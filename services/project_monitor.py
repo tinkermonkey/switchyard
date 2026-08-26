@@ -5914,13 +5914,46 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             current_lock = lock_manager.get_lock(project_name, board_name)
 
             if current_lock and current_lock.locked_by_issue != issue_number:
+                # A retained/failed lock must NEVER be stolen — that would silently
+                # erase the durable failure record (retained_reason/retained_at) and
+                # hand the board to an unrelated issue, exactly the "silently
+                # re-dispatched" failure this whole mechanism exists to prevent.
+                # This is a real, deterministic gap found across three PR review
+                # rounds: this "repair cycles have priority, they can steal the
+                # lock" logic predates the durable-retention design and was never
+                # updated for it — a prior comment here claimed the dispatch gate in
+                # trigger_agent_for_status already protected this path, but that
+                # gate only checks retention of the issue BEING dispatched, not
+                # whoever currently holds the lock being stolen from.
+                if current_lock.retained_reason:
+                    logger.error(
+                        f"Repair cycle for issue #{issue_number} cannot steal the "
+                        f"pipeline lock — it is retained due to a failed run on "
+                        f"issue #{current_lock.locked_by_issue} "
+                        f"({current_lock.retained_reason}). A human must run "
+                        f"scripts/release_lock.py before this board can be used "
+                        f"by any other issue."
+                    )
+                    return None
+
                 # Lock held by another issue (non-repair-cycle) - steal it
                 logger.warning(
                     f"Repair cycle for issue #{issue_number} is stealing pipeline lock from issue #{current_lock.locked_by_issue} "
                     f"(repair cycles have priority over {status})"
                 )
-                # Release the old lock
-                lock_manager.release_lock(project_name, board_name, current_lock.locked_by_issue)
+                # Release the old lock — force=True is safe here: we already
+                # confirmed above it isn't retained, so this is releasing an
+                # ordinary, actively-held lock, not bypassing the recovery flow.
+                released = lock_manager.release_lock(
+                    project_name, board_name, current_lock.locked_by_issue, force=True
+                )
+                if not released:
+                    logger.error(
+                        f"Repair cycle for issue #{issue_number} could not release "
+                        f"the pipeline lock held by issue #{current_lock.locked_by_issue} "
+                        f"— refusing to steal it via a fresh lock creation."
+                    )
+                    return None
                 # Acquire for this issue
                 lock_manager._create_lock(project_name, board_name, issue_number)
             elif not current_lock:
@@ -6326,13 +6359,17 @@ _Repair cycle initiated by Switchyard_
                                     f"({lock.retained_reason}) — skipping stale lock release"
                                 )
                             else:
-                                # Stale lock! No active run, no repair-failed marker
+                                # Stale lock! No active run, not retained
                                 logger.warning(
                                     f"Found stale lock on {project_name}/{pipeline.board_name} "
                                     f"held by issue #{lock.locked_by_issue} with no active pipeline run. "
                                     f"Releasing lock..."
                                 )
-                                lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue)
+                                if not lock_manager.release_lock(project_name, pipeline.board_name, lock.locked_by_issue):
+                                    logger.error(
+                                        f"Failed to release stale lock on {project_name}/"
+                                        f"{pipeline.board_name} (issue #{lock.locked_by_issue})"
+                                    )
                                 logger.info(f"Released stale lock for issue #{lock.locked_by_issue}")
 
         except Exception as e:

@@ -325,18 +325,34 @@ async def main():
                             f"(issue #{lock.locked_by_issue} in column '{lock_holder_column or 'removed'}', reason: {reason})"
                         )
 
-                        lock_manager.release_lock(
+                        # Note: does NOT force — a lock retained due to a failed
+                        # run (PipelineLock.retained_reason) is correctly refused
+                        # here rather than silently released just because its
+                        # issue moved off the board/out of an agent column. That
+                        # would bypass the deliberate scripts/release_lock.py
+                        # recovery flow this mechanism depends on.
+                        released = lock_manager.release_lock(
                             project_name, pipeline.board_name, lock.locked_by_issue
                         )
-                        locks_released += 1
+                        if not released:
+                            logger.warning(
+                                f"Could not release orphaned lock for "
+                                f"{project_name}/{pipeline.board_name} (issue "
+                                f"#{lock.locked_by_issue}) — it is likely retained "
+                                f"due to a failed run; leaving it and the queue "
+                                f"entry untouched. Use scripts/release_lock.py to "
+                                f"release it deliberately."
+                            )
+                        else:
+                            locks_released += 1
 
-                        # Remove issue from queue if present
-                        # (it will be re-added if moved back to trigger column)
-                        pipeline_queue = get_pipeline_queue_manager(
-                            project_name, pipeline.board_name
-                        )
-                        if pipeline_queue.is_issue_in_queue(lock.locked_by_issue):
-                            pipeline_queue.remove_issue_from_queue(lock.locked_by_issue)
+                            # Remove issue from queue if present
+                            # (it will be re-added if moved back to trigger column)
+                            pipeline_queue = get_pipeline_queue_manager(
+                                project_name, pipeline.board_name
+                            )
+                            if pipeline_queue.is_issue_in_queue(lock.locked_by_issue):
+                                pipeline_queue.remove_issue_from_queue(lock.locked_by_issue)
 
                         # NOTE: We don't process the next waiting issue here
                         # The regular monitoring loop will pick it up

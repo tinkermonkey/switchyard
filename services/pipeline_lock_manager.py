@@ -425,6 +425,22 @@ class PipelineLockManager:
 
             # Stale lock threshold: 4 hours
             if lock_age > timedelta(hours=4):
+                # Defense-in-depth re-check: the upfront durable check at the top
+                # of this function already refuses when this lock is retained, so
+                # this should be unreachable in the normal case — but this is a
+                # separate, later read of the same lock (this whole branch only
+                # runs when Redis is down, forcing the YAML-fallback path), so a
+                # narrow race against a concurrent mark_lock_failed() call between
+                # that check and this one isn't provably impossible. Re-check
+                # rather than let _create_lock silently wipe a retained lock.
+                if lock.retained_reason:
+                    logger.error(
+                        f"Refusing to auto-recover 'stale' lock for {project}/{board} "
+                        f"— it is actually retained due to a failed run on issue "
+                        f"#{lock.locked_by_issue} ({lock.retained_reason})"
+                    )
+                    return False, f"locked_by_issue_{lock.locked_by_issue}_failed"
+
                 logger.warning(
                     f"Stale lock detected for {project}/{board} "
                     f"(held by #{lock.locked_by_issue} for {lock_age})"
@@ -434,7 +450,14 @@ class PipelineLockManager:
                 logger.info(
                     f"Auto-releasing stale lock (issue #{lock.locked_by_issue})"
                 )
-                self.release_lock(project, board, lock.locked_by_issue)
+                released = self.release_lock(project, board, lock.locked_by_issue)
+                if not released:
+                    logger.error(
+                        f"Could not release stale lock for {project}/{board} held "
+                        f"by issue #{lock.locked_by_issue} — refusing to steal it "
+                        f"via a fresh lock creation."
+                    )
+                    return False, f"locked_by_issue_{lock.locked_by_issue}"
                 self._create_lock(project, board, issue_number)
                 return True, "stale_lock_recovered"
         except Exception as e:
@@ -561,7 +584,16 @@ class PipelineLockManager:
                 )
                 return False
 
-        # Atomic release via Redis
+        # Atomic release via Redis. Tracks whether Redis actually reached a
+        # definitive, trustworthy ownership result — used below to decide
+        # whether the YAML ownership check can be safely skipped. Previously
+        # this was inferred from `self.redis_client` being configured at all,
+        # which is also true when Redis IS configured but the transaction
+        # raised (connection drop, timeout) — in that case the YAML delete
+        # below would proceed with should_delete defaulting to True and no
+        # ownership re-check, potentially deleting the one non-expiring copy
+        # of a lock held by someone else.
+        redis_confirmed_ownership = False
         if self.redis_client:
             try:
                 lock_key = self._get_lock_key(project, board)
@@ -607,10 +639,12 @@ class PipelineLockManager:
                             elif result == "not_found":
                                 # Already gone, consider it success (idempotent)
                                 logger.debug(f"Lock for {project}/{board} already gone during release by #{issue_number}")
+                                redis_confirmed_ownership = True
                                 # Fall through to clean up YAML just in case
                                 break
                             else:
                                 logger.debug(f"Deleted lock from Redis: {project}/{board}")
+                                redis_confirmed_ownership = True
                                 break
                                 
                         except redis.WatchError:
@@ -629,12 +663,17 @@ class PipelineLockManager:
                 lock_file = state_file.with_suffix(state_file.suffix + '.lock')
                 with file_lock(lock_file):
                     if state_file.exists():  # Check again inside lock
-                        # Double check ownership in YAML if we didn't check Redis (e.g. Redis down)
-                        # If Redis was up, we already validated ownership or deleted it.
-                        # If Redis was down, we must validate against YAML.
-                        
+                        # Double check ownership in YAML unless Redis already gave us
+                        # a definitive, trustworthy answer. Gated on
+                        # redis_confirmed_ownership, NOT on `self.redis_client` being
+                        # configured — those are different things: Redis can be
+                        # configured but the transaction above can still have raised
+                        # (connection drop, timeout), in which case
+                        # redis_confirmed_ownership stays False and we must not skip
+                        # this check, or a lock held by someone else could be
+                        # deleted here with no ownership validation at all.
                         should_delete = True
-                        if not self.redis_client: # Only check YAML content if Redis wasn't used
+                        if not redis_confirmed_ownership:
                             try:
                                 with open(state_file, 'r') as f:
                                     lock_data = yaml.safe_load(f)

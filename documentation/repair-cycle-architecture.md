@@ -119,7 +119,7 @@ When the container exits, the monitor:
 2. Posts a summary comment to the GitHub issue.
 3. If successful: calls `auto_commit_service.commit_agent_changes()`, then uses `PipelineProgression.move_issue_to_column()` to advance the issue to the next column, then calls `pipeline_run_manager.end_pipeline_run()`.
 4. If the next column is an exit column (`Staged` or `Done`), calls `_check_pr_ready_on_issue_exit()`.
-5. If failed: posts a failure summary via `_post_repair_cycle_failure_summary()`, applies the `repair-cycle:failed` label to the GitHub issue, ends the pipeline run with `retain_lock=True`, and sets a Redis marker at `pipeline_lock:repair_failed:{project}:{board}:{issue}` so the stale-lock watchdog does not treat the retained lock as leaked.
+5. If failed: posts a failure summary via `_post_repair_cycle_failure_summary()`, applies the `repair-cycle:failed` label to the GitHub issue, and calls `pipeline_run_manager.mark_failed()` — the shared failure entry point that ends the pipeline run and durably marks the pipeline lock as retained-due-to-failure (`PipelineLock.retained_reason`, persisted to Redis + a non-expiring YAML file) so the stale-lock watchdog and every dispatch gate recognize it and never treat the retained lock as leaked or re-dispatchable.
 6. Always removes the container and clears the Redis tracking key.
 
 ---
@@ -195,7 +195,7 @@ The pipeline lock is the coordination mechanism. While the repair cycle containe
 
 When the repair cycle succeeds, the issue is moved to the next column by `PipelineProgression.move_issue_to_column()`, which triggers the lock release. Normal pipeline execution resumes when the next board poll detects the issue in its new column.
 
-When the repair cycle fails, the lock is retained (`retain_lock=True` in `end_pipeline_run()`). The issue stays in the Testing column, holding the pipeline lock, until a human manually moves the issue. The stale-lock watchdog recognizes the `pipeline_lock:repair_failed:{project}:{board}:{issue}` Redis marker and does not treat this as a leaked lock.
+When the repair cycle fails, `pipeline_run_manager.mark_failed()` durably marks the pipeline lock as retained-due-to-failure (`PipelineLock.retained_reason`). The issue stays in the Testing column, holding the pipeline lock, until a human runs `scripts/release_lock.py` — moving the card does **not** clear this, unlike the old `pipeline_lock:repair_failed:*` Redis marker this replaced (which was cleared by board movement and had no non-expiring durability guarantee). The stale-lock watchdog and every dispatch gate check `retained_reason` directly and never treat a retained lock as leaked or re-dispatchable.
 
 ---
 
@@ -223,7 +223,7 @@ At launch time, `_start_repair_cycle_for_issue()` checks whether the pipeline lo
 
 ### Failure escalation
 
-When the repair cycle fails, the issue is left in the Testing column with the pipeline lock retained and the `repair-cycle:failed` label applied to the GitHub issue. A summary comment with suggested next steps is posted. No automated retry is triggered. The next cycle for the same issue only starts after a human moves the issue, which clears the `repair_failed` Redis marker.
+When the repair cycle fails, the issue is left in the Testing column with the pipeline lock durably retained (`PipelineLock.retained_reason`) and the `repair-cycle:failed` label applied to the GitHub issue. A summary comment with suggested next steps is posted. No automated retry is triggered. Moving the card does **not** un-block anything — a human must run `python scripts/release_lock.py --project <project> --board "<board>" --issue <issue>` to release the lock before the pipeline can resume for this issue.
 
 ### Fast-fail across test types
 

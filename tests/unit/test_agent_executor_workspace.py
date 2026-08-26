@@ -361,13 +361,14 @@ class TestAgentExecutorWorkspaceIntegration:
                     task_context=task_context
                 )
 
-            # Pipeline run must end with the lock retained -- no auto-retry,
-            # no next-queued-issue dispatch into the same broken workspace.
-            mock_prm.end_pipeline_run.assert_called_once()
-            _, end_kwargs = mock_prm.end_pipeline_run.call_args
-            assert end_kwargs['retain_lock'] is True
-            assert end_kwargs['outcome'] == 'failed'
-            assert end_kwargs['issue_number'] == 793
+            # Pipeline run must be marked failed via the shared mark_failed()
+            # entry point (not a bare end_pipeline_run(outcome="failed") whose
+            # return was previously discarded) -- no auto-retry, no
+            # next-queued-issue dispatch into the same broken workspace.
+            mock_prm.mark_failed.assert_called_once()
+            _, mark_kwargs = mock_prm.mark_failed.call_args
+            assert mark_kwargs['issue_number'] == 793
+            assert mark_kwargs['project'] == 'documentation_robotics'
 
             # A human-visible comment must be posted so this doesn't fail silently.
             mock_github.post_comment.assert_called_once()

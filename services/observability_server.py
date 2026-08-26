@@ -4128,7 +4128,16 @@ def release_pipeline_lock(project, board):
     """
     Manually release a pipeline lock for a project/board.
 
-    This is useful when a lock is stuck due to agent crashes or other issues.
+    This is useful when a lock is stuck due to agent crashes or other issues —
+    i.e. it is the web-UI equivalent of scripts/release_lock.py, and this is a
+    deliberate human recovery action just like that script. It mirrors the
+    script's semantics: a lock durably retained due to a failed run
+    (PipelineLock.retained_reason) requires `force: true` in the request body
+    to release, matching PipelineLockManager.release_lock's guard — without
+    this, this endpoint would always fail on exactly the case it exists to
+    handle (a stuck/failed lock), since release_lock() now correctly refuses a
+    retained lock by default. An ordinary, actively-held lock still releases
+    without force, same as before this PR.
 
     Args:
         project: Project name
@@ -4136,7 +4145,8 @@ def release_pipeline_lock(project, board):
 
     Request body (optional):
         {
-            "issue_number": 123  # If provided, only releases lock if held by this issue
+            "issue_number": 123,  # If provided, only releases lock if held by this issue
+            "force": true         # Required to release a lock marked retained-due-to-failure
         }
 
     Returns:
@@ -4149,9 +4159,10 @@ def release_pipeline_lock(project, board):
         lock_manager = get_pipeline_lock_manager()
         queue_manager = get_pipeline_queue_manager(project, board)
 
-        # Get optional issue_number from request body
+        # Get optional issue_number/force from request body
         request_data = request.get_json() if request.is_json else {}
         specified_issue = request_data.get('issue_number')
+        force = bool(request_data.get('force'))
 
         # Check current lock status
         lock = lock_manager.get_lock(project, board)
@@ -4176,10 +4187,43 @@ def release_pipeline_lock(project, board):
 
         locked_by_issue = lock.locked_by_issue
 
-        # Release the lock
-        released = lock_manager.release_lock(project, board, locked_by_issue)
+        if lock.retained_reason and not force:
+            # This is the case this endpoint exists for — surface it clearly
+            # rather than falling through to release_lock()'s generic refusal.
+            return jsonify({
+                'success': False,
+                'message': (
+                    f'Lock for issue #{locked_by_issue} is retained due to a '
+                    f'failed run: {lock.retained_reason}. Confirm and retry with '
+                    f'force: true to release it.'
+                ),
+                'retained_reason': lock.retained_reason,
+                'retained_at': lock.retained_at,
+                'requires_force': True,
+                'lock_status': {
+                    'locked_by_issue': locked_by_issue,
+                    'locked_at': lock.lock_acquired_at
+                }
+            }), 409
+
+        # Release the lock — force is only meaningful (and only passed through)
+        # when the lock is actually retained; an ordinary lock releases the same
+        # as always.
+        released = lock_manager.release_lock(
+            project, board, locked_by_issue, force=bool(lock.retained_reason)
+        )
 
         if released:
+            # Clear the cancellation signal mark_failed()/end_pipeline_run() may
+            # have set when this run was originally marked failed — otherwise it
+            # stays active for up to an hour and the queue failsafe can undo this
+            # recovery, exactly as scripts/release_lock.py already guards against.
+            try:
+                from services.cancellation import get_cancellation_signal
+                get_cancellation_signal().clear(project, locked_by_issue)
+            except Exception as cancel_err:
+                logger.warning(f"Could not clear cancellation signal: {cancel_err}")
+
             # Also reset the issue in the queue from active to waiting
             queue_manager.reset_issue_to_waiting(locked_by_issue)
 

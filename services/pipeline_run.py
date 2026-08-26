@@ -1017,10 +1017,26 @@ class PipelineRunManager:
                 # failure.
                 try:
                     from services.pipeline_lock_manager import get_pipeline_lock_manager
-                    get_pipeline_lock_manager().mark_lock_failed(
+                    marked_ok = get_pipeline_lock_manager().mark_lock_failed(
                         project, pipeline_run.board, issue_number,
                         reason=reason or "Pipeline run failed",
                     )
+                    # mark_lock_failed reports its own failure via return value,
+                    # not exceptions (empty reason, no lock held, or both Redis
+                    # and YAML writes failing are all reported this way — see its
+                    # docstring). end_pipeline_run() is called from ~15 sites
+                    # across the codebase that don't go through the mark_failed()
+                    # wrapper (which does check this), so this is the only place
+                    # that would ever notice a failure for most of them — log it
+                    # loudly rather than let it pass as if retention succeeded.
+                    if not marked_ok:
+                        logger.critical(
+                            f"end_pipeline_run: could NOT durably mark the lock "
+                            f"failed for {project} issue #{issue_number} — the "
+                            f"run is recorded as failed but the lock may not "
+                            f"actually be retained. This issue may be silently "
+                            f"re-dispatched."
+                        )
                 except Exception as e:
                     logger.error(
                         f"Failed to durably mark lock as failed for {project} issue "
@@ -1037,9 +1053,23 @@ class PipelineRunManager:
             lock_manager = get_pipeline_lock_manager()
             current_lock = lock_manager.get_lock(project, pipeline_run.board)
             if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
-                lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                # Does NOT force — this branch only runs when should_retain is
+                # False (an intentional non-retaining end), but the lock could
+                # still independently be retained from an unrelated prior
+                # failure. release_lock() correctly refuses in that case; don't
+                # proceed to dispatch the next queued issue as if this one
+                # cleanly released.
+                released = lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                if not released:
+                    logger.error(
+                        f"Could not release pipeline lock for {project} issue "
+                        f"#{issue_number} after ending run — it is likely retained "
+                        f"due to an unrelated failure. Not dispatching the next "
+                        f"queued issue while this is unresolved."
+                    )
+                    return True
                 logger.info(f"Released pipeline lock for {project} issue #{issue_number} after ending run")
-                
+
                 # CRITICAL: Process next waiting issue in queue after lock release
                 # This ensures queued issues are picked up when the current issue completes
                 try:

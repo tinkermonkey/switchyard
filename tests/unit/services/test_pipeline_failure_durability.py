@@ -268,6 +268,27 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertEqual(synced, 0)
         self.mock_redis.hset.assert_not_called()
 
+    def test_release_lock_still_checks_yaml_ownership_when_redis_transaction_raises(self):
+        """If Redis is configured but the release transaction itself raises
+        (connection drop, timeout — not "Redis unavailable"), the YAML
+        ownership check must still run rather than being skipped just because
+        self.redis_client is non-None. Otherwise a lock held by someone else
+        could be deleted from the one non-expiring copy with zero validation."""
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=999,  # held by a DIFFERENT issue
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+        )
+        self.manager._save_lock_to_yaml(lock)
+
+        self.mock_redis.pipeline.side_effect = Exception("connection dropped")
+
+        released = self.manager.release_lock("proj", "board", 123)  # issue 123 != holder 999
+        self.assertFalse(released)
+        # The YAML file must still exist, untouched.
+        lock_after = self.manager.get_lock("proj", "board")
+        self.assertIsNotNone(lock_after)
+        self.assertEqual(lock_after.locked_by_issue, 999)
+
     def test_release_lock_refuses_retained_lock_without_force(self):
         """release_lock() itself must refuse a retained lock unless force=True
         — this is the guard that closes the gap where several ordinary,

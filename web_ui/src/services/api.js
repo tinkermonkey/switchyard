@@ -26,9 +26,16 @@ class ApiClient {
         const data = await response.json()
         
         if (!response.ok) {
-          throw new Error(data.error || data.message || `HTTP ${response.status}`)
+          const err = new Error(data.error || data.message || `HTTP ${response.status}`)
+          // Preserve the full parsed body so callers that need structured detail
+          // (e.g. a 409 "confirm and retry with force" response) aren't limited
+          // to the flattened message string — existing catch blocks that only
+          // read error.message are unaffected.
+          err.data = data
+          err.status = response.status
+          throw err
         }
-        
+
         return data
       }
       

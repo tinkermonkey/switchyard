@@ -405,10 +405,25 @@ class PipelineProgression:
             pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
             pipeline_run_manager = get_pipeline_run_manager()
 
-            # Release lock
-            lock_manager.release_lock(project_name, board_name, issue_number)
+            # Release lock. Does NOT force — if this issue's lock is actually
+            # retained due to a failed run (which shouldn't normally happen for
+            # an issue that legitimately reached an exit column, but defense in
+            # depth matters here since this ends the run as a SUCCESS and
+            # dispatches the next queued issue), the release is correctly
+            # refused rather than silently discarding the durable failure
+            # record and proceeding as if everything succeeded.
+            released = lock_manager.release_lock(project_name, board_name, issue_number)
+            if not released:
+                logger.error(
+                    f"Could not release pipeline lock for {project_name}/{board_name} "
+                    f"(issue #{issue_number} reached '{exit_column}') — it is likely "
+                    f"retained due to a failed run. NOT ending the pipeline run as "
+                    f"successful or dispatching the next queued issue while this is "
+                    f"unresolved. Use scripts/release_lock.py to investigate."
+                )
+                return
             logger.info(f"Released pipeline lock for {project_name}/{board_name} (issue #{issue_number} reached '{exit_column}')")
-            
+
             # Remove from queue
             if pipeline_queue.is_issue_in_queue(issue_number):
                 pipeline_queue.remove_issue_from_queue(issue_number)
