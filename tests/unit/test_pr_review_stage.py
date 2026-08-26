@@ -499,6 +499,84 @@ async def test_no_pr_found_raises_error(pr_review_stage):
 
 
 @pytest.mark.asyncio
+async def test_already_merged_pr_advances_to_done(pr_review_stage):
+    """No open PR, but a merged PR is found for this issue's branch -- the parent
+    should advance to Done and the "already merged" explanation should be posted."""
+    merged_pr = {'number': '77', 'url': 'https://github.com/o/r/pull/77',
+                 'headRefName': 'feature/issue-42-thing'}
+
+    with patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value=None), \
+         patch.object(pr_review_stage, '_find_merged_pr', return_value=merged_pr), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True), \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+
+        result = await pr_review_stage.execute(context)
+
+        assert result.get('manual_progression_made') is True
+        mock_post_comment.assert_called_once()
+        posted_comment = mock_post_comment.call_args[0][2]
+        assert 'was already merged' in posted_comment.lower()
+        assert 'advancing to done' in posted_comment.lower()
+
+
+@pytest.mark.asyncio
+async def test_already_merged_pr_advance_fails_not_manual_progression(pr_review_stage):
+    """Same as above, but the move to Done fails: manual_progression_made must not
+    be set, and the posted comment must include BOTH the merge explanation (why
+    Done is correct) and the failure warning (that the move didn't happen) --
+    an either/or here would silently drop one of the two."""
+    merged_pr = {'number': '77', 'url': 'https://github.com/o/r/pull/77',
+                 'headRefName': 'feature/issue-42-thing'}
+
+    with patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value=None), \
+         patch.object(pr_review_stage, '_find_merged_pr', return_value=merged_pr), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=False), \
+         patch.object(pr_review_stage, '_post_comment_on_issue', return_value=True) as mock_post_comment:
+
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+
+        result = await pr_review_stage.execute(context)
+
+        assert not result.get('manual_progression_made')
+        mock_post_comment.assert_called_once()
+        posted_comment = mock_post_comment.call_args[0][2]
+        assert 'was already merged' in posted_comment.lower()
+        assert "could not automatically move this issue to 'done'" in posted_comment.lower()
+
+
+@pytest.mark.asyncio
+async def test_already_merged_pr_advance_fails_and_comment_fails_escalates(pr_review_stage):
+    """When the move to Done AND posting the failure warning both fail, the stage
+    must raise rather than silently return -- otherwise the issue is stranded
+    with zero human-visible signal anywhere."""
+    from agents.non_retryable import NonRetryableAgentError
+
+    merged_pr = {'number': '77', 'url': 'https://github.com/o/r/pull/77',
+                 'headRefName': 'feature/issue-42-thing'}
+
+    with patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value=None), \
+         patch.object(pr_review_stage, '_find_merged_pr', return_value=merged_pr), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=False), \
+         patch.object(pr_review_stage, '_post_comment_on_issue', return_value=False):
+
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+
+        with pytest.raises(NonRetryableAgentError, match="stranded"):
+            await pr_review_stage.execute(context)
+
+
+@pytest.mark.asyncio
 async def test_phase2_skipped_when_no_context(pr_review_stage):
     """Verify Phase 2 verifications skipped when no context content"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \

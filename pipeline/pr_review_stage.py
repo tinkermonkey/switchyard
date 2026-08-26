@@ -186,20 +186,24 @@ class PRReviewStage(PipelineStage):
                     self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                     pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
                     advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
+                    merge_notice = (
+                        f"## PR Review\n\n"
+                        f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
+                        f"PR remains to review. Marking this epic complete and advancing to Done."
+                    )
                     if advanced_to_done:
-                        self._post_comment_on_issue(
-                            repo, parent_issue_number,
-                            f"## PR Review\n\n"
-                            f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
-                            f"PR remains to review. Marking this epic complete and advancing to Done.",
-                            pipeline_run_id=pipeline_run_id,
-                        )
+                        self._post_comment_on_issue(repo, parent_issue_number, merge_notice, pipeline_run_id=pipeline_run_id)
                     else:
-                        # Surface the failure -- same reasoning as
-                        # _return_parent_and_surface_failures: a silently-logged failure
-                        # here strands the issue in "In Review" with no human-visible signal.
-                        failure_comment = self._build_move_failure_comment(target_column="Done")
-                        self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
+                        # Include both *why* the epic should move (it was merged) and *that*
+                        # the automated move itself failed -- posting only the generic
+                        # failure warning here would drop the merge-PR explanation entirely,
+                        # leaving the operator with no context for why "Done" is even correct.
+                        # Escalate if even this fails to post.
+                        failure_comment = f"{merge_notice}\n\n{self._build_move_failure_comment(target_column='Done')}"
+                        self._post_failure_comment_or_escalate(
+                            repo, parent_issue_number, failure_comment, pipeline_run_id,
+                            what_failed="Failed to advance parent to 'Done'",
+                        )
                     context['agent_output'] = (
                         f"## PR Review\n\n"
                         f"**Outcome**: PR #{merged_pr['number']} already merged — "
@@ -704,9 +708,13 @@ class PRReviewStage(PipelineStage):
                 if not advanced_to_done:
                     # Surface the failure -- same reasoning as _return_parent_and_surface_failures:
                     # a silently-logged failure here strands the issue in "In Review" with no
-                    # automated path out and no human-visible signal.
+                    # automated path out and no human-visible signal. Escalate if even the
+                    # warning comment fails to post.
                     failure_comment = self._build_move_failure_comment(target_column="Done")
-                    self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
+                    self._post_failure_comment_or_escalate(
+                        repo, parent_issue_number, failure_comment, pipeline_run_id,
+                        what_failed="Failed to advance parent to 'Done'",
+                    )
 
             # Build final summary
             issues_summary = ""
@@ -1654,13 +1662,24 @@ class PRReviewStage(PipelineStage):
             summary_comment = self._build_cycle_limit_comment(
                 current_cycle, all_created_issues, move_succeeded=moved_to_dev
             )
-            self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+            if moved_to_dev:
+                self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+            else:
+                # This comment is the only place the failure gets surfaced in the
+                # at-cycle-limit case -- escalate if posting it fails too.
+                self._post_failure_comment_or_escalate(
+                    repo, parent_issue_number, summary_comment, pipeline_run_id,
+                    what_failed="Failed to move parent back to 'In Development'",
+                )
         elif not moved_to_dev:
             # Not at the cycle limit, so no cycle-limit comment will carry the
             # warning -- surface the failure on its own so the issue isn't
             # silently stranded in 'In Review' with only a log line to show it.
             failure_comment = self._build_move_failure_comment()
-            self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
+            self._post_failure_comment_or_escalate(
+                repo, parent_issue_number, failure_comment, pipeline_run_id,
+                what_failed="Failed to move parent back to 'In Development'",
+            )
 
         return moved_to_dev
 
@@ -1868,8 +1887,15 @@ class PRReviewStage(PipelineStage):
             f"{len(all_issue_ids)} total issues, {issues_closed} closed, {issues_open} open"
         )
 
-    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None):
-        """Post a comment on a GitHub issue."""
+    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None) -> bool:
+        """Post a comment on a GitHub issue.
+
+        Returns True if the comment was actually posted, False otherwise. Most
+        callers treat this as a bare, best-effort side effect and ignore the
+        return value -- but a caller using this as the last resort to surface
+        an upstream failure (e.g. a failed column move) should check it: see
+        `_post_failure_comment_or_escalate`.
+        """
         try:
             subprocess.run(
                 ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
@@ -1891,5 +1917,35 @@ class PRReviewStage(PipelineStage):
             except Exception:
                 pass
 
+            return True
+
         except Exception as e:
             logger.error(f"Failed to post comment on #{issue_number}: {e}", exc_info=True)
+            return False
+
+    def _post_failure_comment_or_escalate(
+        self,
+        repo: str,
+        issue_number: int,
+        comment: str,
+        pipeline_run_id: Optional[str],
+        what_failed: str,
+    ) -> None:
+        """Post a failure-warning comment, and escalate if that post itself fails too.
+
+        These comments are the last-resort human-visible signal that a column
+        move failed. If posting the warning also fails -- plausible, since both
+        are GitHub API calls likely to fail together during an outage, an auth
+        problem, or rate limiting -- silently continuing would leave the issue
+        stranded with no signal anywhere except a log line nobody is watching,
+        which is exactly the failure mode this warning exists to prevent.
+        Raising routes it through the stage's normal failure handling instead
+        (logged, emitted as a failed completion, and re-raised to the
+        orchestrator) so the pipeline run is recorded as failed rather than
+        silently "completed".
+        """
+        if not self._post_comment_on_issue(repo, issue_number, comment, pipeline_run_id=pipeline_run_id):
+            raise NonRetryableAgentError(
+                f"{what_failed} for #{issue_number}, and posting the failure warning "
+                f"comment also failed -- issue is stranded with no human-visible signal"
+            )
