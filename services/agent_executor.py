@@ -336,8 +336,11 @@ class AgentExecutor:
                                 f"Failed to post branch error comment to issue #{issue_number}: {comment_err}"
                             )
 
-                    # End the pipeline run, retaining the lock so the issue stays blocked
-                    # until a human rebases the branch and moves it back to Development.
+                    # End the pipeline run, durably marking the lock as
+                    # retained-due-to-failure (see PipelineLockManager.mark_lock_failed).
+                    # Moving the card back to Development alone no longer re-triggers
+                    # it — a human must run scripts/release_lock.py to release the lock
+                    # before dispatch can resume.
                     if issue_number:
                         try:
                             from services.pipeline_run import get_pipeline_run_manager

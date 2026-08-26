@@ -95,6 +95,18 @@ def main():
 
     print("Lock released.")
 
+    # Clear the cancellation signal that mark_failed()/end_pipeline_run() set when
+    # this run was originally marked failed (services/pipeline_run.py). It has a
+    # 1-hour TTL, so a human recovering promptly would otherwise leave it active —
+    # and the queue-processing failsafe treats an active cancellation signal as a
+    # reason to immediately remove the issue from the queue and release its lock
+    # again, undoing this recovery. Must run before reset_issue_to_waiting below.
+    try:
+        from services.cancellation import get_cancellation_signal
+        get_cancellation_signal().clear(args.project, args.issue)
+    except Exception as e:
+        logger.warning(f"Could not clear cancellation signal: {e}")
+
     # Reset the queue entry so the issue is eligible for a fresh dispatch attempt.
     try:
         from services.pipeline_queue_manager import get_pipeline_queue_manager

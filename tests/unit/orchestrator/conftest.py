@@ -23,6 +23,11 @@ def mock_pipeline_lock_manager_auto():
     mock_lock_mgr.try_acquire_lock.return_value = (True, 'acquired')
     mock_lock_mgr.release_lock.return_value = None
     mock_lock_mgr.get_queue.return_value = None
+    # Consistent with "no existing lock" above — an unconfigured Mock().get_retained_reason()
+    # call otherwise returns a truthy Mock object, which trigger_agent_for_status's
+    # retained-lock gate (services/project_monitor.py) would read as "this issue's
+    # pipeline run failed", short-circuiting every test using this fixture.
+    mock_lock_mgr.get_retained_reason.return_value = None
 
     with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr):
         yield mock_lock_mgr

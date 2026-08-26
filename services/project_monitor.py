@@ -1871,6 +1871,31 @@ class ProjectMonitor:
                     column = col
                     break
 
+            # Universal retained-lock gate — deliberately runs here, before the
+            # trigger/exit-column branching below, so it covers EVERY column type
+            # (review, conversational, repair-cycle, not just the pipeline's
+            # trigger column). A prior version of this gate lived only inside the
+            # is_trigger_column branch further down, which meant a review-cycle
+            # crash (set while the issue sits in a non-trigger column like "Code
+            # Review") could bypass it entirely on the next poll and reach
+            # column-type routing (~line 2810 below) unguarded — re-dispatching a
+            # pipeline that had just been durably marked failed. try_acquire_lock()
+            # itself also independently refuses a retained lock now (defense in
+            # depth), but that only helps for stages that actually call it; this
+            # check stops dispatch before any stage-specific logic runs at all.
+            if agent and agent != 'null':
+                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                retained_reason = get_pipeline_lock_manager().get_retained_reason(
+                    project_name, board_name, issue_number
+                )
+                if retained_reason:
+                    logger.info(
+                        f"Issue #{issue_number} pipeline run failed and the lock is "
+                        f"retained ({retained_reason}); skipping until a human runs "
+                        f"scripts/release_lock.py"
+                    )
+                    return None
+
             # NEW: Pipeline lock and queue management
             # Check if this column triggers pipeline execution (requires exclusive lock)
             is_trigger_column = False
@@ -1900,27 +1925,11 @@ class ProjectMonitor:
                 lock_manager = get_pipeline_lock_manager()
                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
 
-                # Single gate covering BOTH the fresh-lock-acquisition branch below and
-                # the already-holds-lock branch further down: if this issue's pipeline
-                # run previously failed (consecutive dispatch failures in the
-                # already-holds-lock branch, or a crashed review-cycle thread in
-                # run_cycle_in_thread), skip entirely regardless of which branch would
-                # otherwise run. Placed here, before the branch point, rather than inside
-                # each branch, so releasing the lock can never let the OTHER branch
-                # redispatch unguarded on the next poll.
-                #
-                # This checks the pipeline lock's retained_reason directly (durable —
-                # Redis + non-expiring YAML) rather than a separate halt-marker flag, so
-                # it can never go stale/invisible the way the old mechanism did. See
-                # PipelineLockManager.mark_lock_failed/get_retained_reason.
-                retained_reason = lock_manager.get_retained_reason(project_name, board_name, issue_number)
-                if retained_reason:
-                    logger.info(
-                        f"Issue #{issue_number} pipeline run failed and the lock is "
-                        f"retained ({retained_reason}); skipping until a human runs "
-                        f"scripts/release_lock.py"
-                    )
-                    return None
+                # NOTE: the retained-lock check that used to live here (redundant
+                # with the universal gate above, which now runs before the
+                # trigger/exit-column branch point and covers every column type,
+                # not just this one) was removed — see that gate's comment for the
+                # full rationale.
 
                 # Always call enqueue_issue to handle re-queueing of completed issues
                 # The enqueue_issue method handles all cases:
@@ -5285,34 +5294,21 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
                     # End pipeline run if genuinely failed (success and frozen cases are
                     # handled elsewhere). Only end if not already ended (e.g., in timeout
-                    # handler). Pass retain_lock=True and outcome="failed" so the pipeline
-                    # lock is NOT released and is durably marked retained-due-to-failure
-                    # (see PipelineRunManager.end_pipeline_run) — the issue stays blocked
-                    # in Testing until a human runs scripts/release_lock.py.
+                    # handler). Uses the same shared mark_failed() entry point as the
+                    # consecutive-dispatch-failure and review-cycle-crash sites — NOT a
+                    # hand-rolled end_pipeline_run + fallback pair — so this path gets
+                    # mark_failed's guaranteed fallback (it marks the lock directly
+                    # regardless of whether an active PipelineRun was found to end)
+                    # instead of relying on its own independently-written equivalent,
+                    # which had drifted out of sync with the shared implementation.
                     if not overall_success and not is_frozen and not pipeline_run_ended:
-                        try:
-                            ended = self.pipeline_run_manager.end_pipeline_run(
-                                project=project_name,
-                                issue_number=issue_number,
-                                reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
-                                retain_lock=True,
-                                outcome="failed",
-                            )
-                            if ended:
-                                logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure (lock retained)")
-                            else:
-                                # No active PipelineRun was found to end (e.g. it was
-                                # already cleaned up elsewhere) — the lock is still held
-                                # by this issue at this point in the finally block, so
-                                # mark it directly to guarantee the durable failure
-                                # signal is set regardless.
-                                from services.pipeline_lock_manager import get_pipeline_lock_manager
-                                get_pipeline_lock_manager().mark_lock_failed(
-                                    project_name, board_name, issue_number,
-                                    reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
-                                )
-                        except Exception as e:
-                            logger.error(f"Failed to end pipeline run in finally block: {e}")
+                        self.pipeline_run_manager.mark_failed(
+                            project=project_name,
+                            board=board_name,
+                            issue_number=issue_number,
+                            reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
+                        )
+                        logger.info(f"Marked pipeline run failed for {project_name}/#{issue_number} (lock retained)")
 
                     # On success, the lock will be released when auto-advancing to next column.
                     # On genuine failure, the lock is intentionally retained — the issue stays

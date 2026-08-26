@@ -111,40 +111,95 @@ class PipelineLockManager:
             retained_at=(lock_data.get('retained_at') or None),
         )
 
+    def _read_redis_lock_only(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
+        """Read the lock from Redis only. Returns (lock_or_None, read_succeeded)."""
+        if not self.redis_client:
+            return None, True  # no Redis configured isn't a read failure
+        try:
+            lock_data = self.redis_client.hgetall(self._get_lock_key(project, board))
+            if lock_data and lock_data.get('lock_status') == 'locked':
+                return self._lock_from_redis_data(lock_data), True
+            return None, True
+        except Exception as e:
+            logger.warning(f"Failed to get lock from Redis: {e}")
+            return None, False
+
+    def _read_yaml_lock_only(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
+        """Read the lock from the YAML file only. Returns (lock_or_None, read_succeeded)."""
+        from utils.file_lock import file_lock
+
+        state_file = self._get_state_file(project, board)
+        if not state_file.exists():
+            return None, True
+        try:
+            lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+            with file_lock(lock_file):
+                if not state_file.exists():  # Check again inside lock
+                    return None, True
+                with open(state_file, 'r') as f:
+                    lock_data = yaml.safe_load(f)
+                    if lock_data and lock_data.get('lock_status') == 'locked':
+                        return PipelineLock(**lock_data), True
+                    return None, True
+        except Exception as e:
+            logger.error(f"Failed to load lock state from YAML: {e}")
+            return None, False
+
     def get_lock(self, project: str, board: str) -> Optional[PipelineLock]:
         """
         Get current lock state for a pipeline.
 
+        Reads BOTH Redis and the YAML file (not Redis-then-fallback-only-if-empty)
+        specifically so that retained_reason — the durable failure marker — can
+        never be masked by a stale copy in the other store. Redis is preferred as
+        the base record (fresher for ordinary fields), but if either store shows
+        retained_reason set and the other doesn't (e.g. mark_lock_failed's Redis
+        write raced or failed while the YAML write succeeded, or vice versa), the
+        retained fields are merged in from whichever store has them. Without this,
+        a transient write failure on one side could silently un-block a failed
+        issue until the stale side's data changed on its own.
+
         Returns:
             PipelineLock if locked, None if unlocked
         """
-        # Try Redis first
-        if self.redis_client:
-            try:
-                lock_data = self.redis_client.hgetall(self._get_lock_key(project, board))
-                if lock_data and lock_data.get('lock_status') == 'locked':
-                    return self._lock_from_redis_data(lock_data)
-            except Exception as e:
-                logger.warning(f"Failed to get lock from Redis: {e}")
+        redis_lock, _ = self._read_redis_lock_only(project, board)
+        yaml_lock, _ = self._read_yaml_lock_only(project, board)
 
-        # Fallback to YAML
-        from utils.file_lock import file_lock
+        if redis_lock and yaml_lock and redis_lock.locked_by_issue == yaml_lock.locked_by_issue:
+            if yaml_lock.retained_reason and not redis_lock.retained_reason:
+                redis_lock.retained_reason = yaml_lock.retained_reason
+                redis_lock.retained_at = yaml_lock.retained_at
+            return redis_lock
 
-        state_file = self._get_state_file(project, board)
-        if state_file.exists():
-            try:
-                # Use file lock when reading to prevent reading partial writes
-                lock_file = state_file.with_suffix(state_file.suffix + '.lock')
-                with file_lock(lock_file):
-                    if state_file.exists():  # Check again inside lock
-                        with open(state_file, 'r') as f:
-                            lock_data = yaml.safe_load(f)
-                            if lock_data and lock_data.get('lock_status') == 'locked':
-                                return PipelineLock(**lock_data)
-            except Exception as e:
-                logger.error(f"Failed to load lock state from YAML: {e}")
+        if redis_lock:
+            return redis_lock
+        return yaml_lock
 
-        return None
+    def get_lock_fail_closed(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
+        """
+        Like get_lock(), but also reports whether the read was trustworthy.
+
+        Returns (lock_or_None, reads_healthy). reads_healthy is False only when
+        BOTH Redis and YAML reads raised — i.e. lock state is genuinely unknown,
+        not just "confirmed empty". Callers making a safety-critical decision
+        (see try_acquire_lock's durable retained-lock check) should treat
+        reads_healthy=False as "assume retained, refuse" rather than "assume
+        unlocked, proceed" — the whole point of this durable check is to never
+        silently grant a lock it can't actually verify is safe to grant.
+        """
+        redis_lock, redis_ok = self._read_redis_lock_only(project, board)
+        yaml_lock, yaml_ok = self._read_yaml_lock_only(project, board)
+
+        if not redis_ok and not yaml_ok:
+            return None, False
+
+        if redis_lock and yaml_lock and redis_lock.locked_by_issue == yaml_lock.locked_by_issue:
+            if yaml_lock.retained_reason and not redis_lock.retained_reason:
+                redis_lock.retained_reason = yaml_lock.retained_reason
+                redis_lock.retained_at = yaml_lock.retained_at
+            return redis_lock, True
+
+        return (redis_lock or yaml_lock), True
 
     def try_acquire_lock(
         self,
@@ -164,17 +219,41 @@ class PipelineLockManager:
             (can_execute: bool, reason: str)
         """
         # DURABLE SAFETY CHECK — must run before any Redis TTL/staleness logic below.
-        # get_lock() checks Redis then falls back to the YAML file, which never
-        # expires, so this is correct even if the Redis copy of the lock has expired
-        # or was never synced back after a restart. A lock retained after a pipeline
-        # run failure (see PipelineLock.retained_reason / mark_lock_failed) must never
+        # get_lock_fail_closed() consults BOTH Redis and YAML (see get_lock()'s
+        # docstring), so this is correct even if the Redis copy of the lock has
+        # expired, was never synced back after a restart, or one store's write
+        # failed while the other's succeeded. A lock retained after a pipeline run
+        # failure (see PipelineLock.retained_reason / mark_lock_failed) must never
         # be recovered by the 4-hour staleness heuristics further down — those exist
         # for ordinary abandoned locks, not deliberately-retained ones — and it must
         # never look "gone" just because its Redis TTL lapsed while nothing was
         # legitimately re-touching it (which is expected: nothing should be retrying
         # a failed, retained issue).
-        existing_lock = self.get_lock(project, board)
-        if existing_lock and existing_lock.retained_reason and existing_lock.locked_by_issue != issue_number:
+        #
+        # Refuses for the SAME issue too, not just other issues: the dispatch gate
+        # in project_monitor.py is supposed to refuse a retained/failed issue before
+        # ever calling try_acquire_lock again for it, but this is defense-in-depth
+        # against any current or future code path that skips that gate (e.g. a
+        # non-trigger-column re-entry) — such a path must not be able to silently
+        # slip through via the "already_holds_lock" branch, which (via
+        # _create_lock_yaml_only) would otherwise also risk overwriting the durable
+        # YAML copy. The one legitimate "same issue, not retained" case (refreshing
+        # TTL on an active lock) is unaffected — this only fires when retained_reason
+        # is actually set.
+        #
+        # Fails CLOSED, not open: if both Redis and YAML reads fail (lock state is
+        # genuinely unknown, not just confirmed-empty), refuse acquisition rather
+        # than silently proceeding as if the lock were free.
+        existing_lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        if not reads_healthy:
+            logger.error(
+                f"try_acquire_lock: could not determine lock state for {project}/{board} "
+                f"(both Redis and YAML reads failed) — refusing acquisition by issue "
+                f"#{issue_number} rather than risk granting it while a retained/failed "
+                f"lock might actually be held"
+            )
+            return False, "lock_state_unknown_failing_closed"
+        if existing_lock and existing_lock.retained_reason:
             logger.debug(
                 f"Pipeline {project}/{board} lock is retained (failed run, issue "
                 f"#{existing_lock.locked_by_issue}: {existing_lock.retained_reason}) — "
@@ -338,7 +417,30 @@ class PipelineLockManager:
         return False, f"locked_by_issue_{lock.locked_by_issue}"
 
     def _create_lock_yaml_only(self, project: str, board: str, issue_number: int):
-        """Create lock in YAML only (helper for Redis sync)"""
+        """
+        Sync the Redis-acquired lock to YAML (helper for Redis sync — called after
+        every successful try_acquire_lock, including the "already_holds_lock" result
+        which fires on every poll while an issue holds the lock).
+
+        If a YAML lock already exists for this (project, board) held by the same
+        issue, its fields — most importantly retained_reason/retained_at — are
+        preserved rather than overwritten with a fresh, blank PipelineLock. Blindly
+        overwriting here would silently wipe the durable failure marker back to
+        whatever the (TTL'd) Redis copy still has the moment anything re-touches the
+        lock, defeating the durability this mechanism exists to provide. In practice
+        try_acquire_lock's upfront durable check refuses before ever reaching here
+        for a retained lock, but this stays defensive against that check's own
+        edge cases (e.g. a narrow race with mark_lock_failed's writes) rather than
+        relying on a single layer of protection.
+        """
+        existing, _ = self._read_yaml_lock_only(project, board)
+        if existing and existing.locked_by_issue == issue_number:
+            if existing.lock_status == 'locked':
+                return  # nothing changed — avoid an unnecessary rewrite
+            existing.lock_status = 'locked'
+            self._save_lock_to_yaml(existing)
+            return
+
         lock = PipelineLock(
             project=project,
             board=board,
@@ -500,10 +602,22 @@ class PipelineLockManager:
         already be held by issue_number in every call site that uses this.
 
         Returns:
-            True if the lock was found (held by issue_number) and marked, False if
-            no lock is currently held by this issue (nothing to mark — a bug
-            upstream, logged as an error since this should never happen).
+            True if the lock was found (held by issue_number) and marked in at
+            least one durable store, False if no lock is currently held by this
+            issue (a bug upstream — logged as an error since this should never
+            happen) or if `reason` was empty (also a bug upstream — an empty
+            retained_reason would be indistinguishable from "not retained" by
+            every read site, silently disabling the whole mechanism).
         """
+        if not reason or not reason.strip():
+            logger.error(
+                f"mark_lock_failed: refusing to mark {project}/{board} issue "
+                f"#{issue_number} with an empty reason — this would silently "
+                f"disable the retained-lock protection (empty string reads as "
+                f"'not retained' everywhere)"
+            )
+            return False
+
         lock = self.get_lock(project, board)
         if not lock or lock.locked_by_issue != issue_number:
             logger.error(
@@ -516,15 +630,31 @@ class PipelineLockManager:
         lock.retained_reason = reason
         lock.retained_at = datetime.now(timezone.utc).isoformat()
 
+        redis_ok = False
         if self.redis_client:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
                 self.redis_client.expire(lock_key, 7200)
+                redis_ok = True
             except Exception as e:
-                logger.error(f"Failed to mark lock failed in Redis (YAML copy still authoritative): {e}")
+                logger.error(f"Failed to mark lock failed in Redis: {e}")
 
-        self._save_lock_to_yaml(lock)
+        yaml_ok = self._save_lock_to_yaml(lock)
+
+        if not redis_ok and not yaml_ok:
+            # Neither durable store actually recorded the retention — the return
+            # value must reflect that this call did NOT achieve its purpose,
+            # rather than unconditionally claiming success. get_lock()'s merge
+            # logic (see its docstring) covers the case where only ONE of the two
+            # writes fails; it cannot cover both failing.
+            logger.error(
+                f"mark_lock_failed: BOTH Redis and YAML writes failed for "
+                f"{project}/{board} issue #{issue_number} — the retained-failure "
+                f"state was NOT durably recorded anywhere. Reason was: {reason}"
+            )
+            return False
+
         logger.warning(
             f"Pipeline lock for {project}/{board} durably retained (issue #{issue_number} "
             f"failed: {reason}) — blocked until a human runs scripts/release_lock.py"
@@ -534,18 +664,28 @@ class PipelineLockManager:
     def get_retained_reason(self, project: str, board: str, issue_number: int) -> Optional[str]:
         """
         Return the retained_reason if issue_number currently holds a failed/retained
-        lock for this pipeline, else None. This is the single check every dispatch
-        entry point (normal poll, restart rescan, any future trigger path) must call
-        before attempting to (re-)dispatch an issue — replaces the old halt-marker
-        gate.
+        lock for this pipeline, else None.
+
+        This is a convenience wrapper around PipelineLock.retained_reason for
+        callers that only have project/board/issue and not the lock object
+        itself — it is NOT the only place this field is consulted. Every
+        dispatch/rescan/reconciliation gate ultimately keys off this same field,
+        but some (e.g. _reconcile_active_runs, _rescan_boards_for_stalled_items in
+        project_monitor.py) read lock.retained_reason directly off a PipelineLock
+        they've already fetched for other reasons, rather than calling this method
+        again. What matters is that every one of those gates checks the field —
+        not that they all go through this specific function.
         """
         lock = self.get_lock(project, board)
         if lock and lock.locked_by_issue == issue_number:
             return lock.retained_reason
         return None
 
-    def _save_lock_to_yaml(self, lock: PipelineLock):
-        """Save lock state to YAML file with thread-safe file locking"""
+    def _save_lock_to_yaml(self, lock: PipelineLock) -> bool:
+        """Save lock state to YAML file with thread-safe file locking. Returns
+        True on success, False if the write failed (the caller decides how loudly
+        to escalate — see mark_lock_failed, which treats "both stores failed" as
+        a hard failure rather than a routine log line)."""
         from utils.file_lock import safe_yaml_write
 
         state_file = self._get_state_file(lock.project, lock.board)
@@ -554,27 +694,62 @@ class PipelineLockManager:
                 with open(state_file, 'w') as f:
                     yaml.dump(asdict(lock), f, default_flow_style=False, sort_keys=False)
             logger.debug(f"Saved lock to YAML: {state_file}")
+            return True
         except Exception as e:
             logger.error(f"Failed to save lock to YAML: {e}")
+            return False
 
     def get_all_locks(self) -> list[PipelineLock]:
         """
-        Get all active locks (for monitoring/recovery).
+        Get all active locks (for monitoring/recovery — this backs
+        /active-pipeline-runs' failed-run listing and
+        scripts/list_failed_pipeline_runs.py, both of which exist specifically so
+        a retained/failed lock can never be silently undiscoverable).
+
+        Scans BOTH YAML files and Redis lock keys and unions the (project, board)
+        pairs found in either — a YAML-only scan would miss a lock that was
+        successfully written to Redis but whose YAML write failed (see
+        mark_lock_failed), making it correctly *enforced* but invisible to the
+        discovery tools built to surface exactly this state. Each pair is then
+        re-read through get_lock(), which already merges retained state from
+        whichever store has it, so callers get one consistent view regardless of
+        which store this method happened to discover the pair from.
 
         Returns:
             List of all active PipelineLock objects
         """
-        locks = []
+        pairs = set()
 
-        # Scan YAML files
         for state_file in self.state_dir.glob("*.yaml"):
             try:
                 with open(state_file, 'r') as f:
                     lock_data = yaml.safe_load(f)
                     if lock_data and lock_data.get('lock_status') == 'locked':
-                        locks.append(PipelineLock(**lock_data))
+                        pairs.add((lock_data.get('project'), lock_data.get('board')))
             except Exception as e:
                 logger.error(f"Failed to load lock from {state_file}: {e}")
+
+        if self.redis_client:
+            try:
+                for key in self.redis_client.keys("pipeline_lock:*"):
+                    # Skip non-lock keys that share the prefix (e.g. the old
+                    # pipeline_lock:repair_failed:* marker, if any still linger
+                    # from before this PR — that mechanism was removed, but stale
+                    # keys could still exist until their TTL expires).
+                    if key.count(':') != 2:
+                        continue
+                    _, project, board = key.split(':', 2)
+                    pairs.add((project, board))
+            except Exception as e:
+                logger.error(f"Failed to scan lock keys from Redis: {e}")
+
+        locks = []
+        for project, board in pairs:
+            if not project or not board:
+                continue
+            lock = self.get_lock(project, board)
+            if lock:
+                locks.append(lock)
 
         return locks
 

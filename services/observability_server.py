@@ -1042,10 +1042,10 @@ def kill_pipeline_run(pipeline_run_id):
             # This handles "zombie" runs that exist in ES but not in Redis
             try:
                 run_data = pipeline_run.to_dict()
-                run_data['outcome'] = 'failed'
                 pipeline_run_manager._end_run_in_elasticsearch(
                     run_data,
-                    "Killed by user via Web UI (forced update)"
+                    "Killed by user via Web UI (forced update)",
+                    outcome='failed',
                 )
                 success = True # Mark as success since we updated ES
             except Exception as e:
@@ -1195,6 +1195,7 @@ def get_active_pipeline_runs():
             runs.append(run_data)
 
         # Add failed runs, sourced from durable locks (see docstring above)
+        lock_scan_error = None
         try:
             for lock in lock_manager.get_all_locks():
                 if not lock.retained_reason:
@@ -1216,10 +1217,14 @@ def get_active_pipeline_runs():
                     'lock_holder_issue': issue_number,
                 }
 
-                # Best-effort enrichment from the (possibly expired) ES/Redis record
+                # Best-effort enrichment from the (possibly expired) ES/Redis record.
+                # Uses the shared singleton (not a fresh PipelineRunManager()) —
+                # this loop runs on every /active-pipeline-runs poll, once per
+                # failed lock, and a fresh instance re-opens Redis/ES clients and
+                # re-issues ILM/index-template PUTs every time.
                 try:
-                    from services.pipeline_run import PipelineRunManager
-                    pipeline_run_manager = PipelineRunManager()
+                    from services.pipeline_run import get_pipeline_run_manager
+                    pipeline_run_manager = get_pipeline_run_manager()
                     recent_id = pipeline_run_manager.get_recent_pipeline_run_id(project, issue_number)
                     if recent_id:
                         recent_run = pipeline_run_manager.get_pipeline_run_by_id(recent_id)
@@ -1240,13 +1245,29 @@ def get_active_pipeline_runs():
 
                 runs.append(run_data)
         except Exception as lock_scan_err:
-            logger.error(f"Error scanning locks for failed pipeline runs: {lock_scan_err}")
+            # Do NOT swallow this into a clean-looking success response — this
+            # scan is what makes failed runs discoverable at all (that's the
+            # entire point of this PR), so a partial failure here must not read
+            # as "confirmed zero failed runs" to a dashboard viewer.
+            logger.error(f"Error scanning locks for failed pipeline runs: {lock_scan_err}", exc_info=True)
+            lock_scan_error = str(lock_scan_err)
 
-        return jsonify({
+        # `success` stays True here even on a lock-scan error — the ES query for
+        # active/feedback_listening runs above (this endpoint's other half)
+        # succeeded and its data is valid; flipping success to False would make
+        # the frontend discard that too (see web_ui/src/routes/dashboard.jsx,
+        # which only applies `runs` when success is true). Instead the scan
+        # failure is surfaced via a dedicated field so a caller that cares about
+        # failed-run completeness specifically can detect it, without silently
+        # dropping the active-runs view.
+        response = {
             'success': True,
             'runs': runs,
             'count': len(runs)
-        })
+        }
+        if lock_scan_error:
+            response['failed_runs_scan_error'] = lock_scan_error
+        return jsonify(response)
 
     except Exception as e:
         # Handle index not found gracefully (returns empty list at debug level)
@@ -1450,7 +1471,10 @@ def get_completed_pipeline_runs():
         }
         es_sort_field = _sort_field_map.get(sort_col, 'ended_at')
 
-        filter_clauses = [{"term": {"status": "completed"}}]
+        # "completed" and "failed" are both terminal — a failed run belongs in
+        # history just as much as a successful one; outcome=... (below) is how
+        # callers already distinguish between them.
+        filter_clauses = [{"terms": {"status": ["completed", "failed"]}}]
         if project:
             filter_clauses.append({"term": {"project": project}})
         if board:
@@ -1523,7 +1547,7 @@ def get_pipeline_run_filter_options():
         result = es_client.search(
             index="pipeline-runs-*",
             body={
-                "query": {"term": {"status": "completed"}},
+                "query": {"terms": {"status": ["completed", "failed"]}},
                 "size": 0,
                 "aggs": {
                     "projects": {"terms": {"field": "project", "size": 200}},
@@ -1550,7 +1574,7 @@ def get_pipeline_recommendations():
         rec_type = request.args.get('rec_type', 'all')
 
         filter_clauses = [
-            {"term": {"status": "completed"}},
+            {"terms": {"status": ["completed", "failed"]}},
             {"bool": {"should": [
                 {"exists": {"field": "orchestratorRecommendations"}},
                 {"exists": {"field": "projectRecommendations"}},

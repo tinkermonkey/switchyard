@@ -431,10 +431,13 @@ class PipelineRunManager:
                     if existing_data:
                         try:
                             existing = json.loads(existing_data)
-                            if existing.get('status') == 'completed':
+                            # "failed" is just as terminal as "completed" here — both
+                            # mean end_pipeline_run() already ran for this ID, so a
+                            # stale ES "active" doc must not be allowed to resurrect it.
+                            if existing.get('status') in ('completed', 'failed'):
                                 logger.info(
                                     f"Skipping ES fallback restore for {pipeline_run.id} — "
-                                    f"already completed in Redis (stale ES read)"
+                                    f"already {existing.get('status')} in Redis (stale ES read)"
                                 )
                                 return None
                         except (json.JSONDecodeError, TypeError):
@@ -1666,7 +1669,11 @@ class PipelineRunManager:
         try:
             pipeline_run_id = run_data['id']
             run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
-            run_data['status'] = 'completed'
+            # Mirror end_pipeline_run()'s status derivation: a distinct "failed"
+            # status, not "completed" + outcome="failed" simultaneously — the
+            # latter is indistinguishable from success by status alone to every
+            # status-filtered reader (dashboards, /api/pipeline-runs, etc.).
+            run_data['status'] = 'failed' if outcome == 'failed' else 'completed'
             if outcome is not None:
                 run_data['outcome'] = outcome
 

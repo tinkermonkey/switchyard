@@ -41,6 +41,12 @@ function DashboardView() {
       if (data.success) {
         setActiveRuns(prev => mergeArrayByIdStable(prev, data.runs))
       }
+      // The active-runs half of this response can succeed (success: true) while
+      // the failed-runs lock scan half failed independently — don't silently
+      // drop that signal just because it doesn't block the primary view.
+      if (data.failed_runs_scan_error) {
+        console.error('[Dashboard] Failed-runs lock scan error (failed runs may be incomplete):', data.failed_runs_scan_error)
+      }
     } catch (error) {
       console.error('[Dashboard] Error fetching active runs:', error)
     } finally {
