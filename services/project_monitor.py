@@ -2073,7 +2073,7 @@ class ProjectMonitor:
                                 # PipelineRunManager.mark_failed (the single shared failure
                                 # path, also used by review-cycle crashes and repair-cycle
                                 # failures).
-                                self.pipeline_run_manager.mark_failed(
+                                marked_ok = self.pipeline_run_manager.mark_failed(
                                     project=project_name, board=board_name,
                                     issue_number=issue_number, reason=fail_reason,
                                 )
@@ -2083,7 +2083,8 @@ class ProjectMonitor:
                                 # status=='waiting'; nothing else resets active->waiting).
                                 pipeline_queue.reset_issue_to_waiting(issue_number)
                                 self._post_pipeline_failure_comment(
-                                    project_name, repository, issue_number, fail_reason
+                                    project_name, board_name, repository, issue_number,
+                                    fail_reason, marked_successfully=marked_ok,
                                 )
                                 return None
                             else:
@@ -2732,6 +2733,19 @@ class ProjectMonitor:
                                     except Exception as e:
                                         logger.debug(f"Could not log no-container event to observability: {e}")
 
+                                    # retain_lock=False explicit, not the implicit
+                                    # retain_lock=None default — this is a transient,
+                                    # auto-retryable condition ("the next FAILSAFE poll
+                                    # will pick up the now-unlocked issue" below), not a
+                                    # genuine failure that should durably block this
+                                    # board. Leaving retain_lock implicit here would have
+                                    # (via end_pipeline_run's outcome="failed" auto-retain
+                                    # logic) durably marked the lock retained, and then
+                                    # the release_lock() call a few lines below would now
+                                    # correctly REFUSE to release it (release_lock() no
+                                    # longer releases a retained lock without force=True)
+                                    # — turning this transient condition into a
+                                    # permanently stuck board with no auto-recovery.
                                     self.pipeline_run_manager.end_pipeline_run(
                                         project=project_name,
                                         issue_number=issue_number,
@@ -2739,7 +2753,8 @@ class ProjectMonitor:
                                             f"No agent container found {NO_CONTAINER_GRACE_SECONDS}s after "
                                             f"run creation (silent launch failure)"
                                         ),
-                                        outcome="failed"
+                                        outcome="failed",
+                                        retain_lock=False,
                                     )
 
                                     from services.pipeline_lock_manager import get_pipeline_lock_manager
@@ -3000,9 +3015,11 @@ class ProjectMonitor:
     def _post_pipeline_failure_comment(
         self,
         project_name: str,
+        board_name: str,
         repository: str,
         issue_number: int,
         reason: str,
+        marked_successfully: bool = True,
     ):
         """
         Post a GitHub comment explaining a pipeline-run failure (best-effort).
@@ -3012,6 +3029,13 @@ class ProjectMonitor:
         discover a failed run — so a post failure here is not silently swallowed
         the way the old halt-marker notifier's was: it retries once and logs at
         ERROR (not warning) on final failure, so it's at least greppable.
+
+        marked_successfully should be the return value of the mark_failed() call
+        this is reporting on. When False (mark_lock_failed genuinely could not
+        durably mark the lock — e.g. both Redis and YAML writes failed), this
+        comment must NOT claim "the lock is retained" — that would itself be a
+        silent-failure regression: a human reading it would believe the board is
+        protected when it may not be.
         """
         import asyncio
         from services.github_integration import GitHubIntegration
@@ -3028,16 +3052,28 @@ class ProjectMonitor:
             )
             return
 
-        comment = (
-            f"## ⚠️ Pipeline Run Failed\n\n"
-            f"Auto-dispatch has been halted for this issue:\n\n```\n{reason}\n```\n\n"
-            f"The pipeline lock is retained — no other issue on this board will be "
-            f"dispatched until this is resolved.\n\n"
-            f"**Next steps:** fix the underlying issue, then run "
-            f"`python scripts/release_lock.py --project {project_name} "
-            f"--board <board_name> --issue {issue_number}` to release the lock and "
-            f"allow a fresh attempt."
-        )
+        if marked_successfully:
+            comment = (
+                f"## ⚠️ Pipeline Run Failed\n\n"
+                f"Auto-dispatch has been halted for this issue:\n\n```\n{reason}\n```\n\n"
+                f"The pipeline lock is retained — no other issue on this board will be "
+                f"dispatched until this is resolved.\n\n"
+                f"**Next steps:** fix the underlying issue, then run "
+                f"`python scripts/release_lock.py --project {project_name} "
+                f"--board \"{board_name}\" --issue {issue_number}` to release the lock and "
+                f"allow a fresh attempt."
+            )
+        else:
+            comment = (
+                f"## 🔴 Pipeline Run Failed — lock NOT durably marked\n\n"
+                f"This issue failed:\n\n```\n{reason}\n```\n\n"
+                f"**The durable retained-lock mark could not be written** (both "
+                f"Redis and YAML writes failed — see orchestrator logs). This "
+                f"issue may be silently re-dispatched without a human noticing "
+                f"the failure. Please investigate immediately and, if needed, "
+                f"check `scripts/list_failed_pipeline_runs.py` and manually "
+                f"verify the lock state for {project_name}/\"{board_name}\"."
+            )
 
         for attempt in range(2):
             try:
@@ -4763,7 +4799,7 @@ _Review cycle initiated by Switchyard_
                             # repair-cycle failures), so siblings on this board stay blocked
                             # until a human resolves it.
                             fail_reason = f"Review cycle thread crashed: {error_summary}"
-                            self.pipeline_run_manager.mark_failed(
+                            marked_ok = self.pipeline_run_manager.mark_failed(
                                 project=project_name, board=board_name,
                                 issue_number=issue_number, reason=fail_reason,
                             )
@@ -4774,13 +4810,22 @@ _Review cycle initiated by Switchyard_
                             from services.pipeline_queue_manager import get_pipeline_queue_manager
                             queue_mgr = get_pipeline_queue_manager(project_name, board_name)
                             queue_mgr.reset_issue_to_waiting(issue_number)
-                            logger.error(
-                                f"Pipeline lock retained for issue #{issue_number} after review "
-                                f"cycle crash (was mid-pipeline in '{status}') — marked failed "
-                                f"pending explicit human review."
-                            )
+                            if marked_ok:
+                                logger.error(
+                                    f"Pipeline lock retained for issue #{issue_number} after review "
+                                    f"cycle crash (was mid-pipeline in '{status}') — marked failed "
+                                    f"pending explicit human review."
+                                )
+                            else:
+                                logger.critical(
+                                    f"Pipeline lock for issue #{issue_number} could NOT be durably "
+                                    f"marked failed after a review cycle crash (was mid-pipeline in "
+                                    f"'{status}') — both Redis and YAML writes failed. This issue may "
+                                    f"be silently re-dispatched."
+                                )
                             self._post_pipeline_failure_comment(
-                                project_name, repository, issue_number, fail_reason
+                                project_name, board_name, repository, issue_number,
+                                fail_reason, marked_successfully=marked_ok,
                             )
                         else:
                             logger.debug(
@@ -4810,11 +4855,13 @@ _Review cycle initiated by Switchyard_
     def _post_repair_cycle_failure_summary(
         self,
         project_name: str,
+        board_name: str,
         issue_number: int,
         repository: str,
         failure_summary: str,
         exit_code: int,
-        container_name: str = None
+        container_name: str = None,
+        marked_successfully: bool = True,
     ):
         """
         Post a comprehensive failure comment to GitHub issue.
@@ -4825,6 +4872,11 @@ _Review cycle initiated by Switchyard_
         - Link to full logs in observability UI
         - Manual intervention instructions
         - Suggested next steps
+
+        marked_successfully should reflect whether mark_failed() actually
+        durably retained the lock (see PipelineRunManager.mark_failed) — when
+        False, an extra warning is appended so this comment doesn't imply
+        protection that may not actually be in place.
         """
         import subprocess
 
@@ -4845,9 +4897,14 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 **Next Steps:**
 1. Review the test failures and fix manually
 2. Commit your fixes and push to the branch
-3. Move the issue back to **Code Review** to re-trigger testing
-4. Or move to **Development** to continue iterating
-
+3. Run `python scripts/release_lock.py --project {project_name} --board "{board_name}" --issue {issue_number}` to release the pipeline lock (moving the card alone no longer re-triggers anything — the lock is durably retained until this is run)
+4. The issue will be picked up again on the next poll once the lock is released
+{"" if marked_successfully else '''
+**⚠️ WARNING:** The durable retained-lock mark could NOT be written for this
+failure (both Redis and YAML writes failed — see orchestrator logs). This
+issue may be silently re-dispatched without a human noticing. Please verify
+lock state manually via `scripts/list_failed_pipeline_runs.py`.
+'''}
 ---
 🤖 Generated by Switchyard
 """
@@ -5301,14 +5358,22 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                     # regardless of whether an active PipelineRun was found to end)
                     # instead of relying on its own independently-written equivalent,
                     # which had drifted out of sync with the shared implementation.
+                    repair_mark_failed_ok = True
                     if not overall_success and not is_frozen and not pipeline_run_ended:
-                        self.pipeline_run_manager.mark_failed(
+                        repair_mark_failed_ok = self.pipeline_run_manager.mark_failed(
                             project=project_name,
                             board=board_name,
                             issue_number=issue_number,
                             reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
                         )
-                        logger.info(f"Marked pipeline run failed for {project_name}/#{issue_number} (lock retained)")
+                        if repair_mark_failed_ok:
+                            logger.info(f"Marked pipeline run failed for {project_name}/#{issue_number} (lock retained)")
+                        else:
+                            logger.critical(
+                                f"Pipeline lock for {project_name}/#{issue_number} could NOT be "
+                                f"durably marked failed after repair cycle failure — both Redis and "
+                                f"YAML writes failed. This issue may be silently re-dispatched."
+                            )
 
                     # On success, the lock will be released when auto-advancing to next column.
                     # On genuine failure, the lock is intentionally retained — the issue stays
@@ -5321,11 +5386,13 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                             org = project_config.github.get('org', '')
                             self._post_repair_cycle_failure_summary(
                                 project_name=project_name,
+                                board_name=board_name,
                                 issue_number=issue_number,
                                 repository=f"{org}/{repository}" if org else repository,
                                 failure_summary=error_message or "Unknown error",
                                 exit_code=exit_code if exit_code is not None else -1,
-                                container_name=container_name
+                                container_name=container_name,
+                                marked_successfully=repair_mark_failed_ok,
                             )
                         except Exception as summary_error:
                             logger.error(f"Failed to post failure summary: {summary_error}")
@@ -6220,8 +6287,22 @@ _Repair cycle initiated by Switchyard_
                     # Check if this board has a lock
                     from services.pipeline_lock_manager import get_pipeline_lock_manager
                     lock_manager = get_pipeline_lock_manager()
-                    lock = lock_manager.get_lock(project_name, pipeline.board_name)
-                    
+                    lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(
+                        project_name, pipeline.board_name
+                    )
+                    if not lock_reads_healthy:
+                        # Same fail-closed reasoning as the rescan gate below: an
+                        # unreadable lock state must not be treated as "no lock, nothing
+                        # to check" — it could be masking a retained lock whose Redis
+                        # copy has TTL'd out. Skip this board's stale-lock check this
+                        # pass rather than guess; it'll be re-evaluated next pass.
+                        logger.error(
+                            f"Could not determine lock state for {project_name}/"
+                            f"{pipeline.board_name} during stale-lock reconciliation "
+                            f"(both Redis and YAML reads failed) — skipping this pass"
+                        )
+                        continue
+
                     if lock and lock.lock_status == 'locked':
                         # Check if the locking issue has an active run
                         pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
@@ -6482,7 +6563,23 @@ _Repair cycle initiated by Switchyard_
                         # Check pipeline lock status
                         from services.pipeline_lock_manager import get_pipeline_lock_manager
                         lock_manager = get_pipeline_lock_manager()
-                        current_lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                        current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(
+                            project_name, pipeline.board_name
+                        )
+                        if not lock_reads_healthy:
+                            # Fail CLOSED, not open: get_lock()'s plain (fail-open) read would
+                            # return None here — indistinguishable from "genuinely unlocked" —
+                            # and this function would then proceed to dispatch item below,
+                            # exactly the "treated as unlocked, silently re-dispatched" failure
+                            # this whole mechanism exists to prevent. Skip this item rather than
+                            # risk it.
+                            logger.error(
+                                f"Could not determine lock state for {project_name}/"
+                                f"{pipeline.board_name} (both Redis and YAML reads failed) — "
+                                f"skipping issue #{item.issue_number} rather than risk "
+                                f"dispatching it while a retained lock might actually be held"
+                            )
+                            continue
 
                         # Skip if pipeline is locked (by any issue) — UNLESS this is a repair_cycle
                         # stage where the same issue holds the lock (expected: lock carried over from

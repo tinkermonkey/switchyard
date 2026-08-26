@@ -198,6 +198,38 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertFalse(success)
         self.assertEqual(reason, "lock_state_unknown_failing_closed")
 
+    def test_get_lock_fail_closed_treats_unreadable_yaml_plus_empty_redis_as_unhealthy(self):
+        """The asymmetric hole: YAML is the only non-expiring store for
+        retained_reason (Redis's TTL can lapse on a retained lock with nothing
+        legitimately re-touching it, which is expected). If Redis genuinely has
+        no entry (TTL'd out) AND the YAML file can't be read, that must be
+        unhealthy too — not just the both-raised case — because an unreadable
+        YAML file could be masking a retained lock Redis no longer remembers."""
+        # Redis: confirmed empty (not an error — hgetall returns {}).
+        self.mock_redis.hgetall.return_value = {}
+        # YAML: file exists but is corrupt.
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        lock, healthy = self.manager.get_lock_fail_closed("proj", "board")
+        self.assertFalse(healthy)
+
+    def test_get_lock_fail_closed_healthy_when_redis_has_a_definitive_answer(self):
+        """Control case: if Redis DOES have an entry (a definitive answer on
+        its own), an unreadable YAML file doesn't need to make the read
+        unhealthy — Redis already tells us everything we need."""
+        self.mock_redis.hgetall.return_value = {
+            'project': 'proj', 'board': 'board', 'locked_by_issue': '123',
+            'lock_acquired_at': datetime.now(timezone.utc).isoformat(),
+            'lock_status': 'locked', 'retained_reason': 'crashed', 'retained_at': datetime.now(timezone.utc).isoformat(),
+        }
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        lock, healthy = self.manager.get_lock_fail_closed("proj", "board")
+        self.assertTrue(healthy)
+        self.assertEqual(lock.retained_reason, "crashed")
+
     def test_mark_lock_failed_rejects_empty_reason(self):
         self.manager._create_lock("proj", "board", 123)
         marked = self.manager.mark_lock_failed("proj", "board", 123, reason="")
@@ -236,10 +268,43 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertEqual(synced, 0)
         self.mock_redis.hset.assert_not_called()
 
-    def test_release_lock_clears_retained_state(self):
-        """The deliberate recovery action (scripts/release_lock.py) removes the
-        lock entirely, so a fresh try_acquire_lock succeeds afterward."""
+    def test_release_lock_refuses_retained_lock_without_force(self):
+        """release_lock() itself must refuse a retained lock unless force=True
+        — this is the guard that closes the gap where several ordinary,
+        automatic call sites (closing the GitHub issue, an exit-column
+        release, pipeline_progression's own release-and-advance logic) could
+        otherwise silently release a retained lock without ever going through
+        scripts/release_lock.py's deliberate confirmation flow."""
         self._write_retained_lock(issue_number=123, hours_old=0)
+
+        released = self.manager.release_lock("proj", "board", 123)
+        self.assertFalse(released)
+        # And the lock must still be intact — nothing was touched.
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.retained_reason, "agent crashed repeatedly")
+
+    def test_release_lock_clears_retained_state_with_force(self):
+        """The deliberate recovery action (scripts/release_lock.py, which
+        passes force=True only after its own explicit confirmation) removes
+        the lock entirely, so a fresh try_acquire_lock succeeds afterward."""
+        self._write_retained_lock(issue_number=123, hours_old=0)
+
+        def side_effect_transaction(func, *keys, **kwargs):
+            mock_pipe = MagicMock()
+            mock_pipe.hgetall.return_value = {'locked_by_issue': '123'}
+            return func(mock_pipe)
+        self.mock_redis.transaction.side_effect = side_effect_transaction
+
+        released = self.manager.release_lock("proj", "board", 123, force=True)
+        self.assertTrue(released)
+        self.assertIsNone(self.manager.get_lock("proj", "board"))
+
+    def test_release_lock_does_not_need_force_for_ordinary_lock(self):
+        """The force requirement is specific to retained locks — an ordinary,
+        non-retained lock (the overwhelming majority of releases: normal
+        successful completions) releases exactly as before, no code changes
+        needed at any of those call sites."""
+        self.manager._create_lock("proj", "board", 123)
 
         def side_effect_transaction(func, *keys, **kwargs):
             mock_pipe = MagicMock()
@@ -249,7 +314,6 @@ class TestMarkLockFailedDurability(unittest.TestCase):
 
         released = self.manager.release_lock("proj", "board", 123)
         self.assertTrue(released)
-        self.assertIsNone(self.manager.get_lock("proj", "board"))
 
 
 class TestGetRetainedReason(unittest.TestCase):
@@ -295,6 +359,50 @@ class TestGetRetainedReason(unittest.TestCase):
         self.assertIsNone(self.manager.get_retained_reason("proj", "board", 123))
 
 
+class TestPipelineLockValidation(unittest.TestCase):
+    """PipelineLock.__post_init__ — validation at the type level, not just in
+    PipelineLockManager.mark_lock_failed, so direct construction or YAML
+    deserialization of a malformed file can't produce the same falsy-string
+    collapse mark_lock_failed's own check guards against."""
+
+    def test_empty_reason_normalizes_to_none_on_construction(self):
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+            retained_reason="", retained_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.assertIsNone(lock.retained_reason)
+        self.assertIsNone(lock.retained_at)
+        self.assertFalse(lock.is_retained)
+
+    def test_whitespace_only_reason_normalizes_to_none_on_construction(self):
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+            retained_reason="   ", retained_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.assertIsNone(lock.retained_reason)
+
+    def test_is_retained_property(self):
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+            retained_reason="crashed",
+        )
+        self.assertTrue(lock.is_retained)
+
+    def test_yaml_deserialization_of_malformed_field_is_also_normalized(self):
+        """Simulates a hand-edited or corrupted YAML file with
+        retained_reason: "" — PipelineLock(**lock_data) must not produce a
+        lock that reads as retained-but-falsy."""
+        lock = PipelineLock(**{
+            'project': "proj", 'board': "board", 'locked_by_issue': 123,
+            'lock_acquired_at': datetime.now(timezone.utc).isoformat(),
+            'lock_status': "locked", 'retained_reason': "", 'retained_at': None,
+        })
+        self.assertIsNone(lock.retained_reason)
+
+
 class TestGetAllLocksMergesRedisAndYaml(unittest.TestCase):
     """get_all_locks() — backs /active-pipeline-runs' failed-run listing and
     scripts/list_failed_pipeline_runs.py, both of which exist specifically so a
@@ -331,6 +439,41 @@ class TestGetAllLocksMergesRedisAndYaml(unittest.TestCase):
 
         locks = self.manager.get_all_locks()
         self.assertEqual(len(locks), 0)
+
+    def test_deduplicates_a_pair_present_in_both_stores(self):
+        """The case the class is named for: a (project, board) pair discovered
+        via BOTH the YAML scan and the Redis key scan must resolve to exactly
+        one PipelineLock in the result, not two."""
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+        )
+        self.manager._save_lock_to_yaml(lock)  # present in YAML
+
+        self.mock_redis.keys.return_value = ["pipeline_lock:proj:board"]  # also present in Redis
+        self.mock_redis.hgetall.return_value = {
+            'project': 'proj', 'board': 'board', 'locked_by_issue': '123',
+            'lock_acquired_at': lock.lock_acquired_at, 'lock_status': 'locked',
+            'retained_reason': '', 'retained_at': '',
+        }
+
+        locks = self.manager.get_all_locks()
+        self.assertEqual(len(locks), 1)
+
+    def test_finds_lock_that_exists_only_in_yaml(self):
+        """The other direction: a pair present in YAML but with no Redis key at
+        all (e.g. TTL'd out) must still be discovered via the YAML file scan."""
+        lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(), lock_status="locked",
+            retained_reason="crashed", retained_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.manager._save_lock_to_yaml(lock)
+        self.mock_redis.keys.return_value = []  # nothing in Redis
+
+        locks = self.manager.get_all_locks()
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(locks[0].retained_reason, "crashed")
 
 
 class TestPipelineRunManagerMarkFailed(unittest.TestCase):

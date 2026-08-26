@@ -728,8 +728,12 @@ class AgentExecutor:
                                     f"1. Inspect the local commits: `git log origin/{task_context.get('branch_name', '<branch>')}..HEAD`\n"
                                     f"2. Force-push if the changes are correct: `git push --force-with-lease`\n"
                                     f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
-                                    f"4. Move the card back to Development to re-trigger the pipeline.\n\n"
-                                    f"_Pipeline lock retained — no further automated work will run on this issue._",
+                                    f"4. Run `python scripts/release_lock.py --project {project_name} "
+                                    f"--board \"{task_context.get('board', '<board_name>')}\" --issue {issue_number}` "
+                                    f"to release the pipeline lock (moving the card alone no longer re-triggers "
+                                    f"anything — the lock is durably retained until this is run).\n\n"
+                                    f"_Pipeline lock retained — no further automated work will run on this issue "
+                                    f"until the lock is released._",
                                     pipeline_run_id=pipeline_run_id
                                 )
                             except Exception as comment_err:

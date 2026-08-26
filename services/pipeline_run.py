@@ -835,7 +835,7 @@ class PipelineRunManager:
         board: str,
         issue_number: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """
         The single shared entry point for every pipeline-failure path: ends any
         active PipelineRun for this issue with outcome="failed" (for rich ES/
@@ -854,6 +854,15 @@ class PipelineRunManager:
         (set_halt_marker/get_halt_marker/clear_halt_marker), which stored its flag
         in a per-issue YAML file with no relationship to the lock, no visibility,
         and no expiry-safe reconciliation.
+
+        Returns:
+            True if the lock was actually durably marked (the part that matters
+            for enforcement), False if it wasn't. mark_lock_failed() reports its
+            own failure via return value, not exceptions (empty reason, no lock
+            held, or both Redis and YAML writes failing are all reported this
+            way) — callers MUST check this return value rather than assume
+            success, since posting a "the lock is retained" comment or log line
+            when it actually isn't would itself be a silent-failure regression.
         """
         try:
             self.end_pipeline_run(
@@ -872,15 +881,19 @@ class PipelineRunManager:
         # Unconditional fallback/guarantee: end_pipeline_run() above only touches the
         # lock if it found an active PipelineRun. Always mark it directly too so a
         # pre-dispatch failure (no PipelineRun ever created for this attempt) is
-        # covered just as reliably as a mid-execution crash.
+        # covered just as reliably as a mid-execution crash. This is also the
+        # authoritative result — mark_lock_failed is idempotent, so calling it
+        # again here even when end_pipeline_run already succeeded is harmless,
+        # and this is the only call that reports its actual outcome back to us.
         try:
             from services.pipeline_lock_manager import get_pipeline_lock_manager
-            get_pipeline_lock_manager().mark_lock_failed(project, board, issue_number, reason)
+            return get_pipeline_lock_manager().mark_lock_failed(project, board, issue_number, reason)
         except Exception as e:
             logger.error(
                 f"mark_failed: could not durably mark lock for {project} issue "
                 f"#{issue_number}: {e}"
             )
+            return False
 
     def end_pipeline_run(
         self,

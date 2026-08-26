@@ -81,7 +81,7 @@ class TestReleaseLockScript(unittest.TestCase):
             ['--project', 'proj', '--board', 'board', '--issue', '123', '--force'],
             get_lock_return=lock,
         )
-        lock_manager.release_lock.assert_called_once_with('proj', 'board', 123)
+        lock_manager.release_lock.assert_called_once_with('proj', 'board', 123, force=True)
         self.assertIsNone(exit_code)
 
     def test_releases_retained_lock_and_resets_queue_and_cancellation(self):
@@ -90,7 +90,7 @@ class TestReleaseLockScript(unittest.TestCase):
             ['--project', 'proj', '--board', 'board', '--issue', '123'],
             get_lock_return=lock,
         )
-        lock_manager.release_lock.assert_called_once_with('proj', 'board', 123)
+        lock_manager.release_lock.assert_called_once_with('proj', 'board', 123, force=True)
         cancellation.clear.assert_called_once_with('proj', 123)
         queue.reset_issue_to_waiting.assert_called_once_with(123)
         self.assertIsNone(exit_code)

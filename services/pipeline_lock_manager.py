@@ -39,6 +39,25 @@ class PipelineLock:
     retained_reason: Optional[str] = None
     retained_at: Optional[str] = None
 
+    def __post_init__(self):
+        # Normalize a whitespace-only or empty retained_reason to None at the
+        # type level, not just in PipelineLockManager.mark_lock_failed. Every
+        # read site in the codebase checks `if lock.retained_reason:` — a
+        # falsy-but-non-None string (constructed directly, or deserialized from
+        # a hand-edited/malformed YAML file, e.g. retained_reason: "") would
+        # otherwise be silently treated as "not retained" everywhere, exactly
+        # the collapse mark_lock_failed's own validation guards against for its
+        # one call path. This closes it for every other way a PipelineLock can
+        # come into existence too.
+        if self.retained_reason is not None and not self.retained_reason.strip():
+            self.retained_reason = None
+            self.retained_at = None
+
+    @property
+    def is_retained(self) -> bool:
+        """True if this lock is durably marked retained-due-to-failure."""
+        return bool(self.retained_reason)
+
 
 class PipelineLockManager:
     """Manages pipeline execution locks with Redis + YAML persistence"""
@@ -191,6 +210,18 @@ class PipelineLockManager:
         yaml_lock, yaml_ok = self._read_yaml_lock_only(project, board)
 
         if not redis_ok and not yaml_ok:
+            return None, False
+
+        # Asymmetric case that matters: YAML is the only non-expiring store for
+        # retained_reason (Redis's TTL can lapse on a lock nothing is
+        # legitimately re-touching, which is expected for a retained lock). If
+        # YAML couldn't be read AND Redis has no entry either (redis_lock is
+        # None — could mean "genuinely unlocked" or "TTL'd out on a retained
+        # lock"), we cannot distinguish those two cases, so this must be
+        # unhealthy too — not just the both-raised case above. If Redis DOES
+        # have an entry, it's a definitive answer on its own regardless of
+        # YAML's state, so that case is left to the normal merge below.
+        if not yaml_ok and redis_lock is None:
             return None, False
 
         if redis_lock and yaml_lock and redis_lock.locked_by_issue == yaml_lock.locked_by_issue:
@@ -477,18 +508,59 @@ class PipelineLockManager:
             f"Pipeline lock acquired: {project}/{board} by issue #{issue_number}"
         )
 
-    def release_lock(self, project: str, board: str, issue_number: int) -> bool:
+    def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
         """
         Release pipeline lock safely.
+
+        Refuses to release a lock currently marked retained-due-to-failure
+        (PipelineLock.retained_reason) unless force=True — this is the
+        enforcement point for "only an explicit human recovery action clears a
+        retained lock" (see mark_lock_failed's docstring). Without this guard,
+        several ordinary, automatic call sites (closing the GitHub issue,
+        reaching an exit column, pipeline_progression's own release-and-advance
+        logic) would silently release a retained lock outside
+        scripts/release_lock.py, which is the only caller that should ever pass
+        force=True — it does so only after its own explicit confirmation.
+
+        Also fails CLOSED like try_acquire_lock: if lock state genuinely can't
+        be determined (both Redis and YAML reads fail) and force is not set,
+        refuses rather than risk releasing a lock that might be retained.
 
         Args:
             project: Project name
             board: Board name
             issue_number: Issue number releasing the lock
+            force: Release even if the lock is retained-due-to-failure, or if
+                lock state couldn't be determined. Only scripts/release_lock.py
+                should ever pass this.
 
         Returns:
-            True if lock was released, False if not held by this issue
+            True if lock was released, False if not held by this issue, or if
+            it's retained/unknown and force was not set.
         """
+        if not force:
+            existing_lock, reads_healthy = self.get_lock_fail_closed(project, board)
+            if not reads_healthy:
+                logger.error(
+                    f"release_lock: could not determine lock state for "
+                    f"{project}/{board} (both Redis and YAML reads failed) — "
+                    f"refusing to release without force=True"
+                )
+                return False
+            if (
+                existing_lock
+                and existing_lock.locked_by_issue == issue_number
+                and existing_lock.retained_reason
+            ):
+                logger.warning(
+                    f"release_lock: refusing to release {project}/{board} lock "
+                    f"for issue #{issue_number} — it is retained due to a "
+                    f"failed run ({existing_lock.retained_reason}). Only "
+                    f"scripts/release_lock.py's deliberate recovery flow may "
+                    f"clear this (pass force=True)."
+                )
+                return False
+
         # Atomic release via Redis
         if self.redis_client:
             try:
@@ -675,8 +747,21 @@ class PipelineLockManager:
         they've already fetched for other reasons, rather than calling this method
         again. What matters is that every one of those gates checks the field —
         not that they all go through this specific function.
+
+        This is a dispatch-gate call — the highest-frequency, first-line-of-
+        defense check in the whole mechanism (called on every poll for every
+        column) — so, like try_acquire_lock, it fails CLOSED via
+        get_lock_fail_closed(): if lock state genuinely can't be determined
+        (both Redis and YAML reads failed), a synthetic non-None reason is
+        returned so callers treat it as "retained, refuse" rather than
+        silently proceeding as if nothing were wrong.
         """
-        lock = self.get_lock(project, board)
+        lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        if not reads_healthy:
+            return (
+                "lock state unknown (both Redis and YAML reads failed) — "
+                "refusing as a precaution"
+            )
         if lock and lock.locked_by_issue == issue_number:
             return lock.retained_reason
         return None

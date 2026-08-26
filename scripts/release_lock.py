@@ -88,7 +88,13 @@ def main():
             f"(not marked as failed)"
         )
 
-    released = lock_manager.release_lock(args.project, args.board, args.issue)
+    # force=True: this script IS the deliberate human recovery action —
+    # release_lock() itself now refuses to release a retained lock unless
+    # explicitly told to (see PipelineLockManager.release_lock), specifically
+    # so that no other, automatic call site can silently release one. We've
+    # already confirmed above (retained + printed detail, or --force for a
+    # non-retained lock) that releasing is intended here.
+    released = lock_manager.release_lock(args.project, args.board, args.issue, force=True)
     if not released:
         print("Failed to release lock (see logs).")
         sys.exit(1)

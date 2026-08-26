@@ -311,9 +311,18 @@ export default function DashboardRunGraph({ run }) {
     return todos?.length ? todos : null
   }, [liveToolEvents, currentLiveAgent, run?.status])
 
+  // Failed runs sourced from a retained lock with no corresponding ES record
+  // (rolled off the 7-day retention, or never enriched) have no run.id — the
+  // pipeline-run detail page requires one. Route to the GitHub issue instead
+  // of a broken /pipeline-run?runId=undefined link in that case.
   const handleClick = useCallback(() => {
-    navigate({ to: '/pipeline-run', search: { runId: run.id } })
-  }, [navigate, run.id])
+    if (run.id) {
+      navigate({ to: '/pipeline-run', search: { runId: run.id } })
+    } else if (run.issue_url) {
+      window.open(run.issue_url, '_blank', 'noopener,noreferrer')
+    }
+  }, [navigate, run.id, run.issue_url])
+  const isClickable = Boolean(run.id || run.issue_url)
 
   // Status is driven directly off run.status (from the polled /active-pipeline-runs list) —
   // no local state to go stale. feedback_listening is the *only* state that should pulse;
@@ -351,8 +360,8 @@ export default function DashboardRunGraph({ run }) {
               {run.project}
             </div>
             <h3
-              onClick={handleClick}
-              className="text-sm font-semibold md:truncate cursor-pointer">
+              onClick={isClickable ? handleClick : undefined}
+              className={`text-sm font-semibold md:truncate ${isClickable ? 'cursor-pointer' : ''}`}>
               {run.issue_title}
             </h3>
           </div>
