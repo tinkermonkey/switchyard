@@ -185,19 +185,32 @@ class PRReviewStage(PipelineStage):
                     )
                     self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                     pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-                    self._advance_parent_to_documentation(project_name, parent_issue_number)
-                    self._post_comment_on_issue(
-                        repo, parent_issue_number,
+                    advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
+                    merge_notice = (
                         f"## PR Review\n\n"
                         f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
-                        f"PR remains to review. Marking this epic complete and advancing to Done.",
-                        pipeline_run_id=pipeline_run_id,
+                        f"PR remains to review. Marking this epic complete and advancing to Done."
                     )
+                    if advanced_to_done:
+                        self._post_comment_on_issue(repo, parent_issue_number, merge_notice, pipeline_run_id=pipeline_run_id)
+                    else:
+                        # Include both *why* the epic should move (it was merged) and *that*
+                        # the automated move itself failed -- posting only the generic
+                        # failure warning here would drop the merge-PR explanation entirely,
+                        # leaving the operator with no context for why "Done" is even correct.
+                        # Escalate if even this fails to post.
+                        failure_comment = f"{merge_notice}\n\n{self._build_move_failure_comment(target_column='Done')}"
+                        self._post_failure_comment_or_escalate(
+                            repo, parent_issue_number, failure_comment, pipeline_run_id,
+                            what_failed="Failed to advance parent to 'Done'",
+                        )
                     context['agent_output'] = (
                         f"## PR Review\n\n"
-                        f"**Outcome**: PR #{merged_pr['number']} already merged — advanced to Done."
+                        f"**Outcome**: PR #{merged_pr['number']} already merged — "
+                        + ("advanced to Done." if advanced_to_done else "but could not be advanced to Done.")
                     )
-                    context['manual_progression_made'] = True
+                    if advanced_to_done:
+                        context['manual_progression_made'] = True
 
                     end_time = utc_now()
                     duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -317,17 +330,10 @@ class PRReviewStage(PipelineStage):
 
             if ci_failures_found:
                 # CI is broken — skip AI phases and return parent to development immediately
-                created_issue_numbers = [int(i['number']) for i in all_created_issues]
-                pr_review_state_manager.increment_review_count(
-                    project_name, parent_issue_number, created_issue_numbers
+                moved_to_dev = await self._return_parent_and_surface_failures(
+                    project_name, parent_issue_number, repo, github_config,
+                    all_created_issues, current_cycle, pipeline_run_id,
                 )
-                if all_created_issues:
-                    await self._move_issues_to_development(all_created_issues, project_name, github_config)
-                self._return_parent_to_development(project_name, parent_issue_number)
-
-                if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
-                    summary_comment = self._build_cycle_limit_comment(current_cycle, all_created_issues)
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
 
                 issues_summary = ""
                 if all_created_issues:
@@ -343,7 +349,13 @@ class PRReviewStage(PipelineStage):
                     + "\n\n---\n\n".join(review_summary_parts)
                 )
                 context['created_review_issues'] = all_created_issues
-                context['manual_progression_made'] = True
+                # Only claim manual progression if the move actually succeeded --
+                # see _return_parent_and_surface_failures's docstring. Guarded
+                # (not an unconditional assignment) to match the issues-found
+                # branch's convention below: the key is present only when True,
+                # absent (not explicit False) on failure.
+                if moved_to_dev:
+                    context['manual_progression_made'] = True
 
                 end_time = utc_now()
                 duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -656,7 +668,6 @@ class PRReviewStage(PipelineStage):
                         }, pipeline_run_id)
 
             # ---- Post-review decision ----
-            created_issue_numbers = [int(i['number']) for i in all_created_issues]
             manual_progression_made = False
 
             if phases_completed == 0:
@@ -679,30 +690,31 @@ class PRReviewStage(PipelineStage):
 
             elif review_found_issues:
                 # Issues found - return to development
-                pr_review_state_manager.increment_review_count(
-                    project_name, parent_issue_number, created_issue_numbers
+                moved_to_dev = await self._return_parent_and_surface_failures(
+                    project_name, parent_issue_number, repo, github_config,
+                    all_created_issues, current_cycle, pipeline_run_id,
                 )
-
-                if all_created_issues:
-                    await self._move_issues_to_development(
-                        all_created_issues, project_name, github_config
-                    )
-                self._return_parent_to_development(project_name, parent_issue_number)
-                manual_progression_made = True
-
-                if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
-                    summary_comment = self._build_cycle_limit_comment(
-                        current_cycle, all_created_issues
-                    )
-                    self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+                # Only claim manual progression if the move actually succeeded --
+                # see _return_parent_and_surface_failures's docstring.
+                manual_progression_made = moved_to_dev
 
             else:
                 # Clean pass - advance to Done
                 logger.info(f"Clean pass for #{parent_issue_number}, advancing to Done")
                 self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-                self._advance_parent_to_documentation(project_name, parent_issue_number)
-                manual_progression_made = True
+                advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
+                manual_progression_made = advanced_to_done
+                if not advanced_to_done:
+                    # Surface the failure -- same reasoning as _return_parent_and_surface_failures:
+                    # a silently-logged failure here strands the issue in "In Review" with no
+                    # automated path out and no human-visible signal. Escalate if even the
+                    # warning comment fails to post.
+                    failure_comment = self._build_move_failure_comment(target_column="Done")
+                    self._post_failure_comment_or_escalate(
+                        repo, parent_issue_number, failure_comment, pipeline_run_id,
+                        what_failed="Failed to advance parent to 'Done'",
+                    )
 
             # Build final summary
             issues_summary = ""
@@ -1527,8 +1539,14 @@ class PRReviewStage(PipelineStage):
                 issue['number'], repo, github_config, sdlc_board, dev_column
             )
 
-    def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int):
-        """Advance the parent issue from 'In Review' to 'Done' on the Planning board."""
+    def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int) -> bool:
+        """Advance the parent issue from 'In Review' to 'Done' on the Planning board.
+
+        Returns True only if the column move actually succeeded. Callers must check
+        this — same reasoning as `_return_parent_to_development`: if it fails, the
+        issue is left stranded in "In Review" and the failure needs to be surfaced
+        rather than just logged.
+        """
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue
@@ -1539,7 +1557,7 @@ class PRReviewStage(PipelineStage):
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
                 logger.warning(f"No GitHub state for {project_name}, cannot advance to Done")
-                return
+                return False
 
             planning_board = None
             for board_name, board in github_state.boards.items():
@@ -1556,13 +1574,22 @@ class PRReviewStage(PipelineStage):
                     logger.info(f"Advanced #{parent_issue_number} to Done (clean pass)")
                 else:
                     logger.error(f"Failed to advance #{parent_issue_number} to Done")
+                return success
             else:
                 logger.warning(f"Planning board not found for {project_name}, cannot advance to Done")
+                return False
         except Exception as e:
-            logger.error(f"Failed to advance parent to Done: {e}", exc_info=True)
+            logger.error(f"Failed to advance parent to Done ({type(e).__name__}): {e}", exc_info=True)
+            return False
 
-    def _return_parent_to_development(self, project_name: str, parent_issue_number: int):
-        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board."""
+    def _return_parent_to_development(self, project_name: str, parent_issue_number: int) -> bool:
+        """Move the parent issue from 'In Review' back to 'In Development' on the Planning board.
+
+        Returns True only if the column move actually succeeded. Callers must check this —
+        if it fails, the issue remains stranded in "In Review" with no automated path back
+        out (the generic per-poll PR-review trigger will refuse to relaunch once the cycle
+        limit is reached), so the failure needs to be surfaced rather than just logged.
+        """
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue
@@ -1573,7 +1600,7 @@ class PRReviewStage(PipelineStage):
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
                 logger.warning(f"No GitHub state for {project_name}, cannot return parent to In Development")
-                return
+                return False
 
             planning_board = None
             for board_name, board in github_state.boards.items():
@@ -1590,21 +1617,110 @@ class PRReviewStage(PipelineStage):
                     logger.info(f"Returned #{parent_issue_number} to In Development (issues found)")
                 else:
                     logger.error(f"Failed to return #{parent_issue_number} to In Development")
+                return success
             else:
                 logger.warning(f"Planning board not found for {project_name}, cannot return parent to In Development")
+                return False
         except Exception as e:
-            logger.error(f"Failed to return parent to In Development: {e}", exc_info=True)
+            logger.error(f"Failed to return parent to In Development ({type(e).__name__}): {e}", exc_info=True)
+            return False
 
-    def _build_cycle_limit_comment(self, cycle: int, issues: List[Dict]) -> str:
+    async def _return_parent_and_surface_failures(
+        self,
+        project_name: str,
+        parent_issue_number: int,
+        repo: str,
+        github_config: Dict,
+        all_created_issues: List[Dict],
+        current_cycle: int,
+        pipeline_run_id: Optional[str],
+    ) -> bool:
+        """Record the review outcome, move the parent issue back to 'In Development',
+        and post whatever comment(s) the outcome requires.
+
+        Shared by the CI-failure and issues-found branches of `execute()`, which both
+        need to: increment the review cycle count, move any created sub-issues to
+        Development, move the parent back, and surface either the cycle-limit
+        summary or a standalone failure warning.
+
+        Returns whether the move to 'In Development' actually succeeded. Callers
+        must use this (not assume success) when deciding `manual_progression_made` —
+        claiming manual progression happened when the move failed would make the
+        failure look handled when the issue is actually still stranded in
+        'In Review'.
+        """
+        created_issue_numbers = [int(i['number']) for i in all_created_issues]
+        pr_review_state_manager.increment_review_count(
+            project_name, parent_issue_number, created_issue_numbers
+        )
+
+        if all_created_issues:
+            await self._move_issues_to_development(all_created_issues, project_name, github_config)
+        moved_to_dev = self._return_parent_to_development(project_name, parent_issue_number)
+
+        if current_cycle >= MAX_REVIEW_CYCLES and all_created_issues:
+            summary_comment = self._build_cycle_limit_comment(
+                current_cycle, all_created_issues, move_succeeded=moved_to_dev
+            )
+            if moved_to_dev:
+                self._post_comment_on_issue(repo, parent_issue_number, summary_comment, pipeline_run_id=pipeline_run_id)
+            else:
+                # This comment is the only place the failure gets surfaced in the
+                # at-cycle-limit case -- escalate if posting it fails too.
+                self._post_failure_comment_or_escalate(
+                    repo, parent_issue_number, summary_comment, pipeline_run_id,
+                    what_failed="Failed to move parent back to 'In Development'",
+                )
+        elif not moved_to_dev:
+            # Not at the cycle limit, so no cycle-limit comment will carry the
+            # warning -- surface the failure on its own so the issue isn't
+            # silently stranded in 'In Review' with only a log line to show it.
+            failure_comment = self._build_move_failure_comment()
+            self._post_failure_comment_or_escalate(
+                repo, parent_issue_number, failure_comment, pipeline_run_id,
+                what_failed="Failed to move parent back to 'In Development'",
+            )
+
+        return moved_to_dev
+
+    def _build_cycle_limit_comment(
+        self, cycle: int, issues: List[Dict], move_succeeded: bool = True
+    ) -> str:
         """Build a comment for when the cycle limit is reached."""
         issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in issues)
+        if move_succeeded:
+            next_steps = (
+                "No further automated reviews will be triggered after these are resolved. "
+                "Manually move the parent issue to 'In Review' to reset the cycle count."
+            )
+        else:
+            # The parent issue never left "In Review" (the move back to "In Development"
+            # failed), so telling the operator to move it "to In Review" would be
+            # misleading -- it needs to go to "In Development" first.
+            next_steps = (
+                f"⚠️ **This issue could not be automatically moved back to 'In Development' "
+                f"and remains in 'In Review'.** It will NOT progress on its own from here — "
+                f"the cycle limit means the automated PR review will no longer relaunch. "
+                f"Please move it to 'In Development' manually to work the issues above, then "
+                f"back to 'In Review' once resolved to reset the cycle count."
+            )
         return (
             f"## PR Review - Cycle {cycle}/{MAX_REVIEW_CYCLES} (Final)\n\n"
             f"This is the final automated review cycle. The following issues were identified "
             f"and moved to Development:\n\n"
             f"{issues_list}\n\n"
-            f"No further automated reviews will be triggered after these are resolved. "
-            f"Manually move the parent issue to 'In Review' to reset the cycle count."
+            f"{next_steps}"
+        )
+
+    def _build_move_failure_comment(self, target_column: str = "In Development") -> str:
+        """Build a standalone warning comment for when the parent issue could not be
+        automatically moved out of 'In Review' to `target_column`, outside the
+        cycle-limit path (which folds the same warning into
+        `_build_cycle_limit_comment` instead)."""
+        return (
+            f"⚠️ **Could not automatically move this issue to '{target_column}'.** "
+            f"It remains in 'In Review' and will not progress on its own — please move "
+            f"it to '{target_column}' manually."
         )
 
     async def _run_consolidation_phase(
@@ -1771,8 +1887,15 @@ class PRReviewStage(PipelineStage):
             f"{len(all_issue_ids)} total issues, {issues_closed} closed, {issues_open} open"
         )
 
-    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None):
-        """Post a comment on a GitHub issue."""
+    def _post_comment_on_issue(self, repo: str, issue_number: int, comment: str, pipeline_run_id: Optional[str] = None) -> bool:
+        """Post a comment on a GitHub issue.
+
+        Returns True if the comment was actually posted, False otherwise. Most
+        callers treat this as a bare, best-effort side effect and ignore the
+        return value -- but a caller using this as the last resort to surface
+        an upstream failure (e.g. a failed column move) should check it: see
+        `_post_failure_comment_or_escalate`.
+        """
         try:
             subprocess.run(
                 ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
@@ -1794,5 +1917,35 @@ class PRReviewStage(PipelineStage):
             except Exception:
                 pass
 
+            return True
+
         except Exception as e:
             logger.error(f"Failed to post comment on #{issue_number}: {e}", exc_info=True)
+            return False
+
+    def _post_failure_comment_or_escalate(
+        self,
+        repo: str,
+        issue_number: int,
+        comment: str,
+        pipeline_run_id: Optional[str],
+        what_failed: str,
+    ) -> None:
+        """Post a failure-warning comment, and escalate if that post itself fails too.
+
+        These comments are the last-resort human-visible signal that a column
+        move failed. If posting the warning also fails -- plausible, since both
+        are GitHub API calls likely to fail together during an outage, an auth
+        problem, or rate limiting -- silently continuing would leave the issue
+        stranded with no signal anywhere except a log line nobody is watching,
+        which is exactly the failure mode this warning exists to prevent.
+        Raising routes it through the stage's normal failure handling instead
+        (logged, emitted as a failed completion, and re-raised to the
+        orchestrator) so the pipeline run is recorded as failed rather than
+        silently "completed".
+        """
+        if not self._post_comment_on_issue(repo, issue_number, comment, pipeline_run_id=pipeline_run_id):
+            raise NonRetryableAgentError(
+                f"{what_failed} for #{issue_number}, and posting the failure warning "
+                f"comment also failed -- issue is stranded with no human-visible signal"
+            )

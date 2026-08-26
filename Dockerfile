@@ -1,19 +1,3 @@
-# Build DR CLI from local source (until published to npm)
-FROM node:22-slim AS dr-cli-builder
-# python3: needed by download-viewer.sh to check installed version (skips network fetch if current)
-# curl + unzip: fallback if viewer bundle isn't present or version mismatches
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 curl unzip \
-    && rm -rf /var/lib/apt/lists/*
-# Mirror repo layout so sync-spec-schemas.sh resolves $REPO_ROOT correctly:
-# script walks scripts/ → cli/ → repo-root, expects spec/dist/ at repo-root
-COPY documentation_robotics/spec/dist/ /build/spec/dist/
-WORKDIR /build/cli
-COPY documentation_robotics/cli/package*.json ./
-RUN npm ci
-COPY documentation_robotics/cli/ ./
-RUN npm run build
-
 # Main orchestrator Dockerfile
 FROM python:3.11-slim
 
@@ -43,11 +27,11 @@ RUN apt update -y && apt install curl git redis-tools gnupg2 procps jq -y \
     && npm install -g @playwright/mcp \
     && rm -rf /var/lib/apt/lists/*
 
-# Install DR CLI built from local source
-COPY --from=dr-cli-builder /build/cli/dist /opt/dr-cli/dist
-COPY --from=dr-cli-builder /build/cli/node_modules /opt/dr-cli/node_modules
-COPY --from=dr-cli-builder /build/cli/package.json /opt/dr-cli/package.json
-RUN chmod +x /opt/dr-cli/dist/cli.js && ln -sf /opt/dr-cli/dist/cli.js /usr/local/bin/dr
+# Install DR CLI from npm (published package, no local build/copy needed).
+# Deliberately floats on latest -- this resolves fresh whenever this layer
+# actually runs (i.e. on a cache miss; a cached build keeps whatever version
+# was installed at that cache's build time, same as any other RUN layer).
+RUN npm install -g @documentation-robotics/cli@latest
 
 # Install Claude Code via official installer
 RUN curl -fsSL https://claude.ai/install.sh | bash && \
