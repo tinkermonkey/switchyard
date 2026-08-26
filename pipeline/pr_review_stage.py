@@ -185,19 +185,28 @@ class PRReviewStage(PipelineStage):
                     )
                     self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                     pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-                    self._advance_parent_to_documentation(project_name, parent_issue_number)
-                    self._post_comment_on_issue(
-                        repo, parent_issue_number,
-                        f"## PR Review\n\n"
-                        f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
-                        f"PR remains to review. Marking this epic complete and advancing to Done.",
-                        pipeline_run_id=pipeline_run_id,
-                    )
+                    advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
+                    if advanced_to_done:
+                        self._post_comment_on_issue(
+                            repo, parent_issue_number,
+                            f"## PR Review\n\n"
+                            f"PR #{merged_pr['number']} ({merged_pr['url']}) was already merged and no open "
+                            f"PR remains to review. Marking this epic complete and advancing to Done.",
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                    else:
+                        # Surface the failure -- same reasoning as
+                        # _return_parent_and_surface_failures: a silently-logged failure
+                        # here strands the issue in "In Review" with no human-visible signal.
+                        failure_comment = self._build_move_failure_comment(target_column="Done")
+                        self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
                     context['agent_output'] = (
                         f"## PR Review\n\n"
-                        f"**Outcome**: PR #{merged_pr['number']} already merged — advanced to Done."
+                        f"**Outcome**: PR #{merged_pr['number']} already merged — "
+                        + ("advanced to Done." if advanced_to_done else "but could not be advanced to Done.")
                     )
-                    context['manual_progression_made'] = True
+                    if advanced_to_done:
+                        context['manual_progression_made'] = True
 
                     end_time = utc_now()
                     duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -317,7 +326,7 @@ class PRReviewStage(PipelineStage):
 
             if ci_failures_found:
                 # CI is broken — skip AI phases and return parent to development immediately
-                _moved_to_dev = await self._return_parent_and_surface_failures(
+                moved_to_dev = await self._return_parent_and_surface_failures(
                     project_name, parent_issue_number, repo, github_config,
                     all_created_issues, current_cycle, pipeline_run_id,
                 )
@@ -337,8 +346,12 @@ class PRReviewStage(PipelineStage):
                 )
                 context['created_review_issues'] = all_created_issues
                 # Only claim manual progression if the move actually succeeded --
-                # see _return_parent_and_surface_failures's docstring.
-                context['manual_progression_made'] = _moved_to_dev
+                # see _return_parent_and_surface_failures's docstring. Guarded
+                # (not an unconditional assignment) to match the issues-found
+                # branch's convention below: the key is present only when True,
+                # absent (not explicit False) on failure.
+                if moved_to_dev:
+                    context['manual_progression_made'] = True
 
                 end_time = utc_now()
                 duration_ms = (end_time - start_time).total_seconds() * 1000
@@ -673,21 +686,27 @@ class PRReviewStage(PipelineStage):
 
             elif review_found_issues:
                 # Issues found - return to development
-                _moved_to_dev = await self._return_parent_and_surface_failures(
+                moved_to_dev = await self._return_parent_and_surface_failures(
                     project_name, parent_issue_number, repo, github_config,
                     all_created_issues, current_cycle, pipeline_run_id,
                 )
                 # Only claim manual progression if the move actually succeeded --
                 # see _return_parent_and_surface_failures's docstring.
-                manual_progression_made = _moved_to_dev
+                manual_progression_made = moved_to_dev
 
             else:
                 # Clean pass - advance to Done
                 logger.info(f"Clean pass for #{parent_issue_number}, advancing to Done")
                 self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
-                self._advance_parent_to_documentation(project_name, parent_issue_number)
-                manual_progression_made = True
+                advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
+                manual_progression_made = advanced_to_done
+                if not advanced_to_done:
+                    # Surface the failure -- same reasoning as _return_parent_and_surface_failures:
+                    # a silently-logged failure here strands the issue in "In Review" with no
+                    # automated path out and no human-visible signal.
+                    failure_comment = self._build_move_failure_comment(target_column="Done")
+                    self._post_comment_on_issue(repo, parent_issue_number, failure_comment, pipeline_run_id=pipeline_run_id)
 
             # Build final summary
             issues_summary = ""
@@ -1512,8 +1531,14 @@ class PRReviewStage(PipelineStage):
                 issue['number'], repo, github_config, sdlc_board, dev_column
             )
 
-    def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int):
-        """Advance the parent issue from 'In Review' to 'Done' on the Planning board."""
+    def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int) -> bool:
+        """Advance the parent issue from 'In Review' to 'Done' on the Planning board.
+
+        Returns True only if the column move actually succeeded. Callers must check
+        this — same reasoning as `_return_parent_to_development`: if it fails, the
+        issue is left stranded in "In Review" and the failure needs to be surfaced
+        rather than just logged.
+        """
         try:
             from services.pipeline_progression import PipelineProgression
             from task_queue.task_manager import TaskQueue
@@ -1524,7 +1549,7 @@ class PRReviewStage(PipelineStage):
             github_state = self.state_manager.load_project_state(project_name)
             if not github_state:
                 logger.warning(f"No GitHub state for {project_name}, cannot advance to Done")
-                return
+                return False
 
             planning_board = None
             for board_name, board in github_state.boards.items():
@@ -1541,10 +1566,13 @@ class PRReviewStage(PipelineStage):
                     logger.info(f"Advanced #{parent_issue_number} to Done (clean pass)")
                 else:
                     logger.error(f"Failed to advance #{parent_issue_number} to Done")
+                return success
             else:
                 logger.warning(f"Planning board not found for {project_name}, cannot advance to Done")
+                return False
         except Exception as e:
-            logger.error(f"Failed to advance parent to Done: {e}", exc_info=True)
+            logger.error(f"Failed to advance parent to Done ({type(e).__name__}): {e}", exc_info=True)
+            return False
 
     def _return_parent_to_development(self, project_name: str, parent_issue_number: int) -> bool:
         """Move the parent issue from 'In Review' back to 'In Development' on the Planning board.
@@ -1586,7 +1614,7 @@ class PRReviewStage(PipelineStage):
                 logger.warning(f"Planning board not found for {project_name}, cannot return parent to In Development")
                 return False
         except Exception as e:
-            logger.error(f"Failed to return parent to In Development: {e}", exc_info=True)
+            logger.error(f"Failed to return parent to In Development ({type(e).__name__}): {e}", exc_info=True)
             return False
 
     async def _return_parent_and_surface_failures(
@@ -1602,7 +1630,7 @@ class PRReviewStage(PipelineStage):
         """Record the review outcome, move the parent issue back to 'In Development',
         and post whatever comment(s) the outcome requires.
 
-        Shared by the CI-failure and issues-found branches of `run()`, which both
+        Shared by the CI-failure and issues-found branches of `execute()`, which both
         need to: increment the review cycle count, move any created sub-issues to
         Development, move the parent back, and surface either the cycle-limit
         summary or a standalone failure warning.
@@ -1643,15 +1671,15 @@ class PRReviewStage(PipelineStage):
         issues_list = "\n".join(f"- #{i['number']}: {i['title']}" for i in issues)
         if move_succeeded:
             next_steps = (
-                f"No further automated reviews will be triggered after these are resolved. "
-                f"Manually move the parent issue to 'In Review' to reset the cycle count."
+                "No further automated reviews will be triggered after these are resolved. "
+                "Manually move the parent issue to 'In Review' to reset the cycle count."
             )
         else:
             # The parent issue never left "In Review" (the move back to "In Development"
             # failed), so telling the operator to move it "to In Review" would be
             # misleading -- it needs to go to "In Development" first.
             next_steps = (
-                f"\n\n⚠️ **This issue could not be automatically moved back to 'In Development' "
+                f"⚠️ **This issue could not be automatically moved back to 'In Development' "
                 f"and remains in 'In Review'.** It will NOT progress on its own from here — "
                 f"the cycle limit means the automated PR review will no longer relaunch. "
                 f"Please move it to 'In Development' manually to work the issues above, then "
@@ -1665,14 +1693,15 @@ class PRReviewStage(PipelineStage):
             f"{next_steps}"
         )
 
-    def _build_move_failure_comment(self) -> str:
+    def _build_move_failure_comment(self, target_column: str = "In Development") -> str:
         """Build a standalone warning comment for when the parent issue could not be
-        automatically moved back to 'In Development', outside the cycle-limit path
-        (which folds the same warning into `_build_cycle_limit_comment` instead)."""
+        automatically moved out of 'In Review' to `target_column`, outside the
+        cycle-limit path (which folds the same warning into
+        `_build_cycle_limit_comment` instead)."""
         return (
-            f"⚠️ **Could not automatically move this issue back to 'In Development'.** "
+            f"⚠️ **Could not automatically move this issue to '{target_column}'.** "
             f"It remains in 'In Review' and will not progress on its own — please move "
-            f"it to 'In Development' manually."
+            f"it to '{target_column}' manually."
         )
 
     async def _run_consolidation_phase(

@@ -39,7 +39,7 @@ async def test_phase1_launches_pr_code_reviewer(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -79,7 +79,7 @@ async def test_phase2_launches_requirements_verifier(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value='Parent issue requirements'), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -216,7 +216,7 @@ async def test_manual_progression_flag_set_when_clean_pass(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -236,6 +236,43 @@ async def test_manual_progression_flag_set_when_clean_pass(pr_review_stage):
 
         # Verify flag is set
         assert result.get('manual_progression_made') is True
+
+
+@pytest.mark.asyncio
+async def test_clean_pass_advance_fails_not_manual_progression(pr_review_stage):
+    """When advancing the parent issue to 'Done' fails on a clean pass,
+    manual_progression_made must not be set, and a failure warning (with 'Done'
+    as the target column) must be posted rather than silently logged."""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+         patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
+         patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=False), \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock(return_value={
+            'agent_output': '### Critical Issues\nNone found'
+        })
+        mock_get_executor.return_value = mock_executor
+        mock_state.get_review_count.return_value = 0
+
+        context = {
+            'context': {
+                'issue_number': 42,
+                'project': 'test-project'
+            }
+        }
+
+        result = await pr_review_stage.execute(context)
+
+        assert not result.get('manual_progression_made')
+        mock_post_comment.assert_called_once()
+        posted_comment = mock_post_comment.call_args[0][2]
+        assert "could not automatically move this issue to 'done'" in posted_comment.lower()
 
 
 @pytest.mark.asyncio
@@ -278,7 +315,7 @@ async def test_phase3_runs_locally_no_docker(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])) as mock_ci_check, \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -352,6 +389,57 @@ async def test_cycle_limit_posts_comment_and_returns_to_development(pr_review_st
 
 
 @pytest.mark.asyncio
+async def test_cycle_limit_comment_reflects_move_failure(pr_review_stage):
+    """At the final review cycle, if the move back to 'In Development' also fails,
+    the cycle-limit comment must use the failure wording ("remains in 'In Review'"),
+    not the success wording that tells the operator to move it "to In Review" --
+    which would be misleading since the issue never left In Review."""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+         patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
+         patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[
+             {'title': '[PR Feedback] Auth Layer', 'body': 'Body', 'severity': 'high'}
+         ]), \
+         patch.object(pr_review_stage, '_create_review_issues', return_value=[
+             {'number': '99', 'url': 'url', 'title': '[PR Feedback] Auth Layer',
+              'severity': 'high', 'body': 'Body'}
+         ]), \
+         patch.object(pr_review_stage, '_move_issues_to_development'), \
+         patch.object(pr_review_stage, '_return_parent_to_development', return_value=False) as mock_return, \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock(return_value={
+            'agent_output': '{"groups": [], "filtered_out": []}'
+        })
+        mock_get_executor.return_value = mock_executor
+        # Final allowed cycle: review_count=2 → current_cycle=3=MAX_REVIEW_CYCLES
+        mock_state.get_review_count.return_value = 2
+
+        context = {
+            'context': {
+                'issue_number': 42,
+                'project': 'test-project'
+            }
+        }
+
+        result = await pr_review_stage.execute(context)
+
+        mock_return.assert_called_once()
+        assert not result.get('manual_progression_made')
+
+        # Exactly one comment (the cycle-limit comment) -- not also a standalone
+        # failure comment, since move_succeeded=False is already folded into it.
+        mock_post_comment.assert_called_once()
+        posted_comment = mock_post_comment.call_args[0][2]
+        assert "remains in 'in review'" in posted_comment.lower()
+        assert "manually move the parent issue to 'in review'" not in posted_comment.lower()
+
+
+@pytest.mark.asyncio
 async def test_skips_workspace_prep_false(pr_review_stage):
     """Verify agents are launched with skip_workspace_prep=False"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
@@ -361,7 +449,7 @@ async def test_skips_workspace_prep_false(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -420,7 +508,7 @@ async def test_phase2_skipped_when_no_context(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
@@ -530,6 +618,48 @@ async def test_ci_failure_early_return_skips_ai_phases(pr_review_stage):
 
 
 @pytest.mark.asyncio
+async def test_ci_failure_move_fails_not_manual_progression(pr_review_stage):
+    """CI-failure branch analog of test_manual_progression_flag_not_set_when_move_fails:
+    when the move back to 'In Development' fails, manual_progression_made must not be
+    set, and a standalone failure warning must be posted (not the final cycle, so the
+    cycle-limit comment path never fires)."""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/5'), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=(
+             [{'name': 'build', 'state': 'failure', 'bucket': 'fail'}], []
+         )), \
+         patch.object(pr_review_stage, '_build_ci_failure_issue', return_value={
+             'title': 'CI: build failed', 'body': 'Build failed', 'severity': 'high'
+         }), \
+         patch.object(pr_review_stage, '_create_review_issues', return_value=[
+             {'number': '200', 'url': 'url', 'title': 'CI: build failed', 'severity': 'high'}
+         ]), \
+         patch.object(pr_review_stage, '_move_issues_to_development'), \
+         patch.object(pr_review_stage, '_return_parent_to_development', return_value=False) as mock_return, \
+         patch.object(pr_review_stage, '_post_comment_on_issue') as mock_post_comment:
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock()
+        mock_get_executor.return_value = mock_executor
+        # Not the final cycle, so the cycle-limit comment (which folds in its own
+        # move_succeeded warning) never fires -- only the standalone failure path can.
+        mock_state.get_review_count.return_value = 0
+
+        context = {'context': {'issue_number': 10, 'project': 'test-project'}}
+
+        result = await pr_review_stage.execute(context)
+
+        mock_return.assert_called_once()
+        # The move failed, so this stage did NOT successfully handle progression.
+        assert not result.get('manual_progression_made')
+        # The failure must still be surfaced as a comment, not just logged.
+        mock_post_comment.assert_called_once()
+        posted_comment = mock_post_comment.call_args[0][2]
+        assert 'could not automatically move' in posted_comment.lower()
+
+
+@pytest.mark.asyncio
 async def test_ci_failure_at_cycle_limit_posts_comment(pr_review_stage):
     """CI failure on the final review cycle posts the cycle-limit warning comment"""
     with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
@@ -593,7 +723,7 @@ async def test_agent_output_includes_summary(pr_review_stage):
          patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
          patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
          patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
-         patch.object(pr_review_stage, '_advance_parent_to_documentation'):
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
 
         mock_executor = AsyncMock()
         mock_executor.execute_agent = AsyncMock(return_value={
