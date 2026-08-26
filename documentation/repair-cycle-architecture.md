@@ -12,7 +12,7 @@ The repair cycle runs entirely inside a dedicated Docker container that is separ
 
 ## How the orchestrator detects that a repair cycle is needed
 
-`ProjectMonitor` polls GitHub project boards on a 30-second interval. When it processes an issue that is in a column, it resolves the pipeline stage configuration for that column. If `stage_config.stage_type == 'repair_cycle'` (checked at line 2515 of `services/project_monitor.py`), the normal agent dispatch path is bypassed and `_start_repair_cycle_for_issue()` is called instead.
+`ProjectMonitor` polls GitHub project boards on a 30-second interval. When it processes an issue that is in a column, it resolves the pipeline stage configuration for that column. If `stage_config.stage_type == 'repair_cycle'` (checked at line 2868 of `services/project_monitor.py`), the normal agent dispatch path is bypassed and `_start_repair_cycle_for_issue()` is called instead.
 
 Test type configurations come from the project config file under `project.testing.types`. Each entry specifies the test type, iteration limits, and thresholds. If no `testing.types` entries exist, the repair cycle is skipped with a warning and no container is launched.
 
@@ -106,8 +106,11 @@ with a 24-hour TTL. The container then exits with one of these codes:
 | 0 | All tests passed |
 | 1 | Max iterations reached or tests still failing |
 | 2 | Execution error, agent failure, or failed to save result to Redis |
-| 3 | Timeout |
 | 4 | Cancelled (SIGTERM, SIGINT, or `CancellationError`) |
+| 5 | Frozen — paused by the Claude Code token-limit circuit breaker; not treated as a failure, auto-resumes once the breaker closes |
+| -1 | Stalled — set by the orchestrator's own container-monitoring loop (not the container itself) when no observability events have been emitted for a full hour; the container is killed |
+
+Exit code 3 ("Timeout") is defined in `pipeline/repair_cycle_runner.py`'s docstring but is not actually returned anywhere in the runner's own logic — the runner has no internal timeout of its own. What operationally acts as a timeout is exit code -1 above, detected and injected by the orchestrator's own stall watchdog.
 
 ### 7. Container monitoring and post-processing
 
@@ -119,7 +122,7 @@ When the container exits, the monitor:
 2. Posts a summary comment to the GitHub issue.
 3. If successful: calls `auto_commit_service.commit_agent_changes()`, then uses `PipelineProgression.move_issue_to_column()` to advance the issue to the next column, then calls `pipeline_run_manager.end_pipeline_run()`.
 4. If the next column is an exit column (`Staged` or `Done`), calls `_check_pr_ready_on_issue_exit()`.
-5. If failed: posts a failure summary via `_post_repair_cycle_failure_summary()`, applies the `repair-cycle:failed` label to the GitHub issue, and calls `pipeline_run_manager.mark_failed()` — the shared failure entry point that ends the pipeline run and durably marks the pipeline lock as retained-due-to-failure (`PipelineLock.retained_reason`, persisted to Redis + a non-expiring YAML file) so the stale-lock watchdog and every dispatch gate recognize it and never treat the retained lock as leaked or re-dispatchable.
+5. If failed: calls `pipeline_run_manager.mark_failed()` first — the shared failure entry point that ends the pipeline run and durably marks the pipeline lock as retained-due-to-failure (`PipelineLock.retained_reason`, persisted to Redis + a non-expiring YAML file) so the stale-lock watchdog and every dispatch gate recognize it and never treat the retained lock as leaked or re-dispatchable — then posts a failure summary via `_post_repair_cycle_failure_summary()` (whose wording reflects whether the mark actually succeeded) and applies the `repair-cycle:failed` label to the GitHub issue.
 6. Always removes the container and clears the Redis tracking key.
 
 ---

@@ -730,18 +730,118 @@ class PipelineLockManager:
                                 )
 
                         if should_delete:
-                            state_file.unlink()
+                            try:
+                                state_file.unlink()
+                            except Exception as unlink_err:
+                                # Deliberately NOT covered by the outer except below —
+                                # that one is scoped to the ownership-check machinery
+                                # above (file_lock acquisition, etc.) and is allowed to
+                                # fall through since it runs before any destructive
+                                # action is taken. This one guards the destructive
+                                # action itself: if unlink() raises, the (possibly
+                                # still-retained) YAML record survives on disk, and
+                                # this must return False rather than fall through to
+                                # the success path below — previously it did, so
+                                # release_lock reported success while a retained
+                                # lock's YAML record silently remained.
+                                logger.error(
+                                    f"Failed to delete lock YAML file {state_file}: {unlink_err}"
+                                )
+                                return False
                             logger.debug(f"Deleted lock YAML file: {state_file}")
                         else:
                             return False
-                            
+
             except Exception as e:
+                # Any failure here (e.g. file_lock acquisition) means we could not
+                # even attempt/verify the deletion above — fail closed rather than
+                # report a release that may not have happened.
                 logger.error(f"Failed to delete lock YAML: {e}")
+                return False
 
         logger.info(
             f"Pipeline lock released: {project}/{board} by issue #{issue_number}"
         )
         return True
+
+    def steal_lock(self, project: str, board: str, new_issue_number: int) -> Tuple[bool, str]:
+        """
+        Forcibly transfer the (project, board) lock to new_issue_number,
+        refusing if the current holder's lock is retained-due-to-failure.
+
+        This is the ONLY sanctioned way to hand a lock to a different issue
+        than its current (non-retained) holder — e.g. repair cycles, which
+        have priority over whatever ordinary agent currently holds a board's
+        lock. It exists specifically so _create_lock()/_create_lock_yaml_only()
+        never need to be called directly from outside this class again for
+        this purpose: two real bugs across this PR's review rounds came from
+        call sites doing the retained_reason check and the lock-construction
+        call as two separately-maintained steps, where a future edit can drop
+        the check while leaving the construction call intact and unnoticed.
+        Centralizing both here removes that failure mode structurally instead
+        of relying on every caller to re-derive it correctly.
+
+        Uses get_lock_fail_closed() internally — refuses (rather than silently
+        proceeding as if unlocked) when lock state genuinely can't be
+        determined.
+
+        Returns:
+            (True, "stolen") — the lock was released from its prior holder and
+                now belongs to new_issue_number.
+            (True, "already_held") — new_issue_number already held the lock;
+                nothing changed.
+            (True, "acquired") — nothing was locked; a fresh lock was created.
+            (False, "retained:<reason>") — the current holder's lock is
+                retained due to a failed run; refused.
+            (False, "lock_state_unknown") — lock state could not be
+                determined (both Redis and YAML reads failed); refused.
+            (False, "release_failed") — stealing required releasing the prior
+                holder's lock and that release itself failed.
+        """
+        current_lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        if not reads_healthy:
+            logger.error(
+                f"steal_lock: could not determine lock state for {project}/{board} "
+                f"(both Redis and YAML reads failed) — refusing to steal/create "
+                f"rather than risk creating a lock while a retained one might "
+                f"actually be held"
+            )
+            return False, "lock_state_unknown"
+
+        if current_lock and current_lock.locked_by_issue != new_issue_number:
+            if current_lock.retained_reason:
+                logger.error(
+                    f"steal_lock: {project}/{board} cannot be stolen for issue "
+                    f"#{new_issue_number} — it is retained due to a failed run on "
+                    f"issue #{current_lock.locked_by_issue} "
+                    f"({current_lock.retained_reason}). A human must run "
+                    f"scripts/release_lock.py before this board can be used by "
+                    f"any other issue."
+                )
+                return False, f"retained:{current_lock.retained_reason}"
+
+            logger.warning(
+                f"steal_lock: transferring {project}/{board} from issue "
+                f"#{current_lock.locked_by_issue} to issue #{new_issue_number}"
+            )
+            # force=True is safe here: we already confirmed above the lock isn't
+            # retained, so this releases an ordinary, actively-held lock, not
+            # bypassing the recovery flow.
+            released = self.release_lock(project, board, current_lock.locked_by_issue, force=True)
+            if not released:
+                logger.error(
+                    f"steal_lock: could not release the lock held by issue "
+                    f"#{current_lock.locked_by_issue} for {project}/{board} — "
+                    f"refusing to steal it via a fresh lock creation."
+                )
+                return False, "release_failed"
+            self._create_lock(project, board, new_issue_number)
+            return True, "stolen"
+        elif not current_lock:
+            self._create_lock(project, board, new_issue_number)
+            return True, "acquired"
+        else:
+            return True, "already_held"
 
     def mark_lock_failed(self, project: str, board: str, issue_number: int, reason: str) -> bool:
         """

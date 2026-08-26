@@ -931,11 +931,21 @@ class HumanFeedbackLoopExecutor:
                         # the retained_reason surfaced in
                         # scripts/list_failed_pipeline_runs.py and the dashboard
                         # is actually meaningful to an operator.
+                        #
+                        # suppress_cancellation=True preserves the same
+                        # race-avoidance the "feedback_loop_ended" sentinel gives
+                        # the success branch below (see end_pipeline_run) — an
+                        # abnormal exit here is just as likely to be immediately
+                        # followed by the next column's loop starting, and without
+                        # this the more descriptive reason string above would
+                        # otherwise defeat that suppression by no longer matching
+                        # the sentinel, forcing a spurious ~1h dispatch delay.
                         marked_ok = pipeline_run_manager.mark_failed(
                             project=state.project_name,
                             board=state.board_name,
                             issue_number=state.issue_number,
                             reason=f"Conversational feedback loop exited abnormally (exit_reason={_exit_reason})",
+                            suppress_cancellation=True,
                         )
                         if not marked_ok:
                             logger.critical(

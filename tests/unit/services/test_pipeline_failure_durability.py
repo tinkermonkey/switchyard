@@ -633,5 +633,180 @@ class TestPipelineRunManagerMarkFailed(unittest.TestCase):
         self.assertEqual(persisted['status'], 'completed')
 
 
+class TestStealLock(unittest.TestCase):
+    """PipelineLockManager.steal_lock() — the single sanctioned way to hand a
+    lock to a different issue than its current holder (e.g. repair cycles
+    stealing from an ordinary Development item). Centralizes the
+    retained_reason check and the release+create sequence that call sites
+    (services/project_monitor.py's repair-cycle dispatch) previously
+    duplicated as two separately-maintained steps — a pattern that caused two
+    real bugs across this PR's review rounds when a call site's check and its
+    construction call drifted apart."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_refuses_to_steal_a_retained_lock(self):
+        """The core regression case: steal_lock() must never hand a retained
+        lock to a different issue, regardless of which issue is requesting it."""
+        self.manager._create_lock("proj", "board", 999)
+        marked = self.manager.mark_lock_failed("proj", "board", 999, reason="agent crashed")
+        self.assertTrue(marked)
+
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertFalse(ok)
+        self.assertTrue(result.startswith("retained:"))
+        # The retained lock must genuinely still belong to issue 999 afterward.
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.locked_by_issue, 999)
+        self.assertEqual(lock.retained_reason, "agent crashed")
+
+    def test_steals_a_non_retained_lock_held_by_another_issue(self):
+        self.manager._create_lock("proj", "board", 999)
+
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, "stolen")
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.locked_by_issue, 100)
+        self.assertIsNone(lock.retained_reason)
+
+    def test_acquires_when_nothing_is_locked(self):
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, "acquired")
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.locked_by_issue, 100)
+
+    def test_no_op_when_already_held_by_the_requesting_issue(self):
+        self.manager._create_lock("proj", "board", 100)
+
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, "already_held")
+
+    def test_fails_closed_when_lock_state_cannot_be_determined(self):
+        self.mock_redis.hgetall.side_effect = Exception("redis down")
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertFalse(ok)
+        self.assertEqual(result, "lock_state_unknown")
+
+
+class TestReleaseLockUnlinkFailure(unittest.TestCase):
+    """release_lock()'s YAML-deletion step must not report success when the
+    actual unlink() call fails. Before this fix, the outer exception handler
+    wrapping both the ownership-check read AND the unlink() call caught any
+    exception from either and fell through to `return True`, so a failed
+    unlink() (permissions, disk error, etc.) silently left the — potentially
+    still retained_reason-bearing — YAML file on disk while reporting release
+    success to the caller."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        # No Redis-side entry — forces the YAML-ownership/unlink path to run
+        # and be the deciding factor in the result, matching the retained
+        # lock's expected steady state (its Redis TTL commonly lapses).
+        self.mock_redis.hgetall.return_value = {}
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_release_lock_returns_false_when_unlink_raises(self):
+        self.manager._create_lock("proj", "board", 123)
+        state_file = self.manager._get_state_file("proj", "board")
+        self.assertTrue(state_file.exists())
+
+        with patch.object(Path, 'unlink', side_effect=OSError("simulated unlink failure")):
+            released = self.manager.release_lock("proj", "board", 123, force=True)
+
+        self.assertFalse(released)
+        self.assertTrue(state_file.exists(), "YAML lock file should still be present after a failed unlink")
+
+    def test_release_lock_returns_true_and_deletes_file_when_unlink_succeeds(self):
+        """Control case, to prove the fix didn't just make release_lock always
+        return False."""
+        self.manager._create_lock("proj", "board", 123)
+        state_file = self.manager._get_state_file("proj", "board")
+
+        released = self.manager.release_lock("proj", "board", 123, force=True)
+
+        self.assertTrue(released)
+        self.assertFalse(state_file.exists())
+
+
+class TestHumanFeedbackLoopSuppressCancellation(unittest.TestCase):
+    """PipelineRunManager.mark_failed's suppress_cancellation param exists
+    specifically so a caller (services/human_feedback_loop.py's abnormal
+    conversational-loop exit path) can use a descriptive retained_reason
+    without losing the race-avoidance the old "feedback_loop_ended" sentinel
+    string provided — that string match previously governed both the
+    retained_reason text AND whether the cancellation signal fired, so any
+    caller wanting a better reason string silently regressed into firing a
+    cancellation signal that delays re-dispatch by up to an hour."""
+
+    def setUp(self):
+        self.mock_es = MagicMock()
+        self.mock_es.search.return_value = {'hits': {'total': {'value': 0}, 'hits': []}}
+        self.mock_redis = MagicMock()
+        with patch('services.pipeline_run.Elasticsearch', return_value=self.mock_es), \
+             patch('services.pipeline_run.redis.Redis', return_value=self.mock_redis):
+            from services.pipeline_run import PipelineRunManager
+            self.manager = PipelineRunManager()
+        self.manager.es = self.mock_es
+        self.manager.redis = self.mock_redis
+
+        # An active PipelineRun is required to reach the cancellation-signal
+        # code at all (end_pipeline_run returns early with no active run).
+        self.run = self.manager.create_pipeline_run(
+            issue_number=123, issue_title="t", issue_url="u",
+            project="proj", board="board",
+        )
+        self.mock_redis.hget.return_value = self.run.id
+        self.mock_redis.get.side_effect = lambda key: (
+            json.dumps(self.run.to_dict()) if key == self.manager._get_redis_key(self.run.id) else None
+        )
+
+    def test_mark_failed_with_suppress_cancellation_does_not_set_signal(self):
+        mock_cancellation = MagicMock()
+        with patch('services.cancellation.get_cancellation_signal', return_value=mock_cancellation), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=MagicMock()):
+            self.manager.mark_failed(
+                project="proj", board="board", issue_number=123,
+                reason="Conversational feedback loop exited abnormally (exit_reason=crash)",
+                suppress_cancellation=True,
+            )
+
+        mock_cancellation.cancel.assert_not_called()
+
+    def test_mark_failed_without_suppress_cancellation_sets_signal(self):
+        """Control case: a descriptive reason with suppress_cancellation left
+        at its default (False) DOES fire the cancellation signal — proving the
+        suppression above is actually doing something, not just always off."""
+        mock_cancellation = MagicMock()
+        with patch('services.cancellation.get_cancellation_signal', return_value=mock_cancellation), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=MagicMock()):
+            self.manager.mark_failed(
+                project="proj", board="board", issue_number=123,
+                reason="Some other descriptive failure reason",
+            )
+
+        mock_cancellation.cancel.assert_called_once()
+
+
 if __name__ == '__main__':
     unittest.main()

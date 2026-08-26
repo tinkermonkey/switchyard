@@ -945,30 +945,58 @@ class ReviewCycleExecutor:
                             self._remove_cycle_state(self.active_cycles[key])
                             del self.active_cycles[key]
 
-                        # End the pipeline run if it exists
+                        # End the pipeline run and durably mark the lock retained via the
+                        # shared mark_failed() entry point (NOT a bare
+                        # end_pipeline_run(retain_lock=True) with no outcome="failed") —
+                        # this is the third and last sibling of this file's two other
+                        # exception-handling/escalation paths that needed this same
+                        # migration; without outcome="failed" the lock is never durably
+                        # marked retained and would be silently reclaimed as stale.
+                        marked_ok = False
                         if hasattr(existing_cycle, 'pipeline_run_id') and existing_cycle.pipeline_run_id:
                             try:
                                 from services.pipeline_run import get_pipeline_run_manager
                                 pipeline_run_manager = get_pipeline_run_manager()
-                                pipeline_run_manager.end_pipeline_run(
-                                    project_name,
-                                    issue_number,
+                                marked_ok = pipeline_run_manager.mark_failed(
+                                    project=project_name,
+                                    board=board_name,
+                                    issue_number=issue_number,
                                     reason=f"review_cycle_failed: {str(e)[:100]}",
-                                    retain_lock=True,
-                                    outcome="failed"
                                 )
-                                logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
+                                if marked_ok:
+                                    logger.info(f"Ended pipeline run {existing_cycle.pipeline_run_id} due to review cycle failure")
+                                else:
+                                    logger.critical(
+                                        f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                                        f"be durably marked failed after a review cycle error — this "
+                                        f"issue may be silently re-dispatched."
+                                    )
                             except Exception as prm_error:
                                 logger.error(f"Failed to end pipeline run {existing_cycle.pipeline_run_id}: {prm_error}", exc_info=True)
 
-                        # Post error comment (workspace-aware)
+                        # Post error comment (workspace-aware). Wording reflects whether
+                        # the lock was actually marked retained — claiming retention
+                        # unconditionally here would itself be a silent-failure
+                        # regression if marked_ok came back False above.
+                        if marked_ok:
+                            recovery_note = (
+                                f"Please review manually. The pipeline lock is retained — run "
+                                f"`python scripts/release_lock.py --project {project_name} "
+                                f"--board \"{board_name}\" --issue {issue_number}` once ready "
+                                f"to continue."
+                            )
+                        else:
+                            recovery_note = (
+                                f"Please review manually. The pipeline lock could **not** be "
+                                f"durably marked retained — this issue may be silently "
+                                f"re-dispatched. If it is not, run "
+                                f"`python scripts/release_lock.py --project {project_name} "
+                                f"--board \"{board_name}\" --issue {issue_number}` once ready "
+                                f"to continue."
+                            )
                         error_message = (
                             f"⚠️ **Review Cycle Error**\n\nThe automated review cycle "
-                            f"encountered an error:\n```\n{str(e)}\n```\n\nPlease review "
-                            f"manually. The pipeline lock is retained — run "
-                            f"`python scripts/release_lock.py --project {project_name} "
-                            f"--board \"{board_name}\" --issue {issue_number}` once ready "
-                            f"to continue."
+                            f"encountered an error:\n```\n{str(e)}\n```\n\n{recovery_note}"
                         )
 
                         if workspace_type == 'discussions' and discussion_id:

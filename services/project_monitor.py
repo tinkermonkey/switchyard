@@ -5735,15 +5735,37 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # End the pipeline run so it doesn't remain "active" in Redis.
                     # retain_lock=True for cycle limit errors (human must intervene before re-triggering),
                     # retain_lock=False for other errors (allow re-trigger on next poll).
+                    #
+                    # The retain=True branch must go through the shared mark_failed()
+                    # entry point, not a bare end_pipeline_run(retain_lock=True) with no
+                    # outcome="failed" — without outcome="failed", end_pipeline_run()
+                    # never calls mark_lock_failed(), so retained_reason is never set
+                    # and this lock would be silently reclaimed as stale by
+                    # _reconcile_active_runs on its next pass, exactly like the other
+                    # unmigrated failure paths this PR closed elsewhere.
                     from agents.non_retryable import NonRetryableAgentError
                     _retain = isinstance(e, NonRetryableAgentError)
                     try:
-                        self.pipeline_run_manager.end_pipeline_run(
-                            project=project_name,
-                            issue_number=issue_number,
-                            reason=f"PR review stage exception: {type(e).__name__}",
-                            retain_lock=_retain
-                        )
+                        if _retain:
+                            marked_ok = self.pipeline_run_manager.mark_failed(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=issue_number,
+                                reason=f"PR review stage exception: {type(e).__name__}: {str(e)[:200]}",
+                            )
+                            if not marked_ok:
+                                logger.critical(
+                                    f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                                    f"be durably marked failed after a PR review stage error — "
+                                    f"this issue may be silently re-dispatched."
+                                )
+                        else:
+                            self.pipeline_run_manager.end_pipeline_run(
+                                project=project_name,
+                                issue_number=issue_number,
+                                reason=f"PR review stage exception: {type(e).__name__}",
+                                retain_lock=False
+                            )
                     except Exception as end_err:
                         logger.warning(f"Failed to end pipeline run after PR review failure: {end_err}")
 
@@ -5948,69 +5970,48 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
 
-            # Fail-closed read: get_lock() alone would return None indistinguishably
-            # for "genuinely unlocked" and "both Redis and YAML reads failed" — the
-            # latter would fall into the `elif not current_lock:` branch below and
-            # call _create_lock() directly, bypassing the retained_reason check just
-            # below entirely (since there'd be no current_lock object to check). This
-            # was the last remaining fail-open read gating a _create_lock() call.
-            current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
-            if not lock_reads_healthy:
-                logger.error(
-                    f"Could not determine lock state for {project_name}/{board_name} "
-                    f"(both Redis and YAML reads failed) — refusing to start a "
-                    f"repair cycle for issue #{issue_number} rather than risk "
-                    f"creating a lock while a retained one might actually be held"
-                )
-                return None
-
-            if current_lock and current_lock.locked_by_issue != issue_number:
-                # A retained/failed lock must NEVER be stolen — that would silently
-                # erase the durable failure record (retained_reason/retained_at) and
-                # hand the board to an unrelated issue, exactly the "silently
-                # re-dispatched" failure this whole mechanism exists to prevent.
-                # This is a real, deterministic gap found across three PR review
-                # rounds: this "repair cycles have priority, they can steal the
-                # lock" logic predates the durable-retention design and was never
-                # updated for it — a prior comment here claimed the dispatch gate in
-                # trigger_agent_for_status already protected this path, but that
-                # gate only checks retention of the issue BEING dispatched, not
-                # whoever currently holds the lock being stolen from.
-                if current_lock.retained_reason:
+            # Repair cycles have priority over whatever ordinary agent currently
+            # holds this board's lock — but a retained/failed lock must NEVER be
+            # stolen, since that would silently erase the durable failure record
+            # (retained_reason/retained_at) and hand the board to an unrelated
+            # issue, exactly the "silently re-dispatched" failure this whole
+            # mechanism exists to prevent. steal_lock() is the single place that
+            # enforces this (fail-closed lock-state read, retained_reason check,
+            # and the actual release+create) so this call site can no longer
+            # bypass the check the way _create_lock() called directly here once
+            # did — a real, deterministic gap found and fixed across three PR
+            # review rounds before this was centralized.
+            ok, result = lock_manager.steal_lock(project_name, board_name, issue_number)
+            if not ok:
+                if result.startswith("retained:"):
                     logger.error(
                         f"Repair cycle for issue #{issue_number} cannot steal the "
-                        f"pipeline lock — it is retained due to a failed run on "
-                        f"issue #{current_lock.locked_by_issue} "
-                        f"({current_lock.retained_reason}). A human must run "
+                        f"pipeline lock — it is retained due to a failed run "
+                        f"({result.split(':', 1)[1]}). A human must run "
                         f"scripts/release_lock.py before this board can be used "
                         f"by any other issue."
                     )
-                    return None
-
-                # Lock held by another issue (non-repair-cycle) - steal it
-                logger.warning(
-                    f"Repair cycle for issue #{issue_number} is stealing pipeline lock from issue #{current_lock.locked_by_issue} "
-                    f"(repair cycles have priority over {status})"
-                )
-                # Release the old lock — force=True is safe here: we already
-                # confirmed above it isn't retained, so this is releasing an
-                # ordinary, actively-held lock, not bypassing the recovery flow.
-                released = lock_manager.release_lock(
-                    project_name, board_name, current_lock.locked_by_issue, force=True
-                )
-                if not released:
+                elif result == "lock_state_unknown":
                     logger.error(
-                        f"Repair cycle for issue #{issue_number} could not release "
-                        f"the pipeline lock held by issue #{current_lock.locked_by_issue} "
-                        f"— refusing to steal it via a fresh lock creation."
+                        f"Could not determine lock state for {project_name}/{board_name} "
+                        f"(both Redis and YAML reads failed) — refusing to start a "
+                        f"repair cycle for issue #{issue_number} rather than risk "
+                        f"creating a lock while a retained one might actually be held"
                     )
-                    return None
-                # Acquire for this issue
-                lock_manager._create_lock(project_name, board_name, issue_number)
-            elif not current_lock:
-                # No lock exists, acquire it
-                logger.info(f"Repair cycle for issue #{issue_number} acquiring pipeline lock")
-                lock_manager._create_lock(project_name, board_name, issue_number)
+                else:
+                    logger.error(
+                        f"Repair cycle for issue #{issue_number} could not acquire "
+                        f"the pipeline lock for {project_name}/{board_name} "
+                        f"(steal_lock result: {result})"
+                    )
+                return None
+            elif result == "stolen":
+                logger.warning(
+                    f"Repair cycle for issue #{issue_number} stole pipeline lock "
+                    f"from its prior holder (repair cycles have priority over {status})"
+                )
+            elif result == "acquired":
+                logger.info(f"Repair cycle for issue #{issue_number} acquired pipeline lock")
             else:
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
