@@ -826,6 +826,59 @@ class PipelineRunManager:
         )
         return True
 
+    def mark_failed(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        reason: str,
+    ) -> None:
+        """
+        The single shared entry point for every pipeline-failure path: ends any
+        active PipelineRun for this issue with outcome="failed" (for rich ES/
+        dashboard history within its retention window), and unconditionally,
+        durably marks the pipeline lock as retained-due-to-failure regardless of
+        whether a PipelineRun happened to exist for this attempt.
+
+        The lock mark is the part that actually blocks re-dispatch (see
+        PipelineLockManager.mark_lock_failed/get_retained_reason) — it does NOT
+        depend on the PipelineRun call succeeding, because some failure paths (e.g.
+        repeated dispatch failures before an agent ever successfully launched) can
+        legitimately have no PipelineRun to end yet, and the caller is always
+        guaranteed to already hold the lock at the point this is called.
+
+        This replaces the old services.work_execution_state halt-marker mechanism
+        (set_halt_marker/get_halt_marker/clear_halt_marker), which stored its flag
+        in a per-issue YAML file with no relationship to the lock, no visibility,
+        and no expiry-safe reconciliation.
+        """
+        try:
+            self.end_pipeline_run(
+                project=project,
+                issue_number=issue_number,
+                reason=reason,
+                retain_lock=True,
+                outcome="failed",
+            )
+        except Exception as e:
+            logger.error(
+                f"mark_failed: end_pipeline_run raised for {project} issue "
+                f"#{issue_number}: {e}"
+            )
+
+        # Unconditional fallback/guarantee: end_pipeline_run() above only touches the
+        # lock if it found an active PipelineRun. Always mark it directly too so a
+        # pre-dispatch failure (no PipelineRun ever created for this attempt) is
+        # covered just as reliably as a mid-execution crash.
+        try:
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            get_pipeline_lock_manager().mark_lock_failed(project, board, issue_number, reason)
+        except Exception as e:
+            logger.error(
+                f"mark_failed: could not durably mark lock for {project} issue "
+                f"#{issue_number}: {e}"
+            )
+
     def end_pipeline_run(
         self,
         project: str,
@@ -858,9 +911,12 @@ class PipelineRunManager:
             )
             return False
         
-        # Mark as completed
+        # Mark as completed (or "failed" — a distinct terminal status, not just an
+        # outcome flag on an otherwise-indistinguishable "completed" record, so
+        # visibility surfaces like /active-pipeline-runs can find failed runs by
+        # status instead of missing them entirely — see observability_server.py)
         pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
-        pipeline_run.status = "completed"
+        pipeline_run.status = "failed" if outcome == "failed" else "completed"
         pipeline_run.outcome = outcome
 
         # Set cancellation signal so in-flight repair cycles stop.
@@ -936,6 +992,24 @@ class PipelineRunManager:
                     f"Retaining pipeline lock for {project} issue #{issue_number} — "
                     f"run ended with outcome=failed. Manual intervention required to release."
                 )
+                # Durably mark the lock itself (Redis + non-expiring YAML) as retained
+                # due to failure. This is the enforcement signal every dispatch gate
+                # consults — see PipelineLockManager.mark_lock_failed/get_retained_reason.
+                # Deliberately NOT gated on `should_retain` alone (retain_lock=True
+                # without outcome="failed" is used for other intentional-retain cases
+                # that should NOT permanently block re-dispatch), only on genuine
+                # failure.
+                try:
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    get_pipeline_lock_manager().mark_lock_failed(
+                        project, pipeline_run.board, issue_number,
+                        reason=reason or "Pipeline run failed",
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to durably mark lock as failed for {project} issue "
+                        f"#{issue_number}: {e}"
+                    )
             else:
                 logger.info(
                     f"Retaining pipeline lock for {project} issue #{issue_number} after ending run "

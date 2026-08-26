@@ -1123,7 +1123,19 @@ def _get_repo_url(project_name: str) -> Optional[str]:
 
 @app.route('/active-pipeline-runs')
 def get_active_pipeline_runs():
-    """Get all currently active pipeline runs with lock status"""
+    """
+    Get all currently active AND failed pipeline runs, with lock status.
+
+    Active/feedback_listening runs come from Elasticsearch as before. Failed runs
+    are sourced primarily from the pipeline locks themselves (PipelineLock.
+    retained_reason) rather than from ES status="failed" records, because ES
+    pipeline-run records roll off after 7 days (ILM policy) and the Redis cache
+    after a few hours — the lock (Redis + non-expiring YAML) is the only durable
+    signal, per the halt-marker replacement design. The ES record is used only to
+    enrich a failed entry with richer detail (title, reason history) when it's
+    still within its retention window; a failed lock with no corresponding ES
+    record any more still shows up, just with less detail.
+    """
     try:
         # Query Elasticsearch for active pipeline runs (includes feedback_listening)
         query = {
@@ -1146,6 +1158,7 @@ def get_active_pipeline_runs():
         lock_manager = get_pipeline_lock_manager()
 
         runs = []
+        seen_project_issue = set()
         for hit in result['hits']['hits']:
             run_data = hit['_source']
 
@@ -1166,6 +1179,8 @@ def get_active_pipeline_runs():
                 # Add additional context based on lock status
                 if lock_status == 'waiting_for_lock' and lock_holder:
                     run_data['blocked_by_issue'] = lock_holder
+
+                seen_project_issue.add((project, issue_number))
             else:
                 # Missing data - mark as unknown
                 run_data['lock_status'] = 'unknown'
@@ -1178,6 +1193,54 @@ def get_active_pipeline_runs():
             if not run_data.get('issue_url') and repo_url and run_data.get('issue_number'):
                 run_data['issue_url'] = f"{repo_url}/issues/{run_data['issue_number']}"
             runs.append(run_data)
+
+        # Add failed runs, sourced from durable locks (see docstring above)
+        try:
+            for lock in lock_manager.get_all_locks():
+                if not lock.retained_reason:
+                    continue
+                project, issue_number = lock.project, lock.locked_by_issue
+                if (project, issue_number) in seen_project_issue:
+                    continue  # shouldn't happen (failed locks aren't active) but stay safe
+
+                run_data = {
+                    'project': project,
+                    'board': lock.board,
+                    'issue_number': issue_number,
+                    'status': 'failed',
+                    'outcome': 'failed',
+                    'started_at': None,
+                    'ended_at': lock.retained_at,
+                    'reason': lock.retained_reason,
+                    'lock_status': 'holding_lock',
+                    'lock_holder_issue': issue_number,
+                }
+
+                # Best-effort enrichment from the (possibly expired) ES/Redis record
+                try:
+                    from services.pipeline_run import PipelineRunManager
+                    pipeline_run_manager = PipelineRunManager()
+                    recent_id = pipeline_run_manager.get_recent_pipeline_run_id(project, issue_number)
+                    if recent_id:
+                        recent_run = pipeline_run_manager.get_pipeline_run_by_id(recent_id)
+                        if recent_run:
+                            run_data['id'] = recent_run.id
+                            run_data['issue_title'] = recent_run.issue_title
+                            run_data['issue_url'] = recent_run.issue_url
+                            run_data['started_at'] = recent_run.started_at
+                except Exception as enrich_err:
+                    logger.debug(f"Could not enrich failed run for {project}#{issue_number}: {enrich_err}")
+
+                run_data['board_url'] = _get_board_url(project, lock.board)
+                repo_url = _get_repo_url(project)
+                run_data['repo_url'] = repo_url
+                if not run_data.get('issue_url') and repo_url:
+                    run_data['issue_url'] = f"{repo_url}/issues/{issue_number}"
+                run_data.setdefault('issue_title', f"Issue #{issue_number}")
+
+                runs.append(run_data)
+        except Exception as lock_scan_err:
+            logger.error(f"Error scanning locks for failed pipeline runs: {lock_scan_err}")
 
         return jsonify({
             'success': True,

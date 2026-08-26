@@ -97,7 +97,11 @@ function DashboardView() {
             }}
           >
             {displayedRuns.map(run => (
-              <DashboardRunGraph key={run.id} run={run} />
+              // Failed runs (sourced from durable locks, not ES) may not have an
+              // `id` — their PipelineRun history can have rolled off Elasticsearch's
+              // 7-day retention while the lock itself is still retained. Fall back
+              // to a stable project/issue key in that case.
+              <DashboardRunGraph key={run.id || `${run.project}:${run.issue_number}`} run={run} />
             ))}
             {overflowCount > 0 && (
               <Link

@@ -1901,18 +1901,24 @@ class ProjectMonitor:
                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
 
                 # Single gate covering BOTH the fresh-lock-acquisition branch below and
-                # the already-holds-lock branch further down: if auto-dispatch was halted
-                # (by the consecutive-failure guard in the already-holds-lock branch, or by
-                # a crashed review-cycle thread in run_cycle_in_thread), skip entirely
-                # regardless of which branch would otherwise run. Placed here, before the
-                # branch point, rather than inside each branch, so releasing the lock can
-                # never let the OTHER branch redispatch unguarded on the next poll.
-                halt_marker = work_execution_tracker.get_halt_marker(project_name, issue_number)
-                if halt_marker:
+                # the already-holds-lock branch further down: if this issue's pipeline
+                # run previously failed (consecutive dispatch failures in the
+                # already-holds-lock branch, or a crashed review-cycle thread in
+                # run_cycle_in_thread), skip entirely regardless of which branch would
+                # otherwise run. Placed here, before the branch point, rather than inside
+                # each branch, so releasing the lock can never let the OTHER branch
+                # redispatch unguarded on the next poll.
+                #
+                # This checks the pipeline lock's retained_reason directly (durable —
+                # Redis + non-expiring YAML) rather than a separate halt-marker flag, so
+                # it can never go stale/invisible the way the old mechanism did. See
+                # PipelineLockManager.mark_lock_failed/get_retained_reason.
+                retained_reason = lock_manager.get_retained_reason(project_name, board_name, issue_number)
+                if retained_reason:
                     logger.info(
-                        f"Issue #{issue_number} auto-dispatch halted since {halt_marker['halted_at']} "
-                        f"({halt_marker['reason']}); skipping until explicitly cleared via "
-                        f"scripts/clear_halt_marker.py"
+                        f"Issue #{issue_number} pipeline run failed and the lock is "
+                        f"retained ({retained_reason}); skipping until a human runs "
+                        f"scripts/release_lock.py"
                     )
                     return None
 
@@ -2043,31 +2049,32 @@ class ProjectMonitor:
                                 agent=current_column_agent,
                             )
                             if consecutive_failures >= MAX_CONSECUTIVE_DISPATCH_FAILURES:
+                                fail_reason = (
+                                    f"{consecutive_failures} consecutive dispatch failures "
+                                    f"for {current_column_agent} in '{status}'"
+                                )
                                 logger.error(
                                     f"Issue #{issue_number} failed {consecutive_failures} consecutive "
-                                    f"dispatches for {current_column_agent} in '{status}' — halting "
-                                    f"auto-redispatch pending explicit human review."
+                                    f"dispatches for {current_column_agent} in '{status}' — marking "
+                                    f"the pipeline run failed pending explicit human review."
                                 )
-                                work_execution_tracker.set_halt_marker(
-                                    project_name=project_name,
-                                    issue_number=issue_number,
-                                    column=status,
-                                    agent=current_column_agent,
-                                    reason=f"{consecutive_failures} consecutive dispatch failures",
-                                    consecutive_failures=consecutive_failures,
+                                # NOT a plain release — the lock stays held, durably marked
+                                # as retained-due-to-failure, so siblings on this board stay
+                                # blocked too until a human resolves it. See
+                                # PipelineRunManager.mark_failed (the single shared failure
+                                # path, also used by review-cycle crashes and repair-cycle
+                                # failures).
+                                self.pipeline_run_manager.mark_failed(
+                                    project=project_name, board=board_name,
+                                    issue_number=issue_number, reason=fail_reason,
                                 )
-                                # Plain release, NOT _release_pipeline_lock_and_process_next()
-                                # (which also purges the queue entry — wrong here, this issue
-                                # hasn't exited the workflow).
-                                lock_manager.release_lock(project_name, board_name, issue_number)
                                 # MUST reset queue status back to 'waiting' or
                                 # get_next_waiting_issue() will never select this issue again
-                                # even after the halt is cleared (it filters strictly on
+                                # even after the lock is released (it filters strictly on
                                 # status=='waiting'; nothing else resets active->waiting).
                                 pipeline_queue.reset_issue_to_waiting(issue_number)
-                                self._post_halt_comment(
-                                    project_name, repository, issue_number,
-                                    current_column_agent, status, consecutive_failures
+                                self._post_pipeline_failure_comment(
+                                    project_name, repository, issue_number, fail_reason
                                 )
                                 return None
                             else:
@@ -2981,33 +2988,63 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return None
 
-    def _post_halt_comment(
+    def _post_pipeline_failure_comment(
         self,
         project_name: str,
         repository: str,
         issue_number: int,
-        agent: str,
-        status: str,
-        consecutive_failures: int
+        reason: str,
     ):
-        """Post a GitHub comment explaining an auto-dispatch halt (best-effort)."""
+        """
+        Post a GitHub comment explaining a pipeline-run failure (best-effort).
+
+        This is a secondary channel — /active-pipeline-runs and
+        scripts/list_failed_pipeline_runs.py are the primary, durable ways to
+        discover a failed run — so a post failure here is not silently swallowed
+        the way the old halt-marker notifier's was: it retries once and logs at
+        ERROR (not warning) on final failure, so it's at least greppable.
+        """
+        import asyncio
+        from services.github_integration import GitHubIntegration
+
         try:
-            import asyncio
-            from services.github_integration import GitHubIntegration
             project_config = self.config_manager.get_project_config(project_name)
             github = GitHubIntegration(
                 repo_owner=project_config.github['org'], repo_name=repository
             )
-            comment = (
-                f"## ⚠️ Auto-Dispatch Halted\n\n"
-                f"Agent `{agent}` failed {consecutive_failures} consecutive dispatches "
-                f"in status '{status}' and auto-redispatch has been halted.\n\n"
-                f"Run `scripts/clear_halt_marker.py --project {project_name} "
-                f"--issue {issue_number}` to clear the halt and retry."
+        except Exception as setup_err:
+            logger.error(
+                f"Failed to set up GitHub client to post failure comment for "
+                f"{project_name}#{issue_number}: {setup_err}"
             )
-            asyncio.run(github.post_comment(issue_number, comment))
-        except Exception as comment_err:
-            logger.warning(f"Failed to post halt comment for issue #{issue_number}: {comment_err}")
+            return
+
+        comment = (
+            f"## ⚠️ Pipeline Run Failed\n\n"
+            f"Auto-dispatch has been halted for this issue:\n\n```\n{reason}\n```\n\n"
+            f"The pipeline lock is retained — no other issue on this board will be "
+            f"dispatched until this is resolved.\n\n"
+            f"**Next steps:** fix the underlying issue, then run "
+            f"`python scripts/release_lock.py --project {project_name} "
+            f"--board <board_name> --issue {issue_number}` to release the lock and "
+            f"allow a fresh attempt."
+        )
+
+        for attempt in range(2):
+            try:
+                asyncio.run(github.post_comment(issue_number, comment))
+                return
+            except Exception as comment_err:
+                if attempt == 0:
+                    logger.warning(
+                        f"Failed to post failure comment for issue #{issue_number} "
+                        f"(retrying once): {comment_err}"
+                    )
+                    continue
+                logger.error(
+                    f"Failed to post failure comment for issue #{issue_number} after "
+                    f"retry: {comment_err}"
+                )
 
     def _release_pipeline_lock_and_process_next(
         self,
@@ -4706,44 +4743,36 @@ _Review cycle initiated by Switchyard_
                                 import traceback
                                 logger.error(traceback.format_exc())
                         elif exception_occurred:
-                            # Crashed mid-pipeline (not at an exit column). Plain release,
-                            # NOT the "process next queued issue" block above (which also
-                            # purges/reassigns queue state — wrong here since review-type
-                            # columns like "Code Review" are neither trigger nor exit columns,
-                            # so nothing would automatically re-add this issue to the queue).
-                            from services.work_execution_state import work_execution_tracker
-                            lock_mgr.release_lock(project_name, board_name, issue_number)
+                            # Crashed mid-pipeline (not at an exit column). NOT the "process
+                            # next queued issue" block above (which also purges/reassigns
+                            # queue state — wrong here since review-type columns like
+                            # "Code Review" are neither trigger nor exit columns, so nothing
+                            # would automatically re-add this issue to the queue), and NOT a
+                            # plain release either: the lock stays held, durably marked as
+                            # retained-due-to-failure (mark_failed — the same single shared
+                            # failure path used by consecutive-dispatch-failure and
+                            # repair-cycle failures), so siblings on this board stay blocked
+                            # until a human resolves it.
+                            fail_reason = f"Review cycle thread crashed: {error_summary}"
+                            self.pipeline_run_manager.mark_failed(
+                                project=project_name, board=board_name,
+                                issue_number=issue_number, reason=fail_reason,
+                            )
                             # MUST reset queue status back to 'waiting' or get_next_waiting_issue()
-                            # will never select this issue again even after the halt is cleared
+                            # will never select this issue again even after the lock is released
                             # (it filters strictly on status=='waiting'; nothing else resets
                             # active->waiting automatically).
                             from services.pipeline_queue_manager import get_pipeline_queue_manager
                             queue_mgr = get_pipeline_queue_manager(project_name, board_name)
                             queue_mgr.reset_issue_to_waiting(issue_number)
-                            work_execution_tracker.set_halt_marker(
-                                project_name=project_name,
-                                issue_number=issue_number,
-                                column=status,
-                                agent="review_cycle",  # generic — crash could be reviewer or maker agent, ambiguous which
-                                reason=f"Review cycle thread crashed: {error_summary}",
-                            )
                             logger.error(
-                                f"Released pipeline lock for issue #{issue_number} after review "
-                                f"cycle crash (was mid-pipeline in '{status}') and halted "
-                                f"auto-redispatch pending explicit human review."
+                                f"Pipeline lock retained for issue #{issue_number} after review "
+                                f"cycle crash (was mid-pipeline in '{status}') — marked failed "
+                                f"pending explicit human review."
                             )
-                            try:
-                                if 'github' in locals() and 'loop' in locals() and loop is not None:
-                                    loop.run_until_complete(github.post_comment(
-                                        issue_number,
-                                        f"## ⚠️ Review Cycle Halted\n\nThe automated review cycle "
-                                        f"crashed and auto-redispatch has been halted:\n\n```\n"
-                                        f"{error_summary}\n```\n\nRun `scripts/clear_halt_marker.py "
-                                        f"--project {project_name} --issue {issue_number}` to clear "
-                                        f"the halt and retry.",
-                                    ))
-                            except Exception as comment_err:
-                                logger.warning(f"Failed to post halt comment: {comment_err}")
+                            self._post_pipeline_failure_comment(
+                                project_name, repository, issue_number, fail_reason
+                            )
                         else:
                             logger.debug(
                                 f"Keeping pipeline lock for issue #{issue_number} "
@@ -5256,18 +5285,32 @@ The automated test-fix-validate cycle has failed and requires manual interventio
 
                     # End pipeline run if genuinely failed (success and frozen cases are
                     # handled elsewhere). Only end if not already ended (e.g., in timeout
-                    # handler). Pass retain_lock=True so the pipeline lock is NOT released —
-                    # the issue stays blocked in Testing until a human moves it manually.
+                    # handler). Pass retain_lock=True and outcome="failed" so the pipeline
+                    # lock is NOT released and is durably marked retained-due-to-failure
+                    # (see PipelineRunManager.end_pipeline_run) — the issue stays blocked
+                    # in Testing until a human runs scripts/release_lock.py.
                     if not overall_success and not is_frozen and not pipeline_run_ended:
                         try:
                             ended = self.pipeline_run_manager.end_pipeline_run(
                                 project=project_name,
                                 issue_number=issue_number,
                                 reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
-                                retain_lock=True
+                                retain_lock=True,
+                                outcome="failed",
                             )
                             if ended:
                                 logger.info(f"Ended pipeline run for {project_name}/#{issue_number} due to failure (lock retained)")
+                            else:
+                                # No active PipelineRun was found to end (e.g. it was
+                                # already cleaned up elsewhere) — the lock is still held
+                                # by this issue at this point in the finally block, so
+                                # mark it directly to guarantee the durable failure
+                                # signal is set regardless.
+                                from services.pipeline_lock_manager import get_pipeline_lock_manager
+                                get_pipeline_lock_manager().mark_lock_failed(
+                                    project_name, board_name, issue_number,
+                                    reason=f"Repair cycle failed: {error_message or 'Unknown error'}",
+                                )
                         except Exception as e:
                             logger.error(f"Failed to end pipeline run in finally block: {e}")
 
@@ -5312,25 +5355,16 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                         # Retain pipeline lock — the issue stays in Testing pending manual intervention.
                         # Holding the lock prevents other issues from being dispatched until a human
                         # moves this issue out of Testing. The rescan skips issues that hold their own
-                        # lock, so this issue will not re-trigger automatically.
+                        # lock, so this issue will not re-trigger automatically. The lock
+                        # was already durably marked retained-due-to-failure above (via
+                        # end_pipeline_run's outcome="failed" path or the direct
+                        # mark_lock_failed fallback) — no TTL, no separate Redis marker
+                        # needed: _reconcile_active_runs and _rescan_boards_for_stalled_items
+                        # both check PipelineLock.retained_reason directly.
                         logger.info(
                             f"Retaining pipeline lock for {project_name}/{board_name} "
                             f"(repair cycle for issue #{issue_number} failed — awaiting manual intervention)"
                         )
-
-                        # Set a Redis marker so the stale-lock watchdog in _reconcile_active_runs
-                        # knows this lock is intentionally held, not leaked. The marker is cleared
-                        # automatically when the next repair cycle starts for this issue.
-                        try:
-                            if self.task_queue.redis_client:
-                                repair_failed_key = (
-                                    f"pipeline_lock:repair_failed:"
-                                    f"{project_name}:{board_name}:{issue_number}"
-                                )
-                                # 48h TTL as a safety net; cleared on next repair cycle start
-                                self.task_queue.redis_client.set(repair_failed_key, "1", ex=172800)
-                        except Exception as redis_err:
-                            logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
 
                         # Emit decision event so lock-retention is visible in observability
                         try:
@@ -5834,17 +5868,13 @@ The automated test-fix-validate cycle has failed and requires manual interventio
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
 
-            # Clear any repair-failed marker so the stale-lock watchdog doesn't
-            # skip this issue if the orchestrator restarts mid-cycle.
-            try:
-                if self.task_queue.redis_client:
-                    repair_failed_key = (
-                        f"pipeline_lock:repair_failed:"
-                        f"{project_name}:{board_name}:{issue_number}"
-                    )
-                    self.task_queue.redis_client.delete(repair_failed_key)
-            except Exception as redis_err:
-                logger.warning(f"Failed to clear repair_failed marker in Redis: {redis_err}")
+            # NOTE: no separate "repair-failed marker" to clear here any more — the
+            # durable failure signal lives directly on the PipelineLock
+            # (retained_reason), and a lock only reaches this point either newly
+            # created (retained_reason=None by construction) or carried over from a
+            # non-failed stage handoff. A genuinely failed-and-retained lock is
+            # blocked before ever reaching this function — see the retained_reason
+            # gate in trigger_agent_for_status and _rescan_boards_for_stalled_items.
 
             logger.info(
                 f"Starting repair cycle for issue #{issue_number} in Docker container "
@@ -6203,26 +6233,20 @@ _Repair cycle initiated by Switchyard_
                         )
                         
                         if not pipeline_run:
-                            # Check if this lock is intentionally retained after a repair cycle failure.
-                            # In that case it is NOT stale — the issue needs manual intervention.
-                            repair_failed_key = (
-                                f"pipeline_lock:repair_failed:"
-                                f"{project_name}:{pipeline.board_name}:{lock.locked_by_issue}"
-                            )
-                            is_intentional = False
-                            try:
-                                if self.task_queue.redis_client:
-                                    is_intentional = bool(
-                                        self.task_queue.redis_client.exists(repair_failed_key)
-                                    )
-                            except Exception:
-                                pass
+                            # Check if this lock is intentionally retained after a pipeline
+                            # run failure (any stage — repair cycle, review cycle, or
+                            # consecutive dispatch failures, they all go through the same
+                            # PipelineLockManager.mark_lock_failed). In that case it is NOT
+                            # stale — the issue needs manual intervention. This is a direct
+                            # field read off the lock object already fetched above (durable:
+                            # Redis + non-expiring YAML), not an ephemeral TTL'd Redis marker.
+                            is_intentional = bool(lock.retained_reason)
 
                             if is_intentional:
                                 logger.info(
                                     f"Lock on {project_name}/{pipeline.board_name} held by "
                                     f"issue #{lock.locked_by_issue} is intentionally retained "
-                                    f"after repair cycle failure — skipping stale lock release"
+                                    f"({lock.retained_reason}) — skipping stale lock release"
                                 )
                             else:
                                 # Stale lock! No active run, no repair-failed marker
@@ -6469,13 +6493,29 @@ _Repair cycle initiated by Switchyard_
                         # the review cycle) and no container is running.
                         if current_lock and current_lock.lock_status == 'locked':
                             if current_lock.locked_by_issue == item.issue_number:
+                                # A lock durably marked retained-due-to-failure must NEVER be
+                                # treated as an in-progress handoff, regardless of stage type —
+                                # this is the fix for the bug where a restart would
+                                # auto-relaunch a repair cycle that had genuinely failed and
+                                # was left "for manual intervention" (the old is_repair_cycle
+                                # fallthrough below couldn't distinguish the two cases). Checked
+                                # before is_repair_cycle so it applies uniformly to every stage.
+                                if current_lock.retained_reason:
+                                    logger.info(
+                                        f"Issue #{item.issue_number} holds pipeline lock but it "
+                                        f"is retained due to a failed run "
+                                        f"({current_lock.retained_reason}) — skipping until a "
+                                        f"human runs scripts/release_lock.py"
+                                    )
+                                    continue
                                 if not is_repair_cycle:
                                     logger.debug(
                                         f"Issue #{item.issue_number} holds pipeline lock, likely being re-triggered by recovery, skipping"
                                     )
                                     continue
-                                # repair_cycle: same issue holds lock — this is expected and correct,
-                                # fall through so the repair cycle can be launched
+                                # repair_cycle: same issue holds lock and it is NOT retained due
+                                # to failure — this is expected and correct (handoff from the
+                                # review cycle), fall through so the repair cycle can be launched
                                 logger.debug(
                                     f"Issue #{item.issue_number} holds pipeline lock for repair_cycle stage — proceeding"
                                 )

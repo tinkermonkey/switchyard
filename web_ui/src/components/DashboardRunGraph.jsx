@@ -321,6 +321,7 @@ export default function DashboardRunGraph({ run }) {
   // (or the run drops out of the active list) and the pulse clears on the next poll.
   const isAwaitingFeedback = run.status === 'feedback_listening'
   const isRunning = run.status === 'active'
+  const isFailed = run.status === 'failed'
 
   // Most recent event carrying an `agent` field (agent_initialized/completed/failed), read
   // from the same event stream driving the graph — works for both the "running" and
@@ -336,7 +337,11 @@ export default function DashboardRunGraph({ run }) {
 
   return (
     <div
-      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[500px] md:min-h-0"
+      className={`bg-gh-canvas-subtle border rounded-md overflow-hidden transition-colors flex flex-col min-h-[500px] md:min-h-0 ${
+        isFailed
+          ? 'border-red-500 ring-2 ring-red-500/60 animate-pulse'
+          : 'border-gh-border hover:border-gh-accent-primary'
+      }`}
     >
       {/* Compact header */}
       <div className="border-b border-gh-border min-w-0 flex-shrink-0">
@@ -371,7 +376,7 @@ export default function DashboardRunGraph({ run }) {
             className="text-xs text-gh-fg-muted flex-shrink-0"
           />
         </div>
-        {(isRunning || isAwaitingFeedback) && (
+        {(isRunning || isAwaitingFeedback || isFailed) && (
           <div className="flex items-center gap-1.5 px-3 pb-2 min-w-0 text-xs">
             <span className="relative flex h-2 w-2 flex-shrink-0">
               {isAwaitingFeedback && (
@@ -382,16 +387,21 @@ export default function DashboardRunGraph({ run }) {
               )}
               <span
                 className="relative inline-flex rounded-full h-2 w-2"
-                style={{ backgroundColor: isAwaitingFeedback ? '#f0883e' : '#3fb950' }}
+                style={{ backgroundColor: isFailed ? '#f85149' : isAwaitingFeedback ? '#f0883e' : '#3fb950' }}
               />
             </span>
             <span
               className="font-medium truncate"
-              style={{ color: isAwaitingFeedback ? '#f0883e' : undefined }}
+              style={{ color: isFailed ? '#f85149' : isAwaitingFeedback ? '#f0883e' : undefined }}
             >
-              {isAwaitingFeedback ? 'Awaiting Feedback' : 'Running'}
+              {isFailed ? 'Failed' : isAwaitingFeedback ? 'Awaiting Feedback' : 'Running'}
               {currentAgentName ? `: ${currentAgentName}` : ''}
             </span>
+          </div>
+        )}
+        {isFailed && run.reason && (
+          <div className="px-3 pb-2 min-w-0 text-xs text-gh-fg-muted truncate" title={run.reason}>
+            {run.reason}
           </div>
         )}
       </div>
