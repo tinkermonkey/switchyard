@@ -405,24 +405,47 @@ class PipelineProgression:
             pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
             pipeline_run_manager = get_pipeline_run_manager()
 
-            # Release lock. Does NOT force — if this issue's lock is actually
-            # retained due to a failed run (which shouldn't normally happen for
-            # an issue that legitimately reached an exit column, but defense in
-            # depth matters here since this ends the run as a SUCCESS and
-            # dispatches the next queued issue), the release is correctly
-            # refused rather than silently discarding the durable failure
-            # record and proceeding as if everything succeeded.
-            released = lock_manager.release_lock(project_name, board_name, issue_number)
-            if not released:
-                logger.error(
-                    f"Could not release pipeline lock for {project_name}/{board_name} "
-                    f"(issue #{issue_number} reached '{exit_column}') — it is likely "
-                    f"retained due to a failed run. NOT ending the pipeline run as "
-                    f"successful or dispatching the next queued issue while this is "
-                    f"unresolved. Use scripts/release_lock.py to investigate."
+            # release_lock() returns False both when this issue's lock is
+            # genuinely retained due to a failed run AND when this issue simply
+            # doesn't hold the lock at all (held_by_other) — the latter is the
+            # NORMAL case for e.g. conversational issues, which never acquire
+            # the lock in the first place (see the identical
+            # lock_held_by_us gate in project_monitor.py's sibling,
+            # _check_pr_ready_on_issue_exit). Without checking which case this
+            # is first, that normal path was being misdiagnosed as "likely
+            # retained" and permanently stalling the board: queue cleanup and
+            # next-issue dispatch never ran, and the run stayed "active"
+            # forever.
+            lock = lock_manager.get_lock(project_name, board_name)
+            lock_held_by_us = bool(lock and lock.locked_by_issue == issue_number)
+
+            if lock and not lock_held_by_us:
+                logger.info(
+                    f"Issue #{issue_number} reached exit column '{exit_column}' without "
+                    f"holding the pipeline lock for {project_name}/{board_name} "
+                    f"(held by #{lock.locked_by_issue}) — skipping release, continuing "
+                    f"with queue cleanup and next-issue dispatch"
                 )
-                return
-            logger.info(f"Released pipeline lock for {project_name}/{board_name} (issue #{issue_number} reached '{exit_column}')")
+            elif lock_held_by_us:
+                # Does NOT force — if this issue's lock is actually retained due
+                # to a failed run (which shouldn't normally happen for an issue
+                # that legitimately reached an exit column, but defense in depth
+                # matters here since this ends the run as a SUCCESS and
+                # dispatches the next queued issue), the release is correctly
+                # refused rather than silently discarding the durable failure
+                # record and proceeding as if everything succeeded.
+                released = lock_manager.release_lock(project_name, board_name, issue_number)
+                if not released:
+                    logger.error(
+                        f"Could not release pipeline lock for {project_name}/{board_name} "
+                        f"(issue #{issue_number} reached '{exit_column}') — it is held by "
+                        f"this issue but likely retained due to a failed run. NOT ending "
+                        f"the pipeline run as successful or dispatching the next queued "
+                        f"issue while this is unresolved. Use scripts/release_lock.py to "
+                        f"investigate."
+                    )
+                    return
+                logger.info(f"Released pipeline lock for {project_name}/{board_name} (issue #{issue_number} reached '{exit_column}')")
 
             # Remove from queue
             if pipeline_queue.is_issue_in_queue(issue_number):
@@ -469,8 +492,21 @@ class PipelineProgression:
                         # Fetch issue details
                         issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
 
-                        # Get or create pipeline run for next issue
-                        from services.pipeline_run import get_pipeline_run_manager
+                        # Get or create pipeline run for next issue.
+                        # get_pipeline_run_manager is already imported at module
+                        # level above — a redundant local import here previously
+                        # shadowed it for this ENTIRE function (Python's scoping
+                        # rules make a name local to the whole function body the
+                        # moment it's assigned/imported anywhere inside it, even
+                        # conditionally), which made the earlier
+                        # `pipeline_run_manager = get_pipeline_run_manager()`
+                        # call at the top of this method raise UnboundLocalError
+                        # every single time — silently swallowed by this
+                        # method's own outer except, so lock release, queue
+                        # cleanup, and next-issue dispatch never actually ran
+                        # via this path. Pre-existing (2026-01-14, unrelated to
+                        # this PR), found while adding regression coverage for
+                        # a different fix to this same method.
                         pipeline_run_manager = get_pipeline_run_manager()
                         pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
                             project=project_name,

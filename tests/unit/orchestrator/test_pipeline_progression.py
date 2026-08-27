@@ -429,3 +429,129 @@ class TestFullPipelineTraversal:
             assert success_calls[2][1]['from_status'] == 'Design'
             assert success_calls[2][1]['to_status'] == 'Design Review'
 
+
+
+class TestReleaseLockAndProcessNext:
+    """_release_lock_and_process_next's lock-release gate. release_lock()
+    returns False both when this issue's lock is genuinely retained due to a
+    failed run AND when this issue simply doesn't hold the lock at all
+    (held_by_other — the normal case for e.g. conversational issues, which
+    never acquire the lock in the first place; see the identical
+    lock_held_by_us gate in project_monitor.py's sibling,
+    _check_pr_ready_on_issue_exit). Before this fix, that distinction wasn't
+    made: a normal held_by_other exit was misdiagnosed as "likely retained"
+    and returned early, permanently stalling the board — queue cleanup and
+    next-issue dispatch never ran, and the run stayed "active" forever."""
+
+    def test_skips_release_and_still_processes_queue_when_not_held_by_us(self):
+        other_lock = Mock()
+        other_lock.locked_by_issue = 999
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = other_lock
+
+        mock_queue = Mock()
+        mock_queue.is_issue_in_queue.return_value = True
+        mock_queue.get_next_waiting_issue.return_value = None  # nothing else queued
+
+        mock_run_manager = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('monitoring.observability.get_observability_manager'):
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(None)
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        # Never attempted to release a lock this issue doesn't hold.
+        mock_lock_manager.release_lock.assert_not_called()
+        # But cleanup and success-completion still proceeded, rather than
+        # stalling as if the lock were retained.
+        mock_queue.remove_issue_from_queue.assert_called_once_with(100)
+        mock_run_manager.end_pipeline_run.assert_called_once()
+        assert mock_run_manager.end_pipeline_run.call_args[1]['outcome'] == 'success'
+
+    def test_releases_and_processes_queue_when_held_by_us(self):
+        """Control case: when this issue DOES hold the lock, release still
+        happens exactly as before — proving the fix didn't just make release
+        never fire."""
+        our_lock = Mock()
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = True
+
+        mock_queue = Mock()
+        mock_queue.is_issue_in_queue.return_value = True
+        mock_queue.get_next_waiting_issue.return_value = None
+
+        mock_run_manager = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('monitoring.observability.get_observability_manager'):
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(None)
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        mock_lock_manager.release_lock.assert_called_once_with('test-project', 'dev', 100)
+        mock_queue.remove_issue_from_queue.assert_called_once_with(100)
+        mock_run_manager.end_pipeline_run.assert_called_once()
+
+    def test_stops_without_processing_queue_when_release_fails_for_our_own_retained_lock(self):
+        """Defense in depth: if this issue DOES hold the lock but it's
+        somehow retained (shouldn't normally happen for an issue legitimately
+        reaching an exit column), the failed release must still halt
+        everything — this is the genuine-failure case the gate exists for,
+        and must not be weakened by the held_by_other fix above."""
+        our_lock = Mock()
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = False
+
+        mock_queue = Mock()
+        mock_run_manager = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('monitoring.observability.get_observability_manager'):
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(None)
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        mock_queue.remove_issue_from_queue.assert_not_called()
+        mock_run_manager.end_pipeline_run.assert_not_called()
+
+    def test_skips_release_and_processes_queue_when_nothing_is_locked_at_all(self):
+        """Control case: no lock exists at all (lock is None) — must not
+        crash dereferencing lock.locked_by_issue, and must still proceed
+        with cleanup."""
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = None
+
+        mock_queue = Mock()
+        mock_queue.is_issue_in_queue.return_value = False
+        mock_queue.get_next_waiting_issue.return_value = None
+
+        mock_run_manager = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('monitoring.observability.get_observability_manager'):
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(None)
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        mock_lock_manager.release_lock.assert_not_called()
+        mock_run_manager.end_pipeline_run.assert_called_once()
