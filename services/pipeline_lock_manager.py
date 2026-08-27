@@ -852,17 +852,46 @@ class PipelineLockManager:
                 f"steal_lock: transferring {project}/{board} from issue "
                 f"#{current_lock.locked_by_issue} to issue #{new_issue_number}"
             )
-            # force=True is safe here: we already confirmed above the lock isn't
-            # retained, so this releases an ordinary, actively-held lock, not
-            # bypassing the recovery flow.
-            released = self.release_lock(project, board, current_lock.locked_by_issue, force=True)
-            if not released:
+            # Defense-in-depth re-check immediately before the destructive
+            # release: the check above and this release aren't atomic, so a
+            # concurrent mark_lock_failed() landing in between isn't provably
+            # impossible (same narrow-race reasoning try_acquire_lock's stale-
+            # lock recovery branch already applies to itself). force=True below
+            # deliberately bypasses release_lock()'s OWN retained_reason guard
+            # (that's what force means — it's the mechanism scripts/
+            # release_lock.py's deliberate override relies on), so without this
+            # re-check here, nothing between the check above and the release
+            # below would actually catch a lock that became retained in that
+            # window.
+            current_lock, reads_healthy = self.get_lock_fail_closed(project, board)
+            if not reads_healthy:
                 logger.error(
-                    f"steal_lock: could not release the lock held by issue "
-                    f"#{current_lock.locked_by_issue} for {project}/{board} — "
-                    f"refusing to steal it via a fresh lock creation."
+                    f"steal_lock: could not re-confirm lock state for {project}/{board} "
+                    f"immediately before release — refusing to proceed with the steal"
                 )
-                return False, "release_failed"
+                return False, "lock_state_unknown"
+            if current_lock and current_lock.retained_reason:
+                logger.error(
+                    f"steal_lock: {project}/{board} became retained (issue "
+                    f"#{current_lock.locked_by_issue}: {current_lock.retained_reason}) "
+                    f"between the initial check and the release — refusing to steal it."
+                )
+                return False, f"retained:{current_lock.retained_reason}"
+
+            if current_lock:
+                # force=True is safe here: we've now confirmed twice that the
+                # lock isn't retained, so this releases an ordinary,
+                # actively-held lock, not bypassing the recovery flow.
+                released = self.release_lock(project, board, current_lock.locked_by_issue, force=True)
+                if not released:
+                    logger.error(
+                        f"steal_lock: could not release the lock held by issue "
+                        f"#{current_lock.locked_by_issue} for {project}/{board} — "
+                        f"refusing to steal it via a fresh lock creation."
+                    )
+                    return False, "release_failed"
+            # else: someone else already released it between the initial check
+            # and here — nothing left to release, fall through to create.
             if not self._create_lock(project, board, new_issue_number):
                 # The prior holder's lock is already released at this point —
                 # this is a genuine "board is now unlocked, nothing recorded"

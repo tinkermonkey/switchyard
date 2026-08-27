@@ -667,6 +667,37 @@ class TestStealLock(unittest.TestCase):
         self.assertEqual(lock.locked_by_issue, 999)
         self.assertEqual(lock.retained_reason, "agent crashed")
 
+    def test_refuses_to_steal_if_the_lock_becomes_retained_between_the_check_and_the_release(self):
+        """TOCTOU: steal_lock()'s upfront check and its actual release aren't
+        atomic — a concurrent mark_lock_failed() landing in that narrow window
+        must still be caught, not silently overwritten by the force=True
+        release that bypasses release_lock()'s own retained_reason guard."""
+        self.manager._create_lock("proj", "board", 999)
+        non_retained_lock = self.manager.get_lock("proj", "board")
+
+        retained_lock = PipelineLock(
+            project="proj", board="board", locked_by_issue=999,
+            lock_acquired_at=non_retained_lock.lock_acquired_at, lock_status="locked",
+            retained_reason="crashed between check and release",
+            retained_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        with patch.object(
+            self.manager, 'get_lock_fail_closed',
+            side_effect=[(non_retained_lock, True), (retained_lock, True)],
+        ), patch.object(self.manager, '_create_lock') as mock_create:
+            ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertFalse(ok)
+        self.assertTrue(result.startswith("retained:"))
+        # Must not have proceeded to hand the lock to the new issue.
+        mock_create.assert_not_called()
+        # The real, on-disk lock (created in setup above, before the mocked
+        # reads) must be untouched — release_lock() was never reached.
+        real_lock = self.manager._read_yaml_lock_only("proj", "board")[0]
+        self.assertEqual(real_lock.locked_by_issue, 999)
+        self.assertIsNone(real_lock.retained_reason)
+
     def test_steals_a_non_retained_lock_held_by_another_issue(self):
         self.manager._create_lock("proj", "board", 999)
 
