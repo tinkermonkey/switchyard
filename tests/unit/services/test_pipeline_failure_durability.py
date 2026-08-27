@@ -704,6 +704,128 @@ class TestStealLock(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(result, "lock_state_unknown")
 
+    # --- Redis-side dual-write coverage -----------------------------------
+    #
+    # Every test above asserts only via self.manager.get_lock(), which merges
+    # a Redis read and a YAML read. Because self.mock_redis is an unconfigured
+    # MagicMock, _read_redis_lock_only()'s `lock_data.get('lock_status') ==
+    # 'locked'` check always evaluates False against a MagicMock — so every
+    # assertion above is, silently, YAML-only. A regression that drops the
+    # Redis half of steal_lock()'s dual-write (leaving a stale Redis entry
+    # after a steal, or never writing one for a fresh acquire) would be
+    # invisible to the whole suite. These tests assert directly on the mock
+    # Redis client's calls instead, mirroring the pattern already used for
+    # release_lock/try_acquire_lock elsewhere in this file.
+
+    def test_acquire_writes_the_new_holder_to_redis(self):
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, "acquired")
+        lock_key = self.manager._get_lock_key("proj", "board")
+        self.mock_redis.hset.assert_called_once()
+        hset_call = self.mock_redis.hset.call_args
+        self.assertEqual(hset_call[0][0], lock_key)
+        self.assertEqual(int(hset_call[1]['mapping']['locked_by_issue']), 100)
+        self.mock_redis.expire.assert_called_once_with(lock_key, 7200)
+
+    def test_steal_releases_old_holder_and_writes_new_holder_to_redis(self):
+        self.manager._create_lock("proj", "board", 999)
+        # Reset call history from the setup line above so assertions below
+        # unambiguously reflect steal_lock()'s own Redis interactions.
+        self.mock_redis.hset.reset_mock()
+        self.mock_redis.expire.reset_mock()
+
+        # release_lock() (called internally by steal_lock for the prior
+        # holder) needs its Redis transaction mocked to actually succeed —
+        # see the identical pattern used for release_lock's own tests above.
+        def side_effect_transaction(func, *keys, **kwargs):
+            mock_pipe = MagicMock()
+            mock_pipe.hgetall.return_value = {'locked_by_issue': '999'}
+            return func(mock_pipe)
+        self.mock_redis.transaction.side_effect = side_effect_transaction
+
+        ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertTrue(ok)
+        self.assertEqual(result, "stolen")
+        # The old holder's Redis entry was actually released via the real
+        # transaction path, not just skipped.
+        self.mock_redis.transaction.assert_called_once()
+        # The new holder was actually written to Redis, not just YAML.
+        lock_key = self.manager._get_lock_key("proj", "board")
+        self.mock_redis.hset.assert_called_once()
+        self.assertEqual(int(self.mock_redis.hset.call_args[1]['mapping']['locked_by_issue']), 100)
+        self.mock_redis.expire.assert_called_once_with(lock_key, 7200)
+
+    def test_reports_create_failed_when_the_new_lock_cannot_be_written_anywhere(self):
+        """steal_lock() must not report "acquired"/"stolen" if the actual
+        lock-creation write fails in both stores — otherwise the caller
+        proceeds believing it exclusively holds a lock that was never
+        actually recorded anywhere."""
+        with patch.object(self.manager, '_create_lock', return_value=False) as mock_create:
+            ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertFalse(ok)
+        self.assertEqual(result, "create_failed")
+        mock_create.assert_called_once_with("proj", "board", 100)
+
+    def test_reports_create_failed_after_a_successful_steal_release(self):
+        """Same as above, but for the "stolen" branch specifically — the
+        prior holder's lock is already released by this point, so a
+        create_failed here means the board is genuinely unlocked with
+        nothing recorded, not "still held by the old issue"."""
+        self.manager._create_lock("proj", "board", 999)
+
+        def side_effect_transaction(func, *keys, **kwargs):
+            mock_pipe = MagicMock()
+            mock_pipe.hgetall.return_value = {'locked_by_issue': '999'}
+            return func(mock_pipe)
+        self.mock_redis.transaction.side_effect = side_effect_transaction
+
+        with patch.object(self.manager, '_create_lock', return_value=False):
+            ok, result = self.manager.steal_lock("proj", "board", 100)
+
+        self.assertFalse(ok)
+        self.assertEqual(result, "create_failed")
+        # The prior holder's lock really was released — steal_lock() must not
+        # imply it's still safely held by issue 999.
+        self.assertIsNone(self.manager.get_lock("proj", "board"))
+
+
+class TestCreateLockWriteVerification(unittest.TestCase):
+    """PipelineLockManager._create_lock()'s own return value — the primitive
+    steal_lock() (and try_acquire_lock()) rely on to know whether a lock
+    write actually landed anywhere. Before this fix, _create_lock() had no
+    return value at all: a Redis failure was only logged, and the YAML
+    write's own success/failure return from _save_lock_to_yaml() was
+    silently discarded — so a caller could report success (e.g. steal_lock's
+    "stolen"/"acquired") even when neither store actually persisted
+    anything."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_returns_true_when_both_stores_succeed(self):
+        self.assertTrue(self.manager._create_lock("proj", "board", 100))
+
+    def test_returns_true_when_only_yaml_succeeds(self):
+        self.mock_redis.hset.side_effect = Exception("redis down")
+        self.assertTrue(self.manager._create_lock("proj", "board", 100))
+        # YAML must still have actually been written.
+        self.assertIsNotNone(self.manager.get_lock("proj", "board"))
+
+    def test_returns_false_when_both_stores_fail(self):
+        self.mock_redis.hset.side_effect = Exception("redis down")
+        with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            created = self.manager._create_lock("proj", "board", 100)
+        self.assertFalse(created)
+
 
 class TestReleaseLockUnlinkFailure(unittest.TestCase):
     """release_lock()'s YAML-deletion step must not report success when the

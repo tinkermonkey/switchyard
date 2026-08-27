@@ -504,8 +504,18 @@ class PipelineLockManager:
         )
         self._save_lock_to_yaml(lock)
 
-    def _create_lock(self, project: str, board: str, issue_number: int):
-        """Create a new lock (Legacy/Fallback method)"""
+    def _create_lock(self, project: str, board: str, issue_number: int) -> bool:
+        """
+        Create a new lock (Legacy/Fallback method).
+
+        Returns:
+            True if the lock was recorded in at least one durable store
+            (mirrors mark_lock_failed's fail-open-across-two-stores pattern),
+            False if BOTH the Redis and YAML writes failed — a caller relying
+            on this lock actually existing (e.g. steal_lock(), which reports
+            success to its own caller based on this) must not treat a
+            both-failed write as if the lock was acquired.
+        """
         lock = PipelineLock(
             project=project,
             board=board,
@@ -515,21 +525,32 @@ class PipelineLockManager:
         )
 
         # Write to Redis with 2 hour TTL
+        redis_ok = False
         if self.redis_client:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
                 self.redis_client.expire(lock_key, 7200)  # 2 hours
+                redis_ok = True
                 logger.debug(f"Created lock in Redis: {lock_key}")
             except Exception as e:
                 logger.error(f"Failed to create lock in Redis: {e}")
 
         # Write to YAML for persistence
-        self._save_lock_to_yaml(lock)
+        yaml_ok = self._save_lock_to_yaml(lock)
+
+        if not redis_ok and not yaml_ok:
+            logger.error(
+                f"_create_lock: BOTH Redis and YAML writes failed for "
+                f"{project}/{board} issue #{issue_number} — no lock was "
+                f"actually recorded anywhere"
+            )
+            return False
 
         logger.info(
             f"Pipeline lock acquired: {project}/{board} by issue #{issue_number}"
         )
+        return True
 
     def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
         """
@@ -797,6 +818,11 @@ class PipelineLockManager:
                 determined (both Redis and YAML reads failed); refused.
             (False, "release_failed") — stealing required releasing the prior
                 holder's lock and that release itself failed.
+            (False, "create_failed") — the new lock write itself failed in
+                both Redis and YAML (e.g. a prior holder's lock was
+                successfully released, or nothing was locked at all, but the
+                new lock could not be recorded anywhere) — the board may now
+                be genuinely unlocked with nothing to show for it.
         """
         current_lock, reads_healthy = self.get_lock_fail_closed(project, board)
         if not reads_healthy:
@@ -835,10 +861,17 @@ class PipelineLockManager:
                     f"refusing to steal it via a fresh lock creation."
                 )
                 return False, "release_failed"
-            self._create_lock(project, board, new_issue_number)
+            if not self._create_lock(project, board, new_issue_number):
+                # The prior holder's lock is already released at this point —
+                # this is a genuine "board is now unlocked, nothing recorded"
+                # gap, not a no-op. Report failure rather than "stolen" so the
+                # caller doesn't proceed believing it exclusively holds a lock
+                # that doesn't actually exist anywhere.
+                return False, "create_failed"
             return True, "stolen"
         elif not current_lock:
-            self._create_lock(project, board, new_issue_number)
+            if not self._create_lock(project, board, new_issue_number):
+                return False, "create_failed"
             return True, "acquired"
         else:
             return True, "already_held"

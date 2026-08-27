@@ -1,44 +1,45 @@
 """
-Regression test for the repair-cycle "steal the lock" bug found across three
-rounds of PR #35 review: ProjectMonitor._start_repair_cycle_for_issue's logic
-for stealing the pipeline lock from another issue (repair cycles have
-priority over ordinary Development items) never checked whether that lock was
-durably retained due to a failed run before releasing and recreating it —
-silently erasing the retained_reason/retained_at record and handing the lock
-to an unrelated issue.
+Coverage for ProjectMonitor._start_repair_cycle_for_issue's two pipeline-lock
+gates: the "competing repair cycle" check and the steal_lock() call that
+replaced this file's original "steal the lock" bug (found across three
+rounds of PR #35 review — repair cycles have priority over ordinary
+Development items, but a retained/failed lock must never be silently stolen
+and handed to an unrelated issue).
 
-This logic now lives entirely inside PipelineLockManager.steal_lock() (a
-later review round centralized it there specifically so this exact bug class
-— the retained_reason check and the release+create call drifting apart —
-can't recur at new call sites). This test exercises the fix at the
-_start_repair_cycle_for_issue call site: it must call steal_lock() and, when
-steal_lock() reports refusal (a retained lock held by a different issue),
-return None without proceeding.
+DESIGN NOTE — why this file was rewritten from scratch in a sixth round:
 
-IMPORTANT — this test previously did NOT reliably exercise the fix at all,
-twice, for two different reasons:
+_start_repair_cycle_for_issue is one large function wrapped in a single
+top-level try/except that returns None on ANY exception, and that returns
+None from a dozen different legitimate places further down (no test
+configurations found, issue-context fetch failed, container launch failed,
+context file save failed, ...). Every previous version of this test asserted
+only `result is None` (plus which lock-manager methods were or weren't
+called) to prove a lock gate fired — but `None` is also exactly what a
+completely unrelated downstream failure produces, and there IS one in every
+version of this test's own mock setup: `subprocess.run` is patched globally
+(needed so a real `gh` CLI shellout during context-fetching doesn't try to
+hit the network and hang for 15+ seconds), and that same global patch is
+also hit by `_launch_repair_cycle_container`'s real internal `docker run`
+subprocess call further down. So bypassing a lock gate doesn't make the test
+fail — execution simply falls through to a real container-launch attempt,
+which fails for the unrelated subprocess-mock reason, and returns None
+anyway. This was true, undetected, for THREE separate versions of this file
+across rounds 3-6 (see git history), for three different underlying reasons
+each time (an unmocked pipeline_run_manager Redis call; an unconfigured
+steal_lock() Mock; this exact fall-through).
 
-1. In any environment without a live Redis reachable at the `redis` hostname
-   (e.g. a bare `pytest`/`docker run` invocation, per this repo's own
-   CLAUDE.md convention of "No Redis/ES locally: tests handle gracefully via
-   mocks or skips"), the unmocked
-   self.pipeline_run_manager.get_or_create_pipeline_run() call raised a
-   connection error BEFORE the lock-steal logic ever ran, was swallowed by
-   _start_repair_cycle_for_issue's own outer exception handler, and returned
-   None regardless of whether the fix was present or reverted. Fixed by
-   mocking pipeline_run_manager and the `gh` CLI subprocess call below.
-2. After the steal_lock() centralization, mock_pipeline_lock_manager_auto
-   (a plain, unconfigured Mock standing in for the whole lock manager) left
-   .steal_lock() unconfigured — calling it returned another bare Mock, and
-   `ok, result = lock_manager.steal_lock(...)` at the call site raised
-   TypeError: cannot unpack non-iterable Mock object, which the SAME outer
-   exception handler from (1) also swallowed, again returning None regardless
-   of whether the refusal logic was present or reverted. Fixed by explicitly
-   configuring steal_lock.return_value below and asserting it was actually
-   called with the expected arguments, rather than only asserting on
-   release_lock/_create_lock (which this call site no longer calls directly
-   at all post-centralization, so asserting on them no longer distinguishes
-   correct from broken behavior).
+The fix applied here is structural, not another patch: every test in this
+file mocks `_launch_repair_cycle_container` directly (and, for the
+success-reaching tests, `ProjectMonitor._monitor_repair_cycle_container`, so
+a real background monitoring thread never starts). "Was the container launch
+attempted?" is then an unambiguous, directly-observable signal for "did a
+lock gate correctly stop dispatch" vs. "did dispatch correctly proceed" —
+it no longer depends on what happens to fail first several calls further
+down the same function. Every refusal test below additionally asserts the
+exact function return value; every success test asserts the actual
+`stage_config.default_agent` return value AND that the container-launch mock
+was called with this issue's number — proving the call reached a genuine
+successful outcome, not just "didn't raise."
 """
 
 import pytest
@@ -47,165 +48,280 @@ from unittest.mock import Mock, MagicMock, patch
 from tests.unit.orchestrator.conftest import create_test_issue
 
 
-class TestRepairCycleLockSteal:
-    def test_refuses_to_steal_a_retained_lock(
-        self,
-        mock_pipeline_lock_manager_auto,
-        mock_github,
-        mock_config_manager,
-        mock_state_manager,
-        mock_task_queue,
+def _run_start_repair_cycle(
+    mock_pipeline_lock_manager_auto,
+    mock_github,
+    mock_config_manager,
+    mock_state_manager,
+    mock_task_queue,
+    issue_number=100,
+    monitor_mutator=None,
+):
+    """
+    Shared harness for every test in this file. Sets up the common
+    scaffolding (issue, pipeline run, `gh` CLI shellout, at least one test
+    type configured) and calls _start_repair_cycle_for_issue for real,
+    with _launch_repair_cycle_container and _monitor_repair_cycle_container
+    mocked out so nothing here ever touches real Docker/subprocess machinery
+    or starts a real background thread.
+
+    Returns (result, launch_mock, monitor_mock) so callers can assert on the
+    function's actual return value as well as whether/how dispatch proceeded.
+    """
+    mock_run = Mock()
+    mock_run.id = 'run-repair-100'
+
+    with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
+         patch('config.state_manager.state_manager', mock_state_manager), \
+         patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto), \
+         patch('services.pipeline_run.get_pipeline_run_manager') as mock_pipeline_mgr, \
+         patch('services.project_monitor.subprocess.run') as mock_subprocess, \
+         patch('services.project_monitor._launch_repair_cycle_container') as launch_mock:
+
+        mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
+        launch_mock.return_value = f'repair-cycle-test-project-{issue_number}-run-repa'
+
+        # Real `gh` CLI calls (e.g. fetching issue comments for previous-stage
+        # context) would otherwise actually shell out and take 15+ seconds to
+        # fail against a nonexistent test-org/test-repo — deterministic
+        # failure, matching what the code already handles gracefully.
+        import subprocess as _subprocess
+        mock_subprocess.side_effect = _subprocess.CalledProcessError(1, ['gh'])
+
+        create_test_issue(mock_github, issue_number, 'Testing')
+
+        from services.project_monitor import ProjectMonitor
+        monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
+        monitor.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
+        # Never let a real background thread start — its target function does
+        # real `docker wait`/subprocess work this is not testing.
+        monitor._monitor_repair_cycle_container = Mock()
+
+        if monitor_mutator:
+            monitor_mutator(monitor)
+
+        project_config = mock_config_manager.get_project_config('test-project')
+        # test_configs building requires a real dict here (project_config is
+        # otherwise a Mock) — without at least one test type, the function
+        # returns None via the "no test configurations found" branch before
+        # ever reaching either lock gate this file targets.
+        project_config.testing = {'types': [{'type': 'unit'}]}
+        pipeline_config = project_config.pipelines[0]
+        workflow_template = mock_config_manager.get_workflow_template('test-workflow')
+        column = MagicMock()
+        column.type = 'standard'
+        stage_config = MagicMock()
+
+        result = monitor._start_repair_cycle_for_issue(
+            project_name='test-project',
+            board_name='dev',
+            issue_number=issue_number,
+            status='Testing',
+            repository='test-repo',
+            project_config=project_config,
+            pipeline_config=pipeline_config,
+            workflow_template=workflow_template,
+            column=column,
+            stage_config=stage_config,
+        )
+
+        return result, launch_mock, stage_config
+
+
+class TestCompetingRepairCycleGate:
+    """The FIRST lock check in _start_repair_cycle_for_issue: repair cycles
+    must not compete with another already-running repair cycle, but they may
+    freely proceed past an ordinary (non-repair-cycle) holder — that's what
+    the second gate (steal_lock) exists to arbitrate. Round 4's review found
+    this gate's fail-closed branch (both Redis and YAML reads failing) was
+    never actually exercised by any test; this class closes that gap and
+    covers every branch of the gate."""
+
+    def test_refuses_when_lock_state_cannot_be_determined(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
     ):
-        """The core regression test: a repair cycle must never steal a
-        retained lock out from under a different, failed issue."""
-        # A different issue (999) holds a retained lock. An earlier, separate
-        # guard (competing-repair-cycle check) also reads get_lock_fail_closed()
-        # before the steal_lock() call this test targets is ever reached — it
-        # must see the same lock and let this through (999 has no repair-cycle
-        # container registered per mock_task_queue.redis_client.get below, so
-        # it isn't treated as a competing repair cycle).
-        retained_lock = Mock()
-        retained_lock.locked_by_issue = 999
-        retained_lock.retained_reason = "Repair cycle failed: simulated"
-        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (retained_lock, True)
-        # steal_lock() is what actually contains the retained_reason check
-        # now — configure it to report the refusal it would give here.
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, False)
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        # Must refuse before ever reaching the second gate.
+        mock_pipeline_lock_manager_auto.steal_lock.assert_not_called()
+
+    def test_refuses_when_another_active_repair_cycle_holds_the_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        other_lock = Mock()
+        other_lock.locked_by_issue = 999
+        other_lock.retained_reason = None
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (other_lock, True)
+
+        def has_competing_container(key):
+            # repair_cycle:container:{project}:{issue} — non-None means a
+            # repair cycle is registered as running for that issue.
+            return 'repair-cycle-other-container' if key.endswith(':999') else None
+        mock_task_queue.redis_client.get.side_effect = has_competing_container
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        mock_pipeline_lock_manager_auto.steal_lock.assert_not_called()
+
+    def test_proceeds_past_a_non_competing_holder_to_the_steal_lock_gate(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Control case: another issue holds the lock, but it has no repair
+        cycle container registered — this gate must let it through so the
+        second gate (steal_lock) can decide whether to steal it."""
+        other_lock = Mock()
+        other_lock.locked_by_issue = 999
+        other_lock.retained_reason = None
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (other_lock, True)
+        mock_task_queue.redis_client.get.return_value = None  # no competing container anywhere
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "stolen")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        mock_pipeline_lock_manager_auto.steal_lock.assert_called_once_with('test-project', 'dev', 100)
+        launch_mock.assert_called_once()
+        assert result == stage_config.default_agent
+
+
+class TestStealLockCallSiteWiring:
+    """The SECOND lock check: _start_repair_cycle_for_issue must honor every
+    outcome steal_lock() can report. steal_lock()'s own internal correctness
+    (the actual retained_reason check, the release+create sequence) is
+    covered separately in tests/unit/services/test_pipeline_failure_durability.py
+    (TestStealLock) against the real PipelineLockManager — this class covers
+    only whether the call site here correctly acts on each of the six
+    possible (bool, str) results, using whether the container-launch mock
+    was invoked as the unambiguous "did dispatch proceed" signal (see the
+    module docstring for why that's necessary)."""
+
+    def _configure_no_competing_holder(self, mock_pipeline_lock_manager_auto):
+        # No lock at all as far as the FIRST gate is concerned — isolates
+        # these tests to the steal_lock() gate specifically.
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
+        mock_task_queue_get = None  # placeholder, no-op
+
+    def test_refuses_to_steal_a_retained_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The core regression test this file exists for: a repair cycle
+        must never steal a retained lock out from under a different, failed
+        issue."""
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
         mock_pipeline_lock_manager_auto.steal_lock.return_value = (
             False, "retained:Repair cycle failed: simulated"
         )
 
-        # No existing repair-cycle container for issue 100, and no OTHER
-        # repair cycle running for issue 999 either — otherwise the function's
-        # earlier "another repair cycle is already running" guard fires first
-        # (based on this Redis key) and the test wouldn't actually reach the
-        # lock-steal logic being tested here at all.
-        mock_task_queue.redis_client.get.return_value = None
-
-        create_test_issue(mock_github, 100, 'Testing')
-
-        mock_run = Mock()
-        mock_run.id = 'run-repair-100'
-
-        with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
-             patch('config.state_manager.state_manager', mock_state_manager), \
-             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto), \
-             patch('services.pipeline_run.get_pipeline_run_manager') as mock_pipeline_mgr, \
-             patch('services.project_monitor.subprocess.run') as mock_subprocess:
-
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
-            # Real `gh` CLI calls (e.g. fetching issue comments for previous-
-            # stage context) would otherwise actually shell out and take
-            # 15+ seconds to fail against a nonexistent test-org/test-repo —
-            # deterministic failure, matching what the code already handles
-            # gracefully (returns "" and continues).
-            import subprocess as _subprocess
-            mock_subprocess.side_effect = _subprocess.CalledProcessError(1, ['gh'])
-
-            from services.project_monitor import ProjectMonitor
-            monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
-            monitor.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
-
-            project_config = mock_config_manager.get_project_config('test-project')
-            # test_configs building requires a real dict here (project_config is
-            # otherwise a Mock) — without at least one test type, the function
-            # returns None via the "no test configurations found" branch before
-            # ever reaching the lock-steal logic this test targets.
-            project_config.testing = {'types': [{'type': 'unit'}]}
-            pipeline_config = project_config.pipelines[0]
-            workflow_template = mock_config_manager.get_workflow_template('test-workflow')
-            column = MagicMock()
-            column.type = 'standard'
-            stage_config = MagicMock()
-
-            result = monitor._start_repair_cycle_for_issue(
-                project_name='test-project',
-                board_name='dev',
-                issue_number=100,
-                status='Testing',
-                repository='test-repo',
-                project_config=project_config,
-                pipeline_config=pipeline_config,
-                workflow_template=workflow_template,
-                column=column,
-                stage_config=stage_config,
-            )
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
 
         assert result is None
-        mock_pipeline_lock_manager_auto.steal_lock.assert_called_once_with(
-            'test-project', 'dev', 100
-        )
-        # steal_lock() itself owns the release+create sequence now — this call
-        # site must not perform them directly, whether or not steal_lock()
-        # refuses.
-        mock_pipeline_lock_manager_auto.release_lock.assert_not_called()
-        mock_pipeline_lock_manager_auto._create_lock.assert_not_called()
+        mock_pipeline_lock_manager_auto.steal_lock.assert_called_once_with('test-project', 'dev', 100)
+        launch_mock.assert_not_called()
 
-
-class TestRepairCycleLockSteal_HappyPath:
-    def test_steals_a_non_retained_lock_and_proceeds(
-        self,
-        mock_pipeline_lock_manager_auto,
-        mock_github,
-        mock_config_manager,
-        mock_state_manager,
-        mock_task_queue,
+    def test_refuses_when_lock_state_unknown_at_steal_time(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
     ):
-        """Control case for the test above: when steal_lock() reports success
-        (the lock wasn't retained), _start_repair_cycle_for_issue must proceed
-        past the lock-acquisition step rather than returning None — proving
-        the refusal in the test above is actually caused by steal_lock()'s
-        result, not by some earlier, unrelated guard."""
-        # No lock held at all, so the earlier competing-repair-cycle guard
-        # (which also reads get_lock_fail_closed()) passes trivially and this
-        # reaches the steal_lock() call further down.
-        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
-        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "stolen")
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
         mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (False, "lock_state_unknown")
 
-        create_test_issue(mock_github, 100, 'Testing')
-
-        mock_run = Mock()
-        mock_run.id = 'run-repair-100'
-
-        with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
-             patch('config.state_manager.state_manager', mock_state_manager), \
-             patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto), \
-             patch('services.pipeline_run.get_pipeline_run_manager') as mock_pipeline_mgr, \
-             patch('services.project_monitor.subprocess.run') as mock_subprocess:
-
-            mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
-            import subprocess as _subprocess
-            mock_subprocess.side_effect = _subprocess.CalledProcessError(1, ['gh'])
-
-            from services.project_monitor import ProjectMonitor
-            monitor = ProjectMonitor(task_queue=mock_task_queue, config_manager=mock_config_manager)
-            monitor.get_issue_details = lambda repo, num, org: mock_github.get_issue(num)
-
-            project_config = mock_config_manager.get_project_config('test-project')
-            project_config.testing = {'types': [{'type': 'unit'}]}
-            pipeline_config = project_config.pipelines[0]
-            workflow_template = mock_config_manager.get_workflow_template('test-workflow')
-            column = MagicMock()
-            column.type = 'standard'
-            stage_config = MagicMock()
-
-            monitor._start_repair_cycle_for_issue(
-                project_name='test-project',
-                board_name='dev',
-                issue_number=100,
-                status='Testing',
-                repository='test-repo',
-                project_config=project_config,
-                pipeline_config=pipeline_config,
-                workflow_template=workflow_template,
-                column=column,
-                stage_config=stage_config,
-            )
-
-        mock_pipeline_lock_manager_auto.steal_lock.assert_called_once_with(
-            'test-project', 'dev', 100
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
         )
-        # It must not fall back to the removed direct release_lock/_create_lock
-        # sequence — steal_lock() is the only thing that should touch the lock.
+
+        assert result is None
+        launch_mock.assert_not_called()
+
+    def test_refuses_when_the_forced_release_during_steal_fails(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (False, "release_failed")
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+
+    def test_proceeds_after_stealing_a_non_retained_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "stolen")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+        # steal_lock() owns the actual release+create sequence now — this
+        # call site must never perform them directly.
         mock_pipeline_lock_manager_auto.release_lock.assert_not_called()
         mock_pipeline_lock_manager_auto._create_lock.assert_not_called()
+
+    def test_proceeds_after_acquiring_an_unlocked_board(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+    def test_proceeds_when_already_holding_the_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Covers the case where this same issue already holds the lock —
+        e.g. carried over from a prior Development-stage handoff."""
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "already_held")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
