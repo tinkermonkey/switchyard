@@ -754,17 +754,19 @@ class PipelineLockManager:
                             try:
                                 state_file.unlink()
                             except Exception as unlink_err:
-                                # Deliberately NOT covered by the outer except below —
-                                # that one is scoped to the ownership-check machinery
-                                # above (file_lock acquisition, etc.) and is allowed to
-                                # fall through since it runs before any destructive
-                                # action is taken. This one guards the destructive
-                                # action itself: if unlink() raises, the (possibly
-                                # still-retained) YAML record survives on disk, and
-                                # this must return False rather than fall through to
-                                # the success path below — previously it did, so
-                                # release_lock reported success while a retained
-                                # lock's YAML record silently remained.
+                                # Has its own except (rather than letting this fall
+                                # into the outer except below, which also now
+                                # correctly returns False) specifically so this
+                                # failure gets its own distinct log message about
+                                # the surviving YAML file — the outer except's
+                                # message is generic and scoped to the
+                                # ownership-check machinery above (file_lock
+                                # acquisition, etc.), which runs before any
+                                # destructive action is taken. Before this fix
+                                # existed, an unlink() failure WAS silently
+                                # swallowed and fell through to the success path
+                                # below — release_lock reported success while a
+                                # retained lock's YAML record silently remained.
                                 logger.error(
                                     f"Failed to delete lock YAML file {state_file}: {unlink_err}"
                                 )

@@ -5473,7 +5473,12 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                     "error_message": error_message,
                                     "exit_code": exit_code,
                                     "container_name": container_name,
-                                    "lock_retained": True,
+                                    # Reflects whether mark_failed() actually durably
+                                    # retained the lock (set above) — claiming True
+                                    # unconditionally here would misrepresent the
+                                    # observability record when both Redis and YAML
+                                    # writes failed.
+                                    "lock_retained": repair_mark_failed_ok,
                                     "action_required": "manual_intervention",
                                 },
                                 pipeline_run_id=pipeline_run_id,

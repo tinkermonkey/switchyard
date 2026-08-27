@@ -818,6 +818,7 @@ class ReviewCycleExecutor:
                         # outcome="failed" — without it the lock is never
                         # durably marked retained and would be silently
                         # auto-released as stale later.
+                        marked_ok = False
                         if existing_cycle.pipeline_run_id:
                             from services.pipeline_run import get_pipeline_run_manager
                             pipeline_run_manager = get_pipeline_run_manager()
@@ -836,7 +837,24 @@ class ReviewCycleExecutor:
                                     f"issue may be silently re-dispatched."
                                 )
 
-                        # Post escalation message
+                        # Post escalation message. Wording reflects whether the
+                        # lock was actually marked retained — claiming retention
+                        # unconditionally here would itself be a silent-failure
+                        # regression if marked_ok came back False above.
+                        if marked_ok:
+                            recovery_note = (
+                                f"Please review the work. The pipeline lock is retained — run "
+                                f"`python scripts/release_lock.py --project {project_name} "
+                                f"--board \"{board_name}\" --issue {issue_number}` once ready to continue."
+                            )
+                        else:
+                            recovery_note = (
+                                f"Please review the work. The pipeline lock could **not** be "
+                                f"durably marked retained — this issue may be silently "
+                                f"re-dispatched. If it is not, run "
+                                f"`python scripts/release_lock.py --project {project_name} "
+                                f"--board \"{board_name}\" --issue {issue_number}` once ready to continue."
+                            )
                         escalation_message = (
                             f"⚠️ **Review Cycle Exceeded Max Iterations**\n\n"
                             f"The review cycle has already reached or exceeded the maximum iterations "
@@ -844,9 +862,7 @@ class ReviewCycleExecutor:
                             f"Manual review is required.\n\n"
                             f"**Maker Agent:** {existing_cycle.maker_agent}\n"
                             f"**Reviewer Agent:** {existing_cycle.reviewer_agent}\n\n"
-                            f"Please review the work. The pipeline lock is retained — run "
-                            f"`python scripts/release_lock.py --project {project_name} "
-                            f"--board \"{board_name}\" --issue {issue_number}` once ready to continue."
+                            f"{recovery_note}"
                         )
 
                         if workspace_type == 'discussions' and discussion_id:

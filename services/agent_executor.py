@@ -366,7 +366,7 @@ class AgentExecutor:
                     # unconditionally claiming so (see mark_failed's docstring:
                     # posting "the lock is retained" when it isn't would itself
                     # be a silent-failure regression).
-                    board_name = task_context.get('board', '<board_name>')
+                    board_name = task_context.get('board') or '<board_name>'
                     marked_ok = True
                     if issue_number:
                         try:
@@ -468,7 +468,7 @@ class AgentExecutor:
                         # in-process retry loop nor the zombie watchdog's auto-retry
                         # accounting kicks in and silently releases the lock again.
                         if issue_number:
-                            board_name = task_context.get('board', '<board_name>')
+                            board_name = task_context.get('board') or '<board_name>'
                             marked_ok = True
                             try:
                                 from services.pipeline_run import get_pipeline_run_manager
@@ -772,7 +772,7 @@ class AgentExecutor:
                         )
 
                         if issue_number:
-                            board_name = task_context.get('board', '<board_name>')
+                            board_name = task_context.get('board') or '<board_name>'
                             marked_ok = True
                             try:
                                 from services.pipeline_run import get_pipeline_run_manager
@@ -819,8 +819,9 @@ class AgentExecutor:
                                     f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
                                     f"4. Run `python scripts/release_lock.py --project {project_name} "
                                     f"--board \"{board_name}\" --issue {issue_number}` "
-                                    f"to release the pipeline lock (moving the card alone no longer re-triggers "
-                                    f"anything — the lock is durably retained until this is run).\n\n"
+                                    f"to release the pipeline lock (moving the card alone no longer "
+                                    f"re-triggers anything) once ready to continue — see below for "
+                                    f"whether it is actually durably retained.\n\n"
                                     f"{lock_status_line}",
                                     pipeline_run_id=pipeline_run_id
                                 )
