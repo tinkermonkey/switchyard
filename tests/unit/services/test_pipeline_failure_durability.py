@@ -871,15 +871,28 @@ class TestReleaseLockUnlinkFailure(unittest.TestCase):
         self.assertFalse(state_file.exists())
 
 
-class TestHumanFeedbackLoopSuppressCancellation(unittest.TestCase):
-    """PipelineRunManager.mark_failed's suppress_cancellation param exists
-    specifically so a caller (services/human_feedback_loop.py's abnormal
-    conversational-loop exit path) can use a descriptive retained_reason
-    without losing the race-avoidance the old "feedback_loop_ended" sentinel
-    string provided — that string match previously governed both the
-    retained_reason text AND whether the cancellation signal fired, so any
-    caller wanting a better reason string silently regressed into firing a
-    cancellation signal that delays re-dispatch by up to an hour."""
+class TestMarkFailedSetsCancellationSignalForDescriptiveReasons(unittest.TestCase):
+    """A caller of mark_failed() with any reason other than the literal
+    "feedback_loop_ended" sentinel must have the cancellation signal fire
+    normally — this is the regression test for a two-round saga on
+    services/human_feedback_loop.py's abnormal-exit path:
+
+    - Before round 5, that path used the bare "feedback_loop_ended" reason,
+      so the sentinel-match suppression fired even for genuine failures.
+    - Round 5 gave it a descriptive reason (good, for retained_reason
+      visibility) but added a suppress_cancellation override to preserve the
+      old suppression (reasoning it needed the same "next loop about to
+      start" race-avoidance the success branch has) — that reasoning didn't
+      hold: mark_failed() always durably retains the lock first, which
+      already blocks any "next loop" from starting, so there was never a
+      race to avoid, and suppressing the signal instead disabled the
+      recovery/retry layers that check it before touching an orphaned
+      container.
+    - Round 6 removed suppress_cancellation entirely (no caller had a
+      legitimate use for it — every mark_failed() call site durably retains
+      the lock the same way) rather than carry unused API forward. This test
+      guards that a descriptive, non-sentinel reason correctly sets the
+      signal — the actual desired end state of this whole saga."""
 
     def setUp(self):
         self.mock_es = MagicMock()
@@ -903,31 +916,29 @@ class TestHumanFeedbackLoopSuppressCancellation(unittest.TestCase):
             json.dumps(self.run.to_dict()) if key == self.manager._get_redis_key(self.run.id) else None
         )
 
-    def test_mark_failed_with_suppress_cancellation_does_not_set_signal(self):
+    def test_mark_failed_with_descriptive_reason_sets_signal(self):
         mock_cancellation = MagicMock()
         with patch('services.cancellation.get_cancellation_signal', return_value=mock_cancellation), \
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=MagicMock()):
             self.manager.mark_failed(
                 project="proj", board="board", issue_number=123,
                 reason="Conversational feedback loop exited abnormally (exit_reason=crash)",
-                suppress_cancellation=True,
             )
 
-        mock_cancellation.cancel.assert_not_called()
+        mock_cancellation.cancel.assert_called_once()
 
-    def test_mark_failed_without_suppress_cancellation_sets_signal(self):
-        """Control case: a descriptive reason with suppress_cancellation left
-        at its default (False) DOES fire the cancellation signal — proving the
-        suppression above is actually doing something, not just always off."""
+    def test_mark_failed_with_the_sentinel_reason_still_suppresses(self):
+        """Control case: the "feedback_loop_ended" sentinel itself is
+        untouched by this fix — only the override mechanism was removed."""
         mock_cancellation = MagicMock()
         with patch('services.cancellation.get_cancellation_signal', return_value=mock_cancellation), \
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=MagicMock()):
             self.manager.mark_failed(
                 project="proj", board="board", issue_number=123,
-                reason="Some other descriptive failure reason",
+                reason="feedback_loop_ended",
             )
 
-        mock_cancellation.cancel.assert_called_once()
+        mock_cancellation.cancel.assert_not_called()
 
 
 if __name__ == '__main__':

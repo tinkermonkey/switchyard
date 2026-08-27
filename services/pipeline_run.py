@@ -835,7 +835,6 @@ class PipelineRunManager:
         board: str,
         issue_number: int,
         reason: str,
-        suppress_cancellation: bool = False,
     ) -> bool:
         """
         The single shared entry point for every pipeline-failure path: ends any
@@ -864,14 +863,6 @@ class PipelineRunManager:
             way) — callers MUST check this return value rather than assume
             success, since posting a "the lock is retained" comment or log line
             when it actually isn't would itself be a silent-failure regression.
-
-            suppress_cancellation: pass True when the caller already suppresses
-                the "next loop is about to start" race itself (see
-                end_pipeline_run's cancellation-signal docstring) and doesn't
-                want a descriptive reason string to defeat that suppression —
-                that suppression previously keyed off an exact reason-string
-                match ("feedback_loop_ended"), which broke the moment a caller
-                needed a more informative retained_reason.
         """
         try:
             self.end_pipeline_run(
@@ -880,7 +871,6 @@ class PipelineRunManager:
                 reason=reason,
                 retain_lock=True,
                 outcome="failed",
-                suppress_cancellation=suppress_cancellation,
             )
         except Exception as e:
             logger.error(
@@ -911,8 +901,7 @@ class PipelineRunManager:
         issue_number: int,
         reason: Optional[str] = None,
         retain_lock: Optional[bool] = None,
-        outcome: Optional[str] = None,
-        suppress_cancellation: bool = False,
+        outcome: Optional[str] = None
     ) -> bool:
         """
         End an active pipeline run
@@ -925,11 +914,6 @@ class PipelineRunManager:
                 - None (default): auto — retain if outcome="failed", release otherwise.
                 - True: always retain regardless of outcome.
                 - False: always release regardless of outcome (use for intentional kills).
-            suppress_cancellation: Explicitly skip the cancellation signal below,
-                regardless of reason text. Use this (rather than relying on the
-                "feedback_loop_ended" sentinel string) when the caller needs a
-                descriptive `reason` for retained_reason/logging purposes but
-                still needs the same race-avoidance the sentinel provides.
 
         Returns:
             True if run was ended, False if no active run found
@@ -952,12 +936,18 @@ class PipelineRunManager:
         pipeline_run.outcome = outcome
 
         # Set cancellation signal so in-flight repair cycles stop.
-        # Skip for feedback_loop_ended (or suppress_cancellation=True) — a
-        # conversational loop exiting, normally or abnormally, is commonly
-        # followed by the next column's loop starting immediately; setting the
-        # signal here would race against that and cancel it right away.
+        # Skip for feedback_loop_ended — that reason indicates a conversational loop
+        # exiting normally (e.g., stop requested, backlog). Setting the signal here
+        # would race against the next column's loop starting and cancel it immediately.
+        # Deliberately reason-string-based rather than a caller-supplied override
+        # flag: every current failure path (mark_failed()'s callers) durably
+        # retains the lock, which blocks any "next loop" this signal could
+        # spuriously race against — so a failure path never has a legitimate
+        # reason to suppress it, and no such flag currently has any real caller
+        # (round 5 briefly added one for a case this reasoning shows didn't
+        # need it; round 6 removed it rather than carry unused API forward).
         _effective_reason = reason or "completed"
-        if _effective_reason != "feedback_loop_ended" and not suppress_cancellation:
+        if _effective_reason != "feedback_loop_ended":
             try:
                 from services.cancellation import get_cancellation_signal
                 get_cancellation_signal().cancel(

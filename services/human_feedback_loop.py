@@ -932,20 +932,28 @@ class HumanFeedbackLoopExecutor:
                         # scripts/list_failed_pipeline_runs.py and the dashboard
                         # is actually meaningful to an operator.
                         #
-                        # suppress_cancellation=True preserves the same
-                        # race-avoidance the "feedback_loop_ended" sentinel gives
-                        # the success branch below (see end_pipeline_run) — an
-                        # abnormal exit here is just as likely to be immediately
-                        # followed by the next column's loop starting, and without
-                        # this the more descriptive reason string above would
-                        # otherwise defeat that suppression by no longer matching
-                        # the sentinel, forcing a spurious ~1h dispatch delay.
+                        # Deliberately does NOT pass suppress_cancellation=True
+                        # here (round 5 originally did, reasoning it should mirror
+                        # the "feedback_loop_ended" sentinel's race-avoidance for
+                        # the success branch below — that reasoning didn't hold up
+                        # under review). The only way to reach this branch at all
+                        # is an uncaught exception (every deliberate exit sets
+                        # _loop_exited_normally=True explicitly before returning;
+                        # this try has no except, only finally) — and mark_failed()
+                        # durably retains the lock, which blocks ALL further
+                        # dispatch on this board via try_acquire_lock's upfront
+                        # durable check. There is no "next loop about to start" to
+                        # race against here, unlike the success branch. Suppressing
+                        # the signal would instead disable the exact protection it
+                        # exists for (services/cancellation.py: "ensures all
+                        # retry/recovery layers respect the stop signal and don't
+                        # respawn agents") for a container that may still be
+                        # orphaned mid-execution when this exception fired.
                         marked_ok = pipeline_run_manager.mark_failed(
                             project=state.project_name,
                             board=state.board_name,
                             issue_number=state.issue_number,
                             reason=f"Conversational feedback loop exited abnormally (exit_reason={_exit_reason})",
-                            suppress_cancellation=True,
                         )
                         if not marked_ok:
                             logger.critical(
