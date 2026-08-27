@@ -20,7 +20,17 @@ export function useDashboardRunData(run) {
 
   // Initial fetch: events + workflow config in parallel
   useEffect(() => {
-    if (!run?.id) return
+    if (!run?.id) {
+      // A run with no id (e.g. a failed run sourced from a durable lock
+      // whose ES/Redis record has aged out — see PipelineRunSidebar's
+      // shortId comment) has no events to fetch. `loading` starts true;
+      // without this, it would stay true forever and the graph would show
+      // a permanent spinner instead of its empty/unavailable state.
+      setApiEvents([])
+      setWorkflowConfig(null)
+      setLoading(false)
+      return
+    }
     runIdRef.current = run.id
     cancelledRef.current = false
     setApiEvents([])
