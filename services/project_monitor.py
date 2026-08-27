@@ -403,6 +403,65 @@ def _register_repair_cycle_container(
         return False
 
 
+def _end_pr_review_pipeline_run_on_failure(
+    pipeline_run_manager,
+    project_name: str,
+    board_name: str,
+    issue_number: int,
+    exception: Exception,
+) -> Optional[bool]:
+    """
+    Ends the pipeline run after a PR review stage failure, choosing between
+    durable retention (mark_failed(), for NonRetryableAgentError — a human
+    must intervene before this board is dispatched again) and an ordinary
+    release (end_pipeline_run with retain_lock=False, allowing the next poll
+    to retry).
+
+    Extracted as a standalone, module-level function (rather than left inline
+    in trigger_agent_for_status's run_pr_review() closure, where it originally
+    lived) specifically so this decision logic — the retain=True branch must
+    go through mark_failed() rather than a bare end_pipeline_run(retain_lock=
+    True) with no outcome="failed", or retained_reason is never set and the
+    lock is silently reclaimed as stale — can be unit tested directly. That
+    closure captures a large number of locals from its enclosing scope and
+    runs inside a background thread launched from deep within one of this
+    file's largest methods; PR #35's review history has repeatedly found that
+    testing logic like this only by driving the full enclosing dispatch path
+    either requires heavy scaffolding or silently produces a vacuous test
+    (see tests/unit/orchestrator/test_repair_cycle_lock_steal.py's docstring
+    for three such cases in a structurally similar closure).
+
+    Returns:
+        True/False — mark_failed()'s actual result (whether the lock was
+            durably retained) when the retain branch was taken.
+        None — when the release branch was taken instead; retention wasn't
+            attempted, so there's nothing to report on.
+    """
+    from agents.non_retryable import NonRetryableAgentError
+    if isinstance(exception, NonRetryableAgentError):
+        marked_ok = pipeline_run_manager.mark_failed(
+            project=project_name,
+            board=board_name,
+            issue_number=issue_number,
+            reason=f"PR review stage exception: {type(exception).__name__}: {str(exception)[:200]}",
+        )
+        if not marked_ok:
+            logger.critical(
+                f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                f"be durably marked failed after a PR review stage error — "
+                f"this issue may be silently re-dispatched."
+            )
+        return marked_ok
+    else:
+        pipeline_run_manager.end_pipeline_run(
+            project=project_name,
+            issue_number=issue_number,
+            reason=f"PR review stage exception: {type(exception).__name__}",
+            retain_lock=False
+        )
+        return None
+
+
 def _load_repair_cycle_result_from_redis(
     project_name: str,
     issue_number: int,
@@ -1877,9 +1936,10 @@ class ProjectMonitor:
             # trigger column). A prior version of this gate lived only inside the
             # is_trigger_column branch further down, which meant a review-cycle
             # crash (set while the issue sits in a non-trigger column like "Code
-            # Review") could bypass it entirely on the next poll and reach
-            # column-type routing (~line 2810 below) unguarded — re-dispatching a
-            # pipeline that had just been durably marked failed. try_acquire_lock()
+            # Review") could bypass it entirely on the next poll and reach the
+            # "Check column type and route appropriately" block further down
+            # unguarded — re-dispatching a pipeline that had just been durably
+            # marked failed. try_acquire_lock()
             # itself also independently refuses a retained lock now (defense in
             # depth), but that only helps for stages that actually call it; this
             # check stops dispatch before any stage-specific logic runs at all.
@@ -5738,39 +5798,14 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     )
 
                     # End the pipeline run so it doesn't remain "active" in Redis.
-                    # retain_lock=True for cycle limit errors (human must intervene before re-triggering),
-                    # retain_lock=False for other errors (allow re-trigger on next poll).
-                    #
-                    # The retain=True branch must go through the shared mark_failed()
-                    # entry point, not a bare end_pipeline_run(retain_lock=True) with no
-                    # outcome="failed" — without outcome="failed", end_pipeline_run()
-                    # never calls mark_lock_failed(), so retained_reason is never set
-                    # and this lock would be silently reclaimed as stale by
-                    # _reconcile_active_runs on its next pass, exactly like the other
-                    # unmigrated failure paths this PR closed elsewhere.
-                    from agents.non_retryable import NonRetryableAgentError
-                    _retain = isinstance(e, NonRetryableAgentError)
+                    # See _end_pr_review_pipeline_run_on_failure's docstring for why
+                    # this decision logic is a standalone, unit-testable function
+                    # rather than inline here.
                     try:
-                        if _retain:
-                            marked_ok = self.pipeline_run_manager.mark_failed(
-                                project=project_name,
-                                board=board_name,
-                                issue_number=issue_number,
-                                reason=f"PR review stage exception: {type(e).__name__}: {str(e)[:200]}",
-                            )
-                            if not marked_ok:
-                                logger.critical(
-                                    f"Pipeline lock for {project_name}/#{issue_number} could NOT "
-                                    f"be durably marked failed after a PR review stage error — "
-                                    f"this issue may be silently re-dispatched."
-                                )
-                        else:
-                            self.pipeline_run_manager.end_pipeline_run(
-                                project=project_name,
-                                issue_number=issue_number,
-                                reason=f"PR review stage exception: {type(e).__name__}",
-                                retain_lock=False
-                            )
+                        _end_pr_review_pipeline_run_on_failure(
+                            self.pipeline_run_manager, project_name, board_name,
+                            issue_number, e,
+                        )
                     except Exception as end_err:
                         logger.warning(f"Failed to end pipeline run after PR review failure: {end_err}")
 

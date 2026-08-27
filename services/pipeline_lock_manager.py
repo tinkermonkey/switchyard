@@ -797,12 +797,14 @@ class PipelineLockManager:
         have priority over whatever ordinary agent currently holds a board's
         lock. It exists specifically so _create_lock()/_create_lock_yaml_only()
         never need to be called directly from outside this class again for
-        this purpose: two real bugs across this PR's review rounds came from
-        call sites doing the retained_reason check and the lock-construction
-        call as two separately-maintained steps, where a future edit can drop
-        the check while leaving the construction call intact and unnoticed.
-        Centralizing both here removes that failure mode structurally instead
-        of relying on every caller to re-derive it correctly.
+        this purpose: two real bugs at that one call site (project_monitor.py's
+        repair-cycle dispatch) across this PR's review rounds (rounds 3 and 4)
+        came from the retained_reason check and the lock-construction call
+        being two separately-maintained steps there, where a future edit could
+        drop the check while leaving the construction call intact and
+        unnoticed. Centralizing both here removes that failure mode
+        structurally instead of relying on every caller to re-derive it
+        correctly.
 
         Uses get_lock_fail_closed() internally — refuses (rather than silently
         proceeding as if unlocked) when lock state genuinely can't be
