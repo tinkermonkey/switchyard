@@ -222,10 +222,13 @@ class acquire_agent_container_slot:
         async with acquire_agent_container_slot(max_concurrent=cfg.max_concurrent_agent_containers):
             result = await self._execute_in_container(...)
 
-    A fresh limiter (and Redis connection) is created per call by default,
-    matching the lightweight, reconnect-on-use style of this codebase's other
-    Redis-backed primitives; pass an existing limiter via `limiter=` to reuse
-    a connection instead.
+    A fresh limiter (and Redis connection) is created per call by default —
+    fine for occasional/low-frequency use, but callers on a hot path (like
+    claude/docker_runner.py's run_agent_in_container(), invoked on every
+    agent launch) should pass an existing limiter via `limiter=` instead, so
+    a Redis connection is established once and reused rather than
+    reconnecting (and, during an outage, re-paying the connect-timeout cost)
+    on every single call.
     """
 
     def __init__(

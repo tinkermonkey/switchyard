@@ -518,13 +518,24 @@ class DockerAgentRunner:
             # is fully done (success, failure, or timeout) — see
             # services/agent_container_concurrency.py. Redis-backed so it
             # coordinates across orchestrator processes; fails open (never
-            # blocks) if Redis is unavailable.
+            # blocks) if Redis is unavailable. Reuses this runner's own
+            # cached Redis connection (self._get_redis(), already used for
+            # container tracking) instead of opening a fresh connection on
+            # every single launch.
             from config.environment import load_environment
-            from services.agent_container_concurrency import acquire_agent_container_slot
+            from services.agent_container_concurrency import (
+                AgentContainerConcurrencyLimiter,
+                acquire_agent_container_slot,
+            )
             env_config = load_environment()
+            container_limiter = AgentContainerConcurrencyLimiter(
+                max_concurrent=env_config.max_concurrent_agent_containers,
+                redis_client=self._get_redis(),
+            )
 
             async with acquire_agent_container_slot(
-                max_concurrent=env_config.max_concurrent_agent_containers
+                max_concurrent=env_config.max_concurrent_agent_containers,
+                limiter=container_limiter,
             ):
                 # Start the container and execute Claude Code
                 result_text = await self._execute_in_container(
