@@ -8,14 +8,18 @@ Used to ensure YAML state files can be safely written from multiple worker threa
 import fcntl
 import contextlib
 import logging
+import time
 from pathlib import Path
 from typing import Union
 
 logger = logging.getLogger(__name__)
 
+# Poll interval used when enforce_timeout=True.
+_POLL_INTERVAL_SECONDS = 0.1
+
 
 @contextlib.contextmanager
-def file_lock(lock_file_path: Union[str, Path], timeout: int = 10):
+def file_lock(lock_file_path: Union[str, Path], timeout: int = 10, enforce_timeout: bool = False):
     """
     Context manager for exclusive file locking.
 
@@ -25,8 +29,15 @@ def file_lock(lock_file_path: Union[str, Path], timeout: int = 10):
 
     Args:
         lock_file_path: Path to the lock file (typically .lock extension)
-        timeout: Maximum time to wait for lock (seconds). Not enforced by fcntl,
-                but can be used for logging/monitoring.
+        timeout: Maximum time to wait for lock (seconds). Only enforced when
+                enforce_timeout=True; otherwise unused (kept for logging/monitoring
+                and for source compatibility with existing callers).
+        enforce_timeout: If True, poll for a non-blocking lock and raise
+                TimeoutError if it isn't acquired within `timeout` seconds,
+                instead of blocking indefinitely. Defaults to False so existing
+                callers keep today's blocking behavior unchanged; pass True for
+                call sites that must not risk an unbounded wait (e.g. code
+                reachable from an async event loop, or from startup).
 
     Usage:
         with file_lock('/path/to/file.lock'):
@@ -37,7 +48,7 @@ def file_lock(lock_file_path: Union[str, Path], timeout: int = 10):
     Note:
         - The lock file is created if it doesn't exist
         - The lock is automatically released when exiting the context
-        - Blocks until lock is acquired (no timeout enforcement)
+        - Blocks until lock is acquired unless enforce_timeout=True
     """
     lock_path = Path(lock_file_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,9 +58,22 @@ def file_lock(lock_file_path: Union[str, Path], timeout: int = 10):
     try:
         lock_file = open(lock_path, 'a')
 
-        # Acquire exclusive lock (blocks until available)
         logger.debug(f"Acquiring lock: {lock_path}")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if enforce_timeout:
+            start_time = time.time()
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() - start_time > timeout:
+                        raise TimeoutError(
+                            f"Could not acquire lock on {lock_path} within {timeout} seconds"
+                        )
+                    time.sleep(_POLL_INTERVAL_SECONDS)
+        else:
+            # Acquire exclusive lock (blocks until available)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         logger.debug(f"Lock acquired: {lock_path}")
 
         yield

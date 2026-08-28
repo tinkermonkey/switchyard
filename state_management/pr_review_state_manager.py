@@ -66,7 +66,7 @@ class PRReviewStateManager:
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project_name)
-        with file_lock(self._get_lock_file(project_name)):
+        with file_lock(self._get_lock_file(project_name), enforce_timeout=True):
             return self._load_state_unlocked(state_file)
 
     def _save_state(self, project_name: str, data: Dict[str, Any]):
@@ -93,7 +93,7 @@ class PRReviewStateManager:
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project_name)
-        with file_lock(self._get_lock_file(project_name)):
+        with file_lock(self._get_lock_file(project_name), enforce_timeout=True):
             data = self._load_state_unlocked(state_file)
             reviews = data.setdefault("pr_reviews", {})
 
@@ -128,7 +128,7 @@ class PRReviewStateManager:
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project_name)
-        with file_lock(self._get_lock_file(project_name)):
+        with file_lock(self._get_lock_file(project_name), enforce_timeout=True):
             data = self._load_state_unlocked(state_file)
             reviews = data.get("pr_reviews", {})
             issue_data = reviews.get(parent_issue_number)
@@ -176,7 +176,7 @@ class PRReviewStateManager:
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project_name)
-        with file_lock(self._get_lock_file(project_name)):
+        with file_lock(self._get_lock_file(project_name), enforce_timeout=True):
             data = self._load_state_unlocked(state_file)
             reviews = data.setdefault("pr_reviews", {})
             issue_data = reviews.setdefault(parent_issue_number, {"review_count": 0, "iterations": []})

@@ -243,7 +243,7 @@ class ReviewCycleExecutor:
         state_file = self._get_state_file_path(cycle_state.project_name)
         lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
 
-        with file_lock(lock_file):
+        with file_lock(lock_file, enforce_timeout=True):
             # Load existing state
             if os.path.exists(state_file):
                 with open(state_file, 'r') as f:
@@ -287,7 +287,7 @@ class ReviewCycleExecutor:
             return []
 
         lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
-        with file_lock(lock_file):
+        with file_lock(lock_file, enforce_timeout=True):
             if not os.path.exists(state_file):  # Check again inside lock
                 logger.info(f"No active cycles state file found for {project_name}")
                 return []
@@ -312,7 +312,7 @@ class ReviewCycleExecutor:
         state_file = self._get_state_file_path(cycle_state.project_name)
         lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
 
-        with file_lock(lock_file):
+        with file_lock(lock_file, enforce_timeout=True):
             if not os.path.exists(state_file):
                 return
 
@@ -366,7 +366,7 @@ class ReviewCycleExecutor:
             from utils.file_lock import file_lock
             state_file = self._get_state_file_path(project_name)
             lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
-            with file_lock(lock_file):
+            with file_lock(lock_file, enforce_timeout=True):
                 if os.path.exists(state_file):
                     with open(state_file, 'r') as f:
                         data = yaml.safe_load(f) or {}
