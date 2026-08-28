@@ -513,17 +513,30 @@ class DockerAgentRunner:
         )
 
         try:
-            # Start the container and execute Claude Code
-            result_text = await self._execute_in_container(
-                docker_cmd=docker_cmd,
-                prompt=prompt,
-                container_name=container_name,
-                stream_callback=stream_callback,
-                context=context,
-                project_dir=project_dir,
-                image_name=image_name,
-                mcp_config_path=mcp_config_path
-            )
+            # Acquire a tier-0 global concurrency slot immediately before the
+            # actual container execution, and release it as soon as execution
+            # is fully done (success, failure, or timeout) — see
+            # services/agent_container_concurrency.py. Redis-backed so it
+            # coordinates across orchestrator processes; fails open (never
+            # blocks) if Redis is unavailable.
+            from config.environment import load_environment
+            from services.agent_container_concurrency import acquire_agent_container_slot
+            env_config = load_environment()
+
+            async with acquire_agent_container_slot(
+                max_concurrent=env_config.max_concurrent_agent_containers
+            ):
+                # Start the container and execute Claude Code
+                result_text = await self._execute_in_container(
+                    docker_cmd=docker_cmd,
+                    prompt=prompt,
+                    container_name=container_name,
+                    stream_callback=stream_callback,
+                    context=context,
+                    project_dir=project_dir,
+                    image_name=image_name,
+                    mcp_config_path=mcp_config_path
+                )
 
             return result_text
 
