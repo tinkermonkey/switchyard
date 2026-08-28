@@ -193,9 +193,9 @@ class TestGetFeedbackIssueIdsByCycle:
 
 
 class TestConcurrentWrites:
-    """Verify the flock-based locking in _load_state/_save_state (and the
-    read-modify-write methods built on them) prevents lost updates when
-    multiple threads race a save against the same state file."""
+    """Verify the flock-based locking in _load_state_unlocked/_save_state_unlocked
+    (and the read-modify-write methods built on them) prevents lost updates
+    when multiple threads race a save against the same state file."""
 
     def test_concurrent_increments_different_issues_no_lost_updates(self, manager):
         """N threads each increment a different issue's review count concurrently.

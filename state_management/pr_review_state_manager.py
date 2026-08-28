@@ -69,14 +69,6 @@ class PRReviewStateManager:
         with file_lock(self._get_lock_file(project_name), enforce_timeout=True):
             return self._load_state_unlocked(state_file)
 
-    def _save_state(self, project_name: str, data: Dict[str, Any]):
-        """Write state under the file lock, for standalone-write use."""
-        from utils.file_lock import safe_yaml_write
-
-        state_file = self._get_state_file(project_name)
-        with safe_yaml_write(state_file):
-            self._save_state_unlocked(state_file, data)
-
     def get_review_count(self, project_name: str, parent_issue_number: int) -> int:
         """Get the number of review cycles completed for a parent issue."""
         data = self._load_state(project_name)

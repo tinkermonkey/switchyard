@@ -60,13 +60,13 @@ def file_lock(lock_file_path: Union[str, Path], timeout: int = 10, enforce_timeo
 
         logger.debug(f"Acquiring lock: {lock_path}")
         if enforce_timeout:
-            start_time = time.time()
+            start_time = time.monotonic()
             while True:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
-                    if time.time() - start_time > timeout:
+                    if time.monotonic() - start_time > timeout:
                         raise TimeoutError(
                             f"Could not acquire lock on {lock_path} within {timeout} seconds"
                         )

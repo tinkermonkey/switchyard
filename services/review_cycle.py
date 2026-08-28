@@ -1291,8 +1291,6 @@ class ReviewCycleExecutor:
                         logger.info(f"Stored approved commit {current_commit[:8]} for future scoped reviews")
 
                 cycle_state.status = 'completed'
-                self._save_cycle_state(cycle_state)
-
                 self._remove_cycle_state(cycle_state)
                 ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
                 del self.active_cycles[ck]
@@ -1596,7 +1594,6 @@ class ReviewCycleExecutor:
             if review_result_parsed.status == ReviewStatus.BLOCKED:
                 logger.error("Review still blocked after human feedback and reviewer update")
                 cycle_state.status = 'completed'  # Mark as done, needs manual intervention
-                self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
                 ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
                 if ck in self.active_cycles:
@@ -1611,7 +1608,6 @@ class ReviewCycleExecutor:
                     f"Review approved after human feedback in iteration {iteration}"
                 )
                 cycle_state.status = 'completed'
-                self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
                 ck = self._cycle_key(cycle_state.project_name, cycle_state.issue_number)
                 if ck in self.active_cycles:
@@ -2452,7 +2448,6 @@ class ReviewCycleExecutor:
 
                 # Mark cycle as completed and remove from active state
                 cycle_state.status = 'completed'
-                self._save_cycle_state(cycle_state)
                 self._remove_cycle_state(cycle_state)
 
                 # NOTE: Do NOT update PR status here!
