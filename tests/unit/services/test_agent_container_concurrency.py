@@ -226,6 +226,33 @@ class TestStaleTokenPruning:
             await task
 
 
+class TestInvalidMaxConcurrentClamped:
+    """A misconfigured MAX_CONCURRENT_AGENT_CONTAINERS <= 0 must not wedge
+    every future agent launch forever (ZCARD is never negative, so
+    `current < max_concurrent` would never be true)."""
+
+    def test_zero_is_clamped_to_one(self, caplog):
+        with caplog.at_level("ERROR"):
+            limiter = AgentContainerConcurrencyLimiter(max_concurrent=0, redis_client=None)
+        assert limiter.max_concurrent == 1
+        assert any("invalid" in r.message for r in caplog.records)
+
+    def test_negative_is_clamped_to_one(self, caplog):
+        with caplog.at_level("ERROR"):
+            limiter = AgentContainerConcurrencyLimiter(max_concurrent=-3, redis_client=None)
+        assert limiter.max_concurrent == 1
+
+    @pytest.mark.asyncio
+    async def test_clamped_limit_still_acquires_successfully(self):
+        fake_redis = FakeRedisZSet()
+        limiter = AgentContainerConcurrencyLimiter(
+            max_concurrent=0, poll_interval_seconds=0.01, redis_client=fake_redis
+        )
+        token = await asyncio.wait_for(limiter.acquire(), timeout=1)
+        assert token
+        limiter.release(token)
+
+
 class TestOrchestratorWorkersMismatchWarning:
     def test_warns_when_orchestrator_workers_exceeds_cap(self, monkeypatch, caplog):
         monkeypatch.setenv("ORCHESTRATOR_WORKERS", "4")

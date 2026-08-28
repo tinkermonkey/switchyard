@@ -119,6 +119,20 @@ class AgentContainerConcurrencyLimiter:
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         redis_client=_UNSET,
     ):
+        if max_concurrent < 1:
+            # ZCARD is never negative, so a limit <= 0 (e.g. a misconfigured
+            # "0 means unlimited") makes `current < max_concurrent` always
+            # false — every acquire() call would poll forever with no error,
+            # wedging every future agent launch. 0/negative isn't a
+            # meaningful "unlimited" here; clamp to the safe default instead
+            # of hanging the whole orchestrator on a config typo.
+            logger.error(
+                f"agent_container_concurrency: max_concurrent={max_concurrent} is "
+                f"invalid (must be >= 1) — clamping to 1 instead of wedging every "
+                f"agent launch. Check MAX_CONCURRENT_AGENT_CONTAINERS."
+            )
+            max_concurrent = 1
+
         self.max_concurrent = max_concurrent
         self.ttl_seconds = ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
