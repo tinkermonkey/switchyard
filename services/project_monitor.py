@@ -5779,7 +5779,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 try:
                     _ci_config = project_config.ci or {}
                     _skip_ci = not _ci_config.get('enabled', True)
-                    stage = PRReviewStage(name="pr_review", skip_ci_check=_skip_ci)
+                    stage = PRReviewStage(name="pr_review", skip_ci_check=_skip_ci, project_name=project_name)
                     loop.run_until_complete(stage.execute(stage_context))
 
                     # Record success — must match the 'pr_review_stage' outer wrapper name

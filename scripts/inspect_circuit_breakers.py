@@ -38,18 +38,29 @@ def inspect_circuit_breakers():
             data = r.get(key)
             if data:
                 state = json.loads(data)
-                name = state.get('name', 'unknown') # Name might not be in the json, but it is in the key
-                # Extract name from key if needed: circuit_breaker:{name}:state
+                # The JSON body's own 'name' field is authoritative (it's exactly
+                # self.name from services/circuit_breaker.py at save time) — prefer
+                # it over re-deriving from the key. Key-based extraction is only a
+                # fallback for older entries saved without a 'name' field.
+                #
+                # Key format is circuit_breaker:{project}:{agent}:state as of #42
+                # (project:agent_name scoping); circuit_breaker:{agent}:state
+                # (pre-#42) may still be present for up to its 24h TTL after
+                # deploy, so handle both shapes rather than assuming one.
                 key_parts = key.split(':')
-                if len(key_parts) >= 3:
-                    extracted_name = key_parts[1]
+                if len(key_parts) >= 4:
+                    extracted_name = ':'.join(key_parts[1:-1])  # project:agent (colon-joined, in case of nesting)
+                elif len(key_parts) == 3:
+                    extracted_name = key_parts[1]  # pre-#42 bare agent name
                 else:
                     extracted_name = "unknown"
-                
+
+                display_name = state.get('name') or extracted_name
+
                 cb_state = state.get('state', 'unknown')
                 failures = state.get('failure_count', 0)
-                
-                print(f"Name: {extracted_name}")
+
+                print(f"Name: {display_name}")
                 print(f"State: {cb_state}")
                 print(f"Failures: {failures}")
                 print(f"Last Failure: {state.get('last_failure_time')}")
