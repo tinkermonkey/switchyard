@@ -6,6 +6,7 @@ Tests review cycle tracking, persistence, and cycle limit enforcement.
 
 import pytest
 import yaml
+import concurrent.futures
 from pathlib import Path
 from state_management.pr_review_state_manager import PRReviewStateManager
 
@@ -189,3 +190,68 @@ class TestGetFeedbackIssueIdsByCycle:
         manager.increment_review_count("my-project", 55, [20, 21])
         assert manager.get_feedback_issue_ids_by_cycle("my-project", 42) == {1: [10]}
         assert manager.get_feedback_issue_ids_by_cycle("my-project", 55) == {1: [20, 21]}
+
+
+class TestConcurrentWrites:
+    """Verify the flock-based locking in _load_state/_save_state (and the
+    read-modify-write methods built on them) prevents lost updates when
+    multiple threads race a save against the same state file."""
+
+    def test_concurrent_increments_different_issues_no_lost_updates(self, manager):
+        """N threads each increment a different issue's review count concurrently.
+        Without locking spanning the full read-modify-write, later writers can
+        overwrite earlier writers' issue entries with stale data, silently
+        dropping them from pr_reviews."""
+        issue_numbers = list(range(1, 31))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(issue_numbers)) as executor:
+            futures = [
+                executor.submit(manager.increment_review_count, "my-project", issue, [issue * 10])
+                for issue in issue_numbers
+            ]
+            concurrent.futures.wait(futures)
+            for f in futures:
+                f.result()  # re-raise any exception
+
+        for issue in issue_numbers:
+            assert manager.get_review_count("my-project", issue) == 1, (
+                f"Lost update: issue #{issue} missing or has wrong count"
+            )
+
+    def test_concurrent_increments_same_issue_no_lost_updates(self, manager):
+        """N threads increment the SAME issue's review count concurrently.
+        A lost update here would leave the final review_count and iteration
+        history short of N entries."""
+        n = 25
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+            futures = [
+                executor.submit(manager.increment_review_count, "my-project", 42, [i])
+                for i in range(n)
+            ]
+            concurrent.futures.wait(futures)
+            for f in futures:
+                f.result()
+
+        assert manager.get_review_count("my-project", 42) == n
+        history = manager.get_review_history("my-project", 42)
+        assert len(history) == n
+        # Iteration numbers must be a contiguous run 1..n with no duplicates/gaps
+        assert sorted(h["iteration"] for h in history) == list(range(1, n + 1))
+
+    def test_state_file_not_corrupted_by_concurrent_writes(self, manager, tmp_state_dir):
+        """The on-disk YAML must remain valid after concurrent writers race it."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [
+                executor.submit(manager.increment_review_count, "my-project", i, [])
+                for i in range(10)
+            ]
+            concurrent.futures.wait(futures)
+            for f in futures:
+                f.result()
+
+        state_file = tmp_state_dir / "my-project" / "pr_review_state.yaml"
+        with open(state_file) as f:
+            data = yaml.safe_load(f)  # must not raise
+
+        assert len(data["pr_reviews"]) == 10

@@ -233,39 +233,43 @@ class ReviewCycleExecutor:
         """Persist cycle state to disk"""
         import yaml
         import os
+        from pathlib import Path
         from datetime import datetime
+        from utils.file_lock import file_lock
 
         # Update timestamp
         cycle_state.updated_at = datetime.now().isoformat()
 
         state_file = self._get_state_file_path(cycle_state.project_name)
+        lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
 
-        # Load existing state
-        if os.path.exists(state_file):
-            with open(state_file, 'r') as f:
-                data = yaml.safe_load(f) or {}
-        else:
-            data = {}
+        with file_lock(lock_file):
+            # Load existing state
+            if os.path.exists(state_file):
+                with open(state_file, 'r') as f:
+                    data = yaml.safe_load(f) or {}
+            else:
+                data = {}
 
-        # Initialize active_cycles if not present
-        if 'active_cycles' not in data:
-            data['active_cycles'] = []
+            # Initialize active_cycles if not present
+            if 'active_cycles' not in data:
+                data['active_cycles'] = []
 
-        # Update or add this cycle
-        cycle_dict = cycle_state.to_dict()
-        updated = False
-        for i, existing in enumerate(data['active_cycles']):
-            if existing['issue_number'] == cycle_state.issue_number:
-                data['active_cycles'][i] = cycle_dict
-                updated = True
-                break
+            # Update or add this cycle
+            cycle_dict = cycle_state.to_dict()
+            updated = False
+            for i, existing in enumerate(data['active_cycles']):
+                if existing['issue_number'] == cycle_state.issue_number:
+                    data['active_cycles'][i] = cycle_dict
+                    updated = True
+                    break
 
-        if not updated:
-            data['active_cycles'].append(cycle_dict)
+            if not updated:
+                data['active_cycles'].append(cycle_dict)
 
-        # Write back
-        with open(state_file, 'w') as f:
-            yaml.dump(data, f, default_flow_style=False)
+            # Write back
+            with open(state_file, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
 
         logger.info(f"Saved cycle state for issue {cycle_state.issue_number} (status: {cycle_state.status})")
 
@@ -273,6 +277,8 @@ class ReviewCycleExecutor:
         """Load active cycles from disk for a project"""
         import yaml
         import os
+        from pathlib import Path
+        from utils.file_lock import file_lock
 
         state_file = self._get_state_file_path(project_name)
 
@@ -280,8 +286,13 @@ class ReviewCycleExecutor:
             logger.info(f"No active cycles state file found for {project_name}")
             return []
 
-        with open(state_file, 'r') as f:
-            data = yaml.safe_load(f) or {}
+        lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
+        with file_lock(lock_file):
+            if not os.path.exists(state_file):  # Check again inside lock
+                logger.info(f"No active cycles state file found for {project_name}")
+                return []
+            with open(state_file, 'r') as f:
+                data = yaml.safe_load(f) or {}
 
         cycles = []
         for cycle_data in data.get('active_cycles', []):
@@ -295,24 +306,28 @@ class ReviewCycleExecutor:
         """Remove a completed cycle from active state and clean up its context directory."""
         import yaml
         import os
+        from pathlib import Path
+        from utils.file_lock import file_lock
 
         state_file = self._get_state_file_path(cycle_state.project_name)
+        lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
 
-        if not os.path.exists(state_file):
-            return
+        with file_lock(lock_file):
+            if not os.path.exists(state_file):
+                return
 
-        with open(state_file, 'r') as f:
-            data = yaml.safe_load(f) or {}
+            with open(state_file, 'r') as f:
+                data = yaml.safe_load(f) or {}
 
-        # Remove this cycle
-        data['active_cycles'] = [
-            c for c in data.get('active_cycles', [])
-            if c['issue_number'] != cycle_state.issue_number
-        ]
+            # Remove this cycle
+            data['active_cycles'] = [
+                c for c in data.get('active_cycles', [])
+                if c['issue_number'] != cycle_state.issue_number
+            ]
 
-        # Write back
-        with open(state_file, 'w') as f:
-            yaml.dump(data, f, default_flow_style=False)
+            # Write back
+            with open(state_file, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
 
         # Clean up the file-based context directory (best-effort), deferred by 15 minutes.
         # The deferral outlasts the circuit breaker recovery window (10 min) so that maker
@@ -347,16 +362,20 @@ class ReviewCycleExecutor:
         else:
             # Cycle may only exist on disk (e.g. after an orchestrator restart)
             import yaml, os
+            from pathlib import Path
+            from utils.file_lock import file_lock
             state_file = self._get_state_file_path(project_name)
-            if os.path.exists(state_file):
-                with open(state_file, 'r') as f:
-                    data = yaml.safe_load(f) or {}
-                updated = [c for c in data.get('active_cycles', []) if c['issue_number'] != issue_number]
-                if len(updated) != len(data.get('active_cycles', [])):
-                    data['active_cycles'] = updated
-                    with open(state_file, 'w') as f:
-                        yaml.dump(data, f, default_flow_style=False)
-                    logger.info(f"Cleared on-disk review cycle state for issue #{issue_number} in {project_name}")
+            lock_file = Path(state_file).with_suffix(Path(state_file).suffix + '.lock')
+            with file_lock(lock_file):
+                if os.path.exists(state_file):
+                    with open(state_file, 'r') as f:
+                        data = yaml.safe_load(f) or {}
+                    updated = [c for c in data.get('active_cycles', []) if c['issue_number'] != issue_number]
+                    if len(updated) != len(data.get('active_cycles', [])):
+                        data['active_cycles'] = updated
+                        with open(state_file, 'w') as f:
+                            yaml.dump(data, f, default_flow_style=False)
+                        logger.info(f"Cleared on-disk review cycle state for issue #{issue_number} in {project_name}")
 
     async def resume_active_cycles(self, project_name: str, org: str):
         """
