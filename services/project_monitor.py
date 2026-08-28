@@ -578,6 +578,12 @@ class ProjectMonitor:
         import threading
         self.rescan_complete = threading.Event()
 
+        # Guards concurrent access to self.last_state: the polling loop's
+        # detect_changes() writes it on its own cadence while _reconcile_active_runs()
+        # and _rescan_boards_for_stalled_items() read it during reconciliation/rescan.
+        # In-process only (no cross-process contention), so a plain Lock is sufficient.
+        self._last_state_lock = threading.Lock()
+
         # Initialize feedback manager
         from services.feedback_manager import FeedbackManager
         self.feedback_manager = FeedbackManager()
@@ -952,8 +958,9 @@ class ProjectMonitor:
         # Create lookup by issue number for current items
         current_by_issue = {item.issue_number: item for item in current_items}
 
-        # Get last known state
-        last_items = self.last_state.get(project_name, {})
+        # Get last known state (snapshot under lock; diffing below runs unlocked)
+        with self._last_state_lock:
+            last_items = dict(self.last_state.get(project_name, {}))
 
         # Check for status changes
         for issue_number, current_item in current_by_issue.items():
@@ -1016,7 +1023,8 @@ class ProjectMonitor:
                     )
 
         # Update last state
-        self.last_state[project_name] = current_by_issue
+        with self._last_state_lock:
+            self.last_state[project_name] = current_by_issue
 
         return changes
 
@@ -6333,10 +6341,10 @@ _Repair cycle initiated by Switchyard_
                         continue
 
                     board_key = f"{project_name}_{pipeline.board_name}"
-                    if board_key not in self.last_state:
-                        continue
-
-                    current_items = self.last_state[board_key].values()
+                    with self._last_state_lock:
+                        if board_key not in self.last_state:
+                            continue
+                        current_items = list(self.last_state[board_key].values())
                     workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
 
                     for item in current_items:
@@ -6602,10 +6610,10 @@ _Repair cycle initiated by Switchyard_
 
                     # Get current items on the board
                     board_key = f"{project_name}_{pipeline.board_name}"
-                    if board_key not in self.last_state:
-                        continue
-
-                    current_items = self.last_state[board_key].values()
+                    with self._last_state_lock:
+                        if board_key not in self.last_state:
+                            continue
+                        current_items = list(self.last_state[board_key].values())
 
                     for item in current_items:
                         # Find column config
