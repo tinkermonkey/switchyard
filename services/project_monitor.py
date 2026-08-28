@@ -1021,93 +1021,42 @@ class ProjectMonitor:
         return changes
 
     def get_issue_details(self, repository: str, issue_number: int, org: str) -> Dict[str, Any]:
-        """Fetch full issue details from GitHub"""
-        try:
-            result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
-                capture_output=True, text=True, check=True
-            )
-            return json.loads(result.stdout)
-        except Exception as e:
-            logger.error(f"Error fetching issue #{issue_number} details: {e}")
-            return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
+        """Fetch full issue details from GitHub.
 
-    def get_issue_or_discussion_details(self, repository: str, issue_number: int, org: str,
-                                         project_name: str = None, discussion_id: str = None) -> Dict[str, Any]:
-        """Fetch full issue/discussion content, preferring a linked GitHub Discussion's
-        real content over get_issue_details() when one exists.
-
-        get_issue_details() shells out to `gh issue view`, which fails whenever this
-        item is actually a GitHub Discussion rather than an Issue (a discussion number
-        doesn't resolve via that API) — its exception handler then silently returns a
-        placeholder ({'title': f'Issue #{issue_number}', 'body': ''}) that looks
-        superficially valid but breaks any downstream consumer that treats an empty
-        body as a hard failure condition (e.g. the empty-description guard in
-        agent_executor.py, which halts the pipeline believing the real content is
-        empty). When this issue number has a discussion linked via state_manager (or
-        discussion_id is already known to the caller), fetch and use the discussion's
-        real title/body/url/state instead of shelling out to `gh issue view`.
-
-        Caveats:
-        - If a discussion is linked but its GraphQL fetch itself fails (deleted
-          discussion, transient API error), this still falls back to
-          get_issue_details() and can therefore still hit the empty-body placeholder
-          described above — the fallback narrows how often that happens, it doesn't
-          eliminate it.
-        - Discussions have no labels, so 'labels' is always [] on this path.
+        Retries transient `gh` CLI failures before giving up. Confirmed root
+        cause in production (pipeline run bc70ac46, issue #941): five
+        projects' boards syncing in the same second produced an empty-stdout
+        response from `gh issue view` for a real, non-empty issue, which
+        json.loads('') turned into "Expecting value: line 1 column 1
+        (char 0)" — nothing to do with the issue's actual content. On
+        exhausted retries, raises instead of returning a placeholder
+        ({'title': f'Issue #{issue_number}', 'body': ''}) that is
+        indistinguishable from a genuinely-empty issue: silently returning
+        that placeholder let pipelines proceed on fabricated data and trip
+        the downstream empty-description guard with a misleading message,
+        instead of surfacing the real fetch failure to the caller.
         """
-        resolved_discussion_id = discussion_id
-        if not resolved_discussion_id and project_name:
+        last_error = None
+        for attempt in range(3):
             try:
-                from config.state_manager import state_manager
-            except ImportError as e:
-                logger.error(
-                    f"Failed to import state_manager while checking issue #{issue_number} "
-                    f"for a linked discussion: {e}", exc_info=True
+                result = subprocess.run(
+                    ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
+                    capture_output=True, text=True, check=True
                 )
-                state_manager = None
-
-            if state_manager is not None:
-                try:
-                    resolved_discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
-                except Exception as e:
-                    # Deliberately NOT debug-level: swallowing this and proceeding as if no
-                    # discussion were linked falls straight through to get_issue_details(),
-                    # silently reproducing the exact empty-body placeholder bug this method
-                    # exists to avoid — that needs to be discoverable in logs, not buried.
+                return json.loads(result.stdout)
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
                     logger.warning(
-                        f"Unexpected error checking issue #{issue_number} for a linked discussion — "
-                        f"proceeding as if none is linked, which may reintroduce the empty-body "
-                        f"placeholder from get_issue_details(): {e}", exc_info=True
+                        f"Transient failure fetching issue #{issue_number} details "
+                        f"(attempt {attempt + 1}/3): {e}; retrying"
                     )
+                    time.sleep(0.5 * (attempt + 1))
 
-        if resolved_discussion_id:
-            discussion = self.discussions.get_discussion(resolved_discussion_id)
-            if discussion:
-                body = discussion.get('body') or ''
-                if not body:
-                    logger.warning(
-                        f"Discussion {resolved_discussion_id} linked to issue #{issue_number} was "
-                        f"fetched successfully but has an empty body; downstream empty-description "
-                        f"handling may still trigger."
-                    )
-                return {
-                    'title': discussion.get('title') or f'Issue #{issue_number}',
-                    'body': body,
-                    'url': discussion.get('url', ''),
-                    'number': discussion.get('number', issue_number),
-                    'labels': [],
-                    'state': 'CLOSED' if discussion.get('closed') else 'OPEN',
-                    'author': discussion.get('author', {}),
-                    'createdAt': discussion.get('createdAt', ''),
-                    'updatedAt': discussion.get('updatedAt', ''),
-                }
-            logger.warning(
-                f"Discussion {resolved_discussion_id} linked to issue #{issue_number} could not "
-                f"be fetched from GitHub; falling back to get_issue_details()"
-            )
-
-        return self.get_issue_details(repository, issue_number, org)
+        logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
+        raise RuntimeError(
+            f"Could not fetch issue #{issue_number} details from GitHub after 3 attempts: {last_error}"
+        ) from last_error
 
     def get_previous_stage_context(self, repository: str, issue_number: int, org: str,
                                    current_column: str, workflow_template,
@@ -1977,9 +1926,7 @@ class ProjectMonitor:
             workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
 
             # DEFENSIVE: Check if issue is open before triggering any agents
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
             issue_state = issue_data.get('state', '').upper()
 
             if issue_state == 'CLOSED':
@@ -2284,10 +2231,7 @@ class ProjectMonitor:
 
                 # Get or create pipeline run early so we can tag all events
                 # Fetch issue details for pipeline run
-                issue_data_early = self.get_issue_or_discussion_details(
-                    repository, issue_number, project_config.github['org'],
-                    project_name=project_name, discussion_id=discussion_id
-                )
+                issue_data_early = self.get_issue_details(repository, issue_number, project_config.github['org'])
                 pipeline_run, pipeline_run_was_created = self.pipeline_run_manager.get_or_create_pipeline_run(
                     issue_number=issue_number,
                     issue_title=issue_data_early.get('title', f'Issue #{issue_number}'),
@@ -2506,10 +2450,7 @@ class ProjectMonitor:
                                                     org=project_config.github['org'],
                                                     discussion_id=discussion_id,
                                                     column=column,
-                                                    issue_data=self.get_issue_or_discussion_details(
-                                                        repository, issue_number, project_config.github['org'],
-                                                        project_name=project_name, discussion_id=discussion_id
-                                                    ),
+                                                    issue_data=self.get_issue_details(repository, issue_number, project_config.github['org']),
                                                     workflow_columns=workflow_template.columns
                                                 )
                                             )
@@ -2656,10 +2597,7 @@ class ProjectMonitor:
                                             human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
-                                            issue_data = self.get_issue_or_discussion_details(
-                                                repository, issue_number, project_config.github['org'],
-                                                project_name=project_name, discussion_id=discussion_id
-                                            )
+                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
                                             loop.run_until_complete(
                                                 human_feedback_loop_executor._conversational_loop(
@@ -2771,10 +2709,7 @@ class ProjectMonitor:
                                             human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
-                                            issue_data = self.get_issue_or_discussion_details(
-                                                repository, issue_number, project_config.github['org'],
-                                                project_name=project_name, discussion_id=discussion_id
-                                            )
+                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
                                             loop_new.run_until_complete(
                                                 human_feedback_loop_executor._conversational_loop(
@@ -4206,9 +4141,7 @@ class ProjectMonitor:
             human_feedback_loop_executor.request_stop(project_name, issue_number, reason="column_changed")
 
             # Get issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -4510,9 +4443,7 @@ class ProjectMonitor:
             from services.review_cycle import review_cycle_executor
 
             # Get issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get previous stage context (maker's output)
             workspace_type = pipeline_config.workspace
@@ -4855,11 +4786,10 @@ _Review cycle initiated by Switchyard_
 
                                                 # Fetch issue details for pipeline run
                                                 try:
-                                                    next_issue_data = self.get_issue_or_discussion_details(
+                                                    next_issue_data = self.get_issue_details(
                                                         project_config.github['repo'],
                                                         next_issue['issue_number'],
-                                                        project_config.github['org'],
-                                                        project_name=project_name
+                                                        project_config.github['org']
                                                     )
                                                 except Exception as issue_fetch_error:
                                                     logger.warning(
@@ -5771,9 +5701,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
 
             # Get issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -6047,9 +5975,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         return None
 
             # Get issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -8039,9 +7965,7 @@ _Repair cycle initiated by Switchyard_
         """Create a task to handle feedback for an agent"""
         try:
             # Fetch full issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'], project_name=project_name
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # DEFENSIVE: Check if issue is open before creating feedback task
             issue_state = issue_data.get('state', '').upper()
@@ -8361,11 +8285,7 @@ _Repair cycle initiated by Switchyard_
                 logger.info(f"Discussion {existing_id} already linked, aborting creation")
                 return
 
-            # Fetch issue details.
-            # NOTE: intentionally get_issue_details(), not get_issue_or_discussion_details() —
-            # the early return above already guarantees no discussion is linked yet, so the
-            # discussion-lookup branch could never resolve here; it would only add a redundant
-            # state-file read.
+            # Fetch issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # Get discussion category
@@ -9413,10 +9333,7 @@ Moving to implementation phase.
         """Create a task to handle feedback for an agent (from discussion)"""
         try:
             # Fetch full issue details
-            issue_data = self.get_issue_or_discussion_details(
-                repository, issue_number, project_config.github['org'],
-                project_name=project_name, discussion_id=discussion_id
-            )
+            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
 
             # DEFENSIVE: Check if issue is open before creating feedback task
             issue_state = issue_data.get('state', '').upper()

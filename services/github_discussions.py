@@ -324,7 +324,6 @@ class GitHubDiscussions:
               title
               body
               url
-              closed
               createdAt
               updatedAt
               author {
