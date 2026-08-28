@@ -246,7 +246,7 @@ class RepairCycleStage(PipelineStage):
         # Get observability manager and emit lifecycle events
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Emit task received event (repair cycle as a composite agent)
@@ -484,7 +484,7 @@ class RepairCycleStage(PipelineStage):
         # Emit test cycle started event
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         if obs:
@@ -965,7 +965,7 @@ class RepairCycleStage(PipelineStage):
         # Get observability manager
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Emit test execution started event
@@ -1333,7 +1333,7 @@ class RepairCycleStage(PipelineStage):
         # Get observability manager
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Get AgentExecutor
@@ -1497,7 +1497,7 @@ class RepairCycleStage(PipelineStage):
         # Get observability manager
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Get AgentExecutor
@@ -1841,7 +1841,7 @@ class RepairCycleStage(PipelineStage):
             return
 
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", "unknown")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         # Emit performance metrics using the standard emit_performance_metric method
@@ -1921,7 +1921,7 @@ class RepairCycleStage(PipelineStage):
 
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         if obs:
@@ -2123,7 +2123,7 @@ class RepairCycleStage(PipelineStage):
 
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
         issue_number = context.get("issue_number")
 
@@ -2416,7 +2416,7 @@ class RepairCycleStage(PipelineStage):
         """
         obs = context.get("observability")
         project = context.get("project", "unknown")
-        task_id = context.get("task_id", f"repair_cycle_{self.name}")
+        task_id = context.get("task_id", f"repair_cycle_{context.get('issue_number', 'unknown')}_{self.name}")
         pipeline_run_id = context.get("pipeline_run_id")
 
         if obs:
