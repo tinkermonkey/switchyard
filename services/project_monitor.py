@@ -1021,16 +1021,42 @@ class ProjectMonitor:
         return changes
 
     def get_issue_details(self, repository: str, issue_number: int, org: str) -> Dict[str, Any]:
-        """Fetch full issue details from GitHub"""
-        try:
-            result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
-                capture_output=True, text=True, check=True
-            )
-            return json.loads(result.stdout)
-        except Exception as e:
-            logger.error(f"Error fetching issue #{issue_number} details: {e}")
-            return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
+        """Fetch full issue details from GitHub.
+
+        Retries transient `gh` CLI failures before giving up. Confirmed root
+        cause in production (pipeline run bc70ac46, issue #941): five
+        projects' boards syncing in the same second produced an empty-stdout
+        response from `gh issue view` for a real, non-empty issue, which
+        json.loads('') turned into "Expecting value: line 1 column 1
+        (char 0)" — nothing to do with the issue's actual content. On
+        exhausted retries, raises instead of returning a placeholder
+        ({'title': f'Issue #{issue_number}', 'body': ''}) that is
+        indistinguishable from a genuinely-empty issue: silently returning
+        that placeholder let pipelines proceed on fabricated data and trip
+        the downstream empty-description guard with a misleading message,
+        instead of surfacing the real fetch failure to the caller.
+        """
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
+                    capture_output=True, text=True, check=True
+                )
+                return json.loads(result.stdout)
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    logger.warning(
+                        f"Transient failure fetching issue #{issue_number} details "
+                        f"(attempt {attempt + 1}/3): {e}; retrying"
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+
+        logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
+        raise RuntimeError(
+            f"Could not fetch issue #{issue_number} details from GitHub after 3 attempts: {last_error}"
+        ) from last_error
 
     def get_previous_stage_context(self, repository: str, issue_number: int, org: str,
                                    current_column: str, workflow_template,

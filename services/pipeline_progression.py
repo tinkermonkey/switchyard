@@ -386,16 +386,35 @@ class PipelineProgression:
             return False
 
     def _get_issue_details(self, repository: str, issue_number: int, org: str) -> Dict[str, Any]:
-        """Fetch full issue details from GitHub"""
-        try:
-            result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
-                capture_output=True, text=True, check=True
-            )
-            return json.loads(result.stdout)
-        except Exception as e:
-            logger.error(f"Error fetching issue #{issue_number} details: {e}")
-            return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
+        """Fetch full issue details from GitHub.
+
+        Retries transient `gh` CLI failures before giving up — see
+        ProjectMonitor.get_issue_details() for the confirmed production
+        incident (bc70ac46) this mirrors. On exhausted retries, raises
+        instead of returning a placeholder indistinguishable from a
+        genuinely-empty issue.
+        """
+        last_error = None
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
+                    capture_output=True, text=True, check=True
+                )
+                return json.loads(result.stdout)
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    logger.warning(
+                        f"Transient failure fetching issue #{issue_number} details "
+                        f"(attempt {attempt + 1}/3): {e}; retrying"
+                    )
+                    time.sleep(0.5 * (attempt + 1))
+
+        logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
+        raise RuntimeError(
+            f"Could not fetch issue #{issue_number} details from GitHub after 3 attempts: {last_error}"
+        ) from last_error
 
     def _release_lock_and_process_next(self, project_name: str, board_name: str, issue_number: int, 
                                       exit_column: str, repository: str):
