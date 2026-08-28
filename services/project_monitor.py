@@ -1032,6 +1032,50 @@ class ProjectMonitor:
             logger.error(f"Error fetching issue #{issue_number} details: {e}")
             return {'title': f'Issue #{issue_number}', 'body': '', 'labels': []}
 
+    def get_issue_or_discussion_details(self, repository: str, issue_number: int, org: str,
+                                         project_name: str = None, discussion_id: str = None) -> Dict[str, Any]:
+        """Fetch full issue/discussion content, preferring a linked GitHub Discussion's
+        real content over get_issue_details() when one exists.
+
+        get_issue_details() shells out to `gh issue view`, which fails whenever this
+        item is actually a GitHub Discussion rather than an Issue (a discussion number
+        doesn't resolve via that API) — its exception handler then silently returns a
+        placeholder ({'title': f'Issue #{issue_number}', 'body': ''}) that looks
+        superficially valid but breaks any downstream consumer expecting real content
+        (e.g. the empty-description guard in agent_executor.py, which halts the
+        pipeline believing the real issue/discussion body is empty). When this issue
+        number has a discussion linked via state_manager (or discussion_id is already
+        known to the caller), fetch and use the discussion's real title/body/url
+        instead of shelling out to `gh issue view`.
+        """
+        resolved_discussion_id = discussion_id
+        if not resolved_discussion_id and project_name:
+            try:
+                from config.state_manager import state_manager
+                resolved_discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+            except Exception as e:
+                logger.debug(f"Could not check for a discussion linked to issue #{issue_number}: {e}")
+
+        if resolved_discussion_id:
+            discussion = self.discussions.get_discussion(resolved_discussion_id)
+            if discussion:
+                return {
+                    'title': discussion.get('title') or f'Issue #{issue_number}',
+                    'body': discussion.get('body') or '',
+                    'url': discussion.get('url', ''),
+                    'number': discussion.get('number', issue_number),
+                    'labels': [],
+                    'author': discussion.get('author', {}),
+                    'createdAt': discussion.get('createdAt', ''),
+                    'updatedAt': discussion.get('updatedAt', ''),
+                }
+            logger.warning(
+                f"Discussion {resolved_discussion_id} linked to issue #{issue_number} could not "
+                f"be fetched from GitHub; falling back to get_issue_details()"
+            )
+
+        return self.get_issue_details(repository, issue_number, org)
+
     def get_previous_stage_context(self, repository: str, issue_number: int, org: str,
                                    current_column: str, workflow_template,
                                    workspace_type: str = 'issues',
@@ -1900,7 +1944,9 @@ class ProjectMonitor:
             workflow_template = self.config_manager.get_workflow_template(pipeline_config.workflow)
 
             # DEFENSIVE: Check if issue is open before triggering any agents
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
             issue_state = issue_data.get('state', '').upper()
 
             if issue_state == 'CLOSED':
@@ -2205,7 +2251,10 @@ class ProjectMonitor:
 
                 # Get or create pipeline run early so we can tag all events
                 # Fetch issue details for pipeline run
-                issue_data_early = self.get_issue_details(repository, issue_number, project_config.github['org'])
+                issue_data_early = self.get_issue_or_discussion_details(
+                    repository, issue_number, project_config.github['org'],
+                    project_name=project_name, discussion_id=discussion_id
+                )
                 pipeline_run, pipeline_run_was_created = self.pipeline_run_manager.get_or_create_pipeline_run(
                     issue_number=issue_number,
                     issue_title=issue_data_early.get('title', f'Issue #{issue_number}'),
@@ -2424,7 +2473,10 @@ class ProjectMonitor:
                                                     org=project_config.github['org'],
                                                     discussion_id=discussion_id,
                                                     column=column,
-                                                    issue_data=self.get_issue_details(repository, issue_number, project_config.github['org']),
+                                                    issue_data=self.get_issue_or_discussion_details(
+                                                        repository, issue_number, project_config.github['org'],
+                                                        project_name=project_name, discussion_id=discussion_id
+                                                    ),
                                                     workflow_columns=workflow_template.columns
                                                 )
                                             )
@@ -2571,7 +2623,10 @@ class ProjectMonitor:
                                             human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
-                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+                                            issue_data = self.get_issue_or_discussion_details(
+                                                repository, issue_number, project_config.github['org'],
+                                                project_name=project_name, discussion_id=discussion_id
+                                            )
 
                                             loop.run_until_complete(
                                                 human_feedback_loop_executor._conversational_loop(
@@ -2683,7 +2738,10 @@ class ProjectMonitor:
                                             human_feedback_loop_executor.active_loops[lk] = state
                                             human_feedback_loop_executor.workflow_columns = workflow_template.columns
 
-                                            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+                                            issue_data = self.get_issue_or_discussion_details(
+                                                repository, issue_number, project_config.github['org'],
+                                                project_name=project_name, discussion_id=discussion_id
+                                            )
 
                                             loop_new.run_until_complete(
                                                 human_feedback_loop_executor._conversational_loop(
@@ -4115,7 +4173,9 @@ class ProjectMonitor:
             human_feedback_loop_executor.request_stop(project_name, issue_number, reason="column_changed")
 
             # Get issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -4417,7 +4477,9 @@ class ProjectMonitor:
             from services.review_cycle import review_cycle_executor
 
             # Get issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # Get previous stage context (maker's output)
             workspace_type = pipeline_config.workspace
@@ -4760,10 +4822,11 @@ _Review cycle initiated by Switchyard_
 
                                                 # Fetch issue details for pipeline run
                                                 try:
-                                                    next_issue_data = self.get_issue_details(
+                                                    next_issue_data = self.get_issue_or_discussion_details(
                                                         project_config.github['repo'],
                                                         next_issue['issue_number'],
-                                                        project_config.github['org']
+                                                        project_config.github['org'],
+                                                        project_name=project_name
                                                     )
                                                 except Exception as issue_fetch_error:
                                                     logger.warning(
@@ -5675,7 +5738,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
 
             # Get issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -5949,7 +6014,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         return None
 
             # Get issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # Get workspace info
             workspace_type = pipeline_config.workspace
@@ -7939,7 +8006,9 @@ _Repair cycle initiated by Switchyard_
         """Create a task to handle feedback for an agent"""
         try:
             # Fetch full issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # DEFENSIVE: Check if issue is open before creating feedback task
             issue_state = issue_data.get('state', '').upper()
@@ -8260,7 +8329,9 @@ _Repair cycle initiated by Switchyard_
                 return
 
             # Fetch issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'], project_name=project_name
+            )
 
             # Get discussion category
             # Use first discussion stage if available, otherwise 'initial'
@@ -9307,7 +9378,10 @@ Moving to implementation phase.
         """Create a task to handle feedback for an agent (from discussion)"""
         try:
             # Fetch full issue details
-            issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
+            issue_data = self.get_issue_or_discussion_details(
+                repository, issue_number, project_config.github['org'],
+                project_name=project_name, discussion_id=discussion_id
+            )
 
             # DEFENSIVE: Check if issue is open before creating feedback task
             issue_state = issue_data.get('state', '').upper()
