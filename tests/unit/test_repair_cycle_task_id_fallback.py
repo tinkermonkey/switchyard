@@ -100,6 +100,26 @@ class TestEmitCycleMetricsTaskIdFallback:
         task_id_b = obs_b.emit_performance_metric.call_args_list[0].kwargs["task_id"]
         assert task_id_a != task_id_b
 
+    def test_explicit_none_issue_number_falls_back_to_unknown_string(self):
+        """context.get('issue_number', 'unknown') only substitutes on a MISSING
+        key, not on a present-but-None value — context['issue_number'] = None
+        would otherwise produce the literal substring "None" instead of
+        "unknown", and (worse) would let two concurrent cycles that both have
+        issue_number=None collide on the same fallback task_id."""
+        stage = _make_stage()
+        obs = MagicMock()
+        context = {
+            "observability": obs,
+            "project": "test_project",
+            "issue_number": None,
+        }
+
+        stage._emit_cycle_metrics(_make_cycle_result(), context)
+
+        used_task_id = obs.emit_performance_metric.call_args_list[0].kwargs["task_id"]
+        assert "None" not in used_task_id
+        assert "unknown" in used_task_id
+
 
 class TestExecuteTaskIdFallback:
     """Covers the primary pattern: context.get("task_id", f"repair_cycle_{self.name}")."""
