@@ -51,6 +51,21 @@ DEFAULT_TTL_SECONDS = 14400  # 4 hours
 # How often to poll for a free slot while blocked at capacity.
 DEFAULT_POLL_INTERVAL_SECONDS = 2
 
+# Atomically prune stale entries, check capacity, and add the new token — all
+# in one server-side operation, so there is no gap between checking capacity
+# and claiming a slot for a concurrent caller to race into (see acquire()).
+# KEYS[1] = REDIS_KEY, ARGV = [cutoff, max_concurrent, token, now]
+_ACQUIRE_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local current = redis.call('ZCARD', KEYS[1])
+if current < tonumber(ARGV[2]) then
+    redis.call('ZADD', KEYS[1], ARGV[4], ARGV[3])
+    return 1
+else
+    return 0
+end
+"""
+
 # Sentinel distinguishing "no redis_client argument passed, go discover one
 # via _get_redis_client()" from "redis_client=None passed explicitly, meaning
 # Redis is known to be unavailable" (used by tests to simulate an outage
@@ -108,6 +123,25 @@ class AgentContainerConcurrencyLimiter:
         self.ttl_seconds = ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
 
+        # ORCHESTRATOR_WORKERS and MAX_CONCURRENT_AGENT_CONTAINERS are
+        # independent settings that can silently contradict each other: a
+        # deployment configured for N-way worker parallelism would have every
+        # container launch serialize down to this cap regardless. Neither
+        # setting is authoritative over the other, so just surface the
+        # mismatch rather than silently throttling with no explanation.
+        try:
+            orchestrator_workers = int(os.environ.get('ORCHESTRATOR_WORKERS', 1))
+            if orchestrator_workers > self.max_concurrent:
+                logger.warning(
+                    f"agent_container_concurrency: ORCHESTRATOR_WORKERS="
+                    f"{orchestrator_workers} exceeds max_concurrent_agent_containers="
+                    f"{self.max_concurrent} — container launches will serialize "
+                    f"below the configured worker parallelism. Raise "
+                    f"MAX_CONCURRENT_AGENT_CONTAINERS if that's not intended."
+                )
+        except (TypeError, ValueError):
+            pass  # malformed env var — not this module's job to validate it
+
         if redis_client is _UNSET:
             self.redis_client = _get_redis_client()
         else:
@@ -120,11 +154,6 @@ class AgentContainerConcurrencyLimiter:
                 "agent_container_concurrency: Redis unavailable — concurrency "
                 "cap is fail-open (disabled) until Redis is reachable again"
             )
-
-    def _prune_stale(self) -> None:
-        """Remove tokens older than ttl_seconds so crashed holders self-heal."""
-        cutoff = time.time() - self.ttl_seconds
-        self.redis_client.zremrangebyscore(REDIS_KEY, "-inf", cutoff)
 
     async def acquire(self) -> str:
         """
@@ -141,10 +170,26 @@ class AgentContainerConcurrencyLimiter:
 
         while True:
             try:
-                self._prune_stale()
-                current = self.redis_client.zcard(REDIS_KEY)
-                if current < self.max_concurrent:
-                    self.redis_client.zadd(REDIS_KEY, {token: time.time()})
+                # Prune + capacity-check + add must happen as one atomic
+                # server-side operation: a separate ZCARD-then-ZADD is a
+                # classic TOCTOU race — two concurrent callers can both
+                # observe capacity free and both add a token, silently
+                # exceeding max_concurrent (the whole point of this
+                # primitive). EVAL runs the script atomically on the Redis
+                # server (single-threaded execution model), so there is no
+                # window between the check and the add.
+                cutoff = time.time() - self.ttl_seconds
+                now = time.time()
+                acquired = self.redis_client.eval(
+                    _ACQUIRE_SCRIPT,
+                    1,
+                    REDIS_KEY,
+                    cutoff,
+                    self.max_concurrent,
+                    token,
+                    now,
+                )
+                if acquired:
                     return token
             except Exception as e:
                 # Redis became unreachable mid-operation (or some other

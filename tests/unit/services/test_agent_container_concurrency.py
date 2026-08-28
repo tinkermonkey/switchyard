@@ -45,6 +45,19 @@ class FakeRedisZSet:
         for m in stale:
             del self._scores[m]
 
+    def eval(self, script, numkeys, key, cutoff, max_concurrent, token, now):
+        """Emulate _ACQUIRE_SCRIPT's atomic prune+check+add against this
+        in-memory store (a real Redis server runs the Lua script itself;
+        this fake has no Lua interpreter, so it replicates the same three
+        steps directly — atomicity here comes from the test being
+        single-threaded per await point, matching what the real EVAL
+        guarantees on the server)."""
+        self.zremrangebyscore(key, "-inf", cutoff)
+        if self.zcard(key) < max_concurrent:
+            self.zadd(key, {token: now})
+            return 1
+        return 0
+
 
 class RaisingRedis:
     """Stand-in for a Redis client whose every call raises, simulating a
@@ -95,6 +108,37 @@ class TestCapacityBlocking:
 
         limiter.release(token2)
         assert fake_redis.zcard(None) == 0
+
+    async def test_many_concurrent_acquirers_never_exceed_max_concurrent(self):
+        """Regression test for the ZCARD-then-ZADD TOCTOU race: acquire() must
+        use one atomic operation (see _ACQUIRE_SCRIPT), not a separate
+        check-then-act, so N concurrent callers racing for M < N slots never
+        let more than M through at once."""
+        fake_redis = FakeRedisZSet()
+        max_concurrent = 3
+        num_acquirers = 10
+        limiter = AgentContainerConcurrencyLimiter(
+            max_concurrent=max_concurrent,
+            poll_interval_seconds=0.01,
+            redis_client=fake_redis,
+        )
+
+        held_count = 0
+        max_observed = 0
+
+        async def holder():
+            nonlocal held_count, max_observed
+            token = await limiter.acquire()
+            held_count += 1
+            max_observed = max(max_observed, held_count)
+            await asyncio.sleep(0.03)  # simulate doing work while holding the slot
+            held_count -= 1
+            limiter.release(token)
+
+        await asyncio.gather(*(holder() for _ in range(num_acquirers)))
+
+        assert max_observed == max_concurrent
+        assert fake_redis.zcard(None) == 0  # everyone released cleanly
 
     async def test_context_manager_acquires_and_releases(self):
         fake_redis = FakeRedisZSet()
@@ -180,6 +224,20 @@ class TestStaleTokenPruning:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+class TestOrchestratorWorkersMismatchWarning:
+    def test_warns_when_orchestrator_workers_exceeds_cap(self, monkeypatch, caplog):
+        monkeypatch.setenv("ORCHESTRATOR_WORKERS", "4")
+        with caplog.at_level("WARNING"):
+            AgentContainerConcurrencyLimiter(max_concurrent=1, redis_client=None)
+        assert any("ORCHESTRATOR_WORKERS=4" in r.message for r in caplog.records)
+
+    def test_no_warning_when_cap_covers_orchestrator_workers(self, monkeypatch, caplog):
+        monkeypatch.setenv("ORCHESTRATOR_WORKERS", "2")
+        with caplog.at_level("WARNING"):
+            AgentContainerConcurrencyLimiter(max_concurrent=4, redis_client=None)
+        assert not any("ORCHESTRATOR_WORKERS" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
