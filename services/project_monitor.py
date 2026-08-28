@@ -7543,7 +7543,8 @@ _Repair cycle initiated by Switchyard_
                                         f"Error seeding last_state for #{issue_number}: {seed_err}"
                                     )
 
-                            self.last_state[board_key] = current_by_issue
+                            with self._last_state_lock:
+                                self.last_state[board_key] = current_by_issue
                             logger.info(f"Initialized state for {project_name}/{pipeline.board_name}: {len(current_items)} items")
             except Exception as e:
                 logger.warning(f"Error during project state initialization: {e}")
