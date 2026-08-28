@@ -431,10 +431,13 @@ class PipelineRunManager:
                     if existing_data:
                         try:
                             existing = json.loads(existing_data)
-                            if existing.get('status') == 'completed':
+                            # "failed" is just as terminal as "completed" here — both
+                            # mean end_pipeline_run() already ran for this ID, so a
+                            # stale ES "active" doc must not be allowed to resurrect it.
+                            if existing.get('status') in ('completed', 'failed'):
                                 logger.info(
                                     f"Skipping ES fallback restore for {pipeline_run.id} — "
-                                    f"already completed in Redis (stale ES read)"
+                                    f"already {existing.get('status')} in Redis (stale ES read)"
                                 )
                                 return None
                         except (json.JSONDecodeError, TypeError):
@@ -826,6 +829,72 @@ class PipelineRunManager:
         )
         return True
 
+    def mark_failed(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        reason: str,
+    ) -> bool:
+        """
+        The single shared entry point for every pipeline-failure path: ends any
+        active PipelineRun for this issue with outcome="failed" (for rich ES/
+        dashboard history within its retention window), and unconditionally,
+        durably marks the pipeline lock as retained-due-to-failure regardless of
+        whether a PipelineRun happened to exist for this attempt.
+
+        The lock mark is the part that actually blocks re-dispatch (see
+        PipelineLockManager.mark_lock_failed/get_retained_reason) — it does NOT
+        depend on the PipelineRun call succeeding, because some failure paths (e.g.
+        repeated dispatch failures before an agent ever successfully launched) can
+        legitimately have no PipelineRun to end yet, and the caller is always
+        guaranteed to already hold the lock at the point this is called.
+
+        This replaces the old services.work_execution_state halt-marker mechanism
+        (set_halt_marker/get_halt_marker/clear_halt_marker), which stored its flag
+        in a per-issue YAML file with no relationship to the lock, no visibility,
+        and no expiry-safe reconciliation.
+
+        Returns:
+            True if the lock was actually durably marked (the part that matters
+            for enforcement), False if it wasn't. mark_lock_failed() reports its
+            own failure via return value, not exceptions (empty reason, no lock
+            held, or both Redis and YAML writes failing are all reported this
+            way) — callers MUST check this return value rather than assume
+            success, since posting a "the lock is retained" comment or log line
+            when it actually isn't would itself be a silent-failure regression.
+        """
+        try:
+            self.end_pipeline_run(
+                project=project,
+                issue_number=issue_number,
+                reason=reason,
+                retain_lock=True,
+                outcome="failed",
+            )
+        except Exception as e:
+            logger.error(
+                f"mark_failed: end_pipeline_run raised for {project} issue "
+                f"#{issue_number}: {e}"
+            )
+
+        # Unconditional fallback/guarantee: end_pipeline_run() above only touches the
+        # lock if it found an active PipelineRun. Always mark it directly too so a
+        # pre-dispatch failure (no PipelineRun ever created for this attempt) is
+        # covered just as reliably as a mid-execution crash. This is also the
+        # authoritative result — mark_lock_failed is idempotent, so calling it
+        # again here even when end_pipeline_run already succeeded is harmless,
+        # and this is the only call that reports its actual outcome back to us.
+        try:
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            return get_pipeline_lock_manager().mark_lock_failed(project, board, issue_number, reason)
+        except Exception as e:
+            logger.error(
+                f"mark_failed: could not durably mark lock for {project} issue "
+                f"#{issue_number}: {e}"
+            )
+            return False
+
     def end_pipeline_run(
         self,
         project: str,
@@ -858,15 +927,25 @@ class PipelineRunManager:
             )
             return False
         
-        # Mark as completed
+        # Mark as completed (or "failed" — a distinct terminal status, not just an
+        # outcome flag on an otherwise-indistinguishable "completed" record, so
+        # visibility surfaces like /active-pipeline-runs can find failed runs by
+        # status instead of missing them entirely — see observability_server.py)
         pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
-        pipeline_run.status = "completed"
+        pipeline_run.status = "failed" if outcome == "failed" else "completed"
         pipeline_run.outcome = outcome
 
         # Set cancellation signal so in-flight repair cycles stop.
         # Skip for feedback_loop_ended — that reason indicates a conversational loop
         # exiting normally (e.g., stop requested, backlog). Setting the signal here
         # would race against the next column's loop starting and cancel it immediately.
+        # Deliberately reason-string-based rather than a caller-supplied override
+        # flag: every current failure path (mark_failed()'s callers) durably
+        # retains the lock, which blocks any "next loop" this signal could
+        # spuriously race against — so a failure path never has a legitimate
+        # reason to suppress it, and no such flag currently has any real caller
+        # (round 5 briefly added one for a case this reasoning shows didn't
+        # need it; round 6 removed it rather than carry unused API forward).
         _effective_reason = reason or "completed"
         if _effective_reason != "feedback_loop_ended":
             try:
@@ -936,6 +1015,40 @@ class PipelineRunManager:
                     f"Retaining pipeline lock for {project} issue #{issue_number} — "
                     f"run ended with outcome=failed. Manual intervention required to release."
                 )
+                # Durably mark the lock itself (Redis + non-expiring YAML) as retained
+                # due to failure. This is the enforcement signal every dispatch gate
+                # consults — see PipelineLockManager.mark_lock_failed/get_retained_reason.
+                # Deliberately NOT gated on `should_retain` alone (retain_lock=True
+                # without outcome="failed" is used for other intentional-retain cases
+                # that should NOT permanently block re-dispatch), only on genuine
+                # failure.
+                try:
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    marked_ok = get_pipeline_lock_manager().mark_lock_failed(
+                        project, pipeline_run.board, issue_number,
+                        reason=reason or "Pipeline run failed",
+                    )
+                    # mark_lock_failed reports its own failure via return value,
+                    # not exceptions (empty reason, no lock held, or both Redis
+                    # and YAML writes failing are all reported this way — see its
+                    # docstring). end_pipeline_run() is called from ~15 sites
+                    # across the codebase that don't go through the mark_failed()
+                    # wrapper (which does check this), so this is the only place
+                    # that would ever notice a failure for most of them — log it
+                    # loudly rather than let it pass as if retention succeeded.
+                    if not marked_ok:
+                        logger.critical(
+                            f"end_pipeline_run: could NOT durably mark the lock "
+                            f"failed for {project} issue #{issue_number} — the "
+                            f"run is recorded as failed but the lock may not "
+                            f"actually be retained. This issue may be silently "
+                            f"re-dispatched."
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"Failed to durably mark lock as failed for {project} issue "
+                        f"#{issue_number}: {e}"
+                    )
             else:
                 logger.info(
                     f"Retaining pipeline lock for {project} issue #{issue_number} after ending run "
@@ -947,9 +1060,23 @@ class PipelineRunManager:
             lock_manager = get_pipeline_lock_manager()
             current_lock = lock_manager.get_lock(project, pipeline_run.board)
             if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
-                lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                # Does NOT force — this branch only runs when should_retain is
+                # False (an intentional non-retaining end), but the lock could
+                # still independently be retained from an unrelated prior
+                # failure. release_lock() correctly refuses in that case; don't
+                # proceed to dispatch the next queued issue as if this one
+                # cleanly released.
+                released = lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                if not released:
+                    logger.error(
+                        f"Could not release pipeline lock for {project} issue "
+                        f"#{issue_number} after ending run — it is likely retained "
+                        f"due to an unrelated failure. Not dispatching the next "
+                        f"queued issue while this is unresolved."
+                    )
+                    return True
                 logger.info(f"Released pipeline lock for {project} issue #{issue_number} after ending run")
-                
+
                 # CRITICAL: Process next waiting issue in queue after lock release
                 # This ensures queued issues are picked up when the current issue completes
                 try:
@@ -1592,7 +1719,11 @@ class PipelineRunManager:
         try:
             pipeline_run_id = run_data['id']
             run_data['ended_at'] = datetime.utcnow().isoformat() + 'Z'
-            run_data['status'] = 'completed'
+            # Mirror end_pipeline_run()'s status derivation: a distinct "failed"
+            # status, not "completed" + outcome="failed" simultaneously — the
+            # latter is indistinguishable from success by status alone to every
+            # status-filtered reader (dashboards, /api/pipeline-runs, etc.).
+            run_data['status'] = 'failed' if outcome == 'failed' else 'completed'
             if outcome is not None:
                 run_data['outcome'] = outcome
 

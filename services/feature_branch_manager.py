@@ -920,8 +920,20 @@ class FeatureBranchManager:
         matches = []
 
         # 1. Exact issue number match
+        #
+        # Deliberately compares the PARSED integer (via _parse_issue_from_branch_name,
+        # the same exact-match primitive _find_branch_for_parent already uses) rather
+        # than a substring check. `f"issue-{issue_number}" in branch` was a real,
+        # silent bug: for issue_number=2, the substring "issue-2" is contained in
+        # "feature/issue-216-..." (216 starts with the digit 2), "issue-20...",
+        # "issue-200...", etc. — any branch whose number happens to start with the
+        # same digits. That false match scored confidence 1.0, well above
+        # prepare_feature_branch's 0.8 auto-reuse-without-human-review threshold, so
+        # unrelated, already-merged branches got silently reused for a completely
+        # different issue's work — confirmed in production against phone-home #2,
+        # which got silently attached to #216's merged, unrelated branch this way.
         for branch in all_branches:
-            if f"issue-{issue_number}" in branch or f"issue-{issue_number}-" in branch:
+            if self._parse_issue_from_branch_name(branch) == issue_number:
                 matches.append({
                     "branch_name": branch,
                     "match_type": "exact_issue",
@@ -930,9 +942,11 @@ class FeatureBranchManager:
                 })
 
         # 2. Parent issue branch match
+        # Same fix as check 1 above — was the identical substring bug, keyed on
+        # parent_issue instead of issue_number.
         if parent_issue:
             for branch in all_branches:
-                if f"issue-{parent_issue}" in branch or f"issue-{parent_issue}-" in branch:
+                if self._parse_issue_from_branch_name(branch) == parent_issue:
                     matches.append({
                         "branch_name": branch,
                         "match_type": "parent_branch",
@@ -1024,7 +1038,7 @@ Work on this sub-issue cannot proceed due to merge conflicts.
 1. Manually resolve conflicts in the branch
 2. Commit the resolution
 3. Push to remote
-4. Move this issue back to the appropriate column to retry
+4. Run `python scripts/release_lock.py --project <project> --board <board> --issue {issue_number}` to release the pipeline lock (moving the card alone will not re-trigger anything — see `python scripts/list_failed_pipeline_runs.py` for the exact command with your project/board filled in)
 
 **Resolution Command:**
 ```bash

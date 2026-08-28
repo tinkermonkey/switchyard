@@ -882,18 +882,22 @@ export function buildFlowchart({
   // ── 5. Postlude events ────────────────────────────────────────────────────
   processSection(postlude, 'post')
 
-  // ── 6. Pipeline completed node ────────────────────────────────────────────
-  if (selectedPipelineRun.status === 'completed') {
+  // ── 6. Pipeline completed/failed node ─────────────────────────────────────
+  // "failed" is just as terminal as "completed" — without this, a failed run's
+  // flowchart simply ended with no terminal node at all.
+  if (selectedPipelineRun.status === 'completed' || selectedPipelineRun.status === 'failed') {
+    const failed = selectedPipelineRun.status === 'failed'
     newNodes.push({
       id: 'completed',
       type: 'pipelineCompleted',
       position: { x: 0, y: 0 },
       data: {
-        label: 'Pipeline Completed',
-        type: 'pipeline_completed',
-        metadata: selectedPipelineRun.ended_at
-          ? new Date(selectedPipelineRun.ended_at).toLocaleString()
-          : '',
+        label: failed ? 'Pipeline Failed' : 'Pipeline Completed',
+        type: failed ? 'pipeline_failed' : 'pipeline_completed',
+        failed,
+        metadata: failed
+          ? (selectedPipelineRun.reason || '')
+          : (selectedPipelineRun.ended_at ? new Date(selectedPipelineRun.ended_at).toLocaleString() : ''),
         timestamp: selectedPipelineRun.ended_at,
       },
       draggable: false,

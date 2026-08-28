@@ -1042,10 +1042,10 @@ def kill_pipeline_run(pipeline_run_id):
             # This handles "zombie" runs that exist in ES but not in Redis
             try:
                 run_data = pipeline_run.to_dict()
-                run_data['outcome'] = 'failed'
                 pipeline_run_manager._end_run_in_elasticsearch(
                     run_data,
-                    "Killed by user via Web UI (forced update)"
+                    "Killed by user via Web UI (forced update)",
+                    outcome='failed',
                 )
                 success = True # Mark as success since we updated ES
             except Exception as e:
@@ -1123,7 +1123,19 @@ def _get_repo_url(project_name: str) -> Optional[str]:
 
 @app.route('/active-pipeline-runs')
 def get_active_pipeline_runs():
-    """Get all currently active pipeline runs with lock status"""
+    """
+    Get all currently active AND failed pipeline runs, with lock status.
+
+    Active/feedback_listening runs come from Elasticsearch as before. Failed runs
+    are sourced primarily from the pipeline locks themselves (PipelineLock.
+    retained_reason) rather than from ES status="failed" records, because ES
+    pipeline-run records roll off after 7 days (ILM policy) and the Redis cache
+    after a few hours — the lock (Redis + non-expiring YAML) is the only durable
+    signal, per the halt-marker replacement design. The ES record is used only to
+    enrich a failed entry with richer detail (title, reason history) when it's
+    still within its retention window; a failed lock with no corresponding ES
+    record any more still shows up, just with less detail.
+    """
     try:
         # Query Elasticsearch for active pipeline runs (includes feedback_listening)
         query = {
@@ -1146,6 +1158,7 @@ def get_active_pipeline_runs():
         lock_manager = get_pipeline_lock_manager()
 
         runs = []
+        seen_project_issue = set()
         for hit in result['hits']['hits']:
             run_data = hit['_source']
 
@@ -1166,6 +1179,8 @@ def get_active_pipeline_runs():
                 # Add additional context based on lock status
                 if lock_status == 'waiting_for_lock' and lock_holder:
                     run_data['blocked_by_issue'] = lock_holder
+
+                seen_project_issue.add((project, issue_number))
             else:
                 # Missing data - mark as unknown
                 run_data['lock_status'] = 'unknown'
@@ -1179,11 +1194,80 @@ def get_active_pipeline_runs():
                 run_data['issue_url'] = f"{repo_url}/issues/{run_data['issue_number']}"
             runs.append(run_data)
 
-        return jsonify({
+        # Add failed runs, sourced from durable locks (see docstring above)
+        lock_scan_error = None
+        try:
+            for lock in lock_manager.get_all_locks():
+                if not lock.retained_reason:
+                    continue
+                project, issue_number = lock.project, lock.locked_by_issue
+                if (project, issue_number) in seen_project_issue:
+                    continue  # shouldn't happen (failed locks aren't active) but stay safe
+
+                run_data = {
+                    'project': project,
+                    'board': lock.board,
+                    'issue_number': issue_number,
+                    'status': 'failed',
+                    'outcome': 'failed',
+                    'started_at': None,
+                    'ended_at': lock.retained_at,
+                    'reason': lock.retained_reason,
+                    'lock_status': 'holding_lock',
+                    'lock_holder_issue': issue_number,
+                }
+
+                # Best-effort enrichment from the (possibly expired) ES/Redis record.
+                # Uses the shared singleton (not a fresh PipelineRunManager()) —
+                # this loop runs on every /active-pipeline-runs poll, once per
+                # failed lock, and a fresh instance re-opens Redis/ES clients and
+                # re-issues ILM/index-template PUTs every time.
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    pipeline_run_manager = get_pipeline_run_manager()
+                    recent_id = pipeline_run_manager.get_recent_pipeline_run_id(project, issue_number)
+                    if recent_id:
+                        recent_run = pipeline_run_manager.get_pipeline_run_by_id(recent_id)
+                        if recent_run:
+                            run_data['id'] = recent_run.id
+                            run_data['issue_title'] = recent_run.issue_title
+                            run_data['issue_url'] = recent_run.issue_url
+                            run_data['started_at'] = recent_run.started_at
+                except Exception as enrich_err:
+                    logger.debug(f"Could not enrich failed run for {project}#{issue_number}: {enrich_err}")
+
+                run_data['board_url'] = _get_board_url(project, lock.board)
+                repo_url = _get_repo_url(project)
+                run_data['repo_url'] = repo_url
+                if not run_data.get('issue_url') and repo_url:
+                    run_data['issue_url'] = f"{repo_url}/issues/{issue_number}"
+                run_data.setdefault('issue_title', f"Issue #{issue_number}")
+
+                runs.append(run_data)
+        except Exception as lock_scan_err:
+            # Do NOT swallow this into a clean-looking success response — this
+            # scan is what makes failed runs discoverable at all (that's the
+            # entire point of this PR), so a partial failure here must not read
+            # as "confirmed zero failed runs" to a dashboard viewer.
+            logger.error(f"Error scanning locks for failed pipeline runs: {lock_scan_err}", exc_info=True)
+            lock_scan_error = str(lock_scan_err)
+
+        # `success` stays True here even on a lock-scan error — the ES query for
+        # active/feedback_listening runs above (this endpoint's other half)
+        # succeeded and its data is valid; flipping success to False would make
+        # the frontend discard that too (see web_ui/src/routes/dashboard.jsx,
+        # which only applies `runs` when success is true). Instead the scan
+        # failure is surfaced via a dedicated field so a caller that cares about
+        # failed-run completeness specifically can detect it, without silently
+        # dropping the active-runs view.
+        response = {
             'success': True,
             'runs': runs,
             'count': len(runs)
-        })
+        }
+        if lock_scan_error:
+            response['failed_runs_scan_error'] = lock_scan_error
+        return jsonify(response)
 
     except Exception as e:
         # Handle index not found gracefully (returns empty list at debug level)
@@ -1387,7 +1471,10 @@ def get_completed_pipeline_runs():
         }
         es_sort_field = _sort_field_map.get(sort_col, 'ended_at')
 
-        filter_clauses = [{"term": {"status": "completed"}}]
+        # "completed" and "failed" are both terminal — a failed run belongs in
+        # history just as much as a successful one; outcome=... (below) is how
+        # callers already distinguish between them.
+        filter_clauses = [{"terms": {"status": ["completed", "failed"]}}]
         if project:
             filter_clauses.append({"term": {"project": project}})
         if board:
@@ -1460,7 +1547,7 @@ def get_pipeline_run_filter_options():
         result = es_client.search(
             index="pipeline-runs-*",
             body={
-                "query": {"term": {"status": "completed"}},
+                "query": {"terms": {"status": ["completed", "failed"]}},
                 "size": 0,
                 "aggs": {
                     "projects": {"terms": {"field": "project", "size": 200}},
@@ -1487,7 +1574,7 @@ def get_pipeline_recommendations():
         rec_type = request.args.get('rec_type', 'all')
 
         filter_clauses = [
-            {"term": {"status": "completed"}},
+            {"terms": {"status": ["completed", "failed"]}},
             {"bool": {"should": [
                 {"exists": {"field": "orchestratorRecommendations"}},
                 {"exists": {"field": "projectRecommendations"}},
@@ -4041,7 +4128,16 @@ def release_pipeline_lock(project, board):
     """
     Manually release a pipeline lock for a project/board.
 
-    This is useful when a lock is stuck due to agent crashes or other issues.
+    This is useful when a lock is stuck due to agent crashes or other issues —
+    i.e. it is the web-UI equivalent of scripts/release_lock.py, and this is a
+    deliberate human recovery action just like that script. It mirrors the
+    script's semantics: a lock durably retained due to a failed run
+    (PipelineLock.retained_reason) requires `force: true` in the request body
+    to release, matching PipelineLockManager.release_lock's guard — without
+    this, this endpoint would always fail on exactly the case it exists to
+    handle (a stuck/failed lock), since release_lock() now correctly refuses a
+    retained lock by default. An ordinary, actively-held lock still releases
+    without force, same as before this PR.
 
     Args:
         project: Project name
@@ -4049,7 +4145,8 @@ def release_pipeline_lock(project, board):
 
     Request body (optional):
         {
-            "issue_number": 123  # If provided, only releases lock if held by this issue
+            "issue_number": 123,  # If provided, only releases lock if held by this issue
+            "force": true         # Required to release a lock marked retained-due-to-failure
         }
 
     Returns:
@@ -4062,12 +4159,29 @@ def release_pipeline_lock(project, board):
         lock_manager = get_pipeline_lock_manager()
         queue_manager = get_pipeline_queue_manager(project, board)
 
-        # Get optional issue_number from request body
+        # Get optional issue_number/force from request body
         request_data = request.get_json() if request.is_json else {}
         specified_issue = request_data.get('issue_number')
+        force = bool(request_data.get('force'))
 
-        # Check current lock status
-        lock = lock_manager.get_lock(project, board)
+        # Check current lock status — get_lock_fail_closed(), not the plain
+        # get_lock(). This endpoint is a deliberate human recovery action
+        # (the web-UI equivalent of scripts/release_lock.py), so it must not
+        # fold "both Redis and YAML failed to read" into "no active lock" —
+        # an outage severe enough to cause that is exactly when an operator
+        # most needs an honest "state unknown" rather than false reassurance.
+        lock, reads_healthy = lock_manager.get_lock_fail_closed(project, board)
+
+        if not reads_healthy:
+            return jsonify({
+                'success': False,
+                'message': (
+                    f'Could not determine lock state for {project}/{board} — '
+                    f'both Redis and the YAML state file failed to read. This '
+                    f'does not mean the board is unlocked.'
+                ),
+                'lock_status': None
+            }), 500
 
         if not lock or lock.lock_status != 'locked':
             return jsonify({
@@ -4089,10 +4203,43 @@ def release_pipeline_lock(project, board):
 
         locked_by_issue = lock.locked_by_issue
 
-        # Release the lock
-        released = lock_manager.release_lock(project, board, locked_by_issue)
+        if lock.retained_reason and not force:
+            # This is the case this endpoint exists for — surface it clearly
+            # rather than falling through to release_lock()'s generic refusal.
+            return jsonify({
+                'success': False,
+                'message': (
+                    f'Lock for issue #{locked_by_issue} is retained due to a '
+                    f'failed run: {lock.retained_reason}. Confirm and retry with '
+                    f'force: true to release it.'
+                ),
+                'retained_reason': lock.retained_reason,
+                'retained_at': lock.retained_at,
+                'requires_force': True,
+                'lock_status': {
+                    'locked_by_issue': locked_by_issue,
+                    'locked_at': lock.lock_acquired_at
+                }
+            }), 409
+
+        # Release the lock — force is only meaningful (and only passed through)
+        # when the lock is actually retained; an ordinary lock releases the same
+        # as always.
+        released = lock_manager.release_lock(
+            project, board, locked_by_issue, force=bool(lock.retained_reason)
+        )
 
         if released:
+            # Clear the cancellation signal mark_failed()/end_pipeline_run() may
+            # have set when this run was originally marked failed — otherwise it
+            # stays active for up to an hour and the queue failsafe can undo this
+            # recovery, exactly as scripts/release_lock.py already guards against.
+            try:
+                from services.cancellation import get_cancellation_signal
+                get_cancellation_signal().clear(project, locked_by_issue)
+            except Exception as cancel_err:
+                logger.warning(f"Could not clear cancellation signal: {cancel_err}")
+
             # Also reset the issue in the queue from active to waiting
             queue_manager.reset_issue_to_waiting(locked_by_issue)
 

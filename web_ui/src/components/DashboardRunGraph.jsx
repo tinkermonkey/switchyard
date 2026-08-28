@@ -311,9 +311,18 @@ export default function DashboardRunGraph({ run }) {
     return todos?.length ? todos : null
   }, [liveToolEvents, currentLiveAgent, run?.status])
 
+  // Failed runs sourced from a retained lock with no corresponding ES record
+  // (rolled off the 7-day retention, or never enriched) have no run.id — the
+  // pipeline-run detail page requires one. Route to the GitHub issue instead
+  // of a broken /pipeline-run?runId=undefined link in that case.
   const handleClick = useCallback(() => {
-    navigate({ to: '/pipeline-run', search: { runId: run.id } })
-  }, [navigate, run.id])
+    if (run.id) {
+      navigate({ to: '/pipeline-run', search: { runId: run.id } })
+    } else if (run.issue_url) {
+      window.open(run.issue_url, '_blank', 'noopener,noreferrer')
+    }
+  }, [navigate, run.id, run.issue_url])
+  const isClickable = Boolean(run.id || run.issue_url)
 
   // Status is driven directly off run.status (from the polled /active-pipeline-runs list) —
   // no local state to go stale. feedback_listening is the *only* state that should pulse;
@@ -321,6 +330,7 @@ export default function DashboardRunGraph({ run }) {
   // (or the run drops out of the active list) and the pulse clears on the next poll.
   const isAwaitingFeedback = run.status === 'feedback_listening'
   const isRunning = run.status === 'active'
+  const isFailed = run.status === 'failed'
 
   // Most recent event carrying an `agent` field (agent_initialized/completed/failed), read
   // from the same event stream driving the graph — works for both the "running" and
@@ -336,7 +346,11 @@ export default function DashboardRunGraph({ run }) {
 
   return (
     <div
-      className="bg-gh-canvas-subtle border border-gh-border rounded-md overflow-hidden hover:border-gh-accent-primary transition-colors flex flex-col min-h-[500px] md:min-h-0"
+      className={`bg-gh-canvas-subtle border rounded-md overflow-hidden transition-colors flex flex-col min-h-[500px] md:min-h-0 ${
+        isFailed
+          ? 'border-red-500 ring-2 ring-red-500/60 animate-pulse'
+          : 'border-gh-border hover:border-gh-accent-primary'
+      }`}
     >
       {/* Compact header */}
       <div className="border-b border-gh-border min-w-0 flex-shrink-0">
@@ -346,8 +360,8 @@ export default function DashboardRunGraph({ run }) {
               {run.project}
             </div>
             <h3
-              onClick={handleClick}
-              className="text-sm font-semibold md:truncate cursor-pointer">
+              onClick={isClickable ? handleClick : undefined}
+              className={`text-sm font-semibold md:truncate ${isClickable ? 'cursor-pointer' : ''}`}>
               {run.issue_title}
             </h3>
           </div>
@@ -371,7 +385,7 @@ export default function DashboardRunGraph({ run }) {
             className="text-xs text-gh-fg-muted flex-shrink-0"
           />
         </div>
-        {(isRunning || isAwaitingFeedback) && (
+        {(isRunning || isAwaitingFeedback || isFailed) && (
           <div className="flex items-center gap-1.5 px-3 pb-2 min-w-0 text-xs">
             <span className="relative flex h-2 w-2 flex-shrink-0">
               {isAwaitingFeedback && (
@@ -382,16 +396,21 @@ export default function DashboardRunGraph({ run }) {
               )}
               <span
                 className="relative inline-flex rounded-full h-2 w-2"
-                style={{ backgroundColor: isAwaitingFeedback ? '#f0883e' : '#3fb950' }}
+                style={{ backgroundColor: isFailed ? '#f85149' : isAwaitingFeedback ? '#f0883e' : '#3fb950' }}
               />
             </span>
             <span
               className="font-medium truncate"
-              style={{ color: isAwaitingFeedback ? '#f0883e' : undefined }}
+              style={{ color: isFailed ? '#f85149' : isAwaitingFeedback ? '#f0883e' : undefined }}
             >
-              {isAwaitingFeedback ? 'Awaiting Feedback' : 'Running'}
+              {isFailed ? 'Failed' : isAwaitingFeedback ? 'Awaiting Feedback' : 'Running'}
               {currentAgentName ? `: ${currentAgentName}` : ''}
             </span>
+          </div>
+        )}
+        {isFailed && run.reason && (
+          <div className="px-3 pb-2 min-w-0 text-xs text-gh-fg-muted truncate" title={run.reason}>
+            {run.reason}
           </div>
         )}
       </div>

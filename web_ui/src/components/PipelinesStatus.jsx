@@ -6,12 +6,12 @@ export default function PipelinesStatus({ pipelines, projectName }) {
   const [releasing, setReleasing] = useState({})
   const { refreshProjects } = useProjectState()
 
-  const handleReleaseLock = async (pipelineBoard, issueNumber) => {
+  const handleReleaseLock = async (pipelineBoard, issueNumber, force = false) => {
     const key = `${pipelineBoard}-${issueNumber}`
     setReleasing(prev => ({ ...prev, [key]: true }))
 
     try {
-      const response = await projectApi.releasePipelineLock(projectName, pipelineBoard, issueNumber)
+      const response = await projectApi.releasePipelineLock(projectName, pipelineBoard, issueNumber, force)
       if (response.success) {
         // Refresh project data to update lock status
         await refreshProjects()
@@ -19,8 +19,22 @@ export default function PipelinesStatus({ pipelines, projectName }) {
         alert(`Failed to release lock: ${response.message || 'Unknown error'}`)
       }
     } catch (error) {
-      console.error('Error releasing lock:', error)
-      alert(`Error releasing lock: ${error.message}`)
+      // A 409 with requires_force means the lock is retained due to a failed
+      // run — this is expected/routine, not a real error (see
+      // PipelineLockManager.release_lock's guard). Confirm with the operator
+      // and retry with force rather than just showing a generic failure.
+      if (error.status === 409 && error.data?.requires_force) {
+        const confirmed = window.confirm(
+          `${error.data.message}\n\nRelease anyway?`
+        )
+        if (confirmed) {
+          await handleReleaseLock(pipelineBoard, issueNumber, true)
+          return
+        }
+      } else {
+        console.error('Error releasing lock:', error)
+        alert(`Error releasing lock: ${error.message}`)
+      }
     } finally {
       setReleasing(prev => ({ ...prev, [key]: false }))
     }

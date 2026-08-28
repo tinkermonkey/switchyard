@@ -1763,36 +1763,57 @@ class AgentContainerRecovery:
                         )
                     except Exception as state_err:
                         logger.error(f"Failed to record frozen outcome: {state_err}")
-                else:
-                    # Proceed to end the run (either matched or no active run found).
-                    # On failure, retain the lock so the issue blocks the pipeline until
-                    # a human moves it out of Testing (same behaviour as the live-run path).
+                elif overall_success:
+                    # Proceed to end the run normally — matches the live-run success path.
                     ended = pipeline_run_manager.end_pipeline_run(
                         project=project,
                         issue_number=issue_number,
-                        reason="Repair cycle completed successfully" if overall_success else "Repair cycle failed",
-                        retain_lock=not overall_success
+                        reason="Repair cycle completed successfully",
+                        retain_lock=False,
                     )
                     if ended:
-                        logger.info(
-                            f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}"
-                            + (" (lock retained — awaiting manual intervention)" if not overall_success else "")
-                        )
+                        logger.info(f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}")
                     else:
                         logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
-
-                    # Set the repair_failed Redis marker so _reconcile_active_runs knows
-                    # this lock is intentionally held and the watchdog skips it.
-                    if not overall_success:
-                        try:
-                            if self.redis:
-                                repair_failed_key = (
-                                    f"pipeline_lock:repair_failed:"
-                                    f"{project}:{board_name}:{issue_number}"
-                                )
-                                self.redis.set(repair_failed_key, "1", ex=172800)  # 48h TTL
-                        except Exception as redis_err:
-                            logger.warning(f"Failed to set repair_failed marker in Redis: {redis_err}")
+                else:
+                    # Failure on the restart-recovery path — use the same shared
+                    # mark_failed() entry point as every other failure site
+                    # (services/project_monitor.py's consecutive-dispatch-failure,
+                    # review-cycle-crash, and live-run repair-cycle-failure paths),
+                    # NOT a hand-rolled end_pipeline_run(retain_lock=True) here.
+                    # This was previously unmigrated: calling end_pipeline_run
+                    # without outcome="failed" never durably marks the lock (see
+                    # PipelineRunManager.end_pipeline_run — the mark_lock_failed
+                    # call is gated strictly on outcome=="failed"), so an issue
+                    # whose repair-cycle container survived an orchestrator restart
+                    # and then failed got none of the new durable protection: no
+                    # retained_reason, so the universal dispatch gate and
+                    # try_acquire_lock's refusal never applied to it. It fell back
+                    # entirely to the old pipeline_lock:repair_failed:* Redis
+                    # marker (48h TTL) this whole mechanism was built to retire —
+                    # and that marker is no longer read by anything (the watchdog
+                    # and rescan gates in project_monitor.py were migrated to read
+                    # PipelineLock.retained_reason directly), so this path was
+                    # actually providing NO protection at all, not just weaker
+                    # protection.
+                    marked_ok = pipeline_run_manager.mark_failed(
+                        project=project,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason="Repair cycle failed",
+                    )
+                    if marked_ok:
+                        logger.info(
+                            f"Marked pipeline run failed for {project}/#{issue_number} "
+                            f"(lock retained — awaiting manual intervention)"
+                        )
+                    else:
+                        logger.critical(
+                            f"Pipeline lock for {project}/#{issue_number} could NOT be "
+                            f"durably marked failed after restart-recovery repair cycle "
+                            f"failure — both Redis and YAML writes failed. This issue may "
+                            f"be silently re-dispatched."
+                        )
             except Exception as e:
                 logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
 

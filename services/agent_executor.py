@@ -33,9 +33,36 @@ except ImportError:
         return None
 
 
-def _build_branch_error_comment(e) -> str:
-    """Build a GitHub comment body for StaleBranchError or BranchPullFailedError."""
+def _release_lock_instruction(project_name: str, board_name: str, issue_number: int) -> str:
+    """Shared recovery-instruction snippet for the GitHub comments below. The
+    pipeline lock is durably marked retained-due-to-failure once these paths
+    call end_pipeline_run(outcome="failed") — moving the card alone no longer
+    re-triggers anything; a human must run this command."""
+    return (
+        f"`python scripts/release_lock.py --project {project_name} "
+        f"--board \"{board_name}\" --issue {issue_number}` to release the pipeline "
+        f"lock and allow a fresh attempt"
+    )
+
+
+def _build_branch_error_comment(
+    e, project_name: str, board_name: str, issue_number: int, marked_successfully: bool = True
+) -> str:
+    """Build a GitHub comment body for StaleBranchError or BranchPullFailedError.
+
+    marked_successfully should reflect whether mark_failed() actually durably
+    retained the lock — when False, the comment must not claim the lock is
+    retained, since that would itself be a silent-failure regression."""
     from services.feature_branch_manager import StaleBranchError
+    release_instruction = _release_lock_instruction(project_name, board_name, issue_number)
+    lock_status_line = (
+        f"_Pipeline lock retained — no new work will start on this issue until "
+        f"the lock is released._"
+        if marked_successfully else
+        f"_⚠️ The pipeline lock could NOT be durably marked retained (both Redis "
+        f"and YAML writes failed) — this issue may be silently re-dispatched. "
+        f"Please investigate immediately._"
+    )
     if isinstance(e, StaleBranchError):
         return (
             f"## Branch Rebase Required\n\n"
@@ -49,9 +76,8 @@ def _build_branch_error_comment(e) -> str:
             f"# Resolve any conflicts\n"
             f"git push --force-with-lease\n"
             f"```\n\n"
-            f"After rebasing, move this issue back to **Development** to resume work.\n\n"
-            f"_Pipeline lock retained — no new work will start on this issue until "
-            f"the rebase is complete._"
+            f"After rebasing, run {release_instruction}.\n\n"
+            f"{lock_status_line}"
         )
     else:
         return (
@@ -61,13 +87,14 @@ def _build_branch_error_comment(e) -> str:
             f"**To diagnose:**\n"
             f"1. Check `docker-compose logs orchestrator` for git errors\n"
             f"2. Verify network/SSH access to the repository\n"
-            f"3. Move this issue back to **Development** to retry once the issue is resolved.\n\n"
-            f"_Pipeline lock retained — no new work will start on this issue until "
-            f"this is resolved._"
+            f"3. Once resolved, run {release_instruction}\n\n"
+            f"{lock_status_line}"
         )
 
 
-def _build_workspace_prep_error_comment(e) -> str:
+def _build_workspace_prep_error_comment(
+    e, project_name: str, board_name: str, issue_number: int, marked_successfully: bool = True
+) -> str:
     """
     Build a GitHub comment body for the catch-all git-based workspace preparation
     failure (workspace_preparation_git_failure) — e.g. a stash that can't be
@@ -77,7 +104,19 @@ def _build_workspace_prep_error_comment(e) -> str:
     structured detail about which files or branch are involved, so the comment
     points at the shared checkout in general rather than a specific remediation
     command.
+
+    marked_successfully should reflect whether mark_failed() actually durably
+    retained the lock — see _build_branch_error_comment for the same contract.
     """
+    release_instruction = _release_lock_instruction(project_name, board_name, issue_number)
+    lock_status_line = (
+        f"_Pipeline lock retained — no new work will start on this project's board "
+        f"until the lock is released._"
+        if marked_successfully else
+        f"_⚠️ The pipeline lock could NOT be durably marked retained (both Redis "
+        f"and YAML writes failed) — this project's board may be silently "
+        f"re-dispatched. Please investigate immediately._"
+    )
     return (
         f"## Workspace Preparation Failed\n\n"
         f"Git workspace preparation failed and the agent was halted before making "
@@ -91,9 +130,8 @@ def _build_workspace_prep_error_comment(e) -> str:
         f"1. `docker-compose exec orchestrator bash -c \"cd /workspace/<project> && git status\"`\n"
         f"2. Resolve or abort any unresolved merge (`git merge --abort`) and/or "
         f"discard local state (`git reset --hard origin/<branch>`)\n"
-        f"3. Move this issue back to **Development** to retry once the workspace is clean\n\n"
-        f"_Pipeline lock retained — no new work will start on this project's board "
-        f"until this is resolved._"
+        f"3. Once the workspace is clean, run {release_instruction}\n\n"
+        f"{lock_status_line}"
     )
 
 
@@ -320,6 +358,38 @@ class AgentExecutor:
                         f"issue #{issue_number}: {e}"
                     )
 
+                    # Mark the run failed FIRST (before posting the comment) — via
+                    # the shared mark_failed() entry point, not a bare
+                    # end_pipeline_run(outcome="failed") whose return was
+                    # previously discarded — so the comment can accurately say
+                    # whether the lock is actually retained rather than
+                    # unconditionally claiming so (see mark_failed's docstring:
+                    # posting "the lock is retained" when it isn't would itself
+                    # be a silent-failure regression).
+                    board_name = task_context.get('board') or '<board_name>'
+                    marked_ok = True
+                    if issue_number:
+                        try:
+                            from services.pipeline_run import get_pipeline_run_manager
+                            marked_ok = get_pipeline_run_manager().mark_failed(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=issue_number,
+                                reason=str(e),
+                            )
+                            if not marked_ok:
+                                logger.critical(
+                                    f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                                    f"be durably marked failed after a branch error — this issue "
+                                    f"may be silently re-dispatched."
+                                )
+                        except Exception as end_err:
+                            marked_ok = False
+                            logger.error(
+                                f"Failed to end pipeline run after branch error for "
+                                f"{project_name} issue #{issue_number}: {end_err}"
+                            )
+
                     # Post GitHub comment so the issue has visible context
                     if issue_number:
                         try:
@@ -329,29 +399,13 @@ class AgentExecutor:
                                 repo_owner=project_config.github['org'],
                                 repo_name=project_config.github['repo']
                             )
-                            comment = _build_branch_error_comment(e)
+                            comment = _build_branch_error_comment(
+                                e, project_name, board_name, issue_number, marked_successfully=marked_ok
+                            )
                             await github.post_comment(issue_number, comment, pipeline_run_id=pipeline_run_id)
                         except Exception as comment_err:
                             logger.error(
                                 f"Failed to post branch error comment to issue #{issue_number}: {comment_err}"
-                            )
-
-                    # End the pipeline run, retaining the lock so the issue stays blocked
-                    # until a human rebases the branch and moves it back to Development.
-                    if issue_number:
-                        try:
-                            from services.pipeline_run import get_pipeline_run_manager
-                            get_pipeline_run_manager().end_pipeline_run(
-                                project=project_name,
-                                issue_number=issue_number,
-                                reason=str(e),
-                                retain_lock=True,
-                                outcome="failed"
-                            )
-                        except Exception as end_err:
-                            logger.error(
-                                f"Failed to end pipeline run after branch error for "
-                                f"{project_name} issue #{issue_number}: {end_err}"
                             )
 
                     raise NonRetryableAgentError(str(e)) from e
@@ -414,6 +468,29 @@ class AgentExecutor:
                         # in-process retry loop nor the zombie watchdog's auto-retry
                         # accounting kicks in and silently releases the lock again.
                         if issue_number:
+                            board_name = task_context.get('board') or '<board_name>'
+                            marked_ok = True
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                marked_ok = get_pipeline_run_manager().mark_failed(
+                                    project=project_name,
+                                    board=board_name,
+                                    issue_number=issue_number,
+                                    reason=f"Git workspace preparation failed: {e}",
+                                )
+                                if not marked_ok:
+                                    logger.critical(
+                                        f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                                        f"be durably marked failed after a workspace prep error — "
+                                        f"this issue may be silently re-dispatched."
+                                    )
+                            except Exception as end_err:
+                                marked_ok = False
+                                logger.error(
+                                    f"Failed to end pipeline run after workspace prep error for "
+                                    f"{project_name} issue #{issue_number}: {end_err}"
+                                )
+
                             try:
                                 from services.github_integration import GitHubIntegration
                                 project_config = config_manager.get_project_config(project_name)
@@ -421,27 +498,14 @@ class AgentExecutor:
                                     repo_owner=project_config.github['org'],
                                     repo_name=project_config.github['repo']
                                 )
-                                comment = _build_workspace_prep_error_comment(e)
+                                comment = _build_workspace_prep_error_comment(
+                                    e, project_name, board_name, issue_number, marked_successfully=marked_ok
+                                )
                                 await github.post_comment(issue_number, comment, pipeline_run_id=pipeline_run_id)
                             except Exception as comment_err:
                                 logger.error(
                                     f"Failed to post workspace prep error comment to issue "
                                     f"#{issue_number}: {comment_err}"
-                                )
-
-                            try:
-                                from services.pipeline_run import get_pipeline_run_manager
-                                get_pipeline_run_manager().end_pipeline_run(
-                                    project=project_name,
-                                    issue_number=issue_number,
-                                    reason=f"Git workspace preparation failed: {e}",
-                                    retain_lock=True,
-                                    outcome="failed"
-                                )
-                            except Exception as end_err:
-                                logger.error(
-                                    f"Failed to end pipeline run after workspace prep error for "
-                                    f"{project_name} issue #{issue_number}: {end_err}"
                                 )
 
                         raise NonRetryableAgentError(f"Git workspace preparation failed: {e}") from e
@@ -708,6 +772,34 @@ class AgentExecutor:
                         )
 
                         if issue_number:
+                            board_name = task_context.get('board') or '<board_name>'
+                            marked_ok = True
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                marked_ok = get_pipeline_run_manager().mark_failed(
+                                    project=project_name,
+                                    board=board_name,
+                                    issue_number=issue_number,
+                                    reason=str(e),
+                                )
+                                if not marked_ok:
+                                    logger.critical(
+                                        f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                                        f"be durably marked failed after a push failure — this issue "
+                                        f"may be silently re-dispatched."
+                                    )
+                            except Exception as end_err:
+                                marked_ok = False
+                                logger.error(f"Failed to end pipeline run after push failure: {end_err}")
+
+                            lock_status_line = (
+                                f"_Pipeline lock retained — no further automated work will run on "
+                                f"this issue until the lock is released._"
+                                if marked_ok else
+                                f"_⚠️ The pipeline lock could NOT be durably marked retained (both "
+                                f"Redis and YAML writes failed) — this issue may be silently "
+                                f"re-dispatched. Please investigate immediately._"
+                            )
                             try:
                                 from services.github_integration import GitHubIntegration
                                 project_config = config_manager.get_project_config(project_name)
@@ -725,24 +817,16 @@ class AgentExecutor:
                                     f"1. Inspect the local commits: `git log origin/{task_context.get('branch_name', '<branch>')}..HEAD`\n"
                                     f"2. Force-push if the changes are correct: `git push --force-with-lease`\n"
                                     f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
-                                    f"4. Move the card back to Development to re-trigger the pipeline.\n\n"
-                                    f"_Pipeline lock retained — no further automated work will run on this issue._",
+                                    f"4. Run `python scripts/release_lock.py --project {project_name} "
+                                    f"--board \"{board_name}\" --issue {issue_number}` "
+                                    f"to release the pipeline lock (moving the card alone no longer "
+                                    f"re-triggers anything) once ready to continue — see below for "
+                                    f"whether it is actually durably retained.\n\n"
+                                    f"{lock_status_line}",
                                     pipeline_run_id=pipeline_run_id
                                 )
                             except Exception as comment_err:
                                 logger.error(f"Failed to post push-failure comment: {comment_err}")
-
-                            try:
-                                from services.pipeline_run import get_pipeline_run_manager
-                                get_pipeline_run_manager().end_pipeline_run(
-                                    project=project_name,
-                                    issue_number=issue_number,
-                                    reason=str(e),
-                                    retain_lock=True,
-                                    outcome="failed"
-                                )
-                            except Exception as end_err:
-                                logger.error(f"Failed to end pipeline run after push failure: {end_err}")
 
                         from agents.non_retryable import NonRetryableAgentError
                         raise NonRetryableAgentError(str(e)) from e

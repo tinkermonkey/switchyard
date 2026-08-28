@@ -1,28 +1,49 @@
 import { memo, useRef, useLayoutEffect, useEffect, useMemo } from 'react'
-import { RefreshCw, Activity, CheckCircle, MessageCircle } from 'lucide-react'
+import { RefreshCw, Activity, CheckCircle, MessageCircle, AlertTriangle } from 'lucide-react'
 import { formatDuration } from '../utils/stateHelpers'
 import RunDuration from './RunDuration'
 
+// A run's `id` is absent for a failed run sourced purely from a durable lock
+// once its ES/Redis record has rolled off (locks outlive both — that's the
+// whole point of surfacing them here) — see observability_server.py's
+// /active-pipeline-runs enrichment. Every list-item usage below must treat
+// a missing id as the expected steady state for these, not a bug.
+function shortId(run) {
+  return run.id ? `${run.id.substring(0, 8)}...` : 'unknown'
+}
+
+function listKey(run) {
+  return run.id || `${run.project}-${run.issue_number}`
+}
+
 // Memoized run list item — only re-renders when run object or selection changes
 const PipelineRunItem = memo(({ run, isSelected, onClick }) => {
+  const isFailed = run.status === 'failed'
   return (
     <button
       onClick={onClick}
       className={`w-full text-left p-3 rounded border transition-colors ${
         isSelected
           ? 'bg-gh-accent-emphasis border-gh-accent-emphasis text-white'
+          : isFailed
+          ? 'bg-gh-canvas border-red-500/60 hover:border-red-500'
           : 'bg-gh-canvas border-gh-border hover:border-gh-border-muted'
       }`}
     >
       <div className="font-semibold text-sm truncate">
-        {run.issue_title}
+        {run.issue_title || `${run.project} #${run.issue_number}`}
       </div>
       <div className="text-xs mt-1 opacity-75">
         {run.project} #{run.issue_number}
       </div>
       <div className="text-xs mt-1 opacity-75 font-mono">
-        ID: {run.id.substring(0, 8)}...
+        ID: {shortId(run)}
       </div>
+      {isFailed && run.reason && (
+        <div className={`text-xs mt-1 ${isSelected ? '' : 'text-red-400'}`}>
+          {run.reason}
+        </div>
+      )}
       <div className="text-xs mt-1 opacity-75">
         {run.ended_at ? (
           <>Completed {formatDuration(run.ended_at)} ago</>
@@ -86,28 +107,50 @@ export default function PipelineRunSidebar({
     [activePipelineRuns]
   )
 
+  // Failed runs are sourced from durable locks and commonly have no `id` at
+  // all (see shortId's comment above) — they must never be lumped into
+  // "Active" (a failed run is, definitionally, not actively running; the
+  // whole point of surfacing it is that it's stuck and needs a human) nor
+  // silently dropped. Broken out into their own section, mirroring the
+  // pulsing-red treatment DashboardRunGraph already gives them.
+  const failedRuns = useMemo(
+    () => activePipelineRuns.filter(r => r.status === 'failed'),
+    [activePipelineRuns]
+  )
+
   const activeRuns = useMemo(
-    () => activePipelineRuns.filter(r => r.status !== 'feedback_listening'),
+    () => activePipelineRuns.filter(r => r.status !== 'feedback_listening' && r.status !== 'failed'),
     [activePipelineRuns]
   )
 
   const feedbackListeningRunsList = useMemo(() => {
     return feedbackListeningRuns.map(run => (
       <PipelineRunItem
-        key={run.id}
+        key={listKey(run)}
         run={run}
-        isSelected={selectedPipelineRun?.id === run.id}
+        isSelected={selectedPipelineRun ? listKey(selectedPipelineRun) === listKey(run) : false}
         onClick={() => onSelectRun(run)}
       />
     ))
   }, [feedbackListeningRuns, selectedPipelineRun, onSelectRun])
 
+  const failedRunsList = useMemo(() => {
+    return failedRuns.map(run => (
+      <PipelineRunItem
+        key={listKey(run)}
+        run={run}
+        isSelected={selectedPipelineRun ? listKey(selectedPipelineRun) === listKey(run) : false}
+        onClick={() => onSelectRun(run)}
+      />
+    ))
+  }, [failedRuns, selectedPipelineRun, onSelectRun])
+
   const activeRunsList = useMemo(() => {
     return activeRuns.map(run => (
       <PipelineRunItem
-        key={run.id}
+        key={listKey(run)}
         run={run}
-        isSelected={selectedPipelineRun?.id === run.id}
+        isSelected={selectedPipelineRun ? listKey(selectedPipelineRun) === listKey(run) : false}
         onClick={() => onSelectRun(run)}
       />
     ))
@@ -116,9 +159,9 @@ export default function PipelineRunSidebar({
   const completedRunsList = useMemo(() => {
     return completedPipelineRuns.map(run => (
       <PipelineRunItem
-        key={run.id}
+        key={listKey(run)}
         run={run}
-        isSelected={selectedPipelineRun?.id === run.id}
+        isSelected={selectedPipelineRun ? listKey(selectedPipelineRun) === listKey(run) : false}
         onClick={() => onSelectRun(run)}
       />
     ))
@@ -149,6 +192,30 @@ export default function PipelineRunSidebar({
           ) : (
             <div className="space-y-2 mb-2">
               {feedbackListeningRunsList}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Failed section — durably retained locks needing human recovery
+          (scripts/release_lock.py). Shown ahead of Active since these need
+          attention, not just visibility. */}
+      {(loading || failedRuns.length > 0) && (
+        <div className="flex-shrink-0 mb-2">
+          <div className="flex items-center gap-2 mb-2">
+            <AlertTriangle className="w-4 h-4 text-red-500" />
+            <span className="text-sm font-medium text-red-500">Failed</span>
+            {failedRuns.length > 0 && (
+              <span className="ml-auto text-xs bg-red-500 text-white rounded-full px-1.5 py-0.5 leading-none">
+                {failedRuns.length}
+              </span>
+            )}
+          </div>
+          {loading ? (
+            <p className="text-gh-fg-muted text-xs px-1 mb-2">Loading...</p>
+          ) : (
+            <div className="space-y-2 mb-2">
+              {failedRunsList}
             </div>
           )}
         </div>

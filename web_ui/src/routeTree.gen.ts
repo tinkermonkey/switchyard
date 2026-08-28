@@ -14,10 +14,15 @@ import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as ProjectMetricsRouteImport } from './routes/project-metrics'
 import { Route as PipelineRunRouteImport } from './routes/pipeline-run'
 import { Route as PipelineReportsRouteImport } from './routes/pipeline-reports'
+import { Route as MetricsRouteImport } from './routes/metrics'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as CycleMetricsRouteImport } from './routes/cycle-metrics'
 import { Route as AgentMetricsRouteImport } from './routes/agent-metrics'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as MetricsTokensRouteImport } from './routes/metrics/tokens'
+import { Route as MetricsProjectRouteImport } from './routes/metrics/project'
+import { Route as MetricsCycleRouteImport } from './routes/metrics/cycle'
+import { Route as MetricsAgentRouteImport } from './routes/metrics/agent'
 import { Route as AgentExecutionExecutionIdRouteImport } from './routes/agent-execution.$executionId'
 
 const RecommendationReportsRoute = RecommendationReportsRouteImport.update({
@@ -45,6 +50,11 @@ const PipelineReportsRoute = PipelineReportsRouteImport.update({
   path: '/pipeline-reports',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MetricsRoute = MetricsRouteImport.update({
+  id: '/metrics',
+  path: '/metrics',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DashboardRoute = DashboardRouteImport.update({
   id: '/dashboard',
   path: '/dashboard',
@@ -65,6 +75,26 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const MetricsTokensRoute = MetricsTokensRouteImport.update({
+  id: '/tokens',
+  path: '/tokens',
+  getParentRoute: () => MetricsRoute,
+} as any)
+const MetricsProjectRoute = MetricsProjectRouteImport.update({
+  id: '/project',
+  path: '/project',
+  getParentRoute: () => MetricsRoute,
+} as any)
+const MetricsCycleRoute = MetricsCycleRouteImport.update({
+  id: '/cycle',
+  path: '/cycle',
+  getParentRoute: () => MetricsRoute,
+} as any)
+const MetricsAgentRoute = MetricsAgentRouteImport.update({
+  id: '/agent',
+  path: '/agent',
+  getParentRoute: () => MetricsRoute,
+} as any)
 const AgentExecutionExecutionIdRoute =
   AgentExecutionExecutionIdRouteImport.update({
     id: '/agent-execution/$executionId',
@@ -77,24 +107,34 @@ export interface FileRoutesByFullPath {
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
   '/dashboard': typeof DashboardRoute
+  '/metrics': typeof MetricsRouteWithChildren
   '/pipeline-reports': typeof PipelineReportsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/project-metrics': typeof ProjectMetricsRoute
   '/projects': typeof ProjectsRoute
   '/recommendation-reports': typeof RecommendationReportsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/metrics/agent': typeof MetricsAgentRoute
+  '/metrics/cycle': typeof MetricsCycleRoute
+  '/metrics/project': typeof MetricsProjectRoute
+  '/metrics/tokens': typeof MetricsTokensRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
   '/dashboard': typeof DashboardRoute
+  '/metrics': typeof MetricsRouteWithChildren
   '/pipeline-reports': typeof PipelineReportsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/project-metrics': typeof ProjectMetricsRoute
   '/projects': typeof ProjectsRoute
   '/recommendation-reports': typeof RecommendationReportsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/metrics/agent': typeof MetricsAgentRoute
+  '/metrics/cycle': typeof MetricsCycleRoute
+  '/metrics/project': typeof MetricsProjectRoute
+  '/metrics/tokens': typeof MetricsTokensRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -102,12 +142,17 @@ export interface FileRoutesById {
   '/agent-metrics': typeof AgentMetricsRoute
   '/cycle-metrics': typeof CycleMetricsRoute
   '/dashboard': typeof DashboardRoute
+  '/metrics': typeof MetricsRouteWithChildren
   '/pipeline-reports': typeof PipelineReportsRoute
   '/pipeline-run': typeof PipelineRunRoute
   '/project-metrics': typeof ProjectMetricsRoute
   '/projects': typeof ProjectsRoute
   '/recommendation-reports': typeof RecommendationReportsRoute
   '/agent-execution/$executionId': typeof AgentExecutionExecutionIdRoute
+  '/metrics/agent': typeof MetricsAgentRoute
+  '/metrics/cycle': typeof MetricsCycleRoute
+  '/metrics/project': typeof MetricsProjectRoute
+  '/metrics/tokens': typeof MetricsTokensRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -116,36 +161,51 @@ export interface FileRouteTypes {
     | '/agent-metrics'
     | '/cycle-metrics'
     | '/dashboard'
+    | '/metrics'
     | '/pipeline-reports'
     | '/pipeline-run'
     | '/project-metrics'
     | '/projects'
     | '/recommendation-reports'
     | '/agent-execution/$executionId'
+    | '/metrics/agent'
+    | '/metrics/cycle'
+    | '/metrics/project'
+    | '/metrics/tokens'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/agent-metrics'
     | '/cycle-metrics'
     | '/dashboard'
+    | '/metrics'
     | '/pipeline-reports'
     | '/pipeline-run'
     | '/project-metrics'
     | '/projects'
     | '/recommendation-reports'
     | '/agent-execution/$executionId'
+    | '/metrics/agent'
+    | '/metrics/cycle'
+    | '/metrics/project'
+    | '/metrics/tokens'
   id:
     | '__root__'
     | '/'
     | '/agent-metrics'
     | '/cycle-metrics'
     | '/dashboard'
+    | '/metrics'
     | '/pipeline-reports'
     | '/pipeline-run'
     | '/project-metrics'
     | '/projects'
     | '/recommendation-reports'
     | '/agent-execution/$executionId'
+    | '/metrics/agent'
+    | '/metrics/cycle'
+    | '/metrics/project'
+    | '/metrics/tokens'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -153,6 +213,7 @@ export interface RootRouteChildren {
   AgentMetricsRoute: typeof AgentMetricsRoute
   CycleMetricsRoute: typeof CycleMetricsRoute
   DashboardRoute: typeof DashboardRoute
+  MetricsRoute: typeof MetricsRouteWithChildren
   PipelineReportsRoute: typeof PipelineReportsRoute
   PipelineRunRoute: typeof PipelineRunRoute
   ProjectMetricsRoute: typeof ProjectMetricsRoute
@@ -198,6 +259,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PipelineReportsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/metrics': {
+      id: '/metrics'
+      path: '/metrics'
+      fullPath: '/metrics'
+      preLoaderRoute: typeof MetricsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/dashboard': {
       id: '/dashboard'
       path: '/dashboard'
@@ -226,6 +294,34 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/metrics/tokens': {
+      id: '/metrics/tokens'
+      path: '/tokens'
+      fullPath: '/metrics/tokens'
+      preLoaderRoute: typeof MetricsTokensRouteImport
+      parentRoute: typeof MetricsRoute
+    }
+    '/metrics/project': {
+      id: '/metrics/project'
+      path: '/project'
+      fullPath: '/metrics/project'
+      preLoaderRoute: typeof MetricsProjectRouteImport
+      parentRoute: typeof MetricsRoute
+    }
+    '/metrics/cycle': {
+      id: '/metrics/cycle'
+      path: '/cycle'
+      fullPath: '/metrics/cycle'
+      preLoaderRoute: typeof MetricsCycleRouteImport
+      parentRoute: typeof MetricsRoute
+    }
+    '/metrics/agent': {
+      id: '/metrics/agent'
+      path: '/agent'
+      fullPath: '/metrics/agent'
+      preLoaderRoute: typeof MetricsAgentRouteImport
+      parentRoute: typeof MetricsRoute
+    }
     '/agent-execution/$executionId': {
       id: '/agent-execution/$executionId'
       path: '/agent-execution/$executionId'
@@ -236,11 +332,29 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface MetricsRouteChildren {
+  MetricsAgentRoute: typeof MetricsAgentRoute
+  MetricsCycleRoute: typeof MetricsCycleRoute
+  MetricsProjectRoute: typeof MetricsProjectRoute
+  MetricsTokensRoute: typeof MetricsTokensRoute
+}
+
+const MetricsRouteChildren: MetricsRouteChildren = {
+  MetricsAgentRoute: MetricsAgentRoute,
+  MetricsCycleRoute: MetricsCycleRoute,
+  MetricsProjectRoute: MetricsProjectRoute,
+  MetricsTokensRoute: MetricsTokensRoute,
+}
+
+const MetricsRouteWithChildren =
+  MetricsRoute._addFileChildren(MetricsRouteChildren)
+
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AgentMetricsRoute: AgentMetricsRoute,
   CycleMetricsRoute: CycleMetricsRoute,
   DashboardRoute: DashboardRoute,
+  MetricsRoute: MetricsRouteWithChildren,
   PipelineReportsRoute: PipelineReportsRoute,
   PipelineRunRoute: PipelineRunRoute,
   ProjectMetricsRoute: ProjectMetricsRoute,

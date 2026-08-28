@@ -911,13 +911,62 @@ class HumanFeedbackLoopExecutor:
             # ending the run here would force a new pipeline run AND set a cancellation
             # signal that races against the next loop starting.
             if _exit_reason != "column_changed":
+                _outcome = "success" if _loop_exited_normally else "failed"
                 try:
                     from services.pipeline_run import get_pipeline_run_manager
-                    _outcome = "success" if _loop_exited_normally else "failed"
-                    get_pipeline_run_manager().end_pipeline_run(
-                        state.project_name, state.issue_number,
-                        reason="feedback_loop_ended", outcome=_outcome
-                    )
+                    pipeline_run_manager = get_pipeline_run_manager()
+                    if _outcome == "failed":
+                        # Route genuine failures through the shared mark_failed()
+                        # entry point rather than a bare end_pipeline_run(outcome=
+                        # "failed") — previously unmigrated. Before this PR, an
+                        # abnormal exit here just meant "don't release yet" and
+                        # self-healed via the stale-lock watchdog; after this PR,
+                        # retain_lock=None + outcome="failed" durably retains the
+                        # lock (see PipelineRunManager.end_pipeline_run), which
+                        # now permanently blocks this board (conversational
+                        # columns like "Research" are trigger columns for the
+                        # planning workflow) until a human runs
+                        # scripts/release_lock.py. reason is deliberately more
+                        # specific than the old generic "feedback_loop_ended" so
+                        # the retained_reason surfaced in
+                        # scripts/list_failed_pipeline_runs.py and the dashboard
+                        # is actually meaningful to an operator.
+                        #
+                        # Deliberately does NOT pass suppress_cancellation=True
+                        # here (round 5 originally did, reasoning it should mirror
+                        # the "feedback_loop_ended" sentinel's race-avoidance for
+                        # the success branch below — that reasoning didn't hold up
+                        # under review). The only way to reach this branch at all
+                        # is an uncaught exception (every deliberate exit sets
+                        # _loop_exited_normally=True explicitly before returning;
+                        # this try has no except, only finally) — and mark_failed()
+                        # durably retains the lock, which blocks ALL further
+                        # dispatch on this board via try_acquire_lock's upfront
+                        # durable check. There is no "next loop about to start" to
+                        # race against here, unlike the success branch. Suppressing
+                        # the signal would instead disable the exact protection it
+                        # exists for (services/cancellation.py: "ensures all
+                        # retry/recovery layers respect the stop signal and don't
+                        # respawn agents") for a container that may still be
+                        # orphaned mid-execution when this exception fired.
+                        marked_ok = pipeline_run_manager.mark_failed(
+                            project=state.project_name,
+                            board=state.board_name,
+                            issue_number=state.issue_number,
+                            reason=f"Conversational feedback loop exited abnormally (exit_reason={_exit_reason})",
+                        )
+                        if not marked_ok:
+                            logger.critical(
+                                f"Pipeline lock for {state.project_name}/#{state.issue_number} "
+                                f"could NOT be durably marked failed after an abnormal "
+                                f"feedback-loop exit — this issue may be silently "
+                                f"re-dispatched."
+                            )
+                    else:
+                        pipeline_run_manager.end_pipeline_run(
+                            state.project_name, state.issue_number,
+                            reason="feedback_loop_ended", outcome=_outcome
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to end pipeline run after feedback loop for #{state.issue_number}: {e}")
             else:

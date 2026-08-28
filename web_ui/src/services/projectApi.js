@@ -21,8 +21,9 @@ export const projectApi = {
   /**
    * Release a pipeline lock for a project/board
    */
-  async releasePipelineLock(projectName, boardName, issueNumber = null) {
+  async releasePipelineLock(projectName, boardName, issueNumber = null, force = false) {
     const body = issueNumber ? { issue_number: issueNumber } : {}
+    if (force) body.force = true
     return apiClient.post(`/api/projects/${projectName}/pipelines/${encodeURIComponent(boardName)}/release-lock`, body)
   },
 }
