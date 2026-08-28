@@ -5,14 +5,17 @@ This module provides the integration between the main orchestrator and the agent
 replacing the legacy agent_stages.py with a proper factory-based approach.
 """
 
+import logging
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from pipeline.base import PipelineStage
 from pipeline.orchestrator import SequentialPipeline
 from state_management.manager import StateManager
 from agents import AGENT_REGISTRY, get_agent_class
 from services.circuit_breaker import CircuitBreaker
+
+logger = logging.getLogger(__name__)
 
 
 # How long a dev container status may sit at IN_PROGRESS before it's treated as stale
@@ -185,7 +188,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
 class AgentStage(PipelineStage):
     """Generic pipeline stage that wraps any agent"""
 
-    def __init__(self, agent_name: str, agent_config: Dict[str, Any] = None):
+    def __init__(self, agent_name: str, agent_config: Dict[str, Any] = None, project_name: Optional[str] = None):
         # Check for custom circuit breaker config
         circuit_breaker = None
         if agent_config and 'agent_config' in agent_config:
@@ -193,14 +196,20 @@ class AgentStage(PipelineStage):
             real_config = agent_config['agent_config']
             if hasattr(real_config, 'circuit_breaker_config') and real_config.circuit_breaker_config:
                 cb_config = real_config.circuit_breaker_config
+                breaker_name = f"{project_name}:{agent_name}" if project_name else agent_name
+                if not project_name:
+                    logger.warning(
+                        f"AgentStage for '{agent_name}' constructed without project_name — "
+                        f"custom CircuitBreaker falling back to un-namespaced key."
+                    )
                 circuit_breaker = CircuitBreaker(
-                    name=agent_name,
+                    name=breaker_name,
                     failure_threshold=cb_config.get('failure_threshold', 3),
                     recovery_timeout=cb_config.get('recovery_timeout', 30),
                     success_threshold=cb_config.get('success_threshold', 2)
                 )
 
-        super().__init__(agent_name, circuit_breaker=circuit_breaker, agent_config=agent_config)
+        super().__init__(agent_name, circuit_breaker=circuit_breaker, agent_config=agent_config, project_name=project_name)
         self.agent_class = get_agent_class(agent_name)
         if not self.agent_class:
             raise ValueError(f"Unknown agent: {agent_name}")
@@ -262,7 +271,8 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
                 test_configs=test_configs,
                 agent_name=stage_config.default_agent,
                 max_total_agent_calls=max_total_agent_calls,
-                checkpoint_interval=checkpoint_interval
+                checkpoint_interval=checkpoint_interval,
+                project_name=project_name
             )
 
         elif stage_config.stage_type == 'pr_review':
@@ -276,6 +286,7 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
                 pr_review_agent=stage_config.default_agent,  # pr_code_reviewer
                 requirements_verifier_agent="requirements_verifier",
                 skip_ci_check=skip_ci_check,
+                project_name=project_name,
             )
 
         else:
@@ -287,7 +298,7 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
         project_name,
         stage_config.default_agent
     )
-    return AgentStage(stage_config.default_agent, agent_config)
+    return AgentStage(stage_config.default_agent, agent_config, project_name=project_name)
 
 
 def create_agent_pipeline(agent_names: list, state_manager: StateManager) -> SequentialPipeline:

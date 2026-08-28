@@ -46,7 +46,7 @@ class PipelineFactory:
         if not agent_class:
             raise ValueError(f"Unknown agent type: {agent_name}")
 
-        return AgentStage(agent_name, agent_config_dict)
+        return AgentStage(agent_name, agent_config_dict, project_name=project_name)
 
     def create_pipeline_from_template(self, template_name: str, project_name: str) -> SequentialPipeline:
         """Create a pipeline from a template for a specific project"""
