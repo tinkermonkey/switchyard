@@ -391,6 +391,14 @@ async def list_issues(
                 "orchestrator:pipeline_run:issue_mapping",
                 format_pipeline_run_issue_key(project, issue_number, board_name),
             )
+            if not pipeline_run_id:
+                # Fall back to the legacy (pre-board-scoping) key, matching
+                # get_issue()'s behavior — otherwise the two tools disagree
+                # for any mapping still stored in the legacy format.
+                pipeline_run_id = r.hget(
+                    "orchestrator:pipeline_run:issue_mapping",
+                    format_pipeline_run_issue_key(project, issue_number),
+                )
             results.append({
                 "issue_number": issue_number,
                 "title": content.get("title"),

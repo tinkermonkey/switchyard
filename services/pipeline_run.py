@@ -226,6 +226,31 @@ class PipelineRunManager:
     def _get_issue_key(self, project: str, issue_number: int, board: Optional[str] = None) -> str:
         """Get Redis hash field for issue mapping"""
         return format_pipeline_run_issue_key(project, issue_number, board)
+
+    def _cleanup_issue_mapping(self, project: str, issue_number: int, board: Optional[str], pipeline_run_id: str) -> None:
+        """Remove this run's issue-mapping entries: the board-scoped key it was
+        stored under, and — defensively — the legacy 2-field key too, but only
+        if it still points at THIS run_id.
+
+        Why the legacy key needs checking at all: get_active_pipeline_run()
+        (deliberately left un-namespaced, see #43) can restore a run into the
+        legacy key via its ES fallback. Without this check, a run ending would
+        leave that legacy entry orphaned forever (no other cleanup job exists
+        for it), so any future legacy-format lookup for this issue would keep
+        returning this now-completed run's ID indefinitely. Comparing the
+        value before deleting avoids clobbering a DIFFERENT board's still-
+        active run that might currently occupy that same legacy slot.
+        """
+        board_key = self._get_issue_key(project, issue_number, board)
+        self.redis.hdel(self.redis_issue_mapping, board_key)
+
+        legacy_key = self._get_issue_key(project, issue_number)
+        if legacy_key != board_key:
+            try:
+                if self.redis.hget(self.redis_issue_mapping, legacy_key) == pipeline_run_id:
+                    self.redis.hdel(self.redis_issue_mapping, legacy_key)
+            except Exception as e:
+                logger.warning(f"Failed to clean up legacy issue mapping {legacy_key}: {e}")
     
     def create_pipeline_run(
         self,
@@ -1020,9 +1045,8 @@ class PipelineRunManager:
         )
         
         # Remove from issue mapping (can't be reused)
-        issue_key = self._get_issue_key(project, issue_number, pipeline_run.board)
-        self.redis.hdel(self.redis_issue_mapping, issue_key)
-        
+        self._cleanup_issue_mapping(project, issue_number, pipeline_run.board, pipeline_run.id)
+
         # Update in Elasticsearch
         self._persist_to_elasticsearch(pipeline_run)
 
@@ -1781,8 +1805,7 @@ class PipelineRunManager:
             # Remove from issue mapping
             project = run_data['project']
             issue_number = run_data['issue_number']
-            issue_key = self._get_issue_key(project, issue_number, run_data.get('board'))
-            self.redis.hdel(self.redis_issue_mapping, issue_key)
+            self._cleanup_issue_mapping(project, issue_number, run_data.get('board'), pipeline_run_id)
             
             logger.info(f"Ended stale pipeline run {pipeline_run_id}: {reason}")
             

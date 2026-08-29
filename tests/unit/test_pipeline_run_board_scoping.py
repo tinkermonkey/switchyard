@@ -203,6 +203,65 @@ class TestTwoBoardsSameIssueDoNotCollide:
         assert 'proj:BoardB:5' not in mapping
 
 
+class TestLegacyKeyCleanupOnEnd:
+    """Regression tests for the review finding that end_pipeline_run() only
+    deleted the new board-scoped key, orphaning any legacy 2-field key that
+    get_active_pipeline_run()'s ES-fallback restore path may have written —
+    a stale completed run's ID would otherwise linger under the legacy key
+    forever, since nothing else ever cleans it up."""
+
+    def test_end_pipeline_run_removes_legacy_key_if_it_points_to_this_run(self):
+        manager, _, mock_redis = make_manager()
+
+        run = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # Simulate get_active_pipeline_run()'s ES-fallback restore writing the
+        # legacy (board-less) key for this same run.
+        mock_redis.hset(manager.redis_issue_mapping, 'proj:9', run.id)
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_lm, \
+             patch('subprocess.run') as mock_subprocess:
+            mock_lm.return_value.release_lock = MagicMock()
+            mock_subprocess.return_value = MagicMock(returncode=0, stdout='[]')
+            manager.end_pipeline_run('proj', 9, reason='done')
+
+        mapping = mock_redis.data[manager.redis_issue_mapping]
+        assert 'proj:BoardA:9' not in mapping
+        assert 'proj:9' not in mapping  # legacy key cleaned up too
+
+    def test_cleanup_does_not_delete_legacy_key_owned_by_another_run(self):
+        # Exercises _cleanup_issue_mapping() directly: end_pipeline_run()
+        # itself always resolves "the" active run via get_active_pipeline_run()
+        # (legacy-key-based, out of #43's scope), so it can't be used to force
+        # "end run_a specifically while the legacy key points to run_b" — the
+        # compare-and-delete behavior this test targets is a property of the
+        # cleanup helper itself, tested in isolation here.
+        manager, _, mock_redis = make_manager()
+
+        run_a = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        run_b = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardB',
+        )
+        # Legacy key currently belongs to run_b (e.g. BoardB's run was the one
+        # most recently restored into it via ES fallback).
+        mock_redis.hset(manager.redis_issue_mapping, 'proj:9', run_b.id)
+
+        # Clean up run_a's mapping — must NOT clobber the legacy key, since it
+        # currently points to run_b, not run_a.
+        manager._cleanup_issue_mapping('proj', 9, 'BoardA', run_a.id)
+
+        mapping = mock_redis.data[manager.redis_issue_mapping]
+        assert 'proj:BoardA:9' not in mapping  # run_a's own key is removed
+        assert mapping.get('proj:9') == run_b.id  # legacy key untouched
+        assert mapping.get('proj:BoardB:9') == run_b.id  # run_b unaffected
+
+
 class TestGetRecentPipelineRunIdBoardParameter:
     def test_board_none_keeps_legacy_two_field_redis_lookup(self):
         manager, _, mock_redis = make_manager()
