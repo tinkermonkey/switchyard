@@ -11,6 +11,24 @@ variables:
 
 **CRITICAL**: You must verify the Docker image was built successfully and mark the container state appropriately.
 
+### Step 0: Check For A REQUIRED FIX In The Original Issue
+
+If the Original Issue description above contains a `## REQUIRED FIX` section, that is the
+actual reason this rebuild was triggered — a specific automated test is failing because
+of it. This takes priority over the generic checks below:
+
+- Confirm the change was actually made: check `git diff` / `git log -1 --stat` against the
+  project's working tree and verify the file(s) the REQUIRED FIX names were edited and
+  committed.
+- Do NOT accept the setup agent's narrative summary as proof. If its output claims "no
+  change was needed" or "the issue was already resolved," treat that as a red flag
+  requiring extra scrutiny, not confirmation — independently re-run the *exact* failing
+  command described in the REQUIRED FIX (in the actual environment the failing test uses)
+  and verify it now succeeds yourself.
+- If the required fix was not made, or was made but you cannot independently confirm it
+  resolves the described failure, mark **BLOCKED** regardless of whether the image
+  otherwise builds and the CLI tools are present.
+
 ### Step 1: Review Setup Agent's Work
 
 Examine the setup agent's output for:
@@ -127,6 +145,8 @@ print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}"
 - **Any of the three critical CLI tools (claude, git, gh) are missing or broken**
 - Critical validation tests failed
 - Cannot start container
+- **A `## REQUIRED FIX` was named in the Original Issue but was not made, or was made but
+  you could not independently confirm it resolves the described failure (see Step 0)**
 
 ## Review Format
 

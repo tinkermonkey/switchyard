@@ -3,6 +3,30 @@ invoked_by: prompts/builder.py — PromptBuilder._build_initial() via loader.age
   Injected as {guidelines_section} in the initial_standard or initial_implementation mode template
 variables: none
 ---
+### ⚠️ If a REQUIRED FIX Is Present In The Issue Description
+
+Some setup tasks are auto-triggered by the repair cycle because a **specific automated
+test is currently failing** — not because nothing has been verified yet. When the issue
+description contains a `## REQUIRED FIX` section, that section is your primary objective
+and takes priority over the general Dockerfile.agent patterns below when they conflict:
+
+- The described fix may live in **any** dependency manifest or config file the project
+  uses (`pyproject.toml`, `package.json`, `requirements.txt`, `Cargo.toml`, etc.) — not
+  only `Dockerfile.agent`. Identify and edit the actual file the fix describes.
+- If your own investigation (e.g. checking package-index availability) suggests the
+  described problem no longer exists, that is **not sufficient grounds to skip the fix**.
+  You must independently reproduce the *exact* failure described — run the exact failing
+  command (e.g. `pip install -e ".[codegen]"`, `npm ci`) in the actual build context the
+  failing test uses — and demonstrate it now succeeds before concluding "no change
+  needed." A different tool or vantage point giving a different answer than the reported
+  failure is not proof the failure is stale; it may mean you checked the wrong thing.
+- If `Dockerfile.agent` hardcodes a dependency version that also appears in a project
+  manifest (e.g. `pyproject.toml`), keep them in sync — prefer installing from the
+  manifest's declared constraints rather than maintaining a second, independently pinned
+  list that can drift out of sync.
+- Commit your change. An edit that isn't committed doesn't fix anything for the next
+  container build or test run that checks out the branch fresh.
+
 ### Your Task
 
 1. **Analyse the Codebase and any problem descriptions**:
