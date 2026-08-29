@@ -62,7 +62,6 @@ class Environment(BaseSettings):
 
     # Worker Pool Configuration
     orchestrator_workers: int = 1  # Number of worker threads for parallel task execution (default: 1 = single-threaded)
-    max_concurrent_agent_containers: int = 1  # Tier-0 global cap on concurrent agent Docker containers (default: 1 = today's effective norm, no new concurrency)
 
     # Docker/Host Configuration (used by docker-compose for file permissions)
     host_uid: Optional[int] = 1000

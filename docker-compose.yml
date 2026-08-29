@@ -66,10 +66,6 @@ services:
       # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
       # Recommended: 2-3 workers for multi-project deployments
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
-      # Tier-0 global cap on concurrent agent Docker containers (Redis-backed).
-      # Default 1 = no new concurrency enabled. If you raise ORCHESTRATOR_WORKERS
-      # above 1, raise this too or container launches will still serialize below it.
-      - MAX_CONCURRENT_AGENT_CONTAINERS=${MAX_CONCURRENT_AGENT_CONTAINERS:-1}
       - PYTHONDONTWRITEBYTECODE=1
       - OTEL_COLLECTOR_HOST=otel-collector
       # Switchyard's own switchyard.claude.token.usage OTLP metrics export (SigNoz or

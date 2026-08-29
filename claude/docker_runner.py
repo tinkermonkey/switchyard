@@ -92,7 +92,6 @@ class DockerAgentRunner:
         self._host_workspace_path = None  # Cache for host workspace path detection
         self._redis = None  # Lazy Redis connection (shared across register/unregister/persist calls)
         self._active_worktrees: dict = {}  # container_name -> [(repo_path, worktree_path), ...]
-        self._agent_container_limiter = None  # Lazy tier-0 concurrency limiter (see run_agent_in_container)
 
     def _get_redis(self):
         """Lazy Redis connection (tolerates Redis being unavailable)."""
@@ -105,23 +104,6 @@ class DockerAgentRunner:
                 logger.warning(f"Redis unavailable for container tracking: {e}")
                 self._redis = None
         return self._redis
-
-    def _get_agent_container_limiter(self):
-        """Lazy tier-0 concurrency limiter, constructed once and reused across
-        every run_agent_in_container() call on this runner instance — not
-        just to reuse the Redis connection, but so the limiter's own
-        ORCHESTRATOR_WORKERS-vs-cap mismatch warning logs once (at first use)
-        instead of spamming on every single agent launch."""
-        if self._agent_container_limiter is None:
-            from config.environment import load_environment
-            from services.agent_container_concurrency import AgentContainerConcurrencyLimiter
-
-            env_config = load_environment()
-            self._agent_container_limiter = AgentContainerConcurrencyLimiter(
-                max_concurrent=env_config.max_concurrent_agent_containers,
-                redis_client=self._get_redis(),
-            )
-        return self._agent_container_limiter
 
     @staticmethod
     def _detect_host_workspace_path() -> str:
@@ -531,34 +513,17 @@ class DockerAgentRunner:
         )
 
         try:
-            # Acquire a tier-0 global concurrency slot immediately before the
-            # actual container execution, and release it as soon as execution
-            # is fully done (success, failure, or timeout) — see
-            # services/agent_container_concurrency.py. Redis-backed so it
-            # coordinates across orchestrator processes; fails open (never
-            # blocks) if Redis is unavailable. Reuses this runner's own
-            # lazily-cached limiter (see _get_agent_container_limiter)
-            # instead of reconstructing one — and re-parsing config, and
-            # re-logging its mismatch warning — on every single launch.
-            from services.agent_container_concurrency import acquire_agent_container_slot
-
-            container_limiter = self._get_agent_container_limiter()
-
-            async with acquire_agent_container_slot(
-                max_concurrent=container_limiter.max_concurrent,
-                limiter=container_limiter,
-            ):
-                # Start the container and execute Claude Code
-                result_text = await self._execute_in_container(
-                    docker_cmd=docker_cmd,
-                    prompt=prompt,
-                    container_name=container_name,
-                    stream_callback=stream_callback,
-                    context=context,
-                    project_dir=project_dir,
-                    image_name=image_name,
-                    mcp_config_path=mcp_config_path
-                )
+            # Start the container and execute Claude Code
+            result_text = await self._execute_in_container(
+                docker_cmd=docker_cmd,
+                prompt=prompt,
+                container_name=container_name,
+                stream_callback=stream_callback,
+                context=context,
+                project_dir=project_dir,
+                image_name=image_name,
+                mcp_config_path=mcp_config_path
+            )
 
             return result_text
 
