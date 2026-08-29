@@ -195,6 +195,50 @@ class TestFailsafeBatchedGatheringFlagged:
         assert None in prefetched_values
         assert data2 in prefetched_values
 
+    def test_board_missing_from_both_results_and_errors_logs_warning_and_falls_back(self, two_board_setup, caplog):
+        """
+        Regression test: a pair can be silently dropped before ever reaching
+        a query (e.g. build_batched_board_queries() skips a whole chunk
+        whose owner type can't be resolved), landing in neither
+        batched_results nor batched_errors. That board must still fall back
+        AND log a warning - not silently vanish with zero signal every
+        cycle - matching the same fix already applied to
+        _fetch_boards_batched() itself.
+        """
+        import logging
+        monitor = _make_monitor(two_board_setup['config_manager'], batched_flag=True)
+
+        data2 = {'items': {'nodes': [{'id': 'b'}]}}
+        # pair1 is in NEITHER results nor errors; pair2 succeeded.
+        results = {two_board_setup['pair2']: data2}
+        errors = {}
+
+        with patch(
+            'services.pipeline_lock_manager.get_pipeline_lock_manager',
+            return_value=two_board_setup['lock_manager'],
+        ), patch(
+            'services.pipeline_queue_manager.get_pipeline_queue_manager',
+            return_value=two_board_setup['queue_manager'],
+        ), patch(
+            'config.state_manager.state_manager'
+        ) as mock_state_manager, patch(
+            'services.github_owner_utils.execute_batched_board_queries',
+            return_value=(results, errors),
+        ), caplog.at_level(logging.WARNING, logger='services.project_monitor'):
+            mock_state_manager.load_project_state.side_effect = (
+                lambda name: two_board_setup['states'][name]
+            )
+
+            monitor._check_and_process_waiting_issues_failsafe()
+
+        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        assert len(calls) == 2
+        prefetched_values = [c.kwargs['prefetched_board_data'] for c in calls]
+        assert None in prefetched_values  # pair1 falls back
+        assert data2 in prefetched_values  # pair2 unaffected
+        # A warning was logged for the silently-dropped board, not just silence.
+        assert any('project1' in r.message or 'Board1' in r.message for r in caplog.records)
+
     def test_missing_project_state_falls_back_for_that_board_only(self, two_board_setup):
         """A board whose project state can't be resolved is simply dropped
         from the batch gathering pass (mirrors get_issues_in_column_order()'s

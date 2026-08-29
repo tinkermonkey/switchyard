@@ -7697,22 +7697,33 @@ _Repair cycle initiated by Switchyard_
                                 if board_key is not None:
                                     prefetched_board_data[board_key] = project_data
 
-                            # Boards missing from batched_results (present in
-                            # batched_errors, or silently dropped during query
-                            # building) simply have no entry in prefetched_board_data -
-                            # the get_next_waiting_issue() call below then falls back
+                            # Boards missing from batched_results simply have no
+                            # entry in prefetched_board_data - the
+                            # get_next_waiting_issue() call below then falls back
                             # to fetching that one board itself the normal way, the
                             # exact bounded per-board fallback _fetch_boards_batched()
                             # uses, so one bad board never loses the rest of this
-                            # cycle's boards.
-                            for pair, reason in batched_errors.items():
-                                board_key = board_key_by_pair.get(pair)
-                                if board_key is not None:
-                                    logger.warning(
-                                        f"⚠️  FAILSAFE: Batched board query failed for "
-                                        f"{board_key[0]}/{board_key[1]} ({pair[0]}/project#{pair[1]}): "
-                                        f"{reason}. Falling back to single-board fetch for this board only."
-                                    )
+                            # cycle's boards. Logged for EVERY pair missing from
+                            # batched_results (not just the ones explicitly present
+                            # in batched_errors) - a pair can also be silently
+                            # dropped before ever reaching a query (e.g.
+                            # build_batched_board_queries() skips a whole chunk
+                            # whose owner type can't be resolved), landing in
+                            # neither dict. Without checking membership in
+                            # batched_results directly, that case produced no log
+                            # line at all - the board would silently fall back to
+                            # an individual fetch every cycle, forever, with zero
+                            # signal - the same gap already fixed in
+                            # _fetch_boards_batched() itself (services/project_monitor.py).
+                            for pair, board_key in board_key_by_pair.items():
+                                if pair in batched_results:
+                                    continue
+                                reason = batched_errors.get(pair, "board missing from batched response (query build skipped it)")
+                                logger.warning(
+                                    f"⚠️  FAILSAFE: Batched board query failed for "
+                                    f"{board_key[0]}/{board_key[1]} ({pair[0]}/project#{pair[1]}): "
+                                    f"{reason}. Falling back to single-board fetch for this board only."
+                                )
                 except Exception as e:
                     logger.error(
                         f"FAILSAFE: Unexpected error during batched board pre-fetch - "
