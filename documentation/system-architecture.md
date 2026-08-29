@@ -22,9 +22,10 @@ graph TD
     GH -->|next column| PP[PipelineProgression<br>pipeline/progression.py]
     PP -->|poll board| PM
 
-    SP[SequentialPipeline<br>pipeline/orchestrator.py] -->|wraps| AG
-    SP -->|checkpoint| FS[State files<br>orchestrator_data/state/]
-    SP -->|circuit breaker| CB[CircuitBreaker<br>pipeline/base.py]
+    AE[AgentExecutor<br>services/agent_executor.py] -->|creates + runs| AG
+    AE -->|circuit breaker| CB[CircuitBreaker<br>pipeline/base.py]
+    PR[PipelineRunManager<br>services/pipeline_run.py] -->|tracks run status| RD
+    PR -->|failure| PL[PipelineLockManager<br>services/pipeline_lock_manager.py]
 
     GHM[GitHubProjectManager<br>services/github_project_manager.py] -->|reconcile boards| GH
     OBS[ObservabilityServer<br>services/observability_server.py] -->|reads| ES[Elasticsearch]
@@ -99,9 +100,13 @@ Every `MakerAgent` supports three execution modes determined from task context a
 - **Revision**: Re-execution triggered by reviewer feedback (`trigger: 'review_cycle_revision'`).
 - **Question**: Conversational reply triggered by a feedback loop comment (`trigger: 'feedback_loop'` with `conversation_mode: 'threaded'`).
 
-### `pipeline/orchestrator.py` — `SequentialPipeline`
+### `services/pipeline_run.py` — `PipelineRunManager`
 
-Executes a list of `PipelineStage` instances in order. Before each stage it writes a checkpoint to `orchestrator_data/state/checkpoints/<pipeline_id>_stage_<n>.json`. If a checkpoint exists when `execute()` is called, the pipeline resumes from the saved stage index. After each stage succeeds it logs the completion event. If a stage raises and the circuit breaker is open, the pipeline halts.
+Tracks the lifecycle of a `PipelineRun` — an observability record, not an executing object. `get_or_create_pipeline_run()` creates one the moment `ProjectMonitor` detects an issue entering the pipeline, assigning it the `pipeline_run_id` that tags every subsequent task, agent execution, and event for that issue. Status (`active`, `completed`, `failed`) is stored in Redis (fast lookups, 2-hour TTL) and mirrored to Elasticsearch (7-day retention) for durable history. There is no stage list and no cross-stage execution loop here — each column an issue moves into independently triggers exactly one stage's execution, dispatched separately (see `AgentExecutor` below, and the `PRReviewStage`/`RepairCycleStage`/`ReviewCycleExecutor` entries elsewhere in this document); the issue's current board column is its position in the pipeline. `mark_failed()` is the single shared entry point for every pipeline-failure path: it ends the `PipelineRun` and durably marks the pipeline lock as retained via `PipelineLockManager.mark_lock_failed()` (see "Pipeline locking" below).
+
+### `services/agent_executor.py` — `AgentExecutor`
+
+The centralized entry point for executing a single agent — every execution path (task queue dispatch, review cycles, repair cycles, conversational loops) calls `execute_agent()`. It builds the execution context, uses `PipelineFactory.create_agent()` to construct one `AgentStage` for the target agent, and runs it via `agent_stage.run_with_circuit_breaker()`. On failure, after its own per-dispatch retries are exhausted, it calls `PipelineRunManager.mark_failed()`.
 
 ### `claude/docker_runner.py` — `DockerAgentRunner`
 
@@ -400,7 +405,7 @@ State files are YAML or JSON documents written to disk under `orchestrator_data/
 | `state/pipeline_locks/<project>_<board>.yaml` | YAML | Pipeline lock state (YAML-persisted mirror of Redis locks); flat files, not per-project subdirectories |
 | `state/pipeline_queues/<project>_<board>.yaml` | YAML | Issues queued behind the pipeline lock |
 | `state/execution_history/<project>_issue_<number>.yaml` | YAML | Work execution state per issue (prevents double-triggers) |
-| `orchestrator_data/state/checkpoints/<pipeline_id>_stage_<n>.json` | JSON | Pipeline execution checkpoint at a given stage |
+| `state/projects/<project>/repair_cycles/<issue_number>/checkpoint.json` | JSON | Repair cycle checkpoint (test type, iteration, files fixed); backed by `checkpoint.backup.json` |
 | `orchestrator_data/repair_cycles/<project>/<issue>/context.json` | JSON | Repair cycle context passed into the repair cycle container |
 
 `state/` files are auto-managed by the orchestrator and should not be edited manually. The `orchestrator_data/` directory is runtime scratch space.
@@ -417,9 +422,11 @@ The GitHub circuit breaker is checked before every board reconciliation, before 
 
 Circuit breaker states are readable at `GET /api/circuit-breakers` on the observability server.
 
-### Checkpointing
+### Checkpointing and restart recovery
 
-Before executing each stage of a `SequentialPipeline`, a JSON checkpoint is written to disk at `orchestrator_data/state/checkpoints/<pipeline_id>_stage_<n>.json`. If the orchestrator is interrupted mid-pipeline and the same pipeline is re-triggered, `SequentialPipeline.execute()` loads the latest checkpoint and resumes from the saved stage index.
+There is no pipeline-run-level (cross-stage) checkpoint or resume mechanism: each column-triggered stage execution is independent, and an issue's current GitHub board column is its durable position in the pipeline, so there is no in-process or on-disk pipeline state that needs saving and restoring across stages. The one real checkpoint mechanism is scoped to a single `RepairCycleStage` run: it writes to `state/projects/<project>/repair_cycles/<issue_number>/checkpoint.json` (with a `checkpoint.backup.json` fallback) every `checkpoint_interval` iterations (default 5) and on each test type completion, so a killed or restarted repair cycle container can resume mid-run instead of restarting its test-fix loop from scratch.
+
+Recovery from an orchestrator restart otherwise happens at the Docker and board-reconciliation level, not via saved pipeline state: on startup, `ProjectMonitor._reconcile_active_runs()` ends any active `PipelineRun` whose issue has since left the pipeline, and `AgentContainerRecovery` (`services/agent_container_recovery.py`) reconnects to agent and repair-cycle containers that are still running or cleans up execution state for ones that died, so the issue can be re-dispatched from its current column. Failure is made durable independently of any of this: `PipelineRunManager.mark_failed()` ends the run and calls `PipelineLockManager.mark_lock_failed()`, which sets `PipelineLock.retained_reason` in Redis and YAML — a retained lock is never auto-recovered and blocks re-dispatch until a human runs `scripts/release_lock.py`.
 
 ### Pipeline locking
 

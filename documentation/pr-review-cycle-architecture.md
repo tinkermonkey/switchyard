@@ -134,7 +134,7 @@ After all phases complete, `PRReviewStage` makes one of three decisions:
 
 In all three cases, `pr_review_state_manager.increment_review_count()` is called to record the completed cycle.
 
-`context['manual_progression_made'] = True` is set for clean pass and issues-found outcomes, preventing the `SequentialPipeline` from applying its own auto-advancement logic.
+`context['manual_progression_made'] = True` is set for clean pass and issues-found outcomes. This is the same flag `agents/orchestrator_integration.py`'s task-queue dispatch logic (`process_task_integrated`) checks on a stage's result to decide whether to apply its own generic auto-advancement to the next workflow column: when the flag is set, that generic advancement is skipped, because the stage — here, `PRReviewStage` moving the card itself to Documentation or back to "In Development" — has already progressed the issue and a second, generic advance would move the card again.
 
 ---
 

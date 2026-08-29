@@ -8,7 +8,7 @@ Switchyard is a Claude Code agent orchestrator that automates software developme
 
 1. A GitHub issue is labeled and added to a project board (e.g., `pipeline:sdlc-execution`).
 2. `ProjectMonitor` polls the board every 15-30 seconds and detects the issue's column.
-3. The pipeline orchestrator determines which agent handles that column and enqueues a task.
+3. The board's column config (`config/foundations/workflows.yaml`) determines which agent handles that column and enqueues a task.
 4. The agent runs inside a project-specific Docker container (`<project>-agent`) via Docker-in-Docker, with the project workspace mounted.
 5. Agent output (comments, code, PR updates) is posted back to GitHub.
 6. `PipelineProgression` moves the issue to the next column when the agent completes.
@@ -18,7 +18,7 @@ flowchart TD
     GH["GitHub<br>(issues & project boards)"]
     PM["ProjectMonitor<br>(polls boards every 15-30s)"]
     TQ["TaskQueue<br>(Redis priority queue)"]
-    PO["Pipeline Orchestrator<br>(SequentialPipeline stages)"]
+    PO["Agent Dispatch<br>(column config-driven)"]
     AR["Agent Registry<br>(12 specialized agents)"]
     DR["DockerAgentRunner<br>(container lifecycle)"]
     AC["Agent Container<br>(Claude Code + project workspace)"]
@@ -68,8 +68,9 @@ Well, the roadmap is really to fold the learnings from this project into the mor
 
 | Component | Location | Responsibility |
 |---|---|---|
-| Pipeline orchestrator | `pipeline/orchestrator.py` | Sequential stage execution, review/repair cycles |
 | Project monitor | `services/project_monitor.py` | Board polling, task dispatch |
+| Review cycle | `services/review_cycle.py` | Maker-checker review cycles |
+| Repair cycle | `pipeline/repair_cycle.py` | Test-fix iteration loop |
 | Agent registry | `agents/__init__.py` | 12 registered specialized agents |
 | Claude integration | `claude/claude_integration.py` | Prompt assembly, Claude API calls |
 | Docker runner | `claude/docker_runner.py` | Agent container lifecycle |
