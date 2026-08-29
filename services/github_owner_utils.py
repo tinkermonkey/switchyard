@@ -12,7 +12,7 @@ import logging
 import time
 import redis
 import asyncio
-from typing import Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from functools import lru_cache, wraps
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
@@ -243,60 +243,71 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
         return None
 
 
+# Field selection shared by every projectV2 board query. Extracted so the
+# single-board query builder (build_projects_v2_query) and the batched/aliased
+# cross-project builder (build_batched_projects_v2_query) can't drift apart -
+# there is exactly one place that defines what a "board" query fetches.
+#
+# NOTE: This is inserted verbatim inside a `projectV2(number: N) { ... }`
+# selection, so it must remain a plain (non-f-string-braced) GraphQL field
+# selection - no `{{`/`}}` escaping needed when it's spliced into an f-string.
+_PROJECT_V2_FIELDS = '''id
+                    title
+                    items(first: 100, orderBy: {field: POSITION, direction: ASC}) {
+                        nodes {
+                            id
+                            content {
+                                __typename
+                                ... on Issue {
+                                    id
+                                    number
+                                    title
+                                    state
+                                    repository {
+                                        name
+                                    }
+                                    updatedAt
+                                }
+                            }
+                            fieldValues(first: 10) {
+                                nodes {
+                                    ... on ProjectV2ItemFieldSingleSelectValue {
+                                        name
+                                        field {
+                                            ... on ProjectV2SingleSelectField {
+                                                name
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }'''
+
+
 def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[str]:
     """
     Build a GraphQL query for GitHub Projects v2 based on owner type.
-    
+
     Args:
         owner_login: GitHub username or organization name
         project_number: Project number
-        
+
     Returns:
         GraphQL query string, or None if owner type cannot be determined
     """
     owner_type = get_owner_type(owner_login)
-    
+
     if owner_type is None:
         logger.error(f"Cannot build Projects v2 query - unable to determine owner type for '{owner_login}'")
         return None
-    
+
     # Determine the correct GraphQL query based on owner type
     if owner_type == 'user':
         query = f'''{{
             user(login: "{owner_login}") {{
                 projectV2(number: {project_number}) {{
-                    id
-                    title
-                    items(first: 100, orderBy: {{field: POSITION, direction: ASC}}) {{
-                        nodes {{
-                            id
-                            content {{
-                                __typename
-                                ... on Issue {{
-                                    id
-                                    number
-                                    title
-                                    state
-                                    repository {{
-                                        name
-                                    }}
-                                    updatedAt
-                                }}
-                            }}
-                            fieldValues(first: 10) {{
-                                nodes {{
-                                    ... on ProjectV2ItemFieldSingleSelectValue {{
-                                        name
-                                        field {{
-                                            ... on ProjectV2SingleSelectField {{
-                                                name
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
+                    {_PROJECT_V2_FIELDS}
                 }}
             }}
         }}'''
@@ -304,43 +315,321 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
         query = f'''{{
             organization(login: "{owner_login}") {{
                 projectV2(number: {project_number}) {{
-                    id
-                    title
-                    items(first: 100, orderBy: {{field: POSITION, direction: ASC}}) {{
-                        nodes {{
-                            id
-                            content {{
-                                __typename
-                                ... on Issue {{
-                                    id
-                                    number
-                                    title
-                                    state
-                                    repository {{
-                                        name
-                                    }}
-                                    updatedAt
-                                }}
-                            }}
-                            fieldValues(first: 10) {{
-                                nodes {{
-                                    ... on ProjectV2ItemFieldSingleSelectValue {{
-                                        name
-                                        field {{
-                                            ... on ProjectV2SingleSelectField {{
-                                                name
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
+                    {_PROJECT_V2_FIELDS}
                 }}
             }}
         }}'''
-    
+
     return query
+
+
+# ---------------------------------------------------------------------------
+# Batched / aliased cross-project board query builder
+#
+# One-board-per-request polling (build_projects_v2_query + a request per
+# board) burns one GraphQL request per board per poll cycle. GitHub lets a
+# single query alias multiple fields under one root, so N boards belonging to
+# the same owner can be fetched in one request as `p<number>: projectV2(...)`
+# aliases under that owner's `user`/`organization` root field.
+#
+# These builders are intentionally independent of build_projects_v2_query()
+# and execute_board_query_cached() above - they are new, separately callable
+# functions and do not change any existing caller's behavior. Wiring this
+# into the live polling loop (services/project_monitor.py) and reworking the
+# board query cache are separate follow-up tasks.
+# ---------------------------------------------------------------------------
+
+# GitHub's GraphQL API enforces per-query node-count, response-size and
+# execution-time limits, so an unbounded number of aliased projectV2 fields
+# (each fanning out into up to 100 items with nested content/fieldValues)
+# risks a query being rejected or timing out. 12 is a conservative starting
+# point chosen without a production token to test against; it is tunable and
+# should be re-verified against GitHub's actual limits (e.g. by watching for
+# node-count/complexity errors or elevated latency) once one is available.
+MAX_BOARDS_PER_BATCH = 12
+
+
+def build_batched_projects_v2_query(owner_login: str, project_numbers: List[int]) -> Optional[str]:
+    """
+    Build ONE aliased GraphQL query document fetching multiple projectV2
+    boards for a single owner in a single request.
+
+    Each project number is exposed under its own alias (`p<number>`) so all
+    boards can be selected under one `user(...)`/`organization(...)` root
+    field, e.g.:
+
+        { organization(login: "acme") {
+            p1: projectV2(number: 1) { id title items(...) { ... } } }
+            p2: projectV2(number: 2) { id title items(...) { ... } } }
+        } }
+
+    This does not chunk `project_numbers` itself - callers with more than
+    MAX_BOARDS_PER_BATCH boards for one owner should use
+    build_batched_board_queries(), which chunks and calls this per chunk.
+
+    Args:
+        owner_login: GitHub username or organization name (single owner -
+            different owners require separate queries, since they'd need
+            two different, mutually exclusive root fields).
+        project_numbers: Project numbers to fetch for this owner.
+
+    Returns:
+        GraphQL query string, or None if project_numbers is empty or the
+        owner type cannot be determined.
+    """
+    if not project_numbers:
+        logger.warning("build_batched_projects_v2_query() called with an empty project_numbers list")
+        return None
+
+    owner_type = get_owner_type(owner_login)
+
+    if owner_type is None:
+        logger.error(f"Cannot build batched Projects v2 query - unable to determine owner type for '{owner_login}'")
+        return None
+
+    if len(project_numbers) > MAX_BOARDS_PER_BATCH:
+        logger.warning(
+            f"build_batched_projects_v2_query() received {len(project_numbers)} project numbers "
+            f"for '{owner_login}', exceeding MAX_BOARDS_PER_BATCH={MAX_BOARDS_PER_BATCH}. "
+            f"Building the oversized query anyway - use build_batched_board_queries() to chunk automatically."
+        )
+
+    aliased_fields = "\n".join(
+        f'''            p{project_number}: projectV2(number: {project_number}) {{
+                    {_PROJECT_V2_FIELDS}
+                }}'''
+        for project_number in project_numbers
+    )
+
+    root_field = 'user' if owner_type == 'user' else 'organization'
+
+    query = f'''{{
+        {root_field}(login: "{owner_login}") {{
+{aliased_fields}
+        }}
+    }}'''
+
+    return query
+
+
+def build_batched_board_queries(
+    owner_project_pairs: List[Tuple[str, int]]
+) -> List[Dict[str, Any]]:
+    """
+    Group (owner, project_number) pairs by owner and chunk each owner's
+    boards into batches of at most MAX_BOARDS_PER_BATCH, building one
+    aliased GraphQL query document per chunk via
+    build_batched_projects_v2_query().
+
+    Different owners are never mixed into the same query - each query has a
+    single `user`/`organization` root field, so an owner boundary always
+    starts a new chunk even if the previous chunk had room left.
+
+    Args:
+        owner_project_pairs: (owner_login, project_number) tuples for every
+            board to fetch, in any order and across any number of owners.
+
+    Returns:
+        A list of batch descriptors, one per query to execute, each shaped:
+            {
+                'owner': owner_login,
+                'query': <GraphQL query string>,
+                'boards': [(owner_login, project_number, alias), ...],
+            }
+        `boards` records, for every board in this query, the alias it was
+        given (`p<number>`) so a response for this query can later be handed
+        to parse_batched_projects_v2_response() along with this list.
+
+        A chunk whose query fails to build (e.g. owner type undeterminable)
+        is skipped and logged rather than included with a None query.
+    """
+    boards_by_owner: Dict[str, List[int]] = {}
+    for owner, project_number in owner_project_pairs:
+        boards_by_owner.setdefault(owner, []).append(project_number)
+
+    batches: List[Dict[str, Any]] = []
+
+    for owner, project_numbers in boards_by_owner.items():
+        for start in range(0, len(project_numbers), MAX_BOARDS_PER_BATCH):
+            chunk = project_numbers[start:start + MAX_BOARDS_PER_BATCH]
+            query = build_batched_projects_v2_query(owner, chunk)
+            if query is None:
+                logger.error(f"Skipping batched board query for owner '{owner}' (projects {chunk}) - query build failed")
+                continue
+
+            boards = [(owner, project_number, f'p{project_number}') for project_number in chunk]
+            batches.append({'owner': owner, 'query': query, 'boards': boards})
+
+    return batches
+
+
+def parse_batched_projects_v2_response(
+    response: Optional[dict],
+    boards: List[Tuple[str, int, str]],
+) -> Tuple[Dict[Tuple[str, int], dict], Dict[Tuple[str, int], str]]:
+    """
+    Parse one batched/aliased GraphQL response into per-board project data.
+
+    Handles partial-batch failure: a response for a multi-alias query can
+    have `data` populated for some aliases and a top-level `errors` array
+    naming the alias(es) that failed (e.g. a deleted/renamed project) via
+    each error's `path`. Every alias that isn't implicated by an error is
+    still parsed and returned, so one bad board never loses the rest of the
+    batch.
+
+    Args:
+        response: The raw response for the query built from `boards`.
+            Accepts either shape GitHubAPIClient.graphql() can hand back:
+            - the full GraphQL envelope `{'data': {...}, 'errors': [...]}`
+              (returned on partial/total failure, success=False), or
+            - just the unwrapped data payload, e.g. `{'organization': {...}}`
+              (returned on full success, success=True - it never carries a
+              top-level 'errors' key in that case).
+        boards: The (owner, project_number, alias) triples the query was
+            built from - the same list returned in a
+            build_batched_board_queries() batch descriptor's 'boards' entry.
+
+    Returns:
+        Tuple of:
+        - results: dict of (owner, project_number) -> project data dict
+          (`{'id':..., 'title':..., 'items': {'nodes': [...]}}`, matching
+          what build_projects_v2_query() callers already extract from
+          `data['user']['projectV2']` / `data['organization']['projectV2']`)
+          for every alias that parsed successfully.
+        - errors: dict of (owner, project_number) -> error message string
+          for every alias that failed, whether via an attributable
+          top-level GraphQL error or because the alias was simply missing
+          from the response.
+    """
+    results: Dict[Tuple[str, int], dict] = {}
+    errors: Dict[Tuple[str, int], str] = {}
+
+    if not boards:
+        return results, errors
+
+    if response is None:
+        for owner, project_number, _alias in boards:
+            errors[(owner, project_number)] = "No response received"
+        return results, errors
+
+    # Normalize both response shapes described above into (data, errors_list).
+    if 'data' in response:
+        data = response.get('data') or {}
+        errors_list = response.get('errors') or []
+    else:
+        data = response
+        errors_list = []
+
+    alias_to_board = {alias: (owner, project_number) for owner, project_number, alias in boards}
+
+    # Attribute each top-level GraphQL error to the board(s) named in its path.
+    for error in errors_list:
+        if isinstance(error, dict):
+            message = error.get('message', 'Unknown GraphQL error')
+            path = error.get('path') or []
+        else:
+            message = str(error)
+            path = []
+
+        matched = False
+        for segment in path:
+            if isinstance(segment, str) and segment in alias_to_board:
+                board_key = alias_to_board[segment]
+                errors.setdefault(board_key, message)  # keep the first error per board
+                matched = True
+                break
+
+        if not matched:
+            logger.warning(f"Batched board query returned an error with no attributable board path: {message}")
+
+    # Merge every owner root field present (normally just one - a batched
+    # query is built for a single owner - but this stays correct even if a
+    # response somehow carries more than one).
+    owner_roots = []
+    if isinstance(data, dict):
+        for root_field in ('user', 'organization'):
+            root = data.get(root_field)
+            if isinstance(root, dict):
+                owner_roots.append(root)
+
+    for owner, project_number, alias in boards:
+        board_key = (owner, project_number)
+        if board_key in errors:
+            continue  # already recorded via error path attribution above
+
+        project_data = None
+        for root in owner_roots:
+            if alias in root:
+                project_data = root[alias]
+                break
+
+        if project_data is None:
+            errors[board_key] = (
+                f"No data returned for alias '{alias}' (project may have been deleted, "
+                f"renamed, or the owner root field was missing from the response)"
+            )
+            continue
+
+        results[board_key] = project_data
+
+    return results, errors
+
+
+def execute_batched_board_queries(
+    owner_project_pairs: List[Tuple[str, int]],
+) -> Tuple[Dict[Tuple[str, int], dict], Dict[Tuple[str, int], str]]:
+    """
+    Build and execute the minimal set of batched, aliased GraphQL queries
+    needed to fetch every requested (owner, project_number) board, merging
+    parsed results and errors across every batch/chunk executed.
+
+    This is a standalone code path: it does not read from or write to
+    execute_board_query_cached()'s cache, and nothing currently calls it from
+    the live polling loop - wiring it in is a separate follow-up task.
+
+    Args:
+        owner_project_pairs: (owner_login, project_number) tuples for every
+            board to fetch, across any number of owners.
+
+    Returns:
+        Tuple of:
+        - results: dict of (owner, project_number) -> project data dict
+        - errors: dict of (owner, project_number) -> error message, for
+          every board whose batch request failed entirely or whose alias
+          failed within an otherwise-successful batch response.
+    """
+    from services.github_api_client import get_github_client
+
+    all_results: Dict[Tuple[str, int], dict] = {}
+    all_errors: Dict[Tuple[str, int], str] = {}
+
+    batches = build_batched_board_queries(owner_project_pairs)
+    if not batches:
+        return all_results, all_errors
+
+    github_client = get_github_client()
+
+    for batch in batches:
+        boards = batch['boards']
+        success, data = github_client.graphql(batch['query'])
+
+        if success or (isinstance(data, dict) and ('data' in data or 'errors' in data)):
+            # Either fully successful (data is the unwrapped payload), or a
+            # partial failure that still carries a 'data'/'errors' envelope
+            # we can salvage per-alias results from.
+            results, errors = parse_batched_projects_v2_response(data, boards)
+        else:
+            # Total failure for this batch (rate limit, timeout, transport
+            # error, etc.) with no per-board data to salvage.
+            message = data.get('error', str(data)) if isinstance(data, dict) else str(data)
+            logger.warning(f"Batched board query failed for owner '{batch['owner']}' ({len(boards)} boards): {message}")
+            results = {}
+            errors = {(owner, project_number): message for owner, project_number, _alias in boards}
+
+        all_results.update(results)
+        all_errors.update(errors)
+
+    return all_results, all_errors
 
 
 # Board query cache for deduplicating identical GraphQL board queries
