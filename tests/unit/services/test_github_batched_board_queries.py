@@ -10,18 +10,42 @@ Covers:
   GraphQL error attribution
 - execute_batched_board_queries(): end-to-end wiring over a mocked GitHub
   client, including a fully-failed batch
+- Cache unification (GitHub issue #93): execute_batched_board_queries() and
+  execute_board_query_cached() sharing one _board_query_cache - partial
+  cache hits within a batch, cross-path reads of each other's writes, and
+  invalidate_board_query_cache() invalidating a batch-populated entry.
 
 No live network access - all GitHub API calls are mocked.
 """
+import time
+
+import pytest
 from unittest.mock import Mock, patch
 
 from services.github_owner_utils import (
     MAX_BOARDS_PER_BATCH,
+    _board_query_cache,
     build_batched_board_queries,
     build_batched_projects_v2_query,
     execute_batched_board_queries,
+    execute_board_query_cached,
+    invalidate_board_query_cache,
     parse_batched_projects_v2_response,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_board_query_cache():
+    """
+    _board_query_cache is a module-level global shared by every test in this
+    file (and by execute_board_query_cached()/execute_batched_board_queries()
+    themselves). Without clearing it, a board cached by one test is a stale
+    cache hit in the next test that reuses the same (owner, project_number)
+    pair, bypassing that test's mocked GitHub client entirely.
+    """
+    _board_query_cache.clear()
+    yield
+    _board_query_cache.clear()
 
 
 def _board_data(number: int) -> dict:
@@ -311,3 +335,129 @@ class TestExecuteBatchedBoardQueries:
 
         assert results == {}
         assert errors == {}
+
+
+class TestUnifiedBoardQueryCache:
+    """
+    GitHub issue #93: execute_batched_board_queries() and
+    execute_board_query_cached() must share exactly one cache
+    (_board_query_cache), not two parallel ones.
+    """
+
+    def test_batched_call_partially_hits_cache_only_uncached_boards_fetched(self):
+        """A board already cached and fresh is served without a network call;
+        only the still-uncached boards end up in the query actually sent."""
+        # Pre-populate the cache for ('acme', 1) directly, in the same
+        # envelope shape execute_board_query_cached() stores.
+        _board_query_cache[('acme', 1)] = (
+            time.time(),
+            {'organization': {'projectV2': _board_data(1)}},
+        )
+
+        mock_client = Mock()
+
+        def fake_graphql(query):
+            # Only board 2 should ever be queried - board 1 is a cache hit.
+            assert 'p1: projectV2' not in query
+            assert 'p2: projectV2(number: 2)' in query
+            return True, {'organization': {'p2': _board_data(2)}}
+
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            results, errors = execute_batched_board_queries([('acme', 1), ('acme', 2)])
+
+        assert errors == {}
+        assert mock_client.graphql.call_count == 1  # only the uncached board fetched
+        assert results[('acme', 1)]['title'] == 'Board 1'
+        assert results[('acme', 2)]['title'] == 'Board 2'
+
+    def test_batched_results_populate_cache_for_subsequent_single_board_call(self):
+        """A board fetched via execute_batched_board_queries() is a cache
+        hit for execute_board_query_cached() within the TTL - no new call."""
+        mock_client = Mock()
+        mock_client.graphql.return_value = (True, {'organization': {'p1': _board_data(1)}})
+
+        with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            results, _errors = execute_batched_board_queries([('acme', 1)])
+            assert mock_client.graphql.call_count == 1
+
+            cached = execute_board_query_cached('acme', 1)
+
+        assert mock_client.graphql.call_count == 1  # no new API call - served from cache
+        assert cached == {'organization': {'projectV2': _board_data(1)}}
+        assert results[('acme', 1)] == _board_data(1)
+
+    def test_single_board_call_populates_cache_for_subsequent_batched_call(self):
+        """The reverse direction: a board fetched via
+        execute_board_query_cached() is a cache hit for
+        execute_batched_board_queries() within the TTL - no new call."""
+        mock_client = Mock()
+        mock_client.graphql.return_value = (True, {'organization': {'projectV2': _board_data(1)}})
+
+        with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            data = execute_board_query_cached('acme', 1)
+            assert mock_client.graphql.call_count == 1
+
+            results, errors = execute_batched_board_queries([('acme', 1)])
+
+        assert mock_client.graphql.call_count == 1  # no new API call - served from cache
+        assert errors == {}
+        assert results == {('acme', 1): _board_data(1)}
+        assert data == {'organization': {'projectV2': _board_data(1)}}
+
+    def test_invalidate_clears_entry_populated_via_batched_path(self):
+        """invalidate_board_query_cache() must correctly invalidate a board
+        whose cache entry was populated by the batched path, not just ones
+        populated by execute_board_query_cached()."""
+        mock_client = Mock()
+        mock_client.graphql.return_value = (True, {'organization': {'p1': _board_data(1)}})
+
+        with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            execute_batched_board_queries([('acme', 1)])
+            assert ('acme', 1) in _board_query_cache
+
+            invalidate_board_query_cache('acme', 1)
+            assert ('acme', 1) not in _board_query_cache
+
+            # A subsequent fetch (either path) must hit the network again.
+            execute_batched_board_queries([('acme', 1)])
+            assert mock_client.graphql.call_count == 2
+
+    def test_cache_write_uses_actual_response_root_key_not_a_second_get_owner_type_call(self):
+        """
+        Regression test: the cache-write step must derive the envelope's
+        root key ('user' vs 'organization') from the actual GraphQL
+        response payload, not from a second get_owner_type() call.
+
+        get_owner_type() is independently cached/circuit-broken and can
+        legitimately return a different result on a second call than it did
+        when the query was built (e.g. a transient failure after Redis is
+        unreachable). Re-deriving the root key from it risked caching a
+        'user'-owned board's data under the 'organization' key, which
+        execute_board_query_cached() callers key off exactly - a silent
+        empty-items bug downstream. get_owner_type is intentionally NOT
+        patched to return 'user' here even though the response is
+        user-shaped, to prove the cache write no longer depends on it.
+        """
+        mock_client = Mock()
+        # The response is 'user'-shaped, but get_owner_type() below will
+        # report 'organization' - the fix must trust the response, not the
+        # (now differing) get_owner_type() call.
+        mock_client.graphql.return_value = (True, {'user': {'p1': _board_data(1)}})
+
+        with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            results, errors = execute_batched_board_queries([('acme', 1)])
+
+        assert errors == {}
+        assert results[('acme', 1)]['title'] == 'Board 1'
+        # The cached envelope must be keyed 'user' (matching the actual
+        # response), not 'organization' (what the second get_owner_type()
+        # call would have said).
+        assert _board_query_cache[('acme', 1)][1] == {'user': {'projectV2': _board_data(1)}}

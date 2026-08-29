@@ -332,11 +332,14 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
 # the same owner can be fetched in one request as `p<number>: projectV2(...)`
 # aliases under that owner's `user`/`organization` root field.
 #
-# These builders are intentionally independent of build_projects_v2_query()
-# and execute_board_query_cached() above - they are new, separately callable
-# functions and do not change any existing caller's behavior. Wiring this
-# into the live polling loop (services/project_monitor.py) and reworking the
-# board query cache are separate follow-up tasks.
+# build_batched_projects_v2_query(), build_batched_board_queries() and
+# parse_batched_projects_v2_response() are independent of
+# build_projects_v2_query() above and do not change any existing caller's
+# behavior. execute_batched_board_queries() below shares _board_query_cache
+# with execute_board_query_cached() (see the "Board query cache" section
+# further down) - the two are one unified cache/dedup mechanism, not
+# parallel systems. Wiring this batched path into the live polling loop
+# (services/project_monitor.py) is still a separate follow-up task.
 # ---------------------------------------------------------------------------
 
 # GitHub's GraphQL API enforces per-query node-count, response-size and
@@ -583,9 +586,20 @@ def execute_batched_board_queries(
     needed to fetch every requested (owner, project_number) board, merging
     parsed results and errors across every batch/chunk executed.
 
-    This is a standalone code path: it does not read from or write to
-    execute_board_query_cached()'s cache, and nothing currently calls it from
-    the live polling loop - wiring it in is a separate follow-up task.
+    Cache-aware: shares _board_query_cache (same TTL, same lock) with
+    execute_board_query_cached() via the _get_cached_board()/_cache_board()
+    helpers below, so the two are one unified cache/dedup mechanism rather
+    than two parallel ones. Before fetching, every requested board already
+    cached and fresh (within _board_query_cache_ttl) is served from the
+    cache and excluded from the batch(es) actually sent to GitHub. After a
+    batch response is parsed, every successfully-parsed board is written
+    into the same cache (in the same envelope shape
+    execute_board_query_cached() stores) so a subsequent call through
+    either path is a cache hit. Boards whose fetch failed are not cached,
+    matching execute_board_query_cached()'s existing behavior.
+
+    Nothing currently calls this from the live polling loop - wiring it in
+    is a separate follow-up task.
 
     Args:
         owner_project_pairs: (owner_login, project_number) tuples for every
@@ -593,20 +607,45 @@ def execute_batched_board_queries(
 
     Returns:
         Tuple of:
-        - results: dict of (owner, project_number) -> project data dict
+        - results: dict of (owner, project_number) -> project data dict,
+          for every board served from cache or freshly fetched.
         - errors: dict of (owner, project_number) -> error message, for
           every board whose batch request failed entirely or whose alias
-          failed within an otherwise-successful batch response.
+          failed within an otherwise-successful batch response. Boards
+          served from cache are never present here.
     """
-    from services.github_api_client import get_github_client
-
     all_results: Dict[Tuple[str, int], dict] = {}
     all_errors: Dict[Tuple[str, int], str] = {}
 
-    batches = build_batched_board_queries(owner_project_pairs)
+    # De-dup while preserving first-seen order, splitting into boards
+    # already cached and fresh (served straight from the cache, no
+    # network call) vs boards that still need fetching.
+    to_fetch: List[Tuple[str, int]] = []
+    seen = set()
+    for owner, project_number in owner_project_pairs:
+        cache_key = (owner, project_number)
+        if cache_key in seen:
+            continue
+        seen.add(cache_key)
+
+        cached_envelope = _get_cached_board(cache_key)
+        if cached_envelope is not None:
+            project_data = _unwrap_board_envelope(cached_envelope)
+            if project_data is not None:
+                logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
+                all_results[cache_key] = project_data
+                continue
+
+        to_fetch.append(cache_key)
+
+    if not to_fetch:
+        return all_results, all_errors
+
+    batches = build_batched_board_queries(to_fetch)
     if not batches:
         return all_results, all_errors
 
+    from services.github_api_client import get_github_client
     github_client = get_github_client()
 
     for batch in batches:
@@ -626,17 +665,97 @@ def execute_batched_board_queries(
             results = {}
             errors = {(owner, project_number): message for owner, project_number, _alias in boards}
 
+        if results:
+            # Populate the shared cache with every successfully-parsed
+            # board, wrapped in the same envelope shape
+            # execute_board_query_cached() stores/returns, so a cache hit
+            # read through either path returns an equivalent value.
+            #
+            # The root field is read off the ACTUAL response payload (the
+            # same normalization parse_batched_projects_v2_response() uses)
+            # rather than re-derived via a second get_owner_type() call.
+            # get_owner_type() is independently cached/circuit-broken and
+            # can return a different (or None) result on this second call
+            # than it did when the query was built - re-deriving risked
+            # caching a board under the wrong root key (e.g. 'organization'
+            # for a 'user'-owned board) whenever that happened, which
+            # downstream readers (execute_board_query_cached(),
+            # _unwrap_board_envelope()) key off exactly.
+            response_payload = data.get('data') or data if isinstance(data, dict) and 'data' in data else data
+            root_field = 'user' if isinstance(response_payload, dict) and 'user' in response_payload else 'organization'
+            for board_key, project_data in results.items():
+                _cache_board(board_key, {root_field: {'projectV2': project_data}})
+                logger.debug(f"Board query cache miss for {board_key[0]}/project#{board_key[1]}, cached result")
+
         all_results.update(results)
         all_errors.update(errors)
 
     return all_results, all_errors
 
 
-# Board query cache for deduplicating identical GraphQL board queries
+# ---------------------------------------------------------------------------
+# Board query cache for deduplicating identical GraphQL board queries.
+#
+# Backs BOTH execute_board_query_cached() (single-board queries) and
+# execute_batched_board_queries() (aliased multi-board queries) above - one
+# cache, one lock, one TTL, shared via the _get_cached_board()/_cache_board()
+# helpers below, so a board fetched via either path is visible as a cache
+# hit to the other within the TTL window. invalidate_board_query_cache()
+# deletes directly from this same dict, so it correctly invalidates data
+# regardless of which path originally populated it.
+# ---------------------------------------------------------------------------
 import threading
 _board_query_cache: Dict[tuple, tuple] = {}  # (owner, project_number) -> (timestamp, data)
 _board_query_cache_lock = threading.Lock()
 _board_query_cache_ttl = 15  # seconds
+
+
+def _get_cached_board(cache_key: Tuple[str, int]) -> Optional[dict]:
+    """
+    Thread-safe cache read for a single (owner, project_number) key, shared
+    by execute_board_query_cached() and execute_batched_board_queries().
+
+    Returns the cached data - the same envelope shape
+    execute_board_query_cached() has always returned, e.g.
+    {'user': {'projectV2': {...}}} or {'organization': {'projectV2': {...}}}
+    - if there's a fresh (within _board_query_cache_ttl) entry, else None.
+    """
+    now = time.time()
+    with _board_query_cache_lock:
+        if cache_key in _board_query_cache:
+            cached_time, cached_data = _board_query_cache[cache_key]
+            if now - cached_time < _board_query_cache_ttl:
+                return cached_data
+    return None
+
+
+def _cache_board(cache_key: Tuple[str, int], data: dict) -> None:
+    """
+    Thread-safe cache write for a single (owner, project_number) key, shared
+    by execute_board_query_cached() and execute_batched_board_queries().
+
+    `data` must be in the same envelope shape execute_board_query_cached()
+    has always stored/returned (e.g. {'user': {'projectV2': {...}}}) so a
+    read through either path returns an equivalent value.
+    """
+    with _board_query_cache_lock:
+        _board_query_cache[cache_key] = (time.time(), data)
+
+
+def _unwrap_board_envelope(data: dict) -> Optional[dict]:
+    """
+    Extract the projectV2 payload from the cache's envelope shape (e.g.
+    {'user': {'projectV2': {...}}}), matching what
+    parse_batched_projects_v2_response()/execute_batched_board_queries()
+    return directly for a freshly-fetched board.
+
+    Returns None if `data` isn't in the expected shape.
+    """
+    for root_field in ('user', 'organization'):
+        root = data.get(root_field)
+        if isinstance(root, dict) and 'projectV2' in root:
+            return root['projectV2']
+    return None
 
 
 def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict]:
@@ -646,6 +765,12 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     Multiple callers (ProjectMonitor.get_project_items, PipelineQueueManager.get_issues_in_column_order)
     execute the same GraphQL board query. This function ensures only one actual API call is made
     per board per TTL window.
+
+    Thin wrapper over the shared _board_query_cache: cache reads/writes go
+    through _get_cached_board()/_cache_board(), the same helpers
+    execute_batched_board_queries() uses, so this is one unified cache
+    rather than two parallel ones - a board cached via either path is a hit
+    for the other.
 
     Includes a single retry on transient failures.
 
@@ -657,15 +782,12 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
         Raw GraphQL response data dict, or None on failure
     """
     cache_key = (owner, project_number)
-    now = time.time()
 
     # Check cache (thread-safe)
-    with _board_query_cache_lock:
-        if cache_key in _board_query_cache:
-            cached_time, cached_data = _board_query_cache[cache_key]
-            if now - cached_time < _board_query_cache_ttl:
-                logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
-                return cached_data
+    cached_data = _get_cached_board(cache_key)
+    if cached_data is not None:
+        logger.debug(f"Board query cache hit for {owner}/project#{project_number}")
+        return cached_data
 
     # Cache miss — execute query
     query = build_projects_v2_query(owner, project_number)
@@ -679,8 +801,7 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     for attempt in range(2):
         success, data = github_client.graphql(query)
         if success:
-            with _board_query_cache_lock:
-                _board_query_cache[cache_key] = (time.time(), data)
+            _cache_board(cache_key, data)
             logger.debug(f"Board query cache miss for {owner}/project#{project_number}, cached result")
             return data
 
