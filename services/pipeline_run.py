@@ -246,6 +246,13 @@ class PipelineRunManager:
         stored under, and — defensively — the legacy 2-field key too, but only
         if it still points at THIS run_id.
 
+        Both deletes are compare-and-delete, not unconditional HDEL: a new run
+        for this exact (project, board, issue_number) could in principle be
+        created concurrently (e.g. get_or_create_pipeline_run's duplicate
+        guard racing this cleanup) between resolving this run and this call —
+        an unconditional HDEL on the board-scoped key would then wipe out that
+        new run's freshly-written mapping instead of this (ending) run's own.
+
         Why the legacy key needs checking at all: get_active_pipeline_run()
         (deliberately left un-namespaced, see #43) can restore a run into the
         legacy key via its ES fallback. Without this check, a run ending would
@@ -256,7 +263,16 @@ class PipelineRunManager:
         active run that might currently occupy that same legacy slot.
         """
         board_key = self._get_issue_key(project, issue_number, board)
-        self.redis.hdel(self.redis_issue_mapping, board_key)
+        try:
+            self.redis.eval(
+                _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                1,
+                self.redis_issue_mapping,
+                board_key,
+                pipeline_run_id,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to clean up issue mapping {board_key}: {e}")
 
         legacy_key = self._get_issue_key(project, issue_number)
         if legacy_key != board_key:

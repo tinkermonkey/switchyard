@@ -270,31 +270,29 @@ class TestLegacyKeyCleanupOnEnd:
 
     def test_cleanup_uses_atomic_compare_and_delete_not_separate_check_then_act(self):
         """Regression test for the review finding that a separate HGET-then-HDEL
-        has a TOCTOU window: a concurrent writer (e.g. get_active_pipeline_run's
-        ES-restore path, pointing the legacy key at a different board's run)
-        could land between the check and the delete. _cleanup_issue_mapping must
-        go through a single atomic EVAL for the legacy key, not two separate
-        Redis calls — verified with a bare mock (no internal hget/hdel
+        has a TOCTOU window: a concurrent writer (e.g. a new run for the same
+        board+issue, or get_active_pipeline_run's ES-restore path pointing the
+        legacy key at a different board's run) could land between the check
+        and the delete. _cleanup_issue_mapping must go through a single atomic
+        EVAL for BOTH the board-scoped and legacy keys, never a separate
+        hget()+hdel() pair — verified with a bare mock (no internal hget/hdel
         emulation inside eval(), unlike MockRedis) so any direct hget/hdel
-        call on the legacy key is unambiguously attributable to the method
-        under test, not to a mock's own implementation."""
+        call is unambiguously attributable to the method under test, not to a
+        mock's own implementation."""
         manager, _, _ = make_manager()
         bare_mock_redis = MagicMock()
         manager.redis = bare_mock_redis
 
         manager._cleanup_issue_mapping('proj', 9, 'BoardA', 'run-a-id')
 
-        bare_mock_redis.eval.assert_called_once_with(
-            manager._cleanup_issue_mapping.__globals__['_COMPARE_AND_DELETE_HASH_FIELD_SCRIPT'],
-            1,
-            manager.redis_issue_mapping,
-            'proj:9',
-            'run-a-id',
-        )
-        # The board-scoped key is deleted directly (no compare needed there —
-        # only this run could ever hold it); the legacy key must NOT be
-        # touched via a separate hget/hdel outside the atomic eval() above.
-        bare_mock_redis.hdel.assert_called_once_with(manager.redis_issue_mapping, 'proj:BoardA:9')
+        script = manager._cleanup_issue_mapping.__globals__['_COMPARE_AND_DELETE_HASH_FIELD_SCRIPT']
+        assert bare_mock_redis.eval.call_args_list == [
+            ((script, 1, manager.redis_issue_mapping, 'proj:BoardA:9', 'run-a-id'),),
+            ((script, 1, manager.redis_issue_mapping, 'proj:9', 'run-a-id'),),
+        ]
+        # Neither key is ever touched via a separate hget/hdel outside the
+        # atomic eval() calls above.
+        bare_mock_redis.hdel.assert_not_called()
         bare_mock_redis.hget.assert_not_called()
 
 
