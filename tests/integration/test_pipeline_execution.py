@@ -3,7 +3,6 @@ import sys
 import pytest
 from datetime import datetime
 from task_queue.task_manager import Task, TaskPriority
-from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
 from agents.orchestrator_integration import process_task_integrated
 
@@ -16,7 +15,7 @@ async def test_pipeline_execution():
     """Test complete pipeline execution with Business Analyst"""
 
     # Setup
-    state_manager = StateManager()
+    state_manager = None  # StateManager removed (was dead code, see issue #44)
     logger = OrchestratorLogger("test")
 
     logger.info(" Testing Pipeline Execution...")

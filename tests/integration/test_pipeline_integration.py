@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch, Mock
 from task_queue.task_manager import Task, TaskPriority
-from state_management.manager import StateManager
 from monitoring.logging import OrchestratorLogger
 
 import logging
@@ -15,7 +14,7 @@ async def test_pipeline_integration():
     """Test pipeline execution with real Business Analyst"""
 
     # Setup
-    state_manager = StateManager()
+    state_manager = None  # StateManager removed (was dead code, see issue #44)
     logger = OrchestratorLogger("test")
 
     # Create test task

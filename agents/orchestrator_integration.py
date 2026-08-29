@@ -10,8 +10,6 @@ import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from pipeline.base import PipelineStage
-from pipeline.orchestrator import SequentialPipeline
-from state_management.manager import StateManager
 from agents import AGENT_REGISTRY, get_agent_class
 from services.circuit_breaker import CircuitBreaker
 
@@ -299,22 +297,6 @@ def create_stage_from_config(stage_config, project_name: str) -> PipelineStage:
         stage_config.default_agent
     )
     return AgentStage(stage_config.default_agent, agent_config, project_name=project_name)
-
-
-def create_agent_pipeline(agent_names: list, state_manager: StateManager) -> SequentialPipeline:
-    """Create a pipeline from a list of agent names"""
-    stages = []
-
-    for agent_name in agent_names:
-        stage = AgentStage(agent_name)
-        stages.append(stage)
-
-    return SequentialPipeline(stages, state_manager)
-
-
-def create_single_agent_pipeline(agent_name: str, state_manager: StateManager) -> SequentialPipeline:
-    """Create a pipeline with a single agent"""
-    return create_agent_pipeline([agent_name], state_manager)
 
 
 async def process_task_integrated(task, state_manager, logger):
@@ -667,7 +649,5 @@ async def process_task_integrated(task, state_manager, logger):
 # Export the main integration function
 __all__ = [
     'process_task_integrated',
-    'create_agent_pipeline',
-    'create_single_agent_pipeline',
     'AgentStage'
 ]

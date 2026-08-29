@@ -15,7 +15,6 @@ import asyncio
 import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
-from pathlib import Path
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import get_observability_manager
 from pipeline.factory import PipelineFactory
@@ -1155,11 +1154,7 @@ class AgentExecutor:
         task_context: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Build standardized execution context for agent"""
-        from state_management.manager import StateManager
         from services.project_workspace import workspace_manager
-
-        # Create state manager
-        state_manager = StateManager(Path("orchestrator_data/state"))
 
         # Get project directory from workspace manager
         project_dir = workspace_manager.get_project_dir(project_name)
@@ -1177,7 +1172,6 @@ class AgentExecutor:
             'decisions': [],
             'metrics': {},
             'validation': {},
-            'state_manager': state_manager,
             'observability': self.obs,  # REQUIRED: Observability manager
             'use_docker': task_context.get('use_docker', True)
         }
@@ -1349,7 +1343,7 @@ class AgentExecutor:
     _CONTEXT_KEYS = frozenset({
         'pipeline_id', 'task_id', 'agent', 'project', 'context',
         'work_dir', 'completed_work', 'decisions', 'metrics', 'validation',
-        'state_manager', 'observability', 'use_docker', 'claude_model',
+        'observability', 'use_docker', 'claude_model',
         'agent_config', 'mcp_servers', 'claude_session_id', 'output_posted',
         'agent_hard_timeout', 'branch_name', 'container_name',
     })

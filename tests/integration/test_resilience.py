@@ -26,10 +26,9 @@ async def test_circuit_breaker():
 
     # Attempt multiple executions to trigger circuit breaker
     from agents.orchestrator_integration import process_task_integrated
-    from state_management.manager import StateManager
     from monitoring.logging import OrchestratorLogger
 
-    state_manager = StateManager()
+    state_manager = None  # StateManager removed (was dead code, see issue #44)
     logger = OrchestratorLogger("resilience_test")
 
     failures = 0
