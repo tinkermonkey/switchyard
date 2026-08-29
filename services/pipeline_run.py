@@ -17,6 +17,20 @@ from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
+
+def format_pipeline_run_issue_key(project: str, issue_number: int, board: Optional[str] = None) -> str:
+    """Redis hash field for the issue->pipeline_run_id mapping.
+
+    board=None preserves the legacy (pre-board-scoping) 2-field format,
+    used only by get_active_pipeline_run (out of #43's scope, see its own
+    docstring) so its existing ~27 callers and ES-staleness-guard logic
+    are not touched. Pass board whenever it's known — it disambiguates
+    runs for the same (project, issue_number) active on different boards.
+    """
+    if board:
+        return f"{project}:{board}:{issue_number}"
+    return f"{project}:{issue_number}"
+
 # ILM Policy for pipeline runs (7-day retention)
 PIPELINE_RUNS_ILM_POLICY = {
     "policy": {
@@ -209,9 +223,9 @@ class PipelineRunManager:
         """Get Redis key for pipeline run"""
         return f"{self.redis_prefix}:{pipeline_run_id}"
     
-    def _get_issue_key(self, project: str, issue_number: int) -> str:
+    def _get_issue_key(self, project: str, issue_number: int, board: Optional[str] = None) -> str:
         """Get Redis hash field for issue mapping"""
-        return f"{project}:{issue_number}"
+        return format_pipeline_run_issue_key(project, issue_number, board)
     
     def create_pipeline_run(
         self,
@@ -259,7 +273,7 @@ class PipelineRunManager:
         )
         
         # Map issue to pipeline run ID
-        issue_key = self._get_issue_key(project, issue_number)
+        issue_key = self._get_issue_key(project, issue_number, board)
         self.redis.hset(
             self.redis_issue_mapping,
             issue_key,
@@ -297,7 +311,8 @@ class PipelineRunManager:
     def get_recent_pipeline_run_id(
         self,
         project: str,
-        issue_number: int
+        issue_number: int,
+        board: Optional[str] = None
     ) -> Optional[str]:
         """
         Get the most recent pipeline_run_id for an issue, regardless of status.
@@ -309,12 +324,19 @@ class PipelineRunManager:
         Args:
             project: Project name
             issue_number: Issue number
+            board: Optional board name. When given, both the Redis lookup and
+                the ES fallback are scoped to this board, disambiguating runs
+                for the same (project, issue_number) active on different
+                boards. When omitted, behavior is unchanged from before board
+                scoping existed: the legacy 2-field Redis key is checked, and
+                the ES query is unfiltered by board — callers that explicitly
+                want "any recent run for this issue" regardless of board.
 
         Returns:
             pipeline_run_id string if any run exists for this issue, None otherwise
         """
         # 1. Check the issue→run mapping (covers active runs)
-        issue_key = self._get_issue_key(project, issue_number)
+        issue_key = self._get_issue_key(project, issue_number, board)
         run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
         if run_id:
             return run_id
@@ -322,15 +344,18 @@ class PipelineRunManager:
         # 2. Check ES for the most recent run (any status)
         if self.es:
             try:
+                must_clauses = [
+                    {"term": {"project": project}},
+                    {"term": {"issue_number": issue_number}}
+                ]
+                if board:
+                    must_clauses.append({"term": {"board": board}})
                 result = self.es.search(
                     index=f"{self.es_index_pattern}-*",
                     body={
                         "query": {
                             "bool": {
-                                "must": [
-                                    {"term": {"project": project}},
-                                    {"term": {"issue_number": issue_number}}
-                                ]
+                                "must": must_clauses
                             }
                         },
                         "size": 1,
@@ -581,7 +606,7 @@ class PipelineRunManager:
                                 pipeline_run = PipelineRun.from_dict(run_data)
                                 redis_key = self._get_redis_key(pipeline_run.id)
                                 self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
-                                self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number), pipeline_run.id)
+                                self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number, board), pipeline_run.id)
                                 # Same reasoning as the Redis fast-path above — a new trigger
                                 # is reusing a feedback_listening run restored from ES, so
                                 # restore its status to "active" as well.
@@ -995,7 +1020,7 @@ class PipelineRunManager:
         )
         
         # Remove from issue mapping (can't be reused)
-        issue_key = self._get_issue_key(project, issue_number)
+        issue_key = self._get_issue_key(project, issue_number, pipeline_run.board)
         self.redis.hdel(self.redis_issue_mapping, issue_key)
         
         # Update in Elasticsearch
@@ -1756,7 +1781,7 @@ class PipelineRunManager:
             # Remove from issue mapping
             project = run_data['project']
             issue_number = run_data['issue_number']
-            issue_key = self._get_issue_key(project, issue_number)
+            issue_key = self._get_issue_key(project, issue_number, run_data.get('board'))
             self.redis.hdel(self.redis_issue_mapping, issue_key)
             
             logger.info(f"Ended stale pipeline run {pipeline_run_id}: {reason}")
