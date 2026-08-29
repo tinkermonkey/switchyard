@@ -91,6 +91,13 @@ class MockRedis:
             self.data[key].pop(field, None)
         return 1
 
+    def eval(self, script, numkeys, key, field, expected_value):
+        """Emulate _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT against this
+        in-memory store (a real Redis server runs the Lua script itself)."""
+        if self.hget(key, field) == expected_value:
+            return self.hdel(key, field)
+        return 0
+
     def delete(self, key):
         if key in self.data:
             del self.data[key]
@@ -260,6 +267,35 @@ class TestLegacyKeyCleanupOnEnd:
         assert 'proj:BoardA:9' not in mapping  # run_a's own key is removed
         assert mapping.get('proj:9') == run_b.id  # legacy key untouched
         assert mapping.get('proj:BoardB:9') == run_b.id  # run_b unaffected
+
+    def test_cleanup_uses_atomic_compare_and_delete_not_separate_check_then_act(self):
+        """Regression test for the review finding that a separate HGET-then-HDEL
+        has a TOCTOU window: a concurrent writer (e.g. get_active_pipeline_run's
+        ES-restore path, pointing the legacy key at a different board's run)
+        could land between the check and the delete. _cleanup_issue_mapping must
+        go through a single atomic EVAL for the legacy key, not two separate
+        Redis calls — verified with a bare mock (no internal hget/hdel
+        emulation inside eval(), unlike MockRedis) so any direct hget/hdel
+        call on the legacy key is unambiguously attributable to the method
+        under test, not to a mock's own implementation."""
+        manager, _, _ = make_manager()
+        bare_mock_redis = MagicMock()
+        manager.redis = bare_mock_redis
+
+        manager._cleanup_issue_mapping('proj', 9, 'BoardA', 'run-a-id')
+
+        bare_mock_redis.eval.assert_called_once_with(
+            manager._cleanup_issue_mapping.__globals__['_COMPARE_AND_DELETE_HASH_FIELD_SCRIPT'],
+            1,
+            manager.redis_issue_mapping,
+            'proj:9',
+            'run-a-id',
+        )
+        # The board-scoped key is deleted directly (no compare needed there —
+        # only this run could ever hold it); the legacy key must NOT be
+        # touched via a separate hget/hdel outside the atomic eval() above.
+        bare_mock_redis.hdel.assert_called_once_with(manager.redis_issue_mapping, 'proj:BoardA:9')
+        bare_mock_redis.hget.assert_not_called()
 
 
 class TestGetRecentPipelineRunIdBoardParameter:

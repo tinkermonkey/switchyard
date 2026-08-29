@@ -31,6 +31,20 @@ def format_pipeline_run_issue_key(project: str, issue_number: int, board: Option
         return f"{project}:{board}:{issue_number}"
     return f"{project}:{issue_number}"
 
+
+# Atomically delete a hash field only if its current value matches — used by
+# _cleanup_issue_mapping() to remove a legacy-format issue-mapping entry
+# without racing a concurrent writer (e.g. get_active_pipeline_run()'s
+# ES-restore path) that may have just pointed it at a different run.
+# KEYS[1] = hash name, ARGV[1] = field, ARGV[2] = expected value
+_COMPARE_AND_DELETE_HASH_FIELD_SCRIPT = """
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+    return redis.call('HDEL', KEYS[1], ARGV[1])
+else
+    return 0
+end
+"""
+
 # ILM Policy for pipeline runs (7-day retention)
 PIPELINE_RUNS_ILM_POLICY = {
     "policy": {
@@ -247,8 +261,19 @@ class PipelineRunManager:
         legacy_key = self._get_issue_key(project, issue_number)
         if legacy_key != board_key:
             try:
-                if self.redis.hget(self.redis_issue_mapping, legacy_key) == pipeline_run_id:
-                    self.redis.hdel(self.redis_issue_mapping, legacy_key)
+                # Atomic compare-and-delete via EVAL — a separate HGET-then-HDEL
+                # has a real TOCTOU window: get_active_pipeline_run()'s ES-restore
+                # path can write a DIFFERENT board's run into this same legacy
+                # key between the check and the delete, and an unconditional
+                # HDEL at that point would wipe out that other board's freshly-
+                # restored, still-active mapping.
+                self.redis.eval(
+                    _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                    1,
+                    self.redis_issue_mapping,
+                    legacy_key,
+                    pipeline_run_id,
+                )
             except Exception as e:
                 logger.warning(f"Failed to clean up legacy issue mapping {legacy_key}: {e}")
     
