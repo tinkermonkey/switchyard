@@ -14,9 +14,17 @@ Covers:
   execute_board_query_cached() sharing one _board_query_cache - partial
   cache hits within a batch, cross-path reads of each other's writes, and
   invalidate_board_query_cache() invalidating a batch-populated entry.
+- Item pagination (GitHub issue #96): the items(first: 100) truncation fix -
+  a board reporting items.pageInfo.hasNextPage=True triggers exactly the
+  right number of cursor-based follow-up requests on both the single-board
+  path (execute_board_query_cached()) and the batched/aliased path
+  (execute_batched_board_queries(), where each alias paginates
+  independently), a board within the first 100 items needs none, and a
+  pathological board is stopped at MAX_ITEM_PAGES_PER_BOARD.
 
 No live network access - all GitHub API calls are mocked.
 """
+import logging
 import time
 
 import pytest
@@ -24,6 +32,7 @@ from unittest.mock import Mock, patch
 
 from services.github_owner_utils import (
     MAX_BOARDS_PER_BATCH,
+    MAX_ITEM_PAGES_PER_BOARD,
     _board_query_cache,
     build_batched_board_queries,
     build_batched_projects_v2_query,
@@ -461,3 +470,295 @@ class TestUnifiedBoardQueryCache:
         # response), not 'organization' (what the second get_owner_type()
         # call would have said).
         assert _board_query_cache[('acme', 1)][1] == {'user': {'projectV2': _board_data(1)}}
+
+
+def _paged_envelope(items_nodes, has_next_page, end_cursor=None, root='organization'):
+    """A single-board query response envelope holding one page of items."""
+    return {
+        root: {
+            'projectV2': {
+                'id': 'PVT_1',
+                'title': 'Board 1',
+                'items': {
+                    'pageInfo': {'hasNextPage': has_next_page, 'endCursor': end_cursor},
+                    'nodes': items_nodes,
+                },
+            }
+        }
+    }
+
+
+class TestSingleBoardItemPagination:
+    """
+    GitHub issue #96: items(first: 100) truncation fix, single-board path
+    (execute_board_query_cached()).
+    """
+
+    def test_le_100_items_needs_no_follow_up_request(self):
+        """A board whose first (only) page already reports
+        hasNextPage=False issues exactly the one request it always has -
+        no pagination call is made."""
+        envelope = _paged_envelope([{'id': 'item-1'}, {'id': 'item-2'}], has_next_page=False)
+
+        mock_client = Mock()
+        mock_client.graphql.return_value = (True, envelope)
+
+        with patch('services.github_owner_utils.build_projects_v2_query', return_value='query {}'), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            result = execute_board_query_cached('acme', 1)
+
+        assert mock_client.graphql.call_count == 1
+        assert result == envelope
+
+    def test_gt_100_items_triggers_exactly_the_right_follow_up_requests(self):
+        """A board spanning 3 pages (250 items) triggers exactly 2 follow-up
+        requests (cursor-chained), and the final result contains every
+        item, not just the first 100."""
+        pages = {
+            None: ([{'id': f'item-{i}'} for i in range(100)], True, 'c1'),
+            'c1': ([{'id': f'item-{i}'} for i in range(100, 200)], True, 'c2'),
+            'c2': ([{'id': f'item-{i}'} for i in range(200, 250)], False, None),
+        }
+
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            assert (owner_login, project_number) == ('acme', 1)
+            return f'QUERY cursor={cursor}'
+
+        def fake_graphql(query):
+            cursor = query.split('cursor=', 1)[1]
+            cursor = None if cursor == 'None' else cursor
+            nodes, has_next_page, end_cursor = pages[cursor]
+            return True, _paged_envelope(nodes, has_next_page, end_cursor)
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            result = execute_board_query_cached('acme', 1)
+
+        # First page + 2 follow-ups, no more (the 3rd page already reported
+        # hasNextPage=False).
+        assert mock_client.graphql.call_count == 3
+
+        items = result['organization']['projectV2']['items']
+        assert len(items['nodes']) == 250
+        assert [n['id'] for n in items['nodes']] == [f'item-{i}' for i in range(250)]
+        assert items['pageInfo']['hasNextPage'] is False
+
+    def test_fully_paginated_result_is_what_gets_cached(self):
+        """Pagination happens BEFORE caching - a cache hit after a
+        multi-page fetch must return every item, not just the first page."""
+        pages = {
+            None: ([{'id': f'item-{i}'} for i in range(100)], True, 'c1'),
+            'c1': ([{'id': f'item-{i}'} for i in range(100, 120)], False, None),
+        }
+
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            return f'QUERY cursor={cursor}'
+
+        def fake_graphql(query):
+            cursor = query.split('cursor=', 1)[1]
+            cursor = None if cursor == 'None' else cursor
+            nodes, has_next_page, end_cursor = pages[cursor]
+            return True, _paged_envelope(nodes, has_next_page, end_cursor)
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            execute_board_query_cached('acme', 1)
+            assert mock_client.graphql.call_count == 2
+
+            # Second call within TTL - served from cache, no new API call -
+            # and the cached data already holds all 120 items.
+            cached = execute_board_query_cached('acme', 1)
+
+        assert mock_client.graphql.call_count == 2
+        assert len(cached['organization']['projectV2']['items']['nodes']) == 120
+
+    def test_page_count_safety_cap_stops_and_logs_warning(self, caplog):
+        """A pathological board that never reports hasNextPage=False is
+        stopped at MAX_ITEM_PAGES_PER_BOARD pages, with a warning logged,
+        rather than looping unboundedly."""
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            return f'QUERY cursor={cursor}'
+
+        def fake_graphql(query):
+            cursor = query.split('cursor=', 1)[1]
+            page_index = 0 if cursor == 'None' else int(cursor[1:])
+            next_cursor = f'c{page_index + 1}'
+            nodes = [{'id': f'item-{page_index}-{i}'} for i in range(100)]
+            # Always reports more - this board never actually ends.
+            return True, _paged_envelope(nodes, has_next_page=True, end_cursor=next_cursor)
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client), \
+             caplog.at_level(logging.WARNING, logger='services.github_owner_utils'):
+            result = execute_board_query_cached('acme', 1)
+
+        assert mock_client.graphql.call_count == MAX_ITEM_PAGES_PER_BOARD
+        items = result['organization']['projectV2']['items']
+        assert len(items['nodes']) == MAX_ITEM_PAGES_PER_BOARD * 100
+        # Still reports hasNextPage=True - the cap stopped us, not the data.
+        assert items['pageInfo']['hasNextPage'] is True
+        assert any('MAX_ITEM_PAGES_PER_BOARD' in record.message for record in caplog.records)
+
+    def test_transient_follow_up_page_failure_is_retried_once(self):
+        """
+        Regression test: a single transient failure fetching a follow-up
+        page must not permanently truncate the board - one retry (matching
+        this file's existing single-retry convention) recovers it.
+        """
+        pages = {
+            None: ([{'id': f'item-{i}'} for i in range(100)], True, 'c1'),
+            'c1': ([{'id': f'item-{i}'} for i in range(100, 120)], False, None),
+        }
+        call_count = {'c1': 0}
+
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            return f'QUERY cursor={cursor}'
+
+        def fake_graphql(query):
+            cursor = query.split('cursor=', 1)[1]
+            cursor = None if cursor == 'None' else cursor
+            if cursor == 'c1':
+                call_count['c1'] += 1
+                if call_count['c1'] == 1:
+                    return False, {'error': 'transient blip'}  # fails once
+            nodes, has_next_page, end_cursor = pages[cursor]
+            return True, _paged_envelope(nodes, has_next_page, end_cursor)
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client), \
+             patch('services.github_owner_utils.time.sleep'):
+            result = execute_board_query_cached('acme', 1)
+
+        # First page + failed c1 attempt + retried c1 attempt = 3 calls total.
+        assert mock_client.graphql.call_count == 3
+        items = result['organization']['projectV2']['items']
+        assert len(items['nodes']) == 120  # fully recovered, not truncated at 100
+
+    def test_follow_up_page_reuses_owner_type_not_a_fresh_get_owner_type_call(self):
+        """
+        Regression test: build_projects_v2_query() must be called with the
+        owner_type already known from the initial fetch for every
+        follow-up page, not left to re-derive it via a second
+        get_owner_type() call that could legitimately disagree (e.g. after
+        a cache eviction or circuit-breaker trip between pages).
+        """
+        pages = {
+            None: ([{'id': 'item-0'}], True, 'c1'),
+            'c1': ([{'id': 'item-1'}], False, None),
+        }
+        owner_types_passed = []
+
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            owner_types_passed.append(owner_type)
+            return f'QUERY cursor={cursor}'
+
+        def fake_graphql(query):
+            cursor = query.split('cursor=', 1)[1]
+            cursor = None if cursor == 'None' else cursor
+            nodes, has_next_page, end_cursor = pages[cursor]
+            return True, _paged_envelope(nodes, has_next_page, end_cursor)
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        # get_owner_type would disagree if called again - proves the
+        # follow-up page isn't calling it.
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            execute_board_query_cached('acme', 1)
+
+        # First call is the initial (unpaginated) fetch, which has no prior
+        # owner_type to reuse - it defaults to None, same as before this
+        # parameter existed. What matters is the SECOND call (the c1
+        # follow-up page): it must carry the owner_type already known from
+        # the initial response's root field ('organization') through,
+        # rather than leaving it None (which would trigger re-derivation
+        # via a fresh get_owner_type() call).
+        assert owner_types_passed == [None, 'organization']
+
+
+class TestBatchedBoardItemPagination:
+    """
+    GitHub issue #96: items(first: 100) truncation fix, batched/aliased path
+    (execute_batched_board_queries()) - each aliased board paginates
+    independently.
+    """
+
+    def test_one_alias_needs_continuation_while_another_in_same_batch_does_not(self):
+        """Board 1 (150 items, 2 pages) and board 2 (1 item, 1 page) are
+        fetched in the same batch. Only board 1 triggers a follow-up
+        request, and it doesn't affect board 2's already-complete result."""
+        def fake_build_query(owner_login, project_number, cursor=None, owner_type=None):
+            # Only used for single-board follow-up fetches.
+            return f'FOLLOWUP p{project_number} cursor={cursor}'
+
+        def fake_graphql(query):
+            if 'p1: projectV2(number: 1)' in query and 'p2: projectV2(number: 2)' in query:
+                # Initial batched request covering both boards.
+                return True, {
+                    'organization': {
+                        'p1': {
+                            'id': 'PVT_1',
+                            'title': 'Board 1',
+                            'items': {
+                                'pageInfo': {'hasNextPage': True, 'endCursor': 'c1'},
+                                'nodes': [{'id': f'item-1-{i}'} for i in range(100)],
+                            },
+                        },
+                        'p2': {
+                            'id': 'PVT_2',
+                            'title': 'Board 2',
+                            'items': {
+                                'pageInfo': {'hasNextPage': False, 'endCursor': None},
+                                'nodes': [{'id': 'item-2-0'}],
+                            },
+                        },
+                    }
+                }
+            if 'FOLLOWUP p1 cursor=c1' in query:
+                return True, _paged_envelope(
+                    [{'id': f'item-1-{i}'} for i in range(100, 150)],
+                    has_next_page=False,
+                )
+            raise AssertionError(f"Unexpected query: {query}")
+
+        mock_client = Mock()
+        mock_client.graphql.side_effect = fake_graphql
+
+        with patch('services.github_owner_utils.build_projects_v2_query', side_effect=fake_build_query), \
+             patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
+             patch('services.github_api_client.get_github_client', return_value=mock_client):
+            results, errors = execute_batched_board_queries([('acme', 1), ('acme', 2)])
+
+        assert errors == {}
+        # One batched request + exactly one follow-up (board 1 only).
+        assert mock_client.graphql.call_count == 2
+
+        assert len(results[('acme', 1)]['items']['nodes']) == 150
+        assert [n['id'] for n in results[('acme', 1)]['items']['nodes']] == [f'item-1-{i}' for i in range(150)]
+        assert results[('acme', 1)]['items']['pageInfo']['hasNextPage'] is False
+
+        # Board 2 is untouched - no follow-up request was issued for it.
+        assert len(results[('acme', 2)]['items']['nodes']) == 1
+        assert results[('acme', 2)]['items']['nodes'] == [{'id': 'item-2-0'}]
+
+        # Cache holds the fully-paginated result for board 1.
+        assert len(_board_query_cache[('acme', 1)][1]['organization']['projectV2']['items']['nodes']) == 150

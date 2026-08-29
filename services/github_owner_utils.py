@@ -248,12 +248,45 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
 # cross-project builder (build_batched_projects_v2_query) can't drift apart -
 # there is exactly one place that defines what a "board" query fetches.
 #
-# NOTE: This is inserted verbatim inside a `projectV2(number: N) { ... }`
+# This is inserted verbatim inside a `projectV2(number: N) { ... }`
 # selection, so it must remain a plain (non-f-string-braced) GraphQL field
-# selection - no `{{`/`}}` escaping needed when it's spliced into an f-string.
-_PROJECT_V2_FIELDS = '''id
+# selection - no `{{`/`}}` escaping needed when it's spliced into an
+# f-string. It's a function (not a bare constant) so a follow-up page fetch
+# can ask for items past the first 100 via `cursor` - see "Item pagination"
+# below (GitHub issue #96).
+def _project_v2_fields(cursor: Optional[str] = None) -> str:
+    """
+    Build the field selection for a single projectV2 board.
+
+    Args:
+        cursor: Opaque pagination cursor (items.pageInfo.endCursor from a
+            prior response). When given, adds an `after:` argument to the
+            items connection to fetch the next page past the first 100.
+            None (the default) fetches the first page. Every call - first
+            page or a follow-up - now also selects items.pageInfo
+            {hasNextPage endCursor}, which is new since pagination support
+            was added, so the returned text is not byte-for-byte identical
+            to the pre-pagination version even when cursor is None; only
+            the items(first: 100, ...) argument list is unchanged for that
+            case.
+    """
+    # Cursor values are opaque GraphQL connection cursors (GitHub returns
+    # base64-encoded strings for this API), but interpolated defensively
+    # rather than trusting that format - a cursor containing a `"` or `\`
+    # would otherwise produce a syntactically broken (or subtly corrupted)
+    # `after:` argument with no validation catching it beforehand.
+    if cursor:
+        escaped_cursor = cursor.replace('\\', '\\\\').replace('"', '\\"')
+        after_arg = f', after: "{escaped_cursor}"'
+    else:
+        after_arg = ''
+    return '''id
                     title
-                    items(first: 100, orderBy: {field: POSITION, direction: ASC}) {
+                    items(first: 100''' + after_arg + ''', orderBy: {field: POSITION, direction: ASC}) {
+                        pageInfo {
+                            hasNextPage
+                            endCursor
+                        }
                         nodes {
                             id
                             content {
@@ -285,29 +318,52 @@ _PROJECT_V2_FIELDS = '''id
                     }'''
 
 
-def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[str]:
+def build_projects_v2_query(
+    owner_login: str, project_number: int, cursor: Optional[str] = None, owner_type: Optional[str] = None
+) -> Optional[str]:
     """
     Build a GraphQL query for GitHub Projects v2 based on owner type.
 
     Args:
         owner_login: GitHub username or organization name
         project_number: Project number
+        cursor: Opaque pagination cursor (items.pageInfo.endCursor from a
+            prior response on this same board) to fetch the next page of
+            items past the first 100. None (the default) fetches the first
+            page. Existing callers that don't pass this see the same
+            query shape as before pagination support was added, plus the
+            added items.pageInfo{hasNextPage endCursor} selection (needed
+            on every request, including the first, to know whether a
+            follow-up page is required at all).
+        owner_type: 'user' or 'organization', when the caller already knows
+            it (e.g. it's the same board a prior response was just fetched
+            for) - skips the get_owner_type() call entirely rather than
+            re-deriving it. get_owner_type() is independently cached/
+            circuit-broken and can legitimately return a different (or
+            None) result on a later call than it did earlier for the same
+            owner; re-deriving for every pagination follow-up page risked
+            building a query against the wrong root field mid-pagination.
+            None (the default) resolves it via get_owner_type(), matching
+            this function's behavior before this parameter was added.
 
     Returns:
         GraphQL query string, or None if owner type cannot be determined
     """
-    owner_type = get_owner_type(owner_login)
+    if owner_type is None:
+        owner_type = get_owner_type(owner_login)
 
     if owner_type is None:
         logger.error(f"Cannot build Projects v2 query - unable to determine owner type for '{owner_login}'")
         return None
+
+    fields = _project_v2_fields(cursor)
 
     # Determine the correct GraphQL query based on owner type
     if owner_type == 'user':
         query = f'''{{
             user(login: "{owner_login}") {{
                 projectV2(number: {project_number}) {{
-                    {_PROJECT_V2_FIELDS}
+                    {fields}
                 }}
             }}
         }}'''
@@ -315,12 +371,179 @@ def build_projects_v2_query(owner_login: str, project_number: int) -> Optional[s
         query = f'''{{
             organization(login: "{owner_login}") {{
                 projectV2(number: {project_number}) {{
-                    {_PROJECT_V2_FIELDS}
+                    {fields}
                 }}
             }}
         }}'''
 
     return query
+
+
+# ---------------------------------------------------------------------------
+# Item pagination (GitHub issue #96, sub-issue of #36)
+#
+# _project_v2_fields()'s items(first: 100, ...) connection returns at most
+# 100 items per request with no follow-up - any board with more than 100
+# items silently lost everything past the 100th. This is a data-fidelity
+# bug (not just an efficiency one), independent of the batching work in
+# #92-#95. The helpers below walk items.pageInfo.hasNextPage/endCursor with
+# follow-up requests until every item is fetched or a safety cap is hit.
+#
+# Follow-up pages are always fetched as single-board queries
+# (build_projects_v2_query(..., cursor=...)), even when pagination is
+# triggered from the batched/aliased path (execute_batched_board_queries) -
+# simpler and safer than trying to keep independent per-alias cursors
+# progressing within one aliased query, and it's still exactly one extra
+# request per page per board that actually needs one.
+# ---------------------------------------------------------------------------
+
+# 10 pages of 100 items = up to 1000 items fetched for a single board before
+# pagination gives up (logging a warning) rather than looping unboundedly on
+# a board with some pathological item count.
+MAX_ITEM_PAGES_PER_BOARD = 10
+
+
+def _extract_project_v2(envelope: dict) -> Optional[Tuple[str, dict]]:
+    """
+    Extract (root_field, project_data) from a board query response envelope
+    shaped like {'user': {'projectV2': {...}}} or
+    {'organization': {'projectV2': {...}}} - the shape
+    GitHubAPIClient.graphql() hands back on success for a single-board
+    query built by build_projects_v2_query().
+
+    Returns None if `envelope` isn't in that shape, or its `projectV2`
+    value isn't a dict (e.g. a deleted/renamed project, where GitHub
+    returns null).
+    """
+    for root_field in ('user', 'organization'):
+        root = envelope.get(root_field)
+        if isinstance(root, dict) and isinstance(root.get('projectV2'), dict):
+            return root_field, root['projectV2']
+    return None
+
+
+def _paginate_project_items(
+    owner: str,
+    project_number: int,
+    project_data: dict,
+    fetch_page,
+) -> dict:
+    """
+    Follow items.pageInfo.hasNextPage/endCursor on `project_data` (a single
+    board's {'id':..., 'title':..., 'items': {...}} dict, already holding
+    one page) with additional page fetches, appending each page's
+    items.nodes to the accumulated list, until hasNextPage is False or
+    MAX_ITEM_PAGES_PER_BOARD pages have been fetched in total - whichever
+    comes first.
+
+    Args:
+        owner, project_number: Identify the board, for logging only.
+        project_data: The board dict holding the first (or only) page.
+        fetch_page: `fetch_page(cursor) -> (success, project_data_or_None)`,
+            fetching one follow-up page for this same board (same shape as
+            `project_data`). Callers close over whatever owner/
+            project_number/github_client they need.
+
+    Returns:
+        `project_data` with items.nodes replaced by the full accumulated
+        list and items.pageInfo updated to reflect the last page fetched.
+        A board with no items.pageInfo (e.g. cached data from before
+        pagination support) or items.pageInfo.hasNextPage falsy is returned
+        unchanged after exactly zero calls to `fetch_page`.
+    """
+    items = project_data.get('items') if isinstance(project_data, dict) else None
+    if not isinstance(items, dict):
+        return project_data
+
+    page_info = items.get('pageInfo') or {}
+    if not page_info.get('hasNextPage'):
+        # Nothing to paginate - return project_data exactly as received (no
+        # 'pageInfo' key added/rewritten) so a board whose response never
+        # carried pageInfo at all (e.g. cached data from before pagination
+        # support) round-trips byte-for-byte through this function.
+        return project_data
+
+    nodes = list(items.get('nodes') or [])
+    pages_fetched = 1
+
+    while page_info.get('hasNextPage') and pages_fetched < MAX_ITEM_PAGES_PER_BOARD:
+        cursor = page_info.get('endCursor')
+        if not cursor:
+            logger.warning(
+                f"Board {owner}/project#{project_number} items.pageInfo.hasNextPage is true "
+                f"but endCursor is missing - stopping pagination with {len(nodes)} items fetched"
+            )
+            break
+
+        success, next_project_data = fetch_page(cursor)
+        if not success or not isinstance(next_project_data, dict):
+            logger.warning(
+                f"Follow-up items page fetch failed for {owner}/project#{project_number} "
+                f"(cursor={cursor}) - returning {len(nodes)} items fetched so far"
+            )
+            break
+
+        next_items = next_project_data.get('items') or {}
+        nodes.extend(next_items.get('nodes') or [])
+        page_info = next_items.get('pageInfo') or {}
+        pages_fetched += 1
+
+    if page_info.get('hasNextPage') and pages_fetched >= MAX_ITEM_PAGES_PER_BOARD:
+        logger.warning(
+            f"Board {owner}/project#{project_number} still has more items after "
+            f"{pages_fetched} pages ({len(nodes)} items fetched) - hit "
+            f"MAX_ITEM_PAGES_PER_BOARD={MAX_ITEM_PAGES_PER_BOARD}; remaining items were not fetched "
+            f"this cycle"
+        )
+
+    project_data['items'] = {**items, 'nodes': nodes, 'pageInfo': page_info}
+    return project_data
+
+
+def _paginate_single_board(
+    owner: str, project_number: int, project_data: dict, github_client, owner_type: Optional[str] = None
+) -> dict:
+    """
+    _paginate_project_items() wired to fetch follow-up pages as single-board
+    queries (build_projects_v2_query(..., cursor=...)) executed over
+    `github_client`. Shared by execute_board_query_cached() and, for
+    per-alias continuation, execute_batched_board_queries().
+
+    Args:
+        owner_type: 'user' or 'organization', when the caller already
+            knows it (both current callers do - see build_projects_v2_query()'s
+            own `owner_type` param docs for why this matters: without it,
+            every follow-up page would re-derive owner type via a fresh
+            get_owner_type() call that can legitimately disagree with the
+            value used for the initial fetch).
+    """
+    def fetch_page(cursor: str):
+        query = build_projects_v2_query(owner, project_number, cursor=cursor, owner_type=owner_type)
+        if query is None:
+            return False, None
+
+        # Single retry on a transient follow-up page failure, matching this
+        # file's existing single-retry convention elsewhere (e.g.
+        # execute_board_query_cached()) - without it, one blip on (say)
+        # page 3 of 5 silently truncates the board to whatever was fetched
+        # so far, which is then cached and returned as if it were complete.
+        for attempt in range(2):
+            success, page_envelope = github_client.graphql(query)
+            if success and isinstance(page_envelope, dict):
+                extracted = _extract_project_v2(page_envelope)
+                if extracted is not None:
+                    return True, extracted[1]
+                break  # page_envelope wasn't in the expected shape - retrying won't help
+            if attempt == 0:
+                logger.debug(
+                    f"Follow-up items page fetch failed for {owner}/project#{project_number} "
+                    f"(cursor={cursor}), retrying once..."
+                )
+                time.sleep(2)
+
+        return False, None
+
+    return _paginate_project_items(owner, project_number, project_data, fetch_page)
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +622,7 @@ def build_batched_projects_v2_query(owner_login: str, project_numbers: List[int]
 
     aliased_fields = "\n".join(
         f'''            p{project_number}: projectV2(number: {project_number}) {{
-                    {_PROJECT_V2_FIELDS}
+                    {_project_v2_fields()}
                 }}'''
         for project_number in project_numbers
     )
@@ -666,23 +889,43 @@ def execute_batched_board_queries(
             errors = {(owner, project_number): message for owner, project_number, _alias in boards}
 
         if results:
+            # The root field is read off the ACTUAL response payload (the
+            # same normalization parse_batched_projects_v2_response() uses)
+            # rather than re-derived via a get_owner_type() call.
+            # get_owner_type() is independently cached/circuit-broken and
+            # can return a different (or None) result on a later call than
+            # it did when the query was built - re-deriving risked caching
+            # a board under the wrong root key (e.g. 'organization' for a
+            # 'user'-owned board), which downstream readers
+            # (execute_board_query_cached(), _unwrap_board_envelope()) key
+            # off exactly. Computed once per batch (every board in one
+            # batch shares the same owner/root field) and reused below for
+            # both pagination follow-ups and the cache write.
+            response_payload = data.get('data') or data if isinstance(data, dict) and 'data' in data else data
+            root_field = 'user' if isinstance(response_payload, dict) and 'user' in response_payload else 'organization'
+
+            # Per-alias independent pagination (GitHub issue #96): a batched
+            # response's items(first: 100) connection is truncated exactly
+            # like the single-board path's. Each alias that reports more
+            # items is paginated independently - one board needing
+            # continuation never blocks or entangles with another board in
+            # the same batch that doesn't.
+            for board_key, project_data in results.items():
+                if not isinstance(project_data, dict):
+                    continue
+                items = project_data.get('items')
+                if not isinstance(items, dict) or not (items.get('pageInfo') or {}).get('hasNextPage'):
+                    continue
+                board_owner, board_project_number = board_key
+                results[board_key] = _paginate_single_board(
+                    board_owner, board_project_number, project_data, github_client, owner_type=root_field
+                )
+
+        if results:
             # Populate the shared cache with every successfully-parsed
             # board, wrapped in the same envelope shape
             # execute_board_query_cached() stores/returns, so a cache hit
             # read through either path returns an equivalent value.
-            #
-            # The root field is read off the ACTUAL response payload (the
-            # same normalization parse_batched_projects_v2_response() uses)
-            # rather than re-derived via a second get_owner_type() call.
-            # get_owner_type() is independently cached/circuit-broken and
-            # can return a different (or None) result on this second call
-            # than it did when the query was built - re-deriving risked
-            # caching a board under the wrong root key (e.g. 'organization'
-            # for a 'user'-owned board) whenever that happened, which
-            # downstream readers (execute_board_query_cached(),
-            # _unwrap_board_envelope()) key off exactly.
-            response_payload = data.get('data') or data if isinstance(data, dict) and 'data' in data else data
-            root_field = 'user' if isinstance(response_payload, dict) and 'user' in response_payload else 'organization'
             for board_key, project_data in results.items():
                 _cache_board(board_key, {root_field: {'projectV2': project_data}})
                 logger.debug(f"Board query cache miss for {board_key[0]}/project#{board_key[1]}, cached result")
@@ -801,6 +1044,18 @@ def execute_board_query_cached(owner: str, project_number: int) -> Optional[dict
     for attempt in range(2):
         success, data = github_client.graphql(query)
         if success:
+            # Pagination happens BEFORE caching (GitHub issue #96), so a
+            # cache hit always returns the fully-paginated result, not just
+            # the first 100 items. A response not in the expected
+            # {'user'|'organization': {'projectV2': {...}}} shape is cached
+            # and returned as-is, unpaginated - matching this function's
+            # behavior before pagination support existed.
+            if isinstance(data, dict):
+                extracted = _extract_project_v2(data)
+                if extracted is not None:
+                    root_field, project_data = extracted
+                    project_data = _paginate_single_board(owner, project_number, project_data, github_client, owner_type=root_field)
+                    data = {root_field: {'projectV2': project_data}}
             _cache_board(cache_key, data)
             logger.debug(f"Board query cache miss for {owner}/project#{project_number}, cached result")
             return data
