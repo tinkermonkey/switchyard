@@ -33,7 +33,6 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -51,44 +50,59 @@ DEFAULT_STALENESS_SECONDS = 14400  # 4 hours
 # no-op refresh, and otherwise admit a new holder only if under capacity — all
 # in one server-side operation, so there is no window between checking
 # capacity and claiming a slot for a concurrent caller to race into.
+#
+# Returns a 2-element array [acquired, pruned] rather than a bare 0/1:
+# `pruned` (1/0) tells the caller whether any stale holder was actually
+# removed, so it knows to resync the YAML mirror even on a refused acquire
+# (pruning can happen on the refuse path too — other live holders can still
+# keep the board at capacity after a stale one is dropped).
+#
 # KEYS[1] = redis hash key (field = issue_number, value = acquired_at unix ts)
 # ARGV[1] = staleness cutoff (now - staleness_seconds)
 # ARGV[2] = max_concurrent
 # ARGV[3] = issue_number (as string)
 # ARGV[4] = now (unix ts)
+# ARGV[5] = the hash's own EXPIRE seconds (must be >= staleness_seconds, see
+#           _EXPIRE_MARGIN_SECONDS — otherwise Redis could drop the whole
+#           hash, ALL holders included, before this script's own logical
+#           staleness pruning would have removed just the stale ones)
 _TRY_ACQUIRE_SCRIPT = """
+local pruned = 0
 local all = redis.call('HGETALL', KEYS[1])
 for i = 1, #all, 2 do
     local field = all[i]
     local value = tonumber(all[i + 1])
     if value and value < tonumber(ARGV[1]) then
         redis.call('HDEL', KEYS[1], field)
+        pruned = 1
     end
 end
 
 if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then
     redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
-    redis.call('EXPIRE', KEYS[1], 7200)
-    return 1
+    redis.call('EXPIRE', KEYS[1], ARGV[5])
+    return {1, pruned}
 end
 
 local current = redis.call('HLEN', KEYS[1])
 if current < tonumber(ARGV[2]) then
     redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
-    redis.call('EXPIRE', KEYS[1], 7200)
-    return 1
+    redis.call('EXPIRE', KEYS[1], ARGV[5])
+    return {1, pruned}
 else
-    return 0
+    return {0, pruned}
 end
 """
 
-
-@dataclass
-class PipelineSemaphoreState:
-    """Current holders of a (project, board) semaphore."""
-    project: str
-    board: str
-    holders: List[int] = field(default_factory=list)  # issue numbers, order not meaningful
+# The Redis hash's own EXPIRE must never be shorter than the logical
+# staleness window the script prunes against — otherwise Redis silently
+# drops the entire hash (every holder, not just stale ones) before a
+# genuinely-still-active holder's own staleness deadline arrives, and the
+# next acquire sees an empty hash and admits past capacity with no
+# fail-closed check to catch it. Sized as staleness_seconds plus a margin
+# (not exactly equal) so ordinary clock/scheduling jitter can't tip it the
+# wrong way.
+_EXPIRE_MARGIN_SECONDS = 3600  # 1 hour
 
 
 class PipelineSemaphoreManager:
@@ -138,13 +152,20 @@ class PipelineSemaphoreManager:
         return self.state_dir / f"{project}_{board}.yaml"
 
     def _read_redis_holders_only(self, project: str, board: str) -> Tuple[Optional[List[int]], bool]:
-        """Read holder issue numbers from Redis only. Returns (holders_or_None, read_succeeded)."""
+        """Read holder issue numbers from Redis only.
+
+        Returns (holders, read_succeeded). `holders` is None only when Redis
+        isn't configured at all, or the read raised — a confirmed-empty
+        result (the hash genuinely has no fields, or doesn't exist) returns
+        `[]`, NOT None, so callers (see get_holders()) can trust a fresh,
+        empty answer from Redis directly instead of conflating it with "no
+        information" and needlessly falling back to a possibly-stale YAML
+        mirror.
+        """
         if not self.redis_client:
             return None, True  # no Redis configured isn't a read failure
         try:
             data = self.redis_client.hgetall(self._get_semaphore_key(project, board))
-            if not data:
-                return None, True
             return sorted(int(k) for k in data.keys()), True
         except Exception as e:
             logger.warning(f"Failed to get semaphore holders from Redis: {e}")
@@ -175,13 +196,15 @@ class PipelineSemaphoreManager:
         """
         Get the current holder issue numbers for a (project, board) semaphore.
 
-        Reads Redis first (fresher); falls back to YAML only if Redis has no
-        entry. Best-effort — for a safety-critical acquire decision, use
-        try_acquire()'s own internal fail-closed handling instead of building
-        one on top of this method.
+        Trusts a successful Redis read even when it's empty — an empty
+        result is usually the correct, fresh answer (no holders right now),
+        not a signal to fall back. Falls back to YAML only when Redis isn't
+        configured or the read itself failed. Best-effort — for a
+        safety-critical acquire decision, use try_acquire()'s own internal
+        fail-closed handling instead of building one on top of this method.
         """
-        redis_holders, _ = self._read_redis_holders_only(project, board)
-        if redis_holders is not None:
+        redis_holders, redis_ok = self._read_redis_holders_only(project, board)
+        if redis_ok and redis_holders is not None:
             return redis_holders
         yaml_holders, _ = self._read_yaml_holders_only(project, board)
         return yaml_holders or []
@@ -218,7 +241,8 @@ class PipelineSemaphoreManager:
             try:
                 now = time.time()
                 cutoff = now - staleness_seconds
-                acquired = self.redis_client.eval(
+                expire_seconds = staleness_seconds + _EXPIRE_MARGIN_SECONDS
+                acquired, pruned = self.redis_client.eval(
                     _TRY_ACQUIRE_SCRIPT,
                     1,
                     self._get_semaphore_key(project, board),
@@ -226,9 +250,20 @@ class PipelineSemaphoreManager:
                     max_concurrent,
                     str(issue_number),
                     now,
+                    expire_seconds,
                 )
-                if acquired:
+                # Resync YAML whenever Redis's holder set actually changed —
+                # not just on a successful acquire. Pruning can happen on the
+                # refuse path too (other live holders can still keep the
+                # board at capacity after a stale one is dropped); without
+                # this, YAML would keep a phantom already-pruned holder and,
+                # if Redis later became unreachable, the YAML-only fallback
+                # would enforce capacity against a holder that no longer
+                # exists.
+                if acquired or pruned:
                     self._sync_yaml_from_redis(project, board)
+
+                if acquired:
                     logger.info(
                         f"Pipeline semaphore slot acquired: {project}/{board} by issue "
                         f"#{issue_number} (max_concurrent={max_concurrent})"
@@ -363,11 +398,25 @@ class PipelineSemaphoreManager:
         later Redis outage can still fall back to a reasonably fresh view.
         Failure here is logged, not escalated — Redis remains the source of
         truth on the happy path; YAML is the durability net for when Redis
-        itself is unavailable at acquire/release time."""
+        itself is unavailable at acquire/release time.
+
+        Skips the write entirely when the holder *set* hasn't changed
+        (mirrors PipelineLockManager._create_lock_yaml_only's same
+        skip-if-unchanged behavior) — otherwise a holder idempotently
+        re-acquiring on every poll (the module's own documented refresh
+        behavior) would cost a full disk read+write+flock cycle on every
+        poll tick regardless of whether anything actually changed. YAML's
+        mirrored timestamps can therefore lag Redis's slightly during a long
+        unchanged streak; that's acceptable since YAML only matters as a
+        fallback once Redis is already unavailable, at which point "this
+        holder was plausible as of the last real change" is enough.
+        """
         try:
             redis_holders, redis_ok = self._read_redis_holders_only(project, board)
             if not redis_ok:
                 return
+            redis_holder_set = sorted(redis_holders or [])
+
             from utils.file_lock import safe_yaml_write
 
             state_file = self._get_state_file(project, board)
@@ -376,20 +425,24 @@ class PipelineSemaphoreManager:
                 if state_file.exists():
                     with open(state_file, 'r') as f:
                         data = yaml.safe_load(f) or {}
-                now_iso = datetime.now(timezone.utc).isoformat()
+
                 holder_entries = data.get('holder_entries', {})
+                if sorted(int(k) for k in holder_entries) == redis_holder_set:
+                    return  # unchanged — avoid an unnecessary rewrite
+
+                now_iso = datetime.now(timezone.utc).isoformat()
                 # Keep existing timestamps for holders Redis still agrees are
                 # active; stamp any holder Redis has that YAML didn't know
                 # about yet with "now" rather than losing its real acquire time.
                 new_entries = {
                     str(h): holder_entries.get(str(h), now_iso)
-                    for h in (redis_holders or [])
+                    for h in redis_holder_set
                 }
                 data.update({
                     'project': project,
                     'board': board,
                     'holder_entries': new_entries,
-                    'holders': sorted(redis_holders or []),
+                    'holders': redis_holder_set,
                 })
                 with open(state_file, 'w') as f:
                     yaml.dump(data, f, default_flow_style=False, sort_keys=False)

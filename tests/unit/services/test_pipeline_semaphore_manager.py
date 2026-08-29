@@ -35,6 +35,7 @@ class FakeRedis:
 
     def __init__(self):
         self._hashes: dict[str, dict[str, str]] = {}
+        self.expire_calls: list[tuple[str, int]] = []  # (key, seconds) — asserted on directly
 
     def hgetall(self, key):
         return dict(self._hashes.get(key, {}))
@@ -56,27 +57,32 @@ class FakeRedis:
         return len(self._hashes.get(key, {}))
 
     def expire(self, key, seconds):
-        pass  # no-op: staleness is handled by the script's own pruning, not Redis TTL
+        self.expire_calls.append((key, int(seconds)))
 
-    def eval(self, script, numkeys, key, cutoff, max_concurrent, issue_number, now):
+    def eval(self, script, numkeys, key, cutoff, max_concurrent, issue_number, now, expire_seconds):
         """Emulate _TRY_ACQUIRE_SCRIPT's atomic prune+check+add against this
         in-memory store (a real Redis server runs the Lua script itself; this
-        fake replicates the same steps directly)."""
+        fake replicates the same steps directly), including its [acquired,
+        pruned] return shape and its own EXPIRE call using expire_seconds."""
         h = self._hashes.setdefault(key, {})
         cutoff = float(cutoff)
+        pruned = 0
         for field, value in list(h.items()):
             if float(value) < cutoff:
                 del h[field]
+                pruned = 1
 
         issue_number = str(issue_number)
         if issue_number in h:
             h[issue_number] = str(now)
-            return 1
+            self.expire(key, expire_seconds)
+            return [1, pruned]
 
         if len(h) < int(max_concurrent):
             h[issue_number] = str(now)
-            return 1
-        return 0
+            self.expire(key, expire_seconds)
+            return [1, pruned]
+        return [0, pruned]
 
 
 class RaisingRedis:
@@ -272,3 +278,131 @@ class TestGetHoldersAndIsHeldBy:
 
         assert manager.is_held_by("proj", "board", 1) is True
         assert manager.is_held_by("proj", "board", 2) is False
+
+
+class TestExpireNeverShorterThanStaleness:
+    """Regression tests for the review finding that the Redis hash's own
+    EXPIRE was hardcoded shorter than the logical staleness window it's
+    supposed to protect — Redis could silently drop the WHOLE hash (every
+    holder, not just stale ones) before a genuinely-still-active holder's
+    staleness deadline arrived, letting a later acquire exceed capacity with
+    no fail-closed check to catch it."""
+
+    def test_expire_is_always_at_least_staleness_seconds(self, tmp_path):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+        key = manager._get_semaphore_key("proj", "board")
+
+        manager.try_acquire("proj", "board", 1, max_concurrent=1, staleness_seconds=99999)
+
+        assert fake_redis.expire_calls, "acquire must set an EXPIRE on the hash"
+        for called_key, seconds in fake_redis.expire_calls:
+            assert called_key == key
+            assert seconds >= 99999, (
+                f"EXPIRE={seconds} is shorter than staleness_seconds=99999 — "
+                "Redis could drop the whole hash before logical pruning would"
+            )
+
+    def test_expire_scales_with_a_larger_default_staleness(self, tmp_path):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)  # default staleness
+
+        from services.pipeline_semaphore_manager import DEFAULT_STALENESS_SECONDS
+        _, seconds = fake_redis.expire_calls[-1]
+        assert seconds >= DEFAULT_STALENESS_SECONDS
+
+
+class TestGetHoldersTrustsConfirmedEmptyRedis:
+    """Regression tests for the review finding that get_holders() couldn't
+    distinguish 'Redis read succeeded and confirmed zero holders' from 'no
+    information available', and so needlessly (and incorrectly) fell back to
+    a possibly-stale YAML mirror even when Redis had just given a fresh,
+    authoritative empty answer."""
+
+    def test_confirmed_empty_redis_is_trusted_over_stale_yaml(self, tmp_path):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+        manager.release("proj", "board", 1)  # Redis now confirmed-empty for this key
+
+        # Simulate a stale YAML mirror that never got cleaned up (e.g. an
+        # older bug, or a race) still claiming issue 1 holds a slot.
+        state_file = manager._get_state_file("proj", "board")
+        with open(state_file, "w") as f:
+            yaml.dump(
+                {"project": "proj", "board": "board", "holders": [1],
+                 "holder_entries": {"1": "2020-01-01T00:00:00+00:00"}},
+                f,
+            )
+
+        # Redis's fresh, confirmed-empty answer must win, not stale YAML.
+        assert manager.get_holders("proj", "board") == []
+
+    def test_still_falls_back_to_yaml_when_redis_read_actually_fails(self, tmp_path):
+        manager = make_manager(tmp_path, redis_client=FakeRedis())
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+
+        manager.redis_client = RaisingRedis()  # Redis becomes unreachable
+
+        assert manager.get_holders("proj", "board") == [1]  # served from YAML
+
+
+class TestYamlSyncsOnPruneEvenWhenRefused:
+    """Regression test for the review finding that YAML was only resynced on
+    a successful acquire — pruning a stale holder during a REFUSED acquire
+    (other live holders still keep the board at capacity) never propagated
+    to YAML, leaving a phantom already-pruned holder there indefinitely."""
+
+    def test_pruning_during_a_refused_acquire_still_updates_yaml(self, tmp_path):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+        key = manager._get_semaphore_key("proj", "board")
+
+        staleness_seconds = 100
+        # Two holders already at capacity=2: one stale, one fresh.
+        fake_redis._hashes[key] = {
+            "1": str(time.time() - (staleness_seconds + 10)),  # stale
+            "2": str(time.time()),  # fresh
+        }
+        # Seed YAML with the pre-prune state so we can observe the resync.
+        manager._sync_yaml_from_redis("proj", "board")
+        assert sorted(manager._read_yaml_holders_only("proj", "board")[0]) == [1, 2]
+
+        # issue 3 tries to acquire; capacity=2 means it's refused, but issue 1
+        # gets pruned for staleness along the way (issue 2 alone still holds
+        # the board at effective capacity=1 in this scenario... use
+        # capacity=1 explicitly so the refusal is unambiguous after pruning).
+        ok, reason = manager.try_acquire(
+            "proj", "board", 3, max_concurrent=1, staleness_seconds=staleness_seconds
+        )
+
+        assert not ok
+        assert "at_capacity" in reason
+        # Redis-side pruning removed issue 1; YAML must reflect that even
+        # though the overall acquire was refused.
+        assert manager._read_yaml_holders_only("proj", "board")[0] == [2]
+
+
+class TestYamlSyncSkipsUnchangedWrite:
+    """Regression test for the review finding that every idempotent refresh
+    (a holder re-acquiring on every poll, the module's own documented
+    behavior) triggered a full YAML disk read+write+flock cycle even when
+    the holder set hadn't changed at all."""
+
+    def test_idempotent_reacquire_does_not_rewrite_yaml_file(self, tmp_path):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+        state_file = manager._get_state_file("proj", "board")
+        mtime_after_first_acquire = state_file.stat().st_mtime_ns
+
+        time.sleep(0.01)
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)  # idempotent refresh
+
+        assert state_file.stat().st_mtime_ns == mtime_after_first_acquire, (
+            "YAML file must not be rewritten when the holder set is unchanged"
+        )
