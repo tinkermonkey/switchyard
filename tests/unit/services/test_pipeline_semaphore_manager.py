@@ -19,6 +19,7 @@ Covers:
 """
 
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -406,3 +407,69 @@ class TestYamlSyncSkipsUnchangedWrite:
         assert state_file.stat().st_mtime_ns == mtime_after_first_acquire, (
             "YAML file must not be rewritten when the holder set is unchanged"
         )
+
+
+class TestReleaseReportsFailureAccurately:
+    """Regression test for the review finding that release() initialized
+    redis_ok = True instead of False: with no Redis client configured and a
+    failing YAML write, the method incorrectly reported success (mirroring
+    it as an implicit 'this store doesn't apply, so it trivially succeeded'
+    instead of 'this store never confirmed anything'), leaving a slot held
+    forever while callers believed it had been freed."""
+
+    def test_release_reports_failure_when_no_redis_and_yaml_write_fails(self, tmp_path, monkeypatch):
+        manager = make_manager(tmp_path, redis_client=None)
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+
+        monkeypatch.setattr(manager, "_release_yaml_only", lambda *a, **kw: False)
+
+        result = manager.release("proj", "board", 1)
+
+        assert result is False
+
+    def test_release_reports_success_when_redis_confirms_even_without_yaml(self, tmp_path, monkeypatch):
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+
+        monkeypatch.setattr(manager, "_release_yaml_only", lambda *a, **kw: False)
+
+        result = manager.release("proj", "board", 1)
+
+        assert result is True  # Redis-side hdel succeeded, so at least one store confirmed
+
+
+class TestYamlOnlyPersistsPruningEvenOnRefusal:
+    """Regression test mirroring TestYamlSyncsOnPruneEvenWhenRefused, but for
+    the YAML-only fallback path (_try_acquire_yaml_only): pruning a stale
+    holder during a refused acquire must be written back to disk, not just
+    computed in memory and discarded when the function returns False."""
+
+    def test_pruning_during_a_refused_yaml_only_acquire_is_persisted(self, tmp_path):
+        manager = make_manager(tmp_path, redis_client=None)
+        state_file = manager._get_state_file("proj", "board")
+        staleness_seconds = 100
+
+        # Seed the YAML file directly: one stale holder, one fresh — at
+        # capacity=1 (using the fresh holder alone).
+        now = time.time()
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file, "w") as f:
+            yaml.dump({
+                "project": "proj", "board": "board",
+                "holders": [1, 2],
+                "holder_entries": {
+                    "1": datetime.fromtimestamp(now - (staleness_seconds + 10), tz=timezone.utc).isoformat(),
+                    "2": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+                },
+            }, f)
+
+        ok, reason = manager.try_acquire(
+            "proj", "board", 3, max_concurrent=1, staleness_seconds=staleness_seconds
+        )
+
+        assert not ok
+        assert "at_capacity" in reason
+        # Issue 1 was pruned for staleness; that must be persisted even
+        # though the overall acquire (issue 3) was refused.
+        assert manager.get_holders("proj", "board") == [2]

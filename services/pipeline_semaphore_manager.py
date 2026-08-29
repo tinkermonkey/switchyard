@@ -270,12 +270,13 @@ class PipelineSemaphoreManager:
                     )
                     return True, "acquired"
 
-                holders, _ = self._read_redis_holders_only(project, board)
+                holders, holders_read_ok = self._read_redis_holders_only(project, board)
+                holders_display = holders if holders_read_ok else "unknown_read_failed"
                 logger.debug(
                     f"Pipeline semaphore {project}/{board} at capacity "
-                    f"({max_concurrent} held by {holders}) — refusing issue #{issue_number}"
+                    f"({max_concurrent} held by {holders_display}) — refusing issue #{issue_number}"
                 )
-                return False, f"at_capacity_held_by_{holders}"
+                return False, f"at_capacity_held_by_{holders_display}"
             except Exception as e:
                 logger.warning(
                     f"Redis error during semaphore acquire for {project}/{board}, "
@@ -310,26 +311,38 @@ class PipelineSemaphoreManager:
                     with open(state_file, 'r') as f:
                         data = yaml.safe_load(f) or {}
 
-                holder_entries = data.get('holder_entries', {})  # issue_number(str) -> iso timestamp
+                original_holder_entries = data.get('holder_entries', {})  # issue_number(str) -> iso timestamp
                 cutoff = now.timestamp() - staleness_seconds
                 holder_entries = {
-                    k: v for k, v in holder_entries.items()
+                    k: v for k, v in original_holder_entries.items()
                     if datetime.fromisoformat(v).timestamp() >= cutoff
                 }
+                pruned = holder_entries.keys() != original_holder_entries.keys()
 
                 key = str(issue_number)
-                if key not in holder_entries and len(holder_entries) >= max_concurrent:
-                    return False, f"at_capacity_held_by_{sorted(int(k) for k in holder_entries)}"
+                admitted = key in holder_entries or len(holder_entries) < max_concurrent
+                if admitted:
+                    holder_entries[key] = now.isoformat()
 
-                holder_entries[key] = now.isoformat()
-                data.update({
-                    'project': project,
-                    'board': board,
-                    'holder_entries': holder_entries,
-                    'holders': sorted(int(k) for k in holder_entries),
-                })
-                with open(state_file, 'w') as f:
-                    yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+                # Persist whenever anything actually changed — admitted a new/
+                # refreshed holder, or pruned a stale one even though the
+                # acquire itself is refused (other live holders still keep
+                # the board at capacity). Without this, a refused acquire
+                # that DID prune a stale holder would leave that holder on
+                # disk indefinitely, the same bug class already fixed for
+                # the Redis-eval path (see TestYamlSyncsOnPruneEvenWhenRefused).
+                if admitted or pruned:
+                    data.update({
+                        'project': project,
+                        'board': board,
+                        'holder_entries': holder_entries,
+                        'holders': sorted(int(k) for k in holder_entries),
+                    })
+                    with open(state_file, 'w') as f:
+                        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+                if not admitted:
+                    return False, f"at_capacity_held_by_{sorted(int(k) for k in holder_entries)}"
 
                 logger.info(
                     f"Pipeline semaphore slot acquired (YAML-only): {project}/{board} "
@@ -349,13 +362,13 @@ class PipelineSemaphoreManager:
         store (mirrors PipelineLockManager's fail-open-across-two-stores
         pattern for release), False only if both Redis and YAML writes fail.
         """
-        redis_ok = True
+        redis_ok = False
         if self.redis_client:
             try:
                 self.redis_client.hdel(self._get_semaphore_key(project, board), str(issue_number))
+                redis_ok = True
             except Exception as e:
                 logger.warning(f"Failed to release semaphore slot in Redis: {e}")
-                redis_ok = False
 
         yaml_ok = self._release_yaml_only(project, board, issue_number)
 
