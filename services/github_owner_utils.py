@@ -668,9 +668,21 @@ def build_batched_board_queries(
 
         A chunk whose query fails to build (e.g. owner type undeterminable)
         is skipped and logged rather than included with a None query.
+
+        Duplicate (owner, project_number) pairs are de-duplicated (first-seen
+        order kept) - two aliased fields sharing the same alias
+        (`p<number>: projectV2(...)`) in one query would otherwise be
+        invalid GraphQL. The current sole caller (execute_batched_board_queries())
+        already de-dupes before calling this, but this function doesn't rely
+        on that - it's defensive against any future direct caller.
     """
     boards_by_owner: Dict[str, List[int]] = {}
+    seen_pairs = set()
     for owner, project_number in owner_project_pairs:
+        pair = (owner, project_number)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
         boards_by_owner.setdefault(owner, []).append(project_number)
 
     batches: List[Dict[str, Any]] = []
@@ -821,8 +833,11 @@ def execute_batched_board_queries(
     either path is a cache hit. Boards whose fetch failed are not cached,
     matching execute_board_query_cached()'s existing behavior.
 
-    Nothing currently calls this from the live polling loop - wiring it in
-    is a separate follow-up task.
+    Called from the live polling loop when ProjectMonitor's
+    USE_BATCHED_BOARD_QUERIES flag is enabled (see
+    ProjectMonitor._fetch_boards_batched() in services/project_monitor.py,
+    added by GitHub issue #94) - not the standalone/unwired function this
+    docstring described before that wiring landed.
 
     Args:
         owner_project_pairs: (owner_login, project_number) tuples for every
