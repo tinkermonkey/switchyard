@@ -751,7 +751,15 @@ def parse_batched_projects_v2_response(
         return results, errors
 
     # Normalize both response shapes described above into (data, errors_list).
-    if 'data' in response:
+    # Checking for 'errors' as well as 'data' matters: a pre-execution GraphQL
+    # validation error (e.g. a malformed alias, a node/complexity-limit
+    # rejection) comes back as {'errors': [...]} with NO 'data' key at all -
+    # treating that as the unwrapped-success shape (the old `if 'data' in
+    # response` check) would silently drop the real error and report every
+    # board in the batch as generically "missing", masking the actual
+    # failure. Same fix as the sibling parser in
+    # services/feature_branch_manager.py's _parse_batched_sub_issues_response().
+    if 'data' in response or 'errors' in response:
         data = response.get('data') or {}
         errors_list = response.get('errors') or []
     else:

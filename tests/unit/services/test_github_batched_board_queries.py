@@ -257,6 +257,24 @@ class TestParseBatchedProjectsV2Response:
         assert results == {('acme', 1): _board_data(1)}
         assert ('acme', 2) in errors
 
+    def test_errors_only_response_with_no_data_key_is_not_mistaken_for_success(self):
+        """
+        Regression test: a pre-execution GraphQL validation error (e.g. a
+        malformed alias) comes back as {'errors': [...]} with NO 'data' key
+        at all. Treating that as the unwrapped-success shape (checking only
+        `if 'data' in response`) would silently drop the real error and
+        report every board as generically "missing" instead of surfacing
+        the actual failure - the same bug already fixed in the sibling
+        _parse_batched_sub_issues_response() (services/feature_branch_manager.py).
+        """
+        boards = [('acme', 1, 'p1')]
+        response = {'errors': [{'message': "Field 'projectV2' argument 'number' has invalid value.", 'path': ['organization', 'p1']}]}
+
+        results, errors = parse_batched_projects_v2_response(response, boards)
+
+        assert results == {}
+        assert errors == {('acme', 1): "Field 'projectV2' argument 'number' has invalid value."}
+
     def test_empty_boards_list_returns_empty_results(self):
         assert parse_batched_projects_v2_response({'organization': {}}, []) == ({}, {})
 
