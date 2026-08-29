@@ -39,11 +39,12 @@ logger = logging.getLogger(__name__)
 # How long a holder may sit unreleased before it's considered abandoned and
 # pruned on the next acquire attempt — self-healing against a process that
 # died without releasing, the same role PipelineLockManager's Redis TTL plays
-# for its single holder. Sized like PipelineLockManager's own lock TTL (2h);
-# unlike a lock (held for one issue's whole pipeline run), a semaphore holder
-# here represents "this epic is occupying one of the N dispatch slots" for a
-# potentially longer window, so this errs generous rather than reclaiming a
-# genuinely-still-active epic's slot out from under it.
+# for its single holder. Deliberately double PipelineLockManager's own lock
+# TTL (7200s/2h) rather than matching it exactly: unlike a lock (held for one
+# issue's whole pipeline run), a semaphore holder here represents "this epic
+# is occupying one of the N dispatch slots" for a potentially longer window,
+# so this errs generous rather than reclaiming a genuinely-still-active
+# epic's slot out from under it.
 DEFAULT_STALENESS_SECONDS = 14400  # 4 hours
 
 # Atomically prune stale holders, treat a re-acquire by an existing holder as a
@@ -78,16 +79,28 @@ for i = 1, #all, 2 do
     end
 end
 
+-- Never SHRINK the hash's TTL: a later call with a smaller staleness_seconds
+-- (a different, more urgent caller, or just a config change) must not cut
+-- short the window an earlier, still-legitimate holder was counting on —
+-- that would reintroduce the exact premature whole-hash-expiry risk
+-- _EXPIRE_MARGIN_SECONDS exists to prevent. Only extend, never reduce.
+local function extend_expire()
+    local current_ttl = redis.call('TTL', KEYS[1])
+    if current_ttl < tonumber(ARGV[5]) then
+        redis.call('EXPIRE', KEYS[1], ARGV[5])
+    end
+end
+
 if redis.call('HEXISTS', KEYS[1], ARGV[3]) == 1 then
     redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
-    redis.call('EXPIRE', KEYS[1], ARGV[5])
+    extend_expire()
     return {1, pruned}
 end
 
 local current = redis.call('HLEN', KEYS[1])
 if current < tonumber(ARGV[2]) then
     redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
-    redis.call('EXPIRE', KEYS[1], ARGV[5])
+    extend_expire()
     return {1, pruned}
 else
     return {0, pruned}
@@ -211,7 +224,12 @@ class PipelineSemaphoreManager:
 
     def is_held_by(self, project: str, board: str, issue_number: int) -> bool:
         """True if issue_number currently holds a slot on this semaphore."""
-        return issue_number in self.get_holders(project, board)
+        # Normalize to int, matching try_acquire/_try_acquire_yaml_only's own
+        # str(issue_number) normalization on the write side — otherwise a
+        # caller passing a numeric string (e.g. straight from a webhook
+        # payload or URL segment) would always get a false negative here,
+        # since get_holders() returns int-coerced entries.
+        return int(issue_number) in self.get_holders(project, board)
 
     def try_acquire(
         self,
@@ -396,7 +414,13 @@ class PipelineSemaphoreManager:
                 with open(state_file, 'r') as f:
                     data = yaml.safe_load(f) or {}
                 holder_entries = data.get('holder_entries', {})
-                holder_entries.pop(str(issue_number), None)
+                key = str(issue_number)
+                if key not in holder_entries:
+                    return True  # already not held — skip the write, matching
+                    # this file's other two write paths (_try_acquire_yaml_only,
+                    # _sync_yaml_from_redis), both deliberately guarded against
+                    # unnecessary rewrites.
+                holder_entries.pop(key, None)
                 data['holder_entries'] = holder_entries
                 data['holders'] = sorted(int(k) for k in holder_entries)
                 with open(state_file, 'w') as f:

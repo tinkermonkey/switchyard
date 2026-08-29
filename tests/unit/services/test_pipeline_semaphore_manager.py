@@ -36,7 +36,8 @@ class FakeRedis:
 
     def __init__(self):
         self._hashes: dict[str, dict[str, str]] = {}
-        self.expire_calls: list[tuple[str, int]] = []  # (key, seconds) — asserted on directly
+        self._ttls: dict[str, int] = {}  # key -> current TTL (seconds), for extend_expire()
+        self.expire_calls: list[tuple[str, int]] = []  # (key, seconds) — every EXPIRE call, asserted on directly
 
     def hgetall(self, key):
         return dict(self._hashes.get(key, {}))
@@ -57,14 +58,24 @@ class FakeRedis:
     def hlen(self, key):
         return len(self._hashes.get(key, {}))
 
+    def ttl(self, key):
+        return self._ttls.get(key, -2)  # -2: no such key, matching real Redis's TTL semantics
+
     def expire(self, key, seconds):
         self.expire_calls.append((key, int(seconds)))
+        self._ttls[key] = int(seconds)
+
+    def _extend_expire(self, key, expire_seconds):
+        """Emulate the Lua script's extend_expire(): only EXPIRE if it would
+        extend (never shrink) the key's current TTL."""
+        if self.ttl(key) < int(expire_seconds):
+            self.expire(key, expire_seconds)
 
     def eval(self, script, numkeys, key, cutoff, max_concurrent, issue_number, now, expire_seconds):
         """Emulate _TRY_ACQUIRE_SCRIPT's atomic prune+check+add against this
         in-memory store (a real Redis server runs the Lua script itself; this
         fake replicates the same steps directly), including its [acquired,
-        pruned] return shape and its own EXPIRE call using expire_seconds."""
+        pruned] return shape and its own never-shrink EXPIRE behavior."""
         h = self._hashes.setdefault(key, {})
         cutoff = float(cutoff)
         pruned = 0
@@ -76,12 +87,12 @@ class FakeRedis:
         issue_number = str(issue_number)
         if issue_number in h:
             h[issue_number] = str(now)
-            self.expire(key, expire_seconds)
+            self._extend_expire(key, expire_seconds)
             return [1, pruned]
 
         if len(h) < int(max_concurrent):
             h[issue_number] = str(now)
-            self.expire(key, expire_seconds)
+            self._extend_expire(key, expire_seconds)
             return [1, pruned]
         return [0, pruned]
 
@@ -280,6 +291,16 @@ class TestGetHoldersAndIsHeldBy:
         assert manager.is_held_by("proj", "board", 1) is True
         assert manager.is_held_by("proj", "board", 2) is False
 
+    def test_is_held_by_accepts_numeric_string(self, tmp_path):
+        """Regression test: get_holders() returns int-coerced entries, but
+        try_acquire's own write-side normalizes via str(issue_number) — a
+        caller passing issue_number as a numeric string (e.g. straight from
+        a webhook payload) must not get a false negative."""
+        manager = make_manager(tmp_path, FakeRedis())
+        manager.try_acquire("proj", "board", 1, max_concurrent=1)
+
+        assert manager.is_held_by("proj", "board", "1") is True
+
 
 class TestExpireNeverShorterThanStaleness:
     """Regression tests for the review finding that the Redis hash's own
@@ -313,6 +334,25 @@ class TestExpireNeverShorterThanStaleness:
         from services.pipeline_semaphore_manager import DEFAULT_STALENESS_SECONDS
         _, seconds = fake_redis.expire_calls[-1]
         assert seconds >= DEFAULT_STALENESS_SECONDS
+
+    def test_expire_is_never_shrunk_by_a_later_smaller_staleness_call(self, tmp_path):
+        """Regression test: a later acquire/refresh with a smaller
+        staleness_seconds must never cut short the TTL an earlier, still-
+        legitimate holder was counting on — that would reintroduce the exact
+        premature whole-hash-expiry risk this class's EXPIRE margin exists
+        to prevent."""
+        fake_redis = FakeRedis()
+        manager = make_manager(tmp_path, fake_redis)
+        key = manager._get_semaphore_key("proj", "board")
+
+        manager.try_acquire("proj", "board", 1, max_concurrent=2, staleness_seconds=14400)
+        long_ttl = fake_redis.ttl(key)
+
+        manager.try_acquire("proj", "board", 2, max_concurrent=2, staleness_seconds=100)
+
+        assert fake_redis.ttl(key) == long_ttl, (
+            "a later call's smaller staleness_seconds must not shrink the hash's TTL"
+        )
 
 
 class TestGetHoldersTrustsConfirmedEmptyRedis:
@@ -473,3 +513,25 @@ class TestYamlOnlyPersistsPruningEvenOnRefusal:
         # Issue 1 was pruned for staleness; that must be persisted even
         # though the overall acquire (issue 3) was refused.
         assert manager.get_holders("proj", "board") == [2]
+
+
+class TestReleaseNoOpSkipsWrite:
+    """Regression test: releasing an issue that never held a slot is a
+    documented no-op — it must not still cost a disk write and flock
+    acquisition, matching this file's other two write paths
+    (_try_acquire_yaml_only, _sync_yaml_from_redis), both deliberately
+    guarded against unnecessary rewrites."""
+
+    def test_releasing_a_non_holder_does_not_rewrite_yaml_file(self, tmp_path):
+        manager = make_manager(tmp_path, redis_client=None)
+        manager.try_acquire("proj", "board", 1, max_concurrent=2)
+
+        state_file = manager._get_state_file("proj", "board")
+        mtime_before = state_file.stat().st_mtime_ns
+
+        import time as _time
+        _time.sleep(0.01)
+        result = manager.release("proj", "board", 999)  # never held a slot
+
+        assert result is True
+        assert state_file.stat().st_mtime_ns == mtime_before
