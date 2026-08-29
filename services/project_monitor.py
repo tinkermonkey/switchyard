@@ -9,7 +9,7 @@ import logging
 import uuid
 import inspect
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from monitoring.timestamp_utils import utc_isoformat
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
@@ -613,6 +613,38 @@ class ProjectMonitor:
         self._max_poll_interval = 60
         self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
 
+        # --- Batched board queries + per-board adaptive backoff (issue #94) ---
+        # Feature-gated: OFF by default so today's behavior (one sequential
+        # get_project_items() call per board every cycle, and the single
+        # global _current_poll_interval/_idle_cycles pair above) is
+        # completely unchanged unless explicitly enabled.
+        #
+        # No existing boolean feature-flag precedent was found for a
+        # monitor-loop-wide behavior switch like this one: config/foundations/
+        # has no orchestrator-level toggle file, and the per-project
+        # `orchestrator:` block in config/projects/<project>.yaml (see
+        # polling_interval above) is scoped to a single project, whereas this
+        # flag governs monitor_projects()'s main loop, which polls every
+        # project's boards together in one tick. So this follows the plain
+        # env-var-backed flag pattern already used elsewhere in this codebase
+        # for monitor-level settings (e.g. RECONCILIATION_FRESHNESS_HOURS in
+        # services/github_project_manager.py, PROGRAMMATIC_CHANGE_WINDOW_SECONDS
+        # in services/work_execution_state.py), read once here at construction.
+        #
+        # To enable: set USE_BATCHED_BOARD_QUERIES=true in the environment.
+        self._use_batched_board_queries = os.environ.get(
+            'USE_BATCHED_BOARD_QUERIES', 'false'
+        ).lower() == 'true'
+
+        # Per-board adaptive polling state, keyed by (project_name, board_name).
+        # Only populated/consulted when _use_batched_board_queries is True -
+        # the legacy path above (_current_poll_interval/_idle_cycles) is left
+        # completely untouched. Each entry:
+        #   {'interval': float, 'idle_cycles': int, 'next_due': float}
+        # where 'next_due' is a time.monotonic() timestamp - see
+        # _is_board_due()/_record_board_poll_outcome()/_next_cycle_sleep_seconds().
+        self._board_poll_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
     def _get_valid_columns_for_board(
         self,
         project_owner: str,
@@ -706,6 +738,112 @@ class ProjectMonitor:
         )
         return set()
 
+    def _parse_board_items(self, project_data: dict) -> List[ProjectItem]:
+        """
+        Parse one board's raw Projects v2 GraphQL data (the `projectV2` node -
+        i.e. `data['user']['projectV2']` / `data['organization']['projectV2']`
+        for a single-board fetch, or the per-board value already unwrapped to
+        that same shape by execute_batched_board_queries()) into ProjectItem
+        objects, extracting each item's Status field value along the way.
+
+        No status validation happens here - see _split_valid_invalid_items()
+        for that.
+
+        Shared by every board-fetch path (execute_board_query_cached() via
+        get_project_items(), and execute_batched_board_queries() via the
+        batched polling path in monitor_projects(), issue #94) so there is
+        exactly ONE copy of this node-parsing/status-field-extraction/
+        ProjectItem-building logic, not a second (or third) copy per path.
+        """
+        items = []
+        for node in project_data['items']['nodes']:
+            content = node.get('content')
+            if not content:  # Skip draft items
+                continue
+
+            # Find status field
+            status = "No Status"
+            for field_value in node['fieldValues']['nodes']:
+                if field_value and field_value.get('field', {}).get('name') == 'Status':
+                    status = field_value.get('name', 'No Status')
+                    break
+
+            item = ProjectItem(
+                item_id=node['id'],
+                content_id=content['id'],
+                issue_number=content['number'],
+                title=content['title'],
+                status=status,
+                repository=content['repository']['name'],
+                last_updated=content['updatedAt']
+            )
+            items.append(item)
+        return items
+
+    def _split_valid_invalid_items(
+        self,
+        project_owner: str,
+        project_number: int,
+        items: List[ProjectItem],
+        valid_columns: set,
+    ) -> Tuple[List[ProjectItem], List[ProjectItem]]:
+        """
+        Split already-parsed items into (valid_items, invalid_items) against
+        valid_columns - the same status-validation split get_project_items()'s
+        retry loop has always done inline, now shared with the batched
+        polling path (issue #94) via _parse_and_validate_board_items().
+
+        Distinguishes two failure modes exactly as before:
+          - "No Status": the Status field is genuinely unset on GitHub (e.g.
+            issues cross-added to a board but never given a column). This is
+            a permanent condition that will never "recover", so retrying is
+            pointless and only produces log spam every poll cycle. Dropped
+            silently (excluded from both returned lists).
+          - Any other out-of-column status: may be transient GraphQL
+            staleness, so callers retry on these.
+
+        valid_items contains only items whose status is in valid_columns -
+        "No Status" items are excluded from both lists, matching
+        get_project_items()'s existing behavior of dropping them.
+        """
+        unstatused_items = [item for item in items if item.status == "No Status"]
+        invalid_items = [
+            item for item in items
+            if item.status not in valid_columns and item.status != "No Status"
+        ]
+
+        if unstatused_items:
+            logger.debug(
+                f"Ignoring {len(unstatused_items)} untriaged item(s) with no Status on "
+                f"{project_owner}/project#{project_number}: "
+                f"{[item.issue_number for item in unstatused_items]}"
+            )
+
+        valid_items = [item for item in items if item.status in valid_columns]
+        return valid_items, invalid_items
+
+    def _parse_and_validate_board_items(
+        self,
+        project_owner: str,
+        project_number: int,
+        raw_project_data: dict,
+        valid_columns: set,
+    ) -> Tuple[List[ProjectItem], List[ProjectItem]]:
+        """
+        Parse one board's raw projectV2 GraphQL data and split the result
+        into (valid_items, invalid_items) against valid_columns, in one call.
+
+        This is the single shared entry point get_project_items() (wrapping
+        execute_board_query_cached()) and the batched polling path in
+        monitor_projects() (wrapping execute_batched_board_queries(), issue
+        #94) both use to turn a fetched board payload into validated items -
+        see _resolve_batched_board_items() for how the batched path uses it
+        and preserves get_project_items()'s retry-on-invalid-status semantic
+        without duplicating that retry loop.
+        """
+        items = self._parse_board_items(raw_project_data)
+        return self._split_valid_invalid_items(project_owner, project_number, items, valid_columns)
+
     def get_project_items(self, project_owner: str, project_number: int) -> List[ProjectItem]:
         """Query GitHub Projects v2 API to get current project items.
 
@@ -750,31 +888,7 @@ class ProjectMonitor:
                 else:  # organization
                     project_data = data['organization']['projectV2']
 
-                items = []
-                for node in project_data['items']['nodes']:
-                    content = node.get('content')
-                    if not content:  # Skip draft items
-                        continue
-
-                    # Find status field
-                    status = "No Status"
-                    for field_value in node['fieldValues']['nodes']:
-                        if field_value and field_value.get('field', {}).get('name') == 'Status':
-                            status = field_value.get('name', 'No Status')
-                            break
-
-                    item = ProjectItem(
-                        item_id=node['id'],
-                        content_id=content['id'],
-                        issue_number=content['number'],
-                        title=content['title'],
-                        status=status,
-                        repository=content['repository']['name'],
-                        last_updated=content['updatedAt']
-                    )
-                    items.append(item)
-
-                return items
+                return self._parse_board_items(project_data)
 
             except (KeyError, TypeError) as e:
                 logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
@@ -796,60 +910,22 @@ class ProjectMonitor:
                 else:  # organization
                     project_data = data['organization']['projectV2']
 
-                items = []
-                for node in project_data['items']['nodes']:
-                    content = node.get('content')
-                    if not content:  # Skip draft items
-                        continue
-
-                    # Find status field
-                    status = "No Status"
-                    for field_value in node['fieldValues']['nodes']:
-                        if field_value and field_value.get('field', {}).get('name') == 'Status':
-                            status = field_value.get('name', 'No Status')
-                            break
-
-                    item = ProjectItem(
-                        item_id=node['id'],
-                        content_id=content['id'],
-                        issue_number=content['number'],
-                        title=content['title'],
-                        status=status,
-                        repository=content['repository']['name'],
-                        last_updated=content['updatedAt']
-                    )
-                    items.append(item)
-
-                # Validate statuses.
-                # Distinguish two failure modes:
-                #   - "No Status": the Status field is genuinely unset on GitHub (e.g. issues
-                #     cross-added to a board but never given a column). This is a permanent
-                #     condition that will never "recover", so retrying is pointless and only
-                #     produces ERROR-log spam every poll cycle. Drop these silently.
-                #   - Any other out-of-column status: may be transient GraphQL staleness, so
-                #     keep the retry-to-recover behavior below.
-                unstatused_items = [item for item in items if item.status == "No Status"]
-                invalid_items = [
-                    item for item in items
-                    if item.status not in valid_columns and item.status != "No Status"
-                ]
-
-                if unstatused_items:
-                    logger.debug(
-                        f"Ignoring {len(unstatused_items)} untriaged item(s) with no Status on "
-                        f"{project_owner}/project#{project_number}: "
-                        f"{[item.issue_number for item in unstatused_items]}"
-                    )
+                # Parse and validate statuses (see _parse_and_validate_board_items()'s
+                # docstring, and _split_valid_invalid_items() for the two failure
+                # modes distinguished below).
+                valid_items, invalid_items = self._parse_and_validate_board_items(
+                    project_owner, project_number, project_data, valid_columns
+                )
 
                 if not invalid_items:
-                    # No transient-invalid statuses. Return only items in a valid column,
-                    # which also drops any unstatused (No Status) items.
+                    # No transient-invalid statuses. valid_items already excludes
+                    # any unstatused (No Status) items too.
                     if attempt > 0:
                         logger.info(
                             f"✅ Status validation recovered: All items now valid for "
                             f"{project_owner}/project#{project_number} after {attempt+1} attempts"
                         )
-                    return [item for item in items if item.status in valid_columns]
+                    return valid_items
 
                 # Have invalid items
                 if attempt < max_retries:
@@ -884,7 +960,7 @@ class ProjectMonitor:
                     )
 
                     # Return only valid items
-                    return [item for item in items if item.status in valid_columns]
+                    return valid_items
 
             except (KeyError, TypeError) as e:
                 logger.error(f"Failed to parse board query response for {project_owner}/project#{project_number}: {e}")
@@ -892,6 +968,304 @@ class ProjectMonitor:
 
         # Should not reach here, but return empty list as fallback
         return []
+
+    # --- Per-board adaptive backoff + batched-fetch resolution (issue #94) ---
+    # Only used when self._use_batched_board_queries is True (see __init__).
+    # Deliberately small/pure methods (state dict in, state dict out) rather
+    # than inline in monitor_projects()'s giant while-loop, so they're
+    # directly unit-testable without having to drive that loop.
+
+    def _get_or_seed_board_poll_state(self, board_key: Tuple[str, str]) -> Dict[str, Any]:
+        """
+        Return board_key's per-board adaptive-poll state dict from
+        self._board_poll_state, seeding it from self._base_poll_interval
+        (interval reset, idle_cycles at 0, immediately due) on first sight -
+        mirrors how the legacy global _current_poll_interval/_idle_cycles
+        pair starts out in __init__.
+        """
+        state = self._board_poll_state.get(board_key)
+        if state is None:
+            state = {
+                'interval': self._base_poll_interval,
+                'idle_cycles': 0,
+                'next_due': 0.0,  # never polled before - due immediately
+            }
+            self._board_poll_state[board_key] = state
+        return state
+
+    def _is_board_due(self, board_key: Tuple[str, str], now: float) -> bool:
+        """
+        Whether board_key is due to be polled at monotonic time `now`,
+        seeding never-before-seen boards (via _get_or_seed_board_poll_state())
+        as immediately due so a new board is always fetched on first sight.
+        """
+        state = self._get_or_seed_board_poll_state(board_key)
+        return now >= state['next_due']
+
+    def _record_board_poll_outcome(self, board_key: Tuple[str, str], had_changes: bool, now: float) -> None:
+        """
+        Update board_key's per-board interval/idle-cycle state after polling
+        it this cycle, scoping the existing global adaptive-backoff logic
+        (see the non-batched tail of monitor_projects()'s while-loop:
+        reset to _base_poll_interval and idle_cycles=0 on activity, else
+        grow idle_cycles and - once past _idle_backoff_threshold - grow
+        the interval toward _max_poll_interval by the same 1.5x factor) down
+        to just this one board instead of the whole monitor. Sets next_due
+        for this board's following cycle.
+        """
+        state = self._get_or_seed_board_poll_state(board_key)
+        if had_changes:
+            state['idle_cycles'] = 0
+            state['interval'] = self._base_poll_interval
+        else:
+            state['idle_cycles'] += 1
+            if state['idle_cycles'] > self._idle_backoff_threshold:
+                state['interval'] = min(state['interval'] * 1.5, self._max_poll_interval)
+        state['next_due'] = now + state['interval']
+
+    def _next_cycle_sleep_seconds(self) -> float:
+        """
+        Seconds monitor_projects() should sleep before its next tick when
+        per-board adaptive backoff is active.
+
+        The loop tick itself still runs once for the whole tracked board
+        set at a single cadence (a full independent per-board scheduler -
+        where a slow board's tick doesn't fire at all, decoupled from every
+        other board's cadence - would need a bigger scheduler rewrite than
+        this issue's scope), so this returns the MINIMUM time-until-due
+        across every tracked board: sleeping any longer would starve a
+        fast/active board's own interval by making it wait on a slow/idle
+        board's backed-off one. The actual budget win for slow boards comes
+        from _is_board_due() skipping their fetch+processing entirely on
+        ticks where they're not yet due, even though the tick still fires.
+        """
+        if not self._board_poll_state:
+            return self._base_poll_interval
+        now = time.monotonic()
+        return max(0.0, min(state['next_due'] - now for state in self._board_poll_state.values()))
+
+    def _process_board_poll_result(
+        self,
+        project_name: str,
+        pipeline,
+        project_config,
+        current_items: List['ProjectItem'],
+    ) -> bool:
+        """
+        Run the per-board processing (change detection, feedback checks,
+        discussion sync, escalated-cycle monitoring) monitor_projects()'s
+        main loop performs once a board's current_items has been obtained -
+        extracted verbatim from that loop body so it's shared, unchanged,
+        by both the legacy sequential-fetch path and the batched-fetch path
+        (issue #94), rather than existing as two hand-maintained copies.
+
+        Returns True if detect_changes() found any changes on this board -
+        drives both the legacy global adaptive-backoff counter and the
+        per-board one (_record_board_poll_outcome()).
+        """
+        board_key = f"{project_name}_{pipeline.board_name}"
+        had_changes = False
+
+        if current_items:
+            # Detect changes (use board-specific key for state tracking)
+            changes = self.detect_changes(board_key, current_items)
+
+            if changes:
+                had_changes = True
+                logger.info(f"Detected {len(changes)} changes in {project_name}/{pipeline.board_name}")
+                # Process changes with new system
+                self.process_board_changes(changes, project_name, pipeline.board_name)
+            else:
+                logger.debug(f"No changes in {project_name}/{pipeline.board_name}")
+
+            # Check all items for feedback comments (in issues)
+            for item in current_items:
+                self.check_for_feedback(
+                    project_name,
+                    pipeline.board_name,
+                    item.issue_number,
+                    item.repository
+                )
+        else:
+            logger.debug(f"No items found in {project_name}/{pipeline.board_name}")
+
+        # Monitor discussions if pipeline uses discussions workspace
+        if pipeline.workspace in ['discussions', 'hybrid']:
+            # Retry discussion creation for board items that don't have one yet.
+            # Covers cases where initial creation failed (e.g. transient App failure).
+            if current_items:
+                from config.state_manager import state_manager as _sm
+                for _item in current_items:
+                    if not _sm.get_discussion_for_issue(project_name, _item.issue_number):
+                        self._check_and_create_discussion(
+                            project_name,
+                            pipeline.board_name,
+                            _item.issue_number,
+                            _item.repository,
+                            _item.status
+                        )
+
+            self.monitor_discussions(
+                project_name,
+                pipeline.board_name,
+                project_config.github['org'],
+                project_config.github['repo']
+            )
+
+        # Monitor escalated review cycles on issue-based workspaces.
+        # Runs unconditionally: the escalated issue may no longer be on the
+        # board (e.g. removed by force-sync), but its cycle state persists
+        # in-memory and on disk and still needs a feedback listener.
+        self.monitor_escalated_issue_cycles(project_name, pipeline.board_name)
+
+        return had_changes
+
+    def _resolve_batched_board_items(
+        self,
+        project_owner: str,
+        project_number: int,
+        raw_project_data: dict,
+    ) -> List['ProjectItem']:
+        """
+        Turn one board's already-fetched raw projectV2 data (a value from
+        execute_batched_board_queries()'s results dict) into validated
+        ProjectItem objects, using the exact same parsing/validation helpers
+        get_project_items() uses for its execute_board_query_cached() path -
+        see _parse_board_items()/_parse_and_validate_board_items() - so
+        there is exactly one copy of that logic, not a second copy here.
+
+        Preserves get_project_items()'s per-board retry-on-invalid-status
+        semantic (up to 3 total attempts) WITHOUT duplicating that retry
+        loop: if this board's items validate cleanly on the first (already-
+        fetched, batched) attempt - the common case - they're returned
+        immediately with no extra query. Only if this attempt comes back
+        with invalid/transient statuses do we fall through to calling
+        get_project_items() itself, which re-fetches (invalidating the
+        shared board-query cache first) and runs its full up-to-3-attempt
+        retry loop for just this one board. The first (batched) attempt's
+        result is discarded in that case - a bounded, at-most-one-extra-
+        query cost in the uncommon path, in exchange for reusing the single,
+        already-tested retry implementation instead of a second one here.
+        """
+        valid_columns = self._get_valid_columns_for_board(project_owner, project_number)
+
+        if not valid_columns:
+            # Matches get_project_items()'s own "workflow lookup failed"
+            # branch: return items unvalidated rather than dropping them.
+            logger.error(
+                f"❌ Cannot validate status for {project_owner}/project#{project_number}: "
+                f"workflow lookup failed. Returning raw items without validation."
+            )
+            return self._parse_board_items(raw_project_data)
+
+        valid_items, invalid_items = self._parse_and_validate_board_items(
+            project_owner, project_number, raw_project_data, valid_columns
+        )
+
+        if not invalid_items:
+            return valid_items
+
+        logger.warning(
+            f"⚠️  Batched fetch for {project_owner}/project#{project_number} returned "
+            f"{len(invalid_items)} item(s) with invalid/transient status; delegating to "
+            f"get_project_items() for its full retry-on-invalid-status handling on this board."
+        )
+        # Invalidate the shared board-query cache first: execute_batched_board_queries()
+        # just wrote this exact (invalid) data into it, so without invalidating,
+        # get_project_items()'s own first attempt would be a near-guaranteed cache hit
+        # on the same stale data - silently burning one of its 3 total attempts on
+        # data we already know is bad, rather than getting a genuinely fresh retry.
+        from services.github_owner_utils import invalidate_board_query_cache
+        invalidate_board_query_cache(project_owner, project_number)
+        return self.get_project_items(project_owner, project_number)
+
+    def _fetch_boards_batched(
+        self,
+        due_boards: List[Dict[str, Any]],
+    ) -> Dict[Tuple[str, str], List['ProjectItem']]:
+        """
+        Fetch current_items for every board descriptor in due_boards using
+        exactly ONE execute_batched_board_queries() call (issue #94's Part
+        A) - falling back to a bounded single-board get_project_items()
+        call for just the boards whose batched fetch failed, so a
+        batch-level failure never blanks out the rest of this cycle's
+        boards.
+
+        `due_boards` entries are the same dicts monitor_projects() builds
+        in its batched-path board-gathering pass: {'project_name',
+        'project_config', 'pipeline', 'owner', 'project_number',
+        'board_key'}.
+
+        Returns board_key -> current_items.
+
+        Extracted as its own method (rather than left inline in
+        monitor_projects()'s while-loop) so the "one batched call replaces
+        N per-board calls" wiring is directly unit-testable without having
+        to drive that loop.
+        """
+        from services.github_owner_utils import execute_batched_board_queries
+        from services.github_api_client import get_github_client
+
+        result: Dict[Tuple[str, str], List[ProjectItem]] = {}
+        if not due_boards:
+            return result
+
+        # Match get_project_items()'s own breaker check: don't spend a
+        # (possibly cache-served) call while the breaker is open. Without
+        # this, the batched path could still serve fresh cache hits during
+        # a breaker-open window while the legacy path always returns []
+        # for every board, an undocumented divergence between the two
+        # feature-gated paths.
+        github_client = get_github_client()
+        if github_client.breaker.is_open():
+            logger.debug("Circuit breaker is open, skipping batched board query")
+            return result
+
+        owner_project_pairs = [(b['owner'], b['project_number']) for b in due_boards]
+        batched_results, batched_errors = execute_batched_board_queries(owner_project_pairs)
+
+        for b in due_boards:
+            cache_key = (b['owner'], b['project_number'])
+
+            if cache_key in batched_results:
+                try:
+                    current_items = self._resolve_batched_board_items(
+                        b['owner'], b['project_number'], batched_results[cache_key]
+                    )
+                except (KeyError, TypeError) as e:
+                    # Matches get_project_items()'s own parsing guard: a
+                    # malformed payload for ONE board must not raise out of
+                    # this loop and abort every other due board's fetch for
+                    # the whole cycle - fall back to the single-board path
+                    # for just this board instead.
+                    logger.error(
+                        f"Failed to parse batched board query response for "
+                        f"{b['project_name']}/{b['pipeline'].board_name} "
+                        f"({b['owner']}/project#{b['project_number']}): {e}. "
+                        f"Falling back to single-board fetch for this board only."
+                    )
+                    current_items = self.get_project_items(b['owner'], b['project_number'])
+            else:
+                # Covers both an explicit per-alias/batch error AND the case
+                # where this board's owner/chunk was silently skipped before
+                # ever reaching a query (e.g. build_batched_board_queries()
+                # drops a chunk whose owner type couldn't be resolved) - such
+                # a board ends up in neither batched_results nor
+                # batched_errors, so membership in batched_results (not
+                # `cache_key in batched_errors`) is what must gate the
+                # fallback, or this board would hit an unhandled KeyError
+                # below and abort the whole cycle for every other due board.
+                reason = batched_errors.get(cache_key, "board missing from batched response (query build skipped it)")
+                logger.warning(
+                    f"⚠️  Batched board query failed for {b['project_name']}/{b['pipeline'].board_name} "
+                    f"({b['owner']}/project#{b['project_number']}): {reason}. "
+                    f"Falling back to single-board fetch for this board only."
+                )
+                current_items = self.get_project_items(b['owner'], b['project_number'])
+
+            result[b['board_key']] = current_items
+
+        return result
 
     async def get_issue_column_async(self, project_name: str, board_name: str, issue_number: int) -> Optional[str]:
         """
@@ -7675,91 +8049,167 @@ _Repair cycle initiated by Switchyard_
                 cycle_had_changes = False
 
                 # Get all configured visible projects (exclude hidden/test projects)
-                for project_name in self.config_manager.list_visible_projects():
-                    project_config = self.config_manager.get_project_config(project_name)
+                if not self._use_batched_board_queries:
+                    # --- Legacy path: unchanged from before issue #94. ---
+                    # One sequential get_project_items() call per board, every
+                    # cycle, with a single global adaptive-poll interval below.
+                    for project_name in self.config_manager.list_visible_projects():
+                        project_config = self.config_manager.get_project_config(project_name)
 
-                    # Get project state to find actual GitHub project numbers
-                    project_state = state_manager.load_project_state(project_name)
-                    if not project_state:
-                        logger.error(f"FATAL: No GitHub state found for project '{project_name}'")
-                        logger.error("This indicates GitHub project management failed during reconciliation")
-                        logger.error("Project monitoring cannot function without GitHub project state")
-                        logger.error("STOPPING PROJECT MONITOR: Core functionality is broken")
-                        exit(1)  # Fatal error - stop immediately
-
-                    # Monitor each active board
-                    for pipeline in project_config.pipelines:
-                        if not pipeline.active:
-                            continue
-
-                        # Get board state
-                        board_state = project_state.boards.get(pipeline.board_name)
-                        if not board_state:
-                            logger.error(f"FATAL: No GitHub state found for board '{pipeline.board_name}' in project '{project_name}'")
-                            logger.error("This indicates GitHub project board creation failed during reconciliation")
-                            logger.error("STOPPING PROJECT MONITOR: GitHub board management is broken")
+                        # Get project state to find actual GitHub project numbers
+                        project_state = state_manager.load_project_state(project_name)
+                        if not project_state:
+                            logger.error(f"FATAL: No GitHub state found for project '{project_name}'")
+                            logger.error("This indicates GitHub project management failed during reconciliation")
+                            logger.error("Project monitoring cannot function without GitHub project state")
+                            logger.error("STOPPING PROJECT MONITOR: Core functionality is broken")
                             exit(1)  # Fatal error - stop immediately
 
-                        logger.debug(f"Checking {project_config.github['org']} project #{board_state.project_number} ({pipeline.board_name})...")
+                        # Monitor each active board
+                        for pipeline in project_config.pipelines:
+                            if not pipeline.active:
+                                continue
 
-                        # Get current project items
-                        current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
+                            # Get board state
+                            board_state = project_state.boards.get(pipeline.board_name)
+                            if not board_state:
+                                logger.error(f"FATAL: No GitHub state found for board '{pipeline.board_name}' in project '{project_name}'")
+                                logger.error("This indicates GitHub project board creation failed during reconciliation")
+                                logger.error("STOPPING PROJECT MONITOR: GitHub board management is broken")
+                                exit(1)  # Fatal error - stop immediately
+
+                            logger.debug(f"Checking {project_config.github['org']} project #{board_state.project_number} ({pipeline.board_name})...")
+
+                            # Get current project items
+                            current_items = self.get_project_items(project_config.github['org'], board_state.project_number)
+
+                            # Store for failsafe reuse (even if empty — avoids re-fetch)
+                            poll_cycle_items[(project_name, pipeline.board_name)] = current_items
+
+                            if self._process_board_poll_result(project_name, pipeline, project_config, current_items):
+                                cycle_had_changes = True
+
+                else:
+                    # --- Batched path (issue #94), flag-gated. ---
+                    # One upfront pass gathering every (project, pipeline, board)
+                    # tuple this cycle needs, BEFORE fetching anything, so every
+                    # board's GraphQL query can be batched into as few requests
+                    # as possible via execute_batched_board_queries() below. The
+                    # fatal exit(1) checks are identical to the legacy path above,
+                    # just run during this gathering pass instead of interleaved
+                    # with fetching.
+                    now = time.monotonic()
+                    all_boards = []
+                    for project_name in self.config_manager.list_visible_projects():
+                        project_config = self.config_manager.get_project_config(project_name)
+
+                        project_state = state_manager.load_project_state(project_name)
+                        if not project_state:
+                            logger.error(f"FATAL: No GitHub state found for project '{project_name}'")
+                            logger.error("This indicates GitHub project management failed during reconciliation")
+                            logger.error("Project monitoring cannot function without GitHub project state")
+                            logger.error("STOPPING PROJECT MONITOR: Core functionality is broken")
+                            exit(1)  # Fatal error - stop immediately
+
+                        for pipeline in project_config.pipelines:
+                            if not pipeline.active:
+                                continue
+
+                            board_state = project_state.boards.get(pipeline.board_name)
+                            if not board_state:
+                                logger.error(f"FATAL: No GitHub state found for board '{pipeline.board_name}' in project '{project_name}'")
+                                logger.error("This indicates GitHub project board creation failed during reconciliation")
+                                logger.error("STOPPING PROJECT MONITOR: GitHub board management is broken")
+                                exit(1)  # Fatal error - stop immediately
+
+                            all_boards.append({
+                                'project_name': project_name,
+                                'project_config': project_config,
+                                'pipeline': pipeline,
+                                'owner': project_config.github['org'],
+                                'project_number': board_state.project_number,
+                                'board_key': (project_name, pipeline.board_name),
+                            })
+
+                    # Prune per-board backoff state for boards no longer in
+                    # this cycle's config (project/pipeline removed or
+                    # deactivated). Without this, a stale entry's frozen
+                    # 'next_due' falls further into the past every cycle,
+                    # dragging _next_cycle_sleep_seconds()'s min() to 0 and
+                    # busy-looping the whole monitor forever - nothing else
+                    # ever removes an entry once _get_or_seed_board_poll_state()
+                    # creates it.
+                    current_board_keys = {b['board_key'] for b in all_boards}
+                    stale_keys = set(self._board_poll_state) - current_board_keys
+                    for stale_key in stale_keys:
+                        del self._board_poll_state[stale_key]
+
+                    # Per-board adaptive backoff: skip QUERYING boards not yet
+                    # due for their own next poll (see _is_board_due()/
+                    # _record_board_poll_outcome()) - this is what actually
+                    # avoids wasted GraphQL queries for a slow/idle board
+                    # during a fast board's tick. It does NOT skip that
+                    # board's feedback/discussion/escalated-cycle side
+                    # effects below (see the all_boards loop) - those still
+                    # run every cycle for every board, using the last-known
+                    # items for a not-yet-due board, matching legacy
+                    # behavior and monitor_escalated_issue_cycles()'s own
+                    # "runs unconditionally" contract instead of silently
+                    # delaying escalated-cycle responsiveness by up to
+                    # _max_poll_interval. A fully independent per-board
+                    # scheduler, where a slow board's tick doesn't fire at
+                    # all decoupled from every other board's cadence, would
+                    # need a bigger scheduler rewrite than this issue's scope.
+                    due_boards = [b for b in all_boards if self._is_board_due(b['board_key'], now)]
+
+                    # One execute_batched_board_queries() call fetches every
+                    # due board's data (with a bounded per-board fallback to
+                    # get_project_items() for any board whose batched fetch
+                    # failed) - see _fetch_boards_batched().
+                    fetched_items = self._fetch_boards_batched(due_boards)
+
+                    for b in all_boards:
+                        project_name = b['project_name']
+                        pipeline = b['pipeline']
+                        project_config = b['project_config']
+                        board_key = b['board_key']
+                        is_due = board_key in fetched_items
+
+                        if is_due:
+                            current_items = fetched_items[board_key]
+                            logger.debug(f"Checking {b['owner']} project #{b['project_number']} ({pipeline.board_name})...")
+                        else:
+                            # Not due this cycle - reuse the last-known items
+                            # (seeded on startup and kept current by detect_changes()
+                            # on every cycle this board WAS due) so this board's
+                            # feedback/discussion/escalated-cycle checks and the
+                            # failsafe below still see its real item set instead
+                            # of nothing, without spending a query on it.
+                            string_key = f"{project_name}_{pipeline.board_name}"
+                            current_items = list(self.last_state.get(string_key, {}).values())
 
                         # Store for failsafe reuse (even if empty — avoids re-fetch)
                         poll_cycle_items[(project_name, pipeline.board_name)] = current_items
 
-                        if current_items:
-                            # Detect changes (use board-specific key for state tracking)
-                            board_key = f"{project_name}_{pipeline.board_name}"
-                            changes = self.detect_changes(board_key, current_items)
+                        had_changes = self._process_board_poll_result(project_name, pipeline, project_config, current_items)
+                        if had_changes:
+                            cycle_had_changes = True
 
-                            if changes:
-                                cycle_had_changes = True
-                                logger.info(f"Detected {len(changes)} changes in {project_name}/{pipeline.board_name}")
-                                # Process changes with new system
-                                self.process_board_changes(changes, project_name, pipeline.board_name)
-                            else:
-                                logger.debug(f"No changes in {project_name}/{pipeline.board_name}")
-
-                            # Check all items for feedback comments (in issues)
-                            for item in current_items:
-                                self.check_for_feedback(
-                                    project_name,
-                                    pipeline.board_name,
-                                    item.issue_number,
-                                    item.repository
-                                )
-                        else:
-                            logger.debug(f"No items found in {project_name}/{pipeline.board_name}")
-
-                        # Monitor discussions if pipeline uses discussions workspace
-                        if pipeline.workspace in ['discussions', 'hybrid']:
-                            # Retry discussion creation for board items that don't have one yet.
-                            # Covers cases where initial creation failed (e.g. transient App failure).
-                            if current_items:
-                                from config.state_manager import state_manager as _sm
-                                for _item in current_items:
-                                    if not _sm.get_discussion_for_issue(project_name, _item.issue_number):
-                                        self._check_and_create_discussion(
-                                            project_name,
-                                            pipeline.board_name,
-                                            _item.issue_number,
-                                            _item.repository,
-                                            _item.status
-                                        )
-
-                            self.monitor_discussions(
-                                project_name,
-                                pipeline.board_name,
-                                project_config.github['org'],
-                                project_config.github['repo']
-                            )
-
-                        # Monitor escalated review cycles on issue-based workspaces.
-                        # Runs unconditionally: the escalated issue may no longer be on the
-                        # board (e.g. removed by force-sync), but its cycle state persists
-                        # in-memory and on disk and still needs a feedback listener.
-                        self.monitor_escalated_issue_cycles(project_name, pipeline.board_name)
+                        # Only advance this board's own schedule when it was
+                        # actually (re)fetched this cycle - recording an
+                        # outcome for a skipped board would reset its
+                        # next_due off of stale data and defeat the backoff.
+                        #
+                        # Uses a freshly-read timestamp here rather than the
+                        # cycle-start `now` captured before batch-fetching and
+                        # processing every board: if a cycle with many due
+                        # boards (fetch + feedback/discussion/escalated-cycle
+                        # checks per board) takes long enough, next_due computed
+                        # from a stale `now` could already be in the past by the
+                        # time _next_cycle_sleep_seconds() reads it next, causing
+                        # an unintended near-zero sleep / tight loop.
+                        if is_due:
+                            self._record_board_poll_outcome(board_key, had_changes, time.monotonic())
 
                 # FAILSAFE: Check for waiting issues that haven't been processed
                 # This catches edge cases where pipeline lock is released but next issue isn't triggered
@@ -7767,19 +8217,34 @@ _Repair cycle initiated by Switchyard_
                 self._check_and_process_waiting_issues_failsafe(poll_cycle_items=poll_cycle_items)
 
                 # Adaptive polling: backoff when idle, reset on activity
-                if cycle_had_changes:
-                    self._idle_cycles = 0
-                    self._current_poll_interval = self._base_poll_interval
-                else:
-                    self._idle_cycles += 1
-                    if self._idle_cycles > self._idle_backoff_threshold:
-                        self._current_poll_interval = min(
-                            self._current_poll_interval * 1.5,
-                            self._max_poll_interval
-                        )
+                if not self._use_batched_board_queries:
+                    if cycle_had_changes:
+                        self._idle_cycles = 0
+                        self._current_poll_interval = self._base_poll_interval
+                    else:
+                        self._idle_cycles += 1
+                        if self._idle_cycles > self._idle_backoff_threshold:
+                            self._current_poll_interval = min(
+                                self._current_poll_interval * 1.5,
+                                self._max_poll_interval
+                            )
 
-                logger.debug(f"Sleeping for {self._current_poll_interval:.0f}s (idle cycles: {self._idle_cycles})...")
-                time.sleep(self._current_poll_interval)
+                    logger.debug(f"Sleeping for {self._current_poll_interval:.0f}s (idle cycles: {self._idle_cycles})...")
+                    time.sleep(self._current_poll_interval)
+                else:
+                    # Per-board adaptive backoff (issue #94): each polled
+                    # board's own interval/idle_cycles was already updated in
+                    # _record_board_poll_outcome() above as it was polled (or
+                    # left alone, if skipped as not-yet-due) this cycle. Sleep
+                    # for the minimum time-until-due across every tracked
+                    # board so no board's fast interval is starved by another
+                    # board's slow one (see _next_cycle_sleep_seconds()).
+                    sleep_seconds = self._next_cycle_sleep_seconds()
+                    logger.debug(
+                        f"Sleeping for {sleep_seconds:.0f}s (per-board adaptive backoff, "
+                        f"{len(self._board_poll_state)} board(s) tracked)..."
+                    )
+                    time.sleep(sleep_seconds)
 
             except KeyboardInterrupt:
                 logger.info("Project monitor stopped")
