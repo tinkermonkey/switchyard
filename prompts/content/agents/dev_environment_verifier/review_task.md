@@ -25,9 +25,18 @@ of it. This takes priority over the generic checks below:
   requiring extra scrutiny, not confirmation — independently re-run the *exact* failing
   command described in the REQUIRED FIX (in the actual environment the failing test uses)
   and verify it now succeeds yourself.
-- If the required fix was not made, or was made but you cannot independently confirm it
-  resolves the described failure, mark **BLOCKED** regardless of whether the image
-  otherwise builds and the CLI tools are present.
+- These two outcomes are different and matter to the automation that reads your status —
+  pick the one that actually matches, not whichever feels safer to say:
+  - **The fix was not made, or you personally re-ran the exact failing command and it
+    still fails** → mark **BLOCKED**, regardless of whether the image otherwise builds
+    and the CLI tools are present. This stops the repair cycle from retrying — use it
+    only when you're confident the fix is genuinely absent or ineffective.
+  - **The fix appears to have been made, but you could not independently verify it
+    resolves the failure** (e.g. you can't reconstruct the exact build/test context the
+    failing check uses, the REQUIRED FIX description is ambiguous, or the environment to
+    re-run the command in isn't available to you) → mark **CHANGES NEEDED**. This is
+    retried automatically — do not escalate an "I couldn't confirm this" to BLOCKED just
+    to force a decision.
 
 ### Step 1: Review Setup Agent's Work
 
@@ -122,6 +131,24 @@ dev_container_state.set_status(
 print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}")
 ```
 
+**If a `## REQUIRED FIX` was made but you could not independently confirm it** (see
+Step 0 and the CHANGES NEEDED criteria below — do not use this for anything else):
+
+```python
+from services.dev_container_state import dev_container_state, DevContainerStatus
+
+project_name = "{project_name}"
+error_message = "Brief description of what you could not confirm and why"
+
+dev_container_state.set_status(
+    project_name=project_name,
+    status=DevContainerStatus.CHANGES_NEEDED,
+    error_message=error_message
+)
+
+print(f"⚠ Marked {{project_name}} dev container as CHANGES_NEEDED: {{error_message}}")
+```
+
 ## Verification Decision Criteria
 
 **APPROVED (Mark as VERIFIED)**:
@@ -137,10 +164,12 @@ print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}"
   (see Step 0) — do not approve on the image/CLI checks alone**
 - State was marked as VERIFIED using Python code above
 
-**CHANGES NEEDED**:
-- Image exists but CLI tools have warnings to address
-- Build succeeded but tests weren't run when they should have been
-- Minor issues that should be fixed
+**CHANGES NEEDED (Mark as CHANGES_NEEDED)** — this status is retried automatically by
+the repair cycle, and currently means one specific thing; use it ONLY for this case:
+- A `## REQUIRED FIX` was named in the Original Issue, the change appears to have been
+  made, but you could not independently confirm it resolves the described failure (see
+  Step 0's second bullet). Do NOT use this for general "minor issues" — those have no
+  retry path and belong under BLOCKED below instead.
 
 **BLOCKED (Mark as BLOCKED)**:
 - Docker image doesn't exist
@@ -148,8 +177,10 @@ print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}"
 - **Any of the three critical CLI tools (claude, git, gh) are missing or broken**
 - Critical validation tests failed
 - Cannot start container
-- **A `## REQUIRED FIX` was named in the Original Issue but was not made, or was made but
-  you could not independently confirm it resolves the described failure (see Step 0)**
+- Image exists but CLI tools have unresolved warnings
+- Build succeeded but tests that should have run weren't run
+- **A `## REQUIRED FIX` was named in the Original Issue but was not made, or you
+  personally re-ran the exact failing command and confirmed it still fails (see Step 0)**
 
 ## Review Format
 
@@ -181,7 +212,7 @@ IMPORTANT: Output your verification review as text directly in your response. DO
 [List any issues discovered, or "None" if all passed]
 
 ### Dev Container State Update
-[Confirmation that state was updated to VERIFIED or BLOCKED, with Python code output]
+[Confirmation that state was updated to VERIFIED, BLOCKED, or CHANGES_NEEDED, with Python code output]
 
 ### Summary
 [Brief summary of verification decision and next steps]

@@ -82,6 +82,19 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
             'reason': f"Dev container setup is blocked for '{task.project}'. Check state/dev_containers/{task.project}.yaml for error details",
             'needs_dev_setup': False
         }
+    elif status == DevContainerStatus.CHANGES_NEEDED:
+        # needs_dev_setup=False (not the UNVERIFIED default) is deliberate: the
+        # repair cycle's env-rebuild sub-cycle owns retrying this project and will
+        # re-queue setup itself on its next attempt. If this returned
+        # needs_dev_setup=True, an unrelated task validated against this project
+        # while CHANGES_NEEDED is set (a brief window before the sub-cycle's own
+        # reset) could trigger a second, redundant queue_dev_environment_setup()
+        # call racing the sub-cycle's own retry.
+        return {
+            'can_run': False,
+            'reason': f"Dev container verification for '{task.project}' could not confirm a required fix; the repair cycle is retrying",
+            'needs_dev_setup': False
+        }
     else:  # UNVERIFIED
         return {
             'can_run': False,

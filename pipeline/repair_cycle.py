@@ -2112,9 +2112,11 @@ class RepairCycleStage(PipelineStage):
         Coordinate dev environment rebuild to fix environmental failures.
 
         Resets container state, queues dev_environment_setup with the specific
-        change description, and polls until VERIFIED or BLOCKED/timeout.
+        change description, and polls until VERIFIED, BLOCKED, or CHANGES_NEEDED.
         Loops up to MAX_SYSTEMIC_SUB_CYCLES times if rebuild succeeds but tests
-        still fail (suggesting incomplete fix).
+        still fail, or if the verifier returns CHANGES_NEEDED (could not confirm
+        the fix, as opposed to confirming it's still broken). Only BLOCKED stops
+        the sub-cycle early.
 
         Returns the last RepairTestResult obtained, so _run_test_cycle() can
         use it directly without a redundant test re-run.
@@ -2231,10 +2233,10 @@ class RepairCycleStage(PipelineStage):
                     )
                 break
 
-            # Poll until VERIFIED, BLOCKED, or cancellation. No timer here — the
-            # overall 1-hour stall check in _monitor_repair_cycle_container handles
-            # runaway cases, and image builds can legitimately take longer than any
-            # test-type timeout.
+            # Poll until VERIFIED, BLOCKED, CHANGES_NEEDED, or cancellation. No timer
+            # here — the overall 1-hour stall check in _monitor_repair_cycle_container
+            # handles runaway cases, and image builds can legitimately take longer
+            # than any test-type timeout.
             poll_interval = 30
             elapsed = 0
             final_status = None
@@ -2258,7 +2260,11 @@ class RepairCycleStage(PipelineStage):
                 logger.info(
                     f"Dev container status for {project}: {status.value} (elapsed: {elapsed}s)"
                 )
-                if status in (DevContainerStatus.VERIFIED, DevContainerStatus.BLOCKED):
+                if status in (
+                    DevContainerStatus.VERIFIED,
+                    DevContainerStatus.BLOCKED,
+                    DevContainerStatus.CHANGES_NEEDED,
+                ):
                     final_status = status
                     break
 
@@ -2270,6 +2276,29 @@ class RepairCycleStage(PipelineStage):
                 if not last_test_result.has_failures():
                     break  # All tests pass — done
                 # Tests still failing after rebuild; try again (up to MAX attempts)
+            elif final_status == DevContainerStatus.CHANGES_NEEDED:
+                # Verifier couldn't independently confirm the required fix (as
+                # opposed to confirming it's still broken) — retryable, unlike
+                # BLOCKED. No break: falls through to the next `for attempt`
+                # iteration, which resets state to UNVERIFIED and re-queues setup.
+                logger.warning(
+                    f"Env rebuild ended with status=CHANGES_NEEDED for {project} "
+                    f"after {elapsed}s (attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}), retrying"
+                )
+                if obs:
+                    obs.emit(
+                        EventType.ERROR_ENCOUNTERED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "error_type": "env_rebuild_changes_needed",
+                            "elapsed_seconds": elapsed,
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
             else:
                 # BLOCKED — stop retrying
                 logger.warning(

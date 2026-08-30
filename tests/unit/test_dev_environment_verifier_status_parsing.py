@@ -86,7 +86,7 @@ class TestVerifierStatusParsing:
 
     async def test_unrecognized_status_word_marks_blocked_not_silent_success(self):
         """The other silent-success gap: a status marker present, but with a
-        word other than APPROVED/BLOCKED."""
+        word other than APPROVED/BLOCKED/CHANGES NEEDED."""
         from agents.dev_environment_verifier_agent import DevEnvironmentVerifierAgent
 
         agent = DevEnvironmentVerifierAgent()
@@ -100,3 +100,29 @@ class TestVerifierStatusParsing:
         _, kwargs = mock_state.set_status.call_args
         assert kwargs["status"] == DevContainerStatus.BLOCKED
         assert "PENDING" in kwargs["error_message"]
+
+    async def test_changes_needed_marks_changes_needed_with_reason(self):
+        r"""CHANGES NEEDED (used when a REQUIRED FIX could not be independently
+        confirmed) must resolve to CHANGES_NEEDED, not fall through to BLOCKED.
+
+        This also regression-tests the regex fix: the old `\*\*(\w+)\*\*` pattern
+        could never match a two-word status like "CHANGES NEEDED" (the space isn't
+        a \w character), so this status always fell through to the unparseable-output
+        branch and was silently marked BLOCKED instead."""
+        from agents.dev_environment_verifier_agent import DevEnvironmentVerifierAgent
+
+        agent = DevEnvironmentVerifierAgent()
+        output = (
+            "### Status\n**CHANGES NEEDED**\n\n#### Issues Found\n"
+            "Could not reproduce the failing test's exact build context.\n### Next"
+        )
+        with patch(
+            "agents.dev_environment_verifier_agent.run_claude_code",
+            new=AsyncMock(return_value=output),
+        ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
+            await agent.execute(_task_context())
+
+        mock_state.set_status.assert_called_once()
+        _, kwargs = mock_state.set_status.call_args
+        assert kwargs["status"] == DevContainerStatus.CHANGES_NEEDED
+        assert "Could not reproduce" in kwargs["error_message"]
