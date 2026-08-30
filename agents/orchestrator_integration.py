@@ -131,6 +131,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         task_queue = TaskQueue(use_redis=True)
 
         base_body = 'Auto-triggered: Agent requires dev container but it is not verified'
+        has_required_fix = bool(change_description and change_description.strip())
         issue_body = (
             f"{base_body}\n\n"
             "## REQUIRED FIX\n"
@@ -140,7 +141,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
             "A specific automated check is failing because of this. Locate the exact file(s) "
             "this describes — which may or may not be Dockerfile.agent — and resolve it "
             "directly. See the REQUIRED FIX handling instructions in your guidelines."
-            if change_description
+            if has_required_fix
             else base_body
         )
 

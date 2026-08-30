@@ -132,6 +132,9 @@ print(f"✗ Marked {{project_name}} dev container as BLOCKED: {{error_message}}"
 - **GitHub CLI is present and working** (`gh --version` succeeds)
 - Project-specific runtimes work (if applicable)
 - Validation tests passed (if provided in issue)
+- **If a `## REQUIRED FIX` was named in the Original Issue: the named file(s) were edited
+  and committed, AND you personally re-ran the exact failing command and saw it succeed
+  (see Step 0) — do not approve on the image/CLI checks alone**
 - State was marked as VERIFIED using Python code above
 
 **CHANGES NEEDED**:

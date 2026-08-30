@@ -170,6 +170,28 @@ class TestQueueDevEnvironmentSetup:
             assert "REQUIRED FIX" not in body
 
     @pytest.mark.asyncio
+    async def test_issue_body_is_base_body_only_when_change_description_whitespace_only(self, mock_logger):
+        """A whitespace-only change_description is truthy in Python and must not be
+        treated as a real REQUIRED FIX — it would otherwise render an empty section."""
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("my-project", mock_logger, change_description="   ")
+
+            enqueued_task = mock_queue_instance.enqueue.call_args[0][0]
+            body = enqueued_task.context['issue']['body']
+            assert body == 'Auto-triggered: Agent requires dev container but it is not verified'
+            assert "REQUIRED FIX" not in body
+
+    @pytest.mark.asyncio
     async def test_consecutive_calls_only_queue_once(self, mock_logger):
         """First call sets IN_PROGRESS and queues; second call sees IN_PROGRESS and skips."""
         from services.dev_container_state import DevContainerStatus

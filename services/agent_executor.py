@@ -709,9 +709,11 @@ class AgentExecutor:
                     'message': f"Agent {agent_name} output was extracted via fallback, not a known output key",
                 }, pipeline_run_id, execution_type=execution_type)
 
-            # If dev_environment_setup completed successfully, queue verifier
+            # If dev_environment_setup completed successfully, queue verifier,
+            # passing along its actual output so the verifier can scrutinize the
+            # real narrative (e.g. "no change needed" claims) rather than a stand-in.
             if agent_name == 'dev_environment_setup':
-                await self._queue_environment_verifier(project_name, task_context)
+                await self._queue_environment_verifier(project_name, task_context, setup_output=output_text)
 
             # Post agent output to GitHub — skipped when docker_runner already handled it
             # via _complete_agent_execution (which reads workspace routing from durable stores).
@@ -1736,7 +1738,8 @@ class AgentExecutor:
     async def _queue_environment_verifier(
         self,
         project_name: str,
-        task_context: Dict[str, Any]
+        task_context: Dict[str, Any],
+        setup_output: Optional[str] = None
     ):
         """
         Queue a dev_environment_verifier task after setup completes.
@@ -1744,6 +1747,10 @@ class AgentExecutor:
         Args:
             project_name: Name of the project
             task_context: Context from the setup task
+            setup_output: The setup agent's actual markdown output (extracted via
+                _extract_markdown_output), passed through as previous_stage_output so
+                the verifier reviews what the setup agent really said rather than a
+                placeholder. Falls back to a generic note if unavailable.
         """
         try:
             from task_queue.task_manager import Task, TaskPriority, TaskQueue
@@ -1785,7 +1792,7 @@ class AgentExecutor:
                 'auto_triggered': True,
                 'skip_workspace_prep': True,  # Verifier checks Docker image, no issue branch needed
                 'use_docker': False,  # Verifier also runs locally
-                'previous_stage_output': 'Setup agent completed successfully'
+                'previous_stage_output': setup_output if setup_output else 'Setup agent output was not captured — its outcome is unknown.'
             }
             # Propagate pipeline_run_id from setup task so verifier events are
             # visible to the repair cycle's stall-detection query.
