@@ -330,23 +330,38 @@ class TestHealthMonitorIntegration:
 
     @pytest.mark.asyncio
     async def test_health_check_uses_circuit_breaker(self, verify_github_auth):
-        """Test that health checks use circuit breaker protection."""
+        """
+        Test that health checks are gated by the real GitHub API circuit
+        breaker (services/github_api_client.py's GitHubAPIClient.breaker) -
+        the same one the rest of the system's GraphQL/REST traffic uses,
+        not a separate, independent breaker. Previously this test opened a
+        second, health-check-only breaker (_github_health_circuit_breaker);
+        that breaker was removed because its independence from the real one
+        let the dashboard report "no open circuit breakers" during a real
+        production incident where the real breaker was open the whole time.
+        """
+        from services.github_api_client import get_github_client
+
         monitor = HealthMonitor()
+        github_client = get_github_client()
 
         # Clear the cache to prevent cached results
         HealthMonitor._github_auth_cache = None
         HealthMonitor._github_auth_cache_time = None
 
-        # Open the health check circuit breaker
-        HealthMonitor._github_health_circuit_breaker._transition_to_open()
+        # Open the REAL circuit breaker
+        github_client.breaker.trip()
+        try:
+            # Health check should detect the real circuit breaker is open and
+            # return unhealthy - the same signal the rest of the system acts on.
+            health = await monitor.check_github()
 
-        # Health check should detect circuit breaker is open and return unhealthy
-        # The circuit breaker will cause API calls to fail with CircuitBreakerOpen
-        health = await monitor.check_github()
-
-        # Should handle circuit breaker gracefully (may return False or handle error)
-        # The key is that it doesn't crash and handles the circuit breaker state
-        assert 'healthy' in health, "Health check should return health status"
+            # Should handle circuit breaker gracefully (may return False or handle error)
+            # The key is that it doesn't crash and handles the circuit breaker state
+            assert 'healthy' in health, "Health check should return health status"
+        finally:
+            # Don't leak an open breaker into other tests/the real client.
+            github_client.breaker.close()
 
 
 class TestCircuitBreakerPersistence:

@@ -6,7 +6,8 @@ import asyncio
 from typing import Dict, Any, List
 from datetime import datetime
 from config.environment import Environment
-from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+from services.circuit_breaker import CircuitBreakerOpen
+from services.github_api_client import get_github_client
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +22,13 @@ class HealthMonitor:
     _github_auth_cache_time = None
     _github_auth_cache_ttl = 1800  # 30 minutes
 
-    # Circuit breaker for GitHub health checks
-    _github_health_circuit_breaker = CircuitBreaker(
-        name="github_health_checks",
-        failure_threshold=3,
-        recovery_timeout=60,
-        expected_exception=subprocess.CalledProcessError
-    )
+    # NOTE: there used to be a second, independent CircuitBreaker here
+    # (_github_health_circuit_breaker) guarding only this health check's own
+    # GitHub probe calls, disconnected from the real breaker
+    # (services/github_api_client.py's GitHubAPIClient.breaker) the rest of
+    # the system actually uses for GitHub API traffic. Removed - see
+    # _github_api_call_with_circuit_breaker()'s docstring for why having two
+    # independent breakers for "is GitHub usable" was actively misleading.
 
     def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
@@ -163,19 +164,102 @@ class HealthMonitor:
         description: str = "command"
     ) -> subprocess.CompletedProcess:
         """
-        Run GitHub API call with both retry logic and circuit breaker protection.
-        Checks circuit breaker before making call, then runs with retry logic.
-        """
-        # Define the function to call through circuit breaker
-        async def make_call():
-            return await self._run_subprocess_with_retry(cmd, timeout, retries, description)
+        Run GitHub API call with retry logic, gated by the SAME circuit
+        breaker the real GitHub API traffic (GraphQL polling, dispatch,
+        etc. - services/github_api_client.py's GitHubAPIClient.breaker)
+        uses, instead of a separate, independent breaker.
 
-        # Use circuit breaker to protect the call
+        This used to guard these calls with their own CircuitBreaker
+        instance (_github_health_circuit_breaker), disconnected from the
+        real one. The two could - and during a real production incident,
+        did - completely disagree: this health check's own probe calls
+        (gh api user / gh api repos/...) are cheap REST calls that can
+        keep succeeding even while the real breaker is open due to
+        GraphQL exhaustion (REST and GraphQL are separate GitHub
+        rate-limit buckets), so the dashboard kept reporting "no open
+        circuit breakers" and a healthy rate limit while the actual
+        polling/dispatch breaker was open and blocking all real work.
+        Checking the real breaker here means this health check now
+        reflects (and short-circuits consistently with) the same "is
+        GitHub actually usable right now" signal the rest of the system
+        acts on.
+        """
+        github_client = get_github_client()
+        # Check for recovery first, matching every real call site in
+        # services/github_api_client.py (graphql()/rest()/http_request()/
+        # gh_cli() all call check_and_close() before is_open()) - is_open()
+        # alone is a pure state read and won't itself flip OPEN -> HALF_OPEN
+        # once reset_time has passed, which would otherwise leave this
+        # health check reporting a stale "circuit open" for however long it
+        # takes some unrelated real GitHub traffic to happen to trigger the
+        # transition first.
+        github_client.breaker.check_and_close()
+        if github_client.breaker.is_open():
+            raise CircuitBreakerOpen(
+                "GitHub API circuit breaker is open (shared with GraphQL/REST polling) - "
+                f"skipping health-check probe: {description}"
+            )
+
+        return await self._run_subprocess_with_retry(cmd, timeout, retries, description)
+
+    async def _github_probe(
+        self,
+        cmd: List[str],
+        description: str,
+        timeout: int = 30,
+        retries: int = 2,
+    ) -> "tuple[subprocess.CompletedProcess, bool]":
+        """
+        Run one of check_github()'s gh CLI probes and classify the outcome,
+        collapsing the repeated "call it, catch CircuitBreakerOpen
+        separately from other failures, synthesize a failed
+        CompletedProcess either way" pattern that used to be hand-copied
+        at each of the three call sites in check_github() (PAT auth, user
+        info, repo access). Keeping that logic in one place matters here
+        specifically: a future fix to the breaker-open handling applied to
+        only one of three copies would silently reintroduce the
+        exit(1)-on-a-normal-rate-limit-window bug this same change fixed
+        (see main.py's is_transient check and the 'transient' flag below).
+
+        Returns:
+            (result, breaker_open) - result.returncode == 0 on success;
+            breaker_open is True only when the failure was specifically the
+            shared circuit breaker being open (as opposed to a genuine
+            auth/network/timeout failure), so callers can build an accurate,
+            non-misleading error message and set 'transient' correctly.
+        """
         try:
-            return await HealthMonitor._github_health_circuit_breaker.call(make_call)
+            result = await self._github_api_call_with_circuit_breaker(
+                cmd, timeout=timeout, retries=retries, description=description
+            )
+            return result, False
         except CircuitBreakerOpen as e:
-            logger.warning(f"GitHub health check circuit breaker open: {e}")
-            raise
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout='', stderr=str(e)), True
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as e:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout='', stderr=str(e)), False
+
+    @staticmethod
+    def _github_probe_error(breaker_open: bool, breaker_context: str, normal_error: str) -> str:
+        """
+        Build check_github()'s error message for a failed probe. A
+        shared-breaker-open condition is not actually an auth/access
+        failure - it's the same rate-limit/outage state the rest of the
+        system already tolerates and self-recovers from. Distinguishing it
+        here matters for two reasons: it stops an on-call reader from
+        chasing a nonexistent auth problem, and main.py's health-check loop
+        needs this to end up reflected in the 'transient' flag - the
+        breaker's own error message doesn't contain any of the keywords
+        main.py's fallback classifier looks for, so without this a normal,
+        self-recovering breaker-open window gets treated as a persistent
+        failure and can exit(1) the whole orchestrator after enough
+        consecutive health-check cycles.
+        """
+        if breaker_open:
+            return (
+                'GitHub API circuit breaker is open (shared with real GraphQL/REST '
+                f'traffic) - not {breaker_context}, will self-recover'
+            )
+        return normal_error
 
     async def check_github(self) -> Dict[str, Any]:
         """Check GitHub connectivity and project management permissions"""
@@ -221,20 +305,10 @@ class HealthMonitor:
         # Check PAT authentication via gh CLI
         # Note: gh auth status returns error if token is set via GITHUB_TOKEN env var
         # instead of gh auth login, so we test actual API functionality instead
-        try:
-            auth_result = await self._github_api_call_with_circuit_breaker(
-                ['gh', 'api', 'user', '--jq', '.login'],
-                timeout=30,
-                retries=2,
-                description="GitHub PAT authentication check"
-            )
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
-            auth_result = subprocess.CompletedProcess(
-                ['gh', 'api', 'user', '--jq', '.login'],
-                returncode=1,
-                stdout='',
-                stderr=str(e)
-            )
+        auth_result, auth_breaker_open = await self._github_probe(
+            ['gh', 'api', 'user', '--jq', '.login'],
+            description="GitHub PAT authentication check"
+        )
 
         pat_status = {
             'authenticated': auth_result.returncode == 0
@@ -243,34 +317,32 @@ class HealthMonitor:
         if auth_result.returncode != 0:
             return {
                 'healthy': False,
-                'error': f'GitHub PAT authentication failed: {auth_result.stderr}',
+                'error': self._github_probe_error(
+                    auth_breaker_open, 'a PAT authentication problem',
+                    f'GitHub PAT authentication failed: {auth_result.stderr}'
+                ),
+                'transient': auth_breaker_open,
                 'auth_methods': {
                     'pat': pat_status,
                     'github_app': github_app_status
                 },
-                'critical': 'At least PAT authentication is required for orchestrator to function'
+                'critical': None if auth_breaker_open else 'At least PAT authentication is required for orchestrator to function'
             }
 
         # Check if we can access user info
-        try:
-            user_result = await self._github_api_call_with_circuit_breaker(
-                ['gh', 'api', 'user'],
-                timeout=30,
-                retries=2,
-                description="GitHub user info access check"
-            )
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
-            user_result = subprocess.CompletedProcess(
-                ['gh', 'api', 'user'],
-                returncode=1,
-                stdout='',
-                stderr=str(e)
-            )
+        user_result, user_breaker_open = await self._github_probe(
+            ['gh', 'api', 'user'],
+            description="GitHub user info access check"
+        )
 
         if user_result.returncode != 0:
             return {
                 'healthy': False,
-                'error': f'GitHub API access failed: {user_result.stderr}',
+                'error': self._github_probe_error(
+                    user_breaker_open, 'an access-permissions problem',
+                    f'GitHub API access failed: {user_result.stderr}'
+                ),
+                'transient': user_breaker_open,
                 'auth_methods': {
                     'pat': {'authenticated': False},
                     'github_app': github_app_status
@@ -304,25 +376,19 @@ class HealthMonitor:
             }
 
         # Check repository access
-        try:
-            repo_result = await self._github_api_call_with_circuit_breaker(
-                ['gh', 'api', f'repos/{org}/{repo}'],
-                timeout=30,
-                retries=2,
-                description=f"GitHub repo access check for {org}/{repo}"
-            )
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, CircuitBreakerOpen) as e:
-            repo_result = subprocess.CompletedProcess(
-                ['gh', 'api', f'repos/{org}/{repo}'],
-                returncode=1,
-                stdout='',
-                stderr=str(e)
-            )
+        repo_result, repo_breaker_open = await self._github_probe(
+            ['gh', 'api', f'repos/{org}/{repo}'],
+            description=f"GitHub repo access check for {org}/{repo}"
+        )
 
         if repo_result.returncode != 0:
             return {
                 'healthy': False,
-                'error': f'Repository access failed for {org}/{repo}: {repo_result.stderr}',
+                'error': self._github_probe_error(
+                    repo_breaker_open, 'a repo-permissions problem',
+                    f'Repository access failed for {org}/{repo}: {repo_result.stderr}'
+                ),
+                'transient': repo_breaker_open,
                 'auth_methods': {
                     'pat': {'authenticated': True, 'repo_access': False},
                     'github_app': github_app_status
@@ -356,7 +422,6 @@ class HealthMonitor:
         # Note: The rate limit data includes default values (5000/5000) until the background
         # rate limit checker first runs (every 5 minutes). The /health endpoint will fetch
         # fresh rate limit data to avoid returning stale cached values.
-        from services.github_api_client import get_github_client
         try:
             github_client = get_github_client()
             client_status = github_client.get_status()
