@@ -236,6 +236,16 @@ async def test_validate_task_can_run_messages():
         assert "blocked" in result['reason'].lower()
         assert "state/dev_containers/" in result['reason']
 
+        # Test CHANGES_NEEDED status: must NOT set needs_dev_setup=True. The repair
+        # cycle's env-rebuild sub-cycle owns retrying this project; if this returned
+        # needs_dev_setup=True, an unrelated task validating during the brief window
+        # before the sub-cycle's own reset could trigger a second, redundant
+        # queue_dev_environment_setup() call racing the sub-cycle's own retry.
+        mock_dev_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+        result = await validate_task_can_run(mock_task, mock_logger)
+        assert result['can_run'] is False
+        assert result['needs_dev_setup'] is False
+
 
 @pytest.mark.asyncio
 async def test_validate_task_can_run_stale_in_progress_triggers_resetup():

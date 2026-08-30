@@ -5,7 +5,8 @@ Tracks the state of project development container images:
 - unverified: Default state for new projects
 - in_progress: dev_environment_setup agent is working
 - verified: Docker image built and tested successfully
-- blocked: Unable to build working image
+- blocked: Unable to build working image; repair cycle stops retrying
+- changes_needed: Verifier could not confirm a required fix; repair cycle retries
 """
 
 import yaml
@@ -39,7 +40,10 @@ class DevContainerStatus(Enum):
     UNVERIFIED = "unverified"  # Default for new projects
     IN_PROGRESS = "in_progress"  # Setup agent running
     VERIFIED = "verified"  # Image built and tested
-    BLOCKED = "blocked"  # Failed to build working image
+    BLOCKED = "blocked"  # Failed to build working image; repair cycle stops retrying
+    CHANGES_NEEDED = "changes_needed"  # Verifier could not confirm a required fix
+    # (distinct from BLOCKED: repair_cycle's env-rebuild sub-cycle treats this as
+    # retryable rather than terminal — see _run_env_rebuild_sub_cycle)
 
 
 class DevContainerStateManager:

@@ -82,6 +82,19 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
             'reason': f"Dev container setup is blocked for '{task.project}'. Check state/dev_containers/{task.project}.yaml for error details",
             'needs_dev_setup': False
         }
+    elif status == DevContainerStatus.CHANGES_NEEDED:
+        # needs_dev_setup=False (not the UNVERIFIED default) is deliberate: the
+        # repair cycle's env-rebuild sub-cycle owns retrying this project and will
+        # re-queue setup itself on its next attempt. If this returned
+        # needs_dev_setup=True, an unrelated task validated against this project
+        # while CHANGES_NEEDED is set (a brief window before the sub-cycle's own
+        # reset) could trigger a second, redundant queue_dev_environment_setup()
+        # call racing the sub-cycle's own retry.
+        return {
+            'can_run': False,
+            'reason': f"Dev container verification for '{task.project}' could not confirm a required fix; the repair cycle is retrying",
+            'needs_dev_setup': False
+        }
     else:  # UNVERIFIED
         return {
             'can_run': False,
@@ -131,9 +144,17 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         task_queue = TaskQueue(use_redis=True)
 
         base_body = 'Auto-triggered: Agent requires dev container but it is not verified'
+        has_required_fix = bool(change_description and change_description.strip())
         issue_body = (
-            f"{base_body}\n\nRequired changes:\n{change_description}"
-            if change_description
+            f"{base_body}\n\n"
+            "## REQUIRED FIX\n"
+            "⚠️ This is what's actually broken — this is not a general audit.\n\n"
+            f"{change_description}\n\n"
+            "---\n\n"
+            "A specific automated check is failing because of this. Locate the exact file(s) "
+            "this describes — which may or may not be Dockerfile.agent — and resolve it "
+            "directly. See the REQUIRED FIX handling instructions in your guidelines."
+            if has_required_fix
             else base_body
         )
 

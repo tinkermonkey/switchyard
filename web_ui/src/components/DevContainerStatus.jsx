@@ -1,4 +1,4 @@
-import { CheckCircle, XCircle, Clock, AlertCircle } from 'lucide-react'
+import { CheckCircle, XCircle, Clock, AlertCircle, RefreshCw } from 'lucide-react'
 
 export default function DevContainerStatus({ devContainer }) {
   const getStatusBadge = (status) => {
@@ -29,6 +29,15 @@ export default function DevContainerStatus({ devContainer }) {
           <span className="inline-flex items-center px-2 py-1 rounded-md text-xs font-medium bg-yellow-500/10 text-yellow-500 border border-yellow-500/20">
             <AlertCircle className="w-3 h-3 mr-1" />
             Unverified
+          </span>
+        )
+      case 'changes_needed':
+        // Brief/transient in practice: the repair cycle's env-rebuild sub-cycle
+        // resets this to 'unverified' and retries automatically within ~30s.
+        return (
+          <span className="inline-flex items-center px-2 py-1 rounded-md text-xs font-medium bg-orange-500/10 text-orange-500 border border-orange-500/20">
+            <RefreshCw className="w-3 h-3 mr-1" />
+            Retrying
           </span>
         )
       default:

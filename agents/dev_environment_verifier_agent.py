@@ -87,17 +87,21 @@ class DevEnvironmentVerifierAgent(PipelineStage):
 
         # Parse status and update dev container state.
         #
-        # CRITICAL: every branch below MUST resolve dev_container_state to a terminal
-        # status (VERIFIED or BLOCKED). Leaving it untouched on a parse failure means it
-        # stays at whatever dev_environment_setup left it (IN_PROGRESS) forever -- nothing
+        # CRITICAL: every branch below MUST resolve dev_container_state to a status
+        # (VERIFIED, BLOCKED, or CHANGES_NEEDED). Leaving it untouched on a parse
+        # failure means it stays at whatever dev_environment_setup left it
+        # (IN_PROGRESS) forever -- nothing
         # else ever re-checks it, so every task requiring this project's dev container
         # silently defers itself every 30s, indefinitely, with no error ever surfaced
         # (see incident: codetoreum and phone-home both stuck IN_PROGRESS for hours/a day
         # because this exact parse fell through to a silent no-op that still returned
         # "success").
-        status_match = re.search(r"### Status\s*\*\*(\w+)\*\*", review_text, re.IGNORECASE)
+        # [^*\n]+ (not \w+) because "CHANGES NEEDED" is two words separated by a
+        # space, which \w doesn't match -- \w+ would fail to match the marker at
+        # all for that status and fall through to the "could not parse" branch below.
+        status_match = re.search(r"### Status\s*\*\*([^*\n]+)\*\*", review_text, re.IGNORECASE)
         if status_match:
-            status = status_match.group(1).upper()
+            status = status_match.group(1).strip().upper()
             if status == "APPROVED":
                 dev_container_state.set_status(
                     project_name=project_name,
@@ -116,9 +120,23 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     error_message=error_message[:200],
                 )
                 logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
+            elif status == "CHANGES NEEDED":
+                # Distinct from BLOCKED: used when the verifier could not independently
+                # confirm a REQUIRED FIX (rather than confirming it's still broken).
+                # repair_cycle.py's env-rebuild sub-cycle treats this as retryable.
+                error_match = re.search(
+                    r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
+                )
+                error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
+                dev_container_state.set_status(
+                    project_name=project_name,
+                    status=DevContainerStatus.CHANGES_NEEDED,
+                    error_message=error_message[:200],
+                )
+                logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message[:100])
             else:
                 # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
-                error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED or BLOCKED)"
+                error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED, BLOCKED, or CHANGES NEEDED)"
                 dev_container_state.set_status(
                     project_name=project_name,
                     status=DevContainerStatus.BLOCKED,
