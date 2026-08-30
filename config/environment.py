@@ -63,6 +63,13 @@ class Environment(BaseSettings):
     # Worker Pool Configuration
     orchestrator_workers: int = 1  # Number of worker threads for parallel task execution (default: 1 = single-threaded)
 
+    # GitHub board polling: batched cross-project GraphQL queries + per-board adaptive
+    # backoff instead of one sequential request per board (issue #36, #94). Read directly
+    # via os.environ.get() in services/project_monitor.py, not through this Environment
+    # object - declared here anyway so pydantic-settings' strict BaseSettings validation
+    # (extra='forbid') doesn't reject it as an unknown key when it's present in .env.
+    use_batched_board_queries: bool = False
+
     # Docker/Host Configuration (used by docker-compose for file permissions)
     host_uid: Optional[int] = 1000
     host_gid: Optional[int] = 1000

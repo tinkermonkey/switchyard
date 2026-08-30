@@ -151,7 +151,11 @@ class PipelineQueueManager:
 
         logger.debug(f"Saved queue state: {len(queue)} issues")
 
-    def get_issues_in_column_order(self, column_name: str) -> List[Dict[str, Any]]:
+    def get_issues_in_column_order(
+        self,
+        column_name: str,
+        prefetched_board_data: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Fetch current issue order from GitHub Projects v2 board column.
 
@@ -160,6 +164,20 @@ class PipelineQueueManager:
 
         Args:
             column_name: Column name to query (e.g., "Development")
+            prefetched_board_data: Optional pre-fetched raw project data for
+                this board, in the same UNWRAPPED shape
+                execute_batched_board_queries() (services/github_owner_utils.py)
+                returns per board - i.e. already the
+                data['user']['projectV2'] / data['organization']['projectV2']
+                dict (e.g. {'id': ..., 'title': ..., 'items': {'nodes': [...]}}),
+                NOT the {'user'|'organization': {'projectV2': {...}}} envelope
+                execute_board_query_cached() returns. When provided, the
+                network fetch (execute_board_query_cached()) is skipped
+                entirely and this data is used directly for item
+                extraction/column filtering - see issue #100. When None
+                (the default), behavior is 100% unchanged from before #100:
+                this method fetches the board itself via
+                execute_board_query_cached().
 
         Returns:
             List of issues with positions, ordered top-to-bottom:
@@ -170,44 +188,50 @@ class PipelineQueueManager:
             ]
         """
         try:
-            from config.manager import config_manager
-            from config.state_manager import state_manager
-            from services.github_owner_utils import execute_board_query_cached, get_owner_type
+            if prefetched_board_data is not None:
+                # Caller already fetched this board's data (typically via one
+                # shared execute_batched_board_queries() call covering many
+                # boards) - skip the network call entirely and reuse it.
+                project_data = prefetched_board_data
+            else:
+                from config.manager import config_manager
+                from config.state_manager import state_manager
+                from services.github_owner_utils import execute_board_query_cached, get_owner_type
 
-            # Get project config
-            project_config = config_manager.get_project_config(self.project_name)
-            project_state = state_manager.load_project_state(self.project_name)
+                # Get project config
+                project_config = config_manager.get_project_config(self.project_name)
+                project_state = state_manager.load_project_state(self.project_name)
 
-            if not project_state:
-                logger.error(f"No GitHub state found for {self.project_name}")
-                return []
+                if not project_state:
+                    logger.error(f"No GitHub state found for {self.project_name}")
+                    return []
 
-            # Get board state
-            board_state = project_state.boards.get(self.board_name)
-            if not board_state:
-                logger.error(
-                    f"Board '{self.board_name}' not found in project state"
+                # Get board state
+                board_state = project_state.boards.get(self.board_name)
+                if not board_state:
+                    logger.error(
+                        f"Board '{self.board_name}' not found in project state"
+                    )
+                    return []
+
+                # Execute cached board query
+                data = execute_board_query_cached(
+                    project_config.github['org'],
+                    board_state.project_number
                 )
-                return []
 
-            # Execute cached board query
-            data = execute_board_query_cached(
-                project_config.github['org'],
-                board_state.project_number
-            )
+                if data is None:
+                    logger.error(
+                        f"Board query failed for {project_config.github['org']}/project#{board_state.project_number}"
+                    )
+                    return []
 
-            if data is None:
-                logger.error(
-                    f"Board query failed for {project_config.github['org']}/project#{board_state.project_number}"
-                )
-                return []
-
-            # Extract project data based on owner type
-            owner_type = get_owner_type(project_config.github['org'])
-            if owner_type == 'user':
-                project_data = data.get('user', {}).get('projectV2', {})
-            else:  # organization
-                project_data = data.get('organization', {}).get('projectV2', {})
+                # Extract project data based on owner type
+                owner_type = get_owner_type(project_config.github['org'])
+                if owner_type == 'user':
+                    project_data = data.get('user', {}).get('projectV2', {})
+                else:  # organization
+                    project_data = data.get('organization', {}).get('projectV2', {})
 
             # Get items and filter by column
             items = project_data.get('items', {}).get('nodes', [])
@@ -350,7 +374,10 @@ class PipelineQueueManager:
 
             logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
 
-    def sync_queue_with_github(self) -> None:
+    def sync_queue_with_github(
+        self,
+        prefetched_board_data: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Synchronize queue state with GitHub column positions.
 
@@ -364,10 +391,18 @@ class PipelineQueueManager:
 
         Note: GitHub API call is performed OUTSIDE the lock to minimize lock hold time.
         Only file I/O operations are performed within the lock.
+
+        Args:
+            prefetched_board_data: Optional pre-fetched raw board data,
+                forwarded as-is to get_issues_in_column_order() - see that
+                method's docstring for the expected shape. When None (the
+                default), behavior is unchanged: the board is fetched here.
         """
         # STEP 1: Fetch data from GitHub OUTSIDE the lock (network I/O)
         trigger_column = self._get_pipeline_trigger_column()
-        issues_in_column = self.get_issues_in_column_order(trigger_column)
+        issues_in_column = self.get_issues_in_column_order(
+            trigger_column, prefetched_board_data=prefetched_board_data
+        )
         github_issue_numbers = {item['issue_number'] for item in issues_in_column}
 
         if not issues_in_column:
@@ -618,12 +653,22 @@ class PipelineQueueManager:
         # Default fallback
         return "Development"
 
-    def get_next_waiting_issue(self) -> Optional[Dict]:
+    def get_next_waiting_issue(
+        self,
+        prefetched_board_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
         """
         Get the next issue that should execute based on CURRENT GitHub board order.
 
         This method first syncs with GitHub to ensure queue state is accurate,
         then selects the highest priority waiting issue.
+
+        Args:
+            prefetched_board_data: Optional pre-fetched raw board data,
+                forwarded as-is to sync_queue_with_github() /
+                get_issues_in_column_order() - see the latter's docstring for
+                the expected shape. When None (the default), behavior is
+                unchanged: the board is fetched here.
 
         Returns:
             Issue dict with 'issue_number', 'position', etc., or None
@@ -634,7 +679,7 @@ class PipelineQueueManager:
         logger.info(
             f"Syncing queue with GitHub for {self.project_name}/{self.board_name}"
         )
-        self.sync_queue_with_github()
+        self.sync_queue_with_github(prefetched_board_data=prefetched_board_data)
 
         # STEP 2: Atomically read queue under lock to prevent torn reads
         with self._queue_lock():

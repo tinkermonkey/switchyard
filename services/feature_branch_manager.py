@@ -66,6 +66,205 @@ class FeatureBranch:
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
+# ---------------------------------------------------------------------------
+# Batched / aliased cross-parent sub-issue query builder (GitHub issue #95,
+# sub-issue of #36)
+#
+# FeatureBranchManager._get_sub_issues_from_parent() below issues one
+# GraphQL request per parent epic. get_sub_issues_for_parents_batched()
+# fetches sub-issues for multiple parent issues in as few GraphQL requests
+# as possible by aliasing each parent's `issue(number: ...)` field under one
+# `repository(owner, name)` root, mirroring the aliased-batch pattern
+# build_batched_projects_v2_query() / parse_batched_projects_v2_response()
+# established in services/github_owner_utils.py for issue #92's board-query
+# batching (same partial-failure error-attribution-by-path approach).
+#
+# Unlike issue #92's board queries - which batch across *owners* because a
+# single poll cycle can hold boards belonging to many different GitHub
+# owners at once - a GitHubIntegration instance is single-repo scoped (one
+# github_org/repo_name pair, see GitHubIntegration.__init__ in
+# services/github_integration.py) and every caller of
+# _get_sub_issues_from_parent() found in this codebase
+# (services/project_monitor.py, services/scheduled_tasks.py) constructs one
+# GitHubIntegration per project/repo. A batch of parent_issue_numbers is
+# therefore already scoped to a single owner/repo by construction of the
+# github_integration argument, so there is no (owner, repo) grouping step
+# here - only chunking.
+#
+# These two helpers are pure/free functions (no GitHub client access) so
+# they can be unit tested directly, independent of
+# get_sub_issues_for_parents_batched()'s network call.
+# ---------------------------------------------------------------------------
+
+# GitHub's GraphQL API enforces per-query node-count, response-size and
+# execution-time limits, same rationale as MAX_BOARDS_PER_BATCH in
+# services/github_owner_utils.py. 12 is a conservative starting point
+# chosen without a production token to test against; tunable and should be
+# re-verified against GitHub's actual limits once one is available.
+MAX_SUB_ISSUE_PARENTS_PER_BATCH = 12
+
+
+def _build_batched_sub_issues_query(parent_issue_numbers: List[int]) -> str:
+    """
+    Build ONE aliased GraphQL query document fetching sub-issues for
+    multiple parent issues (in one repo) in a single request.
+
+    Each parent issue number is exposed under its own alias (`i<number>`)
+    so all parents can be selected under one `repository(owner, name)` root
+    field, e.g.:
+
+        query($owner: String!, $repo: String!) {
+          repository(owner: $owner, name: $repo) {
+            i123: issue(number: 123) { number subIssues(first: 100) { totalCount nodes { number title state url } } }
+            i456: issue(number: 456) { number subIssues(first: 100) { totalCount nodes { number title state url } } }
+          }
+        }
+
+    This does not chunk `parent_issue_numbers` itself - callers with more
+    than MAX_SUB_ISSUE_PARENTS_PER_BATCH parents should chunk before calling
+    (see get_sub_issues_for_parents_batched(), which does this).
+
+    Args:
+        parent_issue_numbers: Parent issue numbers to alias into this query.
+            Must be non-empty.
+
+    Returns:
+        GraphQL query string, parameterized on $owner/$repo (values are
+        supplied as query variables by the caller, not interpolated here).
+    """
+    aliased_fields = "\n".join(
+        f'''    i{number}: issue(number: {number}) {{
+      number
+      subIssues(first: 100) {{
+        totalCount
+        nodes {{
+          number
+          title
+          state
+          url
+        }}
+      }}
+    }}'''
+        for number in parent_issue_numbers
+    )
+
+    return f'''query($owner: String!, $repo: String!) {{
+  repository(owner: $owner, name: $repo) {{
+{aliased_fields}
+  }}
+}}'''
+
+
+def _parse_batched_sub_issues_response(
+    response: Optional[dict],
+    parent_issue_numbers: List[int],
+) -> Tuple[Dict[int, List[dict]], Dict[int, str]]:
+    """
+    Parse one batched/aliased sub-issues GraphQL response into per-parent
+    sub-issue lists.
+
+    Handles partial-batch failure the same way
+    parse_batched_projects_v2_response() (services/github_owner_utils.py)
+    does: a response for a multi-alias query can have `data` populated for
+    some aliases and a top-level `errors` array naming the alias(es) that
+    failed via each error's `path`. Every alias not implicated by an error
+    is still parsed and returned, so one bad parent never loses the rest of
+    the batch.
+
+    Args:
+        response: The raw response for the query built from
+            `parent_issue_numbers` via _build_batched_sub_issues_query().
+            Accepts either shape GitHubAPIClient.graphql() can hand back:
+            - the full GraphQL envelope `{'data': {...}, 'errors': [...]}`
+              (returned on partial/total GraphQL failure, success=False), or
+            - just the unwrapped data payload, e.g. `{'repository': {...}}`
+              (returned on full success, success=True).
+        parent_issue_numbers: The parent issue numbers the query was built
+            from (same list passed to _build_batched_sub_issues_query()).
+
+    Returns:
+        Tuple of:
+        - results: dict of parent_issue_number -> list of sub-issue dicts
+          (each {'number', 'title', 'state', 'url'}), matching exactly what
+          _get_sub_issues_from_parent() returns for one parent, for every
+          alias that parsed successfully.
+        - errors: dict of parent_issue_number -> error message string for
+          every alias that failed, whether via an attributable top-level
+          GraphQL error or because the alias was simply missing from the
+          response.
+    """
+    results: Dict[int, List[dict]] = {}
+    errors: Dict[int, str] = {}
+
+    if not parent_issue_numbers:
+        return results, errors
+
+    if response is None:
+        for number in parent_issue_numbers:
+            errors[number] = "No response received"
+        return results, errors
+
+    # Normalize both response shapes described above into (data, errors_list).
+    # Checking for 'errors' as well as 'data' matters: a pre-execution
+    # GraphQL validation error (e.g. a malformed alias) comes back as
+    # {'errors': [...]} with NO 'data' key at all - treating that as the
+    # unwrapped-success shape (the old `if 'data' in response` check) would
+    # silently drop the real error and report every parent in the chunk as
+    # generically "missing", masking the actual failure.
+    if 'data' in response or 'errors' in response:
+        data = response.get('data') or {}
+        errors_list = response.get('errors') or []
+    else:
+        data = response
+        errors_list = []
+
+    alias_to_parent = {f'i{number}': number for number in parent_issue_numbers}
+
+    # Attribute each top-level GraphQL error to the parent(s) named in its path.
+    for error in errors_list:
+        if isinstance(error, dict):
+            message = error.get('message', 'Unknown GraphQL error')
+            path = error.get('path') or []
+        else:
+            message = str(error)
+            path = []
+
+        matched = False
+        for segment in path:
+            if isinstance(segment, str) and segment in alias_to_parent:
+                parent_number = alias_to_parent[segment]
+                errors.setdefault(parent_number, message)  # keep the first error per parent
+                matched = True
+                break
+
+        if not matched:
+            logger.warning(f"Batched sub-issues query returned an error with no attributable parent path: {message}")
+
+    repository = data.get('repository') if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        repository = {}
+
+    for number in parent_issue_numbers:
+        if number in errors:
+            continue  # already recorded via error path attribution above
+
+        alias = f'i{number}'
+        issue_data = repository.get(alias)
+
+        if issue_data is None:
+            errors[number] = (
+                f"No data returned for alias '{alias}' (issue #{number} may not exist, "
+                f"or the repository root field was missing from the response)"
+            )
+            continue
+
+        sub_issues_data = issue_data.get('subIssues', {}) if isinstance(issue_data, dict) else {}
+        sub_issues = sub_issues_data.get('nodes', []) if isinstance(sub_issues_data, dict) else []
+        results[number] = sub_issues
+
+    return results, errors
+
+
 class FeatureBranchManager:
     """Manages feature branch lifecycle for parent/sub-issue workflows"""
 
@@ -496,6 +695,133 @@ class FeatureBranchManager:
         except Exception as e:
             logger.error(f"Failed to query sub-issues for parent #{parent_number}: {e}")
             return []
+
+    async def get_sub_issues_for_parents_batched(
+        self, github_integration, parent_issue_numbers: List[int]
+    ) -> Dict[int, List[dict]]:
+        """
+        Fetch sub-issues for multiple parent epics in as few GraphQL
+        requests as possible, instead of issuing one
+        _get_sub_issues_from_parent()-style request per parent.
+
+        Additive: does not change _get_sub_issues_from_parent()'s existing
+        behavior/signature or any of its existing callers - this is a
+        separate, opt-in batched primitive. Returns the exact same
+        per-parent list shape _get_sub_issues_from_parent() returns for one
+        parent (a list of {'number', 'title', 'state', 'url'} dicts), so
+        _verify_all_sub_issues_complete() (or any other consumer of that
+        shape) can be handed either this function's per-parent values or
+        _get_sub_issues_from_parent()'s return value interchangeably.
+
+        Requests are chunked at MAX_SUB_ISSUE_PARENTS_PER_BATCH aliases per
+        query (see module-level comment above FeatureBranchManager for why
+        no (owner, repo) grouping is needed - github_integration is already
+        single-repo scoped). A parent whose alias fails within an otherwise
+        successful chunk (deleted/renamed issue, attributable GraphQL
+        error) is simply omitted from the returned dict rather than raising
+        - every other parent, in that chunk and every other chunk, is still
+        returned. A parent in a chunk that fails entirely (rate limit,
+        timeout, transport error) is likewise omitted. Callers should treat
+        a missing key the same way they already tolerate
+        _get_sub_issues_from_parent() returning an empty list, e.g. via
+        `.get(parent_number, [])`.
+
+        Args:
+            github_integration: GitHubIntegration instance (single-repo
+                scoped - github_org/repo_name). All parent_issue_numbers are
+                queried against this one repo.
+            parent_issue_numbers: Parent issue numbers to fetch sub-issues
+                for. Duplicates are de-duplicated (first-seen order kept).
+                Empty input returns an empty dict without making a request.
+
+        Returns:
+            Dict of parent_issue_number -> list of sub-issue dicts, for
+            every parent that was successfully fetched. Parents that failed
+            (see above) are absent from the dict.
+        """
+        deduped_numbers: List[int] = []
+        seen_numbers = set()
+        for number in parent_issue_numbers:
+            # Matches _get_sub_issues_from_parent()'s own `if not parent_number`
+            # guard: a falsy/invalid number interpolated into an aliased
+            # GraphQL field name (e.g. `i-5: issue(number: -5)`) would produce
+            # an invalid alias and break parsing of the WHOLE chunk it's in,
+            # not just itself - violating this function's own per-parent
+            # isolation guarantee - so invalid numbers are dropped here,
+            # before ever reaching the query builder.
+            if not number or not isinstance(number, int) or number <= 0:
+                logger.error(f"Skipping invalid parent issue number in batched sub-issues request: {number!r}")
+                continue
+            if number in seen_numbers:
+                continue
+            seen_numbers.add(number)
+            deduped_numbers.append(number)
+
+        if not deduped_numbers:
+            return {}
+
+        results: Dict[int, List[dict]] = {}
+
+        try:
+            github_client = get_github_client()
+
+            for start in range(0, len(deduped_numbers), MAX_SUB_ISSUE_PARENTS_PER_BATCH):
+                chunk = deduped_numbers[start:start + MAX_SUB_ISSUE_PARENTS_PER_BATCH]
+                query = _build_batched_sub_issues_query(chunk)
+                variables = {
+                    "owner": github_integration.github_org,
+                    "repo": github_integration.repo_name,
+                }
+
+                query_start = time.time()
+                logger.debug(
+                    f"🔍 Querying GitHub GraphQL (batched) for sub-issues of parents {chunk} "
+                    f"(query_ts={query_start:.3f})"
+                )
+
+                success, response = github_client.graphql(query, variables)
+                query_duration = (time.time() - query_start) * 1000  # milliseconds
+
+                if not success and not (isinstance(response, dict) and ('data' in response or 'errors' in response)):
+                    # Total failure for this chunk (rate limit, timeout,
+                    # transport error, JSON parse error, etc.) with no
+                    # per-alias data to salvage - every parent in this chunk is
+                    # simply omitted from the result, matching
+                    # _get_sub_issues_from_parent()'s failure mode of returning
+                    # [] on total failure.
+                    message = response.get('error', str(response)) if isinstance(response, dict) else str(response)
+                    logger.error(
+                        f"Batched sub-issues GraphQL query failed for parents {chunk} "
+                        f"(duration={query_duration:.0f}ms): {message}"
+                    )
+                    continue
+
+                chunk_results, chunk_errors = _parse_batched_sub_issues_response(response, chunk)
+
+                for parent_number, error_message in chunk_errors.items():
+                    logger.error(
+                        f"Batched sub-issues query: parent #{parent_number} failed "
+                        f"(duration={query_duration:.0f}ms): {error_message}"
+                    )
+
+                if chunk_results:
+                    total_found = sum(len(v) for v in chunk_results.values())
+                    logger.info(
+                        f"🔍 Batched sub-issues query fetched sub-issues for {len(chunk_results)}/{len(chunk)} "
+                        f"parents ({total_found} sub-issues total, duration={query_duration:.0f}ms) "
+                        f"via GitHub structured API"
+                    )
+
+                results.update(chunk_results)
+
+        except Exception as e:
+            # Matches _get_sub_issues_from_parent()'s own guarantee that this
+            # never raises out to its caller (e.g. a malformed
+            # github_integration missing github_org/repo_name) - degrade to
+            # whatever chunks already succeeded rather than crashing.
+            logger.error(f"Unexpected error in batched sub-issues fetch for parents {deduped_numbers}: {e}")
+
+        return results
 
     async def _verify_all_sub_issues_complete(
         self,

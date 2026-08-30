@@ -66,6 +66,10 @@ services:
       # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
       # Recommended: 2-3 workers for multi-project deployments
       - ORCHESTRATOR_WORKERS=${ORCHESTRATOR_WORKERS:-1}
+      # GitHub board polling: batched cross-project GraphQL queries + per-board
+      # adaptive backoff instead of one sequential request per board (issue #36,
+      # #94). Defaults false - byte-identical to legacy per-board polling.
+      - USE_BATCHED_BOARD_QUERIES=${USE_BATCHED_BOARD_QUERIES:-false}
       - PYTHONDONTWRITEBYTECODE=1
       - OTEL_COLLECTOR_HOST=otel-collector
       # Switchyard's own switchyard.claude.token.usage OTLP metrics export (SigNoz or
