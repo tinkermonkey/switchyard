@@ -29,6 +29,23 @@ import yaml
 from services.pipeline_semaphore_manager import PipelineSemaphoreManager
 
 
+@pytest.fixture(autouse=True)
+def _no_real_redis_autoconnect(monkeypatch):
+    """PipelineSemaphoreManager's constructor treats redis_client=None as
+    "not provided" and tries to auto-connect to a real Redis (mirroring
+    PipelineLockManager's pattern) before falling back to None on failure.
+    Every test in this file that passes redis_client=None is deliberately
+    simulating "Redis unavailable" — but without this fixture, that
+    simulation silently breaks in any environment where a real Redis is
+    actually reachable (e.g. this repo's own docker-compose stack), because
+    the auto-connect succeeds and the manager ends up with a live client
+    instead of None. Forcing the connection attempt to fail here makes
+    redis_client=None mean the same thing in every environment."""
+    def _raise(*args, **kwargs):
+        raise ConnectionError("simulated: no Redis in test environment")
+    monkeypatch.setattr("services.pipeline_semaphore_manager.redis.Redis", _raise)
+
+
 class FakeRedis:
     """Minimal in-memory stand-in for the subset of the Redis API this module
     uses (hgetall, hset, hdel, hexists, hlen, expire, eval), so tests exercise
