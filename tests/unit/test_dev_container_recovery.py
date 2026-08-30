@@ -121,6 +121,55 @@ class TestQueueDevEnvironmentSetup:
             assert enqueued_task.project == "my-project"
 
     @pytest.mark.asyncio
+    async def test_issue_body_includes_required_fix_marker_when_change_description_given(self, mock_logger):
+        """A non-empty change_description must be wrapped in a literal '## REQUIRED FIX'
+        section — this exact heading is what dev_environment_setup/guidelines.md and
+        dev_environment_verifier/review_task.md key their behavior off of."""
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup(
+                "my-project", mock_logger,
+                change_description="Add codegen extra to pyproject.toml"
+            )
+
+            enqueued_task = mock_queue_instance.enqueue.call_args[0][0]
+            body = enqueued_task.context['issue']['body']
+            assert "## REQUIRED FIX" in body
+            assert "Add codegen extra to pyproject.toml" in body
+
+    @pytest.mark.asyncio
+    async def test_issue_body_is_base_body_only_when_change_description_empty(self, mock_logger):
+        """With no change_description, the issue body must be exactly the base
+        auto-triggered message and must NOT contain a REQUIRED FIX section — the
+        verifier's Step 0 relies on the marker's absence here."""
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("my-project", mock_logger)
+
+            enqueued_task = mock_queue_instance.enqueue.call_args[0][0]
+            body = enqueued_task.context['issue']['body']
+            assert body == 'Auto-triggered: Agent requires dev container but it is not verified'
+            assert "REQUIRED FIX" not in body
+
+    @pytest.mark.asyncio
     async def test_consecutive_calls_only_queue_once(self, mock_logger):
         """First call sets IN_PROGRESS and queues; second call sees IN_PROGRESS and skips."""
         from services.dev_container_state import DevContainerStatus
