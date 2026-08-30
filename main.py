@@ -652,10 +652,20 @@ async def main():
                         if not github_check.get('healthy', False):
                             error_msg = github_check.get('error', 'Unknown error')
 
-                            # Check if this is a transient network error
-                            is_transient = any(keyword in error_msg.lower() for keyword in [
-                                'eof', 'timeout', 'connection', 'network', 'temporary'
-                            ])
+                            # Check if this is a transient network error. Prefer the
+                            # explicit 'transient' flag health_monitor.py's check_github()
+                            # sets for a shared-circuit-breaker-open condition (see
+                            # monitoring/health_monitor.py) over this keyword heuristic -
+                            # the breaker's own error message doesn't contain any of
+                            # these keywords, and a normal, self-recovering rate-limit
+                            # window being misclassified as persistent here would
+                            # exit(1) the whole orchestrator over exactly the condition
+                            # the shared breaker exists to tolerate gracefully.
+                            is_transient = github_check.get('transient', False) or any(
+                                keyword in error_msg.lower() for keyword in [
+                                    'eof', 'timeout', 'connection', 'network', 'temporary'
+                                ]
+                            )
 
                             if is_transient:
                                 logger.log_warning(f"Transient GitHub connectivity issue detected: {error_msg}")
