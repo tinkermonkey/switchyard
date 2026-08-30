@@ -7552,7 +7552,11 @@ _Repair cycle initiated by Switchyard_
 
         return stalled_issues
 
-    def _check_and_process_waiting_issues_failsafe(self, poll_cycle_items: Dict[tuple, List[ProjectItem]] = None):
+    def _check_and_process_waiting_issues_failsafe(
+        self,
+        poll_cycle_items: Dict[tuple, List[ProjectItem]] = None,
+        due_boards_this_cycle: List[Dict[str, Any]] = None,
+    ):
         """
         Failsafe mechanism to catch cases where waiting issues aren't being processed.
 
@@ -7571,6 +7575,16 @@ _Repair cycle initiated by Switchyard_
         Args:
             poll_cycle_items: Pre-fetched items from the main poll loop, keyed by
                 (project_name, board_name). Avoids duplicate get_project_items() calls.
+            due_boards_this_cycle: The SAME due_boards list monitor_projects()'s
+                own batched branch computed for this cycle (list of
+                {'project_name', 'owner', 'project_number', 'board_key', ...}
+                dicts), passed straight through, BEFORE the caller advances any
+                per-board backoff state - deliberately not re-derived here via
+                _is_board_due(), since by the time this method runs the caller
+                has already updated that state for every board it just polled.
+                None/empty when batching is off, or the caller isn't in its
+                batched branch - in that case Scenario 2 below checks every
+                board individually every cycle, exactly as it always has.
 
         Safety: Uses same lock acquisition as normal flow - prevents duplicate launches.
         Lock acquisition is atomic in Redis - only ONE process can acquire successfully.
@@ -7584,152 +7598,140 @@ _Repair cycle initiated by Switchyard_
             logger.debug("🧹 FAILSAFE: Running state reconciliation...")
             self._reconcile_stale_state()
 
-            # STEP 1.5: Batch-fetch board data for every active project/pipeline
-            # this cycle needs, in ONE execute_batched_board_queries() call,
-            # instead of leaving each get_next_waiting_issue() call below (via
-            # sync_queue_with_github() -> get_issues_in_column_order()) to fetch
-            # its own board individually. This failsafe runs unconditionally
-            # EVERY poll cycle for EVERY project/active-pipeline - unlike
-            # monitor_projects()'s own item-fetch path above, it is NOT gated
-            # by #94's per-board adaptive backoff - and live production
-            # telemetry from the #36 soak confirmed this per-board
-            # get_next_waiting_issue() -> execute_board_query_cached() path is
-            # the dominant GraphQL call source in the system (195 calls/hour
-            # vs. 11 calls/hour for the already-batched monitor_projects()
-            # path). See issue #100.
+            # STEP 1.5: Batch-fetch board data for every board monitor_projects()
+            # already determined was due THIS cycle (due_boards_this_cycle,
+            # passed in by the caller), in ONE execute_batched_board_queries()
+            # call, instead of leaving each get_next_waiting_issue() call below
+            # (via sync_queue_with_github() -> get_issues_in_column_order()) to
+            # fetch its own board individually.
             #
-            # Gated behind the SAME USE_BATCHED_BOARD_QUERIES flag as #94's
-            # monitor_projects()-side batching (self._use_batched_board_queries)
-            # rather than applying unconditionally: this keeps one on/off
-            # switch for the whole batching rollout (consistent with #94's
-            # precedent) so it can be soaked/rolled back together with the
-            # rest of the batched-query path instead of as a second,
-            # independently-toggled change.
+            # CRITICAL: this reuses the caller's OWN due_boards list rather than
+            # re-deriving due-ness here via _is_board_due(). An earlier version
+            # of this fix did re-derive it, and was broken: by the time this
+            # method runs, monitor_projects()'s own batched branch has ALREADY
+            # called _record_board_poll_outcome() for every board it just
+            # polled, advancing next_due into the future - so a fresh
+            # _is_board_due() check moments later reads POST-mutation state and
+            # finds almost nothing due, silently disabling this failsafe's core
+            # "check the Development queue" function every cycle. Reusing the
+            # PRE-mutation due_boards list the caller already computed avoids
+            # that race entirely, and typically means execute_batched_board_queries()
+            # below is a cache hit for boards monitor_projects() just fetched
+            # moments ago (services/github_owner_utils.py's shared 15s-TTL
+            # cache, from #93) - not a guarantee, since the per-board
+            # feedback/discussion/escalated-cycle processing between that
+            # fetch and this call can itself take longer than the TTL on a
+            # cycle with many simultaneously-due boards, in which case this
+            # is a real (if infrequent) duplicate fetch rather than a free
+            # cache hit. It also means no project_config/project_state
+            # re-resolution is needed here at all - due_boards_this_cycle
+            # already carries owner/project_number/board_key straight from the
+            # caller's own (fatal-exit(1)-guarded) resolution of that state.
             #
-            # Gathering mirrors monitor_projects()'s batched-path board-
-            # gathering pass (the `all_boards` loop feeding _fetch_boards_batched())
-            # to build the same (owner, project_number) pairs, but WITHOUT that
-            # pass's fatal exit(1) on missing project/board state: this
-            # failsafe has always tolerated missing state per-board
-            # (get_issues_in_column_order() itself just logs and returns []
-            # for it), so here a gap simply drops that one board's pair from
-            # the batch - it then falls back to being fetched individually
-            # below, the same bounded per-board fallback contract
-            # _fetch_boards_batched() uses for its own per-board fallback.
+            # An even earlier version of this step gathered EVERY active board
+            # every cycle regardless of due-ness at all (before #94's backoff
+            # existed for this failsafe). Live production telemetry after
+            # deploying that version showed execute_batched_board_queries()
+            # alone issuing 674-736 calls/hour - the dominant GraphQL call
+            # source in the system, driving the account to 100% of its GraphQL
+            # budget well before the hourly reset.
+            #
+            # due_boards_this_cycle is None/empty when batching is off (the
+            # caller only computes/passes it from its own batched branch) - in
+            # that case this whole step is skipped and STEP 2 & 3 below checks
+            # every board individually, exactly as it always has.
             prefetched_board_data: Dict[Tuple[str, str], Dict[str, Any]] = {}
-            if self._use_batched_board_queries:
-                # The gathering + batched-fetch below is deliberately wrapped
-                # in its own try/except, separate from this method's outer
-                # try. Before this batching existed, a bad board could never
-                # raise past get_issues_in_column_order()'s own internal
-                # try/except (it logs and returns [] per-board) - so a single
-                # board's failure never affected any other board's
-                # processing in STEP 2 & 3 below. Without this guard, an
-                # unhandled exception here (e.g. a corrupted github_state.yaml
-                # in load_project_state(), or a parsing bug in
-                # execute_batched_board_queries()) would propagate to the
-                # method's outer except and skip STEP 2 & 3 for EVERY
-                # project/board this cycle, not just the one that failed - a
-                # regression from "one board fails, N-1 still processed" to
-                # "one board fails, 0 processed." On any failure here,
-                # prefetched_board_data is left empty, which is exactly
-                # equivalent to the flag being off for this one cycle: every
-                # board below falls back to fetching itself individually via
-                # get_next_waiting_issue()'s existing (already-safe) path.
+            # None means "no due-restriction - check every board" (batching
+            # off, breaker open, or this step hit an unexpected error):
+            # preserves the pre-existing every-board-every-cycle behavior in
+            # all of those cases. Only set to a real set when
+            # due_boards_this_cycle was provided and gathering actually ran,
+            # restricting STEP 2 & 3 below to just the boards due this cycle.
+            due_board_keys: Optional[set] = None
+            # `is not None`, not plain truthiness: an empty list is a
+            # legitimate, common result (batching is on, but zero tracked
+            # boards happened to be due this exact cycle - e.g. right after
+            # a burst of boards all just had their next_due pushed out
+            # together) and must mean "check no board" (due_board_keys stays
+            # an empty set), not be conflated with None ("batching is off /
+            # not available", meaning "check every board"). `if
+            # due_boards_this_cycle:` would treat both the same, silently
+            # reverting to check-everything on every empty-due-set cycle and
+            # reproducing the same call-storm this whole fix exists for.
+            if due_boards_this_cycle is not None:
+                # The batched-fetch below is deliberately wrapped in its own
+                # try/except, separate from this method's outer try. Before
+                # this batching existed, a bad board could never raise past
+                # get_issues_in_column_order()'s own internal try/except (it
+                # logs and returns [] per-board) - so a single board's failure
+                # never affected any other board's processing in STEP 2 & 3
+                # below. Without this guard, an unhandled exception here (e.g.
+                # a parsing bug in execute_batched_board_queries()) would
+                # propagate to the method's outer except and skip STEP 2 & 3
+                # for EVERY project/board this cycle, not just the one that
+                # failed - a regression from "one board fails, N-1 still
+                # processed" to "one board fails, 0 processed." On any failure
+                # here, prefetched_board_data/due_board_keys are left at their
+                # "check everything" defaults.
                 try:
-                    from config.state_manager import state_manager
                     from services.github_owner_utils import execute_batched_board_queries
 
                     github_client = get_github_client()
                     if github_client.breaker.is_open():
-                        # Matches _fetch_boards_batched()'s own breaker check
-                        # (services/project_monitor.py) - skip the batch
-                        # fetch entirely rather than issuing a query that
-                        # graphql() would just short-circuit anyway, which
-                        # would otherwise log a spurious "batched query
-                        # failed" warning for every board, every cycle, for
-                        # the duration of the outage.
+                        # Matches _fetch_boards_batched()'s own breaker check -
+                        # skip the batch fetch entirely rather than issuing a
+                        # query that graphql() would just short-circuit anyway,
+                        # which would otherwise log a spurious "batched query
+                        # failed" warning for every board, every cycle, for the
+                        # duration of the outage. due_board_keys stays None, so
+                        # STEP 2 & 3 checks every board individually - the same
+                        # degraded-but-safe behavior as any other failure path
+                        # here.
                         logger.debug("FAILSAFE: Circuit breaker is open, skipping batched board pre-fetch this cycle")
                     else:
-                        owner_project_pairs: List[Tuple[str, int]] = []
-                        board_key_by_pair: Dict[Tuple[str, int], Tuple[str, str]] = {}
-                        for project_name in self.config_manager.list_visible_projects():
-                            project_config = self.config_manager.get_project_config(project_name)
-                            project_state = state_manager.load_project_state(project_name)
-                            if not project_state:
-                                # Matches get_issues_in_column_order()'s own tolerant
-                                # handling of missing state - skip gathering this
-                                # project's boards for the batch; the per-board fallback
-                                # inside get_next_waiting_issue() below will hit (and
-                                # log) the same missing-state condition itself.
+                        owner_project_pairs = [(b['owner'], b['project_number']) for b in due_boards_this_cycle]
+                        board_key_by_pair = {
+                            (b['owner'], b['project_number']): b['board_key'] for b in due_boards_this_cycle
+                        }
+
+                        batched_results, batched_errors = execute_batched_board_queries(owner_project_pairs)
+
+                        for pair, project_data in batched_results.items():
+                            board_key = board_key_by_pair.get(pair)
+                            if board_key is not None:
+                                prefetched_board_data[board_key] = project_data
+
+                        # Every board in due_boards_this_cycle is due, whether
+                        # or not its batched fetch actually succeeded - STEP
+                        # 2 & 3 below still checks it, falling back to an
+                        # individual fetch for the ones missing from
+                        # prefetched_board_data (present in batched_errors, or
+                        # silently dropped before ever reaching a query - e.g.
+                        # build_batched_board_queries() skips a whole chunk
+                        # whose owner type can't be resolved). Logged for
+                        # every pair missing from batched_results, not just
+                        # the ones explicitly present in batched_errors, so a
+                        # silently-dropped board isn't invisible - the same
+                        # gap already fixed in _fetch_boards_batched() itself.
+                        due_board_keys = {b['board_key'] for b in due_boards_this_cycle}
+                        for pair, board_key in board_key_by_pair.items():
+                            if pair in batched_results:
                                 continue
-
-                            for pipeline in project_config.pipelines:
-                                if not pipeline.active:
-                                    continue
-
-                                board_state = project_state.boards.get(pipeline.board_name)
-                                if not board_state:
-                                    continue
-
-                                pair = (project_config.github['org'], board_state.project_number)
-                                owner_project_pairs.append(pair)
-                                # NOTE: keyed by (owner, project_number), so two
-                                # different (project, board) pairs that happen to
-                                # resolve to the same underlying GitHub Project
-                                # (e.g. two orchestrator project configs pointed
-                                # at one physical board) would have the second
-                                # overwrite the first here - the "losing" board
-                                # simply gets no prefetch entry and falls back to
-                                # an individual fetch every cycle (safe, just
-                                # misses the batching optimization for that one
-                                # board). Not expected in a single well-formed
-                                # project config; left as-is given the fallback
-                                # is safe and this requires an unusual multi-
-                                # project board-reuse configuration to trigger.
-                                board_key_by_pair[pair] = (project_name, pipeline.board_name)
-
-                        if owner_project_pairs:
-                            batched_results, batched_errors = execute_batched_board_queries(owner_project_pairs)
-
-                            for pair, project_data in batched_results.items():
-                                board_key = board_key_by_pair.get(pair)
-                                if board_key is not None:
-                                    prefetched_board_data[board_key] = project_data
-
-                            # Boards missing from batched_results simply have no
-                            # entry in prefetched_board_data - the
-                            # get_next_waiting_issue() call below then falls back
-                            # to fetching that one board itself the normal way, the
-                            # exact bounded per-board fallback _fetch_boards_batched()
-                            # uses, so one bad board never loses the rest of this
-                            # cycle's boards. Logged for EVERY pair missing from
-                            # batched_results (not just the ones explicitly present
-                            # in batched_errors) - a pair can also be silently
-                            # dropped before ever reaching a query (e.g.
-                            # build_batched_board_queries() skips a whole chunk
-                            # whose owner type can't be resolved), landing in
-                            # neither dict. Without checking membership in
-                            # batched_results directly, that case produced no log
-                            # line at all - the board would silently fall back to
-                            # an individual fetch every cycle, forever, with zero
-                            # signal - the same gap already fixed in
-                            # _fetch_boards_batched() itself (services/project_monitor.py).
-                            for pair, board_key in board_key_by_pair.items():
-                                if pair in batched_results:
-                                    continue
-                                reason = batched_errors.get(pair, "board missing from batched response (query build skipped it)")
-                                logger.warning(
-                                    f"⚠️  FAILSAFE: Batched board query failed for "
-                                    f"{board_key[0]}/{board_key[1]} ({pair[0]}/project#{pair[1]}): "
-                                    f"{reason}. Falling back to single-board fetch for this board only."
-                                )
+                            reason = batched_errors.get(
+                                pair, "board missing from batched response (query build skipped it)"
+                            )
+                            logger.warning(
+                                f"⚠️  FAILSAFE: Batched board query failed for "
+                                f"{board_key[0]}/{board_key[1]} ({pair[0]}/project#{pair[1]}): "
+                                f"{reason}. Falling back to single-board fetch for this board only."
+                            )
                 except Exception as e:
                     logger.error(
                         f"FAILSAFE: Unexpected error during batched board pre-fetch - "
                         f"falling back to individual per-board fetches for this cycle: {e}"
                     )
                     prefetched_board_data = {}
+                    due_board_keys = None
 
             # STEP 2 & 3: Process waiting issues and stalled operations
             for project_name in self.config_manager.list_visible_projects():
@@ -7771,16 +7773,36 @@ _Repair cycle initiated by Switchyard_
                         else:
                             # SCENARIO 2: No in-flight issues - check for waiting Development issues
                             # This also syncs queue with GitHub (ensures up-to-date state)
+                            board_key = (project_name, pipeline.board_name)
+                            if due_board_keys is not None and board_key not in due_board_keys:
+                                # Not due this cycle (per-board backoff, same as
+                                # monitor_projects()'s item-fetch path) - skip the
+                                # network-touching queue check entirely rather than
+                                # falling back to an individual fetch, which would
+                                # silently re-check every board every cycle anyway
+                                # and defeat the whole point of gating STEP 1.5 on
+                                # due-ness. Bounded by that board's own current
+                                # backoff interval (max _max_poll_interval) before
+                                # it's checked again - acceptable for a failsafe
+                                # explicitly designed for "eventual correctness."
+                                logger.debug(
+                                    f"⚡ FAILSAFE: {project_name}/{pipeline.board_name} not due this "
+                                    f"cycle, skipping Development queue check"
+                                )
+                                continue
                             logger.debug(f"⚡ FAILSAFE: No in-flight issues for {project_name}/{pipeline.board_name}, checking Development queue...")
                             # Pass this board's batched-prefetched data (issue #100), if
-                            # any - .get() returns None for a board that wasn't gathered
-                            # above (flag off) or whose batched fetch failed, in which
-                            # case get_next_waiting_issue() falls back to fetching this
-                            # one board itself, exactly as it did before #100.
+                            # any - .get() returns None for a board that was due but
+                            # whose batched fetch failed/was ungatherable, in which case
+                            # get_next_waiting_issue() falls back to fetching this one
+                            # board itself (bounded to just that board, not skipped
+                            # above since due_board_keys wouldn't contain it either in
+                            # the ungatherable-state case - see the batch-gathering
+                            # loop above, which still adds a board to due_board_keys
+                            # once it's confirmed due, before it's known whether the
+                            # batch fetch for it will succeed).
                             next_issue = pipeline_queue.get_next_waiting_issue(
-                                prefetched_board_data=prefetched_board_data.get(
-                                    (project_name, pipeline.board_name)
-                                )
+                                prefetched_board_data=prefetched_board_data.get(board_key)
                             )
                             if next_issue:
                                 # We have: waiting issue + unlocked pipeline = should be processing!
@@ -8370,7 +8392,14 @@ _Repair cycle initiated by Switchyard_
                 # FAILSAFE: Check for waiting issues that haven't been processed
                 # This catches edge cases where pipeline lock is released but next issue isn't triggered
                 logger.debug("Running queue processing failsafe check...")
-                self._check_and_process_waiting_issues_failsafe(poll_cycle_items=poll_cycle_items)
+                # due_boards only exists in this local scope when the batched
+                # branch above actually ran (self._use_batched_board_queries) -
+                # the ternary's condition is evaluated first, so due_boards is
+                # only referenced when it's guaranteed to be defined.
+                self._check_and_process_waiting_issues_failsafe(
+                    poll_cycle_items=poll_cycle_items,
+                    due_boards_this_cycle=due_boards if self._use_batched_board_queries else None,
+                )
 
                 # Adaptive polling: backoff when idle, reset on activity
                 if not self._use_batched_board_queries:
