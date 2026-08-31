@@ -747,18 +747,26 @@ class GitWorkflowManager:
 
     async def pull_rebase(self, project_dir: str):
         """
-        Sync the workspace to the remote branch state via fetch + hard reset.
+        Sync the workspace to the remote branch state via fetch + push-then-reset.
 
         Replaces the previous `git pull --rebase` approach, which could produce
         "both added" merge conflicts when the shared workspace held local commits
         that diverged from remote (e.g. a previous agent committed but did not
         push before the next agent's workspace was prepared).
 
-        `git reset --hard origin/<branch>` is conflict-free and idempotent: it
-        always leaves the workspace at exactly the pushed remote state. Any
-        local-only commits are discarded with a warning — in the normal pipeline
-        flow agents always push before completing, so local-only commits indicate
-        stale state from a failed or incomplete run.
+        If local commits exist that the remote doesn't have, they are pushed first
+        — most of the time this is simply a previous step (e.g. a repair-cycle fix
+        iteration) that intentionally skipped its own push because it wasn't done
+        yet, not truly stale or conflicting state. `git push` updates the local
+        origin/<branch> tracking ref on success, so the reset below then finds
+        nothing left to discard for commit history — it still runs, to clear any
+        leftover dirty/uncommitted changes or untracked files.
+
+        Only when the push itself fails (genuine divergence — e.g. another agent
+        rewrote history — or a persistent network/auth failure) do we fall back to
+        discarding those commits via `git reset --hard origin/<branch>`, which is
+        conflict-free and idempotent: it always leaves the workspace at exactly the
+        pushed remote state.
 
         Raises exception if fetch or reset fails.
         """
@@ -791,7 +799,8 @@ class GitWorkflowManager:
                 logger.info(f"Remote branch {remote_ref} does not exist yet; skipping reset")
                 return
 
-            # Warn if there are local commits that will be discarded
+            # If there are local commits the remote doesn't have, try to push them
+            # before doing anything destructive.
             ahead_result = subprocess.run(
                 ['git', 'rev-list', '--count', f'{remote_ref}..HEAD'],
                 cwd=project_dir, capture_output=True, text=True, timeout=10
@@ -799,13 +808,22 @@ class GitWorkflowManager:
             if ahead_result.returncode == 0:
                 ahead_count = int(ahead_result.stdout.strip() or '0')
                 if ahead_count > 0:
-                    logger.error(
-                        f"Discarding {ahead_count} local commit(s) not on {remote_ref} — "
-                        f"previous agent should have pushed before completing. "
-                        f"Work in these commits is lost."
+                    logger.info(
+                        f"{ahead_count} local commit(s) not on {remote_ref} — "
+                        f"attempting to push before syncing workspace."
                     )
+                    try:
+                        await self.push_branch(project_dir, branch_name)
+                        logger.info(f"Pushed {ahead_count} previously-local commit(s) to {remote_ref}")
+                    except PushFailedError as e:
+                        logger.error(
+                            f"Could not push {ahead_count} local commit(s) not on {remote_ref} "
+                            f"before reset ({e}). Discarding them — work in these commits is lost."
+                        )
 
-            # Hard reset to remote state — cannot produce merge conflicts
+            # Hard reset to remote state — cannot produce merge conflicts. If the
+            # push above succeeded, this is a no-op for commit history (remote_ref
+            # now equals HEAD) and only clears any leftover dirty/uncommitted state.
             reset_result = subprocess.run(
                 ['git', 'reset', '--hard', remote_ref],
                 cwd=project_dir, capture_output=True, text=True, timeout=30

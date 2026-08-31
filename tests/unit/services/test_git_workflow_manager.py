@@ -11,11 +11,11 @@ Tests cover:
 
 import pytest
 import json
-from unittest.mock import Mock, patch, MagicMock, call
+from unittest.mock import Mock, AsyncMock, patch, MagicMock, call
 from pathlib import Path
 
 from services.github_api_client import GitHubAPIClient, get_github_client
-from services.git_workflow_manager import GitWorkflowManager, BranchInfo
+from services.git_workflow_manager import GitWorkflowManager, BranchInfo, PushFailedError
 
 
 class TestTrackGhOperation:
@@ -361,8 +361,101 @@ class TestTrackingIntegration:
     def test_tracking_doesnt_affect_rate_limit(self, client):
         """Test that gh operation tracking doesn't modify rate limit status."""
         initial_remaining = client.rate_limit.remaining
-        
+
         client.track_gh_operation('gh_pr_create', 'PR #1')
-        
+
         # Rate limit should be unchanged (tracking is only for counting)
         assert client.rate_limit.remaining == initial_remaining
+
+
+class TestPullRebase:
+    """Test GitWorkflowManager.pull_rebase()'s push-then-reset workspace sync.
+
+    pull_rebase() syncs a shared, reused project workspace to the remote branch
+    state before an agent runs. Local commits that were never pushed (e.g. a
+    repair-cycle fix iteration that intentionally skips its own push) must be
+    pushed before any destructive reset, so real work isn't silently discarded
+    just because the branch is being reused.
+    """
+
+    @pytest.fixture
+    def manager(self):
+        return GitWorkflowManager()
+
+    @staticmethod
+    def _subprocess_side_effect(ahead_count: int, remote_exists: bool = True):
+        """Build a subprocess.run side_effect covering pull_rebase's git calls."""
+        def _run(cmd, **kwargs):
+            if cmd[:3] == ['git', 'rev-parse', '--abbrev-ref']:
+                return Mock(returncode=0, stdout='feature/test-branch\n', stderr='')
+            if cmd[:2] == ['git', 'fetch']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:3] == ['git', 'rev-parse', '--verify']:
+                return Mock(returncode=0 if remote_exists else 1, stdout='', stderr='')
+            if cmd[:3] == ['git', 'rev-list', '--count']:
+                return Mock(returncode=0, stdout=f'{ahead_count}\n', stderr='')
+            if cmd[:3] == ['git', 'reset', '--hard']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:2] == ['git', 'clean']:
+                return Mock(returncode=0, stdout='', stderr='')
+            raise AssertionError(f"Unexpected subprocess.run call: {cmd}")
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_no_local_commits_skips_push_and_resets(self, manager):
+        """No local-only commits: push_branch is never attempted, reset still runs."""
+        manager.push_branch = AsyncMock()
+
+        with patch('services.git_workflow_manager.subprocess.run',
+                    side_effect=self._subprocess_side_effect(ahead_count=0)) as mock_run:
+            await manager.pull_rebase('/workspace/test-project')
+
+        manager.push_branch.assert_not_called()
+        reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
+        assert len(reset_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_local_commits_are_pushed_before_reset(self, manager):
+        """Local-only commits: pushed first; reset still runs (as a no-op) afterward."""
+        manager.push_branch = AsyncMock(return_value=None)
+
+        with patch('services.git_workflow_manager.subprocess.run',
+                    side_effect=self._subprocess_side_effect(ahead_count=2)) as mock_run:
+            with patch('services.git_workflow_manager.logger') as mock_logger:
+                await manager.pull_rebase('/workspace/test-project')
+
+        manager.push_branch.assert_awaited_once_with('/workspace/test-project', 'feature/test-branch')
+        reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
+        assert len(reset_calls) == 1
+        # A successful push must never be logged as discarding work.
+        discard_calls = [c for c in mock_logger.error.call_args_list if 'Discarding' in c.args[0]]
+        assert discard_calls == []
+
+    @pytest.mark.asyncio
+    async def test_push_failure_falls_back_to_reset_with_warning(self, manager):
+        """Genuine divergence (push fails): falls back to the existing discard-and-reset."""
+        manager.push_branch = AsyncMock(side_effect=PushFailedError("non-fast-forward"))
+
+        with patch('services.git_workflow_manager.subprocess.run',
+                    side_effect=self._subprocess_side_effect(ahead_count=3)) as mock_run:
+            with patch('services.git_workflow_manager.logger') as mock_logger:
+                await manager.pull_rebase('/workspace/test-project')
+
+        manager.push_branch.assert_awaited_once()
+        reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
+        assert len(reset_calls) == 1
+        discard_calls = [c for c in mock_logger.error.call_args_list if 'Discarding' in c.args[0]]
+        assert len(discard_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_remote_branch_returns_before_push_or_reset(self, manager):
+        """No remote branch yet (first push pending): nothing to sync, no push/reset attempted."""
+        manager.push_branch = AsyncMock()
+
+        with patch('services.git_workflow_manager.subprocess.run',
+                    side_effect=self._subprocess_side_effect(ahead_count=0, remote_exists=False)) as mock_run:
+            await manager.pull_rebase('/workspace/test-project')
+
+        manager.push_branch.assert_not_called()
+        reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
+        assert reset_calls == []
