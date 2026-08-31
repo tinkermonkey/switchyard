@@ -318,7 +318,7 @@ docker system prune -a
 
 **Issue detection → pipeline execution → agent run → progression:**
 1. `services/project_monitor.py` detects card movement on GitHub board
-2. `pipeline/orchestrator.py` creates pipeline run, iterates through stages
+2. `services/pipeline_run.py` (`PipelineRunManager`) tracks the run, `services/agent_executor.py` builds execution context and dispatches
 3. `claude/claude_integration.py` builds prompt, `claude/docker_runner.py` launches container
 4. Agent executes in Docker (`claude-agent-{project}-{task_id}`), output posted to GitHub
 5. `pipeline/progression.py` moves issue to next column
@@ -333,8 +333,8 @@ docker system prune -a
 | Agent config (model, timeout) | `config/foundations/agents.yaml` |
 | Pipeline stage sequence | `config/foundations/pipelines.yaml` |
 | Board columns & automation | `config/foundations/workflows.yaml` |
-| Review cycle logic | `pipeline/orchestrator.py` (review cycle methods) |
-| Repair cycle logic | `pipeline/orchestrator.py` (repair cycle methods) |
+| Review cycle logic | `services/review_cycle.py` (`ReviewCycleExecutor`) |
+| Repair cycle logic | `pipeline/repair_cycle.py` (`RepairCycleStage`) |
 | Docker container setup | `claude/docker_runner.py` |
 | Event types | `monitoring/observability.py` (`EventType` enum) |
 | ES index schemas | `services/pattern_detection_schema.py` |
@@ -555,18 +555,6 @@ docker-compose exec orchestrator python scripts/inspect_task_health.py --project
 docker-compose exec orchestrator python scripts/inspect_task_health.py --json
 ```
 
-**Checkpoint Inspector** - Verify pipeline recovery state:
-```bash
-# List recent checkpoints
-docker-compose exec orchestrator python scripts/inspect_checkpoint.py
-
-# Inspect specific pipeline
-docker-compose exec orchestrator python scripts/inspect_checkpoint.py <pipeline_run_id>
-
-# Verify recovery readiness
-docker-compose exec orchestrator python scripts/inspect_checkpoint.py <pipeline_run_id> --verify-recovery
-```
-
 See `scripts/DIAGNOSTIC_SCRIPTS.md` for complete documentation, examples, and common workflows.
 
 ## Security Considerations
@@ -593,13 +581,18 @@ switchyard/
 │   └── state_manager.py        # GitHub state management
 ├── pipeline/                    # Pipeline orchestration
 │   ├── base.py                 # PipelineStage base class
-│   └── orchestrator.py         # Sequential pipeline executor
+│   ├── pr_review_stage.py      # PR review multi-phase orchestration
+│   └── repair_cycle.py         # Repair cycle stage
 ├── services/                    # Service layer
 │   ├── github_project_manager.py  # Board reconciliation
 │   ├── project_monitor.py      # Board polling
 │   ├── git_workflow_manager.py # Git automation
+│   ├── pipeline_run.py         # PipelineRunManager (run tracking)
+│   ├── pipeline_lock_manager.py # Per-(project, board) exclusive lock
+│   ├── pipeline_semaphore_manager.py # Per-(project, board) counted semaphore
+│   ├── review_cycle.py         # ReviewCycleExecutor (maker-checker cycles)
 │   └── ...
-├── state_management/           # Checkpointing, recovery, PR review state
+├── state_management/           # PR review cycle state (pr_review_state_manager.py)
 ├── task_queue/                 # Redis task queue
 ├── claude/                     # Claude integration
 │   ├── claude_integration.py  # Claude API wrapper

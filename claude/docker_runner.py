@@ -1659,21 +1659,9 @@ class DockerAgentRunner:
                     obs.emit_container_execution_failed(agent, task_id, project, container_name, exit_code, error_preview, duration_ms,
                                                         pipeline_run_id=pipeline_run_id)
 
-            # Cleanup ALL prompt files in project directory
-            # This handles accumulation from multiple runs and prevents workspace contamination
-            try:
-                import glob
-                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
-                for prompt_file in project_prompt_files:
-                    try:
-                        os.remove(prompt_file)
-                        logger.debug(f"Cleaned up prompt file: {os.path.basename(prompt_file)}")
-                    except Exception as e:
-                        logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
-                if project_prompt_files:
-                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after agent completion")
-            except Exception as e:
-                logger.warning(f"Failed to cleanup prompt files: {e}")
+            # Cleanup this run's own prompt file (not a glob over other runs' files —
+            # see _cleanup_prompt_file).
+            self._cleanup_prompt_file(prompt_path)
 
             # Promote an orchestrator-initiated grace-period kill to success BEFORE emitting
             # observability so metrics reflect the true outcome. Gated on _orchestrator_killed
@@ -2017,20 +2005,9 @@ class DockerAgentRunner:
             # Try to kill container if it's still running
             self._cleanup_container(container_name)
 
-            # Cleanup ALL prompt files in project directory on exception
-            try:
-                import glob
-                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
-                for prompt_file in project_prompt_files:
-                    try:
-                        os.remove(prompt_file)
-                        logger.debug(f"Cleaned up prompt file after exception: {os.path.basename(prompt_file)}")
-                    except Exception as cleanup_err:
-                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
-                if project_prompt_files:
-                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after exception")
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup prompt files during exception: {cleanup_err}")
+            # Cleanup this run's own prompt file (not a glob over other runs' files —
+            # see _cleanup_prompt_file).
+            self._cleanup_prompt_file(prompt_path, context_label="exception")
 
             raise
 
@@ -2038,39 +2015,17 @@ class DockerAgentRunner:
             logger.error("Agent execution timed out")
             self._cleanup_container(container_name)
 
-            # Cleanup ALL prompt files in project directory on timeout
-            try:
-                import glob
-                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
-                for prompt_file in project_prompt_files:
-                    try:
-                        os.remove(prompt_file)
-                        logger.debug(f"Cleaned up prompt file after timeout: {os.path.basename(prompt_file)}")
-                    except Exception as cleanup_err:
-                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
-                if project_prompt_files:
-                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after timeout")
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup prompt files during timeout: {cleanup_err}")
+            # Cleanup this run's own prompt file (not a glob over other runs' files —
+            # see _cleanup_prompt_file).
+            self._cleanup_prompt_file(prompt_path, context_label="timeout")
 
             raise Exception("Agent execution timed out")
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
 
-            # Cleanup ALL prompt files in project directory on exception
-            try:
-                import glob
-                project_prompt_files = glob.glob(str(project_dir / '.claude_prompt_*.txt'))
-                for prompt_file in project_prompt_files:
-                    try:
-                        os.remove(prompt_file)
-                        logger.debug(f"Cleaned up prompt file after exception: {os.path.basename(prompt_file)}")
-                    except Exception as cleanup_err:
-                        logger.warning(f"Failed to remove prompt file {prompt_file}: {cleanup_err}")
-                if project_prompt_files:
-                    logger.info(f"Cleaned up {len(project_prompt_files)} prompt file(s) after exception")
-            except Exception as cleanup_err:
-                logger.warning(f"Failed to cleanup prompt files during exception: {cleanup_err}")
+            # Cleanup this run's own prompt file (not a glob over other runs' files —
+            # see _cleanup_prompt_file).
+            self._cleanup_prompt_file(prompt_path, context_label="exception")
 
             raise
 
@@ -2145,6 +2100,26 @@ class DockerAgentRunner:
             logger.debug(f"Cleaned up container {container_name}")
         except Exception as e:
             logger.warning(f"Failed to cleanup container {container_name}: {e}")
+
+    def _cleanup_prompt_file(self, prompt_path: Path, context_label: str = "") -> None:
+        """Remove this run's own prompt file.
+
+        Deletes only the exact `prompt_path` written for the current run — never a
+        glob over `.claude_prompt_*.txt` in project_dir. project_dir is shared across
+        concurrently-running tasks for the same project, and each has its own
+        `.claude_prompt_{task_id}.txt`; a glob-delete would remove another in-flight
+        run's still-unread prompt file out from under it.
+
+        `context_label` (e.g. "exception", "timeout") is appended to log messages
+        only; it has no effect on which file is removed.
+        """
+        suffix = f" after {context_label}" if context_label else ""
+        try:
+            if prompt_path.exists():
+                prompt_path.unlink(missing_ok=True)
+                logger.debug(f"Cleaned up prompt file{suffix}: {prompt_path.name}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup prompt file {prompt_path}{suffix}: {e}")
 
     def _raise_for_failed_exit_code(self, exit_code: int, stderr_excerpt: str):
         """Raise appropriate exception for a non-zero exit code.

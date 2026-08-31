@@ -578,6 +578,12 @@ class ProjectMonitor:
         import threading
         self.rescan_complete = threading.Event()
 
+        # Guards concurrent access to self.last_state: the polling loop's
+        # detect_changes() writes it on its own cadence while _reconcile_active_runs()
+        # and _rescan_boards_for_stalled_items() read it during reconciliation/rescan.
+        # In-process only (no cross-process contention), so a plain Lock is sufficient.
+        self._last_state_lock = threading.Lock()
+
         # Initialize feedback manager
         from services.feedback_manager import FeedbackManager
         self.feedback_manager = FeedbackManager()
@@ -1326,8 +1332,9 @@ class ProjectMonitor:
         # Create lookup by issue number for current items
         current_by_issue = {item.issue_number: item for item in current_items}
 
-        # Get last known state
-        last_items = self.last_state.get(project_name, {})
+        # Get last known state (snapshot under lock; diffing below runs unlocked)
+        with self._last_state_lock:
+            last_items = dict(self.last_state.get(project_name, {}))
 
         # Check for status changes
         for issue_number, current_item in current_by_issue.items():
@@ -1390,7 +1397,8 @@ class ProjectMonitor:
                     )
 
         # Update last state
-        self.last_state[project_name] = current_by_issue
+        with self._last_state_lock:
+            self.last_state[project_name] = current_by_issue
 
         return changes
 
@@ -6197,7 +6205,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 try:
                     _ci_config = project_config.ci or {}
                     _skip_ci = not _ci_config.get('enabled', True)
-                    stage = PRReviewStage(name="pr_review", skip_ci_check=_skip_ci)
+                    stage = PRReviewStage(name="pr_review", skip_ci_check=_skip_ci, project_name=project_name)
                     loop.run_until_complete(stage.execute(stage_context))
 
                     # Record success — must match the 'pr_review_stage' outer wrapper name
@@ -6759,10 +6767,10 @@ _Repair cycle initiated by Switchyard_
                         continue
 
                     board_key = f"{project_name}_{pipeline.board_name}"
-                    if board_key not in self.last_state:
-                        continue
-
-                    current_items = self.last_state[board_key].values()
+                    with self._last_state_lock:
+                        if board_key not in self.last_state:
+                            continue
+                        current_items = list(self.last_state[board_key].values())
                     workflow_template = self.config_manager.get_workflow_template(pipeline.workflow)
 
                     for item in current_items:
@@ -7028,10 +7036,10 @@ _Repair cycle initiated by Switchyard_
 
                     # Get current items on the board
                     board_key = f"{project_name}_{pipeline.board_name}"
-                    if board_key not in self.last_state:
-                        continue
-
-                    current_items = self.last_state[board_key].values()
+                    with self._last_state_lock:
+                        if board_key not in self.last_state:
+                            continue
+                        current_items = list(self.last_state[board_key].values())
 
                     for item in current_items:
                         # Find column config
@@ -8139,7 +8147,8 @@ _Repair cycle initiated by Switchyard_
                                         f"Error seeding last_state for #{issue_number}: {seed_err}"
                                     )
 
-                            self.last_state[board_key] = current_by_issue
+                            with self._last_state_lock:
+                                self.last_state[board_key] = current_by_issue
                             logger.info(f"Initialized state for {project_name}/{pipeline.board_name}: {len(current_items)} items")
             except Exception as e:
                 logger.warning(f"Error during project state initialization: {e}")

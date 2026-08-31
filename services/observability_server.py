@@ -2,9 +2,22 @@
 WebSocket server for streaming agent observability events to web UI
 """
 
-# Monkey patch for eventlet MUST be first
+# eventlet.monkey_patch() globally and irreversibly replaces socket/ssl/
+# threading/select for the rest of the process — it must run before any of
+# those stdlib modules are imported elsewhere, which is why this stays the
+# very first thing in the file. But it must ONLY run when this module is
+# actually executed as the server entrypoint (`python -m
+# services.observability_server`, see docker-compose.yml) — this module is
+# never imported as a library by other production code. It IS imported by
+# tests (e.g. test_active_pipeline_runs_board_scoping.py, which needs
+# start_observability_server() for assertions unrelated to eventlet), and an
+# unconditional monkey_patch() there broke unrelated threading/asyncio-based
+# tests elsewhere in the same pytest session merely by being imported during
+# collection, since the patch is process-wide and can't be undone.
 import eventlet
-eventlet.monkey_patch()
+
+if __name__ == "__main__":
+    eventlet.monkey_patch()
 
 import asyncio
 import json
@@ -1201,7 +1214,7 @@ def get_active_pipeline_runs():
         lock_manager = get_pipeline_lock_manager()
 
         runs = []
-        seen_project_issue = set()
+        seen_project_board_issue = set()
         for hit in result['hits']['hits']:
             run_data = hit['_source']
 
@@ -1223,7 +1236,7 @@ def get_active_pipeline_runs():
                 if lock_status == 'waiting_for_lock' and lock_holder:
                     run_data['blocked_by_issue'] = lock_holder
 
-                seen_project_issue.add((project, issue_number))
+                seen_project_board_issue.add((project, board, issue_number))
             else:
                 # Missing data - mark as unknown
                 run_data['lock_status'] = 'unknown'
@@ -1244,7 +1257,7 @@ def get_active_pipeline_runs():
                 if not lock.retained_reason:
                     continue
                 project, issue_number = lock.project, lock.locked_by_issue
-                if (project, issue_number) in seen_project_issue:
+                if (project, lock.board, issue_number) in seen_project_board_issue:
                     continue  # shouldn't happen (failed locks aren't active) but stay safe
 
                 run_data = {
@@ -1268,7 +1281,7 @@ def get_active_pipeline_runs():
                 try:
                     from services.pipeline_run import get_pipeline_run_manager
                     pipeline_run_manager = get_pipeline_run_manager()
-                    recent_id = pipeline_run_manager.get_recent_pipeline_run_id(project, issue_number)
+                    recent_id = pipeline_run_manager.get_recent_pipeline_run_id(project, issue_number, board=lock.board)
                     if recent_id:
                         recent_run = pipeline_run_manager.get_pipeline_run_by_id(recent_id)
                         if recent_run:

@@ -37,6 +37,7 @@ from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
+from services.pipeline_run import format_pipeline_run_issue_key
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
@@ -388,8 +389,16 @@ async def list_issues(
 
             pipeline_run_id = r.hget(
                 "orchestrator:pipeline_run:issue_mapping",
-                f"{project}:{issue_number}",
+                format_pipeline_run_issue_key(project, issue_number, board_name),
             )
+            if not pipeline_run_id:
+                # Fall back to the legacy (pre-board-scoping) key, matching
+                # get_issue()'s behavior — otherwise the two tools disagree
+                # for any mapping still stored in the legacy format.
+                pipeline_run_id = r.hget(
+                    "orchestrator:pipeline_run:issue_mapping",
+                    format_pipeline_run_issue_key(project, issue_number),
+                )
             results.append({
                 "issue_number": issue_number,
                 "title": content.get("title"),
@@ -502,10 +511,36 @@ async def get_issue(issue_number: int, project: str) -> dict:
         await asyncio.sleep(_GET_ISSUE_STATUS_RETRY_DELAY_SECONDS)
 
     r = _get_redis()
-    pipeline_run_id = r.hget(
-        "orchestrator:pipeline_run:issue_mapping",
-        f"{project}:{issue_number}",
-    )
+    # No single board is in scope here (this tool aggregates board_statuses
+    # across every board the issue sits on), so a plain hget can't do a
+    # prefix match. Scan for any board-scoped active run for this issue,
+    # falling back to the legacy 2-field key for backward compatibility.
+    pipeline_run_id = None
+    board_scoped_matches: dict[str, str] = {}
+    cursor = 0
+    while True:
+        cursor, batch = r.hscan(
+            "orchestrator:pipeline_run:issue_mapping",
+            cursor=cursor,
+            match=f"{project}:*:{issue_number}",
+        )
+        board_scoped_matches.update(batch)
+        if cursor == 0:
+            break
+    if board_scoped_matches:
+        if len(board_scoped_matches) > 1:
+            log.info(
+                "get_issue: issue #%d in project '%s' has active pipeline runs on "
+                "%d boards (%s) — using the first",
+                issue_number, project, len(board_scoped_matches),
+                list(board_scoped_matches.keys()),
+            )
+        pipeline_run_id = next(iter(board_scoped_matches.values()))
+    else:
+        pipeline_run_id = r.hget(
+            "orchestrator:pipeline_run:issue_mapping",
+            format_pipeline_run_issue_key(project, issue_number),
+        )
     pipeline_run: dict | None = None
     if pipeline_run_id:
         pipeline_run = _redis_get_run(pipeline_run_id, r)
@@ -909,6 +944,9 @@ async def list_active_runs(project: str | None = None) -> list[dict]:
     seen: set[str] = set()
 
     for issue_key, run_id in all_mappings.items():
+        # partition() splits only on the FIRST colon, so this correctly extracts
+        # just the project name from both the legacy "project:issue_number" and
+        # the board-scoped "project:board:issue_number" key shapes (verified).
         proj, _, _ = issue_key.partition(":")
         if project and proj != project:
             continue

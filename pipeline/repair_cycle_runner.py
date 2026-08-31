@@ -160,7 +160,8 @@ class RepairCycleRunner:
                 test_configs=test_configs,
                 agent_name=self.context.get('agent_name', 'senior_software_engineer'),
                 max_total_agent_calls=self.context.get('max_total_agent_calls', 100),
-                checkpoint_interval=self.context.get('checkpoint_interval', 5)
+                checkpoint_interval=self.context.get('checkpoint_interval', 5),
+                project_name=self.context.get('project'),
             )
 
             logger.info(

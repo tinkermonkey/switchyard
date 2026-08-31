@@ -16,7 +16,6 @@ from config.manager import config_manager
 from config.state_manager import state_manager as github_state_manager
 from monitoring.logging import OrchestratorLogger
 from monitoring.metrics import MetricsCollector
-from state_management.manager import StateManager
 from task_queue.task_manager import TaskQueue
 from claude.session_manager import ClaudeSessionManager
 from monitoring.health_monitor import HealthMonitor
@@ -190,9 +189,6 @@ async def main():
     root_logger.info("Zombie process reaper enabled (SIGCHLD handler registered)")
 
     metrics = MetricsCollector()
-
-    # Initialize state management
-    state_manager = StateManager(Path("orchestrator_data/state"))
 
     # Initialize task queue with Redis
     task_queue = TaskQueue(use_redis=True)
@@ -711,7 +707,7 @@ async def main():
 
                         start_time = time.time()
                         try:
-                            result = await process_task_integrated(task, state_manager, logger)
+                            result = await process_task_integrated(task, None, logger)
                             duration = time.time() - start_time
 
                             logger.log_agent_complete(

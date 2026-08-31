@@ -11,11 +11,9 @@ import threading
 import logging
 import time
 from typing import Optional, List, Dict, Any
-from pathlib import Path
 
 from task_queue.task_manager import TaskQueue, Task
 from agents.orchestrator_integration import process_task_integrated
-from state_management.manager import StateManager
 from monitoring.metrics import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -44,12 +42,6 @@ class TaskWorker:
         self.current_task: Optional[Task] = None
         self.tasks_processed = 0
         self.tasks_failed = 0
-
-        # Each worker gets its own StateManager instance
-        # (though state files use file locks for safety)
-        self.state_manager = StateManager(
-            Path(f"orchestrator_data/state")
-        )
 
     async def run(self):
         """Main worker loop - continuously processes tasks from queue"""
@@ -80,7 +72,7 @@ class TaskWorker:
                             attempt += 1
                             try:
                                 result = await process_task_integrated(
-                                    task, self.state_manager, self.logger
+                                    task, None, self.logger
                                 )
                                 duration = time.time() - start_time
 

@@ -6,7 +6,7 @@ A **pipeline template** (`config/foundations/pipelines.yaml`) defines a reusable
 
 A **workflow template** (`config/foundations/workflows.yaml`) defines the Kanban board structure that drives a pipeline. Each column in a workflow maps to a stage in the corresponding pipeline template. Moving an issue into a column is what triggers that stage to execute. A workflow also declares which columns signal "pipeline is active" (`pipeline_trigger_columns`) and which signal "pipeline is complete" (`pipeline_exit_columns`).
 
-A **pipeline run** is a live execution of a pipeline template for a specific issue and project. It is created by `SequentialPipeline` in `pipeline/orchestrator.py` and assigned a `pipeline_id` at runtime. The run advances through stages sequentially, checkpointing before each stage and logging completion or failure after each one.
+A **pipeline run** is a tracking record for a specific issue and project's journey through a pipeline template — not an executing object. `PipelineRunManager.get_or_create_pipeline_run()` (`services/pipeline_run.py`) creates it the moment `ProjectMonitor` detects the issue entering the pipeline (right after the pipeline lock is acquired, before any stage runs) and assigns it a `pipeline_run_id` UUID that tags every subsequent task, agent execution, and observability event for that issue. There is no long-lived process that walks the template's stage list: each column the issue moves into independently triggers exactly one stage's execution, and the issue's current board column IS its position in the pipeline — nothing else tracks "which stage is next." `PipelineRunManager` records status (`active`, `completed`, `failed`) in Redis (fast lookups, 2-hour TTL) and Elasticsearch (durable history, 7-day retention) purely for observability and failure tracking, not to drive execution.
 
 The three templates and the workflows that instantiate them:
 
@@ -52,7 +52,7 @@ graph TD
     SE_CHECK -->|yes| PD5
 ```
 
-Projects reference templates and workflows in `config/projects/<project>.yaml`. The `PipelineFactory` in `pipeline/factory.py` instantiates a `SequentialPipeline` from a template by creating one `AgentStage` per stage (plus a reviewer stage where `review_required: true`).
+Projects reference templates and workflows in `config/projects/<project>.yaml`. Nothing instantiates a whole pipeline of stages up front. Instead, each time an issue's column changes, `ProjectMonitor` looks up the single stage that column maps to and dispatches it directly: `RepairCycleStage` and `PRReviewStage` are constructed and run in-process for their respective stage types, while a standard stage is enqueued as a `Task` for a worker that calls `AgentExecutor.execute_agent()`, which uses `PipelineFactory` (`pipeline/factory.py`) to build one `AgentStage` for that column's agent. A reviewer for a `review_required: true` stage is dispatched separately — when the issue moves into the corresponding review column, `services/review_cycle.py`'s `ReviewCycleExecutor` runs the maker-checker loop.
 
 ---
 
@@ -99,47 +99,48 @@ flowchart TD
     B -->|no| A
     B -->|yes, column has agent| C{pipeline lock<br>available?}
     C -->|locked by another issue| D[add to PipelineQueueManager<br>defer processing]
-    C -->|available| E[fetch full issue details<br>gh issue view]
-    E --> F[assemble previous-stage context<br>get_previous_stage_context]
-    F --> G[enqueue Task in Redis<br>with priority]
-    G --> H[worker dequeues Task<br>calls process_task_integrated]
-    H --> I{validate_task_can_run}
-    I -->|dev container not verified| J[queue dev_environment_setup<br>defer task]
-    I -->|dev container in progress| K[defer task]
-    I -->|dev container verified| L{stage_type?}
-    L -->|none| M[AgentStage]
-    L -->|repair_cycle| N[RepairCycleStage]
-    L -->|pr_review| O[PRReviewStage]
-    M --> P[SequentialPipeline.execute]
-    N --> P
-    O --> P
-    P --> Q[checkpoint stage_index<br>to disk]
-    Q --> R[stage.run_with_circuit_breaker]
+    C -->|available| E[get_or_create_pipeline_run<br>tag pipeline_run_id]
+    E --> F{column / stage_type}
+    F -->|conversational| G[_start_conversational_loop_for_issue<br>runs in-process]
+    F -->|review| H[_start_review_cycle_for_issue<br>ReviewCycleExecutor, in-process]
+    F -->|repair_cycle| I[_start_repair_cycle_for_issue<br>RepairCycleStage, Docker]
+    F -->|pr_review| J[_start_pr_review_for_issue<br>PRReviewStage, in-process thread]
+    F -->|standard stage| K[assemble previous-stage context<br>get_previous_stage_context]
+    K --> L[enqueue Task in Redis<br>with priority]
+    L --> M[worker dequeues Task<br>process_task_integrated]
+    M --> N{validate_task_can_run}
+    N -->|dev container not verified| O[queue dev_environment_setup<br>defer task]
+    N -->|dev container in progress| P[defer task]
+    N -->|dev container verified| Q[AgentExecutor.execute_agent]
+    Q --> R[PipelineFactory.create_agent<br>builds one AgentStage]
+    R --> S[agent_stage.run_with_circuit_breaker]
 ```
 
 ### Detection
 
 `ProjectMonitor` (`services/project_monitor.py`) polls every GitHub Projects v2 board every 15–60 seconds (adaptive backoff when idle). On each poll, `get_project_items()` queries the board via GraphQL. `detect_changes()` compares the result to `last_state` and emits a `status_changed` event when an issue moves to a new column.
 
-### Task creation
+### Dispatch by column/stage type
 
-When a status change lands the issue in a `pipeline_trigger_column` (e.g., `Development` in `sdlc_execution_workflow`), the monitor looks up the column's `stage_mapping` and `agent` from the workflow config, fetches full issue details via `gh issue view`, assembles previous-stage context from prior comments (`get_previous_stage_context()`), and enqueues a `Task` into the Redis-backed `TaskQueue`.
+When a status change lands the issue in a `pipeline_trigger_column` (e.g., `Development` in `sdlc_execution_workflow`), the monitor first acquires the pipeline lock and calls `get_or_create_pipeline_run()` to tag the run, then branches on the column's `type` and the mapped stage's `stage_type`:
 
-The task carries:
+- **`type: conversational`** columns (Research, Requirements, Design) run `_start_conversational_loop_for_issue()` in-process.
+- **`type: review`** columns run `_start_review_cycle_for_issue()`, which hands off to `services/review_cycle.py`'s `ReviewCycleExecutor` for the maker-checker loop.
+- **`stage_type: repair_cycle`** columns run `_start_repair_cycle_for_issue()`, which constructs `RepairCycleStage` directly and launches its work in a Docker container.
+- **`stage_type: pr_review`** columns run `_start_pr_review_for_issue()`, which constructs `PRReviewStage` directly and runs it in-process on a background thread (no Docker container).
+- All other (standard) stages: the monitor fetches full issue details via `gh issue view`, assembles previous-stage context from prior comments (`get_previous_stage_context()`), and enqueues a `Task` into the Redis-backed `TaskQueue` for a worker to pick up.
+
+The enqueued task carries:
 - `agent`: the agent name from the workflow column config
 - `project`: project name
 - `priority`: mapped from issue labels or defaulted
-- `context`: issue object, issue number, board, repository, column, previous stage output, pipeline run ID, and (for repair cycles) test configurations
+- `context`: issue object, issue number, board, repository, column, previous stage output, pipeline run ID
 
 ### Execution
 
-The task worker dequeues the task and calls `create_stage_from_config()` (`agents/orchestrator_integration.py`), which inspects `stage_type` to instantiate the correct `PipelineStage` subclass:
+For queued standard stages, the task worker calls `process_task_integrated()` (`agents/orchestrator_integration.py`), which runs `validate_task_can_run()` (deferring the task if the project's dev container isn't verified) and then calls `AgentExecutor.execute_agent()` (`services/agent_executor.py`) — the single, centralized entry point every execution path (task queue, review cycles, repair cycles, conversational loops) ultimately calls through. `AgentExecutor` uses `PipelineFactory.create_agent()` to build one `AgentStage` for the target agent and runs it via `agent_stage.run_with_circuit_breaker()`. There is no cross-stage loop: each call executes exactly one stage for one column, and column-to-column advancement is driven separately by review-cycle/repair-cycle completion logic or `services/pipeline_progression.py`'s `PipelineProgression`, not by anything iterating the pipeline template.
 
-- No `stage_type` → `AgentStage` wrapping the registered maker agent class
-- `stage_type: repair_cycle` → `RepairCycleStage`
-- `stage_type: pr_review` → `PRReviewStage`
-
-`SequentialPipeline.execute()` then runs the stage. Before executing each stage, it creates a checkpoint. After successful execution, it logs completion and increments `current_stage_index`. On failure, it logs the error and checks whether the circuit breaker is open; if so, it raises and halts the pipeline.
+On failure (after `AgentExecutor`'s own per-dispatch retries are exhausted), the failure path calls `PipelineRunManager.mark_failed()`, which ends the pipeline run with outcome `"failed"` and durably marks the pipeline lock as retained (`PipelineLockManager.mark_lock_failed()` sets `PipelineLock.retained_reason`). A retained lock blocks any further dispatch for that project/board until a human runs `scripts/release_lock.py` — see "Checkpointing and recovery" below.
 
 ---
 
@@ -277,16 +278,13 @@ Columns with `action: start_conversational_loop` support threaded Q&A. When a hu
 
 ## Checkpointing and recovery
 
-### SequentialPipeline checkpoints
+There is no pipeline-run-level (cross-stage) checkpoint or resume mechanism. Since each column-triggered stage execution is independent and the GitHub board column itself is an issue's durable position in the pipeline, there is no in-process or on-disk "pipeline state" that would need to be checkpointed and restored across stages. Recovery from an orchestrator restart, and from a stage's ultimate failure, instead relies on two independent mechanisms:
 
-Before each stage executes, `SequentialPipeline` calls `StateManager.checkpoint()`, which writes a JSON file to `orchestrator_data/state/checkpoints/<pipeline_id>_stage_<index>.json`. The checkpoint contains:
+### Restart recovery
 
-- `pipeline_id`
-- `stage_index` (the index about to execute)
-- `timestamp`
-- `context` (serializable keys only; non-serializable objects such as `state_manager` and `logger` are skipped)
+On startup, `ProjectMonitor._reconcile_active_runs()` compares every active pipeline run (from `PipelineRunManager`) against current board state: if an issue's active run is sitting in an exit column or a column with no agent, the run is ended. Separately, `services/agent_container_recovery.py`'s `AgentContainerRecovery` inspects real Docker state (`recover_or_cleanup_containers()` for standard agent containers, `recover_or_cleanup_repair_cycle_containers()` for repair-cycle containers): a container still running is reconnected to rather than duplicated; a container that died mid-execution has its execution state cleaned up so the issue can be re-dispatched from its current column. Because the board column drives what happens next, a clean restart requires no replay of prior stages — the monitor's normal polling loop simply re-observes the issue's current column state.
 
-On `SequentialPipeline.execute()` startup, `get_latest_checkpoint()` scans for checkpoint files matching the pipeline ID and returns the one with the highest stage index. If found, execution resumes from that stage using the stored context rather than `initial_context`.
+Failure handling itself is durable and independent of any in-memory pipeline object: when a stage's execution ultimately fails (after `AgentExecutor`'s own retries), `PipelineRunManager.mark_failed()` is the single shared entry point every failure path calls. It ends the `PipelineRun` (for ES/dashboard history) and unconditionally marks the pipeline lock as retained via `PipelineLockManager.mark_lock_failed()`, setting `PipelineLock.retained_reason` (persisted in both Redis and YAML, no TTL on the YAML copy). A retained lock is never auto-recovered by staleness/TTL/restart-sync logic and blocks re-dispatch of that project/board until a human runs `scripts/release_lock.py`. This replaced an older, non-durable `work_execution_state` halt-marker mechanism that stored its flag in a per-issue YAML file disconnected from the lock.
 
 ### Repair cycle checkpoints
 
@@ -317,8 +315,15 @@ Issue created in Backlog
         v
 ProjectMonitor detects status_changed
         |
-        | enqueue Task
+        | acquire pipeline lock, get_or_create_pipeline_run()
         v
+[column type / stage_type?]
+        |-- conversational  --> _start_conversational_loop_for_issue (in-process)
+        |-- review          --> _start_review_cycle_for_issue --> ReviewCycleExecutor (in-process)
+        |-- repair_cycle    --> _start_repair_cycle_for_issue --> RepairCycleStage (Docker)
+        |-- pr_review       --> _start_pr_review_for_issue --> PRReviewStage (in-process thread)
+        |-- standard stage  --> enqueue Task
+        v (standard stage path)
 TaskQueue (Redis)
         |
         | dequeue
@@ -327,19 +332,14 @@ validate_task_can_run()
         |-- dev container not verified --> queue dev_environment_setup task, defer
         |-- dev container in progress  --> defer
         v (dev container verified)
-create_stage_from_config()
-        |-- standard stage   --> AgentStage
-        |-- repair_cycle     --> RepairCycleStage
-        |-- pr_review        --> PRReviewStage
-        v
-SequentialPipeline.execute()
+AgentExecutor.execute_agent()
         |
-        +-- checkpoint (stage_index, context)
+        +-- PipelineFactory.create_agent() --> one AgentStage
         |
         v
-stage.run_with_circuit_breaker()
+agent_stage.run_with_circuit_breaker()
         |
-        |-- circuit breaker OPEN --> raise, pipeline halts
+        |-- circuit breaker OPEN, retries exhausted --> mark_failed(): lock retained, run ends "failed"
         |
         v
 MakerAgent.execute()
@@ -352,54 +352,43 @@ MakerAgent.execute()
 Agent output posted to GitHub issue/discussion as comment
         |
         v
-StateManager.log_stage_completion()
-current_stage_index += 1
+[did this execution make a manual progression? (e.g. PRReviewStage moved the card itself)]
+        |-- yes --> auto-advancement skipped
+        |-- no  --> if column's auto_advance_on_approval is set, advance to next column
         |
         v
-[review_required?]
-        |-- yes --> reviewer agent runs --> approved / changes_requested / blocked
-        |           approved    --> advance to next column
-        |           changes_requested (under max_iterations) --> revision mode, re-queue maker
-        |           blocked / over threshold --> escalate, halt pipeline
-        |-- no  --> advance to next column via pipeline_progression
+Next column's status_changed fires --> loop back to "column type / stage_type?" above
         |
         v
-[more stages?]
-        |-- yes --> loop back to checkpoint
-        |-- no  --> pipeline complete
-        |
-        v
-Issue moved to exit column (Staged or Done)
-Pipeline lock released
+Issue reaches an exit column (Staged or Done)
+Pipeline run marked completed, pipeline lock released
 ```
 
 ```mermaid
 flowchart TD
     S0([Issue in Backlog]) --> S1
-    S1[ProjectMonitor detects<br>status_changed] --> S2
+    S1[ProjectMonitor detects<br>status_changed] --> S1B[acquire lock<br>get_or_create_pipeline_run]
+    S1B --> S1C{column type /<br>stage_type?}
+    S1C -->|conversational| S1D[conversational loop<br>in-process]
+    S1C -->|review| S1E[ReviewCycleExecutor<br>in-process]
+    S1C -->|repair_cycle| S1F[RepairCycleStage<br>Docker]
+    S1C -->|pr_review| S1G[PRReviewStage<br>in-process thread]
+    S1C -->|standard stage| S2
     S2[Task enqueued<br>in Redis TaskQueue] --> S3
     S3{validate_task_can_run} -->|dev container missing| S3A[queue env setup<br>defer]
     S3 -->|ready| S4
-    S4[create_stage_from_config<br>AgentStage / RepairCycleStage / PRReviewStage] --> S5
-    S5[SequentialPipeline.execute<br>restore from checkpoint if present] --> S6
-    S6[write checkpoint<br>stage_index + context] --> S7
+    S4[AgentExecutor.execute_agent<br>PipelineFactory builds one AgentStage] --> S7
     S7[stage.run_with_circuit_breaker] --> S8{circuit<br>breaker}
-    S8 -->|open| S9([pipeline halts])
+    S8 -->|open, retries exhausted| S9([mark_failed<br>lock retained])
     S8 -->|closed| S10
     S10[MakerAgent.execute<br>_determine_execution_mode<br>initial / revision / question] --> S11
     S11[build prompt<br>run_claude_code<br>Docker container] --> S12
-    S12[agent posts output<br>to GitHub] --> S13
-    S13[log_stage_completion<br>current_stage_index += 1] --> S14{review<br>required?}
-    S14 -->|yes| S15[reviewer agent runs]
-    S15 --> S16{verdict}
-    S16 -->|approved| S17
-    S16 -->|changes_requested<br>under max_iterations| S18[re-queue maker<br>revision mode]
-    S18 --> S10
-    S16 -->|blocked / over threshold| S19([escalate<br>pipeline halts])
-    S14 -->|no| S17
-    S17{more stages?} -->|yes| S6
-    S17 -->|no| S20
-    S20[advance to exit column<br>Staged or Done] --> S21([pipeline lock released])
+    S12[agent posts output<br>to GitHub] --> S14{manual<br>progression?}
+    S14 -->|yes| S17
+    S14 -->|no, auto_advance_on_approval| S17
+    S17[advance to next column] --> S1
+    S17 -->|exit column reached| S20
+    S20[Staged or Done] --> S21([pipeline run completed<br>lock released])
 ```
 
 ### Circuit breaker states
@@ -413,14 +402,14 @@ stateDiagram-v2
     half_open --> open: probe call fails
 
     closed: closed<br>calls pass through
-    open: open<br>calls rejected immediately<br>pipeline raises halt error
+    open: open<br>calls rejected immediately<br>CircuitBreakerOpen raised
     half_open: half-open<br>limited probe calls allowed
 ```
 
 Each `PipelineStage` holds a `CircuitBreaker` instance. States:
 
 - **closed** (normal): calls pass through
-- **open** (tripped): calls rejected immediately; pipeline raises `"Pipeline halted: <stage> circuit breaker open"`
+- **open** (tripped): calls rejected immediately; raises `CircuitBreakerOpen` — the caller (e.g. `AgentExecutor`) treats it like any other execution failure: retried up to its configured attempts, then handled through the standard failure path (`PipelineRunManager.mark_failed()`, see "Checkpointing and recovery")
 - **half-open** (recovering): after `recovery_timeout` seconds, limited calls allowed; success returns to closed, failure re-opens
 
 The `RepairCycleStage` has an additional application-level circuit breaker: `max_total_agent_calls` (default 100). When the `_agent_call_count` reaches this limit, the stage returns its current result without raising, to prevent unbounded cost accumulation.
@@ -429,4 +418,4 @@ The `RepairCycleStage` has an additional application-level circuit breaker: `max
 
 ### Pipeline run ID
 
-Every pipeline run is tagged with a `pipeline_run_id` UUID assigned when the task is first enqueued. This ID propagates through all observability events, checkpoint files, Redis keys, and Docker container launches, enabling end-to-end tracing of a single issue's execution history.
+Every pipeline run is tagged with a `pipeline_run_id` UUID assigned by `get_or_create_pipeline_run()` when the issue first enters the pipeline. This ID propagates through all observability events, repair-cycle checkpoint files, Redis keys, and Docker container launches, enabling end-to-end tracing of a single issue's execution history.

@@ -884,7 +884,7 @@ Example:
 
 Fields:
 - **asctime** — local time of the log entry
-- **name** — the Python logger name, which maps to the module or service (`docker_runner`, `project_monitor`, `pipeline.orchestrator`, etc.)
+- **name** — the Python logger name, which maps to the module or service (`docker_runner`, `project_monitor`, `agent_executor`, etc.)
 - **levelname** — `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`
 - **message** — the log message
 
@@ -912,7 +912,7 @@ docker-compose logs orchestrator | grep -E " ERROR | CRITICAL "
 # Show logs from a specific module
 docker-compose logs orchestrator | grep " - docker_runner - "
 docker-compose logs orchestrator | grep " - project_monitor - "
-docker-compose logs orchestrator | grep " - pipeline.orchestrator - "
+docker-compose logs orchestrator | grep " - agent_executor - "
 
 # Combine: errors from a specific module
 docker-compose logs orchestrator | grep " - docker_runner - " | grep " ERROR "

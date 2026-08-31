@@ -17,6 +17,34 @@ from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
 
+
+def format_pipeline_run_issue_key(project: str, issue_number: int, board: Optional[str] = None) -> str:
+    """Redis hash field for the issue->pipeline_run_id mapping.
+
+    board=None preserves the legacy (pre-board-scoping) 2-field format,
+    used only by get_active_pipeline_run (out of #43's scope, see its own
+    docstring) so its existing ~27 callers and ES-staleness-guard logic
+    are not touched. Pass board whenever it's known — it disambiguates
+    runs for the same (project, issue_number) active on different boards.
+    """
+    if board:
+        return f"{project}:{board}:{issue_number}"
+    return f"{project}:{issue_number}"
+
+
+# Atomically delete a hash field only if its current value matches — used by
+# _cleanup_issue_mapping() to remove a legacy-format issue-mapping entry
+# without racing a concurrent writer (e.g. get_active_pipeline_run()'s
+# ES-restore path) that may have just pointed it at a different run.
+# KEYS[1] = hash name, ARGV[1] = field, ARGV[2] = expected value
+_COMPARE_AND_DELETE_HASH_FIELD_SCRIPT = """
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+    return redis.call('HDEL', KEYS[1], ARGV[1])
+else
+    return 0
+end
+"""
+
 # ILM Policy for pipeline runs (7-day retention)
 PIPELINE_RUNS_ILM_POLICY = {
     "policy": {
@@ -209,9 +237,61 @@ class PipelineRunManager:
         """Get Redis key for pipeline run"""
         return f"{self.redis_prefix}:{pipeline_run_id}"
     
-    def _get_issue_key(self, project: str, issue_number: int) -> str:
+    def _get_issue_key(self, project: str, issue_number: int, board: Optional[str] = None) -> str:
         """Get Redis hash field for issue mapping"""
-        return f"{project}:{issue_number}"
+        return format_pipeline_run_issue_key(project, issue_number, board)
+
+    def _cleanup_issue_mapping(self, project: str, issue_number: int, board: Optional[str], pipeline_run_id: str) -> None:
+        """Remove this run's issue-mapping entries: the board-scoped key it was
+        stored under, and — defensively — the legacy 2-field key too, but only
+        if it still points at THIS run_id.
+
+        Both deletes are compare-and-delete, not unconditional HDEL: a new run
+        for this exact (project, board, issue_number) could in principle be
+        created concurrently (e.g. get_or_create_pipeline_run's duplicate
+        guard racing this cleanup) between resolving this run and this call —
+        an unconditional HDEL on the board-scoped key would then wipe out that
+        new run's freshly-written mapping instead of this (ending) run's own.
+
+        Why the legacy key needs checking at all: get_active_pipeline_run()
+        (deliberately left un-namespaced, see #43) can restore a run into the
+        legacy key via its ES fallback. Without this check, a run ending would
+        leave that legacy entry orphaned forever (no other cleanup job exists
+        for it), so any future legacy-format lookup for this issue would keep
+        returning this now-completed run's ID indefinitely. Comparing the
+        value before deleting avoids clobbering a DIFFERENT board's still-
+        active run that might currently occupy that same legacy slot.
+        """
+        board_key = self._get_issue_key(project, issue_number, board)
+        try:
+            self.redis.eval(
+                _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                1,
+                self.redis_issue_mapping,
+                board_key,
+                pipeline_run_id,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to clean up issue mapping {board_key}: {e}")
+
+        legacy_key = self._get_issue_key(project, issue_number)
+        if legacy_key != board_key:
+            try:
+                # Atomic compare-and-delete via EVAL — a separate HGET-then-HDEL
+                # has a real TOCTOU window: get_active_pipeline_run()'s ES-restore
+                # path can write a DIFFERENT board's run into this same legacy
+                # key between the check and the delete, and an unconditional
+                # HDEL at that point would wipe out that other board's freshly-
+                # restored, still-active mapping.
+                self.redis.eval(
+                    _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                    1,
+                    self.redis_issue_mapping,
+                    legacy_key,
+                    pipeline_run_id,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to clean up legacy issue mapping {legacy_key}: {e}")
     
     def create_pipeline_run(
         self,
@@ -259,7 +339,7 @@ class PipelineRunManager:
         )
         
         # Map issue to pipeline run ID
-        issue_key = self._get_issue_key(project, issue_number)
+        issue_key = self._get_issue_key(project, issue_number, board)
         self.redis.hset(
             self.redis_issue_mapping,
             issue_key,
@@ -297,7 +377,8 @@ class PipelineRunManager:
     def get_recent_pipeline_run_id(
         self,
         project: str,
-        issue_number: int
+        issue_number: int,
+        board: Optional[str] = None
     ) -> Optional[str]:
         """
         Get the most recent pipeline_run_id for an issue, regardless of status.
@@ -309,12 +390,19 @@ class PipelineRunManager:
         Args:
             project: Project name
             issue_number: Issue number
+            board: Optional board name. When given, both the Redis lookup and
+                the ES fallback are scoped to this board, disambiguating runs
+                for the same (project, issue_number) active on different
+                boards. When omitted, behavior is unchanged from before board
+                scoping existed: the legacy 2-field Redis key is checked, and
+                the ES query is unfiltered by board — callers that explicitly
+                want "any recent run for this issue" regardless of board.
 
         Returns:
             pipeline_run_id string if any run exists for this issue, None otherwise
         """
         # 1. Check the issue→run mapping (covers active runs)
-        issue_key = self._get_issue_key(project, issue_number)
+        issue_key = self._get_issue_key(project, issue_number, board)
         run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
         if run_id:
             return run_id
@@ -322,15 +410,18 @@ class PipelineRunManager:
         # 2. Check ES for the most recent run (any status)
         if self.es:
             try:
+                must_clauses = [
+                    {"term": {"project": project}},
+                    {"term": {"issue_number": issue_number}}
+                ]
+                if board:
+                    must_clauses.append({"term": {"board": board}})
                 result = self.es.search(
                     index=f"{self.es_index_pattern}-*",
                     body={
                         "query": {
                             "bool": {
-                                "must": [
-                                    {"term": {"project": project}},
-                                    {"term": {"issue_number": issue_number}}
-                                ]
+                                "must": must_clauses
                             }
                         },
                         "size": 1,
@@ -581,7 +672,7 @@ class PipelineRunManager:
                                 pipeline_run = PipelineRun.from_dict(run_data)
                                 redis_key = self._get_redis_key(pipeline_run.id)
                                 self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
-                                self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number), pipeline_run.id)
+                                self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number, board), pipeline_run.id)
                                 # Same reasoning as the Redis fast-path above — a new trigger
                                 # is reusing a feedback_listening run restored from ES, so
                                 # restore its status to "active" as well.
@@ -995,9 +1086,8 @@ class PipelineRunManager:
         )
         
         # Remove from issue mapping (can't be reused)
-        issue_key = self._get_issue_key(project, issue_number)
-        self.redis.hdel(self.redis_issue_mapping, issue_key)
-        
+        self._cleanup_issue_mapping(project, issue_number, pipeline_run.board, pipeline_run.id)
+
         # Update in Elasticsearch
         self._persist_to_elasticsearch(pipeline_run)
 
@@ -1756,8 +1846,7 @@ class PipelineRunManager:
             # Remove from issue mapping
             project = run_data['project']
             issue_number = run_data['issue_number']
-            issue_key = self._get_issue_key(project, issue_number)
-            self.redis.hdel(self.redis_issue_mapping, issue_key)
+            self._cleanup_issue_mapping(project, issue_number, run_data.get('board'), pipeline_run_id)
             
             logger.info(f"Ended stale pipeline run {pipeline_run_id}: {reason}")
             
