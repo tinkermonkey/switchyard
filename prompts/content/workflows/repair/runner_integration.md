@@ -14,7 +14,19 @@ Run ONLY integration tests for this project. Do NOT run unit, e2e, or performanc
      a. Check whether a dedicated integration test directory exists (e.g. tests/integration_tests/,
         tests/integration/). If it exists, run: `pytest <integration_test_dir>/`
      b. If tests are NOT separated by directory, use the marker: `pytest -m integration`
-     Always run from the project root so pytest.ini is picked up.
+     c. **Find the pytest config root before picking a cwd — don't assume it's the repo root.**
+        `pytest.ini` / `pyproject.toml` (`[tool.pytest.ini_options]`), which is what sets
+        `pythonpath`/`rootdir`, is often nested under a subdirectory (e.g. `local-server/`,
+        `backend/`, `server/`) rather than at the top of the checkout. Locate the file that
+        actually configures pytest for this project (e.g.
+        `find . -maxdepth 3 -name pytest.ini -o -name pyproject.toml`) and `cd` into the
+        directory that contains it before invoking pytest — or point the test path at it
+        explicitly (e.g. `pytest local-server/tests/integration/`). "Run from the project
+        root" means wherever that pytest config lives, which is not always the container's
+        top-level working directory.
+     If you see `ModuleNotFoundError` for a package that clearly exists on disk, that is a
+     cwd/rootdir mismatch, not a missing dependency — re-check where pytest.ini actually is
+     before concluding anything is broken in the environment.
    - **TypeScript/JavaScript**: use the configured integration test script or directory.
 
 2a. **No integration tests present** — if you AFFIRMATIVELY confirm the project has no integration

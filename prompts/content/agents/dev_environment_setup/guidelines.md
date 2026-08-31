@@ -74,7 +74,7 @@ and takes priority over the general Dockerfile.agent patterns below when they co
    ```
    - If validation script exists (check issue description):
    ```bash
-   docker run --rm -v /workspace/{PROJECT_NAME}:/workspace/{PROJECT_NAME} {PROJECT_NAME}-agent:latest python3 /workspace/{PROJECT_NAME}/validation_script.py
+   docker run --rm -v /workspace/{PROJECT_NAME}:/workspace {PROJECT_NAME}-agent:latest python3 /workspace/validation_script.py
    ```
    - Document test results (pass/fail with full output)
    - **If claude, git, or gh are missing, the image is NOT valid and must be fixed**
@@ -97,6 +97,24 @@ and takes priority over the general Dockerfile.agent patterns below when they co
 - Source code comes from a runtime mount: `-v /host/project:/workspace`
 - Any source code copied during build is WASTED and gets overridden by the mount
 - Copying large directories (node_modules, .git) and then chown'ing them wastes 90+ seconds
+
+**⚠️ CRITICAL — the runtime mount lands at `/workspace`, not `/workspace/{PROJECT_NAME}`:**
+At runtime the project is mounted directly onto `/workspace` — there is no
+`/workspace/{PROJECT_NAME}` directory inside the running agent container, only
+`/workspace/...`. This applies to the working directory too: agents are launched with
+`-w /workspace` regardless of any `WORKDIR` baked into the image, so a build-time
+`WORKDIR /workspace/{PROJECT_NAME}` only affects where `RUN`/`COPY` steps land during the
+*build* — it has **no effect at runtime**, since the volume mount replaces `/workspace`
+wholesale and shadows anything the build wrote under it.
+
+**Never write an absolute path like `/workspace/{PROJECT_NAME}/...` into anything that
+runs at container runtime** — an `ENV` (e.g. `ENV PYTHONPATH=...`), a script, a config
+value — it will silently point at a directory that doesn't exist. Use `/workspace/...`
+instead (e.g. `ENV PYTHONPATH=/workspace/local-server`). If you're fixing a
+`PYTHONPATH`/module-resolution issue, prefer a mechanism that's relative to wherever the
+test runner actually invokes from — `pytest.ini`'s `pythonpath = .`, a `conftest.py`
+`sys.path.insert`, or a project-relative `pyproject.toml` setting — over a hardcoded
+absolute `ENV` path, since it will keep working no matter which directory ends up as cwd.
 
 **Correct Dockerfile.agent Structure**:
 
@@ -139,7 +157,9 @@ USER root
 # ============================================================================
 # Stage 3: Pre-install Dependencies (OPTIONAL but RECOMMENDED)
 # ============================================================================
-WORKDIR /workspace/{PROJECT_NAME}
+WORKDIR /workspace
+# NOTE: this matches the runtime mount point exactly (see the CRITICAL callout above) —
+# don't use /workspace/{PROJECT_NAME} here, that path won't exist when the container runs.
 
 # OPTION A: Pre-install dependencies (Recommended for fast startup)
 # Copy ONLY the dependency manifests needed for installation
@@ -160,7 +180,7 @@ WORKDIR /workspace/{PROJECT_NAME}
 # ============================================================================
 # Change ownership ONLY of what was installed, NOT source code
 # For pre-installed node_modules:
-# RUN chown -R orchestrator:orchestrator /workspace/{PROJECT_NAME}/node_modules
+# RUN chown -R orchestrator:orchestrator /workspace/node_modules
 
 # ============================================================================
 # Stage 5: Switch to Runtime User
@@ -190,7 +210,9 @@ CMD ["/bin/bash"]
 **Anti-Patterns to AVOID**:
 
 ❌ `COPY . .` — copies source code (wasteful, gets overridden)
-❌ `RUN chown -R orchestrator:orchestrator /workspace/{PROJECT_NAME}` — wastes 90+ seconds
+❌ `RUN chown -R orchestrator:orchestrator /workspace` — wastes 90+ seconds
+❌ `WORKDIR /workspace/{PROJECT_NAME}` or `ENV PYTHONPATH=/workspace/{PROJECT_NAME}/...` — this
+  path doesn't exist at runtime; the mount lands at `/workspace` directly (see CRITICAL callout above)
 ❌ Not using .dockerignore — sends huge build context to Docker daemon
 ❌ Not verifying Claude CLI is present — agent will fail at runtime
 ❌ Installing dependencies without cache mounts — slow and wasteful
