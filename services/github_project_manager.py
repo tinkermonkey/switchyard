@@ -621,10 +621,19 @@ class GitHubProjectManager:
 
     async def _diagnose_github_issue(self, org: str):
         """Automatically diagnose GitHub connectivity and permissions issues"""
+        # Uses raw subprocess calls (not the tracked GitHubAPIClient's
+        # rest()/gh_cli()) since these probes intentionally run even when
+        # the client's breaker is open - that's the failure mode being
+        # diagnosed. track_gh_operation() is still called after each probe
+        # so this (low-frequency, reconciliation-time-only) volume is
+        # visible in the Call Summary logging and counted against the
+        # correct bucket (issue #103).
+        github_client = get_github_client()
 
         # 1. Check GitHub CLI authentication
         try:
             auth_result = subprocess.run(['gh', 'auth', 'status'], capture_output=True, text=True)
+            github_client.track_gh_operation('gh_auth_status', 'gh auth status (diagnostics)')
             if auth_result.returncode == 0:
                 logger.info("GitHub CLI authentication: SUCCESS")
                 # Parse the output to get token info
@@ -642,6 +651,7 @@ class GitHubProjectManager:
         # 2. Check if user can access the organization
         try:
             org_result = subprocess.run(['gh', 'api', f'orgs/{org}'], capture_output=True, text=True)
+            github_client.track_gh_operation('gh_api_orgs', f'gh api orgs/{org} (diagnostics)')
             if org_result.returncode == 0:
                 logger.info(f"Organization access ({org}): SUCCESS")
             else:
@@ -656,6 +666,7 @@ class GitHubProjectManager:
         try:
             projects_result = subprocess.run(['gh', 'project', 'list', '--owner', org, '--format', 'json'],
                                            capture_output=True, text=True)
+            github_client.track_gh_operation('gh_project_list', f'gh project list --owner {org} (diagnostics)')
             if projects_result.returncode == 0:
                 logger.info(f"GitHub Projects v2 access ({org}): SUCCESS")
                 try:

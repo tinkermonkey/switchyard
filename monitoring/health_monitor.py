@@ -426,11 +426,28 @@ class HealthMonitor:
             github_client = get_github_client()
             client_status = github_client.get_status()
             
+            # 'api_rate_limit' is kept for backward compat and mirrors the
+            # GraphQL bucket (see GitHubAPIClient.__init__); GraphQL and
+            # REST are separate GitHub rate-limit buckets (issue #103), so
+            # 'api_rate_limit_graphql' / 'api_rate_limit_rest' below are the
+            # ones that should be read going forward.
             rate_limit_info = {
                 'remaining': client_status['rate_limit']['remaining'],
                 'limit': client_status['rate_limit']['limit'],
                 'percentage_used': client_status['rate_limit']['percentage_used'],
                 'reset_time': client_status['rate_limit']['reset_time'],
+            }
+            rate_limit_graphql_info = {
+                'remaining': client_status['rate_limit_graphql']['remaining'],
+                'limit': client_status['rate_limit_graphql']['limit'],
+                'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
+                'reset_time': client_status['rate_limit_graphql']['reset_time'],
+            }
+            rate_limit_rest_info = {
+                'remaining': client_status['rate_limit_rest']['remaining'],
+                'limit': client_status['rate_limit_rest']['limit'],
+                'percentage_used': client_status['rate_limit_rest']['percentage_used'],
+                'reset_time': client_status['rate_limit_rest']['reset_time'],
             }
             
             circuit_breaker_info = {
@@ -440,12 +457,15 @@ class HealthMonitor:
                 'reset_time': client_status['breaker']['reset_time'],
             }
             
-            # Check if rate limit is critically low
-            if client_status['rate_limit']['percentage_used'] > 95:
+            # Check if either bucket is critically low
+            if (client_status['rate_limit_graphql']['percentage_used'] > 95
+                    or client_status['rate_limit_rest']['percentage_used'] > 95):
                 degraded = True
         except Exception as e:
             logger.debug(f"Failed to get GitHub API client status: {e}")
             rate_limit_info = None
+            rate_limit_graphql_info = None
+            rate_limit_rest_info = None
             circuit_breaker_info = None
 
         result = {
@@ -462,6 +482,8 @@ class HealthMonitor:
             'tested_org': org,
             'tested_repo': f'{org}/{repo}',
             'api_rate_limit': rate_limit_info,
+            'api_rate_limit_graphql': rate_limit_graphql_info,
+            'api_rate_limit_rest': rate_limit_rest_info,
             'circuit_breaker': circuit_breaker_info,
         }
         

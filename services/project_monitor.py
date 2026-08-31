@@ -1410,6 +1410,14 @@ class ProjectMonitor:
         the downstream empty-description guard with a misleading message,
         instead of surfacing the real fetch failure to the caller.
         """
+        # Uses a raw subprocess call (not the tracked GitHubAPIClient) because
+        # the retry semantics here are deliberately different from gh_cli()'s:
+        # an empty-stdout success must be retried rather than silently
+        # swallowed (see docstring above). track_gh_operation() is still
+        # called on success so this REST volume is visible in the Call
+        # Summary logging and counted against the correct bucket (issue #103) -
+        # `gh issue view` is a REST call under the hood.
+        github_client = get_github_client()
         last_error = None
         for attempt in range(3):
             try:
@@ -1417,7 +1425,11 @@ class ProjectMonitor:
                     ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
                     capture_output=True, text=True, check=True
                 )
-                return json.loads(result.stdout)
+                parsed = json.loads(result.stdout)
+                github_client.track_gh_operation(
+                    'gh_issue_view', f'gh issue view #{issue_number} in {org}/{repository}'
+                )
+                return parsed
             except Exception as e:
                 last_error = e
                 if attempt < 2:

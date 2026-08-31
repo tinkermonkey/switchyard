@@ -441,11 +441,30 @@ def health():
             github_client = get_github_client()
             client_status = github_client.get_status()
             
+            # 'rate_limit'/'api_rate_limit'/'api_usage' are kept for
+            # backward compat and mirror the GraphQL bucket only. GitHub
+            # enforces separate REST and GraphQL rate-limit buckets
+            # (issue #103) - 'api_usage_graphql'/'api_usage_rest' below are
+            # the ones that let the dashboard report both distinctly
+            # instead of whichever bucket last happened to update the
+            # conflated field.
             fresh_rate_limit = {
                 'remaining': client_status['rate_limit']['remaining'],
                 'limit': client_status['rate_limit']['limit'],
                 'percentage_used': client_status['rate_limit']['percentage_used'],
                 'reset_time': client_status['rate_limit']['reset_time'],
+            }
+            fresh_rate_limit_graphql = {
+                'remaining': client_status['rate_limit_graphql']['remaining'],
+                'limit': client_status['rate_limit_graphql']['limit'],
+                'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
+                'reset_time': client_status['rate_limit_graphql']['reset_time'],
+            }
+            fresh_rate_limit_rest = {
+                'remaining': client_status['rate_limit_rest']['remaining'],
+                'limit': client_status['rate_limit_rest']['limit'],
+                'percentage_used': client_status['rate_limit_rest']['percentage_used'],
+                'reset_time': client_status['rate_limit_rest']['reset_time'],
             }
             
             fresh_circuit_breaker = {
@@ -458,13 +477,27 @@ def health():
             # Update the cached health data with fresh rate limit and circuit breaker info
             if 'checks' in health_data and 'github' in health_data['checks']:
                 health_data['checks']['github']['api_rate_limit'] = fresh_rate_limit
+                health_data['checks']['github']['api_rate_limit_graphql'] = fresh_rate_limit_graphql
+                health_data['checks']['github']['api_rate_limit_rest'] = fresh_rate_limit_rest
                 health_data['checks']['github']['circuit_breaker'] = fresh_circuit_breaker
-                # Add dedicated api_usage section for UI consumption
+                # Add dedicated api_usage sections for UI consumption
                 health_data['checks']['github']['api_usage'] = {
                     'remaining': fresh_rate_limit['remaining'],
                     'limit': fresh_rate_limit['limit'],
                     'percentage_used': fresh_rate_limit['percentage_used'],
                     'reset_time': fresh_rate_limit['reset_time']
+                }
+                health_data['checks']['github']['api_usage_graphql'] = {
+                    'remaining': fresh_rate_limit_graphql['remaining'],
+                    'limit': fresh_rate_limit_graphql['limit'],
+                    'percentage_used': fresh_rate_limit_graphql['percentage_used'],
+                    'reset_time': fresh_rate_limit_graphql['reset_time']
+                }
+                health_data['checks']['github']['api_usage_rest'] = {
+                    'remaining': fresh_rate_limit_rest['remaining'],
+                    'limit': fresh_rate_limit_rest['limit'],
+                    'percentage_used': fresh_rate_limit_rest['percentage_used'],
+                    'reset_time': fresh_rate_limit_rest['reset_time']
                 }
         except Exception as e:
             logger.debug(f"Failed to fetch fresh rate limit data: {e}")

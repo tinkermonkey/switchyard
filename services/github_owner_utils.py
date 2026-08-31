@@ -202,7 +202,16 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
         return None
 
     try:
-        # Query GitHub API to get owner type
+        # Query GitHub API to get owner type. Uses a raw subprocess call
+        # rather than the tracked GitHubAPIClient because this circuit
+        # breaker (_github_circuit_breaker, module-local to this file) and
+        # the client's breaker are independent - going through
+        # GitHubAPIClient.rest() here would mean two breakers gating the
+        # same call. track_gh_operation() is still called on success so
+        # this REST volume is visible in the Call Summary logging and
+        # counted against the correct bucket (issue #103).
+        from services.github_api_client import get_github_client
+        github_client = get_github_client()
         result = subprocess.run(
             ['gh', 'api', f'/users/{owner_login}', '--jq', '.type'],
             capture_output=True,
@@ -210,6 +219,7 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
             timeout=15,
             check=True
         )
+        github_client.track_gh_operation('gh_api_user_type', f'gh api /users/{owner_login}')
 
         owner_type = result.stdout.strip().lower()
 
