@@ -38,6 +38,13 @@ class GitHubRateLimitStatus:
         self.reset_time: Optional[datetime] = None
         self.last_updated = datetime.now()
         self.resource_type = "graphql"  # or "rest"
+        # False until a real GitHub response updates this bucket. Needed
+        # because last_updated alone can't distinguish "genuinely healthy,
+        # 0% used" from "never actually populated, still at the 5000/5000
+        # defaults above" - both look identical in remaining/limit, and
+        # last_updated gets stamped to "now" right here in __init__ before
+        # any real data has arrived. See is_stale().
+        self.ever_updated = False
         
     def update_from_response_headers(self, headers: Dict[str, str]):
         """Update rate limit info from GitHub API response headers."""
@@ -53,6 +60,7 @@ class GitHubRateLimitStatus:
                 self.resource_type = headers['x-ratelimit-resource']
             
             self.last_updated = datetime.now()
+            self.ever_updated = True
         except Exception as e:
             logger.error(f"Error parsing rate limit headers: {e}")
     
@@ -62,6 +70,19 @@ class GitHubRateLimitStatus:
             return 0
         return ((self.limit - self.remaining) / self.limit) * 100
     
+    def is_stale(self, threshold_seconds: float = 900) -> bool:
+        """True if this bucket has never been refreshed from a real GitHub
+        response, or its last refresh is older than `threshold_seconds`
+        (default 15 minutes - comfortably above the 5-minute periodic
+        refresh interval in GitHubAPIClient, so normal jitter between
+        refreshes doesn't false-positive). Lets a health payload tell a
+        genuinely healthy "0% used" apart from "never actually populated"
+        (issue #103) - both look identical in remaining/limit alone.
+        """
+        if not self.ever_updated:
+            return True
+        return (datetime.now() - self.last_updated).total_seconds() > threshold_seconds
+
     def get_time_until_reset(self) -> Optional[float]:
         """Get seconds until rate limit resets."""
         if not self.reset_time:
@@ -93,6 +114,8 @@ class GitHubRateLimitStatus:
             'time_until_reset': self.get_time_until_reset(),
             'resource_type': self.resource_type,
             'last_updated': self.last_updated.isoformat(),
+            'ever_updated': self.ever_updated,
+            'stale': self.is_stale(),
         }
 
 
@@ -682,6 +705,7 @@ class GitHubAPIClient:
                     self.rate_limit_graphql.reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
                 self.rate_limit_graphql.resource_type = "graphql"
                 self.rate_limit_graphql.last_updated = datetime.now()
+                self.rate_limit_graphql.ever_updated = True
                 
                 logger.debug(
                     f"Rate limit update (GraphQL): {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
@@ -732,6 +756,7 @@ class GitHubAPIClient:
                 self.rate_limit_rest.reset_time = datetime.fromtimestamp(reset_timestamp)
             self.rate_limit_rest.resource_type = "rest"
             self.rate_limit_rest.last_updated = datetime.now()
+            self.rate_limit_rest.ever_updated = True
             
             logger.debug(
                 f"Rate limit update (REST): {self.rate_limit_rest.remaining}/{self.rate_limit_rest.limit} "
@@ -752,13 +777,24 @@ class GitHubAPIClient:
         which see real headers).
 
         Falls back to treating the whole input as the body (no headers)
-        if it doesn't look like `--include` output, so callers can use
-        this defensively without special-casing malformed output.
+        when the first line doesn't look like an HTTP status line - covers
+        both plain `gh api` output (no --include, e.g. in tests that mock
+        subprocess with a bare JSON string) and any future `gh` release
+        that changes or drops the --include framing. Without this check, a
+        JSON body that happens to contain a blank line right after some
+        text resembling a status line could be mis-split; with it, that
+        case instead falls through untouched to the body.
         """
-        if '\n\n' not in stdout:
+        first_line, sep, _ = stdout.partition('\n')
+        if not sep or not first_line.startswith('HTTP/'):
             return {}, stdout
 
+        # An empty body here is legitimate (e.g. a 204, or any endpoint
+        # that returns headers with no content) and must be preserved as
+        # '' rather than treated as malformed - rest()'s caller already
+        # handles an empty body as a successful empty-response result.
         header_block, _, body = stdout.partition('\n\n')
+
         headers: Dict[str, str] = {}
         for line in header_block.split('\n')[1:]:  # [0] is the "HTTP/2.0 200 OK" status line
             if ':' in line:
@@ -1005,9 +1041,13 @@ class GitHubAPIClient:
         left the REST bucket permanently unpopulated (issue #103). This
         intentionally bypasses self.rest()/breaker gating: it's a
         zero-cost meta probe (not an application-level API call, so
-        counting it in the Call Summary would just add noise), and
-        probing it even while the breaker is open is how a real recovery
-        gets noticed.
+        counting it in the Call Summary would just add noise), and probing
+        it even while the breaker is open keeps the reported remaining/
+        percentage numbers grounded in GitHub's actual quota instead of
+        frozen at whatever they were when the breaker tripped. This does
+        NOT itself affect breaker state - self.breaker only transitions on
+        its own time-based check_and_close(), called from graphql()/
+        rest()/http_request()/gh_cli() at the start of the next real call.
 
         Returns:
             bool: True if rate limit was successfully fetched and updated, False otherwise
@@ -1035,6 +1075,7 @@ class GitHubAPIClient:
                     self.rate_limit_rest.reset_time = datetime.fromtimestamp(reset_ts)
                 self.rate_limit_rest.resource_type = "rest"
                 self.rate_limit_rest.last_updated = datetime.now()
+                self.rate_limit_rest.ever_updated = True
                 updated = True
 
             graphql = resources.get('graphql')
@@ -1046,6 +1087,7 @@ class GitHubAPIClient:
                     self.rate_limit_graphql.reset_time = datetime.fromtimestamp(reset_ts)
                 self.rate_limit_graphql.resource_type = "graphql"
                 self.rate_limit_graphql.last_updated = datetime.now()
+                self.rate_limit_graphql.ever_updated = True
                 updated = True
 
             if not updated:

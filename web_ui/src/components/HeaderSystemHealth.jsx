@@ -61,7 +61,12 @@ export default function HeaderSystemHealth() {
                 <>
                   {githubCheck?.api_usage_graphql && (
                     <div className="flex items-center justify-between text-xs">
-                      <span className="text-gh-fg-muted">GraphQL</span>
+                      <span className="text-gh-fg-muted">
+                        GraphQL
+                        {githubCheck.api_usage_graphql.stale && (
+                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
+                        )}
+                      </span>
                       <span className={getUsageColor(githubCheck.api_usage_graphql.percentage_used)}>
                         {formatNumber(githubCheck.api_usage_graphql.remaining)} / {formatNumber(githubCheck.api_usage_graphql.limit)}
                       </span>
@@ -69,7 +74,12 @@ export default function HeaderSystemHealth() {
                   )}
                   {githubCheck?.api_usage_rest && (
                     <div className="flex items-center justify-between text-xs">
-                      <span className="text-gh-fg-muted">REST</span>
+                      <span className="text-gh-fg-muted">
+                        REST
+                        {githubCheck.api_usage_rest.stale && (
+                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
+                        )}
+                      </span>
                       <span className={getUsageColor(githubCheck.api_usage_rest.percentage_used)}>
                         {formatNumber(githubCheck.api_usage_rest.remaining)} / {formatNumber(githubCheck.api_usage_rest.limit)}
                       </span>

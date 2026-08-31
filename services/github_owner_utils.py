@@ -207,9 +207,7 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
         # breaker (_github_circuit_breaker, module-local to this file) and
         # the client's breaker are independent - going through
         # GitHubAPIClient.rest() here would mean two breakers gating the
-        # same call. track_gh_operation() is still called on success so
-        # this REST volume is visible in the Call Summary logging and
-        # counted against the correct bucket (issue #103).
+        # same call.
         from services.github_api_client import get_github_client
         github_client = get_github_client()
         result = subprocess.run(
@@ -219,7 +217,19 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
             timeout=15,
             check=True
         )
-        github_client.track_gh_operation('gh_api_user_type', f'gh api /users/{owner_login}')
+        # Tracked on its own try, outside anything that feeds this
+        # function's except clauses below: a bug in track_gh_operation()
+        # itself must never be misread as an owner-type lookup failure
+        # (which would skip _record_success() and return None for an
+        # owner whose type was actually determined fine). This only makes
+        # the call visible in the Call Summary logging (issue #103); it
+        # does not itself update rate_limit_graphql/rate_limit_rest, which
+        # only reflect GitHubAPIClient's own graphql()/rest() calls and the
+        # periodic /rate_limit poll.
+        try:
+            github_client.track_gh_operation('gh_api_user_type', f'gh api /users/{owner_login}')
+        except Exception as track_err:
+            logger.warning(f"Failed to record gh_api_user_type tracking (non-fatal): {track_err}")
 
         owner_type = result.stdout.strip().lower()
 

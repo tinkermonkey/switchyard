@@ -437,17 +437,25 @@ class HealthMonitor:
                 'percentage_used': client_status['rate_limit']['percentage_used'],
                 'reset_time': client_status['rate_limit']['reset_time'],
             }
+            # 'stale' distinguishes a genuinely healthy "0% used" from
+            # "never actually populated" (issue #103) - both look
+            # identical in remaining/limit alone since a bucket defaults
+            # to 5000/5000 before its first real GitHub response.
             rate_limit_graphql_info = {
                 'remaining': client_status['rate_limit_graphql']['remaining'],
                 'limit': client_status['rate_limit_graphql']['limit'],
                 'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
                 'reset_time': client_status['rate_limit_graphql']['reset_time'],
+                'last_updated': client_status['rate_limit_graphql']['last_updated'],
+                'stale': client_status['rate_limit_graphql']['stale'],
             }
             rate_limit_rest_info = {
                 'remaining': client_status['rate_limit_rest']['remaining'],
                 'limit': client_status['rate_limit_rest']['limit'],
                 'percentage_used': client_status['rate_limit_rest']['percentage_used'],
                 'reset_time': client_status['rate_limit_rest']['reset_time'],
+                'last_updated': client_status['rate_limit_rest']['last_updated'],
+                'stale': client_status['rate_limit_rest']['stale'],
             }
             
             circuit_breaker_info = {

@@ -454,17 +454,25 @@ def health():
                 'percentage_used': client_status['rate_limit']['percentage_used'],
                 'reset_time': client_status['rate_limit']['reset_time'],
             }
+            # 'stale' distinguishes a genuinely healthy "0% used" from
+            # "never actually populated" (issue #103) - both look
+            # identical in remaining/limit alone since a bucket defaults
+            # to 5000/5000 before its first real GitHub response.
             fresh_rate_limit_graphql = {
                 'remaining': client_status['rate_limit_graphql']['remaining'],
                 'limit': client_status['rate_limit_graphql']['limit'],
                 'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
                 'reset_time': client_status['rate_limit_graphql']['reset_time'],
+                'last_updated': client_status['rate_limit_graphql']['last_updated'],
+                'stale': client_status['rate_limit_graphql']['stale'],
             }
             fresh_rate_limit_rest = {
                 'remaining': client_status['rate_limit_rest']['remaining'],
                 'limit': client_status['rate_limit_rest']['limit'],
                 'percentage_used': client_status['rate_limit_rest']['percentage_used'],
                 'reset_time': client_status['rate_limit_rest']['reset_time'],
+                'last_updated': client_status['rate_limit_rest']['last_updated'],
+                'stale': client_status['rate_limit_rest']['stale'],
             }
             
             fresh_circuit_breaker = {
@@ -491,13 +499,15 @@ def health():
                     'remaining': fresh_rate_limit_graphql['remaining'],
                     'limit': fresh_rate_limit_graphql['limit'],
                     'percentage_used': fresh_rate_limit_graphql['percentage_used'],
-                    'reset_time': fresh_rate_limit_graphql['reset_time']
+                    'reset_time': fresh_rate_limit_graphql['reset_time'],
+                    'stale': fresh_rate_limit_graphql['stale'],
                 }
                 health_data['checks']['github']['api_usage_rest'] = {
                     'remaining': fresh_rate_limit_rest['remaining'],
                     'limit': fresh_rate_limit_rest['limit'],
                     'percentage_used': fresh_rate_limit_rest['percentage_used'],
-                    'reset_time': fresh_rate_limit_rest['reset_time']
+                    'reset_time': fresh_rate_limit_rest['reset_time'],
+                    'stale': fresh_rate_limit_rest['stale'],
                 }
         except Exception as e:
             logger.debug(f"Failed to fetch fresh rate limit data: {e}")

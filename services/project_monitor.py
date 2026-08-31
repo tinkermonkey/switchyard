@@ -1413,10 +1413,7 @@ class ProjectMonitor:
         # Uses a raw subprocess call (not the tracked GitHubAPIClient) because
         # the retry semantics here are deliberately different from gh_cli()'s:
         # an empty-stdout success must be retried rather than silently
-        # swallowed (see docstring above). track_gh_operation() is still
-        # called on success so this REST volume is visible in the Call
-        # Summary logging and counted against the correct bucket (issue #103) -
-        # `gh issue view` is a REST call under the hood.
+        # swallowed (see docstring above).
         github_client = get_github_client()
         last_error = None
         for attempt in range(3):
@@ -1426,10 +1423,6 @@ class ProjectMonitor:
                     capture_output=True, text=True, check=True
                 )
                 parsed = json.loads(result.stdout)
-                github_client.track_gh_operation(
-                    'gh_issue_view', f'gh issue view #{issue_number} in {org}/{repository}'
-                )
-                return parsed
             except Exception as e:
                 last_error = e
                 if attempt < 2:
@@ -1438,6 +1431,27 @@ class ProjectMonitor:
                         f"(attempt {attempt + 1}/3): {e}; retrying"
                     )
                     time.sleep(0.5 * (attempt + 1))
+                continue
+
+            # Tracked outside the retry try/except above, on its own try:
+            # a bug in track_gh_operation() itself must never be misread as
+            # a GitHub fetch failure - that would discard an already-fetched
+            # real result, trigger a needless retry that re-issues the (now
+            # redundant) `gh issue view` call, and could ultimately raise
+            # "could not fetch" for an issue that was actually fetched fine
+            # every single attempt. This only makes the call visible in the
+            # Call Summary logging (issue #103); it does not itself update
+            # rate_limit_graphql/rate_limit_rest, which only reflect
+            # GitHubAPIClient's own graphql()/rest() calls and the periodic
+            # /rate_limit poll. `gh issue view` uses GraphQL under the hood.
+            try:
+                github_client.track_gh_operation(
+                    'gh_issue_view', f'gh issue view #{issue_number} in {org}/{repository}'
+                )
+            except Exception as track_err:
+                logger.warning(f"Failed to record gh_issue_view tracking (non-fatal): {track_err}")
+
+            return parsed
 
         logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
         raise RuntimeError(
