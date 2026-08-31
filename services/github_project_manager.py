@@ -621,10 +621,31 @@ class GitHubProjectManager:
 
     async def _diagnose_github_issue(self, org: str):
         """Automatically diagnose GitHub connectivity and permissions issues"""
+        # Uses raw subprocess calls (not the tracked GitHubAPIClient's
+        # rest()/gh_cli()) since these probes intentionally run even when
+        # the client's breaker is open - that's the failure mode being
+        # diagnosed.
+        github_client = get_github_client()
+
+        def _track(operation_type: str, description: str) -> None:
+            # Tracking is deliberately isolated from each probe's own
+            # try/except below: a bug in track_gh_operation() itself must
+            # never be misread as "this diagnostic probe failed" - that
+            # would abort the rest of this multi-step diagnosis (steps 2-4
+            # never run) over a bookkeeping bug, not a real GitHub problem.
+            # This only makes the call visible in the Call Summary logging
+            # (issue #103); it does not itself update rate_limit_graphql/
+            # rate_limit_rest, which only reflect GitHubAPIClient's own
+            # graphql()/rest() calls and the periodic /rate_limit poll.
+            try:
+                github_client.track_gh_operation(operation_type, description)
+            except Exception as track_err:
+                logger.warning(f"Failed to record {operation_type} tracking (non-fatal): {track_err}")
 
         # 1. Check GitHub CLI authentication
         try:
             auth_result = subprocess.run(['gh', 'auth', 'status'], capture_output=True, text=True)
+            _track('gh_auth_status', 'gh auth status (diagnostics)')
             if auth_result.returncode == 0:
                 logger.info("GitHub CLI authentication: SUCCESS")
                 # Parse the output to get token info
@@ -642,6 +663,7 @@ class GitHubProjectManager:
         # 2. Check if user can access the organization
         try:
             org_result = subprocess.run(['gh', 'api', f'orgs/{org}'], capture_output=True, text=True)
+            _track('gh_api_orgs', f'gh api orgs/{org} (diagnostics)')
             if org_result.returncode == 0:
                 logger.info(f"Organization access ({org}): SUCCESS")
             else:
@@ -656,6 +678,7 @@ class GitHubProjectManager:
         try:
             projects_result = subprocess.run(['gh', 'project', 'list', '--owner', org, '--format', 'json'],
                                            capture_output=True, text=True)
+            _track('gh_project_list', f'gh project list --owner {org} (diagnostics)')
             if projects_result.returncode == 0:
                 logger.info(f"GitHub Projects v2 access ({org}): SUCCESS")
                 try:

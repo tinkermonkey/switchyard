@@ -285,7 +285,14 @@ class TestSubIssueDetectionAPICall:
 
         client = GitHubAPIClient()
 
-        # Mock subprocess.run to simulate successful API response
+        # Mock subprocess.run to simulate successful API response. Uses the
+        # real `gh api --include` shape (status line + headers + blank
+        # line + body) that rest() actually invokes now (issue #103) -
+        # a bare JSON string here would silently take the no-headers
+        # fallback in _parse_gh_api_include_output() and never exercise
+        # the header-recovery path this test's mock is meant to stand in
+        # for. See test_github_api_rate_limit_buckets.py for dedicated
+        # coverage of that parsing.
         with patch('subprocess.run') as mock_run:
             response_data = [
                 {'number': 1, 'state': 'open'},
@@ -293,7 +300,16 @@ class TestSubIssueDetectionAPICall:
             ]
             mock_run.return_value = Mock(
                 returncode=0,
-                stdout=json.dumps(response_data)
+                stdout=(
+                    # subprocess.run(text=True) normalizes CRLF to '\n' by
+                    # the time rest() ever sees it (verified against the
+                    # real `gh` CLI) - the mock reproduces that already-
+                    # normalized shape, not the raw wire CRLF.
+                    "HTTP/2.0 200 OK\n"
+                    "X-Ratelimit-Remaining: 4999\n"
+                    "\n"
+                    f"{json.dumps(response_data)}"
+                )
             )
 
             # This is how the code SHOULD call the API (with params in URL)

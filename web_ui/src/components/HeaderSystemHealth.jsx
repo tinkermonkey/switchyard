@@ -47,26 +47,53 @@ export default function HeaderSystemHealth() {
   return (
     <HeaderBox title="API Usage" minWidth="md:min-w-[180px]">
       <div className="space-y-2.5">
-        {/* GitHub API Usage */}
-        {githubCheck?.api_usage && (
+        {/* GitHub API Usage - GraphQL and REST are separate rate-limit
+            buckets (issue #103); fall back to the conflated 'api_usage'
+            field if a health payload without the split fields is ever seen. */}
+        {(githubCheck?.api_usage_graphql || githubCheck?.api_usage_rest || githubCheck?.api_usage) && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5 text-xs">
               <Activity className="w-3 h-3 text-gh-fg-muted" />
               <span className="text-gh-fg-default font-medium">GitHub API</span>
             </div>
             <div className="pl-4.5 space-y-0.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-gh-fg-muted">Remaining</span>
-                <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
-                  {formatNumber(githubCheck.api_usage.remaining)} / {formatNumber(githubCheck.api_usage.limit)}
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-gh-fg-muted">Used</span>
-                <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
-                  {githubCheck.api_usage.percentage_used?.toFixed(1)}%
-                </span>
-              </div>
+              {githubCheck?.api_usage_graphql || githubCheck?.api_usage_rest ? (
+                <>
+                  {githubCheck?.api_usage_graphql && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-gh-fg-muted">
+                        GraphQL
+                        {githubCheck.api_usage_graphql.stale && (
+                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
+                        )}
+                      </span>
+                      <span className={getUsageColor(githubCheck.api_usage_graphql.percentage_used)}>
+                        {formatNumber(githubCheck.api_usage_graphql.remaining)} / {formatNumber(githubCheck.api_usage_graphql.limit)}
+                      </span>
+                    </div>
+                  )}
+                  {githubCheck?.api_usage_rest && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-gh-fg-muted">
+                        REST
+                        {githubCheck.api_usage_rest.stale && (
+                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
+                        )}
+                      </span>
+                      <span className={getUsageColor(githubCheck.api_usage_rest.percentage_used)}>
+                        {formatNumber(githubCheck.api_usage_rest.remaining)} / {formatNumber(githubCheck.api_usage_rest.limit)}
+                      </span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gh-fg-muted">Remaining</span>
+                  <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
+                    {formatNumber(githubCheck.api_usage.remaining)} / {formatNumber(githubCheck.api_usage.limit)}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         )}

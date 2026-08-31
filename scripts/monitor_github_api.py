@@ -72,6 +72,31 @@ class GitHubAPIMonitor:
         
         return f"[{bar}] {color}"
     
+    def print_rate_limit_section(self, label: str, rl: Dict[str, Any]):
+        """Print one bucket's (GraphQL or REST) rate-limit section.
+
+        GitHub enforces separate REST and GraphQL rate-limit buckets
+        (issue #103) - this is called once per bucket rather than printing
+        a single conflated number that can't be attributed to either.
+        """
+        remaining = rl['remaining']
+        limit = rl['limit']
+        percentage = rl['percentage_used']
+        reset_time = rl.get('time_until_reset') or 0
+        reset_timestamp = rl.get('reset_time') or 'Unknown'
+
+        print(f"📊 {label} RATE LIMIT STATUS")
+        print("━" * 72)
+        print(f"  Remaining:  {remaining:5d} / {limit:5d} points")
+        print(f"  Used:       {percentage:6.1f}%")
+        print(f"  Time until reset:  {reset_time:.0f} seconds (~{reset_time/60:.0f} minutes)")
+        print(f"  Reset at:   {reset_timestamp}")
+        print()
+
+        bar = self.format_percentage_bar(percentage)
+        print(f"  {bar}")
+        print()
+
     def print_dashboard(self, status: Dict[str, Any]):
         """Print formatted dashboard"""
         print("\033[H\033[J")  # Clear screen
@@ -80,31 +105,20 @@ class GitHubAPIMonitor:
         print("╚════════════════════════════════════════════════════════════════════╝")
         print()
         
-        rl = status['status']['rate_limit']
+        # 'rate_limit' is kept by GitHubAPIClient.get_status() as a
+        # backward-compat alias for the GraphQL bucket only; prefer the
+        # explicit rate_limit_graphql/rate_limit_rest keys so both buckets
+        # are shown distinctly (falls back to the older server shape if
+        # only the conflated key is present).
+        rl_graphql = status['status'].get('rate_limit_graphql', status['status']['rate_limit'])
+        rl_rest = status['status'].get('rate_limit_rest')
         breaker = status['status']['breaker']
         stats = status['status']['stats']
         
-        # Rate limit section
-        remaining = rl['remaining']
-        limit = rl['limit']
-        percentage = rl['percentage_used']
-        reset_time = rl.get('time_until_reset') or 0
-        reset_timestamp = rl.get('reset_time') or 'Unknown'
+        self.print_rate_limit_section("GRAPHQL", rl_graphql)
+        if rl_rest:
+            self.print_rate_limit_section("REST", rl_rest)
         
-        print("📊 RATE LIMIT STATUS")
-        print("━" * 72)
-        print(f"  Remaining:  {remaining:5d} / {limit:5d} points")
-        print(f"  Used:       {percentage:6.1f}%")
-        print(f"  Time until reset:  {reset_time:.0f} seconds (~{reset_time/60:.0f} minutes)")
-        print(f"  Reset at:   {reset_timestamp}")
-        print()
-        
-        # Visual bar
-        bar = self.format_percentage_bar(percentage)
-        print(f"  {bar}")
-        print()
-        
-        # Circuit breaker section
         print("🔌 CIRCUIT BREAKER")
         print("━" * 72)
         
@@ -135,31 +149,44 @@ class GitHubAPIMonitor:
         """Print status as JSON"""
         print(json.dumps(status, indent=2))
     
+    def bucket_alerts(self, label: str, rl: Dict[str, Any]) -> list:
+        """Build alert lines for one bucket (GraphQL or REST)."""
+        percentage = rl['percentage_used']
+        remaining = rl['remaining']
+
+        alerts = []
+        if remaining <= 100:
+            alerts.append(f"🚨 CRITICAL: {label} rate limit critically low! Only {remaining} points remaining")
+        elif remaining <= 250:
+            alerts.append(f"🔴 WARNING: {label} rate limit low! Only {remaining} points remaining ({percentage:.1f}% used)")
+        elif percentage >= 95:
+            alerts.append(f"⚠️  ELEVATED: {label} API usage at {percentage:.1f}% ({remaining} points remaining)")
+        elif percentage >= 90:
+            alerts.append(f"ℹ️  HIGH: {label} API usage at {percentage:.1f}% ({remaining} points remaining)")
+        return alerts
+
     def print_alerts(self, status: Dict[str, Any]):
         """Print only alerts/warnings"""
-        rl = status['status']['rate_limit']
+        # See print_dashboard() for why both buckets are checked separately
+        # rather than reading the conflated 'rate_limit' key alone (issue #103) -
+        # a REST-only exhaustion would otherwise never trigger an alert here.
+        rl_graphql = status['status'].get('rate_limit_graphql', status['status']['rate_limit'])
+        rl_rest = status['status'].get('rate_limit_rest')
         breaker = status['status']['breaker']
         stats = status['status']['stats']
         
-        percentage = rl['percentage_used']
-        remaining = rl['remaining']
-        
         alerts = []
         
-        # Check rate limit
+        # Check circuit breaker
         if breaker['is_open']:
             alerts.append(f"🚨 CRITICAL: Circuit breaker is OPEN - requests being blocked")
             if breaker['reset_time']:
                 alerts.append(f"   Will reset: {breaker['reset_time']}")
         
-        if remaining <= 100:
-            alerts.append(f"🚨 CRITICAL: Rate limit critically low! Only {remaining} points remaining")
-        elif remaining <= 250:
-            alerts.append(f"🔴 WARNING: Rate limit low! Only {remaining} points remaining ({percentage:.1f}% used)")
-        elif percentage >= 95:
-            alerts.append(f"⚠️  ELEVATED: API usage at {percentage:.1f}% ({remaining} points remaining)")
-        elif percentage >= 90:
-            alerts.append(f"ℹ️  HIGH: API usage at {percentage:.1f}% ({remaining} points remaining)")
+        # Check rate limit - both buckets
+        alerts.extend(self.bucket_alerts("GraphQL", rl_graphql))
+        if rl_rest:
+            alerts.extend(self.bucket_alerts("REST", rl_rest))
         
         # Check for failures
         if stats['failed_requests'] > 0:
