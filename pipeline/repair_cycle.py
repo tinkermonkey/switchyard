@@ -57,6 +57,20 @@ logger = logging.getLogger(__name__)
 
 MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
 
+# "__infrastructure__" failures constructed directly by _run_tests()'s own retry-
+# exhaustion paths (JSON parsing never found a result, or the execution call itself
+# kept failing) carry no diagnostic content about the codebase or environment — there
+# is nothing for systemic analysis or per-file fixing to act on. These get a bounded
+# number of plain re-runs instead of the full fix pipeline. Any other "__infrastructure__"
+# failure (e.g. the agent faithfully reporting a real pytest collection crash per its
+# runner instructions) has real content and is left to flow through the normal
+# systemic-analysis / env-rebuild / fix-cycle machinery like any other failure.
+_NO_CONTENT_INFRA_TEST_NAMES = frozenset({
+    "test_execution_json_parse",
+    "test_execution_failure",
+    "test_execution_unknown",
+})
+
 # Inter-phase cooldown: pause between test phases after a long-running phase so the Docker
 # host has time to reclaim cgroups and file descriptors. Observed: a 21-minute unit test run
 # followed immediately by integration tests caused fix-attempt containers to be killed within
@@ -507,6 +521,9 @@ class RepairCycleStage(PipelineStage):
         test_cycle_iteration = 0
         files_fixed = 0
         warnings_reviewed = 0
+        # Bounded separately from config.max_iterations (which budgets genuine fix
+        # attempts) so content-less infrastructure failures can't eat that budget.
+        no_content_infra_attempts = 0
 
         from services.cancellation import get_cancellation_signal
         issue_number = context.get('issue_number')
@@ -604,53 +621,114 @@ class RepairCycleStage(PipelineStage):
             # Check for infrastructure failures (indicated by __infrastructure__ file)
             infrastructure_failures = [f for f in test_result.failures if f.file == "__infrastructure__"]
             if infrastructure_failures:
+                infra_failure = infrastructure_failures[0]
                 logger.error(
-                    f"Infrastructure failure detected in test execution: " f"{infrastructure_failures[0].message}"
+                    f"Infrastructure failure detected in test execution: " f"{infra_failure.message}"
                 )
-                
-                # Emit test cycle completed event with infrastructure failure
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type,
-                            "test_type_index": test_type_index,
-                            "passed": 0,  # Convert bool to int for ES schema
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
-                        },
-                        pipeline_run_id=pipeline_run_id,
+
+                if (
+                    infra_failure.test in _NO_CONTENT_INFRA_TEST_NAMES
+                    and no_content_infra_attempts < MAX_SYSTEMIC_SUB_CYCLES
+                ):
+                    # No diagnostic content to act on (the agent never returned a usable
+                    # result) — the only sensible recovery is a plain re-run, capped
+                    # independently of config.max_iterations.
+                    no_content_infra_attempts += 1
+                    logger.warning(
+                        f"Infrastructure failure carried no diagnostic content "
+                        f"({infra_failure.test}); retrying test execution "
+                        f"(attempt {no_content_infra_attempts}/{MAX_SYSTEMIC_SUB_CYCLES})"
                     )
-                
-                # Emit cycle failed event with infrastructure failure
-                if obs:
-                    obs.emit(
-                        EventType.REPAIR_CYCLE_FAILED,
-                        "repair_cycle",
-                        task_id,
-                        project,
-                        {
-                            "test_type": config.test_type,
-                            "test_type_index": test_type_index,
-                            "test_cycle_iterations": test_cycle_iteration,
-                            "error": f"Infrastructure failure: {infrastructure_failures[0].message}",
-                            "error_type": "infrastructure_failure",
-                        },
-                        pipeline_run_id=pipeline_run_id,
+                    if obs:
+                        obs.emit(
+                            EventType.RETRY_ATTEMPTED,
+                            "repair_cycle",
+                            task_id,
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "test_type_index": test_type_index,
+                                "test_cycle_iteration": test_cycle_iteration,
+                                "max_test_cycle_iterations": config.max_iterations,
+                                "attempt": no_content_infra_attempts,
+                                "max_retries": MAX_SYSTEMIC_SUB_CYCLES,
+                                "reason": "infrastructure_failure_no_content",
+                                "error": infra_failure.message,
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                    continue
+
+                if infra_failure.test not in _NO_CONTENT_INFRA_TEST_NAMES:
+                    # Real diagnostic content (e.g. a genuine crash/collection failure the
+                    # agent faithfully reported per its runner instructions) — this is
+                    # exactly what systemic analysis and the env-rebuild / systemic-fix
+                    # sub-cycles below exist to act on. Let it flow through the normal
+                    # failure-handling path instead of hard-stopping before ever reaching
+                    # them; group_failures_by_file() and _analyze_systemic_failures()
+                    # already operate generically on any (file, failures) grouping,
+                    # "__infrastructure__" included.
+                    logger.info(
+                        f"Infrastructure failure carries diagnostic content "
+                        f"({infra_failure.test}); routing to systemic analysis / fix cycle "
+                        f"instead of failing immediately"
                     )
-                
-                return CycleResult(
-                    test_type=config.test_type,
-                    passed=False,
-                    iterations=test_cycle_iteration,
-                    final_result=test_result,
-                    error=f"Infrastructure failure: {infrastructure_failures[0].message}",
-                    files_fixed=files_fixed,
-                    warnings_reviewed=warnings_reviewed,
-                )
+                    if obs:
+                        obs.emit(
+                            EventType.ERROR_ENCOUNTERED,
+                            "repair_cycle",
+                            task_id,
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "error_type": "infrastructure_failure_routed_to_fix_cycle",
+                                "test_cycle_iteration": test_cycle_iteration,
+                                "infra_test_name": infra_failure.test,
+                                "message": infra_failure.message,
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                    # Fall through to Step 2 below — do not return.
+                else:
+                    # No-content retry budget exhausted — give up as before.
+                    if obs:
+                        obs.emit(
+                            EventType.REPAIR_CYCLE_TEST_CYCLE_COMPLETED,
+                            "repair_cycle",
+                            task_id,
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "test_type_index": test_type_index,
+                                "passed": 0,  # Convert bool to int for ES schema
+                                "test_cycle_iterations": test_cycle_iteration,
+                                "error": f"Infrastructure failure: {infra_failure.message}",
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                        obs.emit(
+                            EventType.REPAIR_CYCLE_FAILED,
+                            "repair_cycle",
+                            task_id,
+                            project,
+                            {
+                                "test_type": config.test_type,
+                                "test_type_index": test_type_index,
+                                "test_cycle_iterations": test_cycle_iteration,
+                                "error": f"Infrastructure failure: {infra_failure.message}",
+                                "error_type": "infrastructure_failure",
+                            },
+                            pipeline_run_id=pipeline_run_id,
+                        )
+                    return CycleResult(
+                        test_type=config.test_type,
+                        passed=False,
+                        iterations=test_cycle_iteration,
+                        final_result=test_result,
+                        error=f"Infrastructure failure: {infra_failure.message}",
+                        files_fixed=files_fixed,
+                        warnings_reviewed=warnings_reviewed,
+                    )
 
             # Step 2: Check for failures
             if not test_result.has_failures():
@@ -1766,17 +1844,30 @@ class RepairCycleStage(PipelineStage):
             except json.JSONDecodeError as e:
                 logger.warning(f"Failed to parse JSON from code block: {e}")
 
-        # Try to find any JSON object in the response (last resort)
-        # Look for the largest JSON object in the response
-        json_objects = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", response, re.DOTALL)
-        for json_str in reversed(json_objects):  # Try largest first
+        # Try to find any JSON object embedded in narrative text (last resort).
+        # Uses the real JSON decoder anchored at every '{' in the response, rather
+        # than a brace-counting regex — a regex miscounts as soon as a failure/warning
+        # message *contains* a literal '{' or '}' (e.g. an error quoting a dict or a
+        # JSON snippet), which silently breaks extraction for exactly the kind of
+        # response this fallback exists to handle. raw_decode() respects string
+        # quoting and arbitrary nesting, so it isn't fooled by that. Scans left to
+        # right and keeps the last matching candidate, since agents that wrap the
+        # result in prose overwhelmingly put the narrative before the JSON (e.g.
+        # "Here are the results: {...}") rather than after it.
+        decoder = json.JSONDecoder()
+        candidate = None
+        for idx, ch in enumerate(response):
+            if ch != "{":
+                continue
             try:
-                parsed = json.loads(json_str)
-                if isinstance(parsed, dict) and "passed" in parsed and "failed" in parsed:
-                    logger.info("Successfully extracted JSON from nested content")
-                    return parsed
+                parsed, _ = decoder.raw_decode(response, idx)
             except json.JSONDecodeError:
                 continue
+            if isinstance(parsed, dict) and "passed" in parsed and "failed" in parsed:
+                candidate = parsed
+        if candidate is not None:
+            logger.info(f"Successfully extracted JSON from narrative response. Keys: {list(candidate.keys())}")
+            return candidate
 
         # No valid JSON found - provide detailed error message
         logger.error(f"Failed to extract valid JSON from response. Response length: {len(response)}")
