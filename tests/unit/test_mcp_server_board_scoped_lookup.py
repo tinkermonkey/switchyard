@@ -23,10 +23,27 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../mcp')))
-
-import server as mcp_server
+# sys.path is mutated only for the duration of this import, then restored —
+# leaving the insert in place for the rest of the pytest session made the
+# repo root and mcp/ the FIRST places Python resolves top-level imports
+# (e.g. a bare `import server`) for every test collected afterward, and
+# contributed to unrelated test-order pollution elsewhere in the suite
+# (confirmed: excluding this file entirely dropped the full-suite failure
+# count by dozens). mcp/server.py itself has no __init__.py alongside it —
+# see its own module docstring — specifically so it isn't a regular package
+# that could shadow the installed `mcp` SDK; that's also why sys.path needs
+# these two entries (repo root for mcp/server.py's own `from services...`
+# imports, and mcp/ itself so `import server`/`import auth` resolve) only
+# while the import below actually happens.
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+_mcp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../mcp'))
+sys.path.insert(0, _repo_root)
+sys.path.insert(0, _mcp_dir)
+try:
+    import server as mcp_server
+finally:
+    sys.path.remove(_mcp_dir)
+    sys.path.remove(_repo_root)
 
 
 class FakeRedis:
