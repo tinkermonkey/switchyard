@@ -38,6 +38,32 @@ of it. This takes priority over the generic checks below:
     retried automatically — do not escalate an "I couldn't confirm this" to BLOCKED just
     to force a decision.
 
+### How To Reproduce The Real Runtime Environment
+
+When Step 0 tells you to "re-run the exact failing command in the actual environment the
+failing test uses," that environment has a specific, non-obvious shape — get it wrong and
+you can validate a fix that doesn't actually work:
+
+- The project's source is mounted directly onto the container's `/workspace` at runtime —
+  **not** `/workspace/{project_name}`. There is no `/workspace/{project_name}` path inside
+  a real agent container; only `/workspace/...` exists.
+- The container's working directory at runtime is always `/workspace`, regardless of any
+  `WORKDIR` baked into the image at build time.
+- Reproduce this exactly rather than improvising your own layout: run the freshly built
+  image with the project mounted the same way production does —
+  `docker run --rm -v <host_project_checkout>:/workspace -w /workspace {project_name}-agent:latest <exact failing command>`.
+  If your sandbox's Docker daemon can't reach the real host checkout path via `-v` (bind
+  mounts silently no-op), the next-best approximation is `docker cp`-ing the real source
+  tree into a running container of that image — but if you do, you MUST place it at
+  `/workspace` (not `/workspace/{project_name}` or any other path) and run the command
+  from there, so cwd, rootdir discovery, and any `ENV PYTHONPATH`-style absolute paths
+  behave exactly as they will in production.
+- A reproduction that uses a different mount point or working directory than production is
+  not evidence the fix works — it only proves the fix works in a layout that will never
+  actually run. If you can't reconstruct the real mount/cwd faithfully, that is exactly the
+  "could not independently verify" case in the CHANGES NEEDED bullet above — don't count it
+  as a pass.
+
 ### Step 1: Review Setup Agent's Work
 
 Examine the setup agent's output for:
