@@ -8399,7 +8399,8 @@ _Repair cycle initiated by Switchyard_
                             # failsafe below still see its real item set instead
                             # of nothing, without spending a query on it.
                             string_key = f"{project_name}_{pipeline.board_name}"
-                            current_items = list(self.last_state.get(string_key, {}).values())
+                            with self._last_state_lock:
+                                current_items = list(self.last_state.get(string_key, {}).values())
 
                         # Store for failsafe reuse (even if empty — avoids re-fetch)
                         poll_cycle_items[(project_name, pipeline.board_name)] = current_items
