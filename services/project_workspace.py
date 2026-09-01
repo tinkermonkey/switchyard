@@ -401,19 +401,30 @@ class ProjectWorkspaceManager:
             )
             newly_created = True
 
-        # Best-effort baked-dependency extraction runs OUTSIDE _epic_worktree_lock
-        # (#50 review): docker create/cp/rm can take several seconds for a large
-        # dependency tree, and running it while holding the lock would serialize
-        # every OTHER epic's/project's worktree creation and cleanup behind it. The
-        # worktree is already fully registered and usable by this point (immediately
-        # above) -- extraction is a pure performance optimization, never correctness-
-        # critical (a fresh install is the documented fallback on any failure), so
-        # only this brand-new-worktree path (never cache-hit reuse or restart-
-        # adoption, both handled inside the lock above) runs it, and running it
-        # unlocked is safe: a concurrent caller for the same epic simply gets the
-        # already-registered worktree path immediately, extraction or not.
+        # Best-effort baked-dependency extraction runs in a detached background
+        # thread, OUTSIDE _epic_worktree_lock (#50 review, 2nd pass): docker
+        # create/cp/rm can take up to _DOCKER_CP_TIMEOUT_SECONDS (5 min) for a large
+        # dependency tree. get_or_create_epic_worktree() is a plain sync method
+        # called directly (no asyncio.to_thread) from async callers like
+        # agent_executor.py's execute_agent -- running extraction inline, even
+        # unlocked, would still block whichever thread called this (the event loop
+        # thread, in the common case) for that entire window. Extraction is a pure
+        # performance optimization, never correctness-critical: a fresh install by
+        # the dev-environment agent is the documented fallback whenever it hasn't
+        # finished (or hasn't run at all, e.g. an old-convention image) by the time
+        # an agent actually needs the dependency, exactly like the "nothing at
+        # BAKED_DEPS_PATH yet" case already behaves -- so not waiting for it here
+        # doesn't add a new class of risk, it just makes the already-existing
+        # fallback path a little more likely to be hit on a freshly-created epic's
+        # very first task. Runs only on this brand-new-worktree path (never cache-hit
+        # reuse or restart-adoption, both handled inside the lock above).
         if newly_created:
-            self._extract_baked_dependencies_if_available(project_name, worktree_path)
+            threading.Thread(
+                target=self._extract_baked_dependencies_if_available,
+                args=(project_name, worktree_path),
+                name=f"extract-deps-{project_name}-{epic_id}",
+                daemon=True,
+            ).start()
 
         return worktree_path
 

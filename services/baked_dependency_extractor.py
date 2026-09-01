@@ -126,10 +126,18 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
             # log message is shown, never control flow (both branches return False
             # and proceed identically), so the risk is a confusing log line, not a
             # behavior change.
+            # Require the source path itself to be named in the error, not just a
+            # generic "no such"/"not found" phrase anywhere in stderr -- narrows
+            # (without eliminating) the risk of misclassifying an unrelated genuine
+            # failure (e.g. a storage/overlay-driver error whose text happens to
+            # contain one of these phrases) as the benign old-convention-image case.
             stderr_lower = stderr.lower()
-            looks_like_missing_path = any(
-                phrase in stderr_lower
-                for phrase in ('no such', 'not found', 'does not exist')
+            looks_like_missing_path = (
+                BAKED_DEPS_PATH.lower() in stderr_lower
+                and any(
+                    phrase in stderr_lower
+                    for phrase in ('no such', 'not found', 'does not exist')
+                )
             )
             if looks_like_missing_path:
                 logger.warning(
@@ -177,7 +185,14 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
                     ['docker', 'rm', '-f', container_name],
                     capture_output=True, text=True, timeout=_DOCKER_TIMEOUT_SECONDS
                 )
-                if created and rm_result.returncode != 0:
+                # Log on ANY nonzero result here, not just when `created` was
+                # confirmed True: this branch already excludes the confirmed-False
+                # case above, so the remaining possibility is `created is None`
+                # (docker create's own subprocess.run raised, e.g. TimeoutExpired --
+                # the daemon's state is unknown). A failed rm there is exactly the
+                # silent-leak scenario these comments exist to prevent; it must be
+                # logged just as loudly as the confirmed-True case.
+                if rm_result.returncode != 0:
                     logger.warning(
                         f"Failed to remove scratch container {container_name}: "
                         f"{rm_result.stderr.strip()}"

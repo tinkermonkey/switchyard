@@ -493,7 +493,31 @@ class TestBakedDependencyExtractionIntegration:
     """get_or_create_epic_worktree() (issue #50) triggers baked-dependency extraction
     only on the brand-new-worktree path -- never on cache-hit reuse, and never on
     adopting a pre-existing worktree found on disk after a restart -- and never lets
-    an extraction problem block worktree creation itself."""
+    an extraction problem block worktree creation itself.
+
+    Extraction runs in a detached background thread (#50 review, 2nd pass) so it
+    can never block the caller/event loop -- but that makes its actual invocation
+    non-deterministic from a plain test's point of view (a race between the
+    background thread and the test's own assertions). run_synchronously below
+    patches threading.Thread to invoke its target inline instead of spawning a
+    real thread, so every test in this class can assert deterministically."""
+
+    @pytest.fixture(autouse=True)
+    def run_synchronously(self):
+        """Make the extraction background thread run inline (same thread, same
+        call stack) instead of actually spawning one, for deterministic tests."""
+        class _ImmediateThread:
+            def __init__(self, target=None, args=(), kwargs=None, **_ignored):
+                self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
+
+            def start(self):
+                if self._target:
+                    self._target(*self._args, **self._kwargs)
+
+        with patch('services.project_workspace.threading.Thread', _ImmediateThread):
+            yield
 
     def test_new_worktree_triggers_extraction_with_resolved_image(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")

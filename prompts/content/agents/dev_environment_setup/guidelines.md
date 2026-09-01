@@ -184,20 +184,38 @@ WORKDIR /opt/deps
 # OPTION A: Pre-install dependencies (Recommended for fast startup)
 # Copy ONLY the dependency manifests needed for installation
 # DO NOT copy source code - it comes from the runtime mount
+#
+# CRITICAL: /opt/deps must end up containing ONLY the INSTALLED dependency
+# directories (node_modules, .venv) by the time this stage finishes -- nothing
+# else. The extraction mechanism (services/baked_dependency_extractor.py, issue
+# #50) copies /opt/deps's entire contents wholesale into a freshly-created epic
+# worktree, landing each entry at the SAME relative path in that worktree. If a
+# manifest file (package.json, a lockfile, requirements.txt) is left sitting in
+# /opt/deps, it gets copied into the worktree too -- silently overwriting the
+# worktree's own, just-`git worktree add`-checked-out, CURRENT manifest with a
+# stale image-build-time snapshot (wrong dependency versions, and a `git status`
+# diff that can get committed by mistake). Always remove/relocate manifests
+# after the install step below, or copy them from somewhere OUTSIDE /opt/deps
+# in the first place.
 
 # For Node.js/pnpm projects:
 # COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
 # COPY apps/*/package.json ./apps/*/
 # RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-#     pnpm install --frozen-lockfile
-# -> produces /opt/deps/node_modules
+#     pnpm install --frozen-lockfile && \
+#     find . -maxdepth 3 -name 'package.json' -delete && \
+#     rm -f pnpm-lock.yaml pnpm-workspace.yaml
+# -> produces /opt/deps/node_modules (and nested apps/*/node_modules) ONLY --
+#    every manifest file copied above is deleted again once install completes.
 
 # For Python projects (a venv, not `pip install` into the image's system site-packages
 # -- system-wide installs have no single directory to extract and copy into a worktree):
-# COPY requirements.txt ./
+# COPY requirements.txt /tmp/requirements.txt
 # RUN python3 -m venv /opt/deps/.venv && \
-#     /opt/deps/.venv/bin/pip install --no-cache-dir -r requirements.txt
-# -> produces /opt/deps/.venv
+#     /opt/deps/.venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \
+#     rm -f /tmp/requirements.txt
+# -> produces /opt/deps/.venv ONLY -- requirements.txt was copied OUTSIDE /opt/deps
+#    from the start (/tmp), so there's nothing to clean up from under /opt/deps itself.
 
 # ============================================================================
 # Stage 4: Ownership and Permissions
@@ -230,7 +248,9 @@ CMD ["/bin/bash"]
    `/workspace/{PROJECT_NAME}/node_modules` (see CRITICAL callout above)
 4. **DO** bake dependencies at `/opt/deps` instead (e.g. `/opt/deps/node_modules`,
    `/opt/deps/.venv`) — outside `/workspace` entirely, so the mount can't shadow them
-5. **DO** copy dependency manifests (package.json, requirements.txt) if pre-installing deps
+5. **DO** copy dependency manifests (package.json, requirements.txt) if pre-installing deps,
+   but remove them again (or stage them outside `/opt/deps` from the start) once the
+   install completes -- see the CRITICAL note above Stage 3's examples
 6. **DO** pre-install dependencies to speed up agent startup
 7. **DO** verify claude, git, and gh CLIs are present
 8. **DO** use cache mounts for package managers when possible
