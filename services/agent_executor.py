@@ -227,9 +227,38 @@ class AgentExecutor:
         # a checkout, on the shared base clone. Best-effort: a resolution failure
         # here must not break executions that worked fine before this migration --
         # fall back to the pre-migration shared-base-clone behavior instead.
+        #
+        # IMPORTANT (issue #46 review, pass 2): this is deliberately an ALLOWLIST
+        # (only 'discussions' today), not a denylist of 'issues' alone. Both
+        # IssuesWorkspaceContext AND HybridWorkspaceContext call
+        # FeatureBranchManager.prepare_feature_branch(), which resolves its OWN
+        # branch (via independent confidence-matching over related branches, which
+        # can legitimately disagree with resolve_epic_branch_name()'s pick here) and
+        # checks it out directly on the shared BASE CLONE, after this block would
+        # otherwise have already created a worktree with the SAME branch checked
+        # out -- git refuses to check out a branch that's already checked out in
+        # another worktree, breaking every such dispatch. Only DiscussionsWorkspace
+        # Context is verified git-free (supports_git_operations=False, no call to
+        # prepare_feature_branch) and therefore safe to isolate today. Reconciling
+        # the two branch-resolution paths (or migrating prepare_feature_branch/
+        # finalize_feature_branch_work to operate on the epic worktree instead of
+        # the base clone) is real, nontrivial work that belongs to issue #48, which
+        # already explicitly scopes services/workspace/issues_context.py's and
+        # hybrid_context.py's get_working_directory() as its own targets. Until
+        # that lands, 'issues'/'hybrid' dispatch keeps its pre-migration shared-
+        # base-clone behavior exactly -- honest, non-regressing, and consistent
+        # with this migration's own 'byte-identical behavior at concurrency=1'
+        # requirement.
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES = {'discussions'}
+        workspace_type_for_epic_gate = task_context.get('workspace_type', 'issues')
         epic_id = task_context.get('epic_id')
         epic_branch_name = task_context.get('branch_name')
-        if epic_id is None and 'issue_number' in task_context and not task_context.get('skip_workspace_prep', False):
+        if (
+            epic_id is None
+            and 'issue_number' in task_context
+            and not task_context.get('skip_workspace_prep', False)
+            and workspace_type_for_epic_gate in EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
+        ):
             try:
                 project_config_for_epic = config_manager.get_project_config(project_name)
                 repo_owner = None

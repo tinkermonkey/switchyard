@@ -586,22 +586,39 @@ class TestExecuteAgentEpicResolution:
         return captured
 
     @pytest.mark.asyncio
-    async def test_sdlc_execution_style_dispatch_resolves_the_parent_epic(self, agent_executor):
-        """A sub-issue dispatch (workspace_type 'issues', get_parent_issue
-        resolves a real parent) must scope the worktree to the PARENT epic,
-        not the sub-issue's own number -- this is what makes two sequential
-        sub-issues of the same epic share one worktree."""
+    async def test_issues_workspace_type_does_not_resolve_epic_id(self, agent_executor):
+        """A sub-issue dispatch through the DEFAULT 'issues' workspace type must NOT
+        resolve/pass an epic_id -- IssuesWorkspaceContext.prepare_execution() ->
+        FeatureBranchManager.prepare_feature_branch() still checks out its own
+        (independently-resolved) branch directly on the shared base clone, which
+        would conflict with a worktree already holding that same branch checked
+        out. Epic worktree isolation for this workspace type is deferred to #48;
+        until then it must keep exactly its pre-migration base-clone behavior."""
         task_context = {'issue_number': 100, 'workspace_type': 'issues'}
 
         captured = await self._run(agent_executor, task_context, parent_issue=42)
 
-        assert captured['epic_id'] == '42'
-        assert task_context['epic_id'] == '42'
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
+
+    @pytest.mark.asyncio
+    async def test_hybrid_workspace_type_does_not_resolve_epic_id(self, agent_executor):
+        """HybridWorkspaceContext also calls prepare_feature_branch() on the base
+        clone (same conflict risk as 'issues') -- must be excluded from epic
+        worktree resolution for the same reason."""
+        task_context = {'issue_number': 150, 'workspace_type': 'hybrid'}
+
+        captured = await self._run(agent_executor, task_context, parent_issue=42)
+
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
 
     @pytest.mark.asyncio
     async def test_planning_design_style_dispatch_falls_back_to_its_own_number(self, agent_executor):
-        """A board item dispatched directly as an epic (no parent found) must
-        scope the worktree to its own issue number."""
+        """A board item dispatched directly as an epic through the 'discussions'
+        workspace type (verified git-free -- supports_git_operations=False, no
+        call to prepare_feature_branch, so no checkout-conflict risk) must scope
+        the worktree to its own issue number when no parent is found."""
         task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
 
         captured = await self._run(agent_executor, task_context, parent_issue=None)
