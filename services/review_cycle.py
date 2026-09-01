@@ -67,9 +67,12 @@ class ReviewCycleState:
         # FeatureBranchManager.resolve_epic_id() (issue #47). NOT currently consumed
         # by any get_project_dir() call site in this file -- see #46's gating
         # decision (epic-worktree resolution is gated off for 'issues'/'hybrid'
-        # workspace types until #48 lands) and #48, which will thread this into
-        # those call sites. Stored here now, read-only/observability only, so #48
-        # has less work later. Stays None if resolution fails or hasn't run yet.
+        # workspace types). #48 investigated every remaining call site in this file
+        # and confirmed none can safely consume this yet -- the gate still applies
+        # until a dedicated fast-follow reconciles FeatureBranchManager's
+        # independent branch resolution with the epic worktree model. Stored here
+        # now, read-only/observability only, ready for that future consumer. Stays
+        # None if resolution fails or hasn't run yet.
         self.epic_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -193,7 +196,9 @@ class ReviewCycleExecutor:
     async def _resolve_epic_id_for_cycle(self, cycle_state: ReviewCycleState) -> None:
         """
         Best-effort resolution of cycle_state.epic_id -- the parent epic issue number
-        that will eventually scope this sub-issue's isolated git worktree (#47/#48).
+        that will eventually scope this sub-issue's isolated git worktree, once a
+        dedicated fast-follow reconciles FeatureBranchManager's independent branch
+        resolution with the epic worktree model (#47/#48).
 
         NOT CURRENTLY CALLED from any ReviewCycleState construction path (pass-1
         review of #47 found that calling this eagerly at cycle start/resume put a
@@ -202,9 +207,14 @@ class ReviewCycleExecutor:
         chain is synchronous I/O with no thread offload -- ahead of the
         active_cycles[key] dict write those paths depend on, widening a real
         concurrent-dispatch race for a value nothing downstream consumes yet).
-        Kept as tested, ready plumbing: #48 should call this from whichever
-        construction path(s) it actually needs epic_id for, once there's a real
-        consumer, rather than unconditionally on every cycle start/resume.
+        Kept as tested, ready plumbing. #48 investigated every remaining
+        get_project_dir() call site in this file and confirmed none can safely
+        become a real consumer yet: 'issues'/'hybrid' review cycles still mount
+        their agent container from the shared base clone (see the
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate note below), so every one of them
+        deliberately keeps calling get_project_dir() with no epic_id. Still stays
+        None here until whichever future change actually reconciles the two
+        branch-resolution paths lands and gives this a real consumer.
 
         IMPORTANT for whoever wires this in: services/agent_executor.py's
         equivalent resolve_epic_id() call is guarded by an explicit
@@ -1346,13 +1356,17 @@ class ReviewCycleExecutor:
                 # Store current commit hash for future scoped reviews (issues workspace)
                 if cycle_state.workspace_type == 'issues':
                     from services.project_workspace import workspace_manager
-                    # NOTE (#47): deliberately NOT passing epic_id=cycle_state.epic_id here.
-                    # Epic-worktree resolution is gated off for 'issues'/'hybrid' workspace
-                    # types until #48 lands (see agent_executor.py's
-                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- the real
-                    # agent container for this sub-issue is still mounted from this same base
-                    # clone today, so scoping this call to the epic worktree would silently
-                    # point it at a directory the agent never touched.
+                    # NOTE (#47/#48): deliberately NOT passing epic_id=cycle_state.epic_id
+                    # here. Epic-worktree resolution is gated off for 'issues'/'hybrid'
+                    # workspace types (see agent_executor.py's
+                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- #48
+                    # investigated this call site and confirmed the gate still applies: the
+                    # real agent container for this sub-issue is still mounted from this
+                    # same base clone today, so scoping this call to the epic worktree would
+                    # silently point it at a directory the agent never touched. Stays this
+                    # way until a dedicated fast-follow reconciles
+                    # FeatureBranchManager.prepare_feature_branch()'s independent branch
+                    # resolution with the epic worktree model.
                     project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
                     current_commit = self._get_git_commit_hash(str(project_dir))
                     if current_commit:
@@ -2528,13 +2542,17 @@ class ReviewCycleExecutor:
                 # Store current commit hash for future scoped reviews (issues workspace)
                 if cycle_state.workspace_type == 'issues':
                     from services.project_workspace import workspace_manager
-                    # NOTE (#47): deliberately NOT passing epic_id=cycle_state.epic_id here.
-                    # Epic-worktree resolution is gated off for 'issues'/'hybrid' workspace
-                    # types until #48 lands (see agent_executor.py's
-                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- the real
-                    # agent container for this sub-issue is still mounted from this same base
-                    # clone today, so scoping this call to the epic worktree would silently
-                    # point it at a directory the agent never touched.
+                    # NOTE (#47/#48): deliberately NOT passing epic_id=cycle_state.epic_id
+                    # here. Epic-worktree resolution is gated off for 'issues'/'hybrid'
+                    # workspace types (see agent_executor.py's
+                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- #48
+                    # investigated this call site and confirmed the gate still applies: the
+                    # real agent container for this sub-issue is still mounted from this
+                    # same base clone today, so scoping this call to the epic worktree would
+                    # silently point it at a directory the agent never touched. Stays this
+                    # way until a dedicated fast-follow reconciles
+                    # FeatureBranchManager.prepare_feature_branch()'s independent branch
+                    # resolution with the epic worktree model.
                     project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
                     current_commit = self._get_git_commit_hash(str(project_dir))
                     if current_commit:

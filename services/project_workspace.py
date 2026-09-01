@@ -67,7 +67,14 @@ class ProjectWorkspaceManager:
                 project_config = config_manager.get_project_config(project_name)
                 was_cloned = self.initialize_project(project_name, project_config)
 
-                # Check if project needs dev environment setup
+                # Check if project needs dev environment setup.
+                # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree
+                # resolution (#48). This startup loop runs once per project before
+                # any board is polled and before any issue/epic exists to scope a
+                # worktree by -- Dockerfile.agent presence is a per-project, not
+                # per-epic, property anyway. If a future caller needs a
+                # worktree-scoped result here, that's a larger change than this
+                # startup check.
                 project_dir = self.get_project_dir(project_name)
                 dockerfile_agent = project_dir / 'Dockerfile.agent'
 
@@ -678,6 +685,10 @@ class ProjectWorkspaceManager:
             f"DEPRECATED: ensure_branch() called for {project_name}/{branch_name}. "
             "Use GitWorkflowManager.checkout_branch() or FeatureBranchManager instead."
         )
+        # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree resolution
+        # (#48). Deprecated, project-level API with no issue/epic argument at all --
+        # there is no task/epic context here to resolve a worktree from, and (per a
+        # full-codebase grep) it has no callers left in production code or tests.
         project_dir = self.get_project_dir(project_name)
 
         if not project_dir.exists():
@@ -733,6 +744,13 @@ class ProjectWorkspaceManager:
 
     def get_current_branch(self, project_name: str) -> Optional[str]:
         """Get the current branch name for a project"""
+        # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree resolution
+        # (#48). Project-level introspection with no issue/epic argument -- there is
+        # no task/epic context here to resolve a worktree from. Unrelated to
+        # FeatureBranchManager.get_current_branch() / GitWorkflowManager's
+        # same-named method (those take an explicit project_dir and are the ones
+        # real callers use); this method has no callers left in production code or
+        # tests.
         project_dir = self.get_project_dir(project_name)
 
         if not project_dir.exists():

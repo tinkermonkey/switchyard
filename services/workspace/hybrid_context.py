@@ -214,7 +214,21 @@ class HybridWorkspaceContext(WorkspaceContext):
             Path to working directory
         """
         if self._current_workspace == 'issues':
-            # Use actual git repository
+            # INTENTIONALLY base-clone-scoped, NOT worktree-aware (#48). This is the
+            # other site #46's review flagged as needing the full rearchitecture (see
+            # the identical comment on IssuesWorkspaceContext.get_working_directory()
+            # in issues_context.py): HybridWorkspaceContext also calls
+            # FeatureBranchManager.prepare_feature_branch() during prepare_execution(),
+            # which independently resolves its own branch and checks it out directly
+            # on the shared base clone -- a resolution that can legitimately disagree
+            # with the epic-worktree branch resolution used by
+            # get_project_dir(epic_id=...), and would crash if git found that branch
+            # already checked out in an epic worktree (agent_executor.py's
+            # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate excludes 'issues'/'hybrid' for
+            # exactly this reason). Reconciling the two branch-resolution paths is
+            # real, substantial work #48 explicitly scoped OUT -- left for a
+            # dedicated fast-follow. Do not migrate this call without that
+            # rearchitecture landing first.
             from services.project_workspace import workspace_manager
             return workspace_manager.get_project_dir(self.project)
         else:

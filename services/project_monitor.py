@@ -4992,6 +4992,21 @@ _Review cycle initiated by Switchyard_
                         from services.git_workflow_manager import git_workflow_manager
                         from services.project_workspace import workspace_manager
 
+                        # INTENTIONALLY base-clone-scoped, not migrated to
+                        # epic-worktree resolution (#48). create_or_update_pr()
+                        # itself is checkout-free (it only runs `gh pr create
+                        # --head <branch>` with this dir as cwd, referencing the
+                        # already-pushed remote branch by name -- no local checkout
+                        # of that branch is required), but this call only ever
+                        # fires for pipeline.workspace == 'issues', which
+                        # agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
+                        # gate excludes from epic-worktree resolution (#46): for
+                        # 'issues', FeatureBranchManager.prepare_feature_branch()
+                        # still independently resolves and checks out its own
+                        # branch on this same base clone elsewhere in this
+                        # dispatch. Scoping just this read to an epic worktree
+                        # would be inconsistent with that -- and gains nothing,
+                        # since gh doesn't need local branch content anyway.
                         project_dir = workspace_manager.get_project_dir(project_name)
 
                         pr_result = loop.run_until_complete(

@@ -894,6 +894,14 @@ class AgentContainerRecovery:
                     return checkpoint
             
             # Fallback: try old location in project directory (for backward compatibility)
+            # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree
+            # resolution (#48). This is a legacy read path that predates both the
+            # state-directory-based checkpoint system (the primary lookup above) AND
+            # the per-epic worktree mechanism (#45) entirely -- any checkpoint file
+            # still readable via this fallback was necessarily written to the base
+            # clone by pre-worktree code, so scoping this read to an epic worktree
+            # would look in a directory that never held it. Read-only and
+            # backward-compat-only; no plausible caller needs this worktree-scoped.
             from services.project_workspace import workspace_manager
             project_dir = workspace_manager.get_project_dir(project)
             checkpoint_file = Path(project_dir) / ".repair_cycle_checkpoint.json"
