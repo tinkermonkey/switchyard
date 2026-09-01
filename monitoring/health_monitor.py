@@ -441,6 +441,39 @@ class HealthMonitor:
             rate_limit_graphql_info = get_shared_rate_limit_status('graphql')
             rate_limit_rest_info = get_shared_rate_limit_status('rest')
 
+            # If the shared (cross-process, Redis-backed) view is
+            # 'unavailable' - a connection failure, timeout, or corrupted
+            # data, distinct from a genuinely quiet bucket - fall back to
+            # this process's own local client's reading rather than
+            # reporting an unusable None. HealthMonitor runs in-process
+            # with the orchestrator's real traffic (see the module comment
+            # above), so its own client's percentage_used is accurate
+            # here, and it's what stands between an operator and a
+            # completely blind quota check during exactly the outage this
+            # matters most for - the alternative (`percentage_used or 0`)
+            # would silently make the degraded check below unable to ever
+            # fire while Redis is down.
+            lost_visibility = False
+            for info, local_key in (
+                (rate_limit_graphql_info, 'rate_limit_graphql'),
+                (rate_limit_rest_info, 'rate_limit_rest'),
+            ):
+                if not info.get('unavailable'):
+                    continue
+                local = client_status[local_key]
+                if local.get('ever_updated'):
+                    info.update({
+                        'percentage_used': local['percentage_used'],
+                        'remaining': local['remaining'],
+                        'limit': local['limit'],
+                        'reset_time': local['reset_time'],
+                    })
+                else:
+                    # Shared view down AND this process has never made a
+                    # real call of this type itself - genuinely no signal
+                    # at all for this bucket, not just a quiet one.
+                    lost_visibility = True
+
             # 'api_rate_limit' is kept for backward compat and mirrors the
             # GraphQL bucket (see GitHubAPIClient.__init__); GraphQL and
             # REST are separate GitHub rate-limit buckets (issue #103), so
@@ -463,9 +496,15 @@ class HealthMonitor:
             call_stats_info = client_status['stats']
 
             # Check if either bucket is critically low (only meaningful
-            # once a real reading exists for that bucket)
+            # once a real reading exists for that bucket - the local
+            # fallback above makes this correctly evaluable even during a
+            # shared-view outage, as long as this process has its own
+            # reading), or if the shared view is down AND this process has
+            # no local reading either - a real loss of visibility into
+            # quota status is itself a degraded condition, not silence.
             if ((rate_limit_graphql_info['percentage_used'] or 0) > 95
-                    or (rate_limit_rest_info['percentage_used'] or 0) > 95):
+                    or (rate_limit_rest_info['percentage_used'] or 0) > 95
+                    or lost_visibility):
                 degraded = True
         except Exception as e:
             logger.debug(f"Failed to get GitHub API client status: {e}")

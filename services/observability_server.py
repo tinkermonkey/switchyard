@@ -448,13 +448,17 @@ def health():
         # Always read the shared, Redis-backed rate limit view instead of the
         # cached health blob's copy, so a quiet period between HealthMonitor
         # cycles doesn't show numbers older than they need to be. This
-        # process (observability-server) never makes real GitHub traffic
-        # itself, so it deliberately does NOT instantiate its own
-        # GitHubAPIClient for this any more - get_shared_rate_limit_status()
+        # deliberately does NOT instantiate a GitHubAPIClient for these
+        # rate-limit numbers any more - get_shared_rate_limit_status()
         # reads whatever the orchestrator (or a repair-cycle/agent
         # container) most recently published from a real response's
-        # headers. A local client here used to "refresh" these numbers from
-        # a periodic self-poll of GitHub's /rate_limit endpoint, which was
+        # headers. (Other endpoints in this file - /api/circuit-breakers*
+        # - still use get_github_client() for breaker admin actions on
+        # this process's own, process-local client; that client's breaker
+        # state has the same "never reflects real traffic" caveat this
+        # comment is about, it's just out of scope for /health here.) A
+        # local client here used to "refresh" these numbers from a
+        # periodic self-poll of GitHub's /rate_limit endpoint, which was
         # found to return bogus always-full data for at least one
         # token/org (issue #103 follow-up) - that whole path is gone.
         # Circuit breaker state is left as HealthMonitor cached it: it's
@@ -488,9 +492,12 @@ def health():
                 health_data['checks']['github']['api_rate_limit_rest'] = rate_limit_rest
                 # Add dedicated api_usage sections for UI consumption.
                 # 'never_observed' (no process has ever published a real
-                # reading for this bucket) and 'stale' (the most recent
-                # reading is older than the freshness threshold) are
-                # deliberately distinct - see get_shared_rate_limit_status().
+                # reading for this bucket), 'unavailable' (the shared view
+                # itself couldn't be read - a Redis outage or corrupted
+                # data, NOT the same as a genuinely quiet bucket), and
+                # 'stale' (have a reading, it's just older than the
+                # freshness threshold) are deliberately distinct - see
+                # get_shared_rate_limit_status().
                 health_data['checks']['github']['api_usage'] = {
                     'remaining': fresh_rate_limit['remaining'],
                     'limit': fresh_rate_limit['limit'],
@@ -504,6 +511,7 @@ def health():
                     'reset_time': rate_limit_graphql['reset_time'],
                     'last_updated': rate_limit_graphql['last_updated'],
                     'never_observed': rate_limit_graphql['never_observed'],
+                    'unavailable': rate_limit_graphql.get('unavailable', False),
                     'stale': rate_limit_graphql['stale'],
                 }
                 health_data['checks']['github']['api_usage_rest'] = {
@@ -513,6 +521,7 @@ def health():
                     'reset_time': rate_limit_rest['reset_time'],
                     'last_updated': rate_limit_rest['last_updated'],
                     'never_observed': rate_limit_rest['never_observed'],
+                    'unavailable': rate_limit_rest.get('unavailable', False),
                     'stale': rate_limit_rest['stale'],
                 }
         except Exception as e:

@@ -639,6 +639,23 @@ async def main():
                     last_health_check = current_time
                     logger.debug(f"Health check complete: healthy={health['healthy']}")
 
+                    # 'degraded' (e.g. GitHub quota critically low, or the
+                    # cross-process rate-limit view itself unreachable - see
+                    # HealthMonitor.check_github()) is a real, actionable
+                    # signal distinct from a full health-check failure below,
+                    # but was previously computed and returned without
+                    # anything ever reading it - silently discarded. Log it
+                    # so it's visible in normal container logs rather than
+                    # only reachable by inspecting /health directly.
+                    if health.get('degraded'):
+                        degraded_checks = [
+                            name for name, result in health.get('checks', {}).items()
+                            if result.get('degraded')
+                        ]
+                        logger.log_warning(
+                            f"System health is degraded (checks: {', '.join(degraded_checks) or 'unknown'})"
+                        )
+
                     if not health['healthy']:
                         consecutive_health_failures += 1
                         logger.log_warning(f"System health check failed (attempt {consecutive_health_failures}/{max_consecutive_failures}): {health}")

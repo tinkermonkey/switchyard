@@ -149,14 +149,33 @@ export default function HeaderSystemHealth() {
   )
 }
 
-// Renders one rate-limit bucket in one of three distinct states:
-// never observed (no process has ever published a real reading for this
-// bucket), stale (have a reading, but nothing's called GitHub recently
-// enough to trust it), or fresh. Conflating the first two into a single
-// "stale" flag used to make a genuinely broken feature look identical to
-// a quiet, healthy one (issue #103) - keeping them apart is the point.
+// Renders one rate-limit bucket in one of four distinct states: unavailable
+// (the shared view itself couldn't be read - Redis down or bad data, a real
+// problem), never observed (the shared view IS readable, it's just empty -
+// no process has ever published a real reading for this bucket), stale
+// (have a reading, but nothing's called GitHub recently enough to trust
+// it), or fresh. Conflating any of the first three into a single flag used
+// to make a genuinely broken feature look identical to a quiet, healthy one
+// (issue #103) - keeping them apart is the point.
 function GithubBucketRow({ label, bucket, getUsageColor, formatNumber }) {
   if (!bucket) return null
+
+  // Distinct from never_observed below: this means the shared view itself
+  // couldn't be read (e.g. Redis is down or returned corrupted data), not
+  // that the bucket is genuinely quiet. Rendered as a warning, not the
+  // same muted/calm treatment as never_observed - conflating the two
+  // would make an actual outage of this mechanism look like a healthy,
+  // uneventful new deployment.
+  if (bucket.unavailable) {
+    return (
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-gh-fg-muted">{label}</span>
+        <span className="text-gh-danger" title="Could not read the shared rate-limit view (Redis unreachable or returned bad data) - this is a problem, not just a quiet bucket">
+          unavailable
+        </span>
+      </div>
+    )
+  }
 
   if (bucket.never_observed) {
     return (
