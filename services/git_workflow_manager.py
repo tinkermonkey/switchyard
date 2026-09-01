@@ -546,12 +546,15 @@ class GitWorkflowManager:
         services/agent_executor.py gates worktree resolution to the
         'discussions' workspace type only -- and DiscussionsWorkspaceContext is
         git-free (supports_git_operations=False), so it never calls this method
-        at all. Every real call site (FeatureBranchManager's
-        create_branch_from_main/detect_and_clean_invalid_branches and
-        review_cycle.py's maker-revision branch switches) still operates on the
-        single SHARED base clone for 'issues'/'hybrid' workspace types, where a
-        previous (possibly unrelated-epic) task's dirty/stale local state is a
-        real, ongoing risk this logic is the only thing guarding against. Do
+        at all. Every real call site -- FeatureBranchManager's
+        create_branch_from_main/detect_and_clean_invalid_branches, its
+        git_checkout() wrapper (called 4x inside prepare_feature_branch()), and
+        review_cycle.py's maker-revision branch switches (reachable via
+        cycle_state.workspace_type == 'issues'; prepare_feature_branch() itself
+        is also reachable via 'hybrid', through HybridWorkspaceContext) --
+        still operates on the single SHARED base clone, where a previous
+        (possibly unrelated-epic) task's dirty/stale local state is a real,
+        ongoing risk this logic is the only thing guarding against. Do
         NOT remove or weaken any of it until FeatureBranchManager's
         prepare_feature_branch()/finalize_feature_branch_work() are migrated to
         the epic worktree model (tracked as a dependency of #49 on #46/#47/#48;
