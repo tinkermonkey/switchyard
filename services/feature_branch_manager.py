@@ -1111,6 +1111,14 @@ class FeatureBranchManager:
         import subprocess
         from services.git_workflow_manager import git_workflow_manager
 
+        # NOTE (#49): all checkout_branch() calls in this method are base-clone-
+        # scoped -- project_dir is the SHARED base clone for 'issues'/'hybrid'
+        # workspace types today (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES in
+        # agent_executor.py gates worktree resolution to 'discussions' only,
+        # which never reaches this method). checkout_branch()'s stash/dirty/
+        # tracking-repair logic stays load-bearing here until
+        # prepare_feature_branch() (this method's only caller) is migrated to
+        # the epic worktree model -- see #46/#47/#48; not yet scheduled.
         # Ensure we're on main and up to date
         await git_workflow_manager.checkout_branch(project_dir, "main")
         pull_success = await git_workflow_manager.pull_branch(project_dir)
@@ -1167,6 +1175,17 @@ class FeatureBranchManager:
         Pull latest changes with rebase
 
         Raises MergeConflictError if conflicts detected
+
+        NOTE (#49): this method's only two callers are both inside
+        prepare_feature_branch(), which runs against the SHARED base clone for
+        'issues'/'hybrid' workspace types today (see the
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate in agent_executor.py --
+        'discussions' is the only worktree-isolated workspace type, and it is
+        git-free, so it never reaches this method). GitWorkflowManager.
+        pull_rebase()'s push-then-reset defensive logic therefore remains
+        genuinely necessary here; do not remove this call. Retiring it is
+        conditional on prepare_feature_branch() being migrated to the epic
+        worktree model -- see #46/#47/#48; not yet scheduled.
         """
         from services.git_workflow_manager import git_workflow_manager
 
@@ -2375,6 +2394,13 @@ The PR is now ready for review and can be merged when approved.
                 try:
                     # Try to delete both local and remote
                     from services.git_workflow_manager import git_workflow_manager
+                    # NOTE (#49): project_dir here is whatever the caller passes --
+                    # currently this method (detect_and_clean_invalid_branches) has
+                    # no in-repo callers, but it is a general maintenance utility,
+                    # not something verified to run only against a worktree. Treat
+                    # it as base-clone-scoped like every other checkout_branch()
+                    # call site in this file until proven otherwise; do not drop
+                    # checkout_branch()'s defensive logic here either.
                     await git_workflow_manager.checkout_branch(project_dir, "main")
 
                     # Delete local branch
