@@ -98,7 +98,9 @@ and takes priority over the general Dockerfile.agent patterns below when they co
 - Any source code copied during build is WASTED and gets overridden by the mount
 - Copying large directories (node_modules, .git) and then chown'ing them wastes 90+ seconds
 
-**⚠️ CRITICAL — the runtime mount lands at `/workspace`, not `/workspace/{PROJECT_NAME}`:**
+**⚠️ CRITICAL — the runtime mount lands at `/workspace`, not `/workspace/{PROJECT_NAME}`,
+and shadows EVERYTHING baked under `/workspace` at build time — even at the mount root
+itself:**
 At runtime the project is mounted directly onto `/workspace` — there is no
 `/workspace/{PROJECT_NAME}` directory inside the running agent container, only
 `/workspace/...`. This applies to the working directory too: agents are launched with
@@ -106,6 +108,16 @@ At runtime the project is mounted directly onto `/workspace` — there is no
 `WORKDIR /workspace/{PROJECT_NAME}` only affects where `RUN`/`COPY` steps land during the
 *build* — it has **no effect at runtime**, since the volume mount replaces `/workspace`
 wholesale and shadows anything the build wrote under it.
+
+**This means dependencies baked directly under `/workspace` (e.g. `/workspace/node_modules`)
+are ALSO shadowed and unreachable at runtime** — a Docker bind mount replaces the ENTIRE
+subtree at its mount point, not just the parts the mount source doesn't provide. Baking
+`RUN npm install` at `WORKDIR /workspace` produces `/workspace/node_modules` in the image,
+which vanishes the instant the container starts and the bind mount takes over `/workspace`.
+**Every dependency install step MUST land somewhere entirely outside `/workspace`** — see
+`BAKED_DEPS_PATH` below. The orchestrator extracts it back out into each worktree at
+creation time (`services/baked_dependency_extractor.py`); Dockerfile.agent itself never
+needs to know about that step.
 
 **Never write an absolute path like `/workspace/{PROJECT_NAME}/...` into anything that
 runs at container runtime** — an `ENV` (e.g. `ENV PYTHONPATH=...`), a script, a config
@@ -157,9 +169,17 @@ USER root
 # ============================================================================
 # Stage 3: Pre-install Dependencies (OPTIONAL but RECOMMENDED)
 # ============================================================================
-WORKDIR /workspace
-# NOTE: this matches the runtime mount point exactly (see the CRITICAL callout above) —
-# don't use /workspace/{PROJECT_NAME} here, that path won't exist when the container runs.
+# CRITICAL: bake dependencies OUTSIDE /workspace entirely, at /opt/deps, mirroring
+# each dependency directory's normal in-tree relative location underneath it (e.g.
+# /opt/deps/node_modules, /opt/deps/.venv). /workspace -- the ENTIRE subtree, not
+# just the mount point itself -- is replaced wholesale by the runtime bind mount
+# (see the CRITICAL callout above), so ANYTHING baked under /workspace, at any
+# depth, is shadowed and unreachable at runtime. /opt/deps sits outside that
+# subtree, so nothing about the mount can ever touch it. The orchestrator copies
+# /opt/deps back into each worktree at creation time (see
+# services/baked_dependency_extractor.py, issue #50) so the agent finds
+# dependencies at their normal in-tree relative path, e.g. <worktree>/node_modules.
+WORKDIR /opt/deps
 
 # OPTION A: Pre-install dependencies (Recommended for fast startup)
 # Copy ONLY the dependency manifests needed for installation
@@ -170,17 +190,21 @@ WORKDIR /workspace
 # COPY apps/*/package.json ./apps/*/
 # RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 #     pnpm install --frozen-lockfile
+# -> produces /opt/deps/node_modules
 
-# For Python projects:
+# For Python projects (a venv, not `pip install` into the image's system site-packages
+# -- system-wide installs have no single directory to extract and copy into a worktree):
 # COPY requirements.txt ./
-# RUN pip install --no-cache-dir -r requirements.txt
+# RUN python3 -m venv /opt/deps/.venv && \
+#     /opt/deps/.venv/bin/pip install --no-cache-dir -r requirements.txt
+# -> produces /opt/deps/.venv
 
 # ============================================================================
 # Stage 4: Ownership and Permissions
 # ============================================================================
-# Change ownership ONLY of what was installed, NOT source code
-# For pre-installed node_modules:
-# RUN chown -R orchestrator:orchestrator /workspace/node_modules
+# Change ownership of what was installed under /opt/deps (NOT source code, and NOT
+# anything under /workspace -- see Stage 3 above)
+# RUN chown -R orchestrator:orchestrator /opt/deps
 
 # ============================================================================
 # Stage 5: Switch to Runtime User
@@ -201,11 +225,16 @@ CMD ["/bin/bash"]
 
 1. **NEVER** copy the entire project with `COPY . .` — this is wasteful
 2. **NEVER** chown source code — it comes from a mount at runtime
-3. **DO** copy dependency manifests (package.json, requirements.txt) if pre-installing deps
-4. **DO** pre-install dependencies to speed up agent startup
-5. **DO** verify claude, git, and gh CLIs are present
-6. **DO** use cache mounts for package managers when possible
-7. **DO** clean up package manager caches to keep image size small
+3. **NEVER** bake dependencies anywhere under `/workspace` — the whole subtree is
+   shadowed by the runtime bind mount, `/workspace/node_modules` included, not just
+   `/workspace/{PROJECT_NAME}/node_modules` (see CRITICAL callout above)
+4. **DO** bake dependencies at `/opt/deps` instead (e.g. `/opt/deps/node_modules`,
+   `/opt/deps/.venv`) — outside `/workspace` entirely, so the mount can't shadow them
+5. **DO** copy dependency manifests (package.json, requirements.txt) if pre-installing deps
+6. **DO** pre-install dependencies to speed up agent startup
+7. **DO** verify claude, git, and gh CLIs are present
+8. **DO** use cache mounts for package managers when possible
+9. **DO** clean up package manager caches to keep image size small
 
 **Anti-Patterns to AVOID**:
 
@@ -213,6 +242,11 @@ CMD ["/bin/bash"]
 ❌ `RUN chown -R orchestrator:orchestrator /workspace` — wastes 90+ seconds
 ❌ `WORKDIR /workspace/{PROJECT_NAME}` or `ENV PYTHONPATH=/workspace/{PROJECT_NAME}/...` — this
   path doesn't exist at runtime; the mount lands at `/workspace` directly (see CRITICAL callout above)
+❌ `WORKDIR /workspace` followed by `RUN npm install` / `RUN pip install -r requirements.txt`
+  — this bakes dependencies at `/workspace/node_modules` etc., which is JUST as shadowed
+  at runtime as `/workspace/{PROJECT_NAME}/node_modules` was; the entire `/workspace`
+  subtree is replaced by the mount, not merely the exact path Docker expected the project
+  at. Bake at `/opt/deps` instead (see Stage 3 above).
 ❌ Not using .dockerignore — sends huge build context to Docker daemon
 ❌ Not verifying Claude CLI is present — agent will fail at runtime
 ❌ Installing dependencies without cache mounts — slow and wasteful

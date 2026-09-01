@@ -392,6 +392,13 @@ class ProjectWorkspaceManager:
 
             self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
 
+            # Best-effort only, and only on this brand-new-worktree path -- never on
+            # cache-hit reuse (above) or on adopting a pre-existing worktree after a
+            # restart (above): both of those already have whatever dependency state
+            # they have, and re-extracting on every reuse would be wasted Docker work
+            # for no benefit. See services/baked_dependency_extractor.py (issue #50).
+            self._extract_baked_dependencies_if_available(project_name, worktree_path)
+
             self._epic_worktrees[key] = str(worktree_path)
             self._epic_worktree_branches[key] = branch_name
             logger.info(
@@ -399,6 +406,60 @@ class ProjectWorkspaceManager:
                 f"at {worktree_path} (branch={branch_name})"
             )
             return worktree_path
+
+    @staticmethod
+    def _extract_baked_dependencies_if_available(project_name: str, worktree_path: Path) -> None:
+        """Best-effort copy of a project's out-of-tree baked dependencies (issue #50)
+        into a freshly-created epic worktree.
+
+        Never raises and never blocks worktree creation: by the time this runs,
+        `git worktree add` has already succeeded, so any failure here is logged and
+        swallowed rather than surfaced. No-ops (with a clear log line) whenever there's
+        nothing to extract yet -- project not verified, no image recorded, or the
+        image predates the out-of-tree baked-dependency convention -- all of which are
+        expected, self-healing states rather than errors.
+
+        See services/baked_dependency_extractor.py for the actual docker create/cp/rm
+        mechanism and services/dev_container_state.py for the verified-image lookup.
+        """
+        try:
+            # Lazy import, mirroring claude/docker_runner.py's own established pattern
+            # for this singleton: DevContainerStateManager's constructor touches the
+            # filesystem (ORCHESTRATOR_ROOT/state/dev_containers), which doesn't exist
+            # outside the orchestrator container (e.g. plain local test runs) -- a
+            # module-level import here would make importing project_workspace at all
+            # fail in those environments.
+            from services.dev_container_state import dev_container_state
+
+            if not dev_container_state.is_verified(project_name):
+                logger.debug(
+                    f"Skipping baked-dependency extraction for {project_name}: dev "
+                    "container not verified, nothing to extract yet."
+                )
+                return
+
+            image_name = dev_container_state.get_image_name(project_name)
+            if not image_name:
+                logger.debug(
+                    f"Skipping baked-dependency extraction for {project_name}: no "
+                    "image name recorded despite verified status."
+                )
+                return
+
+            from services.baked_dependency_extractor import extract_baked_dependencies
+            extract_baked_dependencies(project_name, image_name, worktree_path)
+        except Exception as e:
+            # Belt-and-braces: extract_baked_dependencies() itself already never
+            # raises, but this wrapper -- and everything leading up to it, including
+            # the dev_container_state lookup -- must guarantee it too. Debug level:
+            # this is expected to fire routinely in environments without a real
+            # ORCHESTRATOR_ROOT (e.g. local unit test runs), not just on genuine
+            # operational problems (those are already logged clearly at warning level
+            # inside extract_baked_dependencies itself).
+            logger.debug(
+                f"Baked-dependency extraction lookup for {project_name} raised "
+                f"unexpectedly ({e}); continuing without it."
+            )
 
     @staticmethod
     def _current_worktree_branch(worktree_path: Path) -> Optional[str]:

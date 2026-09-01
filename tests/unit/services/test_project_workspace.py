@@ -17,6 +17,8 @@ Covers:
 All git operations are mocked (subprocess.run) — no real git commands run.
 """
 
+import sys
+import types
 import pytest
 from pathlib import Path
 from unittest.mock import patch, Mock
@@ -463,3 +465,175 @@ class TestPushLocalCommitsBeforeRemoval:
                 ProjectWorkspaceManager._push_local_commits_if_any(worktree_path)
 
         assert any("lost" in r.message for r in caplog.records)
+
+
+def _fake_dev_container_state_module(verified: bool = True, image_name: str = "my-project-agent:latest"):
+    """A stand-in `services.dev_container_state` module for sys.modules patching.
+
+    The real module's singleton (`dev_container_state = DevContainerStateManager()`)
+    touches the filesystem at import time (ORCHESTRATOR_ROOT/state/dev_containers),
+    which doesn't exist in a plain local test run -- so tests that need to control its
+    answers swap the whole module out via `patch.dict(sys.modules, ...)` rather than
+    importing the real thing.
+    """
+    module = types.ModuleType('services.dev_container_state')
+    fake_singleton = Mock()
+    fake_singleton.is_verified.return_value = verified
+    fake_singleton.get_image_name.return_value = image_name if verified else None
+    module.dev_container_state = fake_singleton
+    return module, fake_singleton
+
+
+class TestBakedDependencyExtractionIntegration:
+    """get_or_create_epic_worktree() (issue #50) triggers baked-dependency extraction
+    only on the brand-new-worktree path -- never on cache-hit reuse, and never on
+    adopting a pre-existing worktree found on disk after a restart -- and never lets
+    an extraction problem block worktree creation itself."""
+
+    def test_new_worktree_triggers_extraction_with_resolved_image(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, _ = _fake_dev_container_state_module(image_name="my-project-agent:latest")
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '300'
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]  # existing-branch case
+                    result = manager.get_project_dir(
+                        "my-project", epic_id="300", branch_name="feature/issue-300"
+                    )
+
+        assert result == expected_path
+        mock_extract.assert_called_once_with("my-project", "my-project-agent:latest", expected_path)
+
+    def test_unverified_project_skips_extraction_without_calling_docker(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, _ = _fake_dev_container_state_module(verified=False)
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]
+                    manager.get_project_dir(
+                        "my-project", epic_id="301", branch_name="feature/issue-301"
+                    )
+
+        mock_extract.assert_not_called()
+
+    def test_verified_but_no_image_name_skips_extraction(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, fake_singleton = _fake_dev_container_state_module()
+        fake_singleton.get_image_name.return_value = None  # verified=True but no image recorded
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]
+                    manager.get_project_dir(
+                        "my-project", epic_id="302", branch_name="feature/issue-302"
+                    )
+
+        mock_extract.assert_not_called()
+
+    def test_reuse_on_second_call_does_not_re_trigger_extraction(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, _ = _fake_dev_container_state_module()
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]
+                    manager.get_project_dir(
+                        "my-project", epic_id="303", branch_name="feature/issue-303"
+                    )
+                assert mock_extract.call_count == 1
+
+                # Second call for the same epic reuses the in-flight worktree -- no
+                # new git calls, and critically no repeat extraction attempt.
+                with patch('services.project_workspace.subprocess.run') as mock_run2:
+                    manager.get_project_dir("my-project", epic_id="303")
+                    mock_run2.assert_not_called()
+                assert mock_extract.call_count == 1
+
+    def test_adopted_pre_existing_worktree_does_not_trigger_extraction(self, manager, tmp_path):
+        """A worktree found already on disk (surviving an orchestrator restart) is
+        adopted, not newly created -- extraction only ever runs on actual creation."""
+        _make_base_clone(tmp_path, "my-project")
+        pre_existing = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '304'
+        pre_existing.mkdir(parents=True)
+        (pre_existing / '.git').write_text("gitdir: /fake/base/.git/worktrees/304\n")
+        fake_module, _ = _fake_dev_container_state_module()
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.return_value = _ok("feature/issue-304\n")
+                    manager.get_or_create_epic_worktree(
+                        "my-project", "304", branch_name="feature/issue-304"
+                    )
+
+        mock_extract.assert_not_called()
+
+    def test_extraction_failure_never_blocks_worktree_creation(self, manager, tmp_path):
+        """Even if the extraction call itself raises unexpectedly (it shouldn't --
+        extract_baked_dependencies() has its own internal guard -- but this proves the
+        integration point has a second, independent safety net), get_or_create_epic_worktree
+        must still return the worktree path successfully."""
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, _ = _fake_dev_container_state_module()
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '305'
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch(
+                'services.baked_dependency_extractor.extract_baked_dependencies',
+                side_effect=RuntimeError("boom"),
+            ):
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]
+                    result = manager.get_project_dir(
+                        "my-project", epic_id="305", branch_name="feature/issue-305"
+                    )
+
+        assert result == expected_path
+        assert manager._epic_worktrees[("my-project", "305")] == str(expected_path)
+
+    def test_dev_container_state_lookup_failure_never_blocks_worktree_creation(self, manager, tmp_path):
+        """Any exception out of the dev_container_state lookup itself (e.g. a state
+        file read error, or -- in an environment without ORCHESTRATOR_ROOT such as a
+        plain local test run -- the real singleton's own import/construction failing)
+        must be swallowed by _extract_baked_dependencies_if_available's outer guard.
+        Worktree creation must still succeed."""
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, fake_singleton = _fake_dev_container_state_module()
+        fake_singleton.is_verified.side_effect = RuntimeError("state file corrupt")
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '306'
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.project_workspace.subprocess.run') as mock_run:
+                mock_run.side_effect = [_ok(), _ok()]
+                result = manager.get_project_dir(
+                    "my-project", epic_id="306", branch_name="feature/issue-306"
+                )
+
+        assert result == expected_path
+        assert manager._epic_worktrees[("my-project", "306")] == str(expected_path)
+
+    def test_dev_container_state_import_failure_never_blocks_worktree_creation(self, manager, tmp_path):
+        """In an environment without ORCHESTRATOR_ROOT (e.g. a plain local test run),
+        importing the real dev_container_state singleton itself raises. That must be
+        swallowed too -- worktree creation still succeeds. Forces the real (unfaked)
+        import path by deleting any cached sys.modules entry first, so this is
+        deterministic regardless of what earlier tests in the same session imported."""
+        _make_base_clone(tmp_path, "my-project")
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '307'
+
+        with patch.dict(sys.modules):
+            sys.modules.pop('services.dev_container_state', None)
+            with patch('services.project_workspace.subprocess.run') as mock_run:
+                mock_run.side_effect = [_ok(), _ok()]
+                result = manager.get_project_dir(
+                    "my-project", epic_id="307", branch_name="feature/issue-307"
+                )
+
+        assert result == expected_path
+        assert manager._epic_worktrees[("my-project", "307")] == str(expected_path)
