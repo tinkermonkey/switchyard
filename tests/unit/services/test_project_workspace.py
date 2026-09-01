@@ -1,0 +1,301 @@
+"""
+Unit tests for ProjectWorkspaceManager's per-epic worktree mechanism (issue #45).
+
+Covers:
+- get_project_dir(project_name) with no epic_id is unchanged (base clone path, no
+  git subprocess calls).
+- get_project_dir(project_name, epic_id=...) / get_or_create_epic_worktree()
+  lazily creates a new, non-detached worktree (both the new-branch and
+  existing-branch cases).
+- Repeated calls for the same (project_name, epic_id) reuse the existing worktree
+  instead of recreating it.
+- cleanup_epic_worktree() removes an epic's worktree and its in-flight tracking.
+- prune_epic_worktrees() sweeps orphaned worktrees left under the staging
+  namespace (e.g. after a crash), mirroring
+  DockerAgentRunner.prune_reference_worktrees().
+
+All git operations are mocked (subprocess.run) — no real git commands run.
+"""
+
+import pytest
+from pathlib import Path
+from unittest.mock import patch, Mock
+
+from services.project_workspace import ProjectWorkspaceManager
+
+
+def _ok(stdout: str = "") -> Mock:
+    result = Mock()
+    result.returncode = 0
+    result.stdout = stdout
+    result.stderr = ""
+    return result
+
+
+def _fail(stderr: str = "error") -> Mock:
+    result = Mock()
+    result.returncode = 1
+    result.stdout = ""
+    result.stderr = stderr
+    return result
+
+
+@pytest.fixture
+def manager(tmp_path):
+    """A ProjectWorkspaceManager rooted at an isolated tmp directory."""
+    return ProjectWorkspaceManager(workspace_root=tmp_path)
+
+
+def _make_base_clone(workspace_root: Path, project_name: str) -> Path:
+    """Create a fake base clone (just needs a .git dir to pass the existence check)."""
+    project_dir = workspace_root / project_name
+    (project_dir / '.git').mkdir(parents=True)
+    return project_dir
+
+
+class TestGetProjectDirBaseClone:
+    """get_project_dir(project_name) with no epic_id must be behaviorally identical
+    to the original single-checkout implementation."""
+
+    def test_no_epic_id_returns_base_clone_path(self, manager, tmp_path):
+        result = manager.get_project_dir("my-project")
+        assert result == tmp_path / "my-project"
+
+    def test_no_epic_id_makes_no_git_calls(self, manager):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            manager.get_project_dir("my-project")
+            mock_run.assert_not_called()
+
+    def test_no_epic_id_is_pure_path_join_not_side_effecting(self, manager, tmp_path):
+        # Calling it does not create the directory or any worktree bookkeeping
+        manager.get_project_dir("my-project")
+        assert not (tmp_path / "my-project").exists()
+        assert manager._epic_worktrees == {}
+
+
+class TestCreateNewEpicWorktree:
+    """get_project_dir(project_name, epic_id=X, branch_name=Y) / get_or_create_epic_worktree
+    lazily creates an isolated, non-detached worktree."""
+
+    def test_new_branch_case(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        # First fetch (of the target branch) fails -> branch doesn't exist on origin yet.
+        # Second fetch (of default_branch) succeeds. worktree add -b succeeds.
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_fail("couldn't find remote ref"), _ok(), _ok()]
+
+            result = manager.get_project_dir(
+                "my-project", epic_id="100", branch_name="feature/issue-100-epic"
+            )
+
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '100'
+        assert result == expected_path
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
+                             'feature/issue-100-epic', '--quiet']
+        assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
+                             'main', '--quiet']
+        assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
+                             '-b', 'feature/issue-100-epic', str(expected_path),
+                             'origin/main']
+
+        # Tracked in-flight for reuse
+        assert manager._epic_worktrees[("my-project", "100")] == str(expected_path)
+
+    def test_existing_branch_case(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+
+            result = manager.get_project_dir(
+                "my-project", epic_id="200", branch_name="feature/issue-200-existing"
+            )
+
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '200'
+        assert result == expected_path
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
+                             'feature/issue-200-existing', '--quiet']
+        assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
+                             str(expected_path), 'feature/issue-200-existing']
+
+    def test_missing_branch_name_on_first_create_raises(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with pytest.raises(ValueError):
+            manager.get_project_dir("my-project", epic_id="300")
+
+    def test_missing_base_clone_raises(self, manager):
+        with pytest.raises(ValueError):
+            manager.get_or_create_epic_worktree("no-such-project", "1", branch_name="feature/x")
+
+    def test_worktree_add_failure_raises_runtime_error(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _fail("fatal: some git error")]
+
+            with pytest.raises(RuntimeError):
+                manager.get_project_dir(
+                    "my-project", epic_id="400", branch_name="feature/issue-400"
+                )
+
+
+class TestReuseExistingEpicWorktree:
+    """Two sequential calls for two different sub-issues of the same epic must
+    resolve to the same worktree, without recreating it."""
+
+    def test_second_call_reuses_without_git_calls(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            first = manager.get_project_dir(
+                "my-project", epic_id="500", branch_name="feature/issue-500"
+            )
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            # No branch_name needed on reuse, and no git calls should happen
+            second = manager.get_project_dir("my-project", epic_id="500")
+            mock_run.assert_not_called()
+
+        assert first == second
+
+    def test_reuse_across_different_sub_issue_calls(self, manager, tmp_path):
+        """Simulates sub-issue #1 then sub-issue #2 of the same epic #600 both
+        resolving to the same worktree path."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            sub_issue_1_dir = manager.get_project_dir(
+                "my-project", epic_id="600", branch_name="feature/issue-600"
+            )
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]  # would be used if (wrongly) recreated
+            sub_issue_2_dir = manager.get_project_dir(
+                "my-project", epic_id="600", branch_name="feature/issue-600"
+            )
+            assert mock_run.call_count == 0
+
+        assert sub_issue_1_dir == sub_issue_2_dir
+
+    def test_different_epics_get_different_worktrees(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok(), _ok(), _ok()]
+            epic_a = manager.get_project_dir("my-project", epic_id="700", branch_name="feature/issue-700")
+            epic_b = manager.get_project_dir("my-project", epic_id="701", branch_name="feature/issue-701")
+
+        assert epic_a != epic_b
+
+
+class TestCleanupEpicWorktree:
+    """Cleanup is tied to epic completion, not individual sub-issue/pipeline-run
+    completion — it's just a plain callable mechanism here."""
+
+    def test_cleanup_removes_tracked_worktree(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            worktree_path = manager.get_project_dir(
+                "my-project", epic_id="800", branch_name="feature/issue-800"
+            )
+
+        assert ("my-project", "800") in manager._epic_worktrees
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            removed = manager.cleanup_epic_worktree("my-project", "800")
+
+        assert removed is True
+        assert ("my-project", "800") not in manager._epic_worktrees
+        mock_run.assert_called_once_with(
+            ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'remove',
+             '--force', str(worktree_path)],
+            capture_output=True, text=True, timeout=15
+        )
+
+    def test_cleanup_falls_back_to_rmtree_on_git_failure(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            worktree_path = manager.get_project_dir(
+                "my-project", epic_id="810", branch_name="feature/issue-810"
+            )
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        (worktree_path / "somefile.txt").write_text("data")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_fail("worktree is dirty"), _ok()]  # remove fails, prune ok
+            removed = manager.cleanup_epic_worktree("my-project", "810")
+
+        assert removed is True
+        assert not worktree_path.exists()
+
+    def test_cleanup_untracked_epic_returns_false(self, manager):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            removed = manager.cleanup_epic_worktree("my-project", "999")
+            mock_run.assert_not_called()
+        assert removed is False
+
+
+class TestPruneEpicWorktrees:
+    """Startup sweep catches worktrees orphaned by a crashed orchestrator process."""
+
+    def test_prune_removes_orphaned_worktree_dir(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'
+        orphan.mkdir(parents=True)
+        (orphan / "leftover.txt").write_text("stale")
+
+        # Fresh manager instance (simulating orchestrator restart) has no in-memory
+        # tracking of this worktree at all.
+        assert manager._epic_worktrees == {}
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert not orphan.exists()
+        # The now-empty per-project staging dir should also be cleaned up
+        assert not (tmp_path / '.orchestrator' / 'worktrees' / 'my-project').exists()
+
+    def test_prune_handles_git_command_failure_gracefully(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '901'
+        orphan.mkdir(parents=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _fail("git worktree remove failed")
+            manager.prune_epic_worktrees()
+
+        # Falls back to removing the directory directly even if git fails
+        assert not orphan.exists()
+
+    def test_prune_noop_when_staging_dir_absent(self, manager):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            manager.prune_epic_worktrees()
+            mock_run.assert_not_called()
+
+    def test_prune_does_not_touch_ref_worktrees_namespace(self, manager, tmp_path):
+        """Sanity check that the epic-worktree prune sweep only ever looks under
+        `.orchestrator/worktrees/`, never DockerAgentRunner's sibling
+        `.orchestrator/tmp/ref-worktrees/` namespace."""
+        _make_base_clone(tmp_path, "my-project")
+        ref_worktree = tmp_path / '.orchestrator' / 'tmp' / 'ref-worktrees' / 'my-project' / 'task-1'
+        ref_worktree.mkdir(parents=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert ref_worktree.exists()

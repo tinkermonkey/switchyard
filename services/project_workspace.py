@@ -1,7 +1,7 @@
 import subprocess
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from config.manager import config_manager
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,14 @@ class ProjectWorkspaceManager:
 
         self.workspace_root = workspace_root
         logger.info(f"ProjectWorkspaceManager initialized with workspace root: {workspace_root}")
+
+        # In-flight per-epic worktrees, keyed by (project_name, epic_id). An epic's
+        # worktree spans every sequential sub-issue pipeline run for that epic (created
+        # once, reused by every subsequent sub-issue, torn down only on epic completion)
+        # - NOT per-container-launch and NOT per-individual-pipeline-run. Mirrors
+        # DockerAgentRunner._active_worktrees, but keyed by epic rather than by
+        # container, since lifetime spans many container launches.
+        self._epic_worktrees: Dict[Tuple[str, str], str] = {}
 
     def initialize_all_projects(self) -> Dict[str, bool]:
         """
@@ -206,14 +214,296 @@ class ProjectWorkspaceManager:
         except Exception as e:
             logger.warning(f"Failed to update repository: {e}")
 
-    def get_project_dir(self, project_name: str) -> Path:
-        """Get the directory path for a project"""
-        return self.workspace_root / project_name
+    def get_project_dir(
+        self,
+        project_name: str,
+        epic_id: Optional[str] = None,
+        branch_name: Optional[str] = None,
+        default_branch: str = 'main',
+    ) -> Path:
+        """Get the directory path for a project.
+
+        With no epic_id, this is behaviorally identical to the original single-checkout
+        implementation: it returns the base clone path (a plain path-join, no side
+        effects) — the ~5 existing call sites that must keep operating on the shared
+        base clone are unaffected.
+
+        When epic_id is given, resolves to an isolated, branch-aware (non-detached) git
+        worktree for that epic instead of the base clone — lazily creating it if this is
+        the epic's first sub-issue, or idempotently reusing the existing worktree if one
+        is already in flight for (project_name, epic_id). Worktree granularity is per
+        epic, not per sub-issue: every sequential sub-issue of the same epic resolves to
+        the same worktree path, isolated from the base clone and from other epics'
+        worktrees.
+
+        Args:
+            project_name: Name of the project
+            epic_id: Epic issue number to scope an isolated worktree to. For
+                planning_design, this is the board item's own issue number. For
+                sdlc_execution, this is the sub-issue's PARENT epic issue number
+                (resolving that parent, e.g. via FeatureBranchManager.get_parent_issue,
+                is the caller's job — not this method's). None (default) preserves
+                today's shared-base-clone behavior exactly.
+            branch_name: Branch the epic's worktree should be checked out to. Only
+                consulted (and required) the first time a given epic's worktree is
+                created; ignored on every subsequent call that just reuses the
+                already-in-flight worktree.
+            default_branch: Base branch to cut a brand-new epic branch from, when
+                branch_name doesn't already exist on origin. Defaults to 'main'.
+
+        Returns:
+            The base clone path (epic_id=None), or the epic's isolated worktree path.
+        """
+        if epic_id is None:
+            return self.workspace_root / project_name
+
+        return self.get_or_create_epic_worktree(
+            project_name, epic_id, branch_name, default_branch=default_branch
+        )
+
+    def _epic_worktree_path(self, project_name: str, epic_id: str) -> Path:
+        """Staging path for an epic's worktree: .orchestrator/worktrees/<project>/<epic_id>/
+
+        Deliberately a different staging subdirectory than DockerAgentRunner's
+        `.orchestrator/tmp/ref-worktrees/` (detached, per-container reference-repo
+        worktrees) so the two namespaces, and their respective prune sweeps, never
+        collide.
+        """
+        return self.workspace_root / '.orchestrator' / 'worktrees' / project_name / str(epic_id)
+
+    def get_or_create_epic_worktree(
+        self,
+        project_name: str,
+        epic_id: str,
+        branch_name: Optional[str] = None,
+        default_branch: str = 'main',
+    ) -> Path:
+        """
+        Get (creating if absent) an isolated, non-detached git worktree for one epic.
+
+        Mirrors DockerAgentRunner._create_reference_worktree's create-if-absent pattern,
+        but sourced from the primary (non-bare) base clone rather than a dedicated
+        reference repo, checked out to a real branch (not `--detach`), and long-lived
+        across every sub-issue pipeline run of the epic rather than scoped to one
+        container launch.
+
+        - New-branch case (branch_name doesn't exist on origin yet): fetches
+          origin/<default_branch> and runs `git worktree add -b <branch_name> <path>
+          origin/<default_branch>` — mirrors FeatureBranchManager.create_branch_from_main.
+        - Existing-branch case: fetches origin/<branch_name>, then runs a plain
+          `git worktree add <path> <branch_name>`.
+
+        Idempotent: a second call for the same (project_name, epic_id) returns the
+        already-in-flight worktree path without touching git again, so two sequential
+        sub-issues of the same epic always resolve to the same worktree.
+
+        Args:
+            project_name: Name of the project (must already have a base clone).
+            epic_id: Epic issue number scoping this worktree.
+            branch_name: Branch to check the worktree out to. Required the first time
+                this epic's worktree is created; unused on reuse.
+            default_branch: Base branch to cut a new epic branch from if branch_name
+                doesn't exist on origin yet.
+
+        Returns:
+            The epic's worktree path.
+
+        Raises:
+            ValueError: No worktree exists yet for this epic and branch_name was not
+                given, or the project has no base clone to source the worktree from.
+            RuntimeError: The underlying git worktree add command failed.
+        """
+        key = (project_name, str(epic_id))
+        existing = self._epic_worktrees.get(key)
+        if existing is not None:
+            logger.debug(f"Reusing existing worktree for {project_name} epic #{epic_id}: {existing}")
+            return Path(existing)
+
+        if not branch_name:
+            raise ValueError(
+                f"No worktree exists yet for {project_name} epic #{epic_id}; "
+                "branch_name is required to create one"
+            )
+
+        base_repo_dir = self.workspace_root / project_name
+        if not (base_repo_dir / '.git').exists():
+            raise ValueError(f"Base clone for project {project_name} not found at {base_repo_dir}")
+
+        worktree_path = self._epic_worktree_path(project_name, epic_id)
+        worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
+
+        self._epic_worktrees[key] = str(worktree_path)
+        logger.info(
+            f"Created epic worktree for {project_name} epic #{epic_id} "
+            f"at {worktree_path} (branch={branch_name})"
+        )
+        return worktree_path
+
+    @staticmethod
+    def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
+        """Run the actual `git worktree add` for a new epic worktree.
+
+        Tries the existing-branch path first (fetch origin/<branch_name> then a plain
+        `worktree add`); falls back to creating a brand-new branch from
+        origin/<default_branch> when branch_name doesn't exist on origin yet.
+        """
+        fetch_existing = subprocess.run(
+            ['git', '-C', str(base_repo_dir), 'fetch', 'origin', branch_name, '--quiet'],
+            capture_output=True, text=True, timeout=30
+        )
+
+        if fetch_existing.returncode == 0:
+            result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'worktree', 'add', str(worktree_path), branch_name],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to add worktree for existing branch {branch_name}: {result.stderr.strip()}"
+                )
+            return
+
+        # branch_name doesn't exist on origin yet — cut a new one from default_branch
+        fetch_default = subprocess.run(
+            ['git', '-C', str(base_repo_dir), 'fetch', 'origin', default_branch, '--quiet'],
+            capture_output=True, text=True, timeout=30
+        )
+        if fetch_default.returncode != 0:
+            raise RuntimeError(
+                f"Failed to fetch origin/{default_branch} while creating worktree "
+                f"branch {branch_name}: {fetch_default.stderr.strip()}"
+            )
+
+        result = subprocess.run(
+            ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-b', branch_name,
+             str(worktree_path), f'origin/{default_branch}'],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            # Race with a concurrently-created branch of the same name (e.g. another
+            # process just pushed it) — retry once as the existing-branch case.
+            retry_fetch = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'fetch', 'origin', branch_name, '--quiet'],
+                capture_output=True, text=True, timeout=30
+            )
+            if retry_fetch.returncode == 0:
+                result = subprocess.run(
+                    ['git', '-C', str(base_repo_dir), 'worktree', 'add', str(worktree_path), branch_name],
+                    capture_output=True, text=True, timeout=30
+                )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to create worktree branch {branch_name}: {result.stderr.strip()}"
+                )
+
+    def cleanup_epic_worktree(self, project_name: str, epic_id: str) -> bool:
+        """
+        Remove an epic's worktree once the whole epic is complete.
+
+        This is tied to EPIC completion (all sub-issues done for sdlc_execution, or the
+        epic issue's own board exit/closure for planning_design) — NOT to any individual
+        sub-issue's pipeline-run completion, and NOT to container completion. Wiring this
+        up to actual epic-completion detection is out of scope here; this only exposes
+        the mechanism for those callers to invoke.
+
+        A crash before this ever runs simply leaves the worktree on disk — it's caught by
+        prune_epic_worktrees() on the next orchestrator startup instead.
+
+        Returns:
+            True if a worktree was found and removed (or already gone), False if this
+            epic had no tracked worktree to clean up.
+        """
+        key = (project_name, str(epic_id))
+        worktree_path = self._epic_worktrees.pop(key, None)
+
+        if worktree_path is None:
+            logger.debug(f"No in-flight worktree tracked for {project_name} epic #{epic_id}; nothing to clean up")
+            return False
+
+        base_repo_dir = self.workspace_root / project_name
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'worktree', 'remove', '--force', worktree_path],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
+                    "removing directory directly"
+                )
+                import shutil
+                shutil.rmtree(worktree_path, ignore_errors=True)
+                subprocess.run(
+                    ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
+                    capture_output=True, timeout=15
+                )
+            logger.info(f"Cleaned up epic worktree for {project_name} epic #{epic_id} at {worktree_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up epic worktree {worktree_path}: {e}")
+
+        return True
+
+    def prune_epic_worktrees(self) -> None:
+        """Remove all staged epic worktrees and prune git metadata.
+
+        Call this at orchestrator startup to clean up any epic worktrees left behind by
+        a previous crash. Safe to call even if the directory doesn't exist.
+
+        Sibling of DockerAgentRunner.prune_reference_worktrees() for the `.orchestrator/
+        worktrees/` staging namespace (per-epic, branch-aware worktrees) rather than
+        `.orchestrator/tmp/ref-worktrees/` (per-container, detached reference worktrees)
+        — kept as a parallel routine rather than a shared one since the two live in
+        different modules with different owning lifecycles (ProjectWorkspaceManager vs.
+        DockerAgentRunner).
+
+        Since self._epic_worktrees starts empty on every fresh process, any worktree
+        found on disk at startup is — from this process's perspective — untracked; it is
+        safe to remove unconditionally because it will be transparently recreated (fetch
+        + worktree add, cheap) the next time get_project_dir()/get_or_create_epic_worktree()
+        is called for that epic, exactly like a reference worktree is recreated per
+        container run.
+        """
+        staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
+        if not staging_root.is_dir():
+            return
+
+        for project_staging in staging_root.iterdir():
+            if not project_staging.is_dir():
+                continue
+            repo_path = self.workspace_root / project_staging.name
+            for worktree_path in project_staging.iterdir():
+                if not worktree_path.is_dir():
+                    continue
+                try:
+                    subprocess.run(
+                        ['git', '-C', str(repo_path), 'worktree', 'remove', '--force', str(worktree_path)],
+                        capture_output=True, timeout=15
+                    )
+                except Exception:
+                    pass
+                if worktree_path.is_dir():
+                    import shutil
+                    shutil.rmtree(worktree_path, ignore_errors=True)
+            # Prune any remaining stale metadata entries
+            try:
+                subprocess.run(
+                    ['git', '-C', str(repo_path), 'worktree', 'prune'],
+                    capture_output=True, timeout=15
+                )
+            except Exception:
+                pass
+            # Remove the now-empty staging directory for this project
+            if project_staging.is_dir() and not any(project_staging.iterdir()):
+                project_staging.rmdir()
+
+        logger.info(f"Pruned epic worktrees under {staging_root}")
 
     def ensure_branch(self, project_name: str, branch_name: str, create_if_missing: bool = True) -> bool:
         """
         DEPRECATED: Use GitWorkflowManager.checkout_branch() instead.
-        
+
         This method is deprecated because it can create branches without proper tracking.
         Use services.git_workflow_manager.checkout_branch() for checkout operations,
         or services.feature_branch_manager.ensure_and_prepare_branch() for branch creation.

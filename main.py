@@ -236,6 +236,12 @@ async def main():
     DockerAgentRunner.prune_reference_worktrees()
     logger.info("Reference repo worktree prune complete")
 
+    # Prune any per-epic worktrees left behind by a previous crash (sibling namespace
+    # to the reference-repo worktrees above — see ProjectWorkspaceManager.prune_epic_worktrees)
+    logger.info("Pruning stale epic worktrees")
+    workspace_manager.prune_epic_worktrees()
+    logger.info("Epic worktree prune complete")
+
     # Clean up stuck in_progress execution states from interrupted agent runs
     # This now runs AFTER container recovery, so it won't clean up states for recovered containers
     logger.info("Cleaning up stuck in_progress execution states")
