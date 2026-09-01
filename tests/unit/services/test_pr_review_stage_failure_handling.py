@@ -68,6 +68,7 @@ class TestEndPrReviewPipelineRunOnFailure:
         mock_manager.mark_failed.assert_not_called()
         mock_manager.end_pipeline_run.assert_called_once_with(
             project="proj",
+            board="board",
             issue_number=123,
             reason="PR review stage exception: ValueError",
             retain_lock=False,

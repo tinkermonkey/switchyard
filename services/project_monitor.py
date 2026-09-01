@@ -455,6 +455,7 @@ def _end_pr_review_pipeline_run_on_failure(
     else:
         pipeline_run_manager.end_pipeline_run(
             project=project_name,
+            board=board_name,
             issue_number=issue_number,
             reason=f"PR review stage exception: {type(exception).__name__}",
             retain_lock=False
@@ -3364,7 +3365,13 @@ class ProjectMonitor:
                     return self._start_repair_cycle_for_issue(
                         project_name, board_name, issue_number, status,
                         repository, project_config, pipeline_config,
-                        workflow_template, column, current_stage_config
+                        workflow_template, column, current_stage_config,
+                        # Same rationale as the pr_review call below: this run was
+                        # eagerly created above before we knew the column was a
+                        # repair_cycle stage, so it must be cleaned up if any of
+                        # this call's early-return guards fire before it reaches
+                        # its own get_or_create_pipeline_run() call.
+                        phantom_run_id=(pipeline_run.id if pipeline_run_was_created else None)
                     )
 
                 # Check if this is a pr_review stage and handle it specially
@@ -3375,7 +3382,11 @@ class ProjectMonitor:
                         project_name, board_name, issue_number, status,
                         repository, project_config, pipeline_config,
                         workflow_template, column, current_stage_config,
-                        phantom_run_was_created=pipeline_run_was_created
+                        # Pass the actual run id (not just a bool) so
+                        # _start_pr_review_for_issue can end this specific phantom
+                        # run if its own get_or_create_pipeline_run() call ends up
+                        # NOT reusing it — see that method's cleanup logic below.
+                        phantom_run_id=(pipeline_run.id if pipeline_run_was_created else None)
                     )
 
                 # Fetch context from previous workflow stage (workspace-aware)
@@ -6002,13 +6013,73 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         workflow_template,
         column,
         stage_config,
-        phantom_run_was_created: bool = False
+        phantom_run_id: Optional[str] = None
     ) -> Optional[str]:
         """Start PR review stage for an issue in a background thread.
 
         PRReviewStage runs in-process (not Docker), so we launch it in a
         background thread with its own asyncio event loop.
+
+        Args:
+            phantom_run_id: If the caller already created a pipeline run for this
+                issue (via its own eager get_or_create_pipeline_run() call) before
+                discovering this is a pr_review stage, its id goes here. This
+                method's own get_or_create_pipeline_run() call below should
+                normally reuse that same run (board-scoped lookup). Tracked via
+                `_owned_run_id` below and ended through `_end_owned_run_if_pending()`
+                on every early-return path that fires before that call (the
+                review-cycle-limit guard, the duplicate-execution guard, the
+                lock-acquire failure) so the phantom never lingers as a permanently
+                "active" run. Once get_or_create_pipeline_run() resolves it,
+                `_owned_run_id` is reassigned to the real run's id and
+                `_owned_is_real_run` is set — so if setup fails after that point but
+                before the background thread starts, the outer except instead routes
+                through `_end_pr_review_pipeline_run_on_failure()` (the same
+                failure-handling logic an in-thread failure would use), not
+                `_end_owned_run_if_pending()`, so a genuine failure gets a proper
+                outcome="failed" and retain-vs-release lock decision rather than
+                being stamped outcome="superseded" like an actually-superseded
+                phantom. The background thread itself owns cleanup for anything
+                that fails after it starts (see run_pr_review() below).
         """
+        # See the Args note above. `_settled` guards against double-ending the same
+        # run if, somehow, more than one exit path's cleanup were ever reached.
+        # `_owned_is_real_run` distinguishes "still just the original phantom" from
+        # "now the real run this method is driving" — see its use in the outer
+        # except block below.
+        _owned_run_id = phantom_run_id
+        _settled = False
+        _owned_is_real_run = False
+
+        def _end_owned_run_if_pending(reason: str) -> None:
+            nonlocal _settled
+            if not _owned_run_id or _settled:
+                return
+            _settled = True
+            try:
+                ended = self.pipeline_run_manager.end_phantom_pipeline_run(
+                    pipeline_run_id=_owned_run_id,
+                    project=project_name,
+                    issue_number=issue_number,
+                    reason=reason,
+                )
+                if ended:
+                    logger.info(
+                        f"Ended phantom pipeline run {_owned_run_id} for issue #{issue_number}: {reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"end_phantom_pipeline_run found nothing to end for run {_owned_run_id} "
+                        f"(project={project_name}, issue=#{issue_number}, reason: {reason}) — "
+                        f"already ended, or the id didn't resolve to an active run"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to end phantom pipeline run {_owned_run_id} for "
+                    f"{project_name}/#{issue_number}: {e}",
+                    exc_info=True,
+                )
+
         try:
             import asyncio
             import threading
@@ -6049,6 +6120,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     pr_review_state_manager.mark_cycle_limit_notified(project_name, issue_number)
                 else:
                     logger.info(f"Cycle limit notification already sent for #{issue_number}, skipping.")
+                _end_owned_run_if_pending("Review cycle limit reached before launch - ending phantom run")
                 return stage_config.stage
 
             # Check for duplicate execution
@@ -6059,20 +6131,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
                 # End any phantom pipeline run that was freshly created before this duplicate
                 # check fired — otherwise it lingers as an "active" run in Redis and becomes
-                # a stale pipeline_run_id source on the next orchestrator restart.
-                if phantom_run_was_created:
-                    try:
-                        self.pipeline_run_manager.end_pipeline_run(
-                            project=project_name,
-                            issue_number=issue_number,
-                            reason="Duplicate PR review execution detected - ending phantom run",
-                            retain_lock=True  # Keep lock since the real execution is still active
-                        )
-                        logger.info(
-                            f"Ended phantom pipeline run for issue #{issue_number} (duplicate skip)"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to end phantom pipeline run: {e}")
+                # a stale pipeline_run_id source on the next orchestrator restart. Ended by
+                # id (not end_pipeline_run()'s by-mapping lookup) since the real, in-progress
+                # execution's own run currently owns the lock and must not be touched here.
+                _end_owned_run_if_pending("Duplicate PR review execution detected - ending phantom run")
                 return stage_config.stage
 
             # Acquire pipeline lock if not already held.
@@ -6098,6 +6160,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"Cannot start PR review for #{issue_number}: "
                         f"pipeline lock held by another issue ({_reason}). Skipping."
                     )
+                    _end_owned_run_if_pending("Could not acquire pipeline lock - ending phantom run")
                     return stage_config.stage
                 logger.info(
                     f"PR review acquired pipeline lock for {project_name}/{board_name} "
@@ -6118,7 +6181,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             if workspace_type in ['discussions', 'hybrid']:
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
-            # Get or create pipeline run
+            # Get or create pipeline run. With board passed through, this normally
+            # reuses phantom_run_id (the run trigger_agent_for_status eagerly
+            # created before it knew this was a pr_review stage) via the
+            # board-scoped Redis lookup — see get_or_create_pipeline_run().
             pipeline_run, _ = self.pipeline_run_manager.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
@@ -6128,6 +6194,26 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 discussion_id=discussion_id
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for PR review on issue #{issue_number}")
+
+            # Defensive cleanup: if the run above did NOT turn out to be the phantom
+            # run (e.g. it expired from Redis, or ES hadn't refreshed yet), end the
+            # phantom explicitly rather than leaving it stuck "active" forever with
+            # nothing but its initial routing-decision event. Ended by id (not
+            # end_pipeline_run()'s by-mapping lookup) — by this point the issue
+            # mapping already points at `pipeline_run` (the real run we're about to
+            # drive), so a by-mapping lookup here would resolve to and incorrectly
+            # end that real run instead of the phantom.
+            if _owned_run_id and _owned_run_id != pipeline_run.id:
+                _end_owned_run_if_pending("Superseded by the actual PR review pipeline run - ending phantom run")
+
+            # From here on, `pipeline_run` (reused phantom or freshly created) is the
+            # run this method is driving. If anything below fails before the
+            # background thread starts (which takes over pipeline_run's lifecycle
+            # itself — see run_pr_review()'s except block), the outer except handler
+            # must end THIS run, not whatever phantom_run_id originally pointed at.
+            _owned_run_id = pipeline_run.id
+            _settled = False
+            _owned_is_real_run = True
 
             task_id = f"pr_review_{issue_number}_{pipeline_run.id}"
 
@@ -6271,12 +6357,43 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             thread = threading.Thread(target=run_pr_review, daemon=True, name=f"pr-review-{issue_number}")
             thread.start()
+            # Hand-off: run_pr_review() now owns pipeline_run's lifecycle (its own
+            # except block ends it on failure; PRReviewStage ends it on success).
+            # Nothing below this point can fail in a way that leaves it un-owned.
+            _settled = True
             logger.info(f"PR review background thread started for issue #{issue_number}")
 
             return stage_config.stage
 
         except Exception as e:
             logger.error(f"Error starting PR review for issue #{issue_number}: {e}", exc_info=True)
+
+            if _owned_is_real_run and _owned_run_id and not _settled:
+                # This is the real pipeline run (not the original phantom) failing
+                # during setup, before the background thread — which would normally
+                # own failure handling via _end_pr_review_pipeline_run_on_failure —
+                # ever started. Route through that same function rather than
+                # _end_owned_run_if_pending()/end_phantom_pipeline_run(), which
+                # unconditionally stamps status="completed"/outcome="superseded":
+                # a genuine failure here should get the same NonRetryableAgentError-
+                # aware retain-vs-release lock decision and durable failure marking
+                # (mark_failed()) an in-thread failure would. That function already
+                # makes the correct call on the lock in both its branches, so the
+                # ad-hoc lock release below must be skipped in this case — doing it
+                # unconditionally would silently undo a durable retain-on-failure.
+                _settled = True
+                try:
+                    _end_pr_review_pipeline_run_on_failure(
+                        self.pipeline_run_manager, project_name, board_name, issue_number, e,
+                    )
+                except Exception as end_err:
+                    logger.warning(f"Failed to end pipeline run after PR review setup failure: {end_err}")
+                return None
+
+            # End whichever run this method is still responsible for (the original
+            # phantom if setup failed before get_or_create_pipeline_run()).
+            # No-op if the background thread already took over (_settled is True).
+            _end_owned_run_if_pending(f"PR review setup failed before launch: {e}")
             # Release the pipeline lock if we acquired it above but failed before launching the
             # background thread.  Without this, the board stays locked until the 4-hour stale-lock
             # timeout, blocking every other issue on the same board.
@@ -6307,9 +6424,60 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         pipeline_config,
         workflow_template,
         column,
-        stage_config
+        stage_config,
+        phantom_run_id: Optional[str] = None
     ) -> Optional[str]:
-        """Start an automated repair cycle (test-fix-validate) for an issue"""
+        """Start an automated repair cycle (test-fix-validate) for an issue
+
+        Args:
+            phantom_run_id: See _start_pr_review_for_issue's docstring for the same
+                parameter — the caller's eagerly-created run. Tracked via
+                `_owned_run_id`/`_settled`/`_owned_is_real_run` below, mirroring
+                _start_pr_review_for_issue exactly: `_end_owned_run_if_pending()` is
+                called on every early-return guard before get_or_create_pipeline_run()
+                (duplicate container, lock-state-unknown, locked-by-another-repair-
+                cycle, no test configs), and on the "superseded, not reused" case
+                right after it. Once get_or_create_pipeline_run() resolves the real
+                run, `_owned_is_real_run` is set — failures after that point
+                (steal_lock() failure, context-save failure, or the outer except with
+                nothing more specific to do) instead go through a full
+                end_pipeline_run(board=board_name, ...) call, never
+                _end_owned_run_if_pending(), because only end_pipeline_run() knows how
+                to release a lock steal_lock() may have already acquired.
+        """
+        _owned_run_id = phantom_run_id
+        _settled = False
+        _owned_is_real_run = False
+
+        def _end_owned_run_if_pending(reason: str) -> None:
+            nonlocal _settled
+            if not _owned_run_id or _settled:
+                return
+            _settled = True
+            try:
+                ended = self.pipeline_run_manager.end_phantom_pipeline_run(
+                    pipeline_run_id=_owned_run_id,
+                    project=project_name,
+                    issue_number=issue_number,
+                    reason=reason,
+                )
+                if ended:
+                    logger.info(
+                        f"Ended phantom pipeline run {_owned_run_id} for issue #{issue_number}: {reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"end_phantom_pipeline_run found nothing to end for run {_owned_run_id} "
+                        f"(project={project_name}, issue=#{issue_number}, reason: {reason}) — "
+                        f"already ended, or the id didn't resolve to an active run"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to end phantom pipeline run {_owned_run_id} for "
+                    f"{project_name}/#{issue_number}: {e}",
+                    exc_info=True,
+                )
+
         try:
             import asyncio
             import threading
@@ -6340,6 +6508,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 f"Repair cycle container already running for {project_name}/#{issue_number}: "
                                 f"{existing_container_name}. Skipping duplicate launch."
                             )
+                            _end_owned_run_if_pending("Duplicate repair cycle container already running - ending phantom run")
                             return stage_config.default_agent
                         else:
                             # Orphaned Redis key - container not running, clean it up
@@ -6365,6 +6534,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     f"repair cycle for issue #{issue_number} rather than risk "
                     f"competing with a repair cycle we can't actually see"
                 )
+                _end_owned_run_if_pending("Lock state unreadable before launch - ending phantom run")
                 return None
 
             if current_lock and current_lock.locked_by_issue != issue_number:
@@ -6380,6 +6550,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             f"Pipeline locked by another repair cycle (issue #{current_lock.locked_by_issue}). "
                             f"Skipping repair cycle launch for issue #{issue_number} to prevent competition."
                         )
+                        _end_owned_run_if_pending("Pipeline locked by another repair cycle - ending phantom run")
                         return None
 
             # Get issue details
@@ -6420,6 +6591,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             if not test_configs:
                 logger.warning(f"No test configurations found for project {project_name}")
+                _end_owned_run_if_pending("No test configurations found - ending phantom run")
                 return None
 
             # Get global settings from stage config
@@ -6436,6 +6608,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 discussion_id=discussion_id
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for repair cycle on issue #{issue_number}")
+
+            # Defensive cleanup: if the run above did NOT turn out to be the phantom
+            # run, end the phantom explicitly — same rationale as
+            # _start_pr_review_for_issue's equivalent check.
+            if _owned_run_id and _owned_run_id != pipeline_run.id:
+                _end_owned_run_if_pending("Superseded by the actual repair cycle pipeline run - ending phantom run")
+
+            # From here on, `pipeline_run` is the run this method is driving, and
+            # steal_lock() below may hand it the pipeline lock. Any failure past this
+            # point must go through a full end_pipeline_run(board=board_name, ...)
+            # call (see this method's docstring) — never _end_owned_run_if_pending(),
+            # which deliberately never touches the lock.
+            _owned_run_id = pipeline_run.id
+            _settled = False
+            _owned_is_real_run = True
 
             # CRITICAL: Acquire pipeline lock before starting repair cycle
             # Note: We've already checked above that no OTHER repair cycle is running
@@ -6478,6 +6665,22 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"the pipeline lock for {project_name}/{board_name} "
                         f"(steal_lock result: {result})"
                     )
+                # steal_lock() failed outright, so this issue never actually holds
+                # the lock — end_pipeline_run() will correctly no-op its lock-release
+                # logic (locked_by_issue won't match). Full end_pipeline_run(), not
+                # _end_owned_run_if_pending(): pipeline_run is real by this point, not
+                # a phantom (see this method's docstring).
+                if _owned_is_real_run and _owned_run_id and not _settled:
+                    _settled = True
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            board=board_name,
+                            reason=f"Could not acquire pipeline lock for repair cycle: {result}",
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(f"Failed to end pipeline run after lock-acquire failure: {cleanup_e}")
                 return None
             elif result == "stolen":
                 logger.warning(
@@ -6587,6 +6790,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
             except Exception as e:
                 logger.error(f"Failed to save repair cycle context: {e}", exc_info=True)
+                # By this point steal_lock() above succeeded, so this issue genuinely
+                # holds the pipeline lock — full end_pipeline_run() releases it (or
+                # retains it, per its normal retain/outcome rules), unlike
+                # _end_owned_run_if_pending() which deliberately never touches locks.
+                if _owned_is_real_run and _owned_run_id and not _settled:
+                    _settled = True
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            board=board_name,
+                            reason=f"Failed to save repair cycle context: {e}",
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(f"Failed to end pipeline run after context-save failure: {cleanup_e}")
                 return None
 
             # Post initial comment (workspace-aware)
@@ -6661,11 +6879,17 @@ _Repair cycle initiated by Switchyard_
             if not container_name:
                 logger.error(f"Failed to launch repair cycle container for issue #{issue_number}")
                 try:
-                    self.pipeline_run_manager.end_pipeline_run(
+                    ended = self.pipeline_run_manager.end_pipeline_run(
                         project=project_name,
                         issue_number=issue_number,
+                        board=board_name,
                         reason="Repair cycle container launch failed"
                     )
+                    if not ended:
+                        logger.warning(
+                            f"end_pipeline_run found no active run to end for {project_name} "
+                            f"issue #{issue_number} after container launch failure"
+                        )
                 except Exception as cleanup_e:
                     logger.error(f"Failed to end pipeline run after container launch failure: {cleanup_e}")
                 try:
@@ -6728,11 +6952,23 @@ _Repair cycle initiated by Switchyard_
             # Best-effort cleanup: end the pipeline run and record failure if we got far enough
             try:
                 if 'pipeline_run' in dir():
-                    self.pipeline_run_manager.end_pipeline_run(
+                    ended = self.pipeline_run_manager.end_pipeline_run(
                         project=project_name,
                         issue_number=issue_number,
+                        board=board_name,
                         reason=f"Repair cycle startup error: {e}"
                     )
+                    if not ended:
+                        logger.warning(
+                            f"end_pipeline_run found no active run to end for {project_name} "
+                            f"issue #{issue_number} after repair cycle startup error"
+                        )
+                else:
+                    # Exception fired before get_or_create_pipeline_run() ever ran —
+                    # `_owned_run_id` is still whatever phantom_run_id the caller
+                    # passed (or None). Full end_pipeline_run() above only applies
+                    # once `pipeline_run` exists; this is the phantom-only case.
+                    _end_owned_run_if_pending(f"Repair cycle startup error before pipeline run resolved: {e}")
             except Exception as cleanup_e:
                 logger.error(f"Failed to end pipeline run after repair cycle error: {cleanup_e}")
             try:
@@ -10103,6 +10339,7 @@ Moving to implementation phase.
 
         except Exception as e:
             logger.error(f"Failed to create feedback task for discussion: {e}")
+
 
 if __name__ == "__main__":
     # Initialize task queue and start monitoring
