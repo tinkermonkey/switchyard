@@ -522,11 +522,20 @@ class TestExecuteAgentEpicResolution:
     isolated worktree.
     """
 
-    async def _run(self, agent_executor, task_context, parent_issue):
+    async def _run(self, agent_executor, task_context, parent_issue,
+                    worktree_isolation_enabled=True):
         """Drive execute_agent for real with everything except the epic
         resolution chain and _build_execution_context mocked out, capturing
         the epic_id/branch_name _build_execution_context was actually called
-        with."""
+        with.
+
+        worktree_isolation_enabled defaults to True here so the existing
+        workspace-type-gate tests below keep exercising exactly what they did
+        before the per-project opt-in flag (#52) was added -- that flag is its
+        own, separately-tested dimension (see TestExecuteAgentEpicResolution's
+        opt-in-flag tests further down), not something every workspace-type
+        test needs to also vary.
+        """
         captured = {}
 
         def fake_build_execution_context(agent_name, project_name, task_id, task_context,
@@ -537,6 +546,7 @@ class TestExecuteAgentEpicResolution:
 
         mock_project_config = MagicMock()
         mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+        mock_project_config.worktree_isolation_enabled = worktree_isolation_enabled
 
         with patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor, '_build_execution_context',
@@ -648,3 +658,38 @@ class TestExecuteAgentEpicResolution:
 
         assert captured['epic_id'] == '77'
         assert captured['branch_name'] == 'feature/issue-77-shared'
+
+    @pytest.mark.asyncio
+    async def test_discussions_workspace_type_without_project_opt_in_does_not_resolve_epic_id(
+        self, agent_executor
+    ):
+        """(#52) The workspace-type allowlist alone is not sufficient -- a project
+        that hasn't explicitly set worktree_isolation_enabled=True must keep its
+        pre-migration shared-base-clone behavior even for 'discussions' dispatch,
+        so merging the allowlist doesn't silently roll out isolation to every
+        planning_design project at once."""
+        task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
+
+        captured = await self._run(
+            agent_executor, task_context, parent_issue=None,
+            worktree_isolation_enabled=False,
+        )
+
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
+
+    @pytest.mark.asyncio
+    async def test_discussions_workspace_type_with_project_opt_in_resolves_epic_id(
+        self, agent_executor
+    ):
+        """The positive case, explicit about the flag rather than relying on the
+        shared _run() helper's default -- a project that HAS opted in gets real
+        epic worktree resolution for 'discussions' dispatch."""
+        task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
+
+        captured = await self._run(
+            agent_executor, task_context, parent_issue=None,
+            worktree_isolation_enabled=True,
+        )
+
+        assert captured['epic_id'] == '200'

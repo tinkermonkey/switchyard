@@ -249,6 +249,13 @@ class AgentExecutor:
         # base-clone behavior exactly -- honest, non-regressing, and consistent
         # with this migration's own 'byte-identical behavior at concurrency=1'
         # requirement.
+        #
+        # This workspace-type allowlist is necessary but not sufficient (#52): even
+        # for 'discussions' dispatch, isolation only actually happens for a project
+        # that has opted in via ProjectConfig.worktree_isolation_enabled (checked
+        # further down, once project_config_for_epic is loaded) -- so merging this
+        # allowlist doesn't roll out isolation to every planning_design project at
+        # once, only to whichever project(s) explicitly enable it.
         EPIC_WORKTREE_SAFE_WORKSPACE_TYPES = {'discussions'}
         workspace_type_for_epic_gate = task_context.get('workspace_type', 'issues')
         epic_id = task_context.get('epic_id')
@@ -261,6 +268,13 @@ class AgentExecutor:
         ):
             try:
                 project_config_for_epic = config_manager.get_project_config(project_name)
+                # Per-project opt-in (#52): the workspace_type allowlist above says
+                # this TYPE of dispatch is safe to isolate, but isolation still only
+                # actually happens for a project that has explicitly opted in --
+                # defaults to False so every project keeps today's shared-base-clone
+                # behavior until a chosen pilot project sets this in its config.
+                if not getattr(project_config_for_epic, 'worktree_isolation_enabled', False):
+                    project_config_for_epic = None
                 repo_owner = None
                 repo_name = None
                 if project_config_for_epic and hasattr(project_config_for_epic, 'github'):
