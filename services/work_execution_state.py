@@ -2236,10 +2236,21 @@ class WorkExecutionStateTracker:
         self,
         project_name: str,
         issue_number: int,
-        active_task_ids: set
+        active_task_ids: set,
+        reason: str = 'Orchestrator restarted without completing this execution.'
     ) -> int:
         """
-        Mark orphaned in_progress entries as 'abandoned' after an orchestrator restart.
+        Mark orphaned in_progress entries as 'abandoned'.
+
+        Originally written for the orchestrator-restart recovery case (see
+        agent_container_recovery.py, this method's original and still most
+        common caller) — hence the default `reason` text. Also called by
+        pipeline_watchdog.py's zombie/frozen-run self-heal
+        (_redispatch_same_issue), where no restart occurred; that caller
+        passes its own `reason` so this durable, human-readable forensic
+        record (persisted execution history an operator reads when
+        debugging a repeatedly-zombie'd issue) doesn't claim a restart that
+        didn't happen.
 
         An entry is considered stale (and safe to abandon) when:
         - It has no task_id (was never assigned to a container — a pure probe entry), OR
@@ -2252,6 +2263,9 @@ class WorkExecutionStateTracker:
             project_name: Project name
             issue_number: Issue number
             active_task_ids: Set of task_ids belonging to currently running/recovered containers
+            reason: Human-readable explanation stored on each abandoned entry's
+                `error` field. Defaults to the restart-recovery wording for
+                backward compatibility with the original caller.
 
         Returns:
             Number of entries marked as abandoned
@@ -2269,7 +2283,7 @@ class WorkExecutionStateTracker:
                 continue
 
             execution['outcome'] = 'abandoned'
-            execution['error'] = 'Orchestrator restarted without completing this execution.'
+            execution['error'] = reason
             abandoned += 1
 
         if abandoned:
