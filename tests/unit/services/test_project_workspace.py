@@ -142,7 +142,8 @@ class TestCreateNewEpicWorktree:
                              'feature/issue-200-existing:refs/remotes/origin/feature/issue-200-existing',
                              '--quiet']
         assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
-                             str(expected_path), 'feature/issue-200-existing']
+                             '-B', 'feature/issue-200-existing', str(expected_path),
+                             'origin/feature/issue-200-existing']
 
     def test_missing_branch_name_on_first_create_raises(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")
@@ -215,6 +216,21 @@ class TestReuseExistingEpicWorktree:
             epic_b = manager.get_project_dir("my-project", epic_id="701", branch_name="feature/issue-701")
 
         assert epic_a != epic_b
+
+
+class TestEpicWorktreePathGuard:
+    """_epic_worktree_path() must reject an empty/falsy epic_id rather than silently
+    collapsing to the shared per-project staging directory."""
+
+    def test_empty_epic_id_raises(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        with pytest.raises(ValueError):
+            manager.get_project_dir("my-project", epic_id="", branch_name="feature/x")
+
+    def test_whitespace_only_epic_id_raises(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        with pytest.raises(ValueError):
+            manager.get_or_create_epic_worktree("my-project", "   ", branch_name="feature/x")
 
 
 class TestCleanupEpicWorktree:

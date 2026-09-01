@@ -278,7 +278,14 @@ class ProjectWorkspaceManager:
         worktrees) so the two namespaces, and their respective prune sweeps, never
         collide.
         """
-        return self.workspace_root / '.orchestrator' / 'worktrees' / project_name / str(epic_id)
+        epic_id_str = str(epic_id).strip()
+        if not epic_id_str:
+            raise ValueError(
+                f"epic_id must be a non-empty value to scope a worktree path for "
+                f"project {project_name!r} (got {epic_id!r}); an empty/falsy epic_id "
+                "would collapse the path to the shared per-project staging directory."
+            )
+        return self.workspace_root / '.orchestrator' / 'worktrees' / project_name / epic_id_str
 
     def get_or_create_epic_worktree(
         self,
@@ -376,7 +383,8 @@ class ProjectWorkspaceManager:
 
         if fetch_existing.returncode == 0:
             result = subprocess.run(
-                ['git', '-C', str(base_repo_dir), 'worktree', 'add', str(worktree_path), branch_name],
+                ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
+                 str(worktree_path), f'origin/{branch_name}'],
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode != 0:
@@ -412,7 +420,8 @@ class ProjectWorkspaceManager:
             )
             if retry_fetch.returncode == 0:
                 result = subprocess.run(
-                    ['git', '-C', str(base_repo_dir), 'worktree', 'add', str(worktree_path), branch_name],
+                    ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
+                 str(worktree_path), f'origin/{branch_name}'],
                     capture_output=True, text=True, timeout=30
                 )
             if result.returncode != 0:
