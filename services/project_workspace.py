@@ -824,6 +824,55 @@ class ProjectWorkspaceManager:
 
             return removed
 
+    @staticmethod
+    def _get_running_container_mount_sources() -> set:
+        """Host-side paths currently bind-mounted into any running switchyard-
+        managed container (docker inspect's Mounts[].Source, not the container-
+        side path) -- used by prune_epic_worktrees() to avoid force-removing a
+        worktree a live container still has mounted.
+
+        Best-effort: returns an empty set (callers proceed as if nothing is
+        running) on any failure. Must never block or fail startup over a
+        liveness-check problem -- a missed liveness check just means prune falls
+        back to its pre-existing (already-accepted) behavior for that worktree,
+        not a new failure mode.
+        """
+        try:
+            names_result = subprocess.run(
+                ['docker', 'ps', '--filter', 'label=org.switchyard.managed=true',
+                 '--format', '{{.Names}}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if names_result.returncode != 0:
+                return set()
+            names = [n for n in names_result.stdout.strip().split('\n') if n]
+            if not names:
+                return set()
+
+            inspect_result = subprocess.run(
+                ['docker', 'inspect', '--format', '{{json .Mounts}}'] + names,
+                capture_output=True, text=True, timeout=10
+            )
+            if inspect_result.returncode != 0:
+                return set()
+
+            import json
+            sources = set()
+            for line in inspect_result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                try:
+                    for mount in json.loads(line):
+                        src = mount.get('Source')
+                        if src:
+                            sources.add(src)
+                except Exception:
+                    continue
+            return sources
+        except Exception as e:
+            logger.warning(f"Failed to check running-container mount sources: {e}")
+            return set()
+
     def prune_epic_worktrees(self) -> None:
         """Remove all staged epic worktrees and prune git metadata.
 
@@ -850,10 +899,26 @@ class ProjectWorkspaceManager:
         at a now-missing directory -- every subsequent operation on that epic would
         fail until the next restart, silently defeating #48's own fix. So: skip any
         worktree currently tracked in self._epic_worktrees (actively in use / just
-        adopted this process); only remove genuinely untracked ones. An untracked
-        worktree is still safe to remove unconditionally -- it will be transparently
-        recreated (fetch + worktree add, cheap) the next time get_project_dir()/
-        get_or_create_epic_worktree() is called for that epic.
+        adopted this process).
+
+        Also skips any worktree currently bind-mounted into a live, running
+        switchyard-managed container (e.g. a repair-cycle container that survived
+        the restart and is still running -- reconnect_repair_cycle_container()
+        resumes monitoring it without ever populating self._epic_worktrees, so the
+        tracked-check above alone wouldn't catch this case). Directly relevant to
+        #52's pilot rollout, which explicitly wants to soak-test a forced restart
+        mid-epic.
+
+        Neither check is a complete guarantee (both are inherently racy against a
+        container starting or finishing between the check and the actual removal
+        below -- see the per-worktree lock re-check a few lines down for the
+        narrower, still-not-fully-closed version of this same class of race), but
+        together they cover the two realistic startup scenarios: a just-adopted
+        worktree, and a still-running container's worktree neither adopted nor
+        finished. A worktree matching NEITHER check is still safe to remove
+        unconditionally -- it will be transparently recreated (fetch + worktree
+        add, cheap) the next time get_project_dir()/get_or_create_epic_worktree()
+        is called for that epic.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
@@ -865,6 +930,11 @@ class ProjectWorkspaceManager:
             except OSError as e:
                 logger.warning(f"Failed to list epic worktree staging root {staging_root}: {e}")
                 return
+
+            # Computed once for the whole sweep, not per-worktree -- a single
+            # `docker ps` + batched `docker inspect` covers every running
+            # container regardless of how many worktrees are being considered.
+            running_mount_sources = self._get_running_container_mount_sources()
 
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
@@ -894,6 +964,39 @@ class ProjectWorkspaceManager:
                             "_epic_worktrees (adopted or created earlier this process)"
                         )
                         continue
+
+                    # Liveness check: is this worktree's HOST path currently
+                    # bind-mounted into a running container? worktree_path is
+                    # container-side (rooted at self.workspace_root, i.e.
+                    # /workspace in-container); running_mount_sources holds HOST
+                    # paths (docker inspect's Mounts[].Source), so translate
+                    # before comparing -- same /workspace/ -> host_workspace_path
+                    # translation established in project_monitor.py's
+                    # _launch_repair_cycle_container.
+                    if running_mount_sources:
+                        worktree_path_str = str(worktree_path)
+                        if worktree_path_str.startswith('/workspace/'):
+                            try:
+                                from claude.docker_runner import DockerAgentRunner
+                                host_workspace_path = DockerAgentRunner._detect_host_workspace_path()
+                                host_worktree_path = (
+                                    f"{host_workspace_path}/"
+                                    f"{worktree_path_str[len('/workspace/'):]}"
+                                )
+                                if host_worktree_path in running_mount_sources:
+                                    logger.info(
+                                        f"Skipping prune of {worktree_path} -- currently "
+                                        "bind-mounted into a live, running container "
+                                        "(e.g. a repair-cycle container that survived "
+                                        "the restart)"
+                                    )
+                                    continue
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to check container liveness for "
+                                    f"{worktree_path}, proceeding with prune: {e}"
+                                )
+
                     self._push_local_commits_if_any(worktree_path)
                     try:
                         subprocess.run(

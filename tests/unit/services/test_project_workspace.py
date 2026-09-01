@@ -792,3 +792,208 @@ class TestPushStrayBranchIfAhead:
     def test_subprocess_exception_never_raises(self, tmp_path):
         with patch('services.project_workspace.subprocess.run', side_effect=OSError("boom")):
             ProjectWorkspaceManager._push_stray_branch_if_ahead(tmp_path, "feature/issue-1")  # must not raise
+
+
+class TestGetRunningContainerMountSources:
+    """_get_running_container_mount_sources() -- host-side bind-mount sources for
+    every running switchyard-managed container, used by prune_epic_worktrees() to
+    avoid force-removing a worktree a live container still has mounted (final
+    whole-PR review pass on #87, directly relevant to #52's pilot rollout, which
+    explicitly soak-tests a forced restart mid-epic)."""
+
+    def test_no_running_containers_returns_empty_set(self):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok(stdout="")  # `docker ps` -> no names
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+        mock_run.assert_called_once()  # docker inspect never called -- nothing to inspect
+
+    def test_docker_ps_failure_returns_empty_set(self):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _fail("docker daemon not running")
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+    def test_docker_inspect_failure_returns_empty_set(self):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok(stdout="repair-cycle-my-project-100-abc12345\n"),  # docker ps
+                _fail("no such container"),  # docker inspect
+            ]
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+    def test_collects_mount_sources_across_multiple_containers(self):
+        import json as _json
+        mounts_c1 = _json.dumps([
+            {"Source": "/host/workspace/.orchestrator/worktrees/my-project/42", "Destination": "/workspace/.orchestrator/worktrees/my-project/42"},
+            {"Source": "/host/workspace/switchyard", "Destination": "/app"},
+        ])
+        mounts_c2 = _json.dumps([
+            {"Source": "/host/workspace/my-project", "Destination": "/workspace/my-project"},
+        ])
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok(stdout="container-1\ncontainer-2\n"),  # docker ps
+                _ok(stdout=f"{mounts_c1}\n{mounts_c2}\n"),  # docker inspect, one JSON array per line
+            ]
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+
+        assert result == {
+            "/host/workspace/.orchestrator/worktrees/my-project/42",
+            "/host/workspace/switchyard",
+            "/host/workspace/my-project",
+        }
+
+    def test_mount_entry_missing_source_key_is_skipped_not_a_crash(self):
+        import json as _json
+        mounts = _json.dumps([{"Destination": "/workspace/my-project"}])  # no "Source"
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok(stdout="container-1\n"),
+                _ok(stdout=mounts),
+            ]
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+    def test_malformed_json_line_is_skipped_not_a_crash(self):
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok(stdout="container-1\n"),
+                _ok(stdout="{not valid json"),
+            ]
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+    def test_subprocess_exception_returns_empty_set_not_a_crash(self):
+        with patch('services.project_workspace.subprocess.run', side_effect=OSError("docker not found")):
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+    def test_timeout_returns_empty_set_not_a_crash(self):
+        import subprocess as _subprocess
+        with patch('services.project_workspace.subprocess.run',
+                    side_effect=_subprocess.TimeoutExpired(cmd="docker", timeout=10)):
+            result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result == set()
+
+
+class TestPruneEpicWorktreesLivenessCheck:
+    """prune_epic_worktrees() must not force-remove a worktree that's currently
+    bind-mounted into a live, running switchyard-managed container (e.g. a
+    repair-cycle container that survived an orchestrator restart --
+    reconnect_repair_cycle_container() resumes monitoring it without ever
+    populating _epic_worktrees, so the already-existing tracked-check alone
+    doesn't catch this case).
+
+    The container-side -> host-side path translation this checks
+    (worktree_path_str.startswith('/workspace/')) only fires for paths actually
+    rooted at the in-container /workspace mount -- which the other tests in this
+    file deliberately avoid by using `tmp_path` as workspace_root (so they don't
+    depend on real filesystem access under /workspace, which isn't writable
+    outside the orchestrator container). Exercising that branch here means
+    driving prune_epic_worktrees() over a *simulated* /workspace tree instead:
+    workspace_root is set to Path('/workspace') and every Path.is_dir()/
+    iterdir() call the sweep makes is stubbed in the exact order the method
+    calls them, rather than touching a real directory.
+    """
+
+    def _manager_with_fake_workspace(self, tmp_path):
+        manager = ProjectWorkspaceManager(workspace_root=tmp_path)
+        manager.workspace_root = Path('/workspace')
+        return manager
+
+    def test_skips_worktree_currently_mounted_into_a_live_container(self, tmp_path):
+        manager = self._manager_with_fake_workspace(tmp_path)
+        project_staging = Path('/workspace/.orchestrator/worktrees/my-project')
+        worktree_path = Path('/workspace/.orchestrator/worktrees/my-project/42')
+
+        # Call order the sweep makes for a single project / single worktree,
+        # entirely skipped via the liveness `continue` (no removal-path calls).
+        is_dir_calls = [True, True, True, True]
+        iterdir_calls = [[project_staging], [worktree_path], [worktree_path]]
+
+        with patch.object(Path, 'is_dir', side_effect=is_dir_calls), \
+             patch.object(Path, 'iterdir', side_effect=iterdir_calls), \
+             patch.object(ProjectWorkspaceManager, '_get_running_container_mount_sources',
+                           return_value={'/host/workspace/.orchestrator/worktrees/my-project/42'}), \
+             patch.object(ProjectWorkspaceManager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.shutil.rmtree') as mock_rmtree, \
+             patch('claude.docker_runner.DockerAgentRunner') as mock_runner_cls, \
+             patch('services.project_workspace.subprocess.run') as mock_subprocess_run:
+
+            mock_runner_cls._detect_host_workspace_path.return_value = '/host/workspace'
+            mock_subprocess_run.return_value = _ok()
+
+            manager.prune_epic_worktrees()
+
+        # Neither the push-before-remove step nor the actual removal ran --
+        # the worktree was skipped outright because it's still mounted live.
+        mock_push.assert_not_called()
+        mock_rmtree.assert_not_called()
+        remove_calls = [
+            c for c in mock_subprocess_run.call_args_list
+            if 'remove' in c.args[0]
+        ]
+        assert remove_calls == []
+
+    def test_still_removes_worktree_not_mounted_into_any_container(self, tmp_path):
+        """The liveness check must actually discriminate -- a worktree whose host
+        path ISN'T in the running-container mount set gets removed as before,
+        not unconditionally protected just because some containers are running."""
+        manager = self._manager_with_fake_workspace(tmp_path)
+        project_staging = Path('/workspace/.orchestrator/worktrees/my-project')
+        worktree_path = Path('/workspace/.orchestrator/worktrees/my-project/42')
+
+        is_dir_calls = [True, True, True, True, True]
+        iterdir_calls = [[project_staging], [worktree_path], [worktree_path]]
+
+        with patch.object(Path, 'is_dir', side_effect=is_dir_calls), \
+             patch.object(Path, 'iterdir', side_effect=iterdir_calls), \
+             patch.object(ProjectWorkspaceManager, '_get_running_container_mount_sources',
+                           return_value={'/host/workspace/.orchestrator/worktrees/some-other-project/99'}), \
+             patch.object(ProjectWorkspaceManager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.shutil.rmtree') as mock_rmtree, \
+             patch('claude.docker_runner.DockerAgentRunner') as mock_runner_cls, \
+             patch('services.project_workspace.subprocess.run') as mock_subprocess_run:
+
+            mock_runner_cls._detect_host_workspace_path.return_value = '/host/workspace'
+            mock_subprocess_run.return_value = _ok()
+
+            manager.prune_epic_worktrees()
+
+        mock_push.assert_called_once_with(worktree_path)
+        mock_rmtree.assert_called_once_with(worktree_path, ignore_errors=True)
+        remove_calls = [
+            c for c in mock_subprocess_run.call_args_list
+            if 'remove' in c.args[0]
+        ]
+        assert len(remove_calls) == 1
+
+    def test_liveness_check_failure_falls_back_to_removing(self, tmp_path):
+        """If host-path translation itself blows up (e.g. DockerAgentRunner import
+        fails), prune must log and fall back to its pre-existing behavior for that
+        worktree (remove it), not crash the whole sweep."""
+        manager = self._manager_with_fake_workspace(tmp_path)
+        project_staging = Path('/workspace/.orchestrator/worktrees/my-project')
+        worktree_path = Path('/workspace/.orchestrator/worktrees/my-project/42')
+
+        is_dir_calls = [True, True, True, True, True]
+        iterdir_calls = [[project_staging], [worktree_path], [worktree_path]]
+
+        with patch.object(Path, 'is_dir', side_effect=is_dir_calls), \
+             patch.object(Path, 'iterdir', side_effect=iterdir_calls), \
+             patch.object(ProjectWorkspaceManager, '_get_running_container_mount_sources',
+                           return_value={'/host/workspace/.orchestrator/worktrees/my-project/42'}), \
+             patch.object(ProjectWorkspaceManager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.shutil.rmtree') as mock_rmtree, \
+             patch('claude.docker_runner.DockerAgentRunner') as mock_runner_cls, \
+             patch('services.project_workspace.subprocess.run') as mock_subprocess_run:
+
+            mock_runner_cls._detect_host_workspace_path.side_effect = RuntimeError("boom")
+            mock_subprocess_run.return_value = _ok()
+
+            manager.prune_epic_worktrees()
+
+        mock_push.assert_called_once_with(worktree_path)
+        mock_rmtree.assert_called_once_with(worktree_path, ignore_errors=True)

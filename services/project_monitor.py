@@ -260,6 +260,33 @@ def _launch_repair_cycle_container(
         # Get Docker runner for path detection
         docker_runner = DockerAgentRunner()
         host_workspace_path = docker_runner._detect_host_workspace_path()
+
+        # Translate the container-side project_dir (the shared base clone, e.g.
+        # /workspace/<project>, or -- for 'issues'-workspace repair cycles, see
+        # #46/#48 -- an isolated epic worktree, e.g. /workspace/.orchestrator/
+        # worktrees/<project>/<epic_id>) into the corresponding HOST path, mirroring
+        # claude/docker_runner.py's _build_docker_command's own established
+        # container-path -> host-path translation for ordinary agent containers.
+        # Found in a final whole-PR review pass on #87: this function accepted
+        # project_dir as a parameter but never actually used it to build a mount --
+        # the container was always mounted at a hardcoded /workspace/<project_name>
+        # regardless of what directory the orchestrator had actually resolved.
+        # .orchestrator is mounted separately below and happens to make an epic
+        # worktree reachable as a side effect of that broader mount, but relying on
+        # that implicitly (rather than mounting project_dir at its own path
+        # explicitly) is fragile -- this makes the intent explicit instead.
+        project_dir_str = str(project_dir)
+        if project_dir_str.startswith('/workspace/'):
+            project_dir_relative = project_dir_str[len('/workspace/'):]
+            host_project_dir_path = f'{host_workspace_path}/{project_dir_relative}'
+        else:
+            logger.warning(
+                f"project_dir {project_dir_str!r} for repair cycle on "
+                f"{project_name}/#{issue_number} doesn't start with /workspace/ -- "
+                "falling back to the base-clone mount path"
+            )
+            project_dir_str = f'/workspace/{project_name}'
+            host_project_dir_path = f'{host_workspace_path}/{project_name}'
         # Read HOST_HOME from environment (set in .env, injected via docker-compose.yml).
         # Must be forwarded explicitly to the repair cycle container — it won't inherit
         # the orchestrator's environment, and without it _detect_host_home_path() falls
@@ -297,8 +324,19 @@ def _launch_repair_cycle_container(
             '-v', f'{host_workspace_path}/switchyard:/app',
             # ALSO mount orchestrator at /workspace/switchyard for checkpoint paths
             '-v', f'{host_workspace_path}/switchyard:/workspace/switchyard',
-            # Mount project workspace at standard path (same as agent containers)
+            # Mount the base clone at its standard path (same as agent containers) --
+            # kept even when project_dir below points elsewhere (an epic worktree),
+            # since other code in this container (e.g. PR/base-clone-scoped git
+            # operations outside this repair cycle's own worktree) may still expect
+            # the base clone reachable at its conventional path.
             '-v', f'{host_workspace_path}/{project_name}:/workspace/{project_name}',
+            # Mount project_dir itself at its own container path -- the actual
+            # directory this repair cycle's work happens in, which may be the same
+            # as the base clone mount above (a no-op duplicate mount in that case,
+            # harmless) or a distinct epic worktree path nested under .orchestrator/
+            # (also mounted below; this makes relying on that nesting explicit
+            # rather than implicit).
+            '-v', f'{host_project_dir_path}:{project_dir_str}',
             # Mount .orchestrator dir so MCP config writes and reference worktrees work
             # (docker_runner writes to /workspace/.orchestrator/tmp; without this mount
             # the path is absent/unwritable in the repair cycle container)
