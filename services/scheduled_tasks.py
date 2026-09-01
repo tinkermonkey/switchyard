@@ -522,7 +522,15 @@ class ScheduledTasksService:
                     for container_port, bindings in
                     ((c.get('HostConfig', {}) or {}).get('PortBindings', {}) or {}).items()
                     for binding in (bindings or [])
-                    if binding.get('HostPort')
+                    # HostPort "0" (or "") is exactly the ephemeral/dynamic-assignment
+                    # request this audit exists to encourage (see docker_socket_access.md's
+                    # "bind host port 0" guidance) -- docker inspect's PortBindings echoes
+                    # back the literal requested HostPort, not the resolved ephemeral one
+                    # (that only appears in NetworkSettings.Ports), so "0" here means
+                    # correctly configured, not a fixed port. Found in #51 review: treating
+                    # it as fixed produced a false-positive warning on every container that
+                    # followed the guidance correctly.
+                    if binding.get('HostPort') and binding.get('HostPort') != '0'
                 })
                 if fixed_ports:
                     logger.warning(

@@ -142,6 +142,49 @@ class TestGateWiringForDockerSocketAgents:
             fake_gate.release.assert_called_once_with("phone-home", 99999)
 
     @pytest.mark.asyncio
+    async def test_mcp_config_cleaned_up_even_when_gate_acquire_itself_fails(self, runner):
+        """(#51 review, pass 1) acquire() itself can raise (e.g. TimeoutError
+        under real contention) or the awaiting task can be cancelled. That must
+        not skip the finally block's MCP-config-file cleanup -- previously
+        acquire() ran BEFORE the try/finally, so a raise there leaked the temp
+        file written a few lines earlier. Also confirms release() is never
+        attempted when acquire() never actually returned a holder id."""
+        context = _base_context(agent="dev_environment_setup", project="phone-home", task_id="task-3")
+
+        fake_gate = MagicMock()
+        fake_gate.acquire = AsyncMock(side_effect=TimeoutError("gate timed out"))
+        fake_gate.release = MagicMock(return_value=True)
+
+        with patch("claude.docker_runner.get_breaker", return_value=None), \
+             patch.object(runner, "_build_docker_command", return_value=(["docker", "run"], "some-image")), \
+             patch.object(runner, "_execute_in_container", AsyncMock(return_value="agent output")), \
+             patch.object(runner, "_cleanup_container"), \
+             patch.object(runner, "_unregister_active_container"), \
+             patch.object(runner, "_cleanup_reference_worktrees"), \
+             patch.object(runner, "_requires_docker_socket_access", return_value=True), \
+             patch.object(runner, "_write_mcp_config_file", return_value="/tmp/mcp-config-fake.json"), \
+             patch("claude.docker_runner.os.path.exists", return_value=True), \
+             patch("claude.docker_runner.os.remove") as mock_remove, \
+             patch(
+                 "services.docker_socket_access_gate.get_docker_socket_access_gate",
+                 return_value=fake_gate,
+             ):
+            with pytest.raises(TimeoutError, match="gate timed out"):
+                await runner.run_agent_in_container(
+                    prompt="do the thing",
+                    context=context,
+                    project_dir=Path("/workspace/phone-home"),
+                    mcp_servers=[{"name": "test-server", "type": "http", "url": "http://x"}],
+                )
+
+            fake_gate.acquire.assert_awaited_once_with("phone-home", "task-3")
+            # The MCP config temp file must still be cleaned up despite acquire()
+            # raising before the container was ever launched.
+            mock_remove.assert_called_once_with("/tmp/mcp-config-fake.json")
+            # Nothing was ever acquired -- release() must not be called at all.
+            fake_gate.release.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_gate_not_touched_for_non_docker_socket_agents(self, runner):
         context = _base_context(agent="senior_software_engineer", project="phone-home", task_id="task-3")
 

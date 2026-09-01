@@ -36,9 +36,9 @@ capacity.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
-import zlib
 from typing import Optional
 
 from services.pipeline_semaphore_manager import PipelineSemaphoreManager, get_pipeline_semaphore_manager
@@ -78,14 +78,24 @@ def _holder_id(task_id: str) -> int:
     PipelineSemaphoreManager's holder key is typed/named as an issue number,
     but its Redis hash field and YAML dict key only ever need to be a stable
     hashable identifier for "who holds this slot" -- nothing about its
-    storage requires it to be a real GitHub issue number. A per-launch
-    task_id is what run_agent_in_container actually has in hand, so this
-    derives a deterministic (not Python's randomized hash()) unsigned int
-    from it via CRC32, which is stable across processes/restarts so a
-    caller recomputing it for release() always matches what acquire()
-    stored.
+    storage requires it to be a real GitHub issue number (it's used as a
+    string dict/hash-field key throughout PipelineSemaphoreManager, str()'d
+    on write and int()'d back on read -- Python ints are arbitrary-precision,
+    so nothing constrains this to fit in 32 bits). A per-launch task_id is
+    what run_agent_in_container actually has in hand, so this derives a
+    deterministic (not Python's randomized hash()) id from it.
+
+    Uses a full SHA-256 digest, not a 32-bit checksum (e.g. zlib.crc32): a
+    32-bit space makes an accidental collision between two genuinely
+    concurrent, unrelated task_ids for the same project a real (if
+    individually unlikely) risk over the orchestrator's operating lifetime --
+    and per PipelineSemaphoreManager's idempotent-holder semantics, a
+    colliding second task_id would be silently admitted as if it were the
+    first task_id refreshing its own slot, defeating the exact mutual-
+    exclusion guarantee this gate exists to provide (found in #51 review).
+    SHA-256's 256-bit space makes that practically impossible.
     """
-    return zlib.crc32(str(task_id).encode("utf-8"))
+    return int(hashlib.sha256(str(task_id).encode("utf-8")).hexdigest(), 16)
 
 
 class DockerSocketAccessGate:
@@ -120,7 +130,14 @@ class DockerSocketAccessGate:
         holder_id = _holder_id(task_id)
         waited = 0.0
         while True:
-            acquired, reason = self._semaphore.try_acquire(
+            # try_acquire() does synchronous I/O (a Redis round trip, or a YAML
+            # file-lock read/write on fallback) -- offload each poll tick to a
+            # thread so it can't stall the shared event loop for its duration
+            # (found in #51 review: this poll can run for up to max_wait_seconds,
+            # unlike a typical fail-fast single-attempt gate elsewhere in this
+            # codebase).
+            acquired, reason = await asyncio.to_thread(
+                self._semaphore.try_acquire,
                 project=project,
                 board=DOCKER_SOCKET_ACCESS_BOARD,
                 issue_number=holder_id,

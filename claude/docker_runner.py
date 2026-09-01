@@ -533,17 +533,24 @@ class DockerAgentRunner:
 
         # Concurrency gate for docker-socket-bearing agents (see switchyard #51):
         # independent of, and in addition to, general pipeline-dispatch
-        # concurrency. Acquired here (before the container is launched) and
-        # always released in the finally below, even if launch/execution
-        # raises, so a crash can never leak the gate.
+        # concurrency. Only the (cheap, non-blocking) singleton lookup happens
+        # here; the actual (potentially long-blocking, up to
+        # DockerSocketAccessGate's max_wait_seconds) acquire() call happens
+        # INSIDE the try block below, not out here -- so if it raises (e.g.
+        # TimeoutError) or the awaiting task is cancelled, the finally block's
+        # MCP-config-file cleanup still runs instead of leaking that temp file
+        # (found in #51 review: it was written to disk a few lines above,
+        # before this gate existed).
         docker_socket_gate = None
         docker_socket_holder_id = None
         if self._requires_docker_socket_access(agent, project):
             from services.docker_socket_access_gate import get_docker_socket_access_gate
             docker_socket_gate = get_docker_socket_access_gate()
-            docker_socket_holder_id = await docker_socket_gate.acquire(project, task_id)
 
         try:
+            if docker_socket_gate is not None:
+                docker_socket_holder_id = await docker_socket_gate.acquire(project, task_id)
+
             # Start the container and execute Claude Code
             result_text = await self._execute_in_container(
                 docker_cmd=docker_cmd,
@@ -572,8 +579,11 @@ class DockerAgentRunner:
                 except Exception as e:
                     logger.warning(f"Failed to clean up MCP config file: {e}")
             # Release the docker-socket-access gate last, mirroring the
-            # acquire-last-before-launch ordering above.
-            if docker_socket_gate is not None:
+            # acquire-last-before-launch ordering above. Guarded on
+            # docker_socket_holder_id too (not just docker_socket_gate), since
+            # acquire() itself can now raise/timeout without ever returning a
+            # holder id -- nothing to release in that case.
+            if docker_socket_gate is not None and docker_socket_holder_id is not None:
                 docker_socket_gate.release(project, docker_socket_holder_id)
 
     def _prepare_mcp_config(self, mcp_servers: list, project_dir: Path) -> Dict:
