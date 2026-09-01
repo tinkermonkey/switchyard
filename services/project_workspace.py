@@ -518,6 +518,75 @@ class ProjectWorkspaceManager:
             return None
 
     @staticmethod
+    def _push_stray_branch_if_ahead(base_repo_dir: Path, branch_name: str) -> None:
+        """Best-effort push of a local branch ref that might hold real unpushed
+        commits, before `worktree add -B` is about to reset it.
+
+        Found in a final whole-PR review pass on #87, pass 2: -B unconditionally
+        resets an existing local ref to match the given start-point, discarding
+        anything it pointed to first. That's the correct, safe behavior for a
+        *stray* ref (e.g. left behind by a partial worktree-add failure -- see
+        _add_epic_worktree's own docstring/comments) -- but a local branch ref can
+        ALSO be left in base_repo_dir holding real, never-pushed commits: e.g. a
+        worktree was force-removed (cleanup_epic_worktree/prune_epic_worktrees)
+        after its own push-before-removal attempt (_push_local_commits_if_any)
+        failed. `git worktree remove` only removes the checkout, not the
+        underlying branch ref, which lives in the shared repo. Reactivating that
+        same epic later would hit this exact -B reset and silently discard those
+        commits with zero trace. Uses explicit refspecs throughout (referencing
+        the branch by name directly) rather than checking it out, since this runs
+        against the shared base_repo_dir, not a dedicated worktree -- checking out
+        an arbitrary branch there could itself be unsafe/unnecessary.
+        """
+        try:
+            verify = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'rev-parse', '--verify', '--quiet',
+                 f'refs/heads/{branch_name}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if verify.returncode != 0:
+                return  # no local ref by this name -- nothing to protect
+
+            ahead_result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'rev-list', '--count',
+                 f'origin/{branch_name}..{branch_name}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if ahead_result.returncode == 0:
+                ahead_count = int(ahead_result.stdout.strip() or '0')
+                if ahead_count == 0:
+                    return  # already matches origin -- safe to reset
+                ahead_desc = f"{ahead_count} unpushed commit(s)"
+            else:
+                # origin/<branch_name> doesn't exist at all -- the whole local
+                # branch is unpushed; can't compute a count, but there's
+                # something real to try to save.
+                ahead_count = None
+                ahead_desc = "unpushed commits (no origin ref to compare against)"
+
+            logger.warning(
+                f"Local branch {branch_name!r} in {base_repo_dir} has {ahead_desc} "
+                "and is about to be reset by worktree creation -- attempting to "
+                "push it first."
+            )
+            push_result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'push', 'origin', f'{branch_name}:{branch_name}'],
+                capture_output=True, text=True, timeout=30
+            )
+            if push_result.returncode == 0:
+                logger.info(f"Pushed stray local branch {branch_name!r} to origin before reset")
+            else:
+                logger.error(
+                    f"Could not push stray local branch {branch_name!r} before it's "
+                    f"reset by worktree creation ({push_result.stderr.strip()}). "
+                    "Its commits are lost."
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to check/push stray local branch {branch_name!r} before reset: {e}"
+            )
+
+    @staticmethod
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
         """Run the actual `git worktree add` for a new epic worktree.
 
@@ -532,6 +601,7 @@ class ProjectWorkspaceManager:
         )
 
         if fetch_existing.returncode == 0:
+            ProjectWorkspaceManager._push_stray_branch_if_ahead(base_repo_dir, branch_name)
             result = subprocess.run(
                 ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
                  str(worktree_path), f'origin/{branch_name}'],
@@ -568,6 +638,12 @@ class ProjectWorkspaceManager:
         # worktree (regardless of -b/-B) -- so -B's reset semantics only ever
         # trigger on a stray/stale local ref exactly like the one this bug leaves
         # behind, self-healing it instead of requiring detection/cleanup logic.
+        # _push_stray_branch_if_ahead guards against -B's OTHER edge case (also
+        # found in review, pass 2): a stray ref can hold real unpushed commits
+        # (e.g. from a worktree that was force-removed after its own push-before-
+        # removal attempt failed) -- -B would silently discard those too if this
+        # didn't try to save them first.
+        ProjectWorkspaceManager._push_stray_branch_if_ahead(base_repo_dir, branch_name)
         result = subprocess.run(
             ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
              str(worktree_path), f'origin/{default_branch}'],
@@ -583,6 +659,7 @@ class ProjectWorkspaceManager:
                 capture_output=True, text=True, timeout=30
             )
             if retry_fetch.returncode == 0:
+                ProjectWorkspaceManager._push_stray_branch_if_ahead(base_repo_dir, branch_name)
                 result = subprocess.run(
                     ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
                  str(worktree_path), f'origin/{branch_name}'],
@@ -789,9 +866,6 @@ class ProjectWorkspaceManager:
                 logger.warning(f"Failed to list epic worktree staging root {staging_root}: {e}")
                 return
 
-            with self._epic_worktree_lock:
-                tracked_paths = set(self._epic_worktrees.values())
-
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
                     continue
@@ -804,7 +878,17 @@ class ProjectWorkspaceManager:
                 for worktree_path in worktree_paths:
                     if not worktree_path.is_dir():
                         continue
-                    if str(worktree_path) in tracked_paths:
+                    # Re-check right before acting on each worktree, not once
+                    # up front (review pass 2 on #87): container recovery can
+                    # still be adopting/creating worktrees concurrently on
+                    # another thread while this sweep is mid-loop -- a single
+                    # snapshot taken before the loop started could already be
+                    # stale by the time a later iteration gets here, especially
+                    # for a first-time worktree creation via the slower
+                    # multi-subprocess _add_epic_worktree path.
+                    with self._epic_worktree_lock:
+                        currently_tracked = str(worktree_path) in self._epic_worktrees.values()
+                    if currently_tracked:
                         logger.debug(
                             f"Skipping prune of {worktree_path} -- currently tracked in "
                             "_epic_worktrees (adopted or created earlier this process)"
