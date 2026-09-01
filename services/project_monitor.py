@@ -6505,10 +6505,71 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             # Build context for stage execution
             from services.project_workspace import workspace_manager
+            from services.feature_branch_manager import feature_branch_manager
+            from services.github_integration import GitHubIntegration
             from monitoring.observability import get_observability_manager
-            
-            project_dir = workspace_manager.get_project_dir(project_name)
+            import concurrent.futures
+
             obs = get_observability_manager()
+
+            # Resolve the epic (parent issue) BEFORE computing project_dir, so the
+            # repair cycle container mounts the epic's isolated worktree instead of
+            # the shared base clone. The repair_cycle stage only exists in the
+            # sdlc_execution pipeline template, so every issue reaching this
+            # function is a sub-issue of a parent epic -- unlike the generic
+            # agent_executor dispatch path (which also has to serve
+            # planning_design's directly-dispatched epics and standalone issues),
+            # a missing parent here is a real error: silently scoping the worktree
+            # to this sub-issue's own number instead would silently defeat the
+            # cross-sub-issue isolation this migration exists to deliver.
+            epic_id = None
+            epic_branch_name = None
+            github = None
+            if workspace_type == 'issues':
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=repository
+                )
+
+                async def _resolve_epic_worktree_target():
+                    parent_issue = await feature_branch_manager.get_parent_issue(
+                        github, issue_number, project=project_name
+                    )
+                    if not parent_issue:
+                        raise ValueError(
+                            f"Repair cycle for {project_name}/#{issue_number} could not "
+                            f"resolve a parent epic issue via GitHub's structured "
+                            f"sub-issue API. sdlc_execution sub-issues must have a "
+                            f"parent to scope an isolated worktree by."
+                        )
+                    eid = str(parent_issue)
+                    existing_branch = feature_branch_manager.resolve_epic_branch_name(project_name, eid)
+                    ebranch = existing_branch or feature_branch_manager.create_feature_branch_name(parent_issue, "")
+                    return eid, ebranch
+
+                # Handle both running-loop and no-loop contexts, same pattern used
+                # by the feature-branch preparation call below.
+                try:
+                    try:
+                        asyncio.get_running_loop()
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            epic_id, epic_branch_name = pool.submit(
+                                asyncio.run, _resolve_epic_worktree_target()
+                            ).result()
+                    except RuntimeError:
+                        epic_id, epic_branch_name = asyncio.run(_resolve_epic_worktree_target())
+                except Exception as e:
+                    logger.error(
+                        f"Failed to resolve epic worktree target for repair cycle on "
+                        f"issue #{issue_number}: {e}. Refusing to fall back to the "
+                        f"shared base clone -- aborting repair cycle launch.",
+                        exc_info=True
+                    )
+                    return None
+
+            project_dir = workspace_manager.get_project_dir(
+                project_name, epic_id=epic_id, branch_name=epic_branch_name
+            ) if epic_id else workspace_manager.get_project_dir(project_name)
 
             stage_context = {
                 'project': project_name,
@@ -6523,6 +6584,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 'discussion_id': discussion_id,
                 'pipeline_run_id': pipeline_run.id,
                 'project_dir': project_dir,
+                'epic_id': epic_id,
                 'use_docker': True,
                 'task_id': f"repair_cycle_{issue_number}_{pipeline_run.id}",
                 'agent_name': stage_config.default_agent,
@@ -6535,17 +6597,8 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             branch_name = None
             if workspace_type == 'issues':
                 try:
-                    import asyncio
-                    from services.feature_branch_manager import feature_branch_manager
-                    from services.github_integration import GitHubIntegration
-                    
-                    github = GitHubIntegration(
-                        repo_owner=project_config.github['org'],
-                        repo_name=repository
-                    )
-                    
                     issue_title = issue_data.get('title', '')
-                    
+
                     logger.info(
                         f"Preparing feature branch for repair cycle on issue #{issue_number}"
                     )
@@ -6555,7 +6608,6 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # run_until_complete() on a new loop also fails for the same reason.
                     # Use the same pattern as lines 950-963: detect the running loop and
                     # dispatch to a fresh ThreadPoolExecutor thread if one is found.
-                    import concurrent.futures
                     coro = feature_branch_manager.prepare_feature_branch(
                         project=project_name,
                         issue_number=issue_number,
@@ -6569,10 +6621,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             branch_name = pool.submit(asyncio.run, coro).result()
                     except RuntimeError:
                         branch_name = asyncio.run(coro)
-                    
+
                     logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
                     stage_context['branch_name'] = branch_name
-                    
+
                 except Exception as e:
                     logger.error(f"Failed to prepare feature branch for repair cycle: {e}", exc_info=True)
                     # Don't fail the repair cycle if branch prep fails - it might still work

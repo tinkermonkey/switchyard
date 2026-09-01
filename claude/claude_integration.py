@@ -88,8 +88,33 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         
         logger.info(f"Running agent in Docker container for project {project}")
 
-        # Get project directory from workspace manager
-        project_dir = workspace_manager.get_project_dir(project)
+        # Get project directory from workspace manager.
+        task_context_for_dir = context.get('context', {}) or {}
+        existing_project_dir = task_context_for_dir.get('project_dir')
+        if existing_project_dir:
+            # A caller running in its own separate process (e.g. a repair cycle
+            # container) has already resolved the concrete directory its
+            # originating orchestrator process created/reused -- reuse it as-is.
+            # Re-deriving via epic_id here would run against a *fresh*, empty
+            # in-process worktree cache (ProjectWorkspaceManager's cache is
+            # process-local) and could attempt to `git worktree add` a worktree
+            # that already exists on disk, which is not idempotent and would raise.
+            project_dir = Path(existing_project_dir)
+        else:
+            # If an earlier stage of this same dispatch
+            # (agent_executor._build_execution_context) already resolved the epic
+            # this task belongs to, reuse it here so the container mounts the
+            # epic's isolated worktree -- not the shared base clone -- instead of
+            # re-resolving it a second time. branch_name is only required the
+            # first time an epic's worktree is created; by the time this runs it
+            # has already been created upstream (or never needed a branch at
+            # all), so it is safe to pass along whatever (if anything) is
+            # already known.
+            epic_id = task_context_for_dir.get('epic_id')
+            branch_name = task_context_for_dir.get('branch_name')
+            project_dir = workspace_manager.get_project_dir(
+                project, epic_id=epic_id, branch_name=branch_name
+            )
 
         if not project_dir.exists():
             raise Exception(f"Project directory does not exist: {project_dir}")

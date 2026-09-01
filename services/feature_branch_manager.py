@@ -1044,6 +1044,45 @@ class FeatureBranchManager:
             logger.error(f"Failed to get parent issue for #{issue_number}: {e}")
             return None
 
+    async def resolve_epic_id(
+        self, github_integration, issue_number: int, project: Optional[str] = None
+    ) -> str:
+        """
+        Resolve the epic id that should scope a per-epic git worktree for issue_number.
+
+        Sub-issues (sdlc_execution dispatch) resolve to their parent epic's issue
+        number. An issue with no parent (a planning_design epic dispatched directly,
+        or a standalone issue not part of any epic) resolves to its own number, so
+        every call site gets a consistent, non-empty epic_id to isolate a worktree by.
+
+        Uses the same 1-hour-TTL-cached get_parent_issue lookup used everywhere else
+        parent resolution happens, so calling this from multiple call sites in the
+        same dispatch costs at most one real GitHub API call.
+        """
+        parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
+        return str(parent_issue) if parent_issue else str(issue_number)
+
+    def resolve_epic_branch_name(self, project: str, epic_id: str) -> Optional[str]:
+        """
+        Read-only lookup of the epic's already-established shared branch, if any.
+
+        Pure git query (cached branch state, or a plain `git branch` listing) with
+        no side effects on the shared base clone -- never checks out or creates
+        anything. Returns None when no branch has been created for this epic yet;
+        callers creating the epic's worktree for the first time should fall back to
+        create_feature_branch_name(int(epic_id), ...) for the canonical name. That
+        fallback is safe to use without inventing a new naming scheme: the epic
+        worktree's own `git worktree add -b` call is what actually creates the
+        branch (in the isolated worktree, never in the shared base clone), and
+        because branches are repo-wide refs visible from every worktree of the same
+        repository, any later feature_branch_manager operation against the shared
+        base clone (e.g. prepare_feature_branch for an sdlc_execution sub-issue)
+        will independently rediscover and reuse that same branch rather than
+        creating a second, differently-named one.
+        """
+        existing = self.get_feature_branch_state(project, int(epic_id))
+        return existing.branch_name if existing else None
+
     def create_feature_branch_name(self, parent_issue: int, title: str = "") -> str:
         """Create feature branch name from parent issue"""
         # Validate issue number

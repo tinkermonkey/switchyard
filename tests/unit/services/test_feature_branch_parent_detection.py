@@ -200,3 +200,57 @@ class TestParentIssueDetection:
 
 # Note: _get_sub_issues_from_parent() uses a different signature and data flow
 # The critical bug fix was in get_parent_issue() which is fully tested above
+
+
+class TestResolveEpicWorktreeTarget:
+    """Issue #46: resolve_epic_id()/resolve_epic_branch_name() -- the two
+    helpers the 3 Docker-mount-source call sites (claude_integration.py,
+    agent_executor.py, project_monitor.py's repair cycle) use to scope a
+    per-epic git worktree instead of the shared base clone."""
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    @pytest.mark.asyncio
+    async def test_resolve_epic_id_uses_the_parent_when_one_exists(self, manager):
+        """sdlc_execution dispatch: a sub-issue resolves to its PARENT
+        epic's number, not its own."""
+        with patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent:
+            mock_get_parent.return_value = 42
+
+            epic_id = await manager.resolve_epic_id(Mock(), 101, project='test-project')
+
+            assert epic_id == '42'
+            mock_get_parent.assert_awaited_once_with(mock_get_parent.call_args.args[0], 101, project='test-project')
+
+    @pytest.mark.asyncio
+    async def test_resolve_epic_id_falls_back_to_self_with_no_parent(self, manager):
+        """planning_design dispatch (the board item IS the epic) and
+        standalone issues both resolve to their own number."""
+        with patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent:
+            mock_get_parent.return_value = None
+
+            epic_id = await manager.resolve_epic_id(Mock(), 200, project='test-project')
+
+            assert epic_id == '200'
+
+    def test_resolve_epic_branch_name_returns_the_existing_branch(self, manager):
+        """A read-only lookup: when the epic already has a tracked branch,
+        that exact name must be reused, not regenerated."""
+        existing = Mock()
+        existing.branch_name = 'feature/issue-42-existing-epic'
+        with patch.object(manager, 'get_feature_branch_state', return_value=existing) as mock_state:
+            branch_name = manager.resolve_epic_branch_name('test-project', '42')
+
+            assert branch_name == 'feature/issue-42-existing-epic'
+            mock_state.assert_called_once_with('test-project', 42)
+
+    def test_resolve_epic_branch_name_returns_none_when_nothing_exists_yet(self, manager):
+        """No git side effects, no invented name -- callers creating the
+        epic's worktree for the first time fall back to
+        create_feature_branch_name() themselves."""
+        with patch.object(manager, 'get_feature_branch_state', return_value=None):
+            branch_name = manager.resolve_epic_branch_name('test-project', '42')
+
+            assert branch_name is None

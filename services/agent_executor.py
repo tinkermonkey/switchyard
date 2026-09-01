@@ -216,13 +216,55 @@ class AgentExecutor:
                                     execution_type=execution_type,
                                     pipeline_run_id=pipeline_run_id)
 
+        # Resolve the epic id (and, if already known, its shared branch) so the
+        # container-mount directory built below is the epic's isolated worktree
+        # instead of the shared base clone. If a caller already resolved this
+        # earlier in the same dispatch (e.g. a repair cycle stashed 'epic_id' /
+        # 'branch_name' into task_context before calling us with
+        # skip_workspace_prep=True), reuse it rather than re-resolving. Otherwise
+        # resolve it fresh here -- cheap and side-effect-free: get_parent_issue is
+        # 1h-TTL-cached, and the branch lookup is a plain read-only git query, never
+        # a checkout, on the shared base clone. Best-effort: a resolution failure
+        # here must not break executions that worked fine before this migration --
+        # fall back to the pre-migration shared-base-clone behavior instead.
+        epic_id = task_context.get('epic_id')
+        epic_branch_name = task_context.get('branch_name')
+        if epic_id is None and 'issue_number' in task_context and not task_context.get('skip_workspace_prep', False):
+            try:
+                project_config_for_epic = config_manager.get_project_config(project_name)
+                repo_owner = None
+                repo_name = None
+                if project_config_for_epic and hasattr(project_config_for_epic, 'github'):
+                    repo_owner = project_config_for_epic.github.get('org')
+                    repo_name = project_config_for_epic.github.get('repo')
+                if repo_owner and repo_name:
+                    from services.github_integration import GitHubIntegration
+                    from services.feature_branch_manager import feature_branch_manager
+                    gh_integration_for_epic = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+                    epic_id = await feature_branch_manager.resolve_epic_id(
+                        gh_integration_for_epic, task_context['issue_number'], project=project_name
+                    )
+                    epic_branch_name = feature_branch_manager.resolve_epic_branch_name(project_name, epic_id) \
+                        or feature_branch_manager.create_feature_branch_name(int(epic_id), "")
+                    task_context['epic_id'] = epic_id
+            except Exception as epic_resolve_err:
+                logger.warning(
+                    f"Could not resolve epic worktree target for {project_name} "
+                    f"issue #{task_context.get('issue_number')}: {epic_resolve_err}. "
+                    f"Falling back to the shared base clone for this execution."
+                )
+                epic_id = None
+                epic_branch_name = None
+
         # Build execution context with ALL required fields
         # NOTE: Stream callback removed - docker-claude-wrapper.py handles all Claude log streaming
         execution_context = self._build_execution_context(
             agent_name=agent_name,
             project_name=project_name,
             task_id=task_id,
-            task_context=task_context
+            task_context=task_context,
+            epic_id=epic_id,
+            branch_name=epic_branch_name
         )
 
         self._apply_frozen_session_resume(execution_context, task_context, project_name, agent_name)
@@ -1153,13 +1195,38 @@ class AgentExecutor:
         agent_name: str,
         project_name: str,
         task_id: str,
-        task_context: Dict[str, Any]
+        task_context: Dict[str, Any],
+        epic_id: Optional[str] = None,
+        branch_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Build standardized execution context for agent"""
+        """Build standardized execution context for agent.
+
+        epic_id/branch_name (resolved by the caller -- see execute_agent) scope
+        the returned work_dir to the epic's isolated git worktree instead of the
+        shared base clone. Omitting epic_id preserves the pre-worktree-isolation
+        behavior exactly (plain base-clone path, no side effects).
+        """
+        from pathlib import Path
         from services.project_workspace import workspace_manager
 
-        # Get project directory from workspace manager
-        project_dir = workspace_manager.get_project_dir(project_name)
+        # If the caller already resolved a concrete directory (e.g. a repair
+        # cycle running in its own separate container, handed the epic worktree
+        # path its originating orchestrator process already created/reused via
+        # task_context['project_dir']), reuse it as-is rather than re-deriving
+        # via epic_id here. Re-deriving would run against a *fresh*, empty
+        # in-process worktree cache (ProjectWorkspaceManager's cache is
+        # process-local) and could attempt to `git worktree add` a worktree that
+        # already exists on disk -- which is not idempotent and would raise.
+        existing_project_dir = task_context.get('project_dir')
+        if existing_project_dir:
+            project_dir = Path(existing_project_dir)
+        else:
+            # Get project directory from workspace manager -- an isolated
+            # per-epic worktree when epic_id is known, otherwise the shared base
+            # clone.
+            project_dir = workspace_manager.get_project_dir(
+                project_name, epic_id=epic_id, branch_name=branch_name
+            )
 
         # Build context with ALL required fields for agents
         # NOTE: stream_callback removed - docker-claude-wrapper.py handles all Claude log streaming

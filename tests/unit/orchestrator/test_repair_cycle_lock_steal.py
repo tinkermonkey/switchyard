@@ -43,7 +43,8 @@ successful outcome, not just "didn't raise."
 """
 
 import pytest
-from unittest.mock import Mock, MagicMock, patch
+from pathlib import Path
+from unittest.mock import Mock, MagicMock, AsyncMock, patch
 
 from tests.unit.orchestrator.conftest import create_test_issue
 
@@ -56,6 +57,7 @@ def _run_start_repair_cycle(
     mock_task_queue,
     issue_number=100,
     monitor_mutator=None,
+    parent_issue_number=42,
 ):
     """
     Shared harness for every test in this file. Sets up the common
@@ -65,7 +67,18 @@ def _run_start_repair_cycle(
     mocked out so nothing here ever touches real Docker/subprocess machinery
     or starts a real background thread.
 
-    Returns (result, launch_mock, monitor_mock) so callers can assert on the
+    Also mocks the epic-worktree resolution chain
+    (feature_branch_manager.get_parent_issue / resolve_epic_branch_name and
+    workspace_manager.get_project_dir) added by issue #46 — real calls
+    would try genuine GraphQL/git subprocess work against a nonexistent
+    'test-project' repo. parent_issue_number controls what get_parent_issue
+    resolves to (default 42, a plausible parent epic); pass None for tests
+    covering the "no parent found" hard-error path. The three mocks are
+    stashed onto the returned stage_config as `_epic_mocks` (a dict) so
+    tests needing to assert on them can, without changing this function's
+    long-established 3-tuple return signature.
+
+    Returns (result, launch_mock, stage_config) so callers can assert on the
     function's actual return value as well as whether/how dispatch proceeded.
     """
     mock_run = Mock()
@@ -76,7 +89,17 @@ def _run_start_repair_cycle(
          patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_pipeline_lock_manager_auto), \
          patch('services.pipeline_run.get_pipeline_run_manager') as mock_pipeline_mgr, \
          patch('services.project_monitor.subprocess.run') as mock_subprocess, \
-         patch('services.project_monitor._launch_repair_cycle_container') as launch_mock:
+         patch('services.project_monitor._launch_repair_cycle_container') as launch_mock, \
+         patch('services.project_monitor._save_repair_cycle_context',
+               return_value='/workspace/switchyard/orchestrator_data/repair_cycles/test-project/100/context.json'), \
+         patch('services.feature_branch_manager.feature_branch_manager.get_parent_issue',
+               new_callable=AsyncMock) as mock_get_parent_issue, \
+         patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_branch_name',
+               return_value='feature/issue-42-epic') as mock_resolve_epic_branch, \
+         patch('services.project_workspace.workspace_manager.get_project_dir',
+               return_value=Path('/workspace/test-project')) as mock_get_project_dir:
+
+        mock_get_parent_issue.return_value = parent_issue_number
 
         mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
         launch_mock.return_value = f'repair-cycle-test-project-{issue_number}-run-repa'
@@ -124,6 +147,12 @@ def _run_start_repair_cycle(
             column=column,
             stage_config=stage_config,
         )
+
+        stage_config._epic_mocks = {
+            'get_parent_issue': mock_get_parent_issue,
+            'resolve_epic_branch_name': mock_resolve_epic_branch,
+            'get_project_dir': mock_get_project_dir,
+        }
 
         return result, launch_mock, stage_config
 
@@ -325,3 +354,80 @@ class TestStealLockCallSiteWiring:
 
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
+
+
+class TestEpicWorktreeResolution:
+    """Issue #46: _start_repair_cycle_for_issue must resolve the sub-issue's
+    parent epic and pass it through to workspace_manager.get_project_dir so
+    the repair cycle container mounts the epic's isolated worktree, not the
+    shared base clone. Repair cycles only exist for sdlc_execution
+    sub-issues, so (unlike agent_executor's generic dispatch path, which
+    also has to serve planning_design's directly-dispatched epics and
+    standalone issues) a missing parent here is a hard error, not a silent
+    self-scoped fallback -- see the second test below.
+    """
+
+    def _configure_no_competing_holder(self, mock_pipeline_lock_manager_auto):
+        # Isolates these tests to the epic-resolution logic: no lock gate to
+        # navigate around.
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
+
+    def test_resolves_parent_epic_and_mounts_its_worktree(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+        mocks = stage_config._epic_mocks
+        # Called at least once by this call site's own epic resolution (it's
+        # also called a second time internally by the later, unrelated
+        # prepare_feature_branch call that resolves the sub-issue's own
+        # operational branch -- both resolve against the same sub-issue
+        # number, which is the only thing asserted on below).
+        mocks['get_parent_issue'].assert_awaited()
+        for call in mocks['get_parent_issue'].await_args_list:
+            assert call.args[1] == 100
+
+        # get_project_dir must be scoped to the PARENT epic (42), not the
+        # sub-issue's own number (100) -- this is what makes two sequential
+        # sub-issues of the same epic share one worktree.
+        mocks['resolve_epic_branch_name'].assert_called_once_with('test-project', '42')
+        mocks['get_project_dir'].assert_called_once_with(
+            'test-project', epic_id='42', branch_name='feature/issue-42-epic'
+        )
+
+    def test_aborts_without_launching_when_no_parent_epic_is_found(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """A repair-cycle sub-issue with no resolvable parent must abort
+        rather than silently scope the worktree to its own issue number (the
+        planning_design/standalone-issue fallback used elsewhere) -- that
+        would defeat the cross-sub-issue isolation this migration exists to
+        deliver, for an issue this call site assumes is always a sub-issue.
+        """
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            parent_issue_number=None,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        stage_config._epic_mocks['get_project_dir'].assert_not_called()
