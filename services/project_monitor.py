@@ -10232,38 +10232,6 @@ Moving to implementation phase.
             logger.error(f"Failed to create feedback task for discussion: {e}")
 
 
-# Process-global ProjectMonitor instance, registered once by main.py after
-# construction (ProjectMonitor requires a TaskQueue/ConfigManager at
-# construction time, so — unlike get_pipeline_lock_manager()/
-# get_pipeline_run_manager() — this accessor does NOT lazily build one itself).
-#
-# Exists specifically so components that run outside the main poll loop (e.g.
-# pipeline_watchdog.py's zombie/self-heal redispatch) can reach the single
-# canonical dispatch entry point, trigger_agent_for_status(), instead of
-# duplicating its column/workflow/lock-state logic. See incident e42ca133: a
-# duplicated, partial re-implementation of "advance and dispatch the next
-# agent" (in the container-recovery auto-advance path) was the root cause of
-# an orphaned review verdict — every re-dispatch should go through this one
-# method.
-_project_monitor_instance: Optional["ProjectMonitor"] = None
-
-
-def get_project_monitor() -> Optional["ProjectMonitor"]:
-    """
-    Return the registered process-global ProjectMonitor, or None if
-    register_project_monitor() hasn't been called yet (e.g. early startup, or
-    a test/script that never registers one). Callers MUST handle the None
-    case rather than assume a monitor is always available.
-    """
-    return _project_monitor_instance
-
-
-def register_project_monitor(instance: "ProjectMonitor") -> None:
-    """Register the process-global ProjectMonitor instance. Called once from main.py right after construction."""
-    global _project_monitor_instance
-    _project_monitor_instance = instance
-
-
 if __name__ == "__main__":
     # Initialize task queue and start monitoring
     task_queue = TaskQueue(use_redis=False)
