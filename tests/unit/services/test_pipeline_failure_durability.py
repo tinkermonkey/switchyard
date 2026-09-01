@@ -370,6 +370,68 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertTrue(released)
 
 
+class TestClearRetainedReasonDurability(unittest.TestCase):
+    """PipelineLockManager.clear_retained_reason — the inverse of mark_lock_failed,
+    used by the zombie-watchdog self-heal path (see incident e42ca133) to lift a
+    durable retention without releasing locked_by_issue, so no other issue can
+    acquire the lock during a self-heal retry."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_clears_retained_reason_but_keeps_lock_held(self):
+        self.manager._create_lock("proj", "board", 123)
+        self.assertTrue(self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed"))
+
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertTrue(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNone(lock.retained_reason)
+        self.assertIsNone(lock.retained_at)
+        # The point of this method: locked_by_issue is untouched, so no other
+        # issue can acquire the lock in the gap before a redispatch happens.
+        self.assertEqual(lock.locked_by_issue, 123)
+        self.assertEqual(lock.lock_status, "locked")
+
+    def test_refuses_when_not_held_by_issue(self):
+        self.manager._create_lock("proj", "board", 999)
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+    def test_refuses_when_no_lock_at_all(self):
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+    def test_is_noop_when_already_clear(self):
+        """A lock held by the issue with no retained_reason is a valid,
+        common state (e.g. a lock actively in use) — clearing it must be a
+        harmless no-op, not an error, so callers don't need to check
+        get_retained_reason() first."""
+        self.manager._create_lock("proj", "board", 123)
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertTrue(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.locked_by_issue, 123)
+
+    def test_other_issue_still_refused_after_clear(self):
+        """Clearing the durable mark must not itself change who holds the
+        lock — try_acquire_lock for a different issue must still see this
+        lock as actively held (by issue 123), just no longer retained."""
+        self.manager._create_lock("proj", "board", 123)
+        self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
+        self.manager.clear_retained_reason("proj", "board", 123)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNone(lock.retained_reason)
+        self.assertEqual(lock.locked_by_issue, 123)
+
 class TestGetRetainedReason(unittest.TestCase):
     """PipelineLockManager.get_retained_reason — the single check every dispatch
     entry point calls before (re-)dispatching an issue."""

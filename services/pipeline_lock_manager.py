@@ -984,6 +984,80 @@ class PipelineLockManager:
         )
         return True
 
+    def clear_retained_reason(self, project: str, board: str, issue_number: int) -> bool:
+        """
+        Clear a durable retained_reason while leaving the lock's locked_by_issue
+        untouched — the inverse of mark_lock_failed().
+
+        This exists for a narrow, deliberate case: a watchdog-driven self-heal
+        (zombie auto-retry within budget, or an active-resume after the Claude
+        Code breaker closes) that has decided THIS SPECIFIC failure gets one
+        more automatic attempt. The caller must immediately follow this with a
+        re-dispatch of the same issue — never leave a lock in "cleared but
+        nothing redispatched" limbo, since nothing else will notice the retry is
+        owed.
+
+        Deliberately does NOT release the lock (that's release_lock(), the
+        human-recovery action, or a plain end_pipeline_run(retain_lock=False)
+        release). Keeping locked_by_issue set for the whole self-heal window is
+        the point: it stops any other issue from acquiring the pipeline lock in
+        the gap between "this attempt failed" and "the retry actually starts",
+        which is exactly the race that orphaned issue #853 in incident
+        e42ca133 — the lock was released outright, and a different issue
+        (#854) acquired it before the stalled-issue rescan could re-pick #853.
+
+        Safe to call even if the lock has no retained_reason set (no-op,
+        returns True) — callers don't need to check get_retained_reason() first.
+
+        Returns:
+            True if the lock is held by issue_number (retained_reason cleared,
+            or already clear), False if no lock is currently held by this
+            issue (a bug upstream — logged as an error, mirroring
+            mark_lock_failed's same-shaped guard).
+        """
+        lock = self.get_lock(project, board)
+        if not lock or lock.locked_by_issue != issue_number:
+            logger.error(
+                f"clear_retained_reason: no lock held by issue #{issue_number} for "
+                f"{project}/{board} (current holder: "
+                f"{lock.locked_by_issue if lock else 'none'}) — cannot clear"
+            )
+            return False
+
+        if not lock.retained_reason:
+            # Already clear — nothing to do, but this is not an error condition.
+            return True
+
+        lock.retained_reason = None
+        lock.retained_at = None
+
+        redis_ok = False
+        if self.redis_client:
+            try:
+                lock_key = self._get_lock_key(project, board)
+                self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
+                self.redis_client.expire(lock_key, 7200)
+                redis_ok = True
+            except Exception as e:
+                logger.error(f"Failed to clear retained reason in Redis: {e}")
+
+        yaml_ok = self._save_lock_to_yaml(lock)
+
+        if not redis_ok and not yaml_ok:
+            logger.error(
+                f"clear_retained_reason: BOTH Redis and YAML writes failed for "
+                f"{project}/{board} issue #{issue_number} — the lock may still "
+                f"read as retained elsewhere"
+            )
+            return False
+
+        logger.info(
+            f"Pipeline lock for {project}/{board} issue #{issue_number} — "
+            f"retained_reason cleared for self-heal retry (lock still held by "
+            f"this issue)"
+        )
+        return True
+
     def get_retained_reason(self, project: str, board: str, issue_number: int) -> Optional[str]:
         """
         Return the retained_reason if issue_number currently holds a failed/retained
