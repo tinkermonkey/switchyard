@@ -533,22 +533,23 @@ class DockerAgentRunner:
 
         # Concurrency gate for docker-socket-bearing agents (see switchyard #51):
         # independent of, and in addition to, general pipeline-dispatch
-        # concurrency. Only the (cheap, non-blocking) singleton lookup happens
-        # here; the actual (potentially long-blocking, up to
-        # DockerSocketAccessGate's max_wait_seconds) acquire() call happens
-        # INSIDE the try block below, not out here -- so if it raises (e.g.
-        # TimeoutError) or the awaiting task is cancelled, the finally block's
+        # concurrency. Both the requires-check and the actual (potentially
+        # long-blocking, up to DockerSocketAccessGate's max_wait_seconds)
+        # acquire() call happen INSIDE the try block below, not out here -- so
+        # if either raises (found in #51 review, pass 2: _requires_docker_
+        # socket_access() only catches ConfigurationError, so a different
+        # exception from re-reading the project config here could still leak
+        # the MCP config temp file the same way an un-caught acquire() failure
+        # could) or the awaiting task is cancelled, the finally block's
         # MCP-config-file cleanup still runs instead of leaking that temp file
-        # (found in #51 review: it was written to disk a few lines above,
-        # before this gate existed).
+        # (it was written to disk a few lines above, before this gate existed).
         docker_socket_gate = None
         docker_socket_holder_id = None
-        if self._requires_docker_socket_access(agent, project):
-            from services.docker_socket_access_gate import get_docker_socket_access_gate
-            docker_socket_gate = get_docker_socket_access_gate()
 
         try:
-            if docker_socket_gate is not None:
+            if self._requires_docker_socket_access(agent, project):
+                from services.docker_socket_access_gate import get_docker_socket_access_gate
+                docker_socket_gate = get_docker_socket_access_gate()
                 docker_socket_holder_id = await docker_socket_gate.acquire(project, task_id)
 
             # Start the container and execute Claude Code
@@ -584,7 +585,7 @@ class DockerAgentRunner:
             # acquire() itself can now raise/timeout without ever returning a
             # holder id -- nothing to release in that case.
             if docker_socket_gate is not None and docker_socket_holder_id is not None:
-                docker_socket_gate.release(project, docker_socket_holder_id)
+                await docker_socket_gate.release(project, docker_socket_holder_id)
 
     def _prepare_mcp_config(self, mcp_servers: list, project_dir: Path) -> Dict:
         """Prepare MCP configuration for the container"""

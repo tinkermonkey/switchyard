@@ -68,7 +68,7 @@ class TestAcquireReleaseNoContention:
     @pytest.mark.asyncio
     async def test_release_frees_the_slot(self, gate, semaphore_manager):
         holder_id = await gate.acquire("phone-home", "task-1")
-        released = gate.release("phone-home", holder_id)
+        released = await gate.release("phone-home", holder_id)
 
         assert released is True
         assert semaphore_manager.get_holders("phone-home", "_docker_socket_access") == []
@@ -76,7 +76,7 @@ class TestAcquireReleaseNoContention:
     @pytest.mark.asyncio
     async def test_release_then_reacquire_by_a_different_task(self, gate):
         holder_id_1 = await gate.acquire("phone-home", "task-1")
-        gate.release("phone-home", holder_id_1)
+        await gate.release("phone-home", holder_id_1)
 
         # A second, unrelated launch must be able to acquire the now-free slot
         # without blocking.
@@ -90,7 +90,7 @@ class TestAcquireReleaseNoContention:
         idempotence, matters for the docker_runner finally-block wiring
         where release always runs regardless of whether acquire actually
         got called on some code path."""
-        assert gate.release("phone-home", 999999) is True
+        assert await gate.release("phone-home", 999999) is True
 
 
 class TestConcurrentAcquireBlocks:
@@ -108,7 +108,7 @@ class TestConcurrentAcquireBlocks:
             "holder still holds the slot"
         )
 
-        gate.release("phone-home", holder_id_1)
+        await gate.release("phone-home", holder_id_1)
 
         holder_id_2 = await asyncio.wait_for(second_acquire_task, timeout=1.0)
         assert holder_id_2 != holder_id_1
@@ -139,3 +139,47 @@ class TestConcurrentAcquireBlocks:
 
         with pytest.raises(TimeoutError):
             await gate.acquire("phone-home", "task-2")
+
+
+class TestCancellationDuringAcquireCleansUpOrphanedHolder:
+    """(#51 review, pass 2) loop.run_in_executor()'s underlying thread cannot
+    actually be interrupted once it has started running -- cancelling the
+    awaiting task only stops the caller from observing the result, the
+    background try_acquire() call keeps going regardless. If it goes on to
+    succeed after cancellation, nothing else would ever release that slot
+    without the done-callback fix in acquire()'s except-CancelledError branch."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_acquire_releases_orphaned_slot_once_background_call_completes(
+        self, gate, semaphore_manager
+    ):
+        import threading
+        import time
+
+        real_try_acquire = semaphore_manager.try_acquire
+        started = threading.Event()
+
+        def slow_try_acquire(*args, **kwargs):
+            started.set()
+            time.sleep(0.1)  # simulate a slow Redis/YAML round trip
+            return real_try_acquire(*args, **kwargs)
+
+        semaphore_manager.try_acquire = slow_try_acquire
+
+        task = asyncio.create_task(gate.acquire("phone-home", "task-1"))
+        # Wait until the background thread has actually started (so cancellation
+        # below lands mid-flight, not before the thread call even begins).
+        await asyncio.get_event_loop().run_in_executor(None, started.wait, 1.0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The background try_acquire() call is still finishing despite the
+        # cancellation -- give its done-callback a moment to run.
+        await asyncio.sleep(0.3)
+
+        # The orphaned holder must have been auto-released -- a fresh acquire for
+        # the same project must succeed immediately (capacity=1), not block.
+        holder_id = await asyncio.wait_for(gate.acquire("phone-home", "task-2"), timeout=1.0)
+        assert isinstance(holder_id, int)

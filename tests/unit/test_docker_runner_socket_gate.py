@@ -83,7 +83,7 @@ class TestGateWiringForDockerSocketAgents:
 
         fake_gate = MagicMock()
         fake_gate.acquire = AsyncMock(return_value=12345)
-        fake_gate.release = MagicMock(return_value=True)
+        fake_gate.release = AsyncMock(return_value=True)
 
         with patch("claude.docker_runner.get_breaker", return_value=None), \
              patch.object(runner, "_build_docker_command", return_value=(["docker", "run"], "some-image")), \
@@ -115,7 +115,7 @@ class TestGateWiringForDockerSocketAgents:
 
         fake_gate = MagicMock()
         fake_gate.acquire = AsyncMock(return_value=99999)
-        fake_gate.release = MagicMock(return_value=True)
+        fake_gate.release = AsyncMock(return_value=True)
 
         with patch("claude.docker_runner.get_breaker", return_value=None), \
              patch.object(runner, "_build_docker_command", return_value=(["docker", "run"], "some-image")), \
@@ -153,7 +153,7 @@ class TestGateWiringForDockerSocketAgents:
 
         fake_gate = MagicMock()
         fake_gate.acquire = AsyncMock(side_effect=TimeoutError("gate timed out"))
-        fake_gate.release = MagicMock(return_value=True)
+        fake_gate.release = AsyncMock(return_value=True)
 
         with patch("claude.docker_runner.get_breaker", return_value=None), \
              patch.object(runner, "_build_docker_command", return_value=(["docker", "run"], "some-image")), \
@@ -190,7 +190,7 @@ class TestGateWiringForDockerSocketAgents:
 
         fake_gate = MagicMock()
         fake_gate.acquire = AsyncMock(return_value=1)
-        fake_gate.release = MagicMock(return_value=True)
+        fake_gate.release = AsyncMock(return_value=True)
 
         with patch("claude.docker_runner.get_breaker", return_value=None), \
              patch.object(runner, "_build_docker_command", return_value=(["docker", "run"], "some-image")), \
