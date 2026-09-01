@@ -8,6 +8,12 @@ ReviewCycleState.epic_id for #48 to consume later. Per #46's gating decision
 get_project_dir() call sites consumes epic_id yet -- these tests only cover
 the resolution/storage/persistence of the value itself, not any directory
 resolution behavior change.
+
+NOTE: this method is deliberately not called from any ReviewCycleState
+construction path today (pass-1 review of #47 found that calling it eagerly
+put a real blocking network call ahead of the active_cycles dict write,
+widening a concurrent-dispatch race for a value nothing consumes yet) -- these
+tests exercise the method directly, not via start_review_cycle/resume_review_cycle.
 """
 
 import pytest
@@ -76,7 +82,7 @@ class TestResolveEpicIdForCycle:
         state = make_state(issue_number=101)
 
         mock_github_integration = Mock()
-        with patch.object(executor, '_get_github_for_project', return_value=mock_github_integration), \
+        with patch.object(executor, '_get_github_integration', return_value=mock_github_integration), \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',
                    new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = '42'
@@ -95,7 +101,7 @@ class TestResolveEpicIdForCycle:
         This must never break a review cycle that worked before #47."""
         state = make_state(issue_number=101)
 
-        with patch.object(executor, '_get_github_for_project', return_value=Mock()), \
+        with patch.object(executor, '_get_github_integration', return_value=Mock()), \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',
                    new_callable=AsyncMock) as mock_resolve:
             mock_resolve.side_effect = RuntimeError("simulated GitHub API failure")
@@ -106,11 +112,11 @@ class TestResolveEpicIdForCycle:
 
     @pytest.mark.asyncio
     async def test_missing_repo_owner_falls_back_to_none(self, executor):
-        """_get_github_for_project() raises ValueError when the project's repo
+        """_get_github_integration() raises ValueError when the project's repo
         owner can't be determined -- also swallowed, not propagated."""
         state = make_state(issue_number=101)
 
-        with patch.object(executor, '_get_github_for_project',
+        with patch.object(executor, '_get_github_integration',
                            side_effect=ValueError("Cannot determine repo owner")):
             await executor._resolve_epic_id_for_cycle(state)  # must not raise
 
@@ -139,7 +145,7 @@ class TestResolveEpicIdForCycle:
         FeatureBranchManager.resolve_epic_id()'s self-fallback semantics."""
         state = make_state(issue_number=200)
 
-        with patch.object(executor, '_get_github_for_project', return_value=Mock()), \
+        with patch.object(executor, '_get_github_integration', return_value=Mock()), \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',
                    new_callable=AsyncMock) as mock_resolve:
             mock_resolve.return_value = '200'

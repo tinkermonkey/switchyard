@@ -195,27 +195,31 @@ class ReviewCycleExecutor:
         Best-effort resolution of cycle_state.epic_id -- the parent epic issue number
         that will eventually scope this sub-issue's isolated git worktree (#47/#48).
 
+        NOT CURRENTLY CALLED from any ReviewCycleState construction path (pass-1
+        review of #47 found that calling this eagerly at cycle start/resume put a
+        genuinely blocking network call -- up to ~30s under GitHub rate-limit
+        backoff, since the underlying get_parent_issue() -> github_client.graphql()
+        chain is synchronous I/O with no thread offload -- ahead of the
+        active_cycles[key] dict write those paths depend on, widening a real
+        concurrent-dispatch race for a value nothing downstream consumes yet).
+        Kept as tested, ready plumbing: #48 should call this from whichever
+        construction path(s) it actually needs epic_id for, once there's a real
+        consumer, rather than unconditionally on every cycle start/resume.
+
         Idempotent: a no-op if epic_id is already set (e.g. restored via from_dict
-        from a prior save, or already resolved earlier in the same construction
-        path). Uses FeatureBranchManager.resolve_epic_id() (added in #46; a 1h-TTL
-        cached parent-issue lookup that resolves to the issue's own number when it
-        has no parent), so calling this from multiple ReviewCycleState construction
-        sites in the same cycle costs at most one real GitHub API call.
+        from a prior save). Uses FeatureBranchManager.resolve_epic_id() (added in
+        #46; a 1h-TTL cached parent-issue lookup that resolves to the issue's own
+        number when it has no parent).
 
         Deliberately best-effort: any resolution failure is logged as a warning and
         swallowed, leaving epic_id=None, and MUST NEVER raise or otherwise disrupt
-        the review cycle. Nothing downstream currently depends on epic_id being set
-        -- per #46's gating decision, get_project_dir() call sites in this file
-        still resolve to the shared base clone unconditionally (see comments at
-        each site), so epic_id here is read-only/observability plumbing for #48.
+        the review cycle.
         """
         if cycle_state.epic_id:
             return
         try:
             from services.feature_branch_manager import feature_branch_manager
-            github_integration = self._get_github_for_project(
-                cycle_state.project_name, cycle_state.repository
-            )
+            github_integration = self._get_github_integration(cycle_state)
             cycle_state.epic_id = await feature_branch_manager.resolve_epic_id(
                 github_integration, cycle_state.issue_number, project=cycle_state.project_name
             )
@@ -1155,12 +1159,6 @@ class ReviewCycleExecutor:
                 pipeline_run_id=pipeline_run_id
             )
 
-        # Resolve the parent epic (best-effort, never raises) once for this new cycle.
-        # Shared convergence point for all three ReviewCycleState(...) constructions
-        # above (existing-column-changed reuse, brand-new cycle, and stale-state
-        # discard-and-recreate) -- costs at most one cached GitHub lookup either way.
-        await self._resolve_epic_id_for_cycle(cycle_state)
-
         # Set up file-based context directory for this new cycle
         try:
             writer = PipelineContextWriter.setup(issue_number, pipeline_run_id or '')
@@ -1964,7 +1962,6 @@ class ReviewCycleExecutor:
                         discussion_id=discussion_id
                     )
                     cycle_state.current_iteration = iteration
-                    await self._resolve_epic_id_for_cycle(cycle_state)
 
                     # Reconstruct outputs from timeline
                     maker_signature = f"_Processed by the {maker_agent} agent_"
@@ -2036,7 +2033,6 @@ class ReviewCycleExecutor:
                     discussion_id=discussion_id
                 )
                 cycle_state.current_iteration = iteration
-                await self._resolve_epic_id_for_cycle(cycle_state)
 
                 # Get fresh discussion context
                 fresh_context = await self._get_fresh_discussion_context(cycle_state, org, iteration)
@@ -2152,7 +2148,6 @@ class ReviewCycleExecutor:
                 cycle_state.current_iteration = iteration
                 cycle_state.status = 'awaiting_human_feedback'
                 cycle_state.escalation_time = last_escalation['created_at'].isoformat()
-                await self._resolve_epic_id_for_cycle(cycle_state)
 
                 # Reconstruct outputs from discussion timeline
                 maker_signature = f"_Processed by the {maker_agent} agent_"
