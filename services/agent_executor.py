@@ -244,8 +244,13 @@ class AgentExecutor:
                     epic_id = await feature_branch_manager.resolve_epic_id(
                         gh_integration_for_epic, task_context['issue_number'], project=project_name
                     )
-                    epic_branch_name = feature_branch_manager.resolve_epic_branch_name(project_name, epic_id) \
-                        or feature_branch_manager.create_feature_branch_name(int(epic_id), "")
+                    # resolve_epic_branch_name is sync (a plain read-only git query on a
+                    # cache miss) -- run it off the event loop thread so it can't stall
+                    # other coroutines scheduled on this loop.
+                    resolved_branch = await asyncio.to_thread(
+                        feature_branch_manager.resolve_epic_branch_name, project_name, epic_id
+                    )
+                    epic_branch_name = resolved_branch or feature_branch_manager.create_feature_branch_name(int(epic_id), "")
                     task_context['epic_id'] = epic_id
             except Exception as epic_resolve_err:
                 logger.warning(
@@ -1531,9 +1536,21 @@ class AgentExecutor:
         """
         import subprocess
         import glob
+        from services.project_workspace import workspace_manager
 
         try:
-            project_dir = f"/workspace/{project_name}"
+            # Resolve the SAME directory the agent actually ran in (issue #46):
+            # if this task resolved an epic worktree, task_context carries epic_id/
+            # branch_name and get_project_dir() idempotently returns the existing
+            # worktree (no git calls on a cache hit) rather than the shared base
+            # clone. Checking the base clone here while the agent actually wrote to
+            # an isolated worktree would find nothing dirty and silently skip real
+            # uncommitted work.
+            project_dir = str(workspace_manager.get_project_dir(
+                project_name,
+                epic_id=task_context.get('epic_id'),
+                branch_name=task_context.get('branch_name'),
+            ))
             issue_number = task_context.get('issue_number')
 
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")

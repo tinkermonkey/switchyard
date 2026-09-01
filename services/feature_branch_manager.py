@@ -276,9 +276,12 @@ class FeatureBranchManager:
         self._branch_cache: Dict[tuple, str] = {}
 
         # In-memory cache for parent issue lookups with TTL
-        # Cache structure: {issue_number: (parent_number, cached_at_timestamp)}
-        # Reduces GitHub API usage by caching stable parent relationships
-        self._parent_cache: Dict[int, Tuple[Optional[int], float]] = {}
+        # Cache structure: {(repo_owner, repo_name, issue_number): (parent_number, cached_at_timestamp)}
+        # Keyed by repo identity, not just issue_number: this is a shared module-level
+        # singleton across every monitored project, and issue numbers are only unique
+        # within a single repo -- a bare issue_number key would let two different
+        # projects' issue #N collide and return each other's cached parent.
+        self._parent_cache: Dict[Tuple[str, str, int], Tuple[Optional[int], float]] = {}
         self._parent_cache_ttl = 3600  # 1 hour in seconds
         self._parent_cache_max_size = 1000  # Prevent unbounded growth
 
@@ -947,9 +950,12 @@ class FeatureBranchManager:
 
         Returns parent issue number if found, None otherwise
         """
-        # Check cache with TTL before making API call
-        if issue_number in self._parent_cache:
-            parent_num, cached_at = self._parent_cache[issue_number]
+        # Check cache with TTL before making API call. Keyed by (repo_owner, repo_name,
+        # issue_number) -- this manager is a shared singleton across every monitored
+        # project, so a bare issue_number key would collide across repos.
+        cache_key = (github_integration.repo_owner, github_integration.repo_name, issue_number)
+        if cache_key in self._parent_cache:
+            parent_num, cached_at = self._parent_cache[cache_key]
             age = time.time() - cached_at
 
             if age < self._parent_cache_ttl:
@@ -963,7 +969,7 @@ class FeatureBranchManager:
                     f"Cache expired for issue #{issue_number} parent "
                     f"(age: {age:.0f}s > TTL: {self._parent_cache_ttl}s)"
                 )
-                del self._parent_cache[issue_number]  # Clean up expired entry
+                del self._parent_cache[cache_key]  # Clean up expired entry
 
         # Validate repository information before making API calls
         if not github_integration.github_org or not github_integration.repo_name:
@@ -1019,7 +1025,7 @@ class FeatureBranchManager:
                 )
 
                 # Cache the result with current timestamp
-                self._parent_cache[issue_number] = (parent_num, time.time())
+                self._parent_cache[cache_key] = (parent_num, time.time())
 
                 # Enforce max cache size with simple FIFO eviction
                 if len(self._parent_cache) > self._parent_cache_max_size:
@@ -1037,7 +1043,7 @@ class FeatureBranchManager:
 
             # No parent found - cache this result too (None with timestamp)
             logger.debug(f"Issue #{issue_number} has no parent (structured API returned null)")
-            self._parent_cache[issue_number] = (None, time.time())
+            self._parent_cache[cache_key] = (None, time.time())
             return None
 
         except Exception as e:

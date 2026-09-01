@@ -6565,6 +6565,37 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"shared base clone -- aborting repair cycle launch.",
                         exc_info=True
                     )
+                    # This runs AFTER steal_lock() already succeeded and a pipeline run
+                    # was created above -- without explicitly ending that run, the lock
+                    # stays claimed and the run stays active forever (this board's only
+                    # other recovery paths -- _reconcile_active_runs at startup, and the
+                    # periodic FAILSAFE sweep -- both explicitly skip locked boards).
+                    # Mirrors the existing container-launch-failure cleanup below.
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            reason=f"Failed to resolve epic worktree target: {e}",
+                            outcome='failed'
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(
+                            f"Failed to end pipeline run after epic resolution failure: {cleanup_e}"
+                        )
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=status,
+                            agent=stage_config.default_agent,
+                            outcome='failure',
+                            project_name=project_name,
+                            error=f"Failed to resolve epic worktree target: {e}"
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(
+                            f"Failed to record execution failure after epic resolution failure: {cleanup_e}"
+                        )
                     return None
 
             project_dir = workspace_manager.get_project_dir(
