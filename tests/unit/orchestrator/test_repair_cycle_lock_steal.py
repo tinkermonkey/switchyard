@@ -391,11 +391,15 @@ class TestEpicWorktreeResolution:
         launch_mock.assert_called_once()
 
         mocks = stage_config._epic_mocks
-        # Called at least once by this call site's own epic resolution (it's
-        # also called a second time internally by the later, unrelated
-        # prepare_feature_branch call that resolves the sub-issue's own
-        # operational branch -- both resolve against the same sub-issue
-        # number, which is the only thing asserted on below).
+        # Called exactly once, by this call site's own epic resolution. A final
+        # whole-PR review pass on #87 found and fixed a real bug where this used
+        # to ALSO be called a second time internally by prepare_feature_branch()
+        # (invoked later, "for issues workspace" branch prep) -- which resolved
+        # the SAME branch independently and tried to check it out on the shared
+        # base clone, conflicting with the epic worktree already checked out to
+        # it (git refuses -- "already used by worktree"). See
+        # TestSkipsRedundantPrepareFeatureBranchWhenEpicResolved below for the
+        # direct regression test.
         mocks['get_parent_issue'].assert_awaited()
         for call in mocks['get_parent_issue'].await_args_list:
             assert call.args[1] == 100
@@ -431,3 +435,42 @@ class TestEpicWorktreeResolution:
         assert result is None
         launch_mock.assert_not_called()
         stage_config._epic_mocks['get_project_dir'].assert_not_called()
+
+
+class TestSkipsRedundantPrepareFeatureBranchWhenEpicResolved:
+    """Final whole-PR review pass on #87: once the epic worktree is resolved
+    and checked out (the common case for a repair-cycle sub-issue), the
+    "Prepare workspace branch for issues workspace" block must NOT also call
+    FeatureBranchManager.prepare_feature_branch() -- that call independently
+    resolves the same branch and checks it out on the shared BASE CLONE,
+    which git refuses once the epic worktree already has it checked out.
+    Previously silently caught by a broad except (no crash), but that also
+    silently discarded every one of prepare_feature_branch()'s other side
+    effects (sub-issue tracking, stale-branch escalation) for every
+    repair-cycle-dispatched sub-issue."""
+
+    def test_prepare_feature_branch_not_called_when_epic_resolves(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+
+        with patch(
+            'services.feature_branch_manager.feature_branch_manager.prepare_feature_branch',
+            new_callable=AsyncMock,
+        ) as mock_prepare_feature_branch:
+            result, launch_mock, stage_config = _run_start_repair_cycle(
+                mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+                mock_state_manager, mock_task_queue,
+                issue_number=100,
+                parent_issue_number=42,
+            )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+        # The redundant, conflicting base-clone checkout must never be attempted
+        # -- this is the actual regression this test exists to catch.
+        mock_prepare_feature_branch.assert_not_awaited()

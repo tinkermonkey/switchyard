@@ -6659,7 +6659,35 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             # Prepare workspace branch for issues workspace (git checkout feature branch)
             branch_name = None
-            if workspace_type == 'issues':
+            if workspace_type == 'issues' and epic_id is not None:
+                # The epic worktree resolved above already exists, checked out to
+                # epic_branch_name (worktree creation performs the checkout
+                # atomically) -- running prepare_feature_branch()'s own independent
+                # branch resolution + checkout here would target that SAME branch on
+                # the shared BASE CLONE, which git refuses once the epic worktree
+                # already has it checked out ("already used by worktree at ...").
+                # Found in a final whole-PR review pass on #87: previously this was
+                # silently caught by the except block below (no crash), but that
+                # also silently discarded ALL of prepare_feature_branch()'s other
+                # side effects for repair-cycle-dispatched sub-issues (feature-branch
+                # state/sub-issue tracking, stale-branch escalation comments) -- not
+                # just the checkout. epic_branch_name is already the correct answer,
+                # so use it directly instead.
+                branch_name = epic_branch_name
+                stage_context['branch_name'] = branch_name
+                logger.info(
+                    f"Repair cycle for issue #{issue_number}: epic worktree already "
+                    f"on branch {branch_name!r} -- skipping prepare_feature_branch()'s "
+                    "redundant (and conflicting) base-clone checkout"
+                )
+            elif workspace_type == 'issues':
+                # Defensive fallback, not currently reachable: the epic-resolution
+                # block above already returns None (aborting the whole repair cycle
+                # launch) on ANY failure, so epic_id is guaranteed non-None here for
+                # 'issues' workspace type today. Kept in case that early-return
+                # behavior is ever relaxed upstream -- preserves the pre-#46
+                # behavior of resolving and checking out a branch on the shared base
+                # clone directly when there's no worktree/branch already established.
                 try:
                     issue_title = issue_data.get('title', '')
 

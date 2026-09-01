@@ -554,8 +554,22 @@ class ProjectWorkspaceManager:
                 f"branch {branch_name}: {fetch_default.stderr.strip()}"
             )
 
+        # -B (create-or-RESET), not -b: found in a final whole-PR review pass on #87
+        # that -b left a real, reproducible bug -- a partial failure (e.g. a bad
+        # target path, or a 30s timeout after git had already created the local
+        # branch ref but before `worktree add` finished) can leave a stray local
+        # branch ref with nothing on origin. Neither this call's own retry below
+        # (which only helps the genuine "another process just pushed it" race, since
+        # its re-fetch has nothing to find for a purely-local stray ref) nor any
+        # later call ever cleans that ref up, so every subsequent attempt for this
+        # epic hits "fatal: a branch named '<branch>' already exists" forever,
+        # surviving restarts. -B is safe here specifically because worktree add
+        # already refuses outright if branch_name is checked out in ANY other
+        # worktree (regardless of -b/-B) -- so -B's reset semantics only ever
+        # trigger on a stray/stale local ref exactly like the one this bug leaves
+        # behind, self-healing it instead of requiring detection/cleanup logic.
         result = subprocess.run(
-            ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-b', branch_name,
+            ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
              str(worktree_path), f'origin/{default_branch}'],
             capture_output=True, text=True, timeout=30
         )
@@ -746,12 +760,23 @@ class ProjectWorkspaceManager:
         different modules with different owning lifecycles (ProjectWorkspaceManager vs.
         DockerAgentRunner).
 
-        Since self._epic_worktrees starts empty on every fresh process, any worktree
-        found on disk at startup is — from this process's perspective — untracked; it is
-        safe to remove unconditionally because it will be transparently recreated (fetch
-        + worktree add, cheap) the next time get_project_dir()/get_or_create_epic_worktree()
-        is called for that epic, exactly like a reference worktree is recreated per
-        container run.
+        On a fresh process self._epic_worktrees normally starts empty, so historically
+        any worktree found on disk at startup was safe to remove unconditionally --
+        this call runs before anything else could populate the cache. That's no longer
+        universally true (found in a final whole-PR review pass on #87): main.py calls
+        DockerAgentRunner/AgentContainerRecovery's repair-cycle container recovery
+        BEFORE this prune sweep, and recovering an already-COMPLETED repair cycle calls
+        commit_agent_changes(epic_id=..., branch_name=...) -> get_project_dir() ->
+        get_or_create_epic_worktree(), which can ADOPT an on-disk worktree into
+        self._epic_worktrees (see #48's restart-adoption fix) before this method ever
+        runs. Deleting that just-adopted worktree here would leave the cache pointing
+        at a now-missing directory -- every subsequent operation on that epic would
+        fail until the next restart, silently defeating #48's own fix. So: skip any
+        worktree currently tracked in self._epic_worktrees (actively in use / just
+        adopted this process); only remove genuinely untracked ones. An untracked
+        worktree is still safe to remove unconditionally -- it will be transparently
+        recreated (fetch + worktree add, cheap) the next time get_project_dir()/
+        get_or_create_epic_worktree() is called for that epic.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
@@ -764,6 +789,9 @@ class ProjectWorkspaceManager:
                 logger.warning(f"Failed to list epic worktree staging root {staging_root}: {e}")
                 return
 
+            with self._epic_worktree_lock:
+                tracked_paths = set(self._epic_worktrees.values())
+
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
                     continue
@@ -775,6 +803,12 @@ class ProjectWorkspaceManager:
                     continue
                 for worktree_path in worktree_paths:
                     if not worktree_path.is_dir():
+                        continue
+                    if str(worktree_path) in tracked_paths:
+                        logger.debug(
+                            f"Skipping prune of {worktree_path} -- currently tracked in "
+                            "_epic_worktrees (adopted or created earlier this process)"
+                        )
                         continue
                     self._push_local_commits_if_any(worktree_path)
                     try:

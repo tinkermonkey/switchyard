@@ -102,7 +102,7 @@ class TestCreateNewEpicWorktree:
         assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
                              'main', '--quiet']
         assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
-                             '-b', 'feature/issue-100-epic', str(expected_path),
+                             '-B', 'feature/issue-100-epic', str(expected_path),
                              'origin/main']
         assert calls[3] == ['git', '-C', str(expected_path), 'push', '-u', 'origin',
                              'feature/issue-100-epic']
@@ -365,6 +365,52 @@ class TestEpicWorktreeConcurrencySafety:
 
 class TestPruneEpicWorktrees:
     """Startup sweep catches worktrees orphaned by a crashed orchestrator process."""
+
+    def test_prune_skips_a_worktree_already_tracked_this_process(self, manager, tmp_path):
+        """(Final whole-PR review, #87) main.py runs repair-cycle container
+        recovery BEFORE this prune sweep; recovering an already-completed repair
+        cycle can ADOPT an on-disk worktree into _epic_worktrees (#48) before this
+        method ever runs. Deleting that just-adopted worktree here would leave the
+        cache pointing at a now-missing directory -- prune must skip anything
+        already tracked, not just blindly sweep every directory on disk."""
+        _make_base_clone(tmp_path, "my-project")
+        tracked = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '950'
+        tracked.mkdir(parents=True)
+        (tracked / "some_committed_file.txt").write_text("real work")
+
+        # Simulate: this epic's worktree was already adopted earlier this process
+        # (e.g. by repair-cycle recovery calling get_or_create_epic_worktree()).
+        manager._epic_worktrees[("my-project", "950")] = str(tracked)
+        manager._epic_worktree_branches[("my-project", "950")] = "feature/issue-950"
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        # Untouched -- still tracked, still on disk, still has its real content.
+        assert tracked.exists()
+        assert (tracked / "some_committed_file.txt").exists()
+        assert manager._epic_worktrees[("my-project", "950")] == str(tracked)
+
+    def test_prune_still_removes_a_genuinely_untracked_worktree_alongside_a_tracked_one(
+        self, manager, tmp_path
+    ):
+        """A tracked worktree being skipped must not accidentally protect its
+        untracked siblings -- each is evaluated independently."""
+        _make_base_clone(tmp_path, "my-project")
+        tracked = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '951'
+        tracked.mkdir(parents=True)
+        untracked = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '952'
+        untracked.mkdir(parents=True)
+
+        manager._epic_worktrees[("my-project", "951")] = str(tracked)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert tracked.exists()
+        assert not untracked.exists()
 
     def test_prune_removes_orphaned_worktree_dir(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")
