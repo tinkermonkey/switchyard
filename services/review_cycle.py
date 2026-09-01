@@ -206,6 +206,14 @@ class ReviewCycleExecutor:
         construction path(s) it actually needs epic_id for, once there's a real
         consumer, rather than unconditionally on every cycle start/resume.
 
+        IMPORTANT for whoever wires this in: services/agent_executor.py's
+        equivalent resolve_epic_id() call is guarded by an explicit
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist (currently just
+        'discussions') for exactly the reason above -- 'issues'/'hybrid' cycles
+        must NOT get this called on their hot construction path without either
+        the same gate or a non-blocking (e.g. asyncio.to_thread-offloaded, or
+        deferred-until-after-the-dict-write) resolution strategy.
+
         Idempotent: a no-op if epic_id is already set (e.g. restored via from_dict
         from a prior save). Uses FeatureBranchManager.resolve_epic_id() (added in
         #46; a 1h-TTL cached parent-issue lookup that resolves to the issue's own
