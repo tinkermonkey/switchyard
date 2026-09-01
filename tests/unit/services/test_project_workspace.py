@@ -212,16 +212,17 @@ class TestCleanupEpicWorktree:
         assert ("my-project", "800") in manager._epic_worktrees
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
+            # First call is the push-local-commits-before-remove check (rev-parse
+            # --abbrev-ref HEAD); _ok() with empty stdout -> blank branch name -> that
+            # helper returns immediately, so the very next call is the real removal.
             mock_run.return_value = _ok()
             removed = manager.cleanup_epic_worktree("my-project", "800")
 
         assert removed is True
         assert ("my-project", "800") not in manager._epic_worktrees
-        mock_run.assert_called_once_with(
-            ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'remove',
-             '--force', str(worktree_path)],
-            capture_output=True, text=True, timeout=15
-        )
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'remove',
+                '--force', str(worktree_path)] in calls
 
     def test_cleanup_falls_back_to_rmtree_on_git_failure(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")
@@ -235,7 +236,10 @@ class TestCleanupEpicWorktree:
         (worktree_path / "somefile.txt").write_text("data")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_fail("worktree is dirty"), _ok()]  # remove fails, prune ok
+            # First call is the push-local-commits-before-remove check (rev-parse
+            # --abbrev-ref HEAD); failing it short-circuits that helper with no further
+            # calls, so the next two are the original remove-fails/prune-ok sequence.
+            mock_run.side_effect = [_fail("not a git repo"), _fail("worktree is dirty"), _ok()]
             removed = manager.cleanup_epic_worktree("my-project", "810")
 
         assert removed is True
@@ -246,6 +250,51 @@ class TestCleanupEpicWorktree:
             removed = manager.cleanup_epic_worktree("my-project", "999")
             mock_run.assert_not_called()
         assert removed is False
+
+    def test_cleanup_returns_false_and_keeps_tracking_when_removal_genuinely_fails(self, manager, tmp_path):
+        """If both git-remove and the rmtree fallback fail to actually clear the
+        directory, cleanup must report False and keep the epic tracked — not silently
+        report success while orphaning a dict entry to a worktree that's still there."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            worktree_path = manager.get_project_dir(
+                "my-project", epic_id="820", branch_name="feature/issue-820"
+            )
+        worktree_path.mkdir(parents=True, exist_ok=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_fail("not a git repo"), _fail("worktree busy"), _fail("prune failed")]
+            with patch('shutil.rmtree'):  # simulate rmtree fallback not actually removing it
+                removed = manager.cleanup_epic_worktree("my-project", "820")
+
+        assert removed is False
+        assert ("my-project", "820") in manager._epic_worktrees
+
+
+class TestEpicWorktreeConcurrencySafety:
+    """get_or_create_epic_worktree()/cleanup_epic_worktree() share a lock so two
+    concurrent calls for the same epic can't race each other."""
+
+    def test_branch_mismatch_on_cache_hit_logs_warning_but_returns_existing(self, manager, tmp_path, caplog):
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok()]
+            first = manager.get_project_dir(
+                "my-project", epic_id="900", branch_name="feature/issue-900"
+            )
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            with caplog.at_level("WARNING"):
+                second = manager.get_project_dir(
+                    "my-project", epic_id="900", branch_name="feature/issue-900-DIFFERENT"
+                )
+            mock_run.assert_not_called()
+
+        assert first == second
+        assert any("branch_name" in r.message for r in caplog.records)
 
 
 class TestPruneEpicWorktrees:
@@ -299,3 +348,16 @@ class TestPruneEpicWorktrees:
             manager.prune_epic_worktrees()
 
         assert ref_worktree.exists()
+
+    def test_prune_never_raises_on_unexpected_filesystem_error(self, manager, tmp_path):
+        """prune_epic_worktrees() runs unguarded at every orchestrator startup (main.py
+        has no try/except around the call site) — an unexpected filesystem error must be
+        swallowed and logged, never propagated, or it would take down startup entirely."""
+        _make_base_clone(tmp_path, "my-project")
+        staging = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '950'
+        staging.mkdir(parents=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            with patch.object(Path, 'iterdir', side_effect=OSError("permission denied")):
+                manager.prune_epic_worktrees()  # must not raise

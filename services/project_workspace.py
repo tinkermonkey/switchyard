@@ -1,5 +1,6 @@
 import subprocess
 import logging
+import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from config.manager import config_manager
@@ -39,6 +40,13 @@ class ProjectWorkspaceManager:
         # DockerAgentRunner._active_worktrees, but keyed by epic rather than by
         # container, since lifetime spans many container launches.
         self._epic_worktrees: Dict[Tuple[str, str], str] = {}
+        # Branch each tracked epic worktree was actually checked out to (for the
+        # cache-hit mismatch check in get_or_create_epic_worktree).
+        self._epic_worktree_branches: Dict[Tuple[str, str], str] = {}
+        # Guards check-then-create/cleanup on _epic_worktrees so two concurrent
+        # calls for the same (project, epic_id) can't both attempt to create (or
+        # one create/one cleanup can't race) the same worktree.
+        self._epic_worktree_lock = threading.Lock()
 
     def initialize_all_projects(self) -> Dict[str, bool]:
         """
@@ -314,32 +322,42 @@ class ProjectWorkspaceManager:
             RuntimeError: The underlying git worktree add command failed.
         """
         key = (project_name, str(epic_id))
-        existing = self._epic_worktrees.get(key)
-        if existing is not None:
-            logger.debug(f"Reusing existing worktree for {project_name} epic #{epic_id}: {existing}")
-            return Path(existing)
+        with self._epic_worktree_lock:
+            existing = self._epic_worktrees.get(key)
+            if existing is not None:
+                tracked_branch = self._epic_worktree_branches.get(key)
+                if branch_name and tracked_branch and branch_name != tracked_branch:
+                    logger.warning(
+                        f"get_or_create_epic_worktree called for {project_name} epic #{epic_id} "
+                        f"with branch_name={branch_name!r}, but its existing worktree is already "
+                        f"on {tracked_branch!r}; worktrees are per-epic (not per-branch), so the "
+                        "existing worktree is returned unchanged."
+                    )
+                logger.debug(f"Reusing existing worktree for {project_name} epic #{epic_id}: {existing}")
+                return Path(existing)
 
-        if not branch_name:
-            raise ValueError(
-                f"No worktree exists yet for {project_name} epic #{epic_id}; "
-                "branch_name is required to create one"
+            if not branch_name:
+                raise ValueError(
+                    f"No worktree exists yet for {project_name} epic #{epic_id}; "
+                    "branch_name is required to create one"
+                )
+
+            base_repo_dir = self.workspace_root / project_name
+            if not (base_repo_dir / '.git').exists():
+                raise ValueError(f"Base clone for project {project_name} not found at {base_repo_dir}")
+
+            worktree_path = self._epic_worktree_path(project_name, epic_id)
+            worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+            self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
+
+            self._epic_worktrees[key] = str(worktree_path)
+            self._epic_worktree_branches[key] = branch_name
+            logger.info(
+                f"Created epic worktree for {project_name} epic #{epic_id} "
+                f"at {worktree_path} (branch={branch_name})"
             )
-
-        base_repo_dir = self.workspace_root / project_name
-        if not (base_repo_dir / '.git').exists():
-            raise ValueError(f"Base clone for project {project_name} not found at {base_repo_dir}")
-
-        worktree_path = self._epic_worktree_path(project_name, epic_id)
-        worktree_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
-
-        self._epic_worktrees[key] = str(worktree_path)
-        logger.info(
-            f"Created epic worktree for {project_name} epic #{epic_id} "
-            f"at {worktree_path} (branch={branch_name})"
-        )
-        return worktree_path
+            return worktree_path
 
     @staticmethod
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
@@ -398,6 +416,59 @@ class ProjectWorkspaceManager:
                     f"Failed to create worktree branch {branch_name}: {result.stderr.strip()}"
                 )
 
+    @staticmethod
+    def _push_local_commits_if_any(worktree_path) -> None:
+        """Best-effort push of any local-only commits before an epic worktree is torn down.
+
+        Mirrors GitWorkflowManager.pull_rebase()'s established pattern (commit 6eea6ef):
+        force-removing a worktree that holds a locally-committed-but-not-yet-pushed fix
+        (e.g. a repair-cycle step that skipped its own push) would otherwise silently and
+        permanently discard that work. Only logs and proceeds on push failure — cleanup
+        must never hang or block on a genuine conflict.
+        """
+        try:
+            branch_result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=10
+            )
+            if branch_result.returncode != 0:
+                return
+            branch = branch_result.stdout.strip()
+            if not branch or branch == 'HEAD':
+                return  # detached HEAD; nothing meaningful to push
+
+            ahead_result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-list', '--count', f'origin/{branch}..HEAD'],
+                capture_output=True, text=True, timeout=10
+            )
+            if ahead_result.returncode != 0:
+                return  # e.g. no such remote branch yet; nothing we can safely reconcile here
+            ahead_count = int(ahead_result.stdout.strip() or '0')
+            if ahead_count == 0:
+                return
+
+            logger.info(
+                f"{ahead_count} local commit(s) not on origin/{branch} in {worktree_path}; "
+                "pushing before removal"
+            )
+            push_result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'push', 'origin', branch],
+                capture_output=True, text=True, timeout=30
+            )
+            if push_result.returncode == 0:
+                logger.info(
+                    f"Pushed {ahead_count} previously-local commit(s) from {worktree_path} "
+                    f"to origin/{branch}"
+                )
+            else:
+                logger.error(
+                    f"Could not push {ahead_count} local commit(s) from {worktree_path} to "
+                    f"origin/{branch} before removal ({push_result.stderr.strip()}). "
+                    "Discarding them — work in these commits is lost."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to check/push local commits in {worktree_path} before removal: {e}")
+
     def cleanup_epic_worktree(self, project_name: str, epic_id: str) -> bool:
         """
         Remove an epic's worktree once the whole epic is complete.
@@ -416,34 +487,52 @@ class ProjectWorkspaceManager:
             epic had no tracked worktree to clean up.
         """
         key = (project_name, str(epic_id))
-        worktree_path = self._epic_worktrees.pop(key, None)
+        with self._epic_worktree_lock:
+            worktree_path = self._epic_worktrees.get(key)
 
-        if worktree_path is None:
-            logger.debug(f"No in-flight worktree tracked for {project_name} epic #{epic_id}; nothing to clean up")
-            return False
+            if worktree_path is None:
+                logger.debug(f"No in-flight worktree tracked for {project_name} epic #{epic_id}; nothing to clean up")
+                return False
 
-        base_repo_dir = self.workspace_root / project_name
-        try:
-            result = subprocess.run(
-                ['git', '-C', str(base_repo_dir), 'worktree', 'remove', '--force', worktree_path],
-                capture_output=True, text=True, timeout=15
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
-                    "removing directory directly"
+            self._push_local_commits_if_any(worktree_path)
+
+            base_repo_dir = self.workspace_root / project_name
+            removed = False
+            try:
+                result = subprocess.run(
+                    ['git', '-C', str(base_repo_dir), 'worktree', 'remove', '--force', worktree_path],
+                    capture_output=True, text=True, timeout=15
                 )
-                import shutil
-                shutil.rmtree(worktree_path, ignore_errors=True)
-                subprocess.run(
-                    ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
-                    capture_output=True, timeout=15
-                )
-            logger.info(f"Cleaned up epic worktree for {project_name} epic #{epic_id} at {worktree_path}")
-        except Exception as e:
-            logger.warning(f"Failed to clean up epic worktree {worktree_path}: {e}")
+                if result.returncode == 0:
+                    removed = True
+                else:
+                    logger.warning(
+                        f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
+                        "removing directory directly"
+                    )
+                    import shutil
+                    shutil.rmtree(worktree_path, ignore_errors=True)
+                    subprocess.run(
+                        ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
+                        capture_output=True, timeout=15
+                    )
+                    removed = not Path(worktree_path).exists()
+            except Exception as e:
+                logger.warning(f"Failed to clean up epic worktree {worktree_path}: {e}")
+                removed = not Path(worktree_path).exists()
 
-        return True
+            if removed:
+                self._epic_worktrees.pop(key, None)
+                self._epic_worktree_branches.pop(key, None)
+                logger.info(f"Cleaned up epic worktree for {project_name} epic #{epic_id} at {worktree_path}")
+            else:
+                logger.error(
+                    f"Failed to remove epic worktree for {project_name} epic #{epic_id} at "
+                    f"{worktree_path}; leaving it tracked rather than silently losing the reference "
+                    "to a worktree that still exists on disk"
+                )
+
+            return removed
 
     def prune_epic_worktrees(self) -> None:
         """Remove all staged epic worktrees and prune git metadata.
@@ -466,39 +555,60 @@ class ProjectWorkspaceManager:
         container run.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
-        if not staging_root.is_dir():
-            return
+        try:
+            if not staging_root.is_dir():
+                return
 
-        for project_staging in staging_root.iterdir():
-            if not project_staging.is_dir():
-                continue
-            repo_path = self.workspace_root / project_staging.name
-            for worktree_path in project_staging.iterdir():
-                if not worktree_path.is_dir():
+            try:
+                project_stagings = list(staging_root.iterdir())
+            except OSError as e:
+                logger.warning(f"Failed to list epic worktree staging root {staging_root}: {e}")
+                return
+
+            for project_staging in project_stagings:
+                if not project_staging.is_dir():
                     continue
+                repo_path = self.workspace_root / project_staging.name
+                try:
+                    worktree_paths = list(project_staging.iterdir())
+                except OSError as e:
+                    logger.warning(f"Failed to list epic worktrees under {project_staging}: {e}")
+                    continue
+                for worktree_path in worktree_paths:
+                    if not worktree_path.is_dir():
+                        continue
+                    self._push_local_commits_if_any(worktree_path)
+                    try:
+                        subprocess.run(
+                            ['git', '-C', str(repo_path), 'worktree', 'remove', '--force', str(worktree_path)],
+                            capture_output=True, timeout=15
+                        )
+                    except Exception:
+                        pass
+                    if worktree_path.is_dir():
+                        import shutil
+                        shutil.rmtree(worktree_path, ignore_errors=True)
+                # Prune any remaining stale metadata entries
                 try:
                     subprocess.run(
-                        ['git', '-C', str(repo_path), 'worktree', 'remove', '--force', str(worktree_path)],
+                        ['git', '-C', str(repo_path), 'worktree', 'prune'],
                         capture_output=True, timeout=15
                     )
                 except Exception:
                     pass
-                if worktree_path.is_dir():
-                    import shutil
-                    shutil.rmtree(worktree_path, ignore_errors=True)
-            # Prune any remaining stale metadata entries
-            try:
-                subprocess.run(
-                    ['git', '-C', str(repo_path), 'worktree', 'prune'],
-                    capture_output=True, timeout=15
-                )
-            except Exception:
-                pass
-            # Remove the now-empty staging directory for this project
-            if project_staging.is_dir() and not any(project_staging.iterdir()):
-                project_staging.rmdir()
+                # Remove the now-empty staging directory for this project
+                try:
+                    if project_staging.is_dir() and not any(project_staging.iterdir()):
+                        project_staging.rmdir()
+                except OSError as e:
+                    logger.warning(f"Failed to remove empty epic worktree staging dir {project_staging}: {e}")
 
-        logger.info(f"Pruned epic worktrees under {staging_root}")
+            logger.info(f"Pruned epic worktrees under {staging_root}")
+        except Exception as e:
+            # This runs on every orchestrator startup, unconditionally (main.py has no
+            # try/except around the call site) — it must never raise, or it would take
+            # down orchestrator startup entirely over a stale-worktree cleanup failure.
+            logger.error(f"prune_epic_worktrees failed unexpectedly: {e}", exc_info=True)
 
     def ensure_branch(self, project_name: str, branch_name: str, create_if_missing: bool = True) -> bool:
         """
