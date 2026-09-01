@@ -509,6 +509,29 @@ class ScheduledTasksService:
                     continue
 
                 age_minutes = (now - created).total_seconds() / 60
+
+                # Leading-indicator audit (log-only -- never blocks or reaps):
+                # flag any testcontainers-labeled container publishing a FIXED
+                # host port instead of letting Docker assign an ephemeral one.
+                # Not proof of an actual collision by itself, just a signal
+                # worth surfacing alongside the port-allocation guidance given
+                # to docker-socket-access agents (see switchyard #51). Runs
+                # for every found container, independent of reap eligibility.
+                fixed_ports = sorted({
+                    f"{container_port}->{binding.get('HostPort')}"
+                    for container_port, bindings in
+                    ((c.get('HostConfig', {}) or {}).get('PortBindings', {}) or {}).items()
+                    for binding in (bindings or [])
+                    if binding.get('HostPort')
+                })
+                if fixed_ports:
+                    logger.warning(
+                        f"Testcontainers reaper: container {name} (age={round(age_minutes, 1)}m) "
+                        f"publishes fixed host port(s) {', '.join(fixed_ports)} instead of ephemeral "
+                        f"assignment -- potential port-collision risk under concurrent test runs "
+                        f"(see switchyard #51)"
+                    )
+
                 if age_minutes < reap_age_minutes:
                     continue
 

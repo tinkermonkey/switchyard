@@ -448,6 +448,25 @@ class DockerAgentRunner:
         logger.error(f"   ✗ Container write test FAILED after {max_retries} attempts")
         return False
 
+    @staticmethod
+    def _requires_docker_socket_access(agent: str, project: str) -> bool:
+        """True if launching this agent mounts /var/run/docker.sock into its
+        container -- mirrors the exact condition _build_docker_command uses
+        to decide the mount itself (dev_environment_setup always mounts it;
+        any other agent needs project config's docker_socket_access=True),
+        so run_agent_in_container can gate its docker-socket concurrency
+        semaphore around the same condition, not a re-derived approximation
+        of it.
+        """
+        if agent == 'dev_environment_setup':
+            return True
+        try:
+            from config.manager import config_manager, ConfigurationError
+            agent_config = config_manager.get_project_agent_config(project, agent)
+        except ConfigurationError:
+            agent_config = None
+        return getattr(agent_config, 'docker_socket_access', False)
+
     async def run_agent_in_container(
         self,
         prompt: str,
@@ -512,6 +531,18 @@ class DockerAgentRunner:
             use_stdin=use_stdin
         )
 
+        # Concurrency gate for docker-socket-bearing agents (see switchyard #51):
+        # independent of, and in addition to, general pipeline-dispatch
+        # concurrency. Acquired here (before the container is launched) and
+        # always released in the finally below, even if launch/execution
+        # raises, so a crash can never leak the gate.
+        docker_socket_gate = None
+        docker_socket_holder_id = None
+        if self._requires_docker_socket_access(agent, project):
+            from services.docker_socket_access_gate import get_docker_socket_access_gate
+            docker_socket_gate = get_docker_socket_access_gate()
+            docker_socket_holder_id = await docker_socket_gate.acquire(project, task_id)
+
         try:
             # Start the container and execute Claude Code
             result_text = await self._execute_in_container(
@@ -540,6 +571,10 @@ class DockerAgentRunner:
                     logger.debug(f"Cleaned up MCP config file: {mcp_config_path}")
                 except Exception as e:
                     logger.warning(f"Failed to clean up MCP config file: {e}")
+            # Release the docker-socket-access gate last, mirroring the
+            # acquire-last-before-launch ordering above.
+            if docker_socket_gate is not None:
+                docker_socket_gate.release(project, docker_socket_holder_id)
 
     def _prepare_mcp_config(self, mcp_servers: list, project_dir: Path) -> Dict:
         """Prepare MCP configuration for the container"""
