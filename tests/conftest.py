@@ -456,5 +456,20 @@ def _purge_redis():
                     r.delete(*keys)
                 if cursor == 0:
                     break
+
+        # GitHubAPIClient mirrors real-response-derived rate limit readings
+        # to a couple of small *global* Redis keys (not namespaced by
+        # project, since GitHub's quota is account-wide) that the live
+        # dashboard reads directly - see get_shared_rate_limit_status().
+        # A unit test that exercises graphql()/rest()/http_request() with a
+        # mocked subprocess/response still runs the real mirror code, which
+        # would otherwise leave fabricated numbers sitting in the same keys
+        # production reads from. Purge them explicitly since they don't
+        # match the project-name pattern above.
+        try:
+            from services.github_api_client import RATE_LIMIT_REDIS_KEYS
+            r.delete(*RATE_LIMIT_REDIS_KEYS.values())
+        except Exception:
+            pass
     except Exception:
         pass
