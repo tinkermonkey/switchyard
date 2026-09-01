@@ -1,5 +1,6 @@
 import subprocess
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -368,7 +369,8 @@ class ProjectWorkspaceManager:
         origin/<default_branch> when branch_name doesn't exist on origin yet.
         """
         fetch_existing = subprocess.run(
-            ['git', '-C', str(base_repo_dir), 'fetch', 'origin', branch_name, '--quiet'],
+            ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
+             f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
             capture_output=True, text=True, timeout=30
         )
 
@@ -399,11 +401,13 @@ class ProjectWorkspaceManager:
              str(worktree_path), f'origin/{default_branch}'],
             capture_output=True, text=True, timeout=30
         )
+        created_new_branch = result.returncode == 0
         if result.returncode != 0:
             # Race with a concurrently-created branch of the same name (e.g. another
             # process just pushed it) — retry once as the existing-branch case.
             retry_fetch = subprocess.run(
-                ['git', '-C', str(base_repo_dir), 'fetch', 'origin', branch_name, '--quiet'],
+                ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
                 capture_output=True, text=True, timeout=30
             )
             if retry_fetch.returncode == 0:
@@ -414,6 +418,23 @@ class ProjectWorkspaceManager:
             if result.returncode != 0:
                 raise RuntimeError(
                     f"Failed to create worktree branch {branch_name}: {result.stderr.strip()}"
+                )
+
+        if created_new_branch:
+            # Push the brand-new branch immediately, mirroring
+            # FeatureBranchManager.create_branch_from_main's established pattern: without
+            # an initial push+tracking setup, a plain `git pull` inside the worktree fails
+            # with "no tracking information", and the push-before-removal safety net in
+            # _push_local_commits_if_any has no origin/<branch> ref to compare against.
+            push_result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'push', '-u', 'origin', branch_name],
+                capture_output=True, text=True, timeout=30
+            )
+            if push_result.returncode != 0:
+                logger.warning(
+                    f"Created worktree branch {branch_name} but failed to push it to "
+                    f"origin ({push_result.stderr.strip()}); it has no upstream tracking "
+                    "until something inside the worktree pushes it successfully."
                 )
 
     @staticmethod
@@ -442,7 +463,27 @@ class ProjectWorkspaceManager:
                 capture_output=True, text=True, timeout=10
             )
             if ahead_result.returncode != 0:
-                return  # e.g. no such remote branch yet; nothing we can safely reconcile here
+                # No origin/<branch> tracking ref at all — most likely this branch was
+                # created but its initial push never succeeded. We can't tell how many
+                # commits would be lost, but there's at least HEAD; attempt a first push
+                # now rather than silently discarding everything on removal.
+                logger.warning(
+                    f"No origin/{branch} tracking ref found for {worktree_path}; "
+                    "attempting an initial push before removal so commits aren't lost."
+                )
+                push_result = subprocess.run(
+                    ['git', '-C', str(worktree_path), 'push', '-u', 'origin', branch],
+                    capture_output=True, text=True, timeout=30
+                )
+                if push_result.returncode == 0:
+                    logger.info(f"Pushed {branch} to origin for the first time from {worktree_path}")
+                else:
+                    logger.error(
+                        f"Could not push {branch} to origin from {worktree_path} before "
+                        f"removal ({push_result.stderr.strip()}). Any commits in this "
+                        "worktree are lost."
+                    )
+                return
             ahead_count = int(ahead_result.stdout.strip() or '0')
             if ahead_count == 0:
                 return
@@ -510,7 +551,6 @@ class ProjectWorkspaceManager:
                         f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
                         "removing directory directly"
                     )
-                    import shutil
                     shutil.rmtree(worktree_path, ignore_errors=True)
                     subprocess.run(
                         ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
@@ -586,7 +626,6 @@ class ProjectWorkspaceManager:
                     except Exception:
                         pass
                     if worktree_path.is_dir():
-                        import shutil
                         shutil.rmtree(worktree_path, ignore_errors=True)
                 # Prune any remaining stale metadata entries
                 try:

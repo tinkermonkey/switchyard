@@ -81,9 +81,10 @@ class TestCreateNewEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         # First fetch (of the target branch) fails -> branch doesn't exist on origin yet.
-        # Second fetch (of default_branch) succeeds. worktree add -b succeeds.
+        # Second fetch (of default_branch) succeeds. worktree add -b succeeds, followed by
+        # an immediate `push -u` of the brand-new branch.
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_fail("couldn't find remote ref"), _ok(), _ok()]
+            mock_run.side_effect = [_fail("couldn't find remote ref"), _ok(), _ok(), _ok()]
 
             result = manager.get_project_dir(
                 "my-project", epic_id="100", branch_name="feature/issue-100-epic"
@@ -94,15 +95,34 @@ class TestCreateNewEpicWorktree:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[0] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
-                             'feature/issue-100-epic', '--quiet']
+                             'feature/issue-100-epic:refs/remotes/origin/feature/issue-100-epic',
+                             '--quiet']
         assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
                              'main', '--quiet']
         assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
                              '-b', 'feature/issue-100-epic', str(expected_path),
                              'origin/main']
+        assert calls[3] == ['git', '-C', str(expected_path), 'push', '-u', 'origin',
+                             'feature/issue-100-epic']
 
         # Tracked in-flight for reuse
         assert manager._epic_worktrees[("my-project", "100")] == str(expected_path)
+
+    def test_new_branch_case_survives_push_failure(self, manager, tmp_path):
+        """The worktree is still usable even if the immediate post-creation push fails
+        (e.g. transient network issue) — creation itself must not be rolled back."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_fail("couldn't find remote ref"), _ok(), _ok(),
+                                     _fail("connection reset")]
+            result = manager.get_project_dir(
+                "my-project", epic_id="101", branch_name="feature/issue-101-epic"
+            )
+
+        expected_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '101'
+        assert result == expected_path
+        assert manager._epic_worktrees[("my-project", "101")] == str(expected_path)
 
     def test_existing_branch_case(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")
@@ -119,7 +139,8 @@ class TestCreateNewEpicWorktree:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[0] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
-                             'feature/issue-200-existing', '--quiet']
+                             'feature/issue-200-existing:refs/remotes/origin/feature/issue-200-existing',
+                             '--quiet']
         assert calls[1] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
                              str(expected_path), 'feature/issue-200-existing']
 
@@ -361,3 +382,41 @@ class TestPruneEpicWorktrees:
             mock_run.return_value = _ok()
             with patch.object(Path, 'iterdir', side_effect=OSError("permission denied")):
                 manager.prune_epic_worktrees()  # must not raise
+
+
+class TestPushLocalCommitsBeforeRemoval:
+    """_push_local_commits_if_any() must never silently no-op when it can't tell
+    whether local commits exist (e.g. a brand-new branch whose initial push failed) —
+    that's exactly the state most likely to be silently discarding real work."""
+
+    def test_missing_origin_ref_attempts_push_instead_of_silently_returning(self, manager, tmp_path, caplog):
+        worktree_path = tmp_path / "some-worktree"
+        worktree_path.mkdir(parents=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok("feature/issue-999\n"),  # rev-parse --abbrev-ref HEAD
+                _fail("unknown revision"),      # rev-list --count origin/<branch>..HEAD -> no such ref
+                _ok(),                          # push -u origin <branch> succeeds
+            ]
+            with caplog.at_level("WARNING"):
+                ProjectWorkspaceManager._push_local_commits_if_any(worktree_path)
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[2] == ['git', '-C', str(worktree_path), 'push', '-u', 'origin', 'feature/issue-999']
+        assert any("No origin/" in r.message for r in caplog.records)
+
+    def test_missing_origin_ref_logs_error_when_push_also_fails(self, manager, tmp_path, caplog):
+        worktree_path = tmp_path / "some-worktree"
+        worktree_path.mkdir(parents=True)
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok("feature/issue-999\n"),
+                _fail("unknown revision"),
+                _fail("connection reset"),  # push also fails
+            ]
+            with caplog.at_level("ERROR"):
+                ProjectWorkspaceManager._push_local_commits_if_any(worktree_path)
+
+        assert any("lost" in r.message for r in caplog.records)
