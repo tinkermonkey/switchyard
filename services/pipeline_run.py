@@ -439,7 +439,8 @@ class PipelineRunManager:
     def get_active_pipeline_run(
         self,
         project: str,
-        issue_number: int
+        issue_number: int,
+        board: Optional[str] = None
     ) -> Optional[PipelineRun]:
         """
         Get active pipeline run for an issue
@@ -447,15 +448,37 @@ class PipelineRunManager:
         Args:
             project: Project name
             issue_number: Issue number
+            board: Optional board name. create_pipeline_run() always writes the
+                board-scoped Redis mapping (see _get_issue_key), so when board
+                is given here that key is checked FIRST, falling back to the
+                legacy board-less key for runs restored from before board
+                scoping existed. When board is omitted, only the legacy key is
+                checked — identical to this method's behavior before board
+                support was added, so existing callers are unaffected.
+
+                Without passing board, a run created moments earlier by
+                get_or_create_pipeline_run() (which always writes the
+                board-scoped key) can be invisible to a second, same-second
+                lookup for the same (project, issue_number) — producing a
+                duplicate "phantom" pipeline run instead of reusing the one
+                that already exists.
 
         Returns:
             PipelineRun if active run exists, None otherwise
         """
-        # Check issue mapping
-        issue_key = self._get_issue_key(project, issue_number)
-        pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
+        # Check issue mapping — board-scoped key first (if board given), then
+        # the legacy key. De-dupe so board=None (the common, pre-existing case)
+        # checks exactly one key, same as before board support was added.
+        issue_keys = list(dict.fromkeys([
+            *([self._get_issue_key(project, issue_number, board)] if board else []),
+            self._get_issue_key(project, issue_number),
+        ]))
 
-        if pipeline_run_id:
+        for issue_key in issue_keys:
+            pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
+            if not pipeline_run_id:
+                continue
+
             # Fast path: mapping exists, try Redis first
             redis_key = self._get_redis_key(pipeline_run_id)
             data = self.redis.get(redis_key)
@@ -468,39 +491,42 @@ class PipelineRunManager:
                     else:
                         # Run has completed — clean up stale mapping
                         self.redis.hdel(self.redis_issue_mapping, issue_key)
-                        return None
+                        continue
                 except Exception as e:
                     logger.error(f"Error deserializing pipeline run: {e}")
-                    return None
+                    continue
             else:
                 # Redis data has expired (TTL) while the issue mapping survived.
                 # This can happen if the orchestrator was restarted and the initial
                 # 2-hour creation TTL expired before the run was restored/updated.
-                # Clean up the stale mapping and fall through to the ES lookup.
+                # Clean up the stale mapping and fall through to the next key / ES lookup.
                 logger.debug(
                     f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
                     f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
                 )
                 self.redis.hdel(self.redis_issue_mapping, issue_key)
-                # Fall through to ES lookup below
+                # Fall through to try the next key / ES lookup below
 
         # ES fallback: mapping was absent OR Redis data expired.
         # Include "feedback_listening" so human-feedback loops survive restarts
         # without being recreated (they legitimately have no Docker container).
         if self.es:
             try:
+                must_clauses = [
+                    {"term": {"project": project}},
+                    {"term": {"issue_number": issue_number}},
+                    {"terms": {"status": ["active", "feedback_listening"]}}
+                ]
+                if board:
+                    # Board given: filter strictly by it. Every PipelineRun doc has a
+                    # board field (it's a required create_pipeline_run() arg), so this
+                    # correctly disambiguates instead of risking a match against a
+                    # DIFFERENT board's genuinely-active run for the same issue number.
+                    must_clauses.append({"term": {"board": board}})
                 result = self.es.search(
                     index=f"{self.es_index_pattern}-*",
                     body={
-                        "query": {
-                            "bool": {
-                                "must": [
-                                    {"term": {"project": project}},
-                                    {"term": {"issue_number": issue_number}},
-                                    {"terms": {"status": ["active", "feedback_listening"]}}
-                                ]
-                            }
-                        },
+                        "query": {"bool": {"must": must_clauses}},
                         "size": 1,
                         "sort": [{"started_at": {"order": "desc"}}]
                     }
@@ -541,7 +567,11 @@ class PipelineRunManager:
                         self.redis.setex(restore_key, 604800, json.dumps(pipeline_run.to_dict()))
                     else:
                         self.redis.setex(restore_key, 3600, json.dumps(pipeline_run.to_dict()))
-                    self.redis.hset(self.redis_issue_mapping, issue_key, pipeline_run.id)
+                    # Restore under the board-scoped key when board was given (matches
+                    # what create_pipeline_run() writes), else the legacy key — NOT
+                    # whatever `issue_key` last held from the Redis loop above.
+                    restore_issue_key = self._get_issue_key(project, issue_number, board)
+                    self.redis.hset(self.redis_issue_mapping, restore_issue_key, pipeline_run.id)
 
                     return pipeline_run
             except Exception as e:
@@ -585,8 +615,13 @@ class PipelineRunManager:
         try:
             # Try to acquire lock (wait up to 5 seconds)
             with self.redis.lock(lock_key, timeout=5, blocking_timeout=5):
-                # Check for existing active run in Redis
-                existing = self.get_active_pipeline_run(project, issue_number)
+                # Check for existing active run in Redis. Pass board — this is the
+                # actual root-cause fix for the phantom-duplicate-run bug: without
+                # it, a run this same method just created (which always writes the
+                # board-scoped key) is invisible to a second, same-second call for
+                # the same (project, issue_number), so it creates a duplicate
+                # instead of reusing the one that already exists.
+                existing = self.get_active_pipeline_run(project, issue_number, board=board)
 
                 if existing:
                     if existing.status == 'feedback_listening':
@@ -599,7 +634,7 @@ class PipelineRunManager:
                             f"Reusing feedback_listening pipeline run {existing.id} for "
                             f"{project} issue #{issue_number} via new trigger — restoring to active"
                         )
-                        self.update_run_status(project, issue_number, 'active')
+                        self.update_run_status(project, issue_number, 'active', board=board)
                         existing.status = 'active'
                     logger.debug(
                         f"Using existing pipeline run {existing.id} for "
@@ -680,7 +715,7 @@ class PipelineRunManager:
                                     f"Reusing feedback_listening pipeline run {pipeline_run.id} for "
                                     f"{project} issue #{issue_number} via new trigger (ES fallback) — restoring to active"
                                 )
-                                self.update_run_status(project, issue_number, 'active')
+                                self.update_run_status(project, issue_number, 'active', board=board)
                                 pipeline_run.status = 'active'
                                 return pipeline_run, False
                     except Exception as e:
@@ -710,14 +745,14 @@ class PipelineRunManager:
         except redis.exceptions.LockError:
             logger.warning(f"Could not acquire lock for pipeline run creation: {project} #{issue_number}")
             # Fallback: try to get existing one last time
-            existing = self.get_active_pipeline_run(project, issue_number)
+            existing = self.get_active_pipeline_run(project, issue_number, board=board)
             if existing:
                 if existing.status == 'feedback_listening':
                     logger.info(
                         f"Reusing feedback_listening pipeline run {existing.id} for "
                         f"{project} issue #{issue_number} via new trigger (no-lock fallback) — restoring to active"
                     )
-                    self.update_run_status(project, issue_number, 'active')
+                    self.update_run_status(project, issue_number, 'active', board=board)
                     existing.status = 'active'
                 return existing, False
             
@@ -861,6 +896,7 @@ class PipelineRunManager:
         project: str,
         issue_number: int,
         new_status: str,
+        board: Optional[str] = None,
     ) -> bool:
         """
         Update the status of an active pipeline run without ending it.
@@ -873,11 +909,14 @@ class PipelineRunManager:
             project: Project name
             issue_number: Issue number
             new_status: New status value (e.g. "feedback_listening")
+            board: Optional board name, passed through to get_active_pipeline_run()
+                so a board-scoped-only run can still be found. Omit to preserve
+                prior legacy-key-only behavior.
 
         Returns:
             True if the run was updated, False if no active run was found.
         """
-        pipeline_run = self.get_active_pipeline_run(project, issue_number)
+        pipeline_run = self.get_active_pipeline_run(project, issue_number, board=board)
         if not pipeline_run:
             logger.debug(
                 f"update_run_status: no active run found for {project} issue #{issue_number}"
@@ -992,7 +1031,8 @@ class PipelineRunManager:
         issue_number: int,
         reason: Optional[str] = None,
         retain_lock: Optional[bool] = None,
-        outcome: Optional[str] = None
+        outcome: Optional[str] = None,
+        board: Optional[str] = None
     ) -> bool:
         """
         End an active pipeline run
@@ -1005,12 +1045,16 @@ class PipelineRunManager:
                 - None (default): auto — retain if outcome="failed", release otherwise.
                 - True: always retain regardless of outcome.
                 - False: always release regardless of outcome (use for intentional kills).
+            board: Optional board name, passed through to get_active_pipeline_run()
+                so a board-scoped-only run (e.g. an orphaned "phantom" run created
+                by get_or_create_pipeline_run() and never reused) can still be
+                found and ended. Omit to preserve prior legacy-key-only behavior.
 
         Returns:
             True if run was ended, False if no active run found
         """
         # Get active run
-        pipeline_run = self.get_active_pipeline_run(project, issue_number)
+        pipeline_run = self.get_active_pipeline_run(project, issue_number, board=board)
         
         if not pipeline_run:
             logger.debug(
@@ -1332,9 +1376,97 @@ class PipelineRunManager:
             f"Ended pipeline run {pipeline_run.id} for "
             f"{project} issue #{issue_number}{reason_msg}"
         )
-        
+
         return True
-    
+
+    def end_phantom_pipeline_run(
+        self,
+        pipeline_run_id: str,
+        project: str,
+        issue_number: int,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """
+        End one specific pipeline run by id — for cleaning up a "phantom" run
+        that was superseded by a DIFFERENT run for the same (project,
+        issue_number) before it ever became the one driving execution (e.g.
+        trigger_agent_for_status() eagerly creates a run, then discovers the
+        column is a pr_review stage and _start_pr_review_for_issue() creates
+        or reuses a run of its own).
+
+        Deliberately does NOT go through end_pipeline_run()'s (project,
+        issue_number[, board]) active-run lookup: by the time this is called,
+        the issue-mapping may already point at the run that superseded this
+        one, so that lookup could resolve to — and incorrectly end — the
+        WRONG, currently-active run instead of this phantom. Fetching
+        directly by id avoids that.
+
+        Also deliberately skips everything end_pipeline_run() does around the
+        pipeline lock, the cancellation signal, and the wait queue: a phantom
+        run created before the real run's lock-acquisition step never held
+        the lock or drove any in-flight work, so touching any of that here
+        would only risk interfering with whichever run (real or otherwise)
+        currently does.
+
+        Returns True if an active run with this id was found and ended,
+        False if it was not found or was already terminal (nothing to do).
+        """
+        pipeline_run = self.get_pipeline_run_by_id(pipeline_run_id)
+        if not pipeline_run or pipeline_run.status not in ('active', 'feedback_listening'):
+            logger.debug(
+                f"end_phantom_pipeline_run: no active run found for id {pipeline_run_id}"
+            )
+            return False
+
+        pipeline_run.ended_at = datetime.utcnow().isoformat() + 'Z'
+        pipeline_run.status = "completed"
+        pipeline_run.outcome = "superseded"
+
+        try:
+            from monitoring.observability import get_observability_manager, EventType
+            obs = get_observability_manager()
+            obs.emit(
+                EventType.PIPELINE_RUN_COMPLETED,
+                "pipeline_lifecycle",
+                pipeline_run.id,
+                project,
+                {
+                    "pipeline_run_id": pipeline_run.id,
+                    "issue_number": issue_number,
+                    "board": pipeline_run.board,
+                    "started_at": pipeline_run.started_at,
+                    "ended_at": pipeline_run.ended_at,
+                    "reason": reason or "superseded",
+                    "duration_seconds": (
+                        datetime.fromisoformat(pipeline_run.ended_at.rstrip('Z')) -
+                        datetime.fromisoformat(pipeline_run.started_at.rstrip('Z'))
+                    ).total_seconds()
+                },
+                pipeline_run_id=pipeline_run.id
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to emit pipeline completion event for phantom run {pipeline_run_id}: {e}",
+                exc_info=True
+            )
+
+        redis_key = self._get_redis_key(pipeline_run.id)
+        self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+
+        # Compare-and-delete: only removes the issue mapping if it still points
+        # at THIS run id, so a real run created/restored concurrently for the
+        # same (project, board, issue_number) can't have its own freshly-written
+        # mapping clobbered by this phantom's cleanup.
+        self._cleanup_issue_mapping(project, issue_number, pipeline_run.board, pipeline_run.id)
+
+        self._persist_to_elasticsearch(pipeline_run)
+
+        logger.info(
+            f"Ended phantom pipeline run {pipeline_run.id} for {project} issue #{issue_number}"
+            f"{f' ({reason})' if reason else ''}"
+        )
+        return True
+
     def get_pipeline_run_by_id(self, pipeline_run_id: str) -> Optional[PipelineRun]:
         """
         Get pipeline run by ID (from Redis or Elasticsearch)

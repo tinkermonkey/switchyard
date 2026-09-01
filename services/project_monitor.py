@@ -3375,7 +3375,11 @@ class ProjectMonitor:
                         project_name, board_name, issue_number, status,
                         repository, project_config, pipeline_config,
                         workflow_template, column, current_stage_config,
-                        phantom_run_was_created=pipeline_run_was_created
+                        # Pass the actual run id (not just a bool) so
+                        # _start_pr_review_for_issue can end this specific phantom
+                        # run if its own get_or_create_pipeline_run() call ends up
+                        # NOT reusing it — see that method's cleanup logic below.
+                        phantom_run_id=(pipeline_run.id if pipeline_run_was_created else None)
                     )
 
                 # Fetch context from previous workflow stage (workspace-aware)
@@ -6002,12 +6006,22 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         workflow_template,
         column,
         stage_config,
-        phantom_run_was_created: bool = False
+        phantom_run_id: Optional[str] = None
     ) -> Optional[str]:
         """Start PR review stage for an issue in a background thread.
 
         PRReviewStage runs in-process (not Docker), so we launch it in a
         background thread with its own asyncio event loop.
+
+        Args:
+            phantom_run_id: If the caller already created a pipeline run for this
+                issue (via its own eager get_or_create_pipeline_run() call) before
+                discovering this is a pr_review stage, its id goes here. This
+                method's own get_or_create_pipeline_run() call below should
+                normally reuse that same run (board-scoped lookup), but if it
+                doesn't — or if this method returns early via the duplicate-
+                execution guard — the mismatched/unused phantom run is ended
+                explicitly so it doesn't linger as a permanently "active" run.
         """
         try:
             import asyncio
@@ -6059,17 +6073,19 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
                 # End any phantom pipeline run that was freshly created before this duplicate
                 # check fired — otherwise it lingers as an "active" run in Redis and becomes
-                # a stale pipeline_run_id source on the next orchestrator restart.
-                if phantom_run_was_created:
+                # a stale pipeline_run_id source on the next orchestrator restart. Ended by
+                # id (not end_pipeline_run()'s by-mapping lookup) since the real, in-progress
+                # execution's own run currently owns the lock and must not be touched here.
+                if phantom_run_id:
                     try:
-                        self.pipeline_run_manager.end_pipeline_run(
+                        self.pipeline_run_manager.end_phantom_pipeline_run(
+                            pipeline_run_id=phantom_run_id,
                             project=project_name,
                             issue_number=issue_number,
                             reason="Duplicate PR review execution detected - ending phantom run",
-                            retain_lock=True  # Keep lock since the real execution is still active
                         )
                         logger.info(
-                            f"Ended phantom pipeline run for issue #{issue_number} (duplicate skip)"
+                            f"Ended phantom pipeline run {phantom_run_id} for issue #{issue_number} (duplicate skip)"
                         )
                     except Exception as e:
                         logger.warning(f"Failed to end phantom pipeline run: {e}")
@@ -6118,7 +6134,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             if workspace_type in ['discussions', 'hybrid']:
                 discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
 
-            # Get or create pipeline run
+            # Get or create pipeline run. With board passed through, this normally
+            # reuses phantom_run_id (the run trigger_agent_for_status eagerly
+            # created before it knew this was a pr_review stage) via the
+            # board-scoped Redis lookup — see get_or_create_pipeline_run().
             pipeline_run, _ = self.pipeline_run_manager.get_or_create_pipeline_run(
                 issue_number=issue_number,
                 issue_title=issue_data.get('title', f'Issue #{issue_number}'),
@@ -6128,6 +6147,29 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 discussion_id=discussion_id
             )
             logger.debug(f"Using pipeline run {pipeline_run.id} for PR review on issue #{issue_number}")
+
+            # Defensive cleanup: if the run above did NOT turn out to be the phantom
+            # run (e.g. it expired from Redis, or ES hadn't refreshed yet), end the
+            # phantom explicitly rather than leaving it stuck "active" forever with
+            # nothing but its initial routing-decision event. Ended by id (not
+            # end_pipeline_run()'s by-mapping lookup) — by this point the issue
+            # mapping already points at `pipeline_run` (the real run we're about to
+            # drive), so a by-mapping lookup here would resolve to and incorrectly
+            # end that real run instead of the phantom.
+            if phantom_run_id and phantom_run_id != pipeline_run.id:
+                try:
+                    self.pipeline_run_manager.end_phantom_pipeline_run(
+                        pipeline_run_id=phantom_run_id,
+                        project=project_name,
+                        issue_number=issue_number,
+                        reason="Superseded by the actual PR review pipeline run - ending phantom run",
+                    )
+                    logger.info(
+                        f"Ended unused phantom pipeline run {phantom_run_id} for issue #{issue_number} "
+                        f"(superseded by {pipeline_run.id})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to end unused phantom pipeline run {phantom_run_id}: {e}")
 
             task_id = f"pr_review_{issue_number}_{pipeline_run.id}"
 
