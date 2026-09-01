@@ -80,6 +80,22 @@ class PipelineWatchdog:
         """
         Find and clean up zombie pipeline runs.
 
+        KNOWN CONCURRENCY CAVEAT: this method (via scheduled_tasks.py's
+        _cleanup_zombie_pipeline_runs) runs on asyncio's default executor —
+        it is the first path that drives ProjectMonitor.trigger_agent_for_
+        status() (via _redispatch_same_issue -> _cleanup_zombie_run /
+        _actively_resume_run) from a thread other than ProjectMonitor's own
+        poll thread. That method's duplicate-dispatch guards (the pending-
+        task scan and pipeline_queue.mark_issue_active()) are check-then-act
+        and are not covered by ProjectMonitor._last_state_lock (which only
+        guards its status-cache reads/writes). A poll cycle landing on the
+        exact same issue at the same moment as a self-heal redispatch could
+        theoretically slip two dispatches through. This is a pre-existing
+        category of risk (two poll paths racing on one issue) that this PR
+        makes reachable from a second thread for the first time, rather than
+        a new mechanism; a per-(project, issue) dispatch mutex would close it
+        properly but is a larger change deferred as follow-up work.
+
         Returns:
             Dict with summary of cleanup results:
             {
@@ -474,21 +490,48 @@ class PipelineWatchdog:
         # with no chance of self-healing.
         #
         # Self-heal NEVER releases the pipeline lock outright — see incident
-        # e42ca133, where releasing it let a different queued issue (#854)
-        # acquire the lock before anything could re-pick the zombie's own issue
-        # (#853), orphaning its already-posted CHANGES NEEDED review with no
-        # revision ever dispatched. Instead: end_pipeline_run always retains the
+        # e42ca133 (investigated live in a pipeline-investigate session, not a
+        # separate written postmortem; issue numbers below are from the
+        # managed documentation_robotics project's repo, not this one), where
+        # releasing it let a different queued issue (#854) acquire the lock
+        # before anything could re-pick the zombie's own issue (#853),
+        # orphaning its already-posted CHANGES NEEDED review with no revision
+        # ever dispatched. Instead: end_pipeline_run always retains the
         # lock (which durably marks it retained via mark_lock_failed, since
         # outcome="failed" below), and then — only within budget —
         # clear_retained_reason() immediately lifts that block and
         # _redispatch_same_issue() re-triggers the SAME issue directly, so no
-        # other issue can ever acquire the lock in between. If either step
-        # fails, requires_manual_intervention is raised to true so the lock
-        # ends up durably retained rather than silently idle.
+        # other issue can ever acquire the lock in between. If end_pipeline_run
+        # itself fails, or either the clear or redispatch step fails,
+        # requires_manual_intervention is raised to true (each with its own
+        # specific reason string) so the lock ends up durably retained
+        # rather than silently idle.
         retry_count = self._increment_zombie_retry_count(project, issue_number)
         exceeded_auto_retry = retry_count > ZOMBIE_AUTO_RETRY_LIMIT
         self_heal = not (exceeded_auto_retry or workspace_broken)
         requires_manual_intervention = exceeded_auto_retry or workspace_broken
+        # Accurate, call-site-specific text for _notify_lock_stuck's GitHub
+        # comment — set here for the two "never even attempted self-heal"
+        # causes, and overwritten below if self-heal itself fails instead.
+        # Passing the wrong text (e.g. "auto-retry exhausted" from a self-heal
+        # failure that never touched the retry budget at all) was flagged in
+        # PR review as actively misleading to whoever reads the comment.
+        manual_intervention_reason = None
+        if workspace_broken:
+            manual_intervention_reason = (
+                f"This project's shared workspace ({project}) has unresolved git "
+                f"conflicts (unmerged paths), so auto-retry would just repeat this "
+                f"exact failure for every other issue on this board — the workspace "
+                f"needs manual git repair."
+            )
+        elif exceeded_auto_retry:
+            manual_intervention_reason = (
+                f"This issue's pipeline has zombie-cleaned up {retry_count} times in "
+                f"a row within {ZOMBIE_RETRY_COUNT_TTL_SECONDS // 3600}h (no agent "
+                f"container found for over {self.zombie_threshold_minutes} minutes "
+                f"each time) and auto-retry has been exhausted since repeating the "
+                f"same failure wouldn't self-heal."
+            )
 
         if workspace_broken:
             logger.error(
@@ -510,6 +553,31 @@ class PipelineWatchdog:
                 f"{retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT} — retrying same issue, lock stays held throughout"
             )
 
+        # Remove any stale review cycle state FIRST, before any redispatch
+        # below. Must run before, not after: a synchronous self-heal
+        # redispatch can reach far enough to create a fresh ReviewCycleState
+        # for this same issue — if this cleanup ran afterward, it would find
+        # that brand-new state (indistinguishable in shape from a genuinely
+        # stale one) and delete it, leaving the freshly-dispatched reviewer's
+        # eventual verdict with nothing to act on it. That is exactly incident
+        # e42ca133's root cause, reproduced inside the fix for it — this
+        # ordering is what prevents that.
+        try:
+            from services.review_cycle import review_cycle_executor
+            ck = review_cycle_executor._cycle_key(project, issue_number)
+            cycle_state = review_cycle_executor.active_cycles.get(ck)
+            if cycle_state is None:
+                # Also check disk (cycle may not be in-memory after a restart)
+                all_cycles = review_cycle_executor._load_active_cycles(project)
+                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
+            if cycle_state:
+                review_cycle_executor._remove_cycle_state(cycle_state)
+                if ck in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[ck]
+                logger.info(f"Removed stale review cycle state for {project} issue #{issue_number} during zombie cleanup")
+        except Exception as e:
+            logger.warning(f"Failed to clean up review cycle state during zombie cleanup for {project} issue #{issue_number}: {e}")
+
         # End the pipeline run. Always retain the lock here (never
         # retain_lock=False — see the comment above for why self-heal clears
         # the resulting durable mark itself instead of releasing outright).
@@ -527,57 +595,73 @@ class PipelineWatchdog:
             else:
                 logger.warning(f"Failed to end zombie pipeline run {pipeline_run_id[:8]}...")
 
-            if ended and self_heal:
-                lock_mgr = self.lock_manager
-                if lock_mgr is None:
-                    from services.pipeline_lock_manager import get_pipeline_lock_manager
-                    lock_mgr = get_pipeline_lock_manager()
-                cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
-                redispatched = cleared and self._redispatch_same_issue(project, board, issue_number)
-                if redispatched:
-                    logger.info(
-                        f"Zombie self-heal: issue #{issue_number} in {project} "
-                        f"redispatched, lock never left issue #{issue_number}"
-                    )
-                else:
-                    if cleared:
-                        # Redispatch failed AFTER we lifted the durable block —
-                        # restore it now rather than leave the lock un-retained
-                        # with nothing dispatched (any other issue could then
-                        # acquire it, the exact orphaning this fix exists to stop).
-                        lock_mgr.mark_lock_failed(
-                            project, board, issue_number,
-                            reason=(
-                                f"Zombie self-heal redispatch failed on retry "
-                                f"{retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT}"
-                            ),
-                        )
+            if self_heal:
+                if not ended:
+                    # end_pipeline_run itself failed (e.g. get_active_pipeline_run
+                    # found nothing — a real race: something else ended this run
+                    # between the zombie query and this call, not hypothetical).
+                    # The lock's actual state is now unknown to us, so this
+                    # cannot safely proceed as a self-heal — fail safe toward
+                    # manual intervention rather than silently doing nothing.
                     logger.error(
-                        f"Zombie self-heal: could not complete redispatch for "
-                        f"{project} issue #{issue_number} (cleared={cleared}) — "
-                        f"retaining lock, requires manual intervention"
+                        f"Zombie self-heal: end_pipeline_run did not end an "
+                        f"active run for {project} issue #{issue_number} — "
+                        f"cannot safely self-heal, requires manual intervention"
                     )
                     requires_manual_intervention = True
+                    manual_intervention_reason = (
+                        f"The pipeline watchdog found this issue's run marked "
+                        f"active with no agent container running, but could not "
+                        f"confirm/end that run while attempting an automatic "
+                        f"retry (it may have already ended through another path). "
+                        f"The lock's state couldn't be safely verified, so "
+                        f"auto-retry was skipped rather than risk an unsafe retry."
+                    )
+                else:
+                    lock_mgr = self.lock_manager
+                    if lock_mgr is None:
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        lock_mgr = get_pipeline_lock_manager()
+                    cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
+                    redispatched = cleared and self._redispatch_same_issue(project, board, issue_number)
+                    if redispatched:
+                        logger.info(
+                            f"Zombie self-heal: issue #{issue_number} in {project} "
+                            f"redispatched, lock never left issue #{issue_number}"
+                        )
+                    else:
+                        if cleared:
+                            # Redispatch failed AFTER we lifted the durable block —
+                            # restore it now rather than leave the lock un-retained
+                            # with nothing dispatched (any other issue could then
+                            # acquire it, the exact orphaning this fix exists to stop).
+                            lock_mgr.mark_lock_failed(
+                                project, board, issue_number,
+                                reason=(
+                                    f"Zombie self-heal redispatch failed on retry "
+                                    f"{retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT}"
+                                ),
+                            )
+                        logger.error(
+                            f"Zombie self-heal: could not complete redispatch for "
+                            f"{project} issue #{issue_number} (cleared={cleared}) — "
+                            f"retaining lock, requires manual intervention"
+                        )
+                        requires_manual_intervention = True
+                        manual_intervention_reason = (
+                            f"The pipeline watchdog attempted an automatic retry "
+                            f"(attempt {retry_count}/{ZOMBIE_AUTO_RETRY_LIMIT}) for this "
+                            f"issue's zombie pipeline run, but "
+                            f"{'the redispatch itself did not actually dispatch anything' if cleared else 'it could not clear the lock for retry'} "
+                            f"— the lock has been re-retained rather than left in an "
+                            f"ambiguous state."
+                        )
 
         if requires_manual_intervention:
-            self._notify_lock_stuck(project, board, issue_number, pipeline_run_id, retry_count)
-
-        # Remove any stale review cycle state so it doesn't block future runs
-        try:
-            from services.review_cycle import review_cycle_executor
-            ck = review_cycle_executor._cycle_key(project, issue_number)
-            cycle_state = review_cycle_executor.active_cycles.get(ck)
-            if cycle_state is None:
-                # Also check disk (cycle may not be in-memory after a restart)
-                all_cycles = review_cycle_executor._load_active_cycles(project)
-                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
-            if cycle_state:
-                review_cycle_executor._remove_cycle_state(cycle_state)
-                if ck in review_cycle_executor.active_cycles:
-                    del review_cycle_executor.active_cycles[ck]
-                logger.info(f"Removed stale review cycle state for {project} issue #{issue_number} during zombie cleanup")
-        except Exception as e:
-            logger.warning(f"Failed to clean up review cycle state during zombie cleanup for {project} issue #{issue_number}: {e}")
+            self._notify_lock_stuck(
+                project, board, issue_number, pipeline_run_id, retry_count,
+                reason=manual_intervention_reason,
+            )
 
         # Log cleanup event to observability
         try:
@@ -610,21 +694,37 @@ class PipelineWatchdog:
         clear_retained_reason) before calling this, and must treat a False
         return as "the retry did not actually happen" — never leave the lock
         merely un-retained with nothing dispatched, since nothing else polls
-        for that state (the board's normal poll loop only reacts to column
-        *changes*, and ProjectMonitor's stalled-item rescan only runs once, at
-        startup — see incident e42ca133's follow-up investigation).
+        for that state on a recurring basis (the board's normal poll loop
+        only reacts to column *changes*, and ProjectMonitor's stalled-item
+        rescan — _rescan_boards_for_stalled_items() — only runs once, at
+        startup; the separate per-cycle _check_and_process_waiting_issues_
+        failsafe doesn't help either, since it explicitly skips any board
+        whose lock is still 'locked' regardless of retained_reason).
+
+        Before dispatching, this also abandons any stale 'in_progress'
+        work_execution_state entry for this issue (mirroring what
+        agent_container_recovery.py's startup recovery does). This is
+        required, not optional: a zombie run's dead container almost always
+        left its last execution record at outcome='in_progress' (nothing
+        wrote a terminal outcome), and should_execute_work() refuses to
+        dispatch on 'in_progress' unconditionally, with no staleness
+        timeout — without this, redispatch would silently no-op via
+        trigger_agent_for_status()'s own 'work_already_in_progress' guard on
+        every call, which is exactly the failure this PR's fix is for.
 
         Returns:
-            True if trigger_agent_for_status() was invoked without raising.
-            This does NOT guarantee a container actually launched (that has
-            its own independent failure modes, exactly like any other
-            dispatch) — it only guarantees a genuine redispatch attempt was
-            made through the normal path, so the caller's None-vs-real-retry
-            bookkeeping is correct.
+            True only if trigger_agent_for_status() returned a real dispatch
+            result (non-None) — see incident e42ca133's follow-up
+            investigation: trigger_agent_for_status() has over a dozen
+            legitimate internal branches that dispatch nothing and return
+            None (retained-lock gate, duplicate task, queue-priority wait,
+            closed issue, etc.), several silent by design. Treating "no
+            exception raised" as success (the original version of this
+            method) let the self-heal report success while nothing actually
+            ran.
         """
         try:
             from config.manager import config_manager
-            from services.github_api_client import get_github_client
 
             project_monitor = self.project_monitor
             if project_monitor is None:
@@ -645,62 +745,44 @@ class PipelineWatchdog:
                 )
                 return False
 
-            # Determine the issue's current board column directly via GraphQL —
-            # mirrors the equivalent lookup in work_execution_state.py's
-            # is_still_valid() (kept as a separate inline query here rather
-            # than a shared helper, since that one is itself private to a
-            # different validity check with its own surrounding concerns).
-            query = """
-            query($owner: String!, $repo: String!, $number: Int!) {
-              repository(owner: $owner, name: $repo) {
-                issue(number: $number) {
-                  state
-                  projectItems(first: 10) {
-                    nodes {
-                      fieldValueByName(name: "Status") {
-                        ... on ProjectV2ItemFieldSingleSelectValue { name }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            """
-            success, data = get_github_client().graphql(query, {
-                'owner': project_config.github['org'],
-                'repo': project_config.github['repo'],
-                'number': issue_number,
-            })
-            if not success:
-                logger.error(
-                    f"_redispatch_same_issue: GraphQL query failed for {project} "
-                    f"issue #{issue_number}: {data}"
-                )
-                return False
-
-            issue_data = (data or {}).get('repository', {}).get('issue') or {}
-            if issue_data.get('state', '').upper() == 'CLOSED':
-                logger.info(
-                    f"_redispatch_same_issue: issue #{issue_number} in {project} "
-                    f"is closed — skipping redispatch"
-                )
-                return False
-
-            current_column = None
-            for item in issue_data.get('projectItems', {}).get('nodes', []):
-                field_value = item.get('fieldValueByName')
-                if field_value:
-                    current_column = field_value.get('name')
-                    break
-
+            # Board-aware column lookup (mirrors ProjectMonitor.
+            # _get_parent_column_on_board's project.number filter) — this
+            # issue may sit on more than one Projects v2 board at once (a
+            # project can have several enabled pipelines), so an unfiltered
+            # lookup could resolve a different board's column entirely.
+            current_column = project_monitor.get_issue_column_sync(
+                project, board, issue_number
+            )
             if not current_column:
                 logger.error(
-                    f"_redispatch_same_issue: could not determine current board "
-                    f"column for {project} issue #{issue_number} — cannot redispatch"
+                    f"_redispatch_same_issue: could not determine current "
+                    f"column for {project} issue #{issue_number} on board "
+                    f"'{board}' — cannot redispatch"
                 )
                 return False
 
-            project_monitor.trigger_agent_for_status(
+            # Clear the stale in_progress record left by the zombie's dead
+            # container — see docstring. active_task_ids is empty because
+            # this is only ever called for an issue _cleanup_zombie_run/
+            # _actively_resume_run have already confirmed has no running
+            # container (that's the definition of zombie/frozen), so every
+            # in_progress entry for this issue is unconditionally stale.
+            try:
+                from services.work_execution_state import work_execution_tracker
+                work_execution_tracker.abandon_stale_in_progress_entries(
+                    project_name=project,
+                    issue_number=issue_number,
+                    active_task_ids=set(),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"_redispatch_same_issue: could not abandon stale "
+                    f"in_progress entries for {project} issue #{issue_number} "
+                    f"(redispatch will likely no-op on work_already_in_progress "
+                    f"if any exist): {e}"
+                )
+
+            result = project_monitor.trigger_agent_for_status(
                 project_name=project,
                 board_name=board,
                 issue_number=issue_number,
@@ -708,6 +790,15 @@ class PipelineWatchdog:
                 repository=project_config.github['repo'],
                 lock_already_acquired=True,
             )
+            if result is None:
+                logger.error(
+                    f"_redispatch_same_issue: trigger_agent_for_status did not "
+                    f"dispatch anything for {project} issue #{issue_number} "
+                    f"(column '{current_column}') — treating as redispatch "
+                    f"failure"
+                )
+                return False
+
             logger.info(
                 f"_redispatch_same_issue: redispatched {project} issue "
                 f"#{issue_number} in column '{current_column}'"
@@ -762,6 +853,34 @@ class PipelineWatchdog:
             f"issue #{issue_number} (frozen by Claude Code breaker, now closed)"
         )
 
+        # Remove any stale review cycle in-memory state FIRST, before any
+        # redispatch below — mirrors _cleanup_zombie_run's equivalent
+        # reordering. Must run before, not after: a synchronous redispatch can
+        # reach far enough to create a fresh ReviewCycleState for this same
+        # issue, and running this cleanup afterward could delete that
+        # brand-new state instead of a genuinely stale one — see incident
+        # e42ca133 and _cleanup_zombie_run's matching comment.
+        try:
+            from services.review_cycle import review_cycle_executor
+            ck = review_cycle_executor._cycle_key(project, issue_number)
+            cycle_state = review_cycle_executor.active_cycles.get(ck)
+            if cycle_state is None:
+                all_cycles = review_cycle_executor._load_active_cycles(project)
+                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
+            if cycle_state:
+                review_cycle_executor._remove_cycle_state(cycle_state)
+                if ck in review_cycle_executor.active_cycles:
+                    del review_cycle_executor.active_cycles[ck]
+                logger.info(
+                    f"Removed stale review cycle state for {project} issue #{issue_number} "
+                    f"during active resume"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to clean up review cycle state during active resume for "
+                f"{project} issue #{issue_number}: {e}"
+            )
+
         if self.pipeline_run_manager:
             ended = self.pipeline_run_manager.end_pipeline_run(
                 project=project,
@@ -775,7 +894,29 @@ class PipelineWatchdog:
             else:
                 logger.warning(f"Failed to end frozen pipeline run {pipeline_run_id[:8]}...")
 
-            if ended:
+            if not ended:
+                # end_pipeline_run itself failed (e.g. no active run found —
+                # a real race, not hypothetical). The lock's actual state is
+                # unknown to us, so this cannot safely proceed — fail safe
+                # toward manual intervention rather than silently doing
+                # nothing. Mirrors _cleanup_zombie_run's equivalent gap fix.
+                logger.error(
+                    f"Active resume: end_pipeline_run did not end an active "
+                    f"run for {project} issue #{issue_number} — cannot "
+                    f"safely resume, requires manual intervention"
+                )
+                self._notify_lock_stuck(
+                    project, board, issue_number, pipeline_run_id, retry_count=0,
+                    reason=(
+                        f"The pipeline watchdog tried to actively resume this "
+                        f"issue after the Claude Code breaker closed, but could "
+                        f"not confirm/end its pipeline run (it may have already "
+                        f"ended through another path). The lock's state couldn't "
+                        f"be safely verified, so the resume was skipped rather "
+                        f"than risk an unsafe retry."
+                    ),
+                )
+            else:
                 lock_mgr = self.lock_manager
                 if lock_mgr is None:
                     from services.pipeline_lock_manager import get_pipeline_lock_manager
@@ -803,33 +944,16 @@ class PipelineWatchdog:
                         f"retaining lock, requires manual intervention"
                     )
                     self._notify_lock_stuck(
-                        project, board, issue_number, pipeline_run_id, retry_count=0
+                        project, board, issue_number, pipeline_run_id, retry_count=0,
+                        reason=(
+                            f"The pipeline watchdog resumed this issue's pipeline "
+                            f"after the Claude Code breaker closed, but "
+                            f"{'the redispatch itself did not actually dispatch anything' if cleared else 'it could not clear the lock for the resume'} "
+                            f"— the lock has been re-retained rather than left in "
+                            f"an ambiguous state. This is NOT a zombie/no-container "
+                            f"stall and is not counted against the auto-retry budget."
+                        ),
                     )
-
-        # Remove any stale review cycle in-memory state so the fresh dispatch isn't
-        # mistaken for "still in progress" by review_cycle's own tracker — mirrors
-        # _cleanup_zombie_run's equivalent step, kept for the same uniform-restart
-        # reason (this is a clean restart, not a continuation of that cycle_state).
-        try:
-            from services.review_cycle import review_cycle_executor
-            ck = review_cycle_executor._cycle_key(project, issue_number)
-            cycle_state = review_cycle_executor.active_cycles.get(ck)
-            if cycle_state is None:
-                all_cycles = review_cycle_executor._load_active_cycles(project)
-                cycle_state = next((c for c in all_cycles if c.issue_number == issue_number), None)
-            if cycle_state:
-                review_cycle_executor._remove_cycle_state(cycle_state)
-                if ck in review_cycle_executor.active_cycles:
-                    del review_cycle_executor.active_cycles[ck]
-                logger.info(
-                    f"Removed stale review cycle state for {project} issue #{issue_number} "
-                    f"during active resume"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to clean up review cycle state during active resume for "
-                f"{project} issue #{issue_number}: {e}"
-            )
 
         try:
             from monitoring.observability_server import observability_server
@@ -878,6 +1002,7 @@ class PipelineWatchdog:
         issue_number: int,
         pipeline_run_id: str,
         retry_count: int,
+        reason: Optional[str] = None,
     ):
         """
         Surface a permanently-retained lock somewhere a human will actually see it.
@@ -886,13 +1011,27 @@ class PipelineWatchdog:
         event — nobody would notice until they went looking. This posts a comment on
         the issue itself (where the team already looks) and logs a distinctly-named
         decision event for dashboard/query visibility.
+
+        Args:
+            reason: Human-readable sentence describing WHY the lock is stuck,
+                used in place of the default "zombie-cleaned up N times...
+                auto-retry exhausted" framing. Required for any call site that
+                isn't reporting a genuine exhausted zombie-retry budget (e.g. a
+                self-heal redispatch failure, an active-resume failure, or a
+                workspace-broken case) — reusing the zombie-exhausted wording
+                for those produced factually wrong GitHub comments (e.g.
+                "zombie-cleaned up 0 times" from an active-resume path that
+                was never a zombie cleanup at all). Defaults to the original
+                zombie-exhausted framing for backward compatibility.
         """
-        message = (
-            f"## \N{WARNING SIGN} Pipeline Stuck — Manual Intervention Required\n\n"
+        reason_text = reason or (
             f"This issue's pipeline has zombie-cleaned up {retry_count} times in a row "
             f"(no agent container found for over {self.zombie_threshold_minutes} minutes each time) "
-            f"and the `{board}` board lock is now being retained deliberately — auto-retry has "
-            f"been exhausted since repeating the same failure wouldn't self-heal.\n\n"
+            f"and auto-retry has been exhausted since repeating the same failure wouldn't self-heal."
+        )
+        message = (
+            f"## \N{WARNING SIGN} Pipeline Stuck — Manual Intervention Required\n\n"
+            f"{reason_text} The `{board}` board lock is now being retained deliberately.\n\n"
             f"This blocks every other issue queued behind it on this board.\n\n"
             f"Someone needs to diagnose why this issue's pipeline keeps stalling "
             f"(check `/pipeline-investigate {pipeline_run_id}`) and then release the lock "
@@ -932,7 +1071,7 @@ class PipelineWatchdog:
                 project=project,
                 board=board,
                 issue_number=issue_number,
-                reason=f"Zombie-cleaned up {retry_count} times, auto-retry exhausted",
+                reason=reason or f"Zombie-cleaned up {retry_count} times, auto-retry exhausted",
                 details={
                     "pipeline_run_id": pipeline_run_id,
                     "retry_count": retry_count,

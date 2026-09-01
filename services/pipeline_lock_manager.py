@@ -1003,17 +1003,35 @@ class PipelineLockManager:
         the point: it stops any other issue from acquiring the pipeline lock in
         the gap between "this attempt failed" and "the retry actually starts",
         which is exactly the race that orphaned issue #853 in incident
-        e42ca133 — the lock was released outright, and a different issue
-        (#854) acquired it before the stalled-issue rescan could re-pick #853.
+        e42ca133 (in the managed documentation_robotics project's repo, not
+        this one — investigated live in a pipeline-investigate session, not a
+        separate written postmortem) — the lock was released outright, and a
+        different issue (#854) acquired it before the stalled-issue rescan
+        could re-pick #853.
 
         Safe to call even if the lock has no retained_reason set (no-op,
         returns True) — callers don't need to check get_retained_reason() first.
 
+        NOT the mirror image of mark_lock_failed()'s "succeeded if at least
+        one store wrote" contract, even though the write logic below looks
+        identical to it. get_lock()/get_lock_fail_closed()'s merge is
+        asymmetric: it merges retained_reason IN from whichever store has it
+        set, with no corresponding case for merging a clear OUT. So if only
+        one store's write here actually succeeds, the next read anywhere
+        (most importantly the retained-lock dispatch gate in
+        project_monitor.py) would silently re-merge the stale store's
+        retained_reason back in — reporting True here while the lock still
+        reads as retained is worse than reporting the clear failed, since the
+        caller's fail-safe branch (re-mark failed + notify a human) never
+        fires. Both writes must succeed for a True return; a partial write is
+        treated the same as a total failure.
+
         Returns:
-            True if the lock is held by issue_number (retained_reason cleared,
-            or already clear), False if no lock is currently held by this
-            issue (a bug upstream — logged as an error, mirroring
-            mark_lock_failed's same-shaped guard).
+            True if the lock is held by issue_number AND retained_reason is
+            durably clear in every store that's configured (already-clear is
+            a no-op True). False if no lock is currently held by this issue,
+            or if any configured store's write failed — callers MUST treat
+            False as "still retained, do not proceed with redispatch."
         """
         lock = self.get_lock(project, board)
         if not lock or lock.locked_by_issue != issue_number:
@@ -1043,11 +1061,20 @@ class PipelineLockManager:
 
         yaml_ok = self._save_lock_to_yaml(lock)
 
-        if not redis_ok and not yaml_ok:
+        # Unlike mark_lock_failed, a clear requires EVERY configured store to
+        # have actually succeeded — see the docstring's asymmetric-merge
+        # rationale above. redis_ok stays False (correctly) when no
+        # redis_client is configured at all, so guard for that case
+        # explicitly rather than requiring a write that was never attempted.
+        redis_satisfied = redis_ok or not self.redis_client
+        if not (redis_satisfied and yaml_ok):
             logger.error(
-                f"clear_retained_reason: BOTH Redis and YAML writes failed for "
-                f"{project}/{board} issue #{issue_number} — the lock may still "
-                f"read as retained elsewhere"
+                f"clear_retained_reason: could not durably clear retained_reason "
+                f"for {project}/{board} issue #{issue_number} in every store "
+                f"(redis_ok={redis_ok}, yaml_ok={yaml_ok}, "
+                f"redis_configured={bool(self.redis_client)}) — the lock may "
+                f"still read as retained via get_lock()'s merge; treating this "
+                f"as a failed clear"
             )
             return False
 

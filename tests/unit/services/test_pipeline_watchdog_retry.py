@@ -191,6 +191,7 @@ class TestCleanupZombieRunBrokenWorkspace:
 
     def test_retains_lock_on_first_attempt_when_workspace_has_conflicts(self, watchdog):
         with patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch, \
              patch.object(watchdog, "_is_workspace_git_broken", return_value=True):
             watchdog._cleanup_zombie_run(
                 pipeline_run_id="run-1",
@@ -203,12 +204,18 @@ class TestCleanupZombieRunBrokenWorkspace:
         call = watchdog.pipeline_run_manager.end_pipeline_run.call_args
         assert call.kwargs["retain_lock"] is True
         notify.assert_called_once()
+        # A broken workspace must skip self-heal entirely -- not just retain
+        # the lock, but never even attempt to clear it or redispatch (that
+        # would just repeat the identical failure for the next issue too).
+        watchdog.lock_manager.clear_retained_reason.assert_not_called()
+        redispatch.assert_not_called()
 
     def test_does_not_consume_retry_budget_illusion_for_next_issue(self, watchdog):
         # Even though each issue number gets its own retry counter (by design,
         # for independent stalls), a broken workspace must retain the lock
         # for every issue that hits it -- not just the first.
         with patch.object(watchdog, "_notify_lock_stuck"), \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch, \
              patch.object(watchdog, "_is_workspace_git_broken", return_value=True):
             for issue in (790, 791, 792, 793):
                 watchdog._cleanup_zombie_run(
@@ -221,6 +228,8 @@ class TestCleanupZombieRunBrokenWorkspace:
 
         for call in watchdog.pipeline_run_manager.end_pipeline_run.call_args_list:
             assert call.kwargs["retain_lock"] is True
+        watchdog.lock_manager.clear_retained_reason.assert_not_called()
+        redispatch.assert_not_called()
 
     def test_healthy_workspace_still_uses_normal_retry_budget(self, watchdog):
         # Sanity check: the new check must not change behavior for a clean
@@ -273,9 +282,15 @@ class TestRedispatchSameIssue:
     """
     PipelineWatchdog._redispatch_same_issue — the self-heal redispatch helper
     both _cleanup_zombie_run and _actively_resume_run rely on. Exercises its
-    own GraphQL/config-lookup plumbing directly (the tests above patch this
-    method out entirely, since they only care about the caller's decision
-    logic).
+    own column-lookup/stale-state/dispatch plumbing directly (the tests above
+    patch this method out entirely, since they only care about the caller's
+    decision logic).
+
+    Column resolution goes through ProjectMonitor.get_issue_column_sync(),
+    the same board-aware lookup ProjectMonitor itself uses elsewhere (see
+    _get_parent_column_on_board's project.number filter) — not a bespoke
+    GraphQL query, so an issue on multiple Projects v2 boards at once can't
+    resolve the wrong board's column.
     """
 
     def _fake_project_config(self):
@@ -283,26 +298,18 @@ class TestRedispatchSameIssue:
         cfg.github = {"org": "the-org", "repo": "the-repo"}
         return cfg
 
-    def _graphql_response(self, state="OPEN", column="Code Review"):
-        nodes = [{"fieldValueByName": {"name": column}}] if column else []
-        return (True, {
-            "repository": {
-                "issue": {
-                    "state": state,
-                    "projectItems": {"nodes": nodes},
-                }
-            }
-        })
-
     def test_redispatches_with_current_column_and_repo(self, watchdog):
-        github_client = Mock()
-        github_client.graphql.return_value = self._graphql_response(column="Code Review")
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = "task-abc"
 
         with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
-             patch("services.github_api_client.get_github_client", return_value=github_client):
+             patch("services.work_execution_state.work_execution_tracker") as mock_tracker:
             result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
 
         assert result is True
+        watchdog.project_monitor.get_issue_column_sync.assert_called_once_with(
+            "proj", "SDLC Execution", 159
+        )
         watchdog.project_monitor.trigger_agent_for_status.assert_called_once_with(
             project_name="proj",
             board_name="SDLC Execution",
@@ -311,6 +318,27 @@ class TestRedispatchSameIssue:
             repository="the-repo",
             lock_already_acquired=True,
         )
+        # Stale in_progress state must be abandoned BEFORE the dispatch call,
+        # with an empty active_task_ids set — this issue's zombie/frozen
+        # container is already confirmed dead by the caller, so every
+        # in_progress entry for it is unconditionally stale.
+        mock_tracker.abandon_stale_in_progress_entries.assert_called_once_with(
+            project_name="proj", issue_number=159, active_task_ids=set()
+        )
+
+    def test_returns_false_when_trigger_agent_for_status_returns_none(self, watchdog):
+        """The core regression test for the bug this fix addresses: a legitimate
+        no-op inside trigger_agent_for_status (retained-lock gate, duplicate
+        task, queue-priority wait, etc.) must be treated as a failed
+        redispatch, not silently reported as success."""
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = None
+
+        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is False
 
     def test_returns_false_when_no_project_monitor(self, watchdog):
         watchdog.project_monitor = None
@@ -322,34 +350,204 @@ class TestRedispatchSameIssue:
             assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
         watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
 
-    def test_returns_false_when_graphql_fails(self, watchdog):
-        github_client = Mock()
-        github_client.graphql.return_value = (False, "boom")
-
-        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
-             patch("services.github_api_client.get_github_client", return_value=github_client):
-            assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
-        watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
-
-    def test_returns_false_when_issue_closed(self, watchdog):
-        github_client = Mock()
-        github_client.graphql.return_value = self._graphql_response(state="CLOSED")
-
-        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
-             patch("services.github_api_client.get_github_client", return_value=github_client):
-            assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
-        watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
-
     def test_returns_false_when_no_current_column(self, watchdog):
-        github_client = Mock()
-        github_client.graphql.return_value = self._graphql_response(column=None)
+        watchdog.project_monitor.get_issue_column_sync.return_value = None
 
-        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
-             patch("services.github_api_client.get_github_client", return_value=github_client):
+        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()):
             assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
         watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
+
+    def test_continues_dispatch_when_abandon_stale_entries_raises(self, watchdog):
+        """abandon_stale_in_progress_entries is a best-effort call — if it
+        raises, the redispatch attempt must still proceed (it's more useful
+        to try the dispatch and possibly hit work_already_in_progress than
+        to abandon the whole retry over a bookkeeping failure)."""
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = "task-abc"
+
+        with patch("config.manager.config_manager.get_project_config", return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker") as mock_tracker:
+            mock_tracker.abandon_stale_in_progress_entries.side_effect = RuntimeError("boom")
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is True
+        watchdog.project_monitor.trigger_agent_for_status.assert_called_once()
 
     def test_returns_false_on_unexpected_exception(self, watchdog):
         with patch("config.manager.config_manager.get_project_config", side_effect=RuntimeError("boom")):
             assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
         watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
+
+
+class TestProductionFallbackDependencies:
+    """
+    PipelineWatchdog.lock_manager and .project_monitor are both optional,
+    injectable for tests, and fall back to the process-global singleton when
+    not provided -- that fallback path is what production wiring actually
+    relies on (scheduled_tasks.py's _cleanup_zombie_pipeline_runs constructs
+    the watchdog with no project_monitor argument at all; get_pipeline_
+    watchdog()'s own signature doesn't even expose one). Every other test in
+    this file injects both, so this class is the only coverage of those two
+    fallback branches actually being reached and used successfully.
+    """
+
+    def _watchdog_without_injected_deps(self):
+        pipeline_run_manager = Mock()
+        pipeline_run_manager.redis = FakeRedis()
+        pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
+        return PipelineWatchdog(
+            es_client=Mock(),
+            pipeline_run_manager=pipeline_run_manager,
+            # lock_manager and project_monitor deliberately omitted (None)
+        )
+
+    def test_cleanup_zombie_run_uses_global_lock_manager_when_none_injected(self):
+        wd = self._watchdog_without_injected_deps()
+        global_lock_mgr = Mock()
+        global_lock_mgr.clear_retained_reason.return_value = True
+
+        with patch(
+            "services.pipeline_lock_manager.get_pipeline_lock_manager",
+            return_value=global_lock_mgr,
+        ), patch.object(wd, "_redispatch_same_issue", return_value=True) as redispatch, \
+           patch.object(wd, "_notify_lock_stuck") as notify:
+            wd._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        global_lock_mgr.clear_retained_reason.assert_called_once_with(
+            "proj", "SDLC Execution", 42
+        )
+        redispatch.assert_called_once()
+        notify.assert_not_called()
+
+    def test_redispatch_uses_global_project_monitor_when_none_injected(self):
+        wd = self._watchdog_without_injected_deps()
+        global_monitor = Mock()
+        global_monitor.get_issue_column_sync.return_value = "Code Review"
+        global_monitor.trigger_agent_for_status.return_value = "task-abc"
+        cfg = Mock()
+        cfg.github = {"org": "the-org", "repo": "the-repo"}
+
+        with patch("services.project_monitor.get_project_monitor", return_value=global_monitor), \
+             patch("config.manager.config_manager.get_project_config", return_value=cfg), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = wd._redispatch_same_issue("proj", "SDLC Execution", 42)
+
+        assert result is True
+        global_monitor.trigger_agent_for_status.assert_called_once_with(
+            project_name="proj",
+            board_name="SDLC Execution",
+            issue_number=42,
+            status="Code Review",
+            repository="the-repo",
+            lock_already_acquired=True,
+        )
+
+
+class TestCleanupZombieRunWithRealLockManager:
+    """
+    Integration coverage using a REAL PipelineLockManager (YAML-only, no
+    Redis) instead of a mock, and _redispatch_same_issue is NOT stubbed out
+    -- only its own external boundary (ProjectMonitor) is. This is the one
+    test in the suite that actually proves the property this PR exists for:
+    the lock stays held by the SAME issue for the entire self-heal window,
+    rather than just asserting the right mock methods were called with the
+    right arguments.
+    """
+
+    def _real_lock_manager(self, tmp_path):
+        from services.pipeline_lock_manager import PipelineLockManager
+        return PipelineLockManager(state_dir=tmp_path, redis_client=None)
+
+    def _watchdog(self, lock_mgr, project_monitor):
+        pipeline_run_manager = Mock()
+        pipeline_run_manager.redis = FakeRedis()
+        pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
+        return PipelineWatchdog(
+            es_client=Mock(),
+            pipeline_run_manager=pipeline_run_manager,
+            lock_manager=lock_mgr,
+            project_monitor=project_monitor,
+        )
+
+    def test_lock_never_leaves_the_issue_across_a_full_self_heal_cycle(self, tmp_path):
+        lock_mgr = self._real_lock_manager(tmp_path)
+        lock_mgr._create_lock("proj", "SDLC Execution", 159)
+        # Simulate what end_pipeline_run's outcome="failed" branch would have
+        # already durably done before self-heal even starts.
+        lock_mgr.mark_lock_failed("proj", "SDLC Execution", 159, reason="agent crashed")
+        assert lock_mgr.get_lock("proj", "SDLC Execution").retained_reason is not None
+
+        project_monitor = Mock()
+        project_monitor.get_issue_column_sync.return_value = "Code Review"
+        project_monitor.trigger_agent_for_status.return_value = "task-abc"
+        wd = self._watchdog(lock_mgr, project_monitor)
+
+        with patch("config.manager.config_manager.get_project_config") as get_cfg, \
+             patch("services.work_execution_state.work_execution_tracker"), \
+             patch.object(wd, "_notify_lock_stuck") as notify:
+            cfg = Mock()
+            cfg.github = {"org": "the-org", "repo": "the-repo"}
+            get_cfg.return_value = cfg
+            wd._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=159,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        lock = lock_mgr.get_lock("proj", "SDLC Execution")
+        # The property that matters: still held by issue 159, no longer
+        # durably retained, and never released to any other issue.
+        assert lock.locked_by_issue == 159
+        assert lock.lock_status == "locked"
+        assert lock.retained_reason is None
+        project_monitor.trigger_agent_for_status.assert_called_once()
+        assert project_monitor.trigger_agent_for_status.call_args.kwargs["lock_already_acquired"] is True
+        notify.assert_not_called()
+
+        # And the lock genuinely refuses a different issue in the meantime --
+        # this is the actual orphaning bug (incident e42ca133) this proves
+        # can no longer happen.
+        can_acquire, _reason = lock_mgr.try_acquire_lock("proj", "SDLC Execution", 999)
+        assert can_acquire is False
+
+    def test_redispatch_failure_restores_durable_retention_with_real_lock_manager(self, tmp_path):
+        """When the redispatch itself fails after the durable mark was
+        cleared, mark_lock_failed must actually re-apply against the real
+        lock -- not just be called on a mock -- so a subsequent
+        get_retained_reason() genuinely refuses re-dispatch."""
+        lock_mgr = self._real_lock_manager(tmp_path)
+        lock_mgr._create_lock("proj", "SDLC Execution", 159)
+        lock_mgr.mark_lock_failed("proj", "SDLC Execution", 159, reason="agent crashed")
+
+        project_monitor = Mock()
+        project_monitor.get_issue_column_sync.return_value = "Code Review"
+        project_monitor.trigger_agent_for_status.return_value = None  # no-op, per finding #1
+        wd = self._watchdog(lock_mgr, project_monitor)
+
+        with patch("config.manager.config_manager.get_project_config") as get_cfg, \
+             patch("services.work_execution_state.work_execution_tracker"), \
+             patch.object(wd, "_notify_lock_stuck") as notify:
+            cfg = Mock()
+            cfg.github = {"org": "the-org", "repo": "the-repo"}
+            get_cfg.return_value = cfg
+            wd._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=159,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        lock = lock_mgr.get_lock("proj", "SDLC Execution")
+        assert lock.locked_by_issue == 159
+        assert lock.retained_reason is not None
+        assert lock_mgr.get_retained_reason("proj", "SDLC Execution", 159) is not None
+        notify.assert_called_once()
