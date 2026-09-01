@@ -14,6 +14,23 @@ const formatTokens = (num) => {
   return num.toLocaleString()
 }
 
+// "2026-09-01T10:52:48.159015" -> "3m ago". Used to make a stale GitHub
+// rate-limit reading self-evidently stale (an age, not just a dim asterisk) -
+// staleness is the expected state whenever nothing has called GitHub
+// recently, not a bug signal, so it needs to read as normal, not alarming.
+const formatRelativeTime = (isoString) => {
+  if (!isoString) return null
+  const then = new Date(isoString).getTime()
+  if (Number.isNaN(then)) return null
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - then) / 1000))
+  if (diffSeconds < 60) return 'just now'
+  const diffMinutes = Math.floor(diffSeconds / 60)
+  if (diffMinutes < 60) return `${diffMinutes}m ago`
+  const diffHours = Math.floor(diffMinutes / 60)
+  if (diffHours < 24) return `${diffHours}h ago`
+  return `${Math.floor(diffHours / 24)}d ago`
+}
+
 export default function HeaderSystemHealth() {
   const { checks, loading } = useSystemHealth()
 
@@ -48,8 +65,10 @@ export default function HeaderSystemHealth() {
     <HeaderBox title="API Usage" minWidth="md:min-w-[180px]">
       <div className="space-y-2.5">
         {/* GitHub API Usage - GraphQL and REST are separate rate-limit
-            buckets (issue #103); fall back to the conflated 'api_usage'
-            field if a health payload without the split fields is ever seen. */}
+            buckets tracked from real per-call response headers, shared
+            across every process using the token via Redis (issue #103
+            follow-up); fall back to the conflated 'api_usage' field if a
+            health payload without the split fields is ever seen. */}
         {(githubCheck?.api_usage_graphql || githubCheck?.api_usage_rest || githubCheck?.api_usage) && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5 text-xs">
@@ -59,38 +78,36 @@ export default function HeaderSystemHealth() {
             <div className="pl-4.5 space-y-0.5">
               {githubCheck?.api_usage_graphql || githubCheck?.api_usage_rest ? (
                 <>
-                  {githubCheck?.api_usage_graphql && (
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-gh-fg-muted">
-                        GraphQL
-                        {githubCheck.api_usage_graphql.stale && (
-                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
-                        )}
-                      </span>
-                      <span className={getUsageColor(githubCheck.api_usage_graphql.percentage_used)}>
-                        {formatNumber(githubCheck.api_usage_graphql.remaining)} / {formatNumber(githubCheck.api_usage_graphql.limit)}
-                      </span>
-                    </div>
-                  )}
-                  {githubCheck?.api_usage_rest && (
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="text-gh-fg-muted">
-                        REST
-                        {githubCheck.api_usage_rest.stale && (
-                          <span title="Not yet refreshed from GitHub - number may not be current">*</span>
-                        )}
-                      </span>
-                      <span className={getUsageColor(githubCheck.api_usage_rest.percentage_used)}>
-                        {formatNumber(githubCheck.api_usage_rest.remaining)} / {formatNumber(githubCheck.api_usage_rest.limit)}
-                      </span>
-                    </div>
-                  )}
+                  <GithubBucketRow
+                    label="GraphQL"
+                    bucket={githubCheck?.api_usage_graphql}
+                    getUsageColor={getUsageColor}
+                    formatNumber={formatNumber}
+                  />
+                  <GithubBucketRow
+                    label="REST"
+                    bucket={githubCheck?.api_usage_rest}
+                    getUsageColor={getUsageColor}
+                    formatNumber={formatNumber}
+                  />
                 </>
               ) : (
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-gh-fg-muted">Remaining</span>
                   <span className={getUsageColor(githubCheck.api_usage.percentage_used)}>
                     {formatNumber(githubCheck.api_usage.remaining)} / {formatNumber(githubCheck.api_usage.limit)}
+                  </span>
+                </div>
+              )}
+              {/* Call volume doesn't depend on the token-quota mechanism
+                  above at all, so it stays meaningful context even while
+                  the quota reading is stale or never-observed - a way to
+                  see "the system is working" independent of that number. */}
+              {githubCheck?.api_call_stats && (
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gh-fg-muted">Calls (since restart)</span>
+                  <span className="text-gh-fg-default">
+                    {formatNumber(githubCheck.api_call_stats.total_requests)}
                   </span>
                 </div>
               )}
@@ -129,6 +146,48 @@ export default function HeaderSystemHealth() {
         )}
       </div>
     </HeaderBox>
+  )
+}
+
+// Renders one rate-limit bucket in one of three distinct states:
+// never observed (no process has ever published a real reading for this
+// bucket), stale (have a reading, but nothing's called GitHub recently
+// enough to trust it), or fresh. Conflating the first two into a single
+// "stale" flag used to make a genuinely broken feature look identical to
+// a quiet, healthy one (issue #103) - keeping them apart is the point.
+function GithubBucketRow({ label, bucket, getUsageColor, formatNumber }) {
+  if (!bucket) return null
+
+  if (bucket.never_observed) {
+    return (
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-gh-fg-muted">{label}</span>
+        <span className="text-gh-fg-muted" title="No real GitHub API response has been observed yet">
+          not yet observed
+        </span>
+      </div>
+    )
+  }
+
+  const age = formatRelativeTime(bucket.last_updated)
+
+  return (
+    <div className="flex items-center justify-between text-xs">
+      <span className="text-gh-fg-muted">{label}</span>
+      <span className="text-right">
+        <span className={getUsageColor(bucket.percentage_used)}>
+          {formatNumber(bucket.remaining)} / {formatNumber(bucket.limit)}
+        </span>
+        {bucket.stale && age && (
+          <span
+            className="text-gh-fg-muted ml-1"
+            title="No recent GitHub call to refresh this number"
+          >
+            ({age})
+          </span>
+        )}
+      </span>
+    </div>
   )
 }
 

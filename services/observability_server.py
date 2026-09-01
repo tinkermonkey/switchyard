@@ -445,15 +445,28 @@ def health():
             }
             return jsonify(response_data), 503
         
-        # IMPORTANT: Always fetch fresh rate limit data instead of using cached values
-        # The rate limit changes frequently (every API call), so we should not rely on
-        # cached values that may be stale. The background rate limit checker updates
-        # the client object every 5 minutes, so always get the latest status.
+        # Always read the shared, Redis-backed rate limit view instead of the
+        # cached health blob's copy, so a quiet period between HealthMonitor
+        # cycles doesn't show numbers older than they need to be. This
+        # process (observability-server) never makes real GitHub traffic
+        # itself, so it deliberately does NOT instantiate its own
+        # GitHubAPIClient for this any more - get_shared_rate_limit_status()
+        # reads whatever the orchestrator (or a repair-cycle/agent
+        # container) most recently published from a real response's
+        # headers. A local client here used to "refresh" these numbers from
+        # a periodic self-poll of GitHub's /rate_limit endpoint, which was
+        # found to return bogus always-full data for at least one
+        # token/org (issue #103 follow-up) - that whole path is gone.
+        # Circuit breaker state is left as HealthMonitor cached it: it's
+        # process-local and HealthMonitor runs in-process with the
+        # orchestrator's real traffic, so "freshening" it from this
+        # process's own (never-tripped) breaker would only make it wrong.
         try:
-            from services.github_api_client import get_github_client
-            github_client = get_github_client()
-            client_status = github_client.get_status()
-            
+            from services.github_api_client import get_shared_rate_limit_status
+
+            rate_limit_graphql = get_shared_rate_limit_status('graphql')
+            rate_limit_rest = get_shared_rate_limit_status('rest')
+
             # 'rate_limit'/'api_rate_limit'/'api_usage' are kept for
             # backward compat and mirror the GraphQL bucket only. GitHub
             # enforces separate REST and GraphQL rate-limit buckets
@@ -462,46 +475,22 @@ def health():
             # instead of whichever bucket last happened to update the
             # conflated field.
             fresh_rate_limit = {
-                'remaining': client_status['rate_limit']['remaining'],
-                'limit': client_status['rate_limit']['limit'],
-                'percentage_used': client_status['rate_limit']['percentage_used'],
-                'reset_time': client_status['rate_limit']['reset_time'],
-            }
-            # 'stale' distinguishes a genuinely healthy "0% used" from
-            # "never actually populated" (issue #103) - both look
-            # identical in remaining/limit alone since a bucket defaults
-            # to 5000/5000 before its first real GitHub response.
-            fresh_rate_limit_graphql = {
-                'remaining': client_status['rate_limit_graphql']['remaining'],
-                'limit': client_status['rate_limit_graphql']['limit'],
-                'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
-                'reset_time': client_status['rate_limit_graphql']['reset_time'],
-                'last_updated': client_status['rate_limit_graphql']['last_updated'],
-                'stale': client_status['rate_limit_graphql']['stale'],
-            }
-            fresh_rate_limit_rest = {
-                'remaining': client_status['rate_limit_rest']['remaining'],
-                'limit': client_status['rate_limit_rest']['limit'],
-                'percentage_used': client_status['rate_limit_rest']['percentage_used'],
-                'reset_time': client_status['rate_limit_rest']['reset_time'],
-                'last_updated': client_status['rate_limit_rest']['last_updated'],
-                'stale': client_status['rate_limit_rest']['stale'],
-            }
-            
-            fresh_circuit_breaker = {
-                'state': client_status['breaker']['state'],
-                'is_open': client_status['breaker']['is_open'],
-                'opened_at': client_status['breaker']['opened_at'],
-                'reset_time': client_status['breaker']['reset_time'],
+                'remaining': rate_limit_graphql['remaining'],
+                'limit': rate_limit_graphql['limit'],
+                'percentage_used': rate_limit_graphql['percentage_used'],
+                'reset_time': rate_limit_graphql['reset_time'],
             }
 
-            # Update the cached health data with fresh rate limit and circuit breaker info
+            # Update the cached health data with the fresh rate limit info
             if 'checks' in health_data and 'github' in health_data['checks']:
                 health_data['checks']['github']['api_rate_limit'] = fresh_rate_limit
-                health_data['checks']['github']['api_rate_limit_graphql'] = fresh_rate_limit_graphql
-                health_data['checks']['github']['api_rate_limit_rest'] = fresh_rate_limit_rest
-                health_data['checks']['github']['circuit_breaker'] = fresh_circuit_breaker
-                # Add dedicated api_usage sections for UI consumption
+                health_data['checks']['github']['api_rate_limit_graphql'] = rate_limit_graphql
+                health_data['checks']['github']['api_rate_limit_rest'] = rate_limit_rest
+                # Add dedicated api_usage sections for UI consumption.
+                # 'never_observed' (no process has ever published a real
+                # reading for this bucket) and 'stale' (the most recent
+                # reading is older than the freshness threshold) are
+                # deliberately distinct - see get_shared_rate_limit_status().
                 health_data['checks']['github']['api_usage'] = {
                     'remaining': fresh_rate_limit['remaining'],
                     'limit': fresh_rate_limit['limit'],
@@ -509,18 +498,22 @@ def health():
                     'reset_time': fresh_rate_limit['reset_time']
                 }
                 health_data['checks']['github']['api_usage_graphql'] = {
-                    'remaining': fresh_rate_limit_graphql['remaining'],
-                    'limit': fresh_rate_limit_graphql['limit'],
-                    'percentage_used': fresh_rate_limit_graphql['percentage_used'],
-                    'reset_time': fresh_rate_limit_graphql['reset_time'],
-                    'stale': fresh_rate_limit_graphql['stale'],
+                    'remaining': rate_limit_graphql['remaining'],
+                    'limit': rate_limit_graphql['limit'],
+                    'percentage_used': rate_limit_graphql['percentage_used'],
+                    'reset_time': rate_limit_graphql['reset_time'],
+                    'last_updated': rate_limit_graphql['last_updated'],
+                    'never_observed': rate_limit_graphql['never_observed'],
+                    'stale': rate_limit_graphql['stale'],
                 }
                 health_data['checks']['github']['api_usage_rest'] = {
-                    'remaining': fresh_rate_limit_rest['remaining'],
-                    'limit': fresh_rate_limit_rest['limit'],
-                    'percentage_used': fresh_rate_limit_rest['percentage_used'],
-                    'reset_time': fresh_rate_limit_rest['reset_time'],
-                    'stale': fresh_rate_limit_rest['stale'],
+                    'remaining': rate_limit_rest['remaining'],
+                    'limit': rate_limit_rest['limit'],
+                    'percentage_used': rate_limit_rest['percentage_used'],
+                    'reset_time': rate_limit_rest['reset_time'],
+                    'last_updated': rate_limit_rest['last_updated'],
+                    'never_observed': rate_limit_rest['never_observed'],
+                    'stale': rate_limit_rest['stale'],
                 }
         except Exception as e:
             logger.debug(f"Failed to fetch fresh rate limit data: {e}")

@@ -418,56 +418,54 @@ class HealthMonitor:
         # Determine if we have degraded functionality
         degraded = not github_capabilities.has_capability(GitHubCapability.GITHUB_APP_AUTH)
 
-        # Get GitHub API rate limit and circuit breaker status
-        # Note: The rate limit data includes default values (5000/5000) until the background
-        # rate limit checker first runs (every 5 minutes). The /health endpoint will fetch
-        # fresh rate limit data to avoid returning stale cached values.
+        # Get GitHub API rate limit and circuit breaker status.
+        # Rate limit numbers come from get_shared_rate_limit_status() - the
+        # Redis-backed cross-process view populated by real per-call
+        # response headers, from whichever process (this one, a
+        # repair-cycle container, an agent container) actually made the
+        # most recent call - not from this process's own GitHubAPIClient,
+        # which only reflects real GitHub traffic when this process is the
+        # one generating it. (A periodic self-poll of GitHub's /rate_limit
+        # endpoint used to populate this instead; removed after it was
+        # found to return bogus always-full data for at least one
+        # token/org - issue #103 follow-up.) Circuit breaker and call-volume
+        # stats stay local to this process's own client since HealthMonitor
+        # runs in-process with the orchestrator's real traffic, so that
+        # client's view of its own breaker/call-count is accurate here.
         try:
+            from services.github_api_client import get_shared_rate_limit_status
+
             github_client = get_github_client()
             client_status = github_client.get_status()
-            
+
+            rate_limit_graphql_info = get_shared_rate_limit_status('graphql')
+            rate_limit_rest_info = get_shared_rate_limit_status('rest')
+
             # 'api_rate_limit' is kept for backward compat and mirrors the
             # GraphQL bucket (see GitHubAPIClient.__init__); GraphQL and
             # REST are separate GitHub rate-limit buckets (issue #103), so
-            # 'api_rate_limit_graphql' / 'api_rate_limit_rest' below are the
+            # 'api_rate_limit_graphql' / 'api_rate_limit_rest' above are the
             # ones that should be read going forward.
             rate_limit_info = {
-                'remaining': client_status['rate_limit']['remaining'],
-                'limit': client_status['rate_limit']['limit'],
-                'percentage_used': client_status['rate_limit']['percentage_used'],
-                'reset_time': client_status['rate_limit']['reset_time'],
+                'remaining': rate_limit_graphql_info['remaining'],
+                'limit': rate_limit_graphql_info['limit'],
+                'percentage_used': rate_limit_graphql_info['percentage_used'],
+                'reset_time': rate_limit_graphql_info['reset_time'],
             }
-            # 'stale' distinguishes a genuinely healthy "0% used" from
-            # "never actually populated" (issue #103) - both look
-            # identical in remaining/limit alone since a bucket defaults
-            # to 5000/5000 before its first real GitHub response.
-            rate_limit_graphql_info = {
-                'remaining': client_status['rate_limit_graphql']['remaining'],
-                'limit': client_status['rate_limit_graphql']['limit'],
-                'percentage_used': client_status['rate_limit_graphql']['percentage_used'],
-                'reset_time': client_status['rate_limit_graphql']['reset_time'],
-                'last_updated': client_status['rate_limit_graphql']['last_updated'],
-                'stale': client_status['rate_limit_graphql']['stale'],
-            }
-            rate_limit_rest_info = {
-                'remaining': client_status['rate_limit_rest']['remaining'],
-                'limit': client_status['rate_limit_rest']['limit'],
-                'percentage_used': client_status['rate_limit_rest']['percentage_used'],
-                'reset_time': client_status['rate_limit_rest']['reset_time'],
-                'last_updated': client_status['rate_limit_rest']['last_updated'],
-                'stale': client_status['rate_limit_rest']['stale'],
-            }
-            
+
             circuit_breaker_info = {
                 'state': client_status['breaker']['state'],
                 'is_open': client_status['breaker']['is_open'],
                 'opened_at': client_status['breaker']['opened_at'],
                 'reset_time': client_status['breaker']['reset_time'],
             }
-            
-            # Check if either bucket is critically low
-            if (client_status['rate_limit_graphql']['percentage_used'] > 95
-                    or client_status['rate_limit_rest']['percentage_used'] > 95):
+
+            call_stats_info = client_status['stats']
+
+            # Check if either bucket is critically low (only meaningful
+            # once a real reading exists for that bucket)
+            if ((rate_limit_graphql_info['percentage_used'] or 0) > 95
+                    or (rate_limit_rest_info['percentage_used'] or 0) > 95):
                 degraded = True
         except Exception as e:
             logger.debug(f"Failed to get GitHub API client status: {e}")
@@ -475,6 +473,7 @@ class HealthMonitor:
             rate_limit_graphql_info = None
             rate_limit_rest_info = None
             circuit_breaker_info = None
+            call_stats_info = None
 
         result = {
             'healthy': True,  # Core functionality works with PAT
@@ -493,6 +492,7 @@ class HealthMonitor:
             'api_rate_limit_graphql': rate_limit_graphql_info,
             'api_rate_limit_rest': rate_limit_rest_info,
             'circuit_breaker': circuit_breaker_info,
+            'api_call_stats': call_stats_info,
         }
         
         # Cache successful result

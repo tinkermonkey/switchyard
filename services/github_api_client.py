@@ -28,6 +28,20 @@ logger = logging.getLogger(__name__)
 #TRACE_API_CALLS = os.environ.get('TRACE_GITHUB_API_CALLS', 'false').lower() == 'true'
 TRACE_API_CALLS = True
 
+# Redis keys each GitHubAPIClient mirrors its real-response-derived rate
+# limit readings to, and that get_shared_rate_limit_status() reads back -
+# the cross-process view of "how much quota is left right now", regardless
+# of which process (orchestrator, a repair-cycle container, an agent
+# container) actually made the call that produced the reading.
+RATE_LIMIT_REDIS_KEYS = {
+    'rest': 'github:rate_limit:rest',
+    'graphql': 'github:rate_limit:graphql',
+}
+
+# A shared reading older than this is shown as stale rather than trusted -
+# matches GitHubRateLimitStatus.is_stale()'s default threshold.
+RATE_LIMIT_STALE_THRESHOLD_SECONDS = 900
+
 
 class GitHubRateLimitStatus:
     """Track GitHub API rate limit status and remaining quota."""
@@ -256,14 +270,20 @@ class GitHubAPIClient:
         # Call trace tracking
         self.call_trace_buffer = []  # List of (timestamp, operation_type, caller_info) tuples
         self.call_trace_lock = Lock()
-        
+
         logger.info("GitHub API client initialized with rate limiting")
-        
-        # Fetch initial rate limit from GitHub API (async - don't block initialization)
-        self._fetch_initial_rate_limit()
-        
-        # Start background rate limit checker thread (runs every 5 minutes)
-        self._start_rate_limit_checker()
+
+        # Periodically summarize/trim the call trace buffer. (This used to
+        # also re-poll GitHub's dedicated /rate_limit endpoint every 5
+        # minutes to populate rate_limit_rest/rate_limit_graphql, but that
+        # endpoint was found to return bogus always-full data for at least
+        # one token/org - see issue #103 follow-up. Rate limit state is now
+        # sourced exclusively from real per-call response headers via
+        # _update_rate_limit_from_http_headers()/
+        # _update_rate_limit_from_graphql_response(), which also mirror
+        # each update to Redis for other processes to read via
+        # get_shared_rate_limit_status().)
+        self._start_call_trace_summarizer()
     
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None, retries: int = 0) -> Tuple[bool, Any]:
         """
@@ -306,7 +326,16 @@ class GitHubAPIClient:
         # Build command for GraphQL
         # When variables are present, use stdin to pass the full JSON payload
         # This avoids issues with -F flag not properly handling complex GraphQL variables
-        cmd = ['gh', 'api', 'graphql']
+        # --include prefixes stdout with the HTTP status line and response
+        # headers, same as rest()'s use of it - GitHub reports real,
+        # per-call GraphQL-bucket usage there (x-ratelimit-remaining etc.)
+        # regardless of whether the query itself asks for cost/rateLimit
+        # data in its body. Without this, _update_rate_limit_from_graphql_
+        # response()'s extensions.cost.rateLimit/data.rateLimit fallback
+        # only fires for queries that explicitly request it, which most of
+        # this client's real traffic doesn't - leaving the GraphQL bucket
+        # populated only by the rare query that does.
+        cmd = ['gh', 'api', 'graphql', '--include']
         input_data = None
 
         if variables:
@@ -358,29 +387,39 @@ class GitHubAPIClient:
                 
                 return False, {"error": "failed_after_retries", "stderr": result.stderr}
             
+            # Recover the GraphQL-bucket rate limit info from the headers
+            # --include prepends to stdout (see cmd construction above),
+            # then parse the JSON body out of what's left.
+            headers, body = self._parse_gh_api_include_output(result.stdout)
+            if headers:
+                self._update_rate_limit_from_graphql_headers(headers)
+
             # Parse response
             try:
-                response = json.loads(result.stdout)
-                
-                # Update rate limit from response
+                response = json.loads(body)
+
+                # Fallback: some queries also carry rate limit info in the
+                # response body itself (extensions.cost.rateLimit /
+                # data.rateLimit) - harmless to apply on top of the header
+                # reading above, since both describe the same real call.
                 self._update_rate_limit_from_graphql_response(response)
-                
+
                 # Check for GraphQL errors
                 if 'errors' in response:
                     logger.error(f"GraphQL errors: {response['errors']}")
                     return False, response
-                
+
                 # Reset backoff on success
                 self.backoff_multiplier = 1.0
-                
+
                 # Track the operation
                 self.track_gh_operation('graphql', 'GraphQL query executed successfully')
-                
+
                 return True, response.get('data', response)
-            
+
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse GraphQL response: {e}")
-                return False, {"error": "parse_error", "raw_output": result.stdout}
+                return False, {"error": "parse_error", "raw_output": body}
         
         except subprocess.TimeoutExpired:
             logger.error("GraphQL query timed out")
@@ -706,11 +745,13 @@ class GitHubAPIClient:
                 self.rate_limit_graphql.resource_type = "graphql"
                 self.rate_limit_graphql.last_updated = datetime.now()
                 self.rate_limit_graphql.ever_updated = True
-                
+
                 logger.debug(
                     f"Rate limit update (GraphQL): {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
                     f"({self.rate_limit_graphql.get_percentage_used():.1f}% used)"
                 )
+
+                self._mirror_rate_limit_to_redis(self.rate_limit_graphql, RATE_LIMIT_REDIS_KEYS['graphql'])
         except Exception as e:
             logger.debug(f"Could not extract rate limit from response: {e}")
     
@@ -757,13 +798,52 @@ class GitHubAPIClient:
             self.rate_limit_rest.resource_type = "rest"
             self.rate_limit_rest.last_updated = datetime.now()
             self.rate_limit_rest.ever_updated = True
-            
+
             logger.debug(
                 f"Rate limit update (REST): {self.rate_limit_rest.remaining}/{self.rate_limit_rest.limit} "
                 f"({self.rate_limit_rest.get_percentage_used():.1f}% used)"
             )
+
+            self._mirror_rate_limit_to_redis(self.rate_limit_rest, RATE_LIMIT_REDIS_KEYS['rest'])
         except Exception as e:
             logger.debug(f"Could not extract rate limit from REST headers: {e}")
+
+    def _update_rate_limit_from_graphql_headers(self, headers: Dict[str, str]):
+        """Update the GraphQL bucket from raw x-ratelimit-* response headers.
+
+        Used by graphql()'s `gh api graphql --include` path (headers
+        recovered from CLI stdout - see _parse_gh_api_include_output).
+        GitHub does report this bucket's header value as "graphql", but
+        resource_type is stamped explicitly here anyway, matching
+        _update_rate_limit_from_http_headers's approach for the REST
+        bucket, so reporting stays consistent regardless of the header.
+
+        This is the primary signal for the GraphQL bucket: unlike the
+        extensions.cost.rateLimit/data.rateLimit fields
+        _update_rate_limit_from_graphql_response() looks for, these
+        headers are present on every response regardless of what the
+        query itself asked for.
+        """
+        try:
+            if 'x-ratelimit-limit' in headers:
+                self.rate_limit_graphql.limit = int(headers['x-ratelimit-limit'])
+            if 'x-ratelimit-remaining' in headers:
+                self.rate_limit_graphql.remaining = int(headers['x-ratelimit-remaining'])
+            if 'x-ratelimit-reset' in headers:
+                reset_timestamp = int(headers['x-ratelimit-reset'])
+                self.rate_limit_graphql.reset_time = datetime.fromtimestamp(reset_timestamp)
+            self.rate_limit_graphql.resource_type = "graphql"
+            self.rate_limit_graphql.last_updated = datetime.now()
+            self.rate_limit_graphql.ever_updated = True
+
+            logger.debug(
+                f"Rate limit update (GraphQL headers): {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
+                f"({self.rate_limit_graphql.get_percentage_used():.1f}% used)"
+            )
+
+            self._mirror_rate_limit_to_redis(self.rate_limit_graphql, RATE_LIMIT_REDIS_KEYS['graphql'])
+        except Exception as e:
+            logger.debug(f"Could not extract rate limit from GraphQL headers: {e}")
 
     def _parse_gh_api_include_output(self, stdout: str) -> Tuple[Dict[str, str], str]:
         """Split `gh api --include` stdout into (headers, body).
@@ -1029,142 +1109,93 @@ class GitHubAPIClient:
                 line_num = frame.lineno
                 logger.debug(f"    {i+1}. {module}:{func_name}() [line {line_num}]")
     
-    def _fetch_rate_limit_from_api(self) -> bool:
-        """
-        Fetch current rate limit information for both the REST and GraphQL
-        buckets from GitHub's dedicated /rate_limit REST endpoint.
+    def _mirror_rate_limit_to_redis(self, bucket: 'GitHubRateLimitStatus', redis_key: str):
+        """Best-effort publish of this bucket's latest real-response reading
+        to Redis, so other processes (observability-server, and ephemeral
+        repair-cycle/agent containers that each run their own
+        GitHubAPIClient) can see this process's GitHub traffic without
+        needing a GitHubAPIClient of their own - see get_shared_rate_limit_
+        status(). This used to be handled by a periodic self-poll of
+        GitHub's dedicated /rate_limit endpoint instead, but that endpoint
+        was found to return bogus always-full data for at least one
+        token/org (issue #103 follow-up) - removed rather than trusted.
+        Only ever called with a bucket that a real GitHub response headers
+        parse just updated, so there's no equivalent trust problem here.
 
-        That endpoint reports every resource's rate limit status without
-        itself consuming any quota, and returns both buckets in a single
-        response - cheaper and more complete than the previous approach of
-        querying only the GraphQL bucket's own `rateLimit` field, which
-        left the REST bucket permanently unpopulated (issue #103). This
-        intentionally bypasses self.rest()/breaker gating: it's a
-        zero-cost meta probe (not an application-level API call, so
-        counting it in the Call Summary would just add noise), and probing
-        it even while the breaker is open keeps the reported remaining/
-        percentage numbers grounded in GitHub's actual quota instead of
-        frozen at whatever they were when the breaker tripped. This does
-        NOT itself affect breaker state - self.breaker only transitions on
-        its own time-based check_and_close(), called from graphql()/
-        rest()/http_request()/gh_cli() at the start of the next real call.
-
-        Returns:
-            bool: True if rate limit was successfully fetched and updated, False otherwise
+        Guards against a slower, now-stale write from a sibling process
+        clobbering a fresher, more-depleted reading already in Redis:
+        within the window recorded there (`now < stored reset_time`),
+        `remaining` can only stay flat or decrease, so an incoming value
+        that's higher without also reporting a newer reset is discarded as
+        an out-of-order race rather than applied.
         """
         try:
-            result = subprocess.run(
-                ['gh', 'api', '/rate_limit'],
-                capture_output=True, text=True, timeout=15
+            import redis
+            client = redis.Redis(
+                host='redis', port=6379, decode_responses=True,
+                socket_timeout=2, socket_connect_timeout=2
             )
 
-            if result.returncode != 0:
-                logger.debug(f"Failed to fetch rate limit from GitHub API: {result.stderr}")
-                return False
+            now = datetime.now()
+            existing_json = client.get(redis_key)
+            if existing_json:
+                try:
+                    existing = json.loads(existing_json)
+                    existing_reset = (
+                        datetime.fromisoformat(existing['reset_time'])
+                        if existing.get('reset_time') else None
+                    )
+                    newer_window = (
+                        bucket.reset_time is not None
+                        and existing_reset is not None
+                        and bucket.reset_time > existing_reset
+                    )
+                    still_in_window = existing_reset is not None and now < existing_reset
 
-            data = json.loads(result.stdout)
-            resources = data.get('resources', {})
-            updated = False
+                    if (still_in_window and not newer_window
+                            and existing.get('remaining') is not None
+                            and bucket.remaining > existing['remaining']):
+                        logger.debug(
+                            f"Skipping rate limit mirror for {redis_key}: incoming remaining "
+                            f"({bucket.remaining}) is higher than the stored value "
+                            f"({existing['remaining']}) within the same window - "
+                            f"likely an out-of-order write from another process, ignoring"
+                        )
+                        return
+                except (ValueError, KeyError, TypeError) as parse_err:
+                    logger.debug(f"Could not parse existing rate limit mirror at {redis_key}: {parse_err}")
 
-            core = resources.get('core')
-            if core:
-                self.rate_limit_rest.limit = core.get('limit', self.rate_limit_rest.limit)
-                self.rate_limit_rest.remaining = core.get('remaining', self.rate_limit_rest.remaining)
-                reset_ts = core.get('reset')
-                if reset_ts:
-                    self.rate_limit_rest.reset_time = datetime.fromtimestamp(reset_ts)
-                self.rate_limit_rest.resource_type = "rest"
-                self.rate_limit_rest.last_updated = datetime.now()
-                self.rate_limit_rest.ever_updated = True
-                updated = True
-
-            graphql = resources.get('graphql')
-            if graphql:
-                self.rate_limit_graphql.limit = graphql.get('limit', self.rate_limit_graphql.limit)
-                self.rate_limit_graphql.remaining = graphql.get('remaining', self.rate_limit_graphql.remaining)
-                reset_ts = graphql.get('reset')
-                if reset_ts:
-                    self.rate_limit_graphql.reset_time = datetime.fromtimestamp(reset_ts)
-                self.rate_limit_graphql.resource_type = "graphql"
-                self.rate_limit_graphql.last_updated = datetime.now()
-                self.rate_limit_graphql.ever_updated = True
-                updated = True
-
-            if not updated:
-                logger.debug("GitHub /rate_limit response had no 'core' or 'graphql' resource entries")
-                return False
-
-            logger.debug(
-                f"📊 GitHub API Rate Limits: "
-                f"REST {self.rate_limit_rest.remaining}/{self.rate_limit_rest.limit} "
-                f"({self.rate_limit_rest.get_percentage_used():.1f}% used), "
-                f"GraphQL {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
-                f"({self.rate_limit_graphql.get_percentage_used():.1f}% used)"
-            )
-
-            # Check and alarm if needed
-            self.alarm_if_needed()
-
-            return True
-
+            payload = {
+                'remaining': bucket.remaining,
+                'limit': bucket.limit,
+                'reset_time': bucket.reset_time.isoformat() if bucket.reset_time else None,
+                'last_updated': bucket.last_updated.isoformat(),
+            }
+            client.set(redis_key, json.dumps(payload), ex=7200)  # 2h TTL, just hygiene
         except Exception as e:
-            logger.debug(f"Error fetching rate limit from API: {e}")
-            return False
-    
-    def _fetch_initial_rate_limit(self):
+            logger.debug(f"Failed to mirror rate limit to Redis ({redis_key}): {e}")
+
+    def _start_call_trace_summarizer(self):
+        """Start background thread that periodically summarizes/trims the
+        call trace buffer (drives the "Call Summary" log line and keeps
+        call_trace_buffer from growing unbounded). This used to also
+        re-poll GitHub's /rate_limit endpoint on the same schedule; that
+        poll was removed (see _mirror_rate_limit_to_redis's docstring) but
+        the buffer still needs periodic cleanup independent of it.
         """
-        Fetch rate limit on startup in background thread.
-        
-        This ensures the rate limit is populated with actual GitHub API data
-        rather than default values, so the /health endpoint shows accurate data
-        from the start.
-        """
-        def fetch_on_startup():
-            """Background thread to fetch initial rate limit"""
-            import time
-            time.sleep(5)  # Wait 5 seconds after startup to let services initialize
-            
-            if self._fetch_rate_limit_from_api():
-                logger.info(
-                    f"📊 GitHub API Rate Limit Status: "
-                    f"REST {self.rate_limit_rest.remaining}/{self.rate_limit_rest.limit} remaining, "
-                    f"GraphQL {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} remaining"
-                )
-            else:
-                logger.debug("Failed to fetch initial rate limit on startup")
-        
-        # Start thread as daemon so it doesn't block initialization
-        thread = Thread(target=fetch_on_startup, daemon=True)
-        thread.start()
-    
-    def _start_rate_limit_checker(self):
-        """Start background thread to check rate limits every 5 minutes"""
-        def check_rate_limits():
-            """Background thread that checks rate limits periodically"""
+        def summarize_call_traces():
             import time
             while True:
                 try:
-                    time.sleep(300)  # Check every 5 minutes
-                    
-                    if self._fetch_rate_limit_from_api():
-                        logger.info(
-                            f"📊 GitHub API Rate Limit Check: "
-                            f"REST {self.rate_limit_rest.remaining}/{self.rate_limit_rest.limit} "
-                            f"({self.rate_limit_rest.get_percentage_used():.1f}% used), "
-                            f"GraphQL {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
-                            f"({self.rate_limit_graphql.get_percentage_used():.1f}% used)"
-                        )
-                    
-                    # Summarize and clean up call trace buffer
+                    time.sleep(300)  # Every 5 minutes
                     self._summarize_and_cleanup_call_traces()
-                    
                 except Exception as e:
-                    logger.debug(f"Error in rate limit checker: {e}")
-        
+                    logger.debug(f"Error in call trace summarizer: {e}")
+
         # Start thread as daemon so it doesn't block shutdown
-        thread = Thread(target=check_rate_limits, daemon=True)
+        thread = Thread(target=summarize_call_traces, daemon=True)
         thread.start()
-    
+
     def _summarize_and_cleanup_call_traces(self):
         """Summarize call traces and remove old entries (older than 1 hour)"""
         with self.call_trace_lock:
@@ -1236,4 +1267,78 @@ def get_github_client() -> GitHubAPIClient:
     if _github_client is None:
         _github_client = GitHubAPIClient()
     return _github_client
+
+
+def get_shared_rate_limit_status(resource_type: str) -> dict:
+    """Read the cross-process view of a rate-limit bucket ('rest' or
+    'graphql') as mirrored to Redis by whichever process most recently
+    made a real GitHub call and parsed its response headers (see
+    GitHubAPIClient._mirror_rate_limit_to_redis).
+
+    This is what anything display-facing (HealthMonitor.check_github(),
+    the /health route) should read - never a locally-instantiated
+    GitHubAPIClient's own get_status(), which only reflects real GitHub
+    responses if that specific process happens to be the one making real
+    GitHub traffic. observability-server, in particular, is not; querying
+    its own idle client used to silently overwrite correct numbers with
+    that client's permanent startup defaults (issue #103 follow-up).
+
+    Returns a dict with 'never_observed' True when no process has ever
+    published a reading for this bucket (e.g. right after a fresh deploy,
+    before any real call has been made anywhere), and 'stale' True when
+    the most recent reading is older than RATE_LIMIT_STALE_THRESHOLD_SECONDS
+    - these are deliberately distinct signals for the UI to render
+    differently ("never seen data" vs. "have a number, just an old one").
+    """
+    redis_key = RATE_LIMIT_REDIS_KEYS.get(resource_type)
+    if not redis_key:
+        raise ValueError(f"Unknown rate limit resource_type: {resource_type!r}")
+
+    never_observed_result = {
+        'remaining': None,
+        'limit': None,
+        'percentage_used': None,
+        'reset_time': None,
+        'last_updated': None,
+        'never_observed': True,
+        'stale': False,
+    }
+
+    try:
+        import redis
+        client = redis.Redis(
+            host='redis', port=6379, decode_responses=True,
+            socket_timeout=2, socket_connect_timeout=2
+        )
+        raw = client.get(redis_key)
+        if not raw:
+            return never_observed_result
+
+        data = json.loads(raw)
+        remaining = data.get('remaining')
+        limit = data.get('limit')
+        last_updated_str = data.get('last_updated')
+        last_updated = datetime.fromisoformat(last_updated_str) if last_updated_str else None
+
+        percentage_used = None
+        if limit:
+            percentage_used = ((limit - remaining) / limit) * 100
+
+        stale = (
+            last_updated is None
+            or (datetime.now() - last_updated).total_seconds() > RATE_LIMIT_STALE_THRESHOLD_SECONDS
+        )
+
+        return {
+            'remaining': remaining,
+            'limit': limit,
+            'percentage_used': percentage_used,
+            'reset_time': data.get('reset_time'),
+            'last_updated': last_updated_str,
+            'never_observed': False,
+            'stale': stale,
+        }
+    except Exception as e:
+        logger.debug(f"Failed to read shared rate limit status for {resource_type}: {e}")
+        return never_observed_result
 
