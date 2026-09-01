@@ -62,7 +62,20 @@ class AutoCommitService:
         # workspace) omits epic_id/branch_name, preserving base-clone resolution
         # exactly -- their actual mount source stays the base clone per #46/#47's
         # gating decision.
-        project_dir = workspace_manager.get_project_dir(project, epic_id=epic_id, branch_name=branch_name)
+        try:
+            project_dir = workspace_manager.get_project_dir(project, epic_id=epic_id, branch_name=branch_name)
+        except Exception as e:
+            # get_or_create_epic_worktree() (reached when epic_id is given) can raise
+            # ValueError/RuntimeError on a genuine failure -- must not propagate an
+            # unhandled exception out of this method, whose documented contract is
+            # "True if commit was successful, False otherwise" for every failure mode,
+            # and whose repair-cycle callers run it inside a bare threading.Thread with
+            # no exception handling of their own.
+            logger.error(
+                f"Failed to resolve project directory for {project}/#{issue_number} "
+                f"(epic_id={epic_id}): {e}"
+            )
+            return False
 
         if not project_dir.exists():
             logger.error(f"Project directory does not exist: {project_dir}")

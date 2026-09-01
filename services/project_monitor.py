@@ -87,6 +87,18 @@ def _save_repair_cycle_context(
         'pipeline_run_id': context.get('pipeline_run_id'),
         'project_dir': context.get('project_dir'),  # Keep original project_dir path
         'epic_id': context.get('epic_id'),
+        # NOTE (#48 review): this 'branch_name' is stage_context['branch_name'], set
+        # later in _start_repair_cycle_for_issue() by prepare_feature_branch()'s
+        # SUB-ISSUE-scoped branch resolution -- which can legitimately differ from
+        # epic_branch_name (used to actually create this epic's worktree a few lines
+        # earlier, via resolve_epic_branch_name()/create_feature_branch_name()). A
+        # mismatch here is harmless for its actual consumer today: agent_container_
+        # recovery.py's restart-recovery auto-commit only uses this as an advisory
+        # hint on a cache-miss adoption of an ALREADY-EXISTING worktree
+        # (ProjectWorkspaceManager.get_or_create_epic_worktree() reads the worktree's
+        # real on-disk branch and only warns, never acts, on a mismatch). Still worth
+        # unifying properly if/when #48's deferred FeatureBranchManager reconciliation
+        # lands, rather than relying on that adoption-path safety net indefinitely.
         'branch_name': context.get('branch_name'),
         'use_docker': True,
         'task_id': context.get('task_id'),

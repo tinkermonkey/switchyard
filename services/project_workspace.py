@@ -362,6 +362,32 @@ class ProjectWorkspaceManager:
                 raise ValueError(f"Base clone for project {project_name} not found at {base_repo_dir}")
 
             worktree_path = self._epic_worktree_path(project_name, epic_id)
+
+            # Already on disk despite an empty in-memory cache -- e.g. this epic's
+            # worktree was created before an orchestrator restart. self._epic_worktrees
+            # is populated fresh on every process start, but the directory and git's
+            # own worktree registration persist across restarts. Adopt it instead of
+            # attempting `git worktree add` again, which git unconditionally refuses
+            # ("already used by worktree at ...") since it's already registered --
+            # confirmed via the #48 review to otherwise crash restart-recovery's
+            # auto-commit path outright.
+            if worktree_path.exists() and (worktree_path / '.git').exists():
+                actual_branch = self._current_worktree_branch(worktree_path) or branch_name
+                if branch_name and actual_branch and branch_name != actual_branch:
+                    logger.warning(
+                        f"Adopting pre-existing epic worktree for {project_name} epic "
+                        f"#{epic_id} at {worktree_path}: requested branch_name="
+                        f"{branch_name!r} but it's actually on {actual_branch!r} -- "
+                        "keeping the worktree's real branch rather than the request."
+                    )
+                self._epic_worktrees[key] = str(worktree_path)
+                self._epic_worktree_branches[key] = actual_branch
+                logger.info(
+                    f"Adopted pre-existing epic worktree for {project_name} epic "
+                    f"#{epic_id} at {worktree_path} (branch={actual_branch})"
+                )
+                return worktree_path
+
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
             self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
@@ -373,6 +399,25 @@ class ProjectWorkspaceManager:
                 f"at {worktree_path} (branch={branch_name})"
             )
             return worktree_path
+
+    @staticmethod
+    def _current_worktree_branch(worktree_path: Path) -> Optional[str]:
+        """Best-effort read of the branch actually checked out in an existing worktree.
+
+        Returns None (never raises) on any failure -- callers fall back to whatever
+        branch_name they already have on hand.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return None
+            branch = result.stdout.strip()
+            return branch if branch and branch != 'HEAD' else None
+        except Exception:
+            return None
 
     @staticmethod
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:

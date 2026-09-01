@@ -217,6 +217,33 @@ class TestReuseExistingEpicWorktree:
 
         assert epic_a != epic_b
 
+    def test_adopts_pre_existing_worktree_on_process_restart(self, manager, tmp_path):
+        """A fresh ProjectWorkspaceManager instance (simulating an orchestrator
+        restart) has an empty _epic_worktrees cache even though the worktree
+        directory (and git's own worktree registration) survived the restart on
+        disk. get_or_create_epic_worktree() must adopt it -- reading its real
+        on-disk branch -- rather than attempting `git worktree add` again, which
+        git unconditionally refuses since the path is already registered (#48
+        review: this crashed restart-recovery's auto-commit path outright)."""
+        _make_base_clone(tmp_path, "my-project")
+        pre_existing = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'
+        pre_existing.mkdir(parents=True)
+        (pre_existing / '.git').write_text("gitdir: /fake/base/.git/worktrees/900\n")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok("feature/issue-900-real\n")  # rev-parse --abbrev-ref HEAD
+            result = manager.get_or_create_epic_worktree(
+                "my-project", "900", branch_name="feature/issue-900-DIFFERENT"
+            )
+
+        assert result == pre_existing
+        # No `worktree add`/`fetch` calls -- only the branch-discovery rev-parse
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert all('add' not in c and 'fetch' not in c for c in calls)
+        # Adopted the worktree's REAL branch, not the (mismatched) requested one
+        assert manager._epic_worktree_branches[("my-project", "900")] == "feature/issue-900-real"
+        assert manager._epic_worktrees[("my-project", "900")] == str(pre_existing)
+
 
 class TestEpicWorktreePathGuard:
     """_epic_worktree_path() must reject an empty/falsy epic_id rather than silently
