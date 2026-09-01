@@ -480,6 +480,11 @@ def _fake_dev_container_state_module(verified: bool = True, image_name: str = "m
     fake_singleton = Mock()
     fake_singleton.is_verified.return_value = verified
     fake_singleton.get_image_name.return_value = image_name if verified else None
+    # Live re-check (issue #50 review): defaults to matching `verified`, same as the
+    # cached status, so existing tests that don't care about this distinction are
+    # unaffected. Tests that DO care override it explicitly (e.g. a hijacked-tag case
+    # where cached state says verified but the live check disagrees).
+    fake_singleton.verify_image_exists.return_value = verified
     module.dev_container_state = fake_singleton
     return module, fake_singleton
 
@@ -531,6 +536,25 @@ class TestBakedDependencyExtractionIntegration:
                     mock_run.side_effect = [_ok(), _ok()]
                     manager.get_project_dir(
                         "my-project", epic_id="302", branch_name="feature/issue-302"
+                    )
+
+        mock_extract.assert_not_called()
+
+    def test_hijacked_image_tag_skips_extraction_despite_cached_verified_status(self, manager, tmp_path):
+        """Cached is_verified()=True alone must not be trusted -- a live
+        verify_image_exists() re-check (mirroring claude/docker_runner.py's own
+        safeguard) catches a project's <project>-agent:latest tag having been
+        silently overwritten by an unrelated image while cached state was stale."""
+        _make_base_clone(tmp_path, "my-project")
+        fake_module, fake_singleton = _fake_dev_container_state_module()
+        fake_singleton.verify_image_exists.return_value = False  # live check disagrees
+
+        with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
+            with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
+                with patch('services.project_workspace.subprocess.run') as mock_run:
+                    mock_run.side_effect = [_ok(), _ok()]
+                    manager.get_project_dir(
+                        "my-project", epic_id="304", branch_name="feature/issue-304"
                     )
 
         mock_extract.assert_not_called()

@@ -337,6 +337,7 @@ class ProjectWorkspaceManager:
             RuntimeError: The underlying git worktree add command failed.
         """
         key = (project_name, str(epic_id))
+        newly_created = False
         with self._epic_worktree_lock:
             existing = self._epic_worktrees.get(key)
             if existing is not None:
@@ -392,20 +393,29 @@ class ProjectWorkspaceManager:
 
             self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
 
-            # Best-effort only, and only on this brand-new-worktree path -- never on
-            # cache-hit reuse (above) or on adopting a pre-existing worktree after a
-            # restart (above): both of those already have whatever dependency state
-            # they have, and re-extracting on every reuse would be wasted Docker work
-            # for no benefit. See services/baked_dependency_extractor.py (issue #50).
-            self._extract_baked_dependencies_if_available(project_name, worktree_path)
-
             self._epic_worktrees[key] = str(worktree_path)
             self._epic_worktree_branches[key] = branch_name
             logger.info(
                 f"Created epic worktree for {project_name} epic #{epic_id} "
                 f"at {worktree_path} (branch={branch_name})"
             )
-            return worktree_path
+            newly_created = True
+
+        # Best-effort baked-dependency extraction runs OUTSIDE _epic_worktree_lock
+        # (#50 review): docker create/cp/rm can take several seconds for a large
+        # dependency tree, and running it while holding the lock would serialize
+        # every OTHER epic's/project's worktree creation and cleanup behind it. The
+        # worktree is already fully registered and usable by this point (immediately
+        # above) -- extraction is a pure performance optimization, never correctness-
+        # critical (a fresh install is the documented fallback on any failure), so
+        # only this brand-new-worktree path (never cache-hit reuse or restart-
+        # adoption, both handled inside the lock above) runs it, and running it
+        # unlocked is safe: a concurrent caller for the same epic simply gets the
+        # already-registered worktree path immediately, extraction or not.
+        if newly_created:
+            self._extract_baked_dependencies_if_available(project_name, worktree_path)
+
+        return worktree_path
 
     @staticmethod
     def _extract_baked_dependencies_if_available(project_name: str, worktree_path: Path) -> None:
@@ -443,6 +453,22 @@ class ProjectWorkspaceManager:
                 logger.debug(
                     f"Skipping baked-dependency extraction for {project_name}: no "
                     "image name recorded despite verified status."
+                )
+                return
+
+            # Live re-check, not just the cached is_verified() status above: the same
+            # safeguard claude/docker_runner.py's _get_image_for_agent performs before
+            # using this same image_name, guarding against a real prior incident where
+            # an unrelated Docker Compose service silently overwrote a project's
+            # `<project>-agent:latest` tag while cached state still read VERIFIED.
+            # Cheap (a single `docker image inspect`, 10s timeout) relative to the
+            # create/cp/rm extraction it gates.
+            if not dev_container_state.verify_image_exists(project_name):
+                logger.debug(
+                    f"Skipping baked-dependency extraction for {project_name}: "
+                    f"image {image_name!r} failed live verification (missing, or "
+                    "tag hijacked by an unrelated image) despite cached VERIFIED "
+                    "status."
                 )
                 return
 

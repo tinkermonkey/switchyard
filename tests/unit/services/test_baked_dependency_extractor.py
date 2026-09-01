@@ -135,10 +135,46 @@ class TestExtractionNeverBlocksWorktreeCreation:
         destination.mkdir()
 
         with patch('services.baked_dependency_extractor.subprocess.run') as mock_run:
-            mock_run.side_effect = subprocess.TimeoutExpired(cmd=['docker', 'create'], timeout=60)
+            mock_run.side_effect = [
+                subprocess.TimeoutExpired(cmd=['docker', 'create'], timeout=60),
+                _ok(),  # rm cleanup attempt in finally
+            ]
             result = extract_baked_dependencies("my-project", "my-project-agent:latest", destination)
 
         assert result is False
+
+    def test_create_raises_still_attempts_cleanup_since_container_may_exist(self, tmp_path):
+        """A TimeoutExpired on 'docker create' itself doesn't prove the daemon
+        never created the container server-side before the client gave up --
+        cleanup must still be attempted (a `docker rm -f` on a genuinely
+        nonexistent container is a harmless no-op; skipping it risked a
+        permanent leak whenever the daemon actually had created it)."""
+        destination = tmp_path / "worktree"
+        destination.mkdir()
+
+        with patch('services.baked_dependency_extractor.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                subprocess.TimeoutExpired(cmd=['docker', 'create'], timeout=60),
+                _ok(),  # rm cleanup attempt
+            ]
+            extract_baked_dependencies("my-project", "my-project-agent:latest", destination)
+
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[-1].args[0][:2] == ['docker', 'rm']
+
+    def test_create_confirmed_failed_skips_wasted_rm_call(self, tmp_path):
+        """When 'docker create' explicitly reports failure (returncode != 0), we
+        KNOW the container was never created -- attempting `docker rm -f` on it
+        would be a harmless but wasted extra call, so it's skipped."""
+        destination = tmp_path / "worktree"
+        destination.mkdir()
+
+        with patch('services.baked_dependency_extractor.subprocess.run') as mock_run:
+            mock_run.side_effect = [_fail("Cannot connect to the Docker daemon")]
+            result = extract_baked_dependencies("my-project", "my-project-agent:latest", destination)
+
+        assert result is False
+        assert mock_run.call_count == 1
 
     def test_exception_after_create_still_attempts_rm_cleanup(self, tmp_path):
         destination = tmp_path / "worktree"

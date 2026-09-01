@@ -50,7 +50,12 @@ logger = logging.getLogger(__name__)
 # outside /workspace entirely so the runtime bind mount can never shadow it.
 BAKED_DEPS_PATH = "/opt/deps"
 
-_DOCKER_TIMEOUT_SECONDS = 60
+_DOCKER_TIMEOUT_SECONDS = 60  # create/rm: cheap, near-instant operations
+# Copying a large baked node_modules/.venv can genuinely take minutes -- using the
+# same short timeout as create/rm was found (#50 review) to silently and
+# permanently defeat this feature for exactly the large-dependency projects it's
+# meant to help.
+_DOCKER_CP_TIMEOUT_SECONDS = 300
 
 
 def extract_baked_dependencies(project_name: str, image_name: str, destination: Path) -> bool:
@@ -83,13 +88,23 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
         False if extraction was skipped or failed for any reason.
     """
     container_name = f"tmp-extract-{project_name}-{uuid.uuid4().hex[:8]}"
-    created = False
+    # Three states: None (unknown -- 'docker create's own subprocess.run() hasn't
+    # returned yet, e.g. it's mid-flight or raised, so the daemon may or may not
+    # have actually created the container), True (confirmed created), False
+    # (confirmed NOT created -- docker create explicitly reported failure). Cleanup
+    # in `finally` below is skipped ONLY for the confirmed-False case (a wasted-but-
+    # harmless `docker rm -f` on a container we know was never created); it still
+    # runs for None, since an exception during `docker create` (e.g. TimeoutExpired)
+    # doesn't tell us whether the daemon created the container before the client
+    # gave up -- skipping cleanup there would risk a permanent leak.
+    created = None
     try:
         create_result = subprocess.run(
             ['docker', 'create', '--name', container_name, image_name],
             capture_output=True, text=True, timeout=_DOCKER_TIMEOUT_SECONDS
         )
         if create_result.returncode != 0:
+            created = False
             logger.warning(
                 f"Baked-dependency extraction for {project_name}: 'docker create' from "
                 f"image {image_name!r} failed ({create_result.stderr.strip()}); skipping "
@@ -100,11 +115,23 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
 
         copy_result = subprocess.run(
             ['docker', 'cp', f'{container_name}:{BAKED_DEPS_PATH}/.', str(destination)],
-            capture_output=True, text=True, timeout=_DOCKER_TIMEOUT_SECONDS
+            capture_output=True, text=True, timeout=_DOCKER_CP_TIMEOUT_SECONDS
         )
         if copy_result.returncode != 0:
             stderr = copy_result.stderr.strip()
-            if 'no such' in stderr.lower():
+            # Best-effort classification of "old-convention image, nothing at
+            # BAKED_DEPS_PATH" (expected/self-healing) vs. a genuine copy failure.
+            # Brittle by nature (depends on Docker CLI wording, which can shift
+            # across versions/locales) -- a misclassification only affects which
+            # log message is shown, never control flow (both branches return False
+            # and proceed identically), so the risk is a confusing log line, not a
+            # behavior change.
+            stderr_lower = stderr.lower()
+            looks_like_missing_path = any(
+                phrase in stderr_lower
+                for phrase in ('no such', 'not found', 'does not exist')
+            )
+            if looks_like_missing_path:
                 logger.warning(
                     f"Project {project_name}'s image ({image_name}) has nothing at "
                     f"{BAKED_DEPS_PATH} -- it predates the out-of-tree baked-dependency "
@@ -116,7 +143,11 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
                 logger.warning(
                     f"Baked-dependency extraction for {project_name}: 'docker cp' of "
                     f"{BAKED_DEPS_PATH} into {destination} failed ({stderr}); worktree "
-                    "creation proceeds without pre-baked dependencies."
+                    "creation proceeds. Note: docker cp streams incrementally, so a "
+                    "partial/incomplete dependency tree may already be present at "
+                    "destination -- a subsequent fresh install by the dev-environment "
+                    "agent is expected to reconcile this, not something this module "
+                    "attempts to roll back itself."
                 )
             return False
 
@@ -132,11 +163,24 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
         )
         return False
     finally:
-        if created:
+        # Unconditional, not gated on `created`: `docker rm -f` on a container that
+        # was never actually created is a harmless no-op (nonzero exit, silently
+        # ignored below). Gating on `created` left a real leak when `docker create`'s
+        # own subprocess.run() raised (e.g. TimeoutExpired at the timeout boundary)
+        # AFTER the daemon had already created the container server-side -- `created`
+        # would never be set to True in that case, so cleanup was skipped for a
+        # container that genuinely existed, leaking it permanently (its randomized
+        # name means nothing else can ever rediscover and remove it).
+        if created is not False:  # True (confirmed) or None (unknown) -- attempt cleanup
             try:
-                subprocess.run(
+                rm_result = subprocess.run(
                     ['docker', 'rm', '-f', container_name],
-                    capture_output=True, timeout=_DOCKER_TIMEOUT_SECONDS
+                    capture_output=True, text=True, timeout=_DOCKER_TIMEOUT_SECONDS
                 )
+                if created and rm_result.returncode != 0:
+                    logger.warning(
+                        f"Failed to remove scratch container {container_name}: "
+                        f"{rm_result.stderr.strip()}"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to remove scratch container {container_name}: {e}")
