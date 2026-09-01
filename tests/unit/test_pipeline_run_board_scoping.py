@@ -14,6 +14,7 @@ Covers:
   are stored under independent Redis hash fields and do not collide.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 from services.pipeline_run import format_pipeline_run_issue_key, PipelineRunManager
@@ -106,6 +107,20 @@ class MockRedis:
     def exists(self, key):
         return key in self.data
 
+    def lock(self, name, timeout=None, blocking_timeout=None):
+        """No-op lock context manager — real Redis.lock() serializes concurrent
+        get_or_create_pipeline_run() calls; single-threaded tests don't need
+        that serialization, just something usable in a `with ...:` block."""
+        return _NoopLock()
+
+
+class _NoopLock:
+    def __enter__(self):
+        return True
+
+    def __exit__(self, *exc_info):
+        return False
+
 
 def make_manager():
     mock_es = MockElasticsearch()
@@ -192,14 +207,13 @@ class TestTwoBoardsSameIssueDoNotCollide:
              patch('subprocess.run') as mock_subprocess:
             mock_lm.return_value.release_lock = MagicMock()
             mock_subprocess.return_value = MagicMock(returncode=0, stdout='[]')
-            # end_pipeline_run resolves the active run via get_active_pipeline_run,
-            # which (unmodified, out of #43's scope) reads the legacy 2-field key —
-            # that no longer matches what create_pipeline_run just wrote (board-
-            # scoped), so its Redis fast path misses here and it falls through to
-            # its existing ES fallback, which still finds run_b correctly. This is
-            # a real, observable side effect of board-scoping the write side while
-            # leaving get_active_pipeline_run's read side untouched per the issue's
-            # explicit scope — noted for the record, not a correctness break as
+            # This call deliberately omits board=, so end_pipeline_run resolves the
+            # active run via get_active_pipeline_run()'s legacy 2-field key (its
+            # default when no board is passed) — that no longer matches what
+            # create_pipeline_run just wrote (board-scoped), so the Redis fast path
+            # misses here and it falls through to the existing ES fallback, which
+            # still finds run_b correctly. This is a real, observable side effect of
+            # calling end_pipeline_run() without board — not a correctness break as
             # long as ES is reachable (see PipelineRunManager module docstring).
             manager.end_pipeline_run('proj', 5, reason='done')
 
@@ -239,11 +253,11 @@ class TestLegacyKeyCleanupOnEnd:
         assert 'proj:9' not in mapping  # legacy key cleaned up too
 
     def test_cleanup_does_not_delete_legacy_key_owned_by_another_run(self):
-        # Exercises _cleanup_issue_mapping() directly: end_pipeline_run()
-        # itself always resolves "the" active run via get_active_pipeline_run()
-        # (legacy-key-based, out of #43's scope), so it can't be used to force
-        # "end run_a specifically while the legacy key points to run_b" — the
-        # compare-and-delete behavior this test targets is a property of the
+        # Exercises _cleanup_issue_mapping() directly: end_pipeline_run() itself
+        # resolves "the" active run via get_active_pipeline_run() — board-scoped
+        # first if board is passed, else the legacy key — so it can't be used to
+        # force "end run_a specifically while the legacy key points to run_b" —
+        # the compare-and-delete behavior this test targets is a property of the
         # cleanup helper itself, tested in isolation here.
         manager, _, mock_redis = make_manager()
 
@@ -329,3 +343,250 @@ class TestGetRecentPipelineRunIdBoardParameter:
         del manager.redis.data[manager.redis_issue_mapping]['proj:BoardA:9']
         found = manager.get_recent_pipeline_run_id('proj', 9, board='BoardA')
         assert found == run.id
+
+
+class TestGetActivePipelineRunBoardParameter:
+    """get_active_pipeline_run(board=...) — the read-side half of this PR's fix.
+    create_pipeline_run() always writes the board-scoped key; these verify the
+    read side now actually finds it."""
+
+    def test_board_scoped_key_takes_precedence_over_legacy(self):
+        manager, _, mock_redis = make_manager()
+        run_a = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # A stale legacy entry pointing at a DIFFERENT run for the same issue.
+        run_b = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardB',
+        )
+        mock_redis.hset(manager.redis_issue_mapping, 'proj:5', run_b.id)
+
+        found = manager.get_active_pipeline_run('proj', 5, board='BoardA')
+        assert found is not None
+        assert found.id == run_a.id
+
+    def test_board_none_checks_only_the_legacy_redis_key_unchanged(self):
+        manager, _, mock_redis = make_manager()
+        manager.es = None  # isolate the Redis-only lookup path
+        manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # Board-scoped key exists, but board=None must not check it — only the
+        # legacy key, which was never written for this issue.
+        assert manager.get_active_pipeline_run('proj', 5) is None
+
+    def test_board_none_still_finds_via_unfiltered_es_fallback_unchanged(self):
+        """board=None's ES fallback stays unfiltered (matches by project +
+        issue_number only) — exactly the pre-PR behavior, just now reachable
+        even when a board-scoped-only run exists."""
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        found = manager.get_active_pipeline_run('proj', 5)
+        assert found is not None
+        assert found.id == run.id
+
+    def test_falls_back_to_legacy_key_when_board_scoped_key_absent(self):
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # Simulate a run only ever restored under the legacy key (e.g. by a
+        # board=None caller's ES-fallback restore) — board-scoped key absent.
+        del mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:5']
+        mock_redis.hset(manager.redis_issue_mapping, 'proj:5', run.id)
+
+        found = manager.get_active_pipeline_run('proj', 5, board='BoardA')
+        assert found is not None
+        assert found.id == run.id
+
+    def test_legacy_key_owned_by_a_different_board_is_not_adopted(self):
+        """The legacy key is shared across boards; unlike the board-scoped key
+        it can point at a genuinely different board's active run. Adopting it
+        would misdirect end_pipeline_run()'s downstream lock release/queue
+        processing (both keyed off pipeline_run.board, not the requested board)."""
+        manager, _, mock_redis = make_manager()
+        run_b = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardB',
+        )
+        mock_redis.hset(manager.redis_issue_mapping, 'proj:5', run_b.id)
+
+        found = manager.get_active_pipeline_run('proj', 5, board='BoardA')
+        assert found is None
+
+    def test_es_fallback_restores_under_board_scoped_key_when_board_given(self):
+        manager, mock_es, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # Simulate the Redis mapping having been lost (e.g. TTL expiry) while
+        # ES still has the doc.
+        del mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:9']
+
+        found = manager.get_active_pipeline_run('proj', 9, board='BoardA')
+        assert found is not None
+        assert found.id == run.id
+        mapping = mock_redis.data[manager.redis_issue_mapping]
+        assert mapping.get('proj:BoardA:9') == run.id
+        assert 'proj:9' not in mapping
+
+
+class TestGetOrCreatePipelineRunReusesFreshRun:
+    """Regression test for the phantom-duplicate-run bug this PR fixes: a run
+    created moments earlier for a given (project, board, issue_number) must be
+    reused by a second, same-second get_or_create_pipeline_run() call for the
+    same key — not silently duplicated because the read side only checked the
+    legacy, board-less mapping while the write side always wrote board-scoped.
+
+    This mirrors the real trigger_agent_for_status() -> _start_pr_review_for_issue()
+    sequence: both eagerly call get_or_create_pipeline_run() for the same
+    (project, board, issue_number) moments apart.
+    """
+
+    def test_second_call_reuses_run_created_by_first_call(self):
+        manager, _, mock_redis = make_manager()
+
+        first_run, first_created = manager.get_or_create_pipeline_run(
+            issue_number=277, issue_title='P4: Proactive check-ins', issue_url='u',
+            project='phone-home', board='Planning & Design',
+        )
+        assert first_created is True
+
+        second_run, second_created = manager.get_or_create_pipeline_run(
+            issue_number=277, issue_title='P4: Proactive check-ins', issue_url='u',
+            project='phone-home', board='Planning & Design',
+        )
+
+        assert second_created is False
+        assert second_run.id == first_run.id
+
+        # Exactly one run was ever created for this issue — not a phantom plus
+        # a real one.
+        run_data_keys = [
+            k for k in mock_redis.data
+            if k.startswith(f"{manager.redis_prefix}:") and k != manager.redis_issue_mapping
+        ]
+        assert len(run_data_keys) == 1
+
+        mapping = mock_redis.data[manager.redis_issue_mapping]
+        assert mapping['phone-home:Planning & Design:277'] == first_run.id
+
+    def test_call_for_a_different_board_does_not_reuse_the_first_boards_run(self):
+        manager, _, _ = make_manager()
+
+        run_a, created_a = manager.get_or_create_pipeline_run(
+            issue_number=277, issue_title='t', issue_url='u',
+            project='phone-home', board='Planning & Design',
+        )
+        run_b, created_b = manager.get_or_create_pipeline_run(
+            issue_number=277, issue_title='t', issue_url='u',
+            project='phone-home', board='Development',
+        )
+
+        assert created_a is True
+        assert created_b is True
+        assert run_a.id != run_b.id
+
+
+class TestEndPhantomPipelineRun:
+    """end_phantom_pipeline_run() — ends a run by id directly, bypassing the
+    (project, issue_number, board) mapping lookup end_pipeline_run() uses,
+    since by cleanup time that mapping may already point at whichever run
+    superseded the phantom."""
+
+    def test_ends_an_active_run_and_marks_it_superseded(self):
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+
+        result = manager.end_phantom_pipeline_run(
+            pipeline_run_id=run.id, project='proj', issue_number=5,
+            reason='test cleanup',
+        )
+
+        assert result is True
+        stored = json.loads(mock_redis.data[manager._get_redis_key(run.id)])
+        assert stored['status'] == 'completed'
+        assert stored['outcome'] == 'superseded'
+        assert stored['ended_at'] is not None
+
+    def test_returns_false_and_is_a_noop_for_unknown_id(self):
+        manager, mock_es, mock_redis = make_manager()
+
+        result = manager.end_phantom_pipeline_run(
+            pipeline_run_id='does-not-exist', project='proj', issue_number=5,
+            reason='test cleanup',
+        )
+
+        assert result is False
+        assert mock_redis.data == {}
+        assert mock_es.indexed_docs == []
+
+    def test_returns_false_and_is_a_noop_for_already_terminal_run(self):
+        manager, mock_es, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        manager.end_pipeline_run('proj', 5, board='BoardA', reason='already done')
+        mock_es.indexed_docs.clear()  # the end_pipeline_run() call above indexed it
+
+        result = manager.end_phantom_pipeline_run(
+            pipeline_run_id=run.id, project='proj', issue_number=5,
+            reason='redundant cleanup attempt',
+        )
+
+        assert result is False
+        assert mock_es.indexed_docs == []
+
+    def test_does_not_clobber_a_different_runs_mapping_compare_and_delete(self):
+        """The phantom (run_a) is superseded by run_b, which has already
+        overwritten the board-scoped issue mapping. Ending run_a by id must
+        leave run_b's mapping entry intact — this is exactly the scenario
+        _start_pr_review_for_issue()'s defensive cleanup relies on."""
+        manager, _, mock_redis = make_manager()
+        run_a = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        run_b = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        # run_b's create_pipeline_run() call above already overwrote the mapping.
+        assert mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:5'] == run_b.id
+
+        result = manager.end_phantom_pipeline_run(
+            pipeline_run_id=run_a.id, project='proj', issue_number=5,
+            reason='superseded',
+        )
+
+        assert result is True
+        assert mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:5'] == run_b.id
+
+    def test_does_not_touch_the_pipeline_lock(self):
+        """Unlike end_pipeline_run(), this must never call into the lock
+        manager — the phantom and whatever superseded it share the same
+        (project, board, issue_number) lock, which the real run still needs."""
+        manager, _, _ = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=5, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_lm:
+            manager.end_phantom_pipeline_run(
+                pipeline_run_id=run.id, project='proj', issue_number=5,
+                reason='test cleanup',
+            )
+            mock_lm.assert_not_called()

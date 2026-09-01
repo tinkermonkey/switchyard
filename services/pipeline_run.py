@@ -21,11 +21,14 @@ logger = logging.getLogger(__name__)
 def format_pipeline_run_issue_key(project: str, issue_number: int, board: Optional[str] = None) -> str:
     """Redis hash field for the issue->pipeline_run_id mapping.
 
-    board=None preserves the legacy (pre-board-scoping) 2-field format,
-    used only by get_active_pipeline_run (out of #43's scope, see its own
-    docstring) so its existing ~27 callers and ES-staleness-guard logic
-    are not touched. Pass board whenever it's known — it disambiguates
-    runs for the same (project, issue_number) active on different boards.
+    board=None produces the legacy (pre-board-scoping) 2-field format.
+    get_active_pipeline_run() now checks the board-scoped key first when it's
+    given a board, falling back to this legacy key — see its own docstring —
+    so board=None is no longer "out of scope" for it, just its default when
+    no board is known. Existing callers that still omit board are unaffected:
+    they get exactly this legacy-key behavior, unchanged. Pass board whenever
+    it's known — it disambiguates runs for the same (project, issue_number)
+    active on different boards.
     """
     if board:
         return f"{project}:{board}:{issue_number}"
@@ -253,9 +256,11 @@ class PipelineRunManager:
         an unconditional HDEL on the board-scoped key would then wipe out that
         new run's freshly-written mapping instead of this (ending) run's own.
 
-        Why the legacy key needs checking at all: get_active_pipeline_run()
-        (deliberately left un-namespaced, see #43) can restore a run into the
-        legacy key via its ES fallback. Without this check, a run ending would
+        Why the legacy key needs checking at all: get_active_pipeline_run()'s
+        ES fallback restores into the board-scoped key when it was given a
+        board, but still restores into the legacy key otherwise (its default
+        when no board is known — see its own docstring). Without this check, a
+        run ending would
         leave that legacy entry orphaned forever (no other cleanup job exists
         for it), so any future legacy-format lookup for this issue would keep
         returning this now-completed run's ID indefinitely. Comparing the
@@ -467,8 +472,11 @@ class PipelineRunManager:
             PipelineRun if active run exists, None otherwise
         """
         # Check issue mapping — board-scoped key first (if board given), then
-        # the legacy key. De-dupe so board=None (the common, pre-existing case)
-        # checks exactly one key, same as before board support was added.
+        # the legacy key. When board is None (the common, pre-existing case) the
+        # list comprehension below contributes nothing, so exactly one key (the
+        # legacy one) is checked — same as before board support was added.
+        # dict.fromkeys() is defensive scaffolding, not load-bearing: the two key
+        # formats ("project:board:issue" vs "project:issue") can never collide.
         issue_keys = list(dict.fromkeys([
             *([self._get_issue_key(project, issue_number, board)] if board else []),
             self._get_issue_key(project, issue_number),
@@ -486,14 +494,36 @@ class PipelineRunManager:
             if data:
                 try:
                     pipeline_run = PipelineRun.from_dict(json.loads(data))
-                    if pipeline_run.is_active():
-                        return pipeline_run
-                    else:
+                    if not pipeline_run.is_active():
                         # Run has completed — clean up stale mapping
                         self.redis.hdel(self.redis_issue_mapping, issue_key)
                         continue
+                    if board and pipeline_run.board and pipeline_run.board != board:
+                        # The board-scoped key always matches by construction; this
+                        # guards the LEGACY key, which is shared across boards. Its
+                        # mapping can point at a different board's genuinely-active
+                        # run for this (project, issue_number) — e.g. left behind by
+                        # a board=None caller, or backfilled by this method's own ES
+                        # restore path below. Adopting that run here would be wrong:
+                        # everything downstream (end_pipeline_run's lock release,
+                        # queue processing, etc.) keys off pipeline_run.board, not
+                        # the board this caller asked for. Treat it as a miss.
+                        logger.debug(
+                            f"get_active_pipeline_run: legacy key for {project} issue "
+                            f"#{issue_number} points at run {pipeline_run.id} on board "
+                            f"'{pipeline_run.board}', not requested board '{board}' — skipping"
+                        )
+                        continue
+                    return pipeline_run
                 except Exception as e:
-                    logger.error(f"Error deserializing pipeline run: {e}")
+                    # Don't leave a corrupted mapping in place — every subsequent
+                    # call for this issue would otherwise re-hit this same error and
+                    # never self-heal (it only ever falls through to the ES fallback).
+                    logger.error(
+                        f"Error deserializing pipeline run {pipeline_run_id} for {project} "
+                        f"issue #{issue_number} (key={issue_key}): {e} — removing corrupted mapping"
+                    )
+                    self.redis.hdel(self.redis_issue_mapping, issue_key)
                     continue
             else:
                 # Redis data has expired (TTL) while the issue mapping survived.
@@ -1402,17 +1432,23 @@ class PipelineRunManager:
         directly by id avoids that.
 
         Also deliberately skips everything end_pipeline_run() does around the
-        pipeline lock, the cancellation signal, and the wait queue: a phantom
-        run created before the real run's lock-acquisition step never held
-        the lock or drove any in-flight work, so touching any of that here
-        would only risk interfering with whichever run (real or otherwise)
-        currently does.
+        pipeline lock, the cancellation signal, and the wait queue. This is NOT
+        because the phantom predates some other run's "lock-acquisition step" —
+        PipelineLock (services/pipeline_lock_manager.py) and CancellationSignal
+        (services/cancellation.py) are both keyed by (project, board,
+        issue_number), not by pipeline_run_id, so there is no such thing as
+        "the phantom's lock" vs. "the real run's lock": a phantom and the run
+        that superseded it share the exact same lock/signal for their shared
+        issue. Touching either from here would affect whichever execution
+        currently owns that issue's lock — phantom or real — so this method
+        never calls into lock/signal/queue code at all; only the run object
+        itself (Redis/ES bookkeeping and the issue-mapping cleanup) is touched.
 
         Returns True if an active run with this id was found and ended,
         False if it was not found or was already terminal (nothing to do).
         """
         pipeline_run = self.get_pipeline_run_by_id(pipeline_run_id)
-        if not pipeline_run or pipeline_run.status not in ('active', 'feedback_listening'):
+        if not pipeline_run or not pipeline_run.is_active():
             logger.debug(
                 f"end_phantom_pipeline_run: no active run found for id {pipeline_run_id}"
             )
