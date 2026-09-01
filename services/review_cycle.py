@@ -1426,16 +1426,18 @@ class ReviewCycleExecutor:
                     if branch_info:
                         # Checkout existing branch
                         from services.git_workflow_manager import git_workflow_manager
-                        # NOTE (#47/#49): deliberately NOT epic_id-scoped, and this
-                        # checkout_branch() call itself is a #49 target. Today the base
-                        # clone is genuinely what the agent container mounts (#46's gating
-                        # decision keeps 'issues'/'hybrid' worktree isolation off until
-                        # #48), so switching its branch here is still necessary. Once #48
-                        # unblocks worktree isolation and #49 retires most of
-                        # checkout_branch()'s logic, a per-epic worktree will already be on
-                        # the right branch by construction -- this call likely becomes
-                        # unnecessary rather than needing redirection to a different
-                        # directory.
+                        # NOTE (#47/#48/#49): deliberately NOT epic_id-scoped, and this
+                        # checkout_branch() call itself is a #49 target. The base clone is
+                        # genuinely what the agent container mounts for 'issues'/'hybrid'
+                        # workspace types -- #48 investigated every get_project_dir() call
+                        # site in this file and CONFIRMED the #46 gating decision stays in
+                        # place (no fast-follow date set for the FeatureBranchManager/
+                        # epic-worktree reconciliation this would need), so switching this
+                        # branch on the base clone remains necessary for now. If/when that
+                        # reconciliation lands and #49 retires most of checkout_branch()'s
+                        # logic, a per-epic worktree will already be on the right branch by
+                        # construction -- this call likely becomes unnecessary rather than
+                        # needing redirection to a different directory.
                         project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
                         await git_workflow_manager.checkout_branch(str(project_dir), branch_info.branch_name)
                         logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
@@ -2706,13 +2708,16 @@ class ReviewCycleExecutor:
                 if branch_info:
                     # Switch to existing branch
                     from services.git_workflow_manager import git_workflow_manager
-                    # NOTE (#47/#49): deliberately NOT epic_id-scoped, and this
-                    # checkout_branch() call itself is a #49 target. Today the base clone
-                    # is genuinely what the agent container mounts (#46's gating decision
-                    # keeps 'issues'/'hybrid' worktree isolation off until #48), so
-                    # switching its branch here is still necessary. Once #48 unblocks
-                    # worktree isolation and #49 retires most of checkout_branch()'s logic,
-                    # a per-epic worktree will already be on the right branch by
+                    # NOTE (#47/#48/#49): deliberately NOT epic_id-scoped, and this
+                    # checkout_branch() call itself is a #49 target. The base clone is
+                    # genuinely what the agent container mounts for 'issues'/'hybrid'
+                    # workspace types -- #48 investigated every get_project_dir() call
+                    # site in this file and CONFIRMED the #46 gating decision stays in
+                    # place (no fast-follow date set for the FeatureBranchManager/
+                    # epic-worktree reconciliation this would need), so switching this
+                    # branch on the base clone remains necessary for now. If/when that
+                    # reconciliation lands and #49 retires most of checkout_branch()'s
+                    # logic, a per-epic worktree will already be on the right branch by
                     # construction -- this call likely becomes unnecessary rather than
                     # needing redirection to a different directory.
                     project_dir = workspace_manager.get_project_dir(cycle_state.project_name)

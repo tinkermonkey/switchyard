@@ -1658,7 +1658,14 @@ class AgentContainerRecovery:
                             agent='repair_cycle',
                             task_id=f'repair_cycle_{issue_number}',
                             issue_number=issue_number,
-                            custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                            custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                            # Match the mount source the repair-cycle container actually
+                            # used (an epic worktree, for 'issues' workspace type -- see
+                            # #48/auto_commit.py's docstring). context.json now carries
+                            # these (project_monitor.py's _save_repair_cycle_context was
+                            # fixed alongside this to forward them).
+                            epic_id=context.get('epic_id'),
+                            branch_name=context.get('branch_name')
                         )
                     )
 

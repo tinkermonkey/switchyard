@@ -22,7 +22,9 @@ class AutoCommitService:
         agent: str,
         task_id: str,
         issue_number: Optional[int] = None,
-        custom_message: Optional[str] = None
+        custom_message: Optional[str] = None,
+        epic_id: Optional[str] = None,
+        branch_name: Optional[str] = None
     ) -> bool:
         """
         Commit changes made by an agent
@@ -33,42 +35,34 @@ class AutoCommitService:
             task_id: Task ID
             issue_number: GitHub issue number (if applicable)
             custom_message: Custom commit message (optional)
+            epic_id: Epic issue number scoping an isolated worktree, if the caller's
+                actual mount source was an epic worktree rather than the shared base
+                clone (#48 fast-follow). None (default) preserves base-clone
+                behavior exactly, matching every caller except the repair-cycle
+                ones below.
+            branch_name: Branch the epic's worktree is on. Only consulted (and only
+                needed) the first time a given epic's worktree would be created --
+                by the time this method runs, the repair-cycle container has
+                already created/used it, so this is normally a no-op cache-hit
+                lookup; passed through for completeness.
 
         Returns:
             True if commit was successful, False otherwise
         """
-        # INTENTIONALLY base-clone-scoped, NOT migrated to epic-worktree resolution
-        # (#48), even though this is a mount-CONSUMING site that must commit
-        # whatever directory the agent actually wrote to. Investigated for #48 and
-        # found genuinely inconsistent across this method's callers, which is why
-        # it stays unconditional rather than resolving epic_id here:
-        #
-        #  - services/review_cycle.py's maker-commit calls (agent=cycle_state.
-        #    maker_agent, for 'issues' workspace) are consistent with this: per
-        #    agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate (#46),
-        #    'issues'/'hybrid' dispatch still mounts the agent container from this
-        #    same base clone, so this method's base-clone resolution matches.
-        #
-        #  - services/project_monitor.py's and services/agent_container_recovery.
-        #    py's repair-cycle calls (agent='repair_cycle') are NOT consistent:
-        #    _start_repair_cycle_for_issue() in project_monitor.py resolves and
-        #    mounts an epic-scoped worktree for 'issues' workspace type
-        #    UNCONDITIONALLY -- deliberately exempted from the
-        #    EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate because its own internal
-        #    execute_agent calls always run with skip_workspace_prep=True (see
-        #    #46's commit message). This method resolving unconditionally to the
-        #    base clone means a repair cycle's actual on-disk changes, written
-        #    into the epic worktree, are never found here (_check_for_changes()
-        #    below would see a clean base clone) -- so repair-cycle fixes likely
-        #    go uncommitted and unpushed for 'issues'-workspace projects. This
-        #    appears to be a PRE-EXISTING gap introduced when #46 migrated the
-        #    repair-cycle mount, not something #48 introduced; fixing it correctly
-        #    needs per-caller epic_id threading (this function would need to know
-        #    which of its callers' mount sources to match, which isn't
-        #    determinable from `agent` alone without a signature change touching
-        #    3 files) and its own dedicated test coverage, so it's flagged here
-        #    for a fast-follow rather than fixed as a drive-by in #48.
-        project_dir = workspace_manager.get_project_dir(project)
+        # Resolve to the SAME directory the agent actually wrote to. Fixes a real
+        # gap found while implementing #48: services/project_monitor.py's and
+        # services/agent_container_recovery.py's repair-cycle callers (agent=
+        # 'repair_cycle') mount an epic-scoped worktree unconditionally for
+        # 'issues' workspace type (deliberately exempted from agent_executor.py's
+        # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate -- see #46's commit message),
+        # so resolving unconditionally to the base clone here meant this method's
+        # _check_for_changes() below would see a clean base clone and silently
+        # skip committing real repair-cycle fixes. Every OTHER caller (e.g.
+        # services/review_cycle.py's maker-commit calls, for 'issues'/'hybrid'
+        # workspace) omits epic_id/branch_name, preserving base-clone resolution
+        # exactly -- their actual mount source stays the base clone per #46/#47's
+        # gating decision.
+        project_dir = workspace_manager.get_project_dir(project, epic_id=epic_id, branch_name=branch_name)
 
         if not project_dir.exists():
             logger.error(f"Project directory does not exist: {project_dir}")

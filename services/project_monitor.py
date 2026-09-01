@@ -86,6 +86,8 @@ def _save_repair_cycle_context(
         'discussion_id': context.get('discussion_id'),
         'pipeline_run_id': context.get('pipeline_run_id'),
         'project_dir': context.get('project_dir'),  # Keep original project_dir path
+        'epic_id': context.get('epic_id'),
+        'branch_name': context.get('branch_name'),
         'use_docker': True,
         'task_id': context.get('task_id'),
         'test_configs': serialized_configs,
@@ -5500,7 +5502,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         project_config,
         workflow_template,
         agent_name: str,
-        pipeline_run_id: Optional[str] = None
+        pipeline_run_id: Optional[str] = None,
+        epic_id: Optional[str] = None,
+        epic_branch_name: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
@@ -5739,7 +5743,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 agent='repair_cycle',
                                 task_id=f'repair_cycle_{issue_number}',
                                 issue_number=issue_number,
-                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                                epic_id=epic_id,
+                                branch_name=epic_branch_name
                             )
                         )
                         
@@ -6814,7 +6820,9 @@ _Repair cycle initiated by Switchyard_
                 project_config=project_config,
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
-                pipeline_run_id=pipeline_run.id
+                pipeline_run_id=pipeline_run.id,
+                epic_id=epic_id,
+                epic_branch_name=epic_branch_name
             )
 
             return stage_config.default_agent
