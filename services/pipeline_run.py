@@ -260,9 +260,9 @@ class PipelineRunManager:
         ES fallback restores into the board-scoped key when it was given a
         board, but still restores into the legacy key otherwise (its default
         when no board is known — see its own docstring). Without this check, a
-        run ending would
-        leave that legacy entry orphaned forever (no other cleanup job exists
-        for it), so any future legacy-format lookup for this issue would keep
+        run ending would leave that legacy entry orphaned forever (no other
+        cleanup job exists for it), so any future legacy-format lookup for
+        this issue would keep
         returning this now-completed run's ID indefinitely. Comparing the
         value before deleting avoids clobbering a DIFFERENT board's still-
         active run that might currently occupy that same legacy slot.
@@ -1027,6 +1027,7 @@ class PipelineRunManager:
         try:
             self.end_pipeline_run(
                 project=project,
+                board=board,
                 issue_number=issue_number,
                 reason=reason,
                 retain_lock=True,
@@ -1434,15 +1435,21 @@ class PipelineRunManager:
         Also deliberately skips everything end_pipeline_run() does around the
         pipeline lock, the cancellation signal, and the wait queue. This is NOT
         because the phantom predates some other run's "lock-acquisition step" —
-        PipelineLock (services/pipeline_lock_manager.py) and CancellationSignal
-        (services/cancellation.py) are both keyed by (project, board,
-        issue_number), not by pipeline_run_id, so there is no such thing as
-        "the phantom's lock" vs. "the real run's lock": a phantom and the run
-        that superseded it share the exact same lock/signal for their shared
-        issue. Touching either from here would affect whichever execution
-        currently owns that issue's lock — phantom or real — so this method
-        never calls into lock/signal/queue code at all; only the run object
-        itself (Redis/ES bookkeeping and the issue-mapping cleanup) is touched.
+        neither PipelineLock nor CancellationSignal is keyed by pipeline_run_id
+        at all, so there is no such thing as "the phantom's lock" vs. "the real
+        run's lock" to begin with:
+          - PipelineLock (services/pipeline_lock_manager.py) is keyed by
+            (project, board) — every issue on that board shares the one lock,
+            so there isn't even a per-issue lock, let alone a per-run one.
+          - CancellationSignal (services/cancellation.py) is keyed by
+            (project, issue_number), independent of board.
+        Either way, a phantom and the run that superseded it — same project,
+        same board, same issue — always resolve to the exact same lock and the
+        exact same cancellation signal. Touching either from here would affect
+        whichever execution currently owns that issue's lock — phantom or real
+        — so this method never calls into lock/signal/queue code at all; only
+        the run object itself (Redis/ES bookkeeping and the issue-mapping
+        cleanup) is touched.
 
         Returns True if an active run with this id was found and ended,
         False if it was not found or was already terminal (nothing to do).

@@ -452,7 +452,16 @@ class TestGetOrCreatePipelineRunReusesFreshRun:
     """
 
     def test_second_call_reuses_run_created_by_first_call(self):
+        # es=None isolates the Redis fast path this test targets. With ES live,
+        # MockElasticsearch's synchronous, unfiltered-by-board search() means a
+        # SECOND call would still find the first run via the ES fallback even
+        # with the bug this test guards against reintroduced (a real ES has
+        # near-real-time indexing latency and would very likely miss it, which
+        # is the actual production mechanism behind the bug this PR fixes) —
+        # so without es=None this test does not actually fail if
+        # get_or_create_pipeline_run()'s board-scoped Redis lookup regresses.
         manager, _, mock_redis = make_manager()
+        manager.es = None
 
         first_run, first_created = manager.get_or_create_pipeline_run(
             issue_number=277, issue_title='P4: Proactive check-ins', issue_url='u',
