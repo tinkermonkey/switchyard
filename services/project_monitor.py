@@ -5667,27 +5667,48 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
                 # Capture the container's own stdout/stderr BEFORE it's removed below.
                 # This container runs `--rm`, so once cleanup runs any traceback it
-                # printed is gone forever ??? previously the only signal a non-zero exit
+                # printed is gone forever -- previously the only signal a non-zero exit
                 # left behind was "exited with code N", with the actual cause
                 # unrecoverable after the fact (see the repair_cycle_runner.py startup
                 # crash this was added for: an unhandled exception there exits 1 with
                 # no Redis result, before any of that process's own error handling
                 # runs). Best-effort only: never let a `docker logs` failure block
                 # normal completion handling.
+                #
+                # Only for exit codes that actually indicate a crash/error -- 4
+                # (cancelled) and 5 (frozen by the Claude Code circuit breaker, see
+                # repair_cycle_runner.py's Exit Codes docstring) are expected,
+                # routine outcomes, not failures, and logging their output at ERROR
+                # would directly contradict this function's own "no misleading
+                # failure comment" handling for is_frozen further below.
                 container_log_excerpt = None
-                if exit_code not in (0, None):
+                if exit_code not in (0, None, 4, 5):
                     try:
                         logs_result = subprocess.run(
                             ['docker', 'logs', '--tail', '100', container_name],
                             capture_output=True, text=True, timeout=30
                         )
-                        combined = (logs_result.stdout or '') + (logs_result.stderr or '')
-                        combined = combined.strip()
-                        if combined:
-                            container_log_excerpt = combined[-2000:]
-                            logger.error(
-                                f"Container {container_name} logs (last 100 lines, exit {exit_code}):\n"
-                                f"{container_log_excerpt}"
+                        if logs_result.returncode == 0:
+                            combined = (logs_result.stdout or '') + (logs_result.stderr or '')
+                            combined = combined.strip()
+                            if combined:
+                                container_log_excerpt = combined[-2000:]
+                                logger.error(
+                                    f"Container {container_name} logs (last 100 lines, exit {exit_code}):\n"
+                                    f"{container_log_excerpt}"
+                                )
+                        else:
+                            # `docker logs` itself failed -- most likely the --rm
+                            # container was already auto-removed by the time this
+                            # runs. Its stderr here is the Docker CLI's own error
+                            # text (e.g. "No such container"), not anything the
+                            # container printed -- log it distinctly rather than
+                            # storing it in container_log_excerpt, where it would
+                            # be indistinguishable from genuine container output.
+                            logger.warning(
+                                f"Could not capture logs for {container_name}: "
+                                f"docker logs exited {logs_result.returncode} "
+                                f"({(logs_result.stderr or '').strip()[:200]})"
                             )
                     except Exception as e:
                         logger.warning(f"Could not capture logs for {container_name}: {e}")
