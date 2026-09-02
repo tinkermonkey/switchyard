@@ -20,7 +20,7 @@ from task_queue.task_manager import TaskQueue
 from claude.session_manager import ClaudeSessionManager
 from monitoring.health_monitor import HealthMonitor
 from services.github_project_manager import GitHubProjectManager
-from services.project_monitor import ProjectMonitor
+from services.project_monitor import ProjectMonitor, register_project_monitor
 from services.project_workspace import workspace_manager
 from services.scheduled_tasks import get_scheduled_tasks_service
 from services.dev_container_state import dev_container_state
@@ -556,6 +556,12 @@ async def main():
 
     # Start project monitor in background
     project_monitor = ProjectMonitor(task_queue, config_manager)
+    # Register the singleton so components outside the main poll loop (e.g.
+    # pipeline_watchdog.py's zombie self-heal redispatch) can reach
+    # trigger_agent_for_status() — the one canonical dispatch entry point —
+    # instead of re-implementing dispatch logic. See get_project_monitor()'s
+    # docstring in services/project_monitor.py.
+    register_project_monitor(project_monitor)
     monitor_thread = threading.Thread(
         target=project_monitor.monitor_projects,
         daemon=True

@@ -1167,7 +1167,16 @@ class PipelineRunManager:
         self._persist_to_elasticsearch(pipeline_run)
 
         # Release pipeline lock if this issue holds it.
-        # retain_lock=True  → always retain (caller wants manual intervention)
+        # retain_lock=True  → always retain. Historically this meant "caller
+        #     wants manual intervention", but pipeline_watchdog.py's zombie/
+        #     frozen-run self-heal (see incident e42ca133) also passes True
+        #     for an AUTOMATIC retry: it relies on retain_lock=True + this
+        #     method's outcome="failed" branch below durably marking the lock
+        #     via mark_lock_failed(), then immediately calls
+        #     PipelineLockManager.clear_retained_reason() itself to lift that
+        #     mark for its own self-heal window — so "retain_lock=True" no
+        #     longer implies "requires a human", only "the lock must not be
+        #     released to the general pool by end_pipeline_run itself".
         # retain_lock=False → always release (intentional kill / cleanup)
         # retain_lock=None  → auto: retain on failure, release on success/other
         should_retain = (

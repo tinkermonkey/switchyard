@@ -49,10 +49,13 @@ def watchdog():
     pipeline_run_manager = Mock()
     pipeline_run_manager.redis = FakeRedis()
     pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
+    lock_manager = Mock()
+    lock_manager.clear_retained_reason = Mock(return_value=True)
     return PipelineWatchdog(
         es_client=Mock(),
         pipeline_run_manager=pipeline_run_manager,
-        lock_manager=Mock(),
+        lock_manager=lock_manager,
+        project_monitor=Mock(),
     )
 
 
@@ -104,9 +107,21 @@ class TestGlobalFreezeGate:
 
 
 class TestActivelyResumeRun:
-    def test_releases_lock_without_retry_count(self, watchdog):
+    """
+    _redispatch_same_issue is patched to a plain success/failure stub here --
+    its own GraphQL/config-lookup internals are covered separately in
+    TestRedispatchSameIssue (test_pipeline_watchdog_retry.py). What matters
+    here is _actively_resume_run's own decision logic.
+    """
+
+    def test_retains_lock_clears_mark_and_redispatches_same_issue(self, watchdog):
+        """The lock must never be released outright here (see incident
+        e42ca133) — end_pipeline_run always retains it, and the resume then
+        clears the durable mark and redispatches the SAME issue directly
+        while the lock stays held by that issue throughout."""
         with patch.object(watchdog, "_increment_zombie_retry_count") as incr, \
              patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue", return_value=True) as redispatch, \
              patch("services.review_cycle.review_cycle_executor") as mock_rc:
             mock_rc.active_cycles = {}
             mock_rc._load_active_cycles.return_value = []
@@ -121,9 +136,60 @@ class TestActivelyResumeRun:
 
         watchdog.pipeline_run_manager.end_pipeline_run.assert_called_once()
         call = watchdog.pipeline_run_manager.end_pipeline_run.call_args
-        assert call.kwargs["retain_lock"] is False
+        assert call.kwargs["retain_lock"] is True
+        watchdog.lock_manager.clear_retained_reason.assert_called_once_with(
+            "proj", "SDLC Execution", 42
+        )
+        redispatch.assert_called_once_with("proj", "SDLC Execution", 42)
         incr.assert_not_called()
         notify.assert_not_called()
+
+    def test_retains_lock_and_alerts_when_clear_fails(self, watchdog):
+        """If clear_retained_reason() itself fails, the lock is already
+        durably retained and a human is notified; redispatch must not even
+        be attempted."""
+        watchdog.lock_manager.clear_retained_reason = Mock(return_value=False)
+        with patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch, \
+             patch("services.review_cycle.review_cycle_executor") as mock_rc:
+            mock_rc.active_cycles = {}
+            mock_rc._load_active_cycles.return_value = []
+
+            watchdog._actively_resume_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T15:00:00Z",
+            )
+
+        redispatch.assert_not_called()
+        notify.assert_called_once()
+
+    def test_restores_durable_retention_when_redispatch_fails_after_clear(self, watchdog):
+        """If clear succeeds but the redispatch itself fails, the lock must
+        not be left un-retained with nothing dispatched — the durable mark
+        must be restored before notifying."""
+        with patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue", return_value=False), \
+             patch("services.review_cycle.review_cycle_executor") as mock_rc:
+            mock_rc.active_cycles = {}
+            mock_rc._load_active_cycles.return_value = []
+
+            watchdog._actively_resume_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T15:00:00Z",
+            )
+
+        watchdog.lock_manager.clear_retained_reason.assert_called_once()
+        watchdog.lock_manager.mark_lock_failed.assert_called_once()
+        assert watchdog.lock_manager.mark_lock_failed.call_args.args[:3] == (
+            "proj", "SDLC Execution", 42
+        )
+        notify.assert_called_once()
 
 
 class TestFrozenRunBypassesAgeGate:
