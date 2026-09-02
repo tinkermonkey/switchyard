@@ -101,6 +101,57 @@ class TestVerifierStatusParsing:
         assert kwargs["status"] == DevContainerStatus.BLOCKED
         assert "PENDING" in kwargs["error_message"]
 
+    async def test_unparseable_final_text_honors_status_agent_already_set(self):
+        """The clobbering bug: when the final response text has no marker but
+        the agent's own tool calls already resolved dev_container_state
+        (e.g. it called set_status(VERIFIED) mid-session, then closed with a
+        summary that happened to drop the "### Status" marker), the fallback
+        must NOT overwrite that resolution with a forced BLOCKED.
+
+        Regression for incident: phone-home #341 -- verifier confirmed the fix
+        and set VERIFIED itself, then this exact fallback clobbered it back to
+        BLOCKED because the closing text lacked the marker, forcing manual
+        intervention on an already-passing rebuild."""
+        from agents.dev_environment_verifier_agent import DevEnvironmentVerifierAgent
+
+        agent = DevEnvironmentVerifierAgent()
+        with patch(
+            "agents.dev_environment_verifier_agent.run_claude_code",
+            new=AsyncMock(return_value="```\n### Summary\nConfirmed resolved. Dev container state updated to VERIFIED.\n```"),
+        ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
+            mock_state.get_status.side_effect = [
+                DevContainerStatus.IN_PROGRESS,  # snapshot taken before the session runs
+                DevContainerStatus.VERIFIED,     # what the agent's own tool call already set
+            ]
+            result = await agent.execute(_task_context())
+
+        mock_state.set_status.assert_not_called()
+        assert result["status"] == "success"
+
+    async def test_unparseable_final_text_still_blocks_when_nothing_changed(self):
+        """Negative case for the fix above: if the agent never resolved
+        dev_container_state itself (status is identical before and after,
+        e.g. still IN_PROGRESS), the "could not parse" fallback must still
+        force BLOCKED -- otherwise the project deadlocks forever, which is
+        the original bug this whole module guards against."""
+        from agents.dev_environment_verifier_agent import DevEnvironmentVerifierAgent
+
+        agent = DevEnvironmentVerifierAgent()
+        with patch(
+            "agents.dev_environment_verifier_agent.run_claude_code",
+            new=AsyncMock(return_value="I looked at the environment and it seems fine, no markers here."),
+        ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
+            mock_state.get_status.side_effect = [
+                DevContainerStatus.IN_PROGRESS,
+                DevContainerStatus.IN_PROGRESS,
+            ]
+            await agent.execute(_task_context())
+
+        mock_state.set_status.assert_called_once()
+        _, kwargs = mock_state.set_status.call_args
+        assert kwargs["status"] == DevContainerStatus.BLOCKED
+        assert "could not parse" in kwargs["error_message"].lower()
+
     async def test_changes_needed_marks_changes_needed_with_reason(self):
         r"""CHANGES NEEDED (used when a REQUIRED FIX could not be independently
         confirmed) must resolve to CHANGES_NEEDED, not fall through to BLOCKED.

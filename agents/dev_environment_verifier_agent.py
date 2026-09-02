@@ -74,6 +74,14 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             # by temporarily patching the loader result via build_verifier_prompt
             prompt = self._prompt_builder.build_verifier_prompt(ctx)
 
+        # Snapshot the status dev_environment_setup left in place (normally
+        # IN_PROGRESS) before this agent's session runs. Compared against the
+        # post-session status below to detect whether the agent's own tool
+        # calls already resolved dev_container_state during the session, even
+        # if the final response text we parse doesn't carry the expected
+        # marker (see the "could not parse" branch).
+        status_before_session = dev_container_state.get_status(project_name)
+
         result = await run_claude_code(prompt, context)
 
         if isinstance(result, dict):
@@ -147,18 +155,47 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     error_message, project_name
                 )
         else:
-            snippet = review_text.strip()[:300]
-            error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
-            dev_container_state.set_status(
-                project_name=project_name,
-                status=DevContainerStatus.BLOCKED,
-                error_message=error_message[:200],
+            # No "### Status **X**" marker in the final response text. Before
+            # forcing BLOCKED, check whether the agent's own tool calls
+            # already resolved dev_container_state during the session (per
+            # the Step 5 instructions in the prompt) -- if so, the final
+            # response is just a closing summary that happened to drop the
+            # marker, not a genuinely unresolved verification. Trust the
+            # self-reported resolution instead of clobbering it.
+            #
+            # See incident: phone-home #341 -- the verifier confirmed the fix,
+            # called dev_container_state.set_status(VERIFIED) itself mid-session,
+            # then this fallback overwrote that back to BLOCKED because the
+            # closing "### Summary" text it wrote afterward omitted the marker.
+            status_after_session = dev_container_state.get_status(project_name)
+            resolved_statuses = (
+                DevContainerStatus.VERIFIED,
+                DevContainerStatus.BLOCKED,
+                DevContainerStatus.CHANGES_NEEDED,
             )
-            logger.error(
-                "Could not parse verification status for %s -- marking dev container BLOCKED "
-                "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
-                "output excerpt)",
-                project_name, project_name
-            )
+            if (
+                status_after_session != status_before_session
+                and status_after_session in resolved_statuses
+            ):
+                logger.warning(
+                    "Could not find a '### Status' marker in %s's final verifier response, "
+                    "but dev_container_state was already updated to %s during the session "
+                    "(from %s) -- honoring that instead of forcing BLOCKED.",
+                    project_name, status_after_session.value, status_before_session.value
+                )
+            else:
+                snippet = review_text.strip()[:300]
+                error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
+                dev_container_state.set_status(
+                    project_name=project_name,
+                    status=DevContainerStatus.BLOCKED,
+                    error_message=error_message[:200],
+                )
+                logger.error(
+                    "Could not parse verification status for %s -- marking dev container BLOCKED "
+                    "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
+                    "output excerpt)",
+                    project_name, project_name
+                )
 
         return {"status": "success", "agent_output": review_text}
