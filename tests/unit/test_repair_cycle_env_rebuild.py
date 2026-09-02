@@ -106,8 +106,13 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
     async def test_changes_needed_exhausts_attempts_without_verified(self):
         """If every attempt comes back CHANGES_NEEDED, the sub-cycle must stop after
-        MAX_SYSTEMIC_SUB_CYCLES attempts (not loop forever) and return a failure,
-        having never run tests."""
+        MAX_SYSTEMIC_SUB_CYCLES attempts (not loop forever), return a failure having
+        never run tests, and — critically — must leave the dev container in the
+        terminal BLOCKED status rather than dangling at CHANGES_NEEDED. Nothing else
+        owns retrying CHANGES_NEEDED once this sub-cycle gives up
+        (validate_task_can_run() deliberately never re-triggers setup for it), so
+        leaving it there would silently block every future task for the project
+        forever. Regression guard for that exact incident."""
         stage = _stage()
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
@@ -125,3 +130,9 @@ class TestEnvRebuildSubCycleRetrySemantics:
         assert mock_queue.call_count == MAX_SYSTEMIC_SUB_CYCLES
         mock_run_tests.assert_not_called()
         assert result.has_failures() is True
+
+        # Last set_status call (after MAX_SYSTEMIC_SUB_CYCLES UNVERIFIED resets,
+        # one per attempt) must be the terminal BLOCKED transition.
+        last_call = mock_state.set_status.call_args_list[-1]
+        assert last_call.args[1] == DevContainerStatus.BLOCKED
+        assert "test-project" in last_call.args[0]

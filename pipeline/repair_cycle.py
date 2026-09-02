@@ -2411,6 +2411,41 @@ class RepairCycleStage(PipelineStage):
                         pipeline_run_id=pipeline_run_id,
                     )
                 break
+        else:
+            # `for...else`: only reached when the loop ran out of attempts
+            # without an early `break` (VERIFIED-with-passing-tests, or
+            # BLOCKED). If the last attempt's poll ended in CHANGES_NEEDED,
+            # nothing else owns retrying it once this sub-cycle gives up —
+            # validate_task_can_run() deliberately treats CHANGES_NEEDED as
+            # "the env-rebuild sub-cycle is handling it" and never re-triggers
+            # setup for it itself. Left as CHANGES_NEEDED, that silently blocks
+            # every future task for this project forever. Move it to the
+            # terminal BLOCKED status instead — the same outcome the verifier
+            # itself would have produced had it confirmed the fix was still
+            # broken rather than merely uncertain.
+            if final_status == DevContainerStatus.CHANGES_NEEDED:
+                dev_container_state.set_status(
+                    project,
+                    DevContainerStatus.BLOCKED,
+                    error_message=(
+                        f"Env rebuild exhausted {MAX_SYSTEMIC_SUB_CYCLES} attempts; "
+                        f"verifier never confirmed the required fix: "
+                        f"{analysis.env_issue_description[:200]}"
+                    ),
+                )
+                if obs:
+                    obs.emit(
+                        EventType.ERROR_ENCOUNTERED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "error_type": "env_rebuild_changes_needed_exhausted",
+                            "attempts": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
 
         if obs:
             obs.emit(
