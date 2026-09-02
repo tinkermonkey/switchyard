@@ -245,3 +245,17 @@ IMPORTANT: Output your verification review as text directly in your response. DO
 ```
 
 REMEMBER: You MUST execute Python code to update the dev container state. Without this, the verification is incomplete.
+
+REMEMBER: Your literal final message — the very last thing you send, whatever else it
+contains — MUST include the exact line `### Status` followed on its own line by
+`**APPROVED**`, `**CHANGES NEEDED**`, or `**BLOCKED**` (that exact bold markdown, that
+exact wording). This is true even if you already executed the Python state-update code
+above, even if this is a short closing note after a long investigation, and even if you
+think the state update already speaks for itself. Do not rely on the state-update code
+having already run: there is a narrow same-session fallback that can honor a status you
+already wrote via that code, but it only covers APPROVED/BLOCKED, and only if this
+message's text is otherwise unparseable — CHANGES NEEDED has no such fallback and always
+requires the marker. A final message that only summarizes your findings in prose (e.g.
+"the fix is confirmed resolved...") without this exact marker risks being treated as a
+failure requiring manual intervention even when your investigation itself was correct —
+always include it.

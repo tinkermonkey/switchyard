@@ -12,6 +12,7 @@ Covers the docker create/cp/rm extraction mechanism directly:
 All Docker calls are mocked (subprocess.run) — no real docker commands run.
 """
 
+import logging
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, Mock
@@ -91,6 +92,34 @@ class TestExtractionSkipsGracefullyForOldConventionImage:
         # cleanup (docker rm) still ran despite the missing path
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[-1][:2] == ['docker', 'rm']
+
+    def test_actual_daemon_wording_is_classified_as_missing_path_not_generic_failure(self, tmp_path, caplog):
+        # The Docker daemon's real wording for this case ("Error response from
+        # daemon: Could not find the file ... in container ...") differs from the
+        # older CLI-side wording ('no such'/'not found'/'does not exist') the
+        # classifier originally checked for. Before the fix, this exact stderr
+        # (observed in production against real project images) fell through to
+        # the "genuine copy failure" branch instead of the expected/self-healing
+        # "old-convention image" branch -- same return value, but a misleading
+        # log message that made a benign, expected condition look like a bug.
+        destination = tmp_path / "worktree"
+        destination.mkdir()
+
+        with patch('services.baked_dependency_extractor.subprocess.run') as mock_run:
+            mock_run.side_effect = [
+                _ok(),  # docker create succeeds
+                _fail(
+                    "Error response from daemon: Could not find the file /opt/deps/. "
+                    "in container tmp-extract-my-project-0e51b4c5"
+                ),
+                _ok(),  # docker rm cleanup still runs
+            ]
+            with caplog.at_level(logging.WARNING):
+                result = extract_baked_dependencies("my-project", "my-project-agent:latest", destination)
+
+        assert result is False
+        assert any("predates the out-of-tree baked-dependency convention" in r.message for r in caplog.records)
+        assert not any("worktree creation proceeds" in r.message for r in caplog.records)
 
 
 class TestExtractionNeverBlocksWorktreeCreation:
