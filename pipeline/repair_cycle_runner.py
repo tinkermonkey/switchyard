@@ -85,12 +85,25 @@ class RepairCycleRunner:
         self.checkpoint_manager = None
         self._cancelled = False
 
-        # Add file handler now that we know the project directory
+        # Add file handler now that we know the project directory. This
+        # directory may be a base clone or (see #46/#48) an isolated epic
+        # worktree mounted in explicitly by project_monitor.py's
+        # _launch_repair_cycle_container -- if that mount isn't present/
+        # writable for any reason, opening the log file here must not take
+        # down the whole container before it's had a chance to report
+        # anything (see the try/except around RepairCycleRunner(args) in
+        # main()): fall back to stderr-only logging instead of crashing.
         log_file = self.project_dir / ".repair_cycle.log"
-        file_handler = logging.FileHandler(log_file, mode='a')
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(file_handler)
-        logger.info(f"Logging to {log_file}")
+        try:
+            file_handler = logging.FileHandler(log_file, mode='a')
+            file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(file_handler)
+            logger.info(f"Logging to {log_file}")
+        except OSError as e:
+            logger.warning(
+                f"Could not open repair-cycle log file at {log_file} ({e}) -- "
+                "continuing with stderr-only logging for this run"
+            )
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -488,7 +501,21 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    runner = RepairCycleRunner(args)
+    try:
+        runner = RepairCycleRunner(args)
+    except Exception as e:
+        # RepairCycleRunner.__init__ does file I/O (e.g. the per-worktree
+        # .repair_cycle.log FileHandler) before any of run()'s own error
+        # handling exists. An unhandled exception here previously crashed
+        # the whole process with Python's default exit code 1 -- instantly,
+        # with 0 agent calls and no result ever written to Redis -- which is
+        # indistinguishable from every other silent failure once this
+        # container (launched with `docker run --rm`) is cleaned up. Log it
+        # loudly to stderr (captured by `docker logs` before removal) and
+        # exit with the same "error" code initialize_stage() uses below.
+        logger.error(f"Failed to initialize RepairCycleRunner: {e}", exc_info=True)
+        sys.exit(2)
+
     exit_code = runner.run()
     sys.exit(exit_code)
 

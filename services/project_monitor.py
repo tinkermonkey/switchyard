@@ -5665,6 +5665,33 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 elif exit_code == 143:
                     logger.info(f"Exit code 143 indicates SIGTERM - container was gracefully terminated.")
 
+                # Capture the container's own stdout/stderr BEFORE it's removed below.
+                # This container runs `--rm`, so once cleanup runs any traceback it
+                # printed is gone forever ??? previously the only signal a non-zero exit
+                # left behind was "exited with code N", with the actual cause
+                # unrecoverable after the fact (see the repair_cycle_runner.py startup
+                # crash this was added for: an unhandled exception there exits 1 with
+                # no Redis result, before any of that process's own error handling
+                # runs). Best-effort only: never let a `docker logs` failure block
+                # normal completion handling.
+                container_log_excerpt = None
+                if exit_code not in (0, None):
+                    try:
+                        logs_result = subprocess.run(
+                            ['docker', 'logs', '--tail', '100', container_name],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        combined = (logs_result.stdout or '') + (logs_result.stderr or '')
+                        combined = combined.strip()
+                        if combined:
+                            container_log_excerpt = combined[-2000:]
+                            logger.error(
+                                f"Container {container_name} logs (last 100 lines, exit {exit_code}):\n"
+                                f"{container_log_excerpt}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Could not capture logs for {container_name}: {e}")
+
                 # Load result from Redis
                 repair_result = None
                 try:
@@ -6014,7 +6041,11 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                     'error_message': error_message,
                                     'container_name': container_name,
                                     'pipeline_run_id': pipeline_run_id,
-                                    'agent_name': agent_name
+                                    'agent_name': agent_name,
+                                    # Container runs `--rm` and is gone by the time a human
+                                    # looks at this event, so this is the only surviving
+                                    # copy of whatever it printed before dying.
+                                    'container_log_excerpt': container_log_excerpt,
                                 }
                             )
                         except Exception as es_error:

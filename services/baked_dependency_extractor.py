@@ -136,7 +136,14 @@ def extract_baked_dependencies(project_name: str, image_name: str, destination: 
                 BAKED_DEPS_PATH.lower() in stderr_lower
                 and any(
                     phrase in stderr_lower
-                    for phrase in ('no such', 'not found', 'does not exist')
+                    # 'could not find' covers the actual daemon wording observed in
+                    # practice ("Error response from daemon: Could not find the file
+                    # /opt/deps/. in container ...") -- the original 'no such'/
+                    # 'not found'/'does not exist' set was written against older
+                    # Docker CLI-side wording and never actually matched this, so
+                    # every old-convention image logged as if it were a genuine copy
+                    # failure instead of the expected/self-healing case.
+                    for phrase in ('no such', 'not found', 'does not exist', 'could not find')
                 )
             )
             if looks_like_missing_path:
