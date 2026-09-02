@@ -2209,6 +2209,13 @@ class RepairCycleStage(PipelineStage):
         the fix, as opposed to confirming it's still broken). Only BLOCKED stops
         the sub-cycle early.
 
+        If the sub-cycle stops (attempts exhausted, or the circuit breaker trips)
+        while the dev container is still sitting at CHANGES_NEEDED, it is forced
+        to the terminal BLOCKED status before returning — CHANGES_NEEDED has no
+        other owner once this method stops driving it, so leaving it in place
+        would silently block the project forever. See
+        _finalize_unconfirmed_changes_needed.
+
         Returns the last RepairTestResult obtained, so _run_test_cycle() can
         use it directly without a redundant test re-run.
         """
@@ -2235,6 +2242,47 @@ class RepairCycleStage(PipelineStage):
 
         last_test_result = None
         attempts_made = 0
+        # Tracks the last *observed* dev container status across attempts —
+        # initialized before the loop (not just inside it) so it's safe to read
+        # even if the very first attempt breaks before ever polling.
+        final_status = None
+
+        def _finalize_unconfirmed_changes_needed(reason: str) -> None:
+            """Force the terminal BLOCKED transition if we're about to stop
+            driving this sub-cycle while the dev container is still sitting at
+            CHANGES_NEEDED. CHANGES_NEEDED has no other owner once this
+            sub-cycle stops: validate_task_can_run() deliberately never
+            re-triggers setup for it itself (to avoid racing this sub-cycle's
+            own retry) — so leaving it here would silently block every future
+            task for the project forever. Called from every early-exit point
+            that skips the loop's `else` clause (currently just the circuit
+            breaker) as well as from the `else` clause itself on exhaustion —
+            a `break` after the setup-queue exception is exempt because that
+            path resets state to UNVERIFIED (self-healing) before it can fail.
+            """
+            if final_status != DevContainerStatus.CHANGES_NEEDED:
+                return
+            dev_container_state.set_status(
+                project,
+                DevContainerStatus.BLOCKED,
+                error_message=(
+                    f"Env rebuild sub-cycle {reason}; verifier never confirmed "
+                    f"the required fix: {analysis.env_issue_description[:200]}"
+                ),
+            )
+            if obs:
+                obs.emit(
+                    EventType.ERROR_ENCOUNTERED,
+                    "repair_cycle",
+                    task_id,
+                    project,
+                    {
+                        "test_type": config.test_type,
+                        "error_type": "env_rebuild_changes_needed_exhausted",
+                        "attempts": attempts_made,
+                    },
+                    pipeline_run_id=pipeline_run_id,
+                )
 
         for attempt in range(MAX_SYSTEMIC_SUB_CYCLES):
             attempts_made = attempt + 1
@@ -2261,6 +2309,11 @@ class RepairCycleStage(PipelineStage):
                         },
                         pipeline_run_id=pipeline_run_id,
                     )
+                # The loop's `else` clause below (which normally owns the
+                # CHANGES_NEEDED->BLOCKED terminal transition) is skipped by
+                # this `break` — a prior attempt could have left the dev
+                # container at CHANGES_NEEDED with no attempt left to retry it.
+                _finalize_unconfirmed_changes_needed("was stopped by the circuit breaker")
                 break
 
             logger.info(
@@ -2374,7 +2427,12 @@ class RepairCycleStage(PipelineStage):
                 # iteration, which resets state to UNVERIFIED and re-queues setup.
                 logger.warning(
                     f"Env rebuild ended with status=CHANGES_NEEDED for {project} "
-                    f"after {elapsed}s (attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES}), retrying"
+                    f"after {elapsed}s (attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES})"
+                    + (
+                        ", retrying"
+                        if attempts_made < MAX_SYSTEMIC_SUB_CYCLES
+                        else ", attempts exhausted — will be marked BLOCKED"
+                    )
                 )
                 if obs:
                     obs.emit(
@@ -2411,6 +2469,14 @@ class RepairCycleStage(PipelineStage):
                         pipeline_run_id=pipeline_run_id,
                     )
                 break
+        else:
+            # `for...else`: only reached when the loop ran out of attempts
+            # without an early `break` (VERIFIED-with-passing-tests, or
+            # BLOCKED — the circuit-breaker `break` is handled separately,
+            # above, since it also skips this clause). Exhausting attempts
+            # while still at CHANGES_NEEDED needs the same terminal transition
+            # as the circuit-breaker case; see _finalize_unconfirmed_changes_needed.
+            _finalize_unconfirmed_changes_needed("exhausted all attempts")
 
         if obs:
             obs.emit(
