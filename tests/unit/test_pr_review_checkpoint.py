@@ -93,3 +93,19 @@ class TestPRReviewCheckpoint:
 
         resumed = PRReviewCheckpoint("test-project", 123, base_dir=tmp_path)
         assert resumed.get_phase_output(1, "code_review") == "output from the interrupted run"
+
+    def test_refuses_empty_output(self, checkpoint):
+        """An empty result isn't a completed phase — checkpointing it as done would
+        make a later resume skip a phase that actually still needs to run."""
+        assert checkpoint.save_phase_output(1, "code_review", "") is False
+        assert checkpoint.get_phase_output(1, "code_review") is None
+
+    def test_refuses_whitespace_only_output(self, checkpoint):
+        assert checkpoint.save_phase_output(1, "code_review", "   \n  ") is False
+        assert checkpoint.get_phase_output(1, "code_review") is None
+
+    def test_refuses_non_int_cycle(self, checkpoint):
+        """A str cycle like '1' would compare unequal to the stored int 1, look like
+        a new cycle, and silently discard real phase data — refuse it outright."""
+        assert checkpoint.save_phase_output("1", "code_review", "output") is False
+        assert checkpoint.get_phase_output(1, "code_review") is None

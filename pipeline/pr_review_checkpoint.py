@@ -82,8 +82,29 @@ class PRReviewCheckpoint:
             output: The phase's raw text output.
 
         Returns:
-            True if saved successfully, False otherwise.
+            True if saved successfully, False otherwise (including a refused
+            empty/whitespace-only output — an empty result isn't "this phase is
+            done", it's indistinguishable from "this phase never ran", and
+            checkpointing it as done would make a later resume skip a phase that
+            actually still needs to run).
         """
+        if not isinstance(cycle, int):
+            logger.error(
+                f"Refusing to save PR review checkpoint for {self.project_name}/"
+                f"#{self.issue_number} phase={phase_key}: cycle must be an int, "
+                f"got {cycle!r} ({type(cycle).__name__}) — a str/int mismatch here "
+                f"would silently look like a new cycle and discard real phase data"
+            )
+            return False
+
+        if not output or not output.strip():
+            logger.warning(
+                f"Refusing to checkpoint empty output for {self.project_name}/"
+                f"#{self.issue_number} cycle={cycle} phase={phase_key} — an empty "
+                f"result isn't a completed phase"
+            )
+            return False
+
         try:
             checkpoint = self._load_from_file(self.checkpoint_file)
             if not checkpoint or checkpoint.get('cycle') != cycle:

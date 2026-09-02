@@ -3,33 +3,45 @@ Unit tests for PRReviewStage
 
 Test orchestration logic without actually launching Docker containers.
 
-Requires Docker container environment: pipeline.pr_review_stage's import chain
-needs orchestrator config/state modules that only resolve correctly there. Run via
+Requires the real Docker orchestrator container. pipeline.pr_review_stage's import
+chain is eager, not lazy: pr_review_stage -> services.agent_executor -> pipeline.factory
+-> agents (__init__.py) -> agents.dev_environment_verifier_agent -> a module-level
+`from services.dev_container_state import dev_container_state` that instantiates a
+DevContainerStateManager singleton, whose __init__ unconditionally does
+`Path('/app/state/dev_containers').mkdir(parents=True, exist_ok=True)`. That's a real
+directory the orchestrator already manages inside the container, but outside it
+`/app` doesn't exist at all, so the import itself fails. Run via
 `docker-compose exec orchestrator python -m pytest tests/unit/test_pr_review_stage.py`.
 """
 
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
+
+# See the module docstring above: pipeline.pr_review_stage's import chain touches a
+# real, orchestrator-managed directory under /app that only exists inside the
+# container. This is a real environment check, not a style preference — do not
+# replace it with patch.dict('sys.modules', {'services.dev_container_state': ...})
+# to make this importable outside Docker too. That was tried historically and wraps
+# pipeline.pr_review_stage's *first-ever* import of the process in a temporary
+# sys.modules patch, which caused a double-import artifact: the resulting
+# PRReviewStage instance's bound methods kept referencing a stale, orphaned copy of
+# the module's globals that later per-test patch(...) calls (targeting the live,
+# current sys.modules entry) never reached. In practice this silently fell through
+# to the real pr_review_state_manager singleton instead of the mock —
+# test_phase1_launches_pr_code_reviewer failed this way, reading real leftover state
+# from state/projects/test-project/pr_review_state.yaml, until that workaround was
+# removed from the fixture below.
+if not Path('/app').is_dir():
+    pytest.skip(
+        "Requires the real Docker orchestrator container — see module docstring.",
+        allow_module_level=True,
+    )
 
 
 @pytest.fixture
 def pr_review_stage():
-    """Create PRReviewStage with mocked dependencies.
-
-    Does NOT wrap this import in patch.dict('sys.modules', {'services.dev_container_state':
-    MagicMock()}) — that was here historically to dodge a real module-level import of
-    dev_container_state (which creates /app/state/dev_containers as a side effect), but
-    services.agent_executor now only imports it lazily, inside functions, so the
-    workaround is obsolete. Worse, wrapping pipeline.pr_review_stage's *first-ever*
-    import of the process in a temporary sys.modules patch caused a double-import
-    artifact: the resulting PRReviewStage instance's bound methods kept referencing a
-    stale, orphaned copy of the module's globals that later per-test patch(...) calls
-    (targeting the live, current sys.modules entry) never reached. In practice this
-    silently fell through to the real pr_review_state_manager singleton instead of the
-    mock — see test_phase1_launches_pr_code_reviewer, which failed this way by reading
-    real leftover state (state/projects/test-project/pr_review_state.yaml) until this
-    fixture was fixed.
-    """
+    """Create PRReviewStage with mocked dependencies."""
     with patch('pipeline.pr_review_stage.ConfigManager'), \
          patch('pipeline.pr_review_stage.GitHubStateManager'), \
          patch('pipeline.pr_review_stage.pr_review_state_manager'):

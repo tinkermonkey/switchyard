@@ -2732,11 +2732,25 @@ class DockerAgentRunner:
 
         if exit_code == 0 and output and cycle is not None:
             from pipeline.pr_review_checkpoint import PRReviewCheckpoint
-            PRReviewCheckpoint(project, issue_number).save_phase_output(cycle, pr_review_phase, output)
-            logger.info(
-                f"Checkpointed recovered PR review phase '{pr_review_phase}' "
-                f"(cycle {cycle}) for {project}/#{issue_number} — will resume from here"
+            saved = PRReviewCheckpoint(project, issue_number).save_phase_output(
+                cycle, pr_review_phase, output
             )
+            if saved:
+                logger.info(
+                    f"Checkpointed recovered PR review phase '{pr_review_phase}' "
+                    f"(cycle {cycle}) for {project}/#{issue_number} — will resume from here"
+                )
+            else:
+                # save_phase_output already logged the specific I/O error. Don't claim
+                # success here — a caller re-reading logs for "did this get saved?"
+                # must not see a false "Checkpointed..." line right next to the real
+                # failure. This phase's real output is now lost for this attempt; the
+                # re-trigger below will simply redo it.
+                logger.error(
+                    f"Checkpoint save FAILED for recovered PR review phase "
+                    f"'{pr_review_phase}' (cycle {cycle}) on {project}/#{issue_number} — "
+                    f"this phase's output could not be persisted and will be re-run"
+                )
         else:
             logger.warning(
                 f"Recovered PR review phase '{pr_review_phase}' for {project}/#{issue_number} "
@@ -2755,8 +2769,26 @@ class DockerAgentRunner:
                     project_name=project,
                     error=None if exit_code == 0 else f"Container exited with code {exit_code}",
                 )
+            else:
+                # Not a no-op: this phase's own in_progress execution_history entry
+                # (recorded by work_execution_start when its container was launched)
+                # is never closed out. It doesn't block the re-trigger below (that's
+                # gated on the separate pr_review_stage wrapper entry, which
+                # cleanup_orphaned_execution_history already marks abandoned during
+                # container recovery), but it does leave a stale in_progress record
+                # for this specific agent/column pair sitting in state until a human
+                # or a later reconciliation pass notices it.
+                logger.warning(
+                    f"Recovered PR review phase '{pr_review_phase}' for "
+                    f"{project}/#{issue_number} has no known column — could not "
+                    f"record its execution outcome; a stale in_progress entry for "
+                    f"agent '{agent}' may be left behind"
+                )
         except Exception as e:
-            logger.error(f"Failed to record execution outcome for recovered PR review phase: {e}")
+            logger.error(
+                f"Failed to record execution outcome for recovered PR review phase: {e}",
+                exc_info=True,
+            )
 
         try:
             from config.manager import config_manager
@@ -2768,6 +2800,14 @@ class DockerAgentRunner:
                 logger.warning(f"No project config for {project} — cannot re-trigger PR review")
                 return
 
+            # Find the board whose column resolves (via stage_mapping, into the
+            # pipeline's own template) to a stage_type of "pr_review" — mirroring
+            # exactly how services/project_monitor.py's trigger_agent_for_status
+            # itself decides a column is a pr_review stage. column.agent is NOT
+            # that signal: the real config has agent="pr_review_agent" on this
+            # column (config/foundations/workflows.yaml), never "pr_review_stage"
+            # (that string only ever appears as work_execution_state's synthetic
+            # wrapper agent name — it is never a column's configured agent).
             board_name = None
             repository = None
             for pipeline in project_config.pipelines:
@@ -2777,27 +2817,49 @@ class DockerAgentRunner:
                 current_column = next(
                     (c for c in workflow_template.columns if c.name == column), None
                 )
-                if current_column and getattr(current_column, 'agent', None) == 'pr_review_stage':
+                if not current_column:
+                    continue
+                stage_name = getattr(current_column, 'stage_mapping', None)
+                if not stage_name:
+                    continue
+                pipeline_template = config_manager.get_pipeline_template(pipeline.template)
+                if not pipeline_template:
+                    continue
+                stage_config = next(
+                    (s for s in pipeline_template.stages if s.stage == stage_name), None
+                )
+                if stage_config and getattr(stage_config, 'stage_type', None) == 'pr_review':
                     board_name = pipeline.board_name
                     repository = project_config.github.get('repo')
                     break
 
             if not board_name:
                 logger.warning(
-                    f"Could not find a pr_review_stage board/column for {project}/#{issue_number} "
+                    f"Could not find a pr_review board/column for {project}/#{issue_number} "
                     f"in column '{column}' — not re-triggering"
                 )
                 return
 
             monitor = ProjectMonitor(TaskQueue(), config_manager)
-            # lock_already_acquired=True: this issue already holds the pipeline lock for
-            # this board (never released — see docstring above), and try_acquire_lock()
-            # refuses even the lock's own holder, so a plain re-trigger would fail here
-            # without this flag.
-            monitor.trigger_agent_for_status(
+            # No lock_already_acquired flag: "In Review" isn't a pipeline_trigger_column,
+            # so trigger_agent_for_status's own lock-acquisition branch (the only place
+            # that flag is consulted) never runs for it anyway — it routes straight to
+            # _start_pr_review_for_issue, which doesn't accept that parameter at all and
+            # already handles "this issue already holds the lock" correctly on its own
+            # via its independent _lock_held_by_us check.
+            dispatched_stage = monitor.trigger_agent_for_status(
                 project, board_name, issue_number, column, repository,
-                lock_already_acquired=True,
             )
+            if not dispatched_stage:
+                logger.warning(
+                    f"trigger_agent_for_status did not dispatch a re-trigger for "
+                    f"{project}/#{issue_number} in column '{column}' (returned None) — "
+                    f"the issue may be closed, off the board, behind another queued "
+                    f"issue, or its lock may be retained after a prior failure. It will "
+                    f"stay stuck until the next event re-evaluates it or a human "
+                    f"intervenes; check the issue's pipeline lock and queue state."
+                )
+                return
             logger.info(
                 f"Re-triggered PR review for {project}/#{issue_number} after restart recovery"
             )
