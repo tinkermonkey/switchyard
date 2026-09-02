@@ -67,8 +67,19 @@ class RepairCycleRunner:
 
     def __init__(self, args):
         self.args = args
-        self.project_dir = Path(f"/workspace/{args.project}")
         self.context_file = Path(args.context) if args.context else None
+        # project_dir must match whatever directory the orchestrator actually
+        # launched this container against -- the shared base clone for
+        # 'discussions'-type work, or an isolated epic worktree for 'issues'-type
+        # repair cycles (see #46/#48). context.json (already written to disk by
+        # the orchestrator before this container starts -- see project_monitor.py's
+        # _save_repair_cycle_context) is the source of truth for that path; the
+        # base-clone default below is only a fallback for a missing/corrupt/
+        # pre-#48 context file, matching this runner's pre-existing behavior in
+        # that case. Read directly here (before self.context is populated by the
+        # later load_context() call) since project_dir is needed immediately below
+        # for the log file handler.
+        self.project_dir = self._resolve_initial_project_dir(args)
         self.context = None
         self.stage = None
         self.checkpoint_manager = None
@@ -84,6 +95,32 @@ class RepairCycleRunner:
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+
+    @staticmethod
+    def _resolve_initial_project_dir(args) -> Path:
+        """Best-effort read of context.json's 'project_dir' before self.context is
+        populated by the later load_context() call. Falls back to the pre-#46
+        base-clone-style default (/workspace/<project>) if the context file is
+        missing, unreadable, or predates #48 (no 'project_dir' key) -- never
+        raises, since this must not block container startup over a resolution
+        problem here any more than any other project_dir resolution in this
+        codebase does.
+        """
+        default = Path(f"/workspace/{args.project}")
+        if not args.context:
+            return default
+        try:
+            with open(args.context, 'r') as f:
+                saved_context = json.load(f)
+            project_dir = saved_context.get('project_dir')
+            if project_dir:
+                return Path(project_dir)
+        except Exception as e:
+            logger.warning(
+                f"Could not read project_dir from context file {args.context} at "
+                f"startup, falling back to {default}: {e}"
+            )
+        return default
 
     def _handle_signal(self, signum, frame):
         """Handle termination signals gracefully"""

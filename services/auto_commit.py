@@ -22,7 +22,9 @@ class AutoCommitService:
         agent: str,
         task_id: str,
         issue_number: Optional[int] = None,
-        custom_message: Optional[str] = None
+        custom_message: Optional[str] = None,
+        epic_id: Optional[str] = None,
+        branch_name: Optional[str] = None
     ) -> bool:
         """
         Commit changes made by an agent
@@ -33,11 +35,47 @@ class AutoCommitService:
             task_id: Task ID
             issue_number: GitHub issue number (if applicable)
             custom_message: Custom commit message (optional)
+            epic_id: Epic issue number scoping an isolated worktree, if the caller's
+                actual mount source was an epic worktree rather than the shared base
+                clone (#48 fast-follow). None (default) preserves base-clone
+                behavior exactly, matching every caller except the repair-cycle
+                ones below.
+            branch_name: Branch the epic's worktree is on. Only consulted (and only
+                needed) the first time a given epic's worktree would be created --
+                by the time this method runs, the repair-cycle container has
+                already created/used it, so this is normally a no-op cache-hit
+                lookup; passed through for completeness.
 
         Returns:
             True if commit was successful, False otherwise
         """
-        project_dir = workspace_manager.get_project_dir(project)
+        # Resolve to the SAME directory the agent actually wrote to. Fixes a real
+        # gap found while implementing #48: services/project_monitor.py's and
+        # services/agent_container_recovery.py's repair-cycle callers (agent=
+        # 'repair_cycle') mount an epic-scoped worktree unconditionally for
+        # 'issues' workspace type (deliberately exempted from agent_executor.py's
+        # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate -- see #46's commit message),
+        # so resolving unconditionally to the base clone here meant this method's
+        # _check_for_changes() below would see a clean base clone and silently
+        # skip committing real repair-cycle fixes. Every OTHER caller (e.g.
+        # services/review_cycle.py's maker-commit calls, for 'issues'/'hybrid'
+        # workspace) omits epic_id/branch_name, preserving base-clone resolution
+        # exactly -- their actual mount source stays the base clone per #46/#47's
+        # gating decision.
+        try:
+            project_dir = workspace_manager.get_project_dir(project, epic_id=epic_id, branch_name=branch_name)
+        except Exception as e:
+            # get_or_create_epic_worktree() (reached when epic_id is given) can raise
+            # ValueError/RuntimeError on a genuine failure -- must not propagate an
+            # unhandled exception out of this method, whose documented contract is
+            # "True if commit was successful, False otherwise" for every failure mode,
+            # and whose repair-cycle callers run it inside a bare threading.Thread with
+            # no exception handling of their own.
+            logger.error(
+                f"Failed to resolve project directory for {project}/#{issue_number} "
+                f"(epic_id={epic_id}): {e}"
+            )
+            return False
 
         if not project_dir.exists():
             logger.error(f"Project directory does not exist: {project_dir}")

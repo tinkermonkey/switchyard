@@ -142,6 +142,15 @@ class ProjectConfig:
     hidden: bool = False  # Hide from UI and monitoring
     reference_repos: List[ReferenceRepo] = None  # Read-only repos mounted at agent launch via git worktrees
     code_review_lint: Optional[Dict[str, Any]] = None  # Pre-review mechanical lint configuration
+    # Per-project opt-in for real epic-worktree isolation (#87/#52). Defaults to
+    # False so every existing project keeps today's shared-base-clone behavior
+    # unchanged; only a chosen pilot project should set this to True. Only takes
+    # effect for dispatches services/agent_executor.py's EPIC_WORKTREE_SAFE_
+    # WORKSPACE_TYPES allowlist already considers safe (currently just
+    # 'discussions', i.e. the planning_design pipeline) -- this flag narrows an
+    # already-safe workspace type down to a specific project, it does not widen
+    # which workspace types are eligible.
+    worktree_isolation_enabled: bool = False
 
 
 class ConfigurationError(Exception):
@@ -403,6 +412,7 @@ class ConfigManager:
             hidden=project_data.get('hidden', False),
             reference_repos=reference_repos,
             code_review_lint=project_data.get('code_review_lint'),
+            worktree_isolation_enabled=project_data.get('worktree_isolation_enabled', False),
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:

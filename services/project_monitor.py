@@ -86,6 +86,20 @@ def _save_repair_cycle_context(
         'discussion_id': context.get('discussion_id'),
         'pipeline_run_id': context.get('pipeline_run_id'),
         'project_dir': context.get('project_dir'),  # Keep original project_dir path
+        'epic_id': context.get('epic_id'),
+        # NOTE (#48 review): this 'branch_name' is stage_context['branch_name'], set
+        # later in _start_repair_cycle_for_issue() by prepare_feature_branch()'s
+        # SUB-ISSUE-scoped branch resolution -- which can legitimately differ from
+        # epic_branch_name (used to actually create this epic's worktree a few lines
+        # earlier, via resolve_epic_branch_name()/create_feature_branch_name()). A
+        # mismatch here is harmless for its actual consumer today: agent_container_
+        # recovery.py's restart-recovery auto-commit only uses this as an advisory
+        # hint on a cache-miss adoption of an ALREADY-EXISTING worktree
+        # (ProjectWorkspaceManager.get_or_create_epic_worktree() reads the worktree's
+        # real on-disk branch and only warns, never acts, on a mismatch). Still worth
+        # unifying properly if/when #48's deferred FeatureBranchManager reconciliation
+        # lands, rather than relying on that adoption-path safety net indefinitely.
+        'branch_name': context.get('branch_name'),
         'use_docker': True,
         'task_id': context.get('task_id'),
         'test_configs': serialized_configs,
@@ -246,6 +260,33 @@ def _launch_repair_cycle_container(
         # Get Docker runner for path detection
         docker_runner = DockerAgentRunner()
         host_workspace_path = docker_runner._detect_host_workspace_path()
+
+        # Translate the container-side project_dir (the shared base clone, e.g.
+        # /workspace/<project>, or -- for 'issues'-workspace repair cycles, see
+        # #46/#48 -- an isolated epic worktree, e.g. /workspace/.orchestrator/
+        # worktrees/<project>/<epic_id>) into the corresponding HOST path, mirroring
+        # claude/docker_runner.py's _build_docker_command's own established
+        # container-path -> host-path translation for ordinary agent containers.
+        # Found in a final whole-PR review pass on #87: this function accepted
+        # project_dir as a parameter but never actually used it to build a mount --
+        # the container was always mounted at a hardcoded /workspace/<project_name>
+        # regardless of what directory the orchestrator had actually resolved.
+        # .orchestrator is mounted separately below and happens to make an epic
+        # worktree reachable as a side effect of that broader mount, but relying on
+        # that implicitly (rather than mounting project_dir at its own path
+        # explicitly) is fragile -- this makes the intent explicit instead.
+        project_dir_str = str(project_dir)
+        if project_dir_str.startswith('/workspace/'):
+            project_dir_relative = project_dir_str[len('/workspace/'):]
+            host_project_dir_path = f'{host_workspace_path}/{project_dir_relative}'
+        else:
+            logger.warning(
+                f"project_dir {project_dir_str!r} for repair cycle on "
+                f"{project_name}/#{issue_number} doesn't start with /workspace/ -- "
+                "falling back to the base-clone mount path"
+            )
+            project_dir_str = f'/workspace/{project_name}'
+            host_project_dir_path = f'{host_workspace_path}/{project_name}'
         # Read HOST_HOME from environment (set in .env, injected via docker-compose.yml).
         # Must be forwarded explicitly to the repair cycle container — it won't inherit
         # the orchestrator's environment, and without it _detect_host_home_path() falls
@@ -283,8 +324,19 @@ def _launch_repair_cycle_container(
             '-v', f'{host_workspace_path}/switchyard:/app',
             # ALSO mount orchestrator at /workspace/switchyard for checkpoint paths
             '-v', f'{host_workspace_path}/switchyard:/workspace/switchyard',
-            # Mount project workspace at standard path (same as agent containers)
+            # Mount the base clone at its standard path (same as agent containers) --
+            # kept even when project_dir below points elsewhere (an epic worktree),
+            # since other code in this container (e.g. PR/base-clone-scoped git
+            # operations outside this repair cycle's own worktree) may still expect
+            # the base clone reachable at its conventional path.
             '-v', f'{host_workspace_path}/{project_name}:/workspace/{project_name}',
+            # Mount project_dir itself at its own container path -- the actual
+            # directory this repair cycle's work happens in, which may be the same
+            # as the base clone mount above (a no-op duplicate mount in that case,
+            # harmless) or a distinct epic worktree path nested under .orchestrator/
+            # (also mounted below; this makes relying on that nesting explicit
+            # rather than implicit).
+            '-v', f'{host_project_dir_path}:{project_dir_str}',
             # Mount .orchestrator dir so MCP config writes and reference worktrees work
             # (docker_runner writes to /workspace/.orchestrator/tmp; without this mount
             # the path is absent/unwritable in the repair cycle container)
@@ -5003,6 +5055,21 @@ _Review cycle initiated by Switchyard_
                         from services.git_workflow_manager import git_workflow_manager
                         from services.project_workspace import workspace_manager
 
+                        # INTENTIONALLY base-clone-scoped, not migrated to
+                        # epic-worktree resolution (#48). create_or_update_pr()
+                        # itself is checkout-free (it only runs `gh pr create
+                        # --head <branch>` with this dir as cwd, referencing the
+                        # already-pushed remote branch by name -- no local checkout
+                        # of that branch is required), but this call only ever
+                        # fires for pipeline.workspace == 'issues', which
+                        # agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
+                        # gate excludes from epic-worktree resolution (#46): for
+                        # 'issues', FeatureBranchManager.prepare_feature_branch()
+                        # still independently resolves and checks out its own
+                        # branch on this same base clone elsewhere in this
+                        # dispatch. Scoping just this read to an epic worktree
+                        # would be inconsistent with that -- and gains nothing,
+                        # since gh doesn't need local branch content anyway.
                         project_dir = workspace_manager.get_project_dir(project_name)
 
                         pr_result = loop.run_until_complete(
@@ -5496,7 +5563,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         project_config,
         workflow_template,
         agent_name: str,
-        pipeline_run_id: Optional[str] = None
+        pipeline_run_id: Optional[str] = None,
+        epic_id: Optional[str] = None,
+        epic_branch_name: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
@@ -5735,7 +5804,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 agent='repair_cycle',
                                 task_id=f'repair_cycle_{issue_number}',
                                 issue_number=issue_number,
-                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                                custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                                epic_id=epic_id,
+                                branch_name=epic_branch_name
                             )
                         )
                         
@@ -6708,10 +6779,102 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             # Build context for stage execution
             from services.project_workspace import workspace_manager
+            from services.feature_branch_manager import feature_branch_manager
+            from services.github_integration import GitHubIntegration
             from monitoring.observability import get_observability_manager
-            
-            project_dir = workspace_manager.get_project_dir(project_name)
+            import concurrent.futures
+
             obs = get_observability_manager()
+
+            # Resolve the epic (parent issue) BEFORE computing project_dir, so the
+            # repair cycle container mounts the epic's isolated worktree instead of
+            # the shared base clone. The repair_cycle stage only exists in the
+            # sdlc_execution pipeline template, so every issue reaching this
+            # function is a sub-issue of a parent epic -- unlike the generic
+            # agent_executor dispatch path (which also has to serve
+            # planning_design's directly-dispatched epics and standalone issues),
+            # a missing parent here is a real error: silently scoping the worktree
+            # to this sub-issue's own number instead would silently defeat the
+            # cross-sub-issue isolation this migration exists to deliver.
+            epic_id = None
+            epic_branch_name = None
+            github = None
+            if workspace_type == 'issues':
+                github = GitHubIntegration(
+                    repo_owner=project_config.github['org'],
+                    repo_name=repository
+                )
+
+                async def _resolve_epic_worktree_target():
+                    parent_issue = await feature_branch_manager.get_parent_issue(
+                        github, issue_number, project=project_name
+                    )
+                    if not parent_issue:
+                        raise ValueError(
+                            f"Repair cycle for {project_name}/#{issue_number} could not "
+                            f"resolve a parent epic issue via GitHub's structured "
+                            f"sub-issue API. sdlc_execution sub-issues must have a "
+                            f"parent to scope an isolated worktree by."
+                        )
+                    eid = str(parent_issue)
+                    existing_branch = feature_branch_manager.resolve_epic_branch_name(project_name, eid)
+                    ebranch = existing_branch or feature_branch_manager.create_feature_branch_name(parent_issue, "")
+                    return eid, ebranch
+
+                # Handle both running-loop and no-loop contexts, same pattern used
+                # by the feature-branch preparation call below.
+                try:
+                    try:
+                        asyncio.get_running_loop()
+                        with concurrent.futures.ThreadPoolExecutor() as pool:
+                            epic_id, epic_branch_name = pool.submit(
+                                asyncio.run, _resolve_epic_worktree_target()
+                            ).result()
+                    except RuntimeError:
+                        epic_id, epic_branch_name = asyncio.run(_resolve_epic_worktree_target())
+                except Exception as e:
+                    logger.error(
+                        f"Failed to resolve epic worktree target for repair cycle on "
+                        f"issue #{issue_number}: {e}. Refusing to fall back to the "
+                        f"shared base clone -- aborting repair cycle launch.",
+                        exc_info=True
+                    )
+                    # This runs AFTER steal_lock() already succeeded and a pipeline run
+                    # was created above -- without explicitly ending that run, the lock
+                    # stays claimed and the run stays active forever (this board's only
+                    # other recovery paths -- _reconcile_active_runs at startup, and the
+                    # periodic FAILSAFE sweep -- both explicitly skip locked boards).
+                    # Mirrors the existing container-launch-failure cleanup below.
+                    try:
+                        self.pipeline_run_manager.end_pipeline_run(
+                            project=project_name,
+                            issue_number=issue_number,
+                            reason=f"Failed to resolve epic worktree target: {e}",
+                            outcome='failed'
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(
+                            f"Failed to end pipeline run after epic resolution failure: {cleanup_e}"
+                        )
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=status,
+                            agent=stage_config.default_agent,
+                            outcome='failure',
+                            project_name=project_name,
+                            error=f"Failed to resolve epic worktree target: {e}"
+                        )
+                    except Exception as cleanup_e:
+                        logger.error(
+                            f"Failed to record execution failure after epic resolution failure: {cleanup_e}"
+                        )
+                    return None
+
+            project_dir = workspace_manager.get_project_dir(
+                project_name, epic_id=epic_id, branch_name=epic_branch_name
+            ) if epic_id else workspace_manager.get_project_dir(project_name)
 
             stage_context = {
                 'project': project_name,
@@ -6726,6 +6889,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 'discussion_id': discussion_id,
                 'pipeline_run_id': pipeline_run.id,
                 'project_dir': project_dir,
+                'epic_id': epic_id,
                 'use_docker': True,
                 'task_id': f"repair_cycle_{issue_number}_{pipeline_run.id}",
                 'agent_name': stage_config.default_agent,
@@ -6736,19 +6900,38 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 
             # Prepare workspace branch for issues workspace (git checkout feature branch)
             branch_name = None
-            if workspace_type == 'issues':
+            if workspace_type == 'issues' and epic_id is not None:
+                # The epic worktree resolved above already exists, checked out to
+                # epic_branch_name (worktree creation performs the checkout
+                # atomically) -- running prepare_feature_branch()'s own independent
+                # branch resolution + checkout here would target that SAME branch on
+                # the shared BASE CLONE, which git refuses once the epic worktree
+                # already has it checked out ("already used by worktree at ...").
+                # Found in a final whole-PR review pass on #87: previously this was
+                # silently caught by the except block below (no crash), but that
+                # also silently discarded ALL of prepare_feature_branch()'s other
+                # side effects for repair-cycle-dispatched sub-issues (feature-branch
+                # state/sub-issue tracking, stale-branch escalation comments) -- not
+                # just the checkout. epic_branch_name is already the correct answer,
+                # so use it directly instead.
+                branch_name = epic_branch_name
+                stage_context['branch_name'] = branch_name
+                logger.info(
+                    f"Repair cycle for issue #{issue_number}: epic worktree already "
+                    f"on branch {branch_name!r} -- skipping prepare_feature_branch()'s "
+                    "redundant (and conflicting) base-clone checkout"
+                )
+            elif workspace_type == 'issues':
+                # Defensive fallback, not currently reachable: the epic-resolution
+                # block above already returns None (aborting the whole repair cycle
+                # launch) on ANY failure, so epic_id is guaranteed non-None here for
+                # 'issues' workspace type today. Kept in case that early-return
+                # behavior is ever relaxed upstream -- preserves the pre-#46
+                # behavior of resolving and checking out a branch on the shared base
+                # clone directly when there's no worktree/branch already established.
                 try:
-                    import asyncio
-                    from services.feature_branch_manager import feature_branch_manager
-                    from services.github_integration import GitHubIntegration
-                    
-                    github = GitHubIntegration(
-                        repo_owner=project_config.github['org'],
-                        repo_name=repository
-                    )
-                    
                     issue_title = issue_data.get('title', '')
-                    
+
                     logger.info(
                         f"Preparing feature branch for repair cycle on issue #{issue_number}"
                     )
@@ -6758,7 +6941,6 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # run_until_complete() on a new loop also fails for the same reason.
                     # Use the same pattern as lines 950-963: detect the running loop and
                     # dispatch to a fresh ThreadPoolExecutor thread if one is found.
-                    import concurrent.futures
                     coro = feature_branch_manager.prepare_feature_branch(
                         project=project_name,
                         issue_number=issue_number,
@@ -6772,10 +6954,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             branch_name = pool.submit(asyncio.run, coro).result()
                     except RuntimeError:
                         branch_name = asyncio.run(coro)
-                    
+
                     logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
                     stage_context['branch_name'] = branch_name
-                    
+
                 except Exception as e:
                     logger.error(f"Failed to prepare feature branch for repair cycle: {e}", exc_info=True)
                     # Don't fail the repair cycle if branch prep fails - it might still work
@@ -6940,7 +7122,9 @@ _Repair cycle initiated by Switchyard_
                 project_config=project_config,
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
-                pipeline_run_id=pipeline_run.id
+                pipeline_run_id=pipeline_run.id,
+                epic_id=epic_id,
+                epic_branch_name=epic_branch_name
             )
 
             return stage_config.default_agent

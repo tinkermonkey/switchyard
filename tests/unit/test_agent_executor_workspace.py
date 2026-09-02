@@ -9,6 +9,7 @@ import pytest
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
@@ -437,3 +438,258 @@ class TestAgentExecutorWorkspaceIntegration:
             comment_args, _ = mock_github.post_comment.call_args
             assert 'could NOT be durably marked retained' in comment_args[1]
             assert 'Pipeline lock retained' not in comment_args[1]
+
+
+class TestBuildExecutionContextEpicWorktree:
+    """Issue #46: _build_execution_context's work_dir must resolve to the
+    epic's isolated git worktree (via workspace_manager.get_project_dir's
+    epic_id/branch_name kwargs) instead of the shared base clone, while
+    staying byte-for-byte identical to the pre-migration behavior when no
+    epic_id is supplied.
+    """
+
+    def test_defaults_to_shared_base_clone_without_epic_id(self, agent_executor):
+        """Omitting epic_id must preserve the pre-worktree-isolation behavior
+        exactly: a plain base-clone path, no epic/branch kwargs threaded."""
+        with patch('services.project_workspace.workspace_manager.get_project_dir',
+                   return_value=Path('/workspace/test-project')) as mock_get_dir, \
+             patch('services.agent_executor.config_manager') as mock_config:
+            mock_config.get_project_agent_config.return_value = MagicMock()
+
+            context = agent_executor._build_execution_context(
+                agent_name='test_agent',
+                project_name='test-project',
+                task_id='task-1',
+                task_context={'issue_number': 100},
+            )
+
+            mock_get_dir.assert_called_once_with('test-project', epic_id=None, branch_name=None)
+            assert context['work_dir'] == '/workspace/test-project'
+
+    def test_scopes_work_dir_to_the_epic_worktree_when_epic_id_given(self, agent_executor):
+        with patch('services.project_workspace.workspace_manager.get_project_dir',
+                   return_value=Path('/workspace/.orchestrator/worktrees/test-project/42')) as mock_get_dir, \
+             patch('services.agent_executor.config_manager') as mock_config:
+            mock_config.get_project_agent_config.return_value = MagicMock()
+
+            context = agent_executor._build_execution_context(
+                agent_name='test_agent',
+                project_name='test-project',
+                task_id='task-1',
+                task_context={'issue_number': 101},
+                epic_id='42',
+                branch_name='feature/issue-42-epic',
+            )
+
+            mock_get_dir.assert_called_once_with(
+                'test-project', epic_id='42', branch_name='feature/issue-42-epic'
+            )
+            assert context['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+
+    def test_reuses_an_already_resolved_project_dir_without_rederiving(self, agent_executor):
+        """A caller running in its own separate process (a repair cycle
+        container) hands us the concrete directory its originating
+        orchestrator process already created/reused via
+        task_context['project_dir'] -- re-deriving via epic_id here would run
+        against a fresh, empty in-process worktree cache and could try to
+        `git worktree add` a worktree that already exists on disk."""
+        with patch('services.project_workspace.workspace_manager.get_project_dir') as mock_get_dir, \
+             patch('services.agent_executor.config_manager') as mock_config:
+            mock_config.get_project_agent_config.return_value = MagicMock()
+
+            task_context = {
+                'issue_number': 100,
+                'project_dir': '/workspace/.orchestrator/worktrees/test-project/42',
+            }
+            context = agent_executor._build_execution_context(
+                agent_name='test_agent',
+                project_name='test-project',
+                task_id='task-1',
+                task_context=task_context,
+                epic_id='42',
+                branch_name='feature/issue-42-epic',
+            )
+
+            mock_get_dir.assert_not_called()
+            assert context['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+
+
+class TestExecuteAgentEpicResolution:
+    """Issue #46: execute_agent must resolve the epic (parent issue for
+    sdlc_execution sub-issues, or the issue's own number for
+    planning_design/standalone dispatch) and thread it into
+    _build_execution_context, so the directory it builds is the epic's
+    isolated worktree.
+    """
+
+    async def _run(self, agent_executor, task_context, parent_issue,
+                    worktree_isolation_enabled=True):
+        """Drive execute_agent for real with everything except the epic
+        resolution chain and _build_execution_context mocked out, capturing
+        the epic_id/branch_name _build_execution_context was actually called
+        with.
+
+        worktree_isolation_enabled defaults to True here so the existing
+        workspace-type-gate tests below keep exercising exactly what they did
+        before the per-project opt-in flag (#52) was added -- that flag is its
+        own, separately-tested dimension (see TestExecuteAgentEpicResolution's
+        opt-in-flag tests further down), not something every workspace-type
+        test needs to also vary.
+        """
+        captured = {}
+
+        def fake_build_execution_context(agent_name, project_name, task_id, task_context,
+                                          epic_id=None, branch_name=None):
+            captured['epic_id'] = epic_id
+            captured['branch_name'] = branch_name
+            return {'work_dir': '/fake', 'use_docker': True, 'context': task_context}
+
+        mock_project_config = MagicMock()
+        mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+        mock_project_config.worktree_isolation_enabled = worktree_isolation_enabled
+
+        with patch('services.agent_executor.config_manager') as mock_config, \
+             patch.object(agent_executor, '_build_execution_context',
+                          side_effect=fake_build_execution_context), \
+             patch.object(agent_executor, '_apply_frozen_session_resume'), \
+             patch.object(agent_executor.factory, 'create_agent') as mock_create, \
+             patch.object(agent_executor.obs, 'emit_task_received'), \
+             patch.object(agent_executor.obs, 'emit_agent_initialized'), \
+             patch.object(agent_executor.obs, 'emit_agent_completed'), \
+             patch.object(agent_executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
+             patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',
+                   new_callable=AsyncMock) as mock_resolve_epic_id, \
+             patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_branch_name',
+                   return_value=None), \
+             patch('services.feature_branch_manager.feature_branch_manager.create_feature_branch_name',
+                   return_value='feature/issue-generated'), \
+             patch('services.feature_branch_manager.feature_branch_manager.get_current_branch',
+                   new_callable=AsyncMock, return_value='feature/issue-42-shared'):
+
+            mock_config.get_project_config.return_value = mock_project_config
+
+            async def fake_resolve_epic_id(gh, issue_number, project=None):
+                return str(parent_issue) if parent_issue else str(issue_number)
+            mock_resolve_epic_id.side_effect = fake_resolve_epic_id
+
+            mock_workspace = MagicMock()
+            mock_workspace.supports_git_operations = True
+            mock_workspace.prepare_execution = AsyncMock(
+                return_value={'branch_name': 'feature/issue-42-shared', 'work_dir': '/workspace/test-project'}
+            )
+            mock_workspace.finalize_execution = AsyncMock(return_value={'success': True})
+            mock_factory.create.return_value = mock_workspace
+
+            mock_agent = MagicMock()
+            mock_agent.execute = AsyncMock(return_value={'status': 'success'})
+            mock_agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
+            mock_agent.agent_config = {}
+            mock_create.return_value = mock_agent
+
+            await agent_executor.execute_agent(
+                agent_name='test_agent',
+                project_name='test-project',
+                task_context=task_context,
+            )
+
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_issues_workspace_type_does_not_resolve_epic_id(self, agent_executor):
+        """A sub-issue dispatch through the DEFAULT 'issues' workspace type must NOT
+        resolve/pass an epic_id -- IssuesWorkspaceContext.prepare_execution() ->
+        FeatureBranchManager.prepare_feature_branch() still checks out its own
+        (independently-resolved) branch directly on the shared base clone, which
+        would conflict with a worktree already holding that same branch checked
+        out. Epic worktree isolation for this workspace type is deferred to #48;
+        until then it must keep exactly its pre-migration base-clone behavior."""
+        task_context = {'issue_number': 100, 'workspace_type': 'issues'}
+
+        captured = await self._run(agent_executor, task_context, parent_issue=42)
+
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
+
+    @pytest.mark.asyncio
+    async def test_hybrid_workspace_type_does_not_resolve_epic_id(self, agent_executor):
+        """HybridWorkspaceContext also calls prepare_feature_branch() on the base
+        clone (same conflict risk as 'issues') -- must be excluded from epic
+        worktree resolution for the same reason."""
+        task_context = {'issue_number': 150, 'workspace_type': 'hybrid'}
+
+        captured = await self._run(agent_executor, task_context, parent_issue=42)
+
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
+
+    @pytest.mark.asyncio
+    async def test_planning_design_style_dispatch_falls_back_to_its_own_number(self, agent_executor):
+        """A board item dispatched directly as an epic through the 'discussions'
+        workspace type (verified git-free -- supports_git_operations=False, no
+        call to prepare_feature_branch, so no checkout-conflict risk) must scope
+        the worktree to its own issue number when no parent is found."""
+        task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
+
+        captured = await self._run(agent_executor, task_context, parent_issue=None)
+
+        assert captured['epic_id'] == '200'
+
+    @pytest.mark.asyncio
+    async def test_skip_workspace_prep_reuses_a_pre_resolved_epic_id(self, agent_executor):
+        """A repair cycle's own internal execute_agent calls
+        (skip_workspace_prep=True) already have 'epic_id'/'project_dir'
+        threaded in from the stage_context their originating dispatch built
+        -- this must be reused as-is, not re-resolved (which would run a
+        fresh GitHub lookup and, for project_dir, risk re-deriving via a
+        worktree cache that's empty in this process)."""
+        task_context = {
+            'issue_number': 100,
+            'workspace_type': 'issues',
+            'skip_workspace_prep': True,
+            'epic_id': '77',
+            'branch_name': 'feature/issue-77-shared',
+            'project_dir': '/workspace/.orchestrator/worktrees/test-project/77',
+        }
+
+        # parent_issue=42 here would be WRONG if reached -- proves resolution
+        # was skipped entirely rather than happening to agree.
+        captured = await self._run(agent_executor, task_context, parent_issue=42)
+
+        assert captured['epic_id'] == '77'
+        assert captured['branch_name'] == 'feature/issue-77-shared'
+
+    @pytest.mark.asyncio
+    async def test_discussions_workspace_type_without_project_opt_in_does_not_resolve_epic_id(
+        self, agent_executor
+    ):
+        """(#52) The workspace-type allowlist alone is not sufficient -- a project
+        that hasn't explicitly set worktree_isolation_enabled=True must keep its
+        pre-migration shared-base-clone behavior even for 'discussions' dispatch,
+        so merging the allowlist doesn't silently roll out isolation to every
+        planning_design project at once."""
+        task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
+
+        captured = await self._run(
+            agent_executor, task_context, parent_issue=None,
+            worktree_isolation_enabled=False,
+        )
+
+        assert captured['epic_id'] is None
+        assert 'epic_id' not in task_context
+
+    @pytest.mark.asyncio
+    async def test_discussions_workspace_type_with_project_opt_in_resolves_epic_id(
+        self, agent_executor
+    ):
+        """The positive case, explicit about the flag rather than relying on the
+        shared _run() helper's default -- a project that HAS opted in gets real
+        epic worktree resolution for 'discussions' dispatch."""
+        task_context = {'issue_number': 200, 'workspace_type': 'discussions'}
+
+        captured = await self._run(
+            agent_executor, task_context, parent_issue=None,
+            worktree_isolation_enabled=True,
+        )
+
+        assert captured['epic_id'] == '200'

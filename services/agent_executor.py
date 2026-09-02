@@ -216,13 +216,103 @@ class AgentExecutor:
                                     execution_type=execution_type,
                                     pipeline_run_id=pipeline_run_id)
 
+        # Resolve the epic id (and, if already known, its shared branch) so the
+        # container-mount directory built below is the epic's isolated worktree
+        # instead of the shared base clone. If a caller already resolved this
+        # earlier in the same dispatch (e.g. a repair cycle stashed 'epic_id' /
+        # 'branch_name' into task_context before calling us with
+        # skip_workspace_prep=True), reuse it rather than re-resolving. Otherwise
+        # resolve it fresh here -- cheap and side-effect-free: get_parent_issue is
+        # 1h-TTL-cached, and the branch lookup is a plain read-only git query, never
+        # a checkout, on the shared base clone. Best-effort: a resolution failure
+        # here must not break executions that worked fine before this migration --
+        # fall back to the pre-migration shared-base-clone behavior instead.
+        #
+        # IMPORTANT (issue #46 review, pass 2): this is deliberately an ALLOWLIST
+        # (only 'discussions' today), not a denylist of 'issues' alone. Both
+        # IssuesWorkspaceContext AND HybridWorkspaceContext call
+        # FeatureBranchManager.prepare_feature_branch(), which resolves its OWN
+        # branch (via independent confidence-matching over related branches, which
+        # can legitimately disagree with resolve_epic_branch_name()'s pick here) and
+        # checks it out directly on the shared BASE CLONE, after this block would
+        # otherwise have already created a worktree with the SAME branch checked
+        # out -- git refuses to check out a branch that's already checked out in
+        # another worktree, breaking every such dispatch. Only DiscussionsWorkspace
+        # Context is verified git-free (supports_git_operations=False, no call to
+        # prepare_feature_branch) and therefore safe to isolate today. Reconciling
+        # the two branch-resolution paths (or migrating prepare_feature_branch/
+        # finalize_feature_branch_work to operate on the epic worktree instead of
+        # the base clone) is real, nontrivial work that belongs to issue #48, which
+        # already explicitly scopes services/workspace/issues_context.py's and
+        # hybrid_context.py's get_working_directory() as its own targets. Until
+        # that lands, 'issues'/'hybrid' dispatch keeps its pre-migration shared-
+        # base-clone behavior exactly -- honest, non-regressing, and consistent
+        # with this migration's own 'byte-identical behavior at concurrency=1'
+        # requirement.
+        #
+        # This workspace-type allowlist is necessary but not sufficient (#52): even
+        # for 'discussions' dispatch, isolation only actually happens for a project
+        # that has opted in via ProjectConfig.worktree_isolation_enabled (checked
+        # further down, once project_config_for_epic is loaded) -- so merging this
+        # allowlist doesn't roll out isolation to every planning_design project at
+        # once, only to whichever project(s) explicitly enable it.
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES = {'discussions'}
+        workspace_type_for_epic_gate = task_context.get('workspace_type', 'issues')
+        epic_id = task_context.get('epic_id')
+        epic_branch_name = task_context.get('branch_name')
+        if (
+            epic_id is None
+            and 'issue_number' in task_context
+            and not task_context.get('skip_workspace_prep', False)
+            and workspace_type_for_epic_gate in EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
+        ):
+            try:
+                project_config_for_epic = config_manager.get_project_config(project_name)
+                # Per-project opt-in (#52): the workspace_type allowlist above says
+                # this TYPE of dispatch is safe to isolate, but isolation still only
+                # actually happens for a project that has explicitly opted in --
+                # defaults to False so every project keeps today's shared-base-clone
+                # behavior until a chosen pilot project sets this in its config.
+                if not getattr(project_config_for_epic, 'worktree_isolation_enabled', False):
+                    project_config_for_epic = None
+                repo_owner = None
+                repo_name = None
+                if project_config_for_epic and hasattr(project_config_for_epic, 'github'):
+                    repo_owner = project_config_for_epic.github.get('org')
+                    repo_name = project_config_for_epic.github.get('repo')
+                if repo_owner and repo_name:
+                    from services.github_integration import GitHubIntegration
+                    from services.feature_branch_manager import feature_branch_manager
+                    gh_integration_for_epic = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+                    epic_id = await feature_branch_manager.resolve_epic_id(
+                        gh_integration_for_epic, task_context['issue_number'], project=project_name
+                    )
+                    # resolve_epic_branch_name is sync (a plain read-only git query on a
+                    # cache miss) -- run it off the event loop thread so it can't stall
+                    # other coroutines scheduled on this loop.
+                    resolved_branch = await asyncio.to_thread(
+                        feature_branch_manager.resolve_epic_branch_name, project_name, epic_id
+                    )
+                    epic_branch_name = resolved_branch or feature_branch_manager.create_feature_branch_name(int(epic_id), "")
+                    task_context['epic_id'] = epic_id
+            except Exception as epic_resolve_err:
+                logger.warning(
+                    f"Could not resolve epic worktree target for {project_name} "
+                    f"issue #{task_context.get('issue_number')}: {epic_resolve_err}. "
+                    f"Falling back to the shared base clone for this execution."
+                )
+                epic_id = None
+                epic_branch_name = None
+
         # Build execution context with ALL required fields
         # NOTE: Stream callback removed - docker-claude-wrapper.py handles all Claude log streaming
         execution_context = self._build_execution_context(
             agent_name=agent_name,
             project_name=project_name,
             task_id=task_id,
-            task_context=task_context
+            task_context=task_context,
+            epic_id=epic_id,
+            branch_name=epic_branch_name
         )
 
         self._apply_frozen_session_resume(execution_context, task_context, project_name, agent_name)
@@ -1153,13 +1243,38 @@ class AgentExecutor:
         agent_name: str,
         project_name: str,
         task_id: str,
-        task_context: Dict[str, Any]
+        task_context: Dict[str, Any],
+        epic_id: Optional[str] = None,
+        branch_name: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Build standardized execution context for agent"""
+        """Build standardized execution context for agent.
+
+        epic_id/branch_name (resolved by the caller -- see execute_agent) scope
+        the returned work_dir to the epic's isolated git worktree instead of the
+        shared base clone. Omitting epic_id preserves the pre-worktree-isolation
+        behavior exactly (plain base-clone path, no side effects).
+        """
+        from pathlib import Path
         from services.project_workspace import workspace_manager
 
-        # Get project directory from workspace manager
-        project_dir = workspace_manager.get_project_dir(project_name)
+        # If the caller already resolved a concrete directory (e.g. a repair
+        # cycle running in its own separate container, handed the epic worktree
+        # path its originating orchestrator process already created/reused via
+        # task_context['project_dir']), reuse it as-is rather than re-deriving
+        # via epic_id here. Re-deriving would run against a *fresh*, empty
+        # in-process worktree cache (ProjectWorkspaceManager's cache is
+        # process-local) and could attempt to `git worktree add` a worktree that
+        # already exists on disk -- which is not idempotent and would raise.
+        existing_project_dir = task_context.get('project_dir')
+        if existing_project_dir:
+            project_dir = Path(existing_project_dir)
+        else:
+            # Get project directory from workspace manager -- an isolated
+            # per-epic worktree when epic_id is known, otherwise the shared base
+            # clone.
+            project_dir = workspace_manager.get_project_dir(
+                project_name, epic_id=epic_id, branch_name=branch_name
+            )
 
         # Build context with ALL required fields for agents
         # NOTE: stream_callback removed - docker-claude-wrapper.py handles all Claude log streaming
@@ -1464,9 +1579,21 @@ class AgentExecutor:
         """
         import subprocess
         import glob
+        from services.project_workspace import workspace_manager
 
         try:
-            project_dir = f"/workspace/{project_name}"
+            # Resolve the SAME directory the agent actually ran in (issue #46):
+            # if this task resolved an epic worktree, task_context carries epic_id/
+            # branch_name and get_project_dir() idempotently returns the existing
+            # worktree (no git calls on a cache hit) rather than the shared base
+            # clone. Checking the base clone here while the agent actually wrote to
+            # an isolated worktree would find nothing dirty and silently skip real
+            # uncommitted work.
+            project_dir = str(workspace_manager.get_project_dir(
+                project_name,
+                epic_id=task_context.get('epic_id'),
+                branch_name=task_context.get('branch_name'),
+            ))
             issue_number = task_context.get('issue_number')
 
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")

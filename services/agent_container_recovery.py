@@ -902,6 +902,14 @@ class AgentContainerRecovery:
                     return checkpoint
             
             # Fallback: try old location in project directory (for backward compatibility)
+            # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree
+            # resolution (#48). This is a legacy read path that predates both the
+            # state-directory-based checkpoint system (the primary lookup above) AND
+            # the per-epic worktree mechanism (#45) entirely -- any checkpoint file
+            # still readable via this fallback was necessarily written to the base
+            # clone by pre-worktree code, so scoping this read to an epic worktree
+            # would look in a directory that never held it. Read-only and
+            # backward-compat-only; no plausible caller needs this worktree-scoped.
             from services.project_workspace import workspace_manager
             project_dir = workspace_manager.get_project_dir(project)
             checkpoint_file = Path(project_dir) / ".repair_cycle_checkpoint.json"
@@ -1117,6 +1125,18 @@ class AgentContainerRecovery:
             board_name = None
             effective_run_id = run_id          # fallback to caller-supplied (may be truncated)
             agent_name = 'senior_software_engineer'
+            # epic_id/branch_name: needed so the eventual auto-commit (once this
+            # reconnected container finishes) resolves the SAME epic worktree the
+            # container was actually launched against, not the shared base clone.
+            # Found and fixed alongside #48's identical whitelist gap in
+            # _save_repair_cycle_context -- this is that same context.json, which
+            # already carries both fields; this path just never read them before.
+            # None here (context file missing/unreadable, or an old container
+            # started before #48 landed) falls back to _monitor_repair_cycle_
+            # container's own base-clone-resolving default -- pre-#46 behavior,
+            # not a new failure mode.
+            epic_id = None
+            epic_branch_name = None
 
             if context_file.exists():
                 try:
@@ -1126,10 +1146,13 @@ class AgentContainerRecovery:
                     board_name = saved_context.get('board')
                     effective_run_id = saved_context.get('pipeline_run_id') or run_id
                     agent_name = saved_context.get('agent_name') or agent_name
+                    epic_id = saved_context.get('epic_id')
+                    epic_branch_name = saved_context.get('branch_name')
 
                     logger.info(
                         f"Loaded reconnect context from file: board={board_name}, "
-                        f"run_id={effective_run_id}, agent={agent_name}"
+                        f"run_id={effective_run_id}, agent={agent_name}, "
+                        f"epic_id={epic_id}"
                     )
                 except Exception as e:
                     logger.warning(f"Could not load context file, falling back to heuristics: {e}")
@@ -1181,9 +1204,11 @@ class AgentContainerRecovery:
                 project_config=project_config,
                 workflow_template=workflow_template,
                 agent_name=agent_name,
-                pipeline_run_id=effective_run_id
+                pipeline_run_id=effective_run_id,
+                epic_id=epic_id,
+                epic_branch_name=epic_branch_name
             )
-            
+
             logger.info(f"✓ Reconnected to repair cycle container: {container_name}")
             
         except Exception as e:
@@ -1492,6 +1517,7 @@ class AgentContainerRecovery:
             result: Result dict from result.json
         """
         import asyncio
+        import threading
         from pathlib import Path
 
         logger.info(f"Processing completed repair cycle for {project}/#{issue_number}")
@@ -1619,8 +1645,9 @@ class AgentContainerRecovery:
         # actively misleading (matches the silent-pause behavior of the live path).
         if not comment_already_posted and not is_frozen:
             # Run async code in a new thread to avoid event loop conflicts
-            import threading
-
+            # (threading imported at the top of this method -- also needed
+            # unconditionally by the auto-commit section below, whether or not
+            # this block runs; see #87 final review, "address these 4 items").
             comment_context = {
                 'issue_number': issue_number,
                 'repository': repository,
@@ -1645,7 +1672,11 @@ class AgentContainerRecovery:
                 except Exception as e:
                     logger.warning(f"Failed to mark comment as posted: {e}")
 
-        # Auto-commit if successful
+        # Auto-commit if successful. commit_success is defined unconditionally
+        # (before the try block, not inside it) so the auto-advance check below
+        # always has a real value to gate on, even if something raises before the
+        # commit thread itself ever runs (e.g. the auto_commit_service import).
+        commit_success = [False]
         if overall_success:
             try:
                 logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
@@ -1658,12 +1689,18 @@ class AgentContainerRecovery:
                             agent='repair_cycle',
                             task_id=f'repair_cycle_{issue_number}',
                             issue_number=issue_number,
-                            custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing."
+                            custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                            # Match the mount source the repair-cycle container actually
+                            # used (an epic worktree, for 'issues' workspace type -- see
+                            # #48/auto_commit.py's docstring). context.json now carries
+                            # these (project_monitor.py's _save_repair_cycle_context was
+                            # fixed alongside this to forward them).
+                            epic_id=context.get('epic_id'),
+                            branch_name=context.get('branch_name')
                         )
                     )
 
                 # Run in separate thread
-                commit_success = [False]
                 def commit_thread():
                     commit_success[0] = do_commit()
 
@@ -1678,8 +1715,17 @@ class AgentContainerRecovery:
             except Exception as e:
                 logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
 
-        # Auto-advance if successful
-        if overall_success:
+        # Auto-advance ONLY if both the repair cycle itself succeeded AND its fix
+        # was actually committed. Found in a final whole-PR review pass on #87:
+        # this previously advanced on overall_success alone, so a commit that
+        # silently found "nothing to commit" (e.g. because it resolved the wrong
+        # directory -- exactly what the #52-blocking reconnect_repair_cycle_container
+        # gap could cause) still moved the issue forward as if the fix had landed,
+        # making a broken run look identical to a clean one. The matching change to
+        # how the pipeline run itself gets ended/marked-failed for this same
+        # tests-passed-but-commit-failed case lives further down, inside the
+        # existing frozen/success/failure chain (not here) -- see its own comment.
+        if overall_success and commit_success[0]:
             try:
                 # Get workflow columns
                 workflow_name = None
@@ -1771,7 +1817,7 @@ class AgentContainerRecovery:
                         )
                     except Exception as state_err:
                         logger.error(f"Failed to record frozen outcome: {state_err}")
-                elif overall_success:
+                elif overall_success and commit_success[0]:
                     # Proceed to end the run normally — matches the live-run success path.
                     ended = pipeline_run_manager.end_pipeline_run(
                         project=project,
@@ -1783,6 +1829,43 @@ class AgentContainerRecovery:
                         logger.info(f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}")
                     else:
                         logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+                elif overall_success and not commit_success[0]:
+                    # Tests passed but the fix was never actually committed (found
+                    # in a final whole-PR review pass on #87). Treated the SAME way
+                    # as a genuine repair-cycle failure just below -- mark_failed(),
+                    # not a bare log line or a silent "success" end: durably marking
+                    # the pipeline lock's retained_reason is what actually prevents
+                    # silent re-dispatch and forces human attention (see the
+                    # genuine-failure branch's own comment on why
+                    # end_pipeline_run(retain_lock=True) alone is NOT equivalent --
+                    # it never sets retained_reason). Reusing pipeline_run_manager
+                    # here (not a second get_pipeline_run_manager() call) also means
+                    # this benefits from the SAME current_active_run validation just
+                    # above, instead of risking marking failed a DIFFERENT run than
+                    # the one that actually ran.
+                    marked_ok = pipeline_run_manager.mark_failed(
+                        project=project,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason="Repair cycle passed but its fix was not committed",
+                    )
+                    if marked_ok:
+                        logger.error(
+                            f"Repair cycle for {project}/#{issue_number} passed but "
+                            "its fix was not committed (see the 'No changes to "
+                            "commit' warning above) -- marked the pipeline run "
+                            "failed and the lock retained (awaiting manual "
+                            "intervention) rather than silently ending the run as "
+                            "if the fix had landed."
+                        )
+                    else:
+                        logger.critical(
+                            f"Pipeline lock for {project}/#{issue_number} could NOT "
+                            "be durably marked failed after a repair cycle passed "
+                            "but its fix went uncommitted -- both Redis and YAML "
+                            "writes failed. This issue may be silently re-dispatched "
+                            "despite its fix never having been saved."
+                        )
                 else:
                     # Failure on the restart-recovery path — use the same shared
                     # mark_failed() entry point as every other failure site

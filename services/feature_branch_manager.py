@@ -276,9 +276,12 @@ class FeatureBranchManager:
         self._branch_cache: Dict[tuple, str] = {}
 
         # In-memory cache for parent issue lookups with TTL
-        # Cache structure: {issue_number: (parent_number, cached_at_timestamp)}
-        # Reduces GitHub API usage by caching stable parent relationships
-        self._parent_cache: Dict[int, Tuple[Optional[int], float]] = {}
+        # Cache structure: {(repo_owner, repo_name, issue_number): (parent_number, cached_at_timestamp)}
+        # Keyed by repo identity, not just issue_number: this is a shared module-level
+        # singleton across every monitored project, and issue numbers are only unique
+        # within a single repo -- a bare issue_number key would let two different
+        # projects' issue #N collide and return each other's cached parent.
+        self._parent_cache: Dict[Tuple[str, str, int], Tuple[Optional[int], float]] = {}
         self._parent_cache_ttl = 3600  # 1 hour in seconds
         self._parent_cache_max_size = 1000  # Prevent unbounded growth
 
@@ -947,9 +950,12 @@ class FeatureBranchManager:
 
         Returns parent issue number if found, None otherwise
         """
-        # Check cache with TTL before making API call
-        if issue_number in self._parent_cache:
-            parent_num, cached_at = self._parent_cache[issue_number]
+        # Check cache with TTL before making API call. Keyed by (repo_owner, repo_name,
+        # issue_number) -- this manager is a shared singleton across every monitored
+        # project, so a bare issue_number key would collide across repos.
+        cache_key = (github_integration.repo_owner, github_integration.repo_name, issue_number)
+        if cache_key in self._parent_cache:
+            parent_num, cached_at = self._parent_cache[cache_key]
             age = time.time() - cached_at
 
             if age < self._parent_cache_ttl:
@@ -963,7 +969,7 @@ class FeatureBranchManager:
                     f"Cache expired for issue #{issue_number} parent "
                     f"(age: {age:.0f}s > TTL: {self._parent_cache_ttl}s)"
                 )
-                del self._parent_cache[issue_number]  # Clean up expired entry
+                del self._parent_cache[cache_key]  # Clean up expired entry
 
         # Validate repository information before making API calls
         if not github_integration.github_org or not github_integration.repo_name:
@@ -1019,7 +1025,7 @@ class FeatureBranchManager:
                 )
 
                 # Cache the result with current timestamp
-                self._parent_cache[issue_number] = (parent_num, time.time())
+                self._parent_cache[cache_key] = (parent_num, time.time())
 
                 # Enforce max cache size with simple FIFO eviction
                 if len(self._parent_cache) > self._parent_cache_max_size:
@@ -1037,12 +1043,51 @@ class FeatureBranchManager:
 
             # No parent found - cache this result too (None with timestamp)
             logger.debug(f"Issue #{issue_number} has no parent (structured API returned null)")
-            self._parent_cache[issue_number] = (None, time.time())
+            self._parent_cache[cache_key] = (None, time.time())
             return None
 
         except Exception as e:
             logger.error(f"Failed to get parent issue for #{issue_number}: {e}")
             return None
+
+    async def resolve_epic_id(
+        self, github_integration, issue_number: int, project: Optional[str] = None
+    ) -> str:
+        """
+        Resolve the epic id that should scope a per-epic git worktree for issue_number.
+
+        Sub-issues (sdlc_execution dispatch) resolve to their parent epic's issue
+        number. An issue with no parent (a planning_design epic dispatched directly,
+        or a standalone issue not part of any epic) resolves to its own number, so
+        every call site gets a consistent, non-empty epic_id to isolate a worktree by.
+
+        Uses the same 1-hour-TTL-cached get_parent_issue lookup used everywhere else
+        parent resolution happens, so calling this from multiple call sites in the
+        same dispatch costs at most one real GitHub API call.
+        """
+        parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
+        return str(parent_issue) if parent_issue else str(issue_number)
+
+    def resolve_epic_branch_name(self, project: str, epic_id: str) -> Optional[str]:
+        """
+        Read-only lookup of the epic's already-established shared branch, if any.
+
+        Pure git query (cached branch state, or a plain `git branch` listing) with
+        no side effects on the shared base clone -- never checks out or creates
+        anything. Returns None when no branch has been created for this epic yet;
+        callers creating the epic's worktree for the first time should fall back to
+        create_feature_branch_name(int(epic_id), ...) for the canonical name. That
+        fallback is safe to use without inventing a new naming scheme: the epic
+        worktree's own `git worktree add -b` call is what actually creates the
+        branch (in the isolated worktree, never in the shared base clone), and
+        because branches are repo-wide refs visible from every worktree of the same
+        repository, any later feature_branch_manager operation against the shared
+        base clone (e.g. prepare_feature_branch for an sdlc_execution sub-issue)
+        will independently rediscover and reuse that same branch rather than
+        creating a second, differently-named one.
+        """
+        existing = self.get_feature_branch_state(project, int(epic_id))
+        return existing.branch_name if existing else None
 
     def create_feature_branch_name(self, parent_issue: int, title: str = "") -> str:
         """Create feature branch name from parent issue"""
@@ -1066,6 +1111,14 @@ class FeatureBranchManager:
         import subprocess
         from services.git_workflow_manager import git_workflow_manager
 
+        # NOTE (#49): all checkout_branch() calls in this method are base-clone-
+        # scoped -- project_dir is the SHARED base clone for 'issues'/'hybrid'
+        # workspace types today (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES in
+        # agent_executor.py gates worktree resolution to 'discussions' only,
+        # which never reaches this method). checkout_branch()'s stash/dirty/
+        # tracking-repair logic stays load-bearing here until
+        # prepare_feature_branch() (this method's only caller) is migrated to
+        # the epic worktree model -- see #46/#47/#48; not yet scheduled.
         # Ensure we're on main and up to date
         await git_workflow_manager.checkout_branch(project_dir, "main")
         pull_success = await git_workflow_manager.pull_branch(project_dir)
@@ -1122,6 +1175,17 @@ class FeatureBranchManager:
         Pull latest changes with rebase
 
         Raises MergeConflictError if conflicts detected
+
+        NOTE (#49): this method's only two callers are both inside
+        prepare_feature_branch(), which runs against the SHARED base clone for
+        'issues'/'hybrid' workspace types today (see the
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate in agent_executor.py --
+        'discussions' is the only worktree-isolated workspace type, and it is
+        git-free, so it never reaches this method). GitWorkflowManager.
+        pull_rebase()'s push-then-reset defensive logic therefore remains
+        genuinely necessary here; do not remove this call. Retiring it is
+        conditional on prepare_feature_branch() being migrated to the epic
+        worktree model -- see #46/#47/#48; not yet scheduled.
         """
         from services.git_workflow_manager import git_workflow_manager
 
@@ -2330,6 +2394,13 @@ The PR is now ready for review and can be merged when approved.
                 try:
                     # Try to delete both local and remote
                     from services.git_workflow_manager import git_workflow_manager
+                    # NOTE (#49): project_dir here is whatever the caller passes --
+                    # currently this method (detect_and_clean_invalid_branches) has
+                    # no in-repo callers, but it is a general maintenance utility,
+                    # not something verified to run only against a worktree. Treat
+                    # it as base-clone-scoped like every other checkout_branch()
+                    # call site in this file until proven otherwise; do not drop
+                    # checkout_branch()'s defensive logic here either.
                     await git_workflow_manager.checkout_branch(project_dir, "main")
 
                     # Delete local branch
