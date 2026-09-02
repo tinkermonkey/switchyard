@@ -74,6 +74,19 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             # by temporarily patching the loader result via build_verifier_prompt
             prompt = self._prompt_builder.build_verifier_prompt(ctx)
 
+        # Snapshot dev_container_state's last-write timestamp before this
+        # agent's session runs. Compared against the post-session timestamp
+        # below to detect whether the agent's own tool calls wrote to
+        # dev_container_state *during this session*, even if the final
+        # response text we parse doesn't carry the expected marker (see the
+        # "could not parse" branch). A timestamp comparison -- rather than
+        # comparing the status values themselves -- is deliberate: a session
+        # that re-affirms the same status it started with (e.g. re-writes
+        # VERIFIED) still counts as this session having resolved it, while an
+        # unrelated write from another process landing in this same window
+        # would not (its timestamp falls outside what this session produced).
+        status_updated_before_session = dev_container_state.get_status_updated_at(project_name)
+
         result = await run_claude_code(prompt, context)
 
         if isinstance(result, dict):
@@ -147,18 +160,61 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     error_message, project_name
                 )
         else:
-            snippet = review_text.strip()[:300]
-            error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
-            dev_container_state.set_status(
-                project_name=project_name,
-                status=DevContainerStatus.BLOCKED,
-                error_message=error_message[:200],
+            # No "### Status **X**" marker in the final response text. Before
+            # forcing BLOCKED, check whether the agent's own tool calls wrote
+            # to dev_container_state *during this session* (per the Step 5
+            # instructions in the prompt) -- if so, the final response is just
+            # a closing summary that happened to drop the marker, not a
+            # genuinely unresolved verification. Trust that self-reported
+            # resolution instead of clobbering it, gated on:
+            #   1. A write actually happened in this session's window (by
+            #      updated_at, not by comparing status values -- a session
+            #      that re-affirms the same status it started with must still
+            #      count as resolved; comparing raw values would miss that).
+            #      This isn't airtight against a write from an unrelated
+            #      process landing in the exact same window, but it's a real
+            #      improvement over no time-bounding at all.
+            #   2. The resulting status is VERIFIED or BLOCKED specifically --
+            #      NOT CHANGES_NEEDED. Unlike those two, CHANGES_NEEDED has no
+            #      staleness escape of its own (see validate_task_can_run in
+            #      agents/orchestrator_integration.py, which deliberately never
+            #      re-triggers setup for it) and is owned solely by
+            #      repair_cycle's env-rebuild sub-cycle retrying it. Honoring
+            #      a self-set CHANGES_NEEDED here, outside that sub-cycle's
+            #      supervision, risks recreating the exact dangling-forever
+            #      failure mode fixed in 5a8af03/65e5bd7 on this same branch.
+            #
+            # See incident: phone-home -- the verifier confirmed the fix,
+            # called dev_container_state.set_status(VERIFIED) itself mid-session,
+            # then this fallback overwrote that back to BLOCKED because the
+            # closing "### Summary" text it wrote afterward omitted the marker.
+            status_updated_after_session = dev_container_state.get_status_updated_at(project_name)
+            session_wrote_state = (
+                status_updated_before_session != status_updated_after_session
+                and status_updated_after_session is not None
             )
-            logger.error(
-                "Could not parse verification status for %s -- marking dev container BLOCKED "
-                "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
-                "output excerpt)",
-                project_name, project_name
-            )
+            status_after_session = dev_container_state.get_status(project_name)
+            honorable_statuses = (DevContainerStatus.VERIFIED, DevContainerStatus.BLOCKED)
+            if session_wrote_state and status_after_session in honorable_statuses:
+                logger.warning(
+                    "Could not find a '### Status' marker in %s's final verifier response, "
+                    "but dev_container_state was written to %s during this session -- "
+                    "honoring that instead of forcing BLOCKED.",
+                    project_name, status_after_session.value
+                )
+            else:
+                snippet = review_text.strip()[:300]
+                error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
+                dev_container_state.set_status(
+                    project_name=project_name,
+                    status=DevContainerStatus.BLOCKED,
+                    error_message=error_message[:200],
+                )
+                logger.error(
+                    "Could not parse verification status for %s -- marking dev container BLOCKED "
+                    "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
+                    "output excerpt)",
+                    project_name, project_name
+                )
 
         return {"status": "success", "agent_output": review_text}
