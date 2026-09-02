@@ -3,30 +3,50 @@ Unit tests for PRReviewStage
 
 Test orchestration logic without actually launching Docker containers.
 
-NOTE: These tests require Docker container environment due to import dependencies.
-Run tests inside Docker compose orchestrator container.
+Requires the real Docker orchestrator container. pipeline.pr_review_stage's import
+chain is eager, not lazy: pr_review_stage -> services.agent_executor -> pipeline.factory
+-> agents (__init__.py) -> agents.dev_environment_verifier_agent -> a module-level
+`from services.dev_container_state import dev_container_state` that instantiates a
+DevContainerStateManager singleton, whose __init__ unconditionally does
+`Path('/app/state/dev_containers').mkdir(parents=True, exist_ok=True)`. That's a real
+directory the orchestrator already manages inside the container, but outside it
+`/app` doesn't exist at all, so the import itself fails. Run via
+`docker-compose exec orchestrator python -m pytest tests/unit/test_pr_review_stage.py`.
 """
 
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
-# Skip all tests in this module if not in Docker environment
-# PRReviewStage imports trigger dev_container_state which creates /app/state/dev_containers
-pytest.skip("Requires Docker container environment", allow_module_level=True)
+# See the module docstring above: pipeline.pr_review_stage's import chain touches a
+# real, orchestrator-managed directory under /app that only exists inside the
+# container. This is a real environment check, not a style preference — do not
+# replace it with patch.dict('sys.modules', {'services.dev_container_state': ...})
+# to make this importable outside Docker too. That was tried historically and wraps
+# pipeline.pr_review_stage's *first-ever* import of the process in a temporary
+# sys.modules patch, which caused a double-import artifact: the resulting
+# PRReviewStage instance's bound methods kept referencing a stale, orphaned copy of
+# the module's globals that later per-test patch(...) calls (targeting the live,
+# current sys.modules entry) never reached. In practice this silently fell through
+# to the real pr_review_state_manager singleton instead of the mock —
+# test_phase1_launches_pr_code_reviewer failed this way, reading real leftover state
+# from state/projects/test-project/pr_review_state.yaml, until that workaround was
+# removed from the fixture below.
+if not Path('/app').is_dir():
+    pytest.skip(
+        "Requires the real Docker orchestrator container — see module docstring.",
+        allow_module_level=True,
+    )
 
 
 @pytest.fixture
 def pr_review_stage():
-    """Create PRReviewStage with mocked dependencies"""
-    # Mock dev_container_state at module level to prevent /app directory creation
-    with patch.dict('sys.modules', {
-        'services.dev_container_state': MagicMock(),
-    }):
-        with patch('pipeline.pr_review_stage.ConfigManager'), \
-             patch('pipeline.pr_review_stage.GitHubStateManager'), \
-             patch('pipeline.pr_review_stage.pr_review_state_manager'):
-            from pipeline.pr_review_stage import PRReviewStage
-            return PRReviewStage()
+    """Create PRReviewStage with mocked dependencies."""
+    with patch('pipeline.pr_review_stage.ConfigManager'), \
+         patch('pipeline.pr_review_stage.GitHubStateManager'), \
+         patch('pipeline.pr_review_stage.pr_review_state_manager'):
+        from pipeline.pr_review_stage import PRReviewStage
+        return PRReviewStage()
 
 
 @pytest.mark.asyncio
@@ -64,6 +84,89 @@ async def test_phase1_launches_pr_code_reviewer(pr_review_stage):
         assert first_call[1]['execution_type'] == 'pr_review_phase1'
         assert first_call[1]['project_name'] == 'test-project'
         assert 'pr_url' in first_call[1]['task_context']
+        # Labeled on the container so restart recovery can checkpoint this exact
+        # phase (see pipeline/pr_review_checkpoint.py).
+        assert first_call[1]['task_context']['review_cycle'] == 1
+        assert first_call[1]['task_context']['pr_review_checkpoint_phase'] == 'code_review'
+
+
+@pytest.mark.asyncio
+async def test_phase1_saves_checkpoint_after_completing(pr_review_stage):
+    """Phase 1's real output must be checkpointed as soon as it completes, so a
+    restart between Phase 1 and Phase 2 doesn't lose it."""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch('pipeline.pr_review_stage.PRReviewCheckpoint') as MockCheckpoint, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+         patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
+         patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock(return_value={
+            'agent_output': '### Critical Issues\nNone found'
+        })
+        mock_get_executor.return_value = mock_executor
+        mock_state.get_review_count.return_value = 0
+
+        mock_checkpoint = MockCheckpoint.return_value
+        mock_checkpoint.get_phase_output.return_value = None  # nothing checkpointed yet
+
+        context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+        await pr_review_stage.execute(context)
+
+        mock_checkpoint.save_phase_output.assert_any_call(
+            1, 'code_review', '### Critical Issues\nNone found'
+        )
+        # A cycle that reaches a real conclusion (clean pass here) must clear the
+        # checkpoint so a later cycle never reuses this cycle's phase output.
+        mock_checkpoint.clear_checkpoint.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_phase1_reuses_checkpointed_output_after_restart_recovery(pr_review_stage):
+    """If Phase 1's container already finished before an orchestrator restart (see
+    claude/docker_runner.py's recovered-container handling), a fresh execute() call
+    must reuse the checkpointed output instead of paying for another Phase 1 review."""
+    with patch('pipeline.pr_review_stage.get_agent_executor') as mock_get_executor, \
+         patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
+         patch('pipeline.pr_review_stage.PRReviewCheckpoint') as MockCheckpoint, \
+         patch.object(pr_review_stage, '_find_pr_url', return_value='https://github.com/o/r/pull/1'), \
+         patch.object(pr_review_stage, '_load_discussion_outputs', return_value={}), \
+         patch.object(pr_review_stage, '_get_parent_issue_body', return_value=''), \
+         patch.object(pr_review_stage, '_check_ci_status', return_value=([], [])), \
+         patch.object(pr_review_stage, '_parse_consolidated_findings', return_value=[]), \
+         patch.object(pr_review_stage, '_advance_parent_to_documentation', return_value=True):
+
+        mock_executor = AsyncMock()
+        mock_executor.execute_agent = AsyncMock(return_value={
+            'agent_output': '### Critical Issues\nNone found (from phase 4)'
+        })
+        mock_get_executor.return_value = mock_executor
+        mock_state.get_review_count.return_value = 0
+
+        mock_checkpoint = MockCheckpoint.return_value
+
+        def _cached(cycle, phase_key):
+            if cycle == 1 and phase_key == 'code_review':
+                return 'checkpointed phase 1 output from before the restart'
+            return None
+
+        mock_checkpoint.get_phase_output.side_effect = _cached
+
+        context = {'context': {'issue_number': 42, 'project': 'test-project'}}
+        await pr_review_stage.execute(context)
+
+        # No call re-launched Phase 1's container...
+        calls = [c[1] for c in mock_executor.execute_agent.call_args_list]
+        phase1_calls = [c for c in calls if c['execution_type'] == 'pr_review_phase1']
+        assert phase1_calls == []
+        # ...and the checkpointed Phase 1 text was never re-saved (it was reused, not
+        # redone) — Phase 4 legitimately still saves its own ('consolidation') output.
+        saved_phases = [call.args[1] for call in mock_checkpoint.save_phase_output.call_args_list]
+        assert 'code_review' not in saved_phases
 
 
 @pytest.mark.asyncio

@@ -115,3 +115,85 @@ class TestPrReviewStageWrapperAgentMismatch:
         mock_cleanup.assert_called_once_with(
             'context-studio', 1137, 'senior_software_engineer', 'agent_mismatch'
         )
+
+
+def _past_created_at(minutes_ago=30):
+    """A created_at timestamp before this test process started, so recovery takes
+    the full reconnect path instead of the 'already monitored' shortcut."""
+    return (datetime.utcnow() - timedelta(minutes=minutes_ago)).strftime('%Y-%m-%d %H:%M:%S +0000 UTC')
+
+
+class TestPrReviewPhaseLabelsPassedToReconnect:
+    """A recovered PR-review-stage phase container carries which phase and review
+    cycle it belongs to (org.switchyard.pr_review_phase / pr_review_cycle labels) so
+    completion handling can checkpoint its real output instead of posting it as a
+    stray terminal comment — see claude/docker_runner.py's
+    _process_recovered_pr_review_phase_completion."""
+
+    def test_phase_and_cycle_labels_are_read_and_passed_through(self):
+        recovery = _make_recovery()
+        container = {
+            'name': 'claude-agent-context-studio-9ed4ab1c',
+            'id': 'abc123',
+            'status': 'Up 30 minutes',
+            'created_at': _past_created_at(),
+            'image': 'context-studio-agent',
+            'labels': (
+                'org.switchyard.project=context-studio,'
+                'org.switchyard.agent=pr_code_reviewer,'
+                'org.switchyard.task_id=task-1,'
+                'org.switchyard.issue_number=1137,'
+                'org.switchyard.pr_review_phase=code_review,'
+                'org.switchyard.pr_review_cycle=1'
+            ),
+        }
+
+        mock_docker_runner_instance = MagicMock()
+        mock_docker_runner_class = MagicMock(return_value=mock_docker_runner_instance)
+
+        with patch.object(recovery, 'get_running_agent_containers', return_value=[container]), \
+             patch.object(recovery, 'check_execution_history', return_value={
+                 'agent': 'pr_review_stage',
+                 'column': 'In Review',
+                 'outcome': 'in_progress',
+                 'timestamp': datetime.utcnow().isoformat(),
+             }), \
+             patch.object(recovery, 'cleanup_orphaned_execution_history', return_value=0), \
+             patch.dict('sys.modules', {'claude.docker_runner': MagicMock(
+                 DockerAgentRunner=mock_docker_runner_class
+             )}):
+            recovered, killed, errors = recovery.recover_or_cleanup_containers()
+
+        assert recovered == 1
+        assert killed == 0
+        mock_docker_runner_instance.reconnect_to_container.assert_called_once()
+        call_kwargs = mock_docker_runner_instance.reconnect_to_container.call_args.kwargs
+        assert call_kwargs['pr_review_phase'] == 'code_review'
+        assert call_kwargs['pr_review_cycle'] == '1'
+
+    def test_labels_absent_for_non_pr_review_container(self):
+        """A container with no pr_review_phase label (any other agent type) must pass
+        None through, not fail or fabricate a phase."""
+        recovery = _make_recovery()
+        container = _make_container(agent='senior_software_engineer')
+        container['created_at'] = _past_created_at()
+
+        mock_docker_runner_instance = MagicMock()
+        mock_docker_runner_class = MagicMock(return_value=mock_docker_runner_instance)
+
+        with patch.object(recovery, 'get_running_agent_containers', return_value=[container]), \
+             patch.object(recovery, 'check_execution_history', return_value={
+                 'agent': 'senior_software_engineer',
+                 'column': 'Development',
+                 'outcome': 'in_progress',
+                 'timestamp': datetime.utcnow().isoformat(),
+             }), \
+             patch.object(recovery, 'cleanup_orphaned_execution_history', return_value=0), \
+             patch.dict('sys.modules', {'claude.docker_runner': MagicMock(
+                 DockerAgentRunner=mock_docker_runner_class
+             )}):
+            recovery.recover_or_cleanup_containers()
+
+        call_kwargs = mock_docker_runner_instance.reconnect_to_container.call_args.kwargs
+        assert call_kwargs['pr_review_phase'] is None
+        assert call_kwargs['pr_review_cycle'] is None

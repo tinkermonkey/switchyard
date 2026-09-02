@@ -27,6 +27,7 @@ from monitoring.observability import EventType
 from monitoring.decision_events import DecisionEventEmitter
 from monitoring.cycle_stack import push_frame, CycleFrame
 from services.cancellation import get_cancellation_signal
+from pipeline.pr_review_checkpoint import PRReviewCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,13 @@ class PRReviewStage(PipelineStage):
             current_cycle = review_count + 1
             logger.info(f"Starting review cycle {current_cycle}/{MAX_REVIEW_CYCLES}")
 
+            # Persists each phase's output as it completes so that if the orchestrator
+            # restarts mid-cycle, a fresh execute() call (this stage's own in-process
+            # coroutine does not survive a restart — see pipeline/pr_review_checkpoint.py)
+            # can skip re-running any phase whose container already finished and reuse
+            # its real output instead of discarding it and redoing the whole cycle.
+            review_checkpoint = PRReviewCheckpoint(project_name, parent_issue_number)
+
             # Build base pr_review_stage stack; phase frames are pushed per agent call
             _pr_stage_stack = push_frame(
                 task_context.get('cycle_stack', []),
@@ -185,6 +193,7 @@ class PRReviewStage(PipelineStage):
                     )
                     self._emit_pr_review_outcome(project_name, parent_issue_number, repo, pipeline_run_id)
                     pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+                    review_checkpoint.clear_checkpoint()
                     advanced_to_done = self._advance_parent_to_documentation(project_name, parent_issue_number)
                     merge_notice = (
                         f"## PR Review\n\n"
@@ -334,6 +343,7 @@ class PRReviewStage(PipelineStage):
                     project_name, parent_issue_number, repo, github_config,
                     all_created_issues, current_cycle, pipeline_run_id,
                 )
+                review_checkpoint.clear_checkpoint()
 
                 issues_summary = ""
                 if all_created_issues:
@@ -390,47 +400,66 @@ class PRReviewStage(PipelineStage):
                 }, pipeline_run_id)
 
             try:
-                self._agent_call_count += 1
-                # Build prior cycle context for reviewer memory (only on cycles 2+)
-                prior_cycle_context = ""
-                if current_cycle > 1:
-                    prior_cycle_context = self._build_prior_cycle_context(
-                        project_name, parent_issue_number, repo
+                # Recovery checkpoint: if a restart interrupted a previous attempt at this
+                # cycle after this phase's container already finished, its real output was
+                # captured to checkpoint (see claude/docker_runner.py's recovered-container
+                # handling) — reuse it instead of paying for another Phase 1 review.
+                _checkpointed_phase1 = review_checkpoint.get_phase_output(current_cycle, 'code_review')
+                if _checkpointed_phase1 is not None:
+                    logger.info(
+                        f"Phase 1: reusing checkpointed code review output for cycle "
+                        f"{current_cycle} (restart recovery) — skipping re-launch"
                     )
-                    if prior_cycle_context:
-                        logger.info(
-                            f"Injecting prior cycle history into reviewer prompt "
-                            f"(cycle {current_cycle})"
+                    pr_review_text = _checkpointed_phase1
+                else:
+                    self._agent_call_count += 1
+                    # Build prior cycle context for reviewer memory (only on cycles 2+)
+                    prior_cycle_context = ""
+                    if current_cycle > 1:
+                        prior_cycle_context = self._build_prior_cycle_context(
+                            project_name, parent_issue_number, repo
                         )
+                        if prior_cycle_context:
+                            logger.info(
+                                f"Injecting prior cycle history into reviewer prompt "
+                                f"(cycle {current_cycle})"
+                            )
 
-                # Build prompt for pr_code_reviewer
-                pr_review_prompt = self._build_pr_review_prompt(pr_url, prior_cycle_context)
+                    # Build prompt for pr_code_reviewer
+                    pr_review_prompt = self._build_pr_review_prompt(pr_url, prior_cycle_context)
 
-                # Launch pr_code_reviewer in Docker (via AgentExecutor)
-                _phase1_stack = push_frame(_pr_stage_stack, CycleFrame(
-                    cycle_type="pr_review_phase",
-                    cycle_id=f"phase-1-cycle-{current_cycle}",
-                    iteration=1,
-                    max_iterations=4,
-                    label=f"pr_review[cycle {current_cycle}][phase 1]",
-                ))
-                pr_review_result = await agent_executor.execute_agent(
-                    agent_name=self.pr_review_agent,
-                    project_name=project_name,
-                    task_context={
-                        **task_context,
-                        'pr_url': pr_url,
-                        'phase': 'code_review',
-                        'direct_prompt': pr_review_prompt,
-                        # IMPORTANT: Don't skip workspace prep - agent needs project code
-                        'skip_workspace_prep': False,
-                        'cycle_stack': _phase1_stack,
-                    },
-                    execution_type="pr_review_phase1"
-                )
+                    # Launch pr_code_reviewer in Docker (via AgentExecutor)
+                    _phase1_stack = push_frame(_pr_stage_stack, CycleFrame(
+                        cycle_type="pr_review_phase",
+                        cycle_id=f"phase-1-cycle-{current_cycle}",
+                        iteration=1,
+                        max_iterations=4,
+                        label=f"pr_review[cycle {current_cycle}][phase 1]",
+                    ))
+                    pr_review_result = await agent_executor.execute_agent(
+                        agent_name=self.pr_review_agent,
+                        project_name=project_name,
+                        task_context={
+                            **task_context,
+                            'pr_url': pr_url,
+                            'phase': 'code_review',
+                            'direct_prompt': pr_review_prompt,
+                            # IMPORTANT: Don't skip workspace prep - agent needs project code
+                            'skip_workspace_prep': False,
+                            'cycle_stack': _phase1_stack,
+                            # Labeled on the container (claude/docker_runner.py) so restart
+                            # recovery can checkpoint this exact phase's output rather than
+                            # posting it as a stray terminal comment.
+                            'review_cycle': current_cycle,
+                            'pr_review_checkpoint_phase': 'code_review',
+                        },
+                        execution_type="pr_review_phase1"
+                    )
+
+                    pr_review_text = pr_review_result.get('agent_output') or pr_review_result.get('markdown_analysis', '')
+                    review_checkpoint.save_phase_output(current_cycle, 'code_review', pr_review_text)
 
                 # Collect text for Phase 4 consolidation (don't create issues yet)
-                pr_review_text = pr_review_result.get('agent_output') or pr_review_result.get('markdown_analysis', '')
                 phase_outputs.append(("PR Code Review", pr_review_text))
                 review_summary_parts.append(f"### PR Code Review\n\n{pr_review_text}")
                 phases_completed += 1
@@ -510,49 +539,63 @@ class PRReviewStage(PipelineStage):
                     }, pipeline_run_id)
 
                 try:
-                    self._agent_call_count += 1
-                    # Build verification prompt with authority framing for this source
-                    verification_prompt = self._build_verification_prompt(
-                        pr_url, check_name, authority_key, check_content
-                    )
+                    # See Phase 1's comment above on checkpoint reuse.
+                    _checkpointed_phase2 = review_checkpoint.get_phase_output(current_cycle, authority_key)
+                    if _checkpointed_phase2 is not None:
+                        logger.info(
+                            f"Phase 2.{phase2_index}: reusing checkpointed {check_name} "
+                            f"verification output for cycle {current_cycle} (restart recovery) "
+                            f"— skipping re-launch"
+                        )
+                        verification_text = _checkpointed_phase2
+                    else:
+                        self._agent_call_count += 1
+                        # Build verification prompt with authority framing for this source
+                        verification_prompt = self._build_verification_prompt(
+                            pr_url, check_name, authority_key, check_content
+                        )
 
-                    # Record in_progress BEFORE launching container so restart recovery
-                    # can identify this container as legitimate and keep it alive.
-                    work_execution_tracker.record_execution_start(
-                        issue_number=parent_issue_number,
-                        column=column,
-                        agent=self.requirements_verifier_agent,
-                        trigger_source='pr_review_phase2',
-                        project_name=project_name
-                    )
+                        # Record in_progress BEFORE launching container so restart recovery
+                        # can identify this container as legitimate and keep it alive.
+                        work_execution_tracker.record_execution_start(
+                            issue_number=parent_issue_number,
+                            column=column,
+                            agent=self.requirements_verifier_agent,
+                            trigger_source='pr_review_phase2',
+                            project_name=project_name
+                        )
 
-                    # Launch requirements_verifier in Docker (via AgentExecutor)
-                    _phase2_stack = push_frame(_pr_stage_stack, CycleFrame(
-                        cycle_type="pr_review_phase",
-                        cycle_id=f"phase-2-{phase2_index}-cycle-{current_cycle}",
-                        iteration=2,
-                        max_iterations=4,
-                        label=f"pr_review[cycle {current_cycle}][phase 2.{phase2_index}]",
-                    ))
-                    verification_result = await agent_executor.execute_agent(
-                        agent_name=self.requirements_verifier_agent,
-                        project_name=project_name,
-                        task_context={
-                            **task_context,
-                            'pr_url': pr_url,
-                            'check_name': check_name,
-                            'check_content': check_content,
-                            'phase': 'requirements_verification',
-                            'direct_prompt': verification_prompt,
-                            # IMPORTANT: Don't skip workspace prep - agent needs project code
-                            'skip_workspace_prep': False,
-                            'cycle_stack': _phase2_stack,
-                        },
-                        execution_type="pr_review_phase2"
-                    )
+                        # Launch requirements_verifier in Docker (via AgentExecutor)
+                        _phase2_stack = push_frame(_pr_stage_stack, CycleFrame(
+                            cycle_type="pr_review_phase",
+                            cycle_id=f"phase-2-{phase2_index}-cycle-{current_cycle}",
+                            iteration=2,
+                            max_iterations=4,
+                            label=f"pr_review[cycle {current_cycle}][phase 2.{phase2_index}]",
+                        ))
+                        verification_result = await agent_executor.execute_agent(
+                            agent_name=self.requirements_verifier_agent,
+                            project_name=project_name,
+                            task_context={
+                                **task_context,
+                                'pr_url': pr_url,
+                                'check_name': check_name,
+                                'check_content': check_content,
+                                'phase': 'requirements_verification',
+                                'direct_prompt': verification_prompt,
+                                # IMPORTANT: Don't skip workspace prep - agent needs project code
+                                'skip_workspace_prep': False,
+                                'cycle_stack': _phase2_stack,
+                                'review_cycle': current_cycle,
+                                'pr_review_checkpoint_phase': authority_key,
+                            },
+                            execution_type="pr_review_phase2"
+                        )
+
+                        verification_text = verification_result.get('agent_output') or verification_result.get('markdown_analysis', '')
+                        review_checkpoint.save_phase_output(current_cycle, authority_key, verification_text)
 
                     # Collect text for Phase 4 consolidation (don't create issues yet)
-                    verification_text = verification_result.get('agent_output') or verification_result.get('markdown_analysis', '')
                     phase_outputs.append((check_name, verification_text))
                     review_summary_parts.append(f"### {check_name} Verification\n\n{verification_text}")
                     phases_completed += 1
@@ -622,7 +665,8 @@ class PRReviewStage(PipelineStage):
                     ))
                     consolidated_text = await self._run_consolidation_phase(
                         phase_outputs, pr_url, task_context, obs, pipeline_run_id, task_id,
-                        project_name, parent_issue_number, column, _phase4_stack
+                        project_name, parent_issue_number, column, _phase4_stack,
+                        review_checkpoint=review_checkpoint, current_cycle=current_cycle,
                     )
                     phases_completed += 1
 
@@ -678,6 +722,7 @@ class PRReviewStage(PipelineStage):
                 msg = f"All review phases failed for #{parent_issue_number}"
                 logger.error(msg)
                 pr_review_state_manager.increment_review_count(project_name, parent_issue_number, [])
+                review_checkpoint.clear_checkpoint()
                 raise NonRetryableAgentError(msg)
 
             elif phases_completed < phases_attempted and not review_found_issues:
@@ -715,6 +760,11 @@ class PRReviewStage(PipelineStage):
                         repo, parent_issue_number, failure_comment, pipeline_run_id,
                         what_failed="Failed to advance parent to 'Done'",
                     )
+
+            # This review cycle has genuinely concluded (inconclusive, issues found, or a
+            # clean pass) — clear the checkpoint so a future review cycle never reuses
+            # this cycle's phase output.
+            review_checkpoint.clear_checkpoint()
 
             # Build final summary
             issues_summary = ""
@@ -1735,8 +1785,20 @@ class PRReviewStage(PipelineStage):
         parent_issue_number: int,
         column: str,
         cycle_stack: Optional[list] = None,
+        review_checkpoint: Optional['PRReviewCheckpoint'] = None,
+        current_cycle: Optional[int] = None,
     ) -> str:
         """Run Phase 4 consolidation — feed all phase texts into a single agent call."""
+        # See Phase 1's checkpoint-reuse comment in execute() above.
+        if review_checkpoint is not None and current_cycle is not None:
+            cached = review_checkpoint.get_phase_output(current_cycle, 'consolidation')
+            if cached is not None:
+                logger.info(
+                    f"Phase 4: reusing checkpointed consolidation output for cycle "
+                    f"{current_cycle} (restart recovery) — skipping re-launch"
+                )
+                return cached
+
         self._agent_call_count += 1
         prompt = self._build_consolidation_prompt(phase_outputs)
         agent_executor = get_agent_executor()
@@ -1761,6 +1823,13 @@ class PRReviewStage(PipelineStage):
         }
         if cycle_stack is not None:
             phase4_ctx['cycle_stack'] = cycle_stack
+        if current_cycle is not None:
+            # Labeled on the container (claude/docker_runner.py) so restart recovery can
+            # checkpoint this exact phase's output. Phase 4 also runs under
+            # self.pr_review_agent (same as Phase 1) so the agent name alone can't tell
+            # recovery which phase a recovered container belongs to — this label can.
+            phase4_ctx['review_cycle'] = current_cycle
+            phase4_ctx['pr_review_checkpoint_phase'] = 'consolidation'
 
         result = await agent_executor.execute_agent(
             agent_name=self.pr_review_agent,
@@ -1768,7 +1837,10 @@ class PRReviewStage(PipelineStage):
             task_context=phase4_ctx,
             execution_type="pr_review_phase4"
         )
-        return result.get('agent_output') or result.get('markdown_analysis', '')
+        consolidated_text = result.get('agent_output') or result.get('markdown_analysis', '')
+        if review_checkpoint is not None and current_cycle is not None:
+            review_checkpoint.save_phase_output(current_cycle, 'consolidation', consolidated_text)
+        return consolidated_text
 
     def _build_consolidation_prompt(self, phase_outputs: List[Tuple[str, str]]) -> str:
         """Build the consolidation prompt requesting JSON output."""
