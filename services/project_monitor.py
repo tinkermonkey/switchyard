@@ -515,6 +515,70 @@ def _end_pr_review_pipeline_run_on_failure(
         return None
 
 
+def _capture_container_logs_via_follower(
+    container_name: str,
+    max_lines: int = 100,
+    follow_timeout_seconds: int = 30,
+):
+    """
+    Start `docker logs -f <container_name>` in a background daemon thread that
+    collects the container's stdout/stderr into a bounded, thread-safe buffer,
+    and return (thread, get_captured).
+
+    Why a live follower and not a post-hoc `docker logs` call: repair-cycle
+    containers run `--rm`, and the daemon can auto-remove a container as soon
+    as it exits -- the same event a caller would typically be waiting on
+    (e.g. via `docker wait`) before then trying to fetch its logs. A `docker
+    logs` call issued only *after* that wait returns reliably loses this race
+    in practice (verified: 5/5 runs on a normal Docker host hit "No such
+    container" when logs are fetched after `docker wait` returns for an `--rm`
+    container). Attaching a follower instead, ideally started as close to
+    container launch as possible, reads the daemon's live log stream directly
+    -- `docker logs -f` replays everything already buffered for the container
+    from the start and then continues streaming, so it captures output
+    regardless of how fast the container exits, as long as the follower has
+    managed to attach before the container is actually removed. This narrows
+    the race dramatically (typically down to however long it takes this
+    thread to start and the `docker` CLI to connect) but does not eliminate
+    it entirely for a container that disappears before the follower attaches.
+
+    Never raises -- this is a best-effort diagnostic aid and must not affect
+    the caller's own control flow. `thread` is always returned already
+    started; the caller should `thread.join(timeout=...)` to give it a brief
+    grace period to drain trailing output before calling `get_captured()`.
+    """
+    import threading
+
+    log_lines: List[str] = []
+    lock = threading.Lock()
+
+    def _follow():
+        try:
+            follow_proc = subprocess.Popen(
+                ['docker', 'logs', '-f', container_name],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            )
+            for line in follow_proc.stdout:
+                with lock:
+                    log_lines.append(line)
+                    if len(log_lines) > max_lines:
+                        del log_lines[:-max_lines]
+            follow_proc.wait(timeout=follow_timeout_seconds)
+        except Exception as e:
+            logger.debug(f"Log follower for {container_name} stopped: {e}")
+
+    thread = threading.Thread(
+        target=_follow, daemon=True, name=f"log-follower-{container_name}"
+    )
+    thread.start()
+
+    def get_captured() -> str:
+        with lock:
+            return ''.join(log_lines)
+
+    return thread, get_captured
+
+
 def _load_repair_cycle_result_from_redis(
     project_name: str,
     issue_number: int,
@@ -5587,11 +5651,27 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             error_message = None
             pipeline_run_ended = False
             next_column = None  # Initialize to prevent NameError in PR ready check
+            # Initialized here (not inside the try below) because it's read in
+            # the `finally` block on every path, including the stall-path
+            # `return` a few lines down, which exits before the try's own
+            # log-capture code would otherwise set it -- an uninitialized read
+            # there is a NameError, silently swallowed by record_pipeline_event's
+            # own except-and-log-at-debug handler, which was quietly dropping
+            # the repair_cycle_failed Elasticsearch event for every stalled run.
+            container_log_excerpt = None
             loop = None
+
+            # Start following the container's own output now, before `docker
+            # wait` below -- see _capture_container_logs_via_follower's
+            # docstring for why a live follower is used instead of a post-hoc
+            # `docker logs` call against this --rm container.
+            log_follower_thread, get_captured_container_logs = _capture_container_logs_via_follower(
+                container_name
+            )
 
             try:
                 logger.info(f"Starting container monitor for {container_name}")
-                
+
                 # Wait for container to finish, checking for progress every hour.
                 # If no events are emitted for a full hour the cycle is considered stalled
                 # and the container is killed. There is no upper bound on total runtime —
@@ -5665,53 +5745,22 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 elif exit_code == 143:
                     logger.info(f"Exit code 143 indicates SIGTERM - container was gracefully terminated.")
 
-                # Capture the container's own stdout/stderr BEFORE it's removed below.
-                # This container runs `--rm`, so once cleanup runs any traceback it
-                # printed is gone forever -- previously the only signal a non-zero exit
-                # left behind was "exited with code N", with the actual cause
-                # unrecoverable after the fact (see the repair_cycle_runner.py startup
-                # crash this was added for: an unhandled exception there exits 1 with
-                # no Redis result, before any of that process's own error handling
-                # runs). Best-effort only: never let a `docker logs` failure block
-                # normal completion handling.
-                #
-                # Only for exit codes that actually indicate a crash/error -- 4
-                # (cancelled) and 5 (frozen by the Claude Code circuit breaker, see
-                # repair_cycle_runner.py's Exit Codes docstring) are expected,
-                # routine outcomes, not failures, and logging their output at ERROR
-                # would directly contradict this function's own "no misleading
-                # failure comment" handling for is_frozen further below.
-                container_log_excerpt = None
-                if exit_code not in (0, None, 4, 5):
-                    try:
-                        logs_result = subprocess.run(
-                            ['docker', 'logs', '--tail', '100', container_name],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if logs_result.returncode == 0:
-                            combined = (logs_result.stdout or '') + (logs_result.stderr or '')
-                            combined = combined.strip()
-                            if combined:
-                                container_log_excerpt = combined[-2000:]
-                                logger.error(
-                                    f"Container {container_name} logs (last 100 lines, exit {exit_code}):\n"
-                                    f"{container_log_excerpt}"
-                                )
-                        else:
-                            # `docker logs` itself failed -- most likely the --rm
-                            # container was already auto-removed by the time this
-                            # runs. Its stderr here is the Docker CLI's own error
-                            # text (e.g. "No such container"), not anything the
-                            # container printed -- log it distinctly rather than
-                            # storing it in container_log_excerpt, where it would
-                            # be indistinguishable from genuine container output.
-                            logger.warning(
-                                f"Could not capture logs for {container_name}: "
-                                f"docker logs exited {logs_result.returncode} "
-                                f"({(logs_result.stderr or '').strip()[:200]})"
-                            )
-                    except Exception as e:
-                        logger.warning(f"Could not capture logs for {container_name}: {e}")
+                # Give the log follower (started above, before `docker wait`) a
+                # brief grace period to drain any output the container produced
+                # right up until it exited, then snapshot what it has. This does
+                # NOT decide yet whether the run counts as a genuine failure --
+                # that decision (and the corresponding ERROR-level log / the
+                # attachment onto the repair_cycle_failed Elasticsearch event)
+                # happens further below, gated on the same `not overall_success
+                # and not is_frozen` check the rest of this function already
+                # uses to distinguish a real failure from an expected outcome
+                # (cancelled, frozen, gracefully terminated). Deciding it here
+                # via a hand-maintained exit-code list would just be a second,
+                # easily-drifting copy of that same logic.
+                log_follower_thread.join(timeout=5)
+                captured_container_logs = get_captured_container_logs().strip()
+                if captured_container_logs:
+                    container_log_excerpt = captured_container_logs[-2000:]
 
                 # Load result from Redis
                 repair_result = None
@@ -6034,6 +6083,12 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # are excluded: they're not a failure, and pipeline_watchdog's frozen-resume
                     # path (triggered by the outcome='frozen' recorded above) handles them.
                     if not overall_success and not is_frozen:
+                        if container_log_excerpt:
+                            logger.error(
+                                f"Container {container_name} logs (last 100 lines, exit "
+                                f"{exit_code}):\n{container_log_excerpt}"
+                            )
+
                         # Post detailed failure summary to GitHub issue
                         try:
                             org = project_config.github.get('org', '')

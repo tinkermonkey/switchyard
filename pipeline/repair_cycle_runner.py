@@ -92,7 +92,7 @@ class RepairCycleRunner:
         # writable for any reason, opening the log file here must not take
         # down the whole container before it's had a chance to report
         # anything (see the try/except around RepairCycleRunner(args) in
-        # main()): fall back to stderr-only logging instead of crashing.
+        # main()): fall back to stdout-only logging instead of crashing.
         log_file = self.project_dir / ".repair_cycle.log"
         try:
             file_handler = logging.FileHandler(log_file, mode='a')
@@ -102,7 +102,7 @@ class RepairCycleRunner:
         except OSError as e:
             logger.warning(
                 f"Could not open repair-cycle log file at {log_file} ({e}) -- "
-                "continuing with stderr-only logging for this run"
+                "continuing with stdout-only logging for this run"
             )
 
         # Setup signal handlers
@@ -511,8 +511,9 @@ def main():
         # with 0 agent calls and no result ever written to Redis -- which is
         # indistinguishable from every other silent failure once this
         # container (launched with `docker run --rm`) is cleaned up. Log it
-        # loudly to stderr (captured by `docker logs` before removal) and
-        # exit with the same "error" code initialize_stage() uses below.
+        # loudly to stdout (captured by `docker logs` before removal) and
+        # exit with the same code (2) run() itself returns for its own
+        # error paths below (e.g. initialize_stage() failing).
         logger.error(f"Failed to initialize RepairCycleRunner: {e}", exc_info=True)
         sys.exit(2)
 

@@ -251,9 +251,11 @@ contains — MUST include the exact line `### Status` followed on its own line b
 `**APPROVED**`, `**CHANGES NEEDED**`, or `**BLOCKED**` (that exact bold markdown, that
 exact wording). This is true even if you already executed the Python state-update code
 above, even if this is a short closing note after a long investigation, and even if you
-think the state update already speaks for itself — the automation that reads your
-response only ever looks at this final message's text for that marker, it does not
-re-read your earlier tool output. A final message that only summarizes your findings in
-prose (e.g. "the fix is confirmed resolved...") without this exact marker is
-indistinguishable, to that automation, from a verification that never ran at all, and
-gets treated as a failure requiring manual intervention.
+think the state update already speaks for itself. Do not rely on the state-update code
+having already run: there is a narrow same-session fallback that can honor a status you
+already wrote via that code, but it only covers APPROVED/BLOCKED, and only if this
+message's text is otherwise unparseable — CHANGES NEEDED has no such fallback and always
+requires the marker. A final message that only summarizes your findings in prose (e.g.
+"the fix is confirmed resolved...") without this exact marker risks being treated as a
+failure requiring manual intervention even when your investigation itself was correct —
+always include it.
