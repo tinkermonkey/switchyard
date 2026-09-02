@@ -20,7 +20,7 @@ from task_queue.task_manager import TaskQueue
 from claude.session_manager import ClaudeSessionManager
 from monitoring.health_monitor import HealthMonitor
 from services.github_project_manager import GitHubProjectManager
-from services.project_monitor import ProjectMonitor
+from services.project_monitor import ProjectMonitor, register_project_monitor
 from services.project_workspace import workspace_manager
 from services.scheduled_tasks import get_scheduled_tasks_service
 from services.dev_container_state import dev_container_state
@@ -562,6 +562,12 @@ async def main():
 
     # Start project monitor in background
     project_monitor = ProjectMonitor(task_queue, config_manager)
+    # Register the singleton so components outside the main poll loop (e.g.
+    # pipeline_watchdog.py's zombie self-heal redispatch) can reach
+    # trigger_agent_for_status() — the one canonical dispatch entry point —
+    # instead of re-implementing dispatch logic. See get_project_monitor()'s
+    # docstring in services/project_monitor.py.
+    register_project_monitor(project_monitor)
     monitor_thread = threading.Thread(
         target=project_monitor.monitor_projects,
         daemon=True
@@ -644,6 +650,23 @@ async def main():
                     health = await health_monitor.check_health()
                     last_health_check = current_time
                     logger.debug(f"Health check complete: healthy={health['healthy']}")
+
+                    # 'degraded' (e.g. GitHub quota critically low, or the
+                    # cross-process rate-limit view itself unreachable - see
+                    # HealthMonitor.check_github()) is a real, actionable
+                    # signal distinct from a full health-check failure below,
+                    # but was previously computed and returned without
+                    # anything ever reading it - silently discarded. Log it
+                    # so it's visible in normal container logs rather than
+                    # only reachable by inspecting /health directly.
+                    if health.get('degraded'):
+                        degraded_checks = [
+                            name for name, result in health.get('checks', {}).items()
+                            if result.get('degraded')
+                        ]
+                        logger.log_warning(
+                            f"System health is degraded (checks: {', '.join(degraded_checks) or 'unknown'})"
+                        )
 
                     if not health['healthy']:
                         consecutive_health_failures += 1

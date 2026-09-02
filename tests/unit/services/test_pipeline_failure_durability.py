@@ -370,6 +370,130 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertTrue(released)
 
 
+class TestClearRetainedReasonDurability(unittest.TestCase):
+    """PipelineLockManager.clear_retained_reason — the inverse of mark_lock_failed,
+    used by the zombie-watchdog self-heal path (see incident e42ca133) to lift a
+    durable retention without releasing locked_by_issue, so no other issue can
+    acquire the lock during a self-heal retry."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_clears_retained_reason_but_keeps_lock_held(self):
+        self.manager._create_lock("proj", "board", 123)
+        self.assertTrue(self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed"))
+
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertTrue(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNone(lock.retained_reason)
+        self.assertIsNone(lock.retained_at)
+        # The point of this method: locked_by_issue is untouched, so no other
+        # issue can acquire the lock in the gap before a redispatch happens.
+        self.assertEqual(lock.locked_by_issue, 123)
+        self.assertEqual(lock.lock_status, "locked")
+
+    def test_refuses_when_not_held_by_issue(self):
+        self.manager._create_lock("proj", "board", 999)
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+    def test_refuses_when_no_lock_at_all(self):
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+    def test_is_noop_when_already_clear(self):
+        """A lock held by the issue with no retained_reason is a valid,
+        common state (e.g. a lock actively in use) — clearing it must be a
+        harmless no-op, not an error, so callers don't need to check
+        get_retained_reason() first."""
+        self.manager._create_lock("proj", "board", 123)
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertTrue(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.locked_by_issue, 123)
+
+    def test_other_issue_still_refused_after_clear(self):
+        """Clearing the durable mark must not itself change who holds the
+        lock — try_acquire_lock for a different issue must still see this
+        lock as actively held (by issue 123), just no longer retained."""
+        self.manager._create_lock("proj", "board", 123)
+        self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
+        self.manager.clear_retained_reason("proj", "board", 123)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNone(lock.retained_reason)
+        self.assertEqual(lock.locked_by_issue, 123)
+
+    def test_returns_false_when_redis_write_fails_even_if_yaml_succeeds(self):
+        """The core behavior change from mark_lock_failed's "at least one
+        store" contract: clear_retained_reason requires EVERY configured
+        store to succeed, because get_lock()'s merge is asymmetric -- it
+        only merges retained_reason IN from whichever store has it, with no
+        case for merging a clear OUT. A partial write here (YAML cleared,
+        Redis still holding the stale retained value) must be reported as a
+        failed clear, and the lock must still genuinely read as retained
+        afterward -- not silently un-retained while the caller believes it
+        succeeded."""
+        self.manager._create_lock("proj", "board", 123)
+        self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
+
+        # A bare MagicMock's hgetall doesn't persist what hset was "called
+        # with" -- configure it to actually reflect the retained state
+        # mark_lock_failed just wrote, so the subsequent failed clear leaves
+        # genuinely stale (not merely absent) data in "Redis", matching the
+        # real scenario this test is for.
+        self.mock_redis.hgetall.return_value = {
+            'project': 'proj', 'board': 'board', 'locked_by_issue': '123',
+            'lock_acquired_at': datetime.now(timezone.utc).isoformat(),
+            'lock_status': 'locked',
+            'retained_reason': 'agent crashed',
+            'retained_at': datetime.now(timezone.utc).isoformat(),
+        }
+        # Only the subsequent clear's Redis write fails -- mark_lock_failed
+        # above must have already succeeded normally.
+        self.mock_redis.hset.side_effect = Exception("redis boom")
+
+        cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNotNone(lock.retained_reason)
+
+    def test_returns_false_when_yaml_write_fails_even_if_redis_succeeds(self):
+        """Mirror of the above for the opposite partial-failure direction."""
+        self.manager._create_lock("proj", "board", 123)
+        self.manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
+
+        with patch.object(
+            PipelineLockManager, "_save_lock_to_yaml", return_value=False
+        ):
+            cleared = self.manager.clear_retained_reason("proj", "board", 123)
+        self.assertFalse(cleared)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertIsNotNone(lock.retained_reason)
+
+    def test_succeeds_with_no_redis_client_configured_and_yaml_ok(self):
+        """redis_satisfied must not require an unattempted write when no
+        Redis client is configured at all -- only require it when Redis
+        actually is configured."""
+        yaml_only_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        yaml_only_manager._create_lock("proj", "board", 123)
+        yaml_only_manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
+
+        cleared = yaml_only_manager.clear_retained_reason("proj", "board", 123)
+        self.assertTrue(cleared)
+        lock = yaml_only_manager.get_lock("proj", "board")
+        self.assertIsNone(lock.retained_reason)
+
 class TestGetRetainedReason(unittest.TestCase):
     """PipelineLockManager.get_retained_reason — the single check every dispatch
     entry point calls before (re-)dispatching an issue."""

@@ -806,6 +806,19 @@ class DockerAgentRunner:
         if pipeline_run_id:
             cmd.extend(['--label', f'org.switchyard.pipeline_run_id={pipeline_run_id}'])
 
+        # PRReviewStage phase containers carry which phase and review cycle they belong
+        # to, so restart recovery can checkpoint a recovered container's real output
+        # under the right slot (see pipeline/pr_review_checkpoint.py) instead of posting
+        # it as a stray terminal comment. Phase 1 and Phase 4 both run under the same
+        # agent name (pr_code_reviewer), so the agent name alone can't disambiguate them.
+        pr_review_phase = task_context.get('pr_review_checkpoint_phase')
+        if pr_review_phase:
+            cmd.extend(['--label', f'org.switchyard.pr_review_phase={pr_review_phase}'])
+
+        review_cycle = task_context.get('review_cycle')
+        if review_cycle is not None:
+            cmd.extend(['--label', f'org.switchyard.pr_review_cycle={review_cycle}'])
+
         # Add -i (interactive) flag if we need stdin for large prompts
         if use_stdin:
             cmd.append('-i')
@@ -2301,7 +2314,9 @@ class DockerAgentRunner:
         agent: str,
         task_id: str,
         column: str = 'unknown',
-        pipeline_run_id: str = None
+        pipeline_run_id: str = None,
+        pr_review_phase: str = None,
+        pr_review_cycle: str = None,
     ):
         """
         Reconnect to a running container after orchestrator restart.
@@ -2317,13 +2332,19 @@ class DockerAgentRunner:
             task_id: Task ID
             column: Column name from execution history for proper state matching (default: 'unknown')
             pipeline_run_id: Pipeline run ID for traceability (default: None)
+            pr_review_phase: If this container is a PRReviewStage phase (org.switchyard.pr_review_phase
+                label), which phase it was running — e.g. "code_review", an authority_key like
+                "parent_issue", or "consolidation". None for non-PR-review containers.
+            pr_review_cycle: The PR review cycle number (org.switchyard.pr_review_cycle label) this
+                phase belongs to, as a string. None for non-PR-review containers.
         """
         logger.info(f"Reconnecting to container {container_name}")
 
         # Spawn daemon thread to monitor container until exit
         monitoring_thread = threading.Thread(
             target=self._monitor_recovered_container,
-            args=(container_name, project, issue_number, agent, task_id, column, pipeline_run_id),
+            args=(container_name, project, issue_number, agent, task_id, column, pipeline_run_id,
+                  pr_review_phase, pr_review_cycle),
             daemon=True
         )
         monitoring_thread.start()
@@ -2389,7 +2410,9 @@ class DockerAgentRunner:
         agent: str,
         task_id: str,
         column: str = 'unknown',
-        pipeline_run_id: str = None
+        pipeline_run_id: str = None,
+        pr_review_phase: str = None,
+        pr_review_cycle: str = None,
     ):
         """
         Monitor a recovered container until it exits.
@@ -2405,6 +2428,9 @@ class DockerAgentRunner:
             task_id: Task ID
             column: Column name for proper execution state matching (default: 'unknown')
             pipeline_run_id: Pipeline run ID for traceability (default: None)
+            pr_review_phase: PRReviewStage phase this container belongs to, if any (see
+                reconnect_to_container's docstring).
+            pr_review_cycle: PR review cycle number this container belongs to, if any.
         """
         try:
             logger.info(
@@ -2529,6 +2555,8 @@ class DockerAgentRunner:
                     output=output,
                     column=column,
                     pipeline_run_id=pipeline_run_id,
+                    pr_review_phase=pr_review_phase,
+                    pr_review_cycle=pr_review_cycle,
                 )
             else:
                 logger.error(
@@ -2711,6 +2739,182 @@ class DockerAgentRunner:
         except Exception as e:
             logger.error(f"Failed to record execution outcome: {e}", exc_info=True)
 
+    def _process_recovered_pr_review_phase_completion(
+        self,
+        project: str,
+        issue_number: int,
+        agent: str,
+        column: str,
+        exit_code: int,
+        output: str,
+        pr_review_phase: str,
+        pr_review_cycle: str = None,
+    ) -> None:
+        """
+        Handle a recovered container that was one phase of PRReviewStage.
+
+        PRReviewStage.execute() orchestrates several sequential Docker containers
+        (Phase 1 code review, Phase 2 verifications, Phase 4 consolidation) from a
+        single in-process coroutine. That coroutine does not survive an orchestrator
+        restart — even though the container itself does, since it's a sibling process
+        under the host's Docker daemon, not a child of the orchestrator process. So
+        the container's own work is never actually lost; what's lost is the
+        orchestration that was going to consume its output and launch the next phase.
+
+        Rather than treating this one phase's output as the whole stage's complete,
+        terminal result (which is what the generic _complete_agent_execution path
+        would do), this:
+          1. Checkpoints the phase's real output, if it succeeded (see
+             pipeline/pr_review_checkpoint.py) — so a fresh run doesn't redo it.
+          2. Re-triggers a fresh pr_review_stage run for the issue. That run reuses
+             the pipeline lock this issue already holds (it was never released, since
+             the coroutine that would have released it died with the old process) and
+             reads the checkpoint, skipping straight past any phase already done.
+        """
+        try:
+            cycle = int(pr_review_cycle) if pr_review_cycle is not None else None
+        except (TypeError, ValueError):
+            cycle = None
+
+        if exit_code == 0 and output and cycle is not None:
+            from pipeline.pr_review_checkpoint import PRReviewCheckpoint
+            saved = PRReviewCheckpoint(project, issue_number).save_phase_output(
+                cycle, pr_review_phase, output
+            )
+            if saved:
+                logger.info(
+                    f"Checkpointed recovered PR review phase '{pr_review_phase}' "
+                    f"(cycle {cycle}) for {project}/#{issue_number} — will resume from here"
+                )
+            else:
+                # save_phase_output already logged the specific I/O error. Don't claim
+                # success here — a caller re-reading logs for "did this get saved?"
+                # must not see a false "Checkpointed..." line right next to the real
+                # failure. This phase's real output is now lost for this attempt; the
+                # re-trigger below will simply redo it.
+                logger.error(
+                    f"Checkpoint save FAILED for recovered PR review phase "
+                    f"'{pr_review_phase}' (cycle {cycle}) on {project}/#{issue_number} — "
+                    f"this phase's output could not be persisted and will be re-run"
+                )
+        else:
+            logger.warning(
+                f"Recovered PR review phase '{pr_review_phase}' for {project}/#{issue_number} "
+                f"did not produce a checkpointable result (exit_code={exit_code}, "
+                f"cycle_label={pr_review_cycle!r}) — it will be re-run"
+            )
+
+        try:
+            from services.work_execution_state import work_execution_tracker
+            if column != 'unknown':
+                work_execution_tracker.record_execution_outcome(
+                    issue_number=issue_number,
+                    column=column,
+                    agent=agent,
+                    outcome='success' if exit_code == 0 else 'failed',
+                    project_name=project,
+                    error=None if exit_code == 0 else f"Container exited with code {exit_code}",
+                )
+            else:
+                # Not a no-op: this phase's own in_progress execution_history entry
+                # (recorded by work_execution_start when its container was launched)
+                # is never closed out. It doesn't block the re-trigger below (that's
+                # gated on the separate pr_review_stage wrapper entry, which
+                # cleanup_orphaned_execution_history already marks abandoned during
+                # container recovery), but it does leave a stale in_progress record
+                # for this specific agent/column pair sitting in state until a human
+                # or a later reconciliation pass notices it.
+                logger.warning(
+                    f"Recovered PR review phase '{pr_review_phase}' for "
+                    f"{project}/#{issue_number} has no known column — could not "
+                    f"record its execution outcome; a stale in_progress entry for "
+                    f"agent '{agent}' may be left behind"
+                )
+        except Exception as e:
+            logger.error(
+                f"Failed to record execution outcome for recovered PR review phase: {e}",
+                exc_info=True,
+            )
+
+        try:
+            from config.manager import config_manager
+            from services.project_monitor import ProjectMonitor
+            from task_queue.task_manager import TaskQueue
+
+            project_config = config_manager.get_project_config(project)
+            if not project_config:
+                logger.warning(f"No project config for {project} — cannot re-trigger PR review")
+                return
+
+            # Find the board whose column resolves (via stage_mapping, into the
+            # pipeline's own template) to a stage_type of "pr_review" — mirroring
+            # exactly how services/project_monitor.py's trigger_agent_for_status
+            # itself decides a column is a pr_review stage. column.agent is NOT
+            # that signal: the real config has agent="pr_review_agent" on this
+            # column (config/foundations/workflows.yaml), never "pr_review_stage"
+            # (that string only ever appears as work_execution_state's synthetic
+            # wrapper agent name — it is never a column's configured agent).
+            board_name = None
+            repository = None
+            for pipeline in project_config.pipelines:
+                workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+                if not workflow_template:
+                    continue
+                current_column = next(
+                    (c for c in workflow_template.columns if c.name == column), None
+                )
+                if not current_column:
+                    continue
+                stage_name = getattr(current_column, 'stage_mapping', None)
+                if not stage_name:
+                    continue
+                pipeline_template = config_manager.get_pipeline_template(pipeline.template)
+                if not pipeline_template:
+                    continue
+                stage_config = next(
+                    (s for s in pipeline_template.stages if s.stage == stage_name), None
+                )
+                if stage_config and getattr(stage_config, 'stage_type', None) == 'pr_review':
+                    board_name = pipeline.board_name
+                    repository = project_config.github.get('repo')
+                    break
+
+            if not board_name:
+                logger.warning(
+                    f"Could not find a pr_review board/column for {project}/#{issue_number} "
+                    f"in column '{column}' — not re-triggering"
+                )
+                return
+
+            monitor = ProjectMonitor(TaskQueue(), config_manager)
+            # No lock_already_acquired flag: "In Review" isn't a pipeline_trigger_column,
+            # so trigger_agent_for_status's own lock-acquisition branch (the only place
+            # that flag is consulted) never runs for it anyway — it routes straight to
+            # _start_pr_review_for_issue, which doesn't accept that parameter at all and
+            # already handles "this issue already holds the lock" correctly on its own
+            # via its independent _lock_held_by_us check.
+            dispatched_stage = monitor.trigger_agent_for_status(
+                project, board_name, issue_number, column, repository,
+            )
+            if not dispatched_stage:
+                logger.warning(
+                    f"trigger_agent_for_status did not dispatch a re-trigger for "
+                    f"{project}/#{issue_number} in column '{column}' (returned None) — "
+                    f"the issue may be closed, off the board, behind another queued "
+                    f"issue, or its lock may be retained after a prior failure. It will "
+                    f"stay stuck until the next event re-evaluates it or a human "
+                    f"intervenes; check the issue's pipeline lock and queue state."
+                )
+                return
+            logger.info(
+                f"Re-triggered PR review for {project}/#{issue_number} after restart recovery"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to re-trigger PR review for {project}/#{issue_number} after "
+                f"restart recovery: {e}", exc_info=True
+            )
+
     def _process_recovered_container_completion(
         self,
         container_name: str,
@@ -2721,13 +2925,19 @@ class DockerAgentRunner:
         exit_code: int,
         output: str,
         column: str = 'unknown',
-        pipeline_run_id: str = None
+        pipeline_run_id: str = None,
+        pr_review_phase: str = None,
+        pr_review_cycle: str = None,
     ):
         """
         Process completion of a recovered container.
 
         Delegates to _complete_agent_execution so both fresh and recovered
-        executions share the same posting and recording logic.
+        executions share the same posting and recording logic — EXCEPT for a
+        PRReviewStage phase container (pr_review_phase set), which is handled by
+        _process_recovered_pr_review_phase_completion instead: this container's
+        output is only one phase of a multi-container stage, not the stage's
+        complete, terminal result, so it must not be posted to GitHub as if it were.
 
         Args:
             container_name: Container name
@@ -2739,9 +2949,35 @@ class DockerAgentRunner:
             output: Agent output
             column: Column name for proper execution state matching (default: 'unknown')
             pipeline_run_id: Pipeline run ID for traceability (default: None)
+            pr_review_phase: If set, this container was one phase of PRReviewStage (see
+                reconnect_to_container's docstring) — routes to the checkpoint-and-
+                retrigger path instead of the generic terminal-completion path.
+            pr_review_cycle: The PR review cycle number this phase belongs to, if any.
         """
         try:
             import asyncio
+
+            if pr_review_phase:
+                self._process_recovered_pr_review_phase_completion(
+                    project=project,
+                    issue_number=issue_number,
+                    agent=agent,
+                    column=column,
+                    exit_code=exit_code,
+                    output=output,
+                    pr_review_phase=pr_review_phase,
+                    pr_review_cycle=pr_review_cycle,
+                )
+                self._unregister_active_container(container_name)
+                try:
+                    subprocess.run(['docker', 'rm', '-f', container_name], timeout=30)
+                except Exception:
+                    pass  # Container may already be auto-removed
+                logger.info(
+                    f"✓ Completed processing recovered PR review phase container {container_name}"
+                )
+                return
+
             logger.info(
                 f"Processing recovered container completion: {container_name} "
                 f"(exit_code={exit_code})"

@@ -617,6 +617,12 @@ class AgentContainerRecovery:
 
                 if issue_number:
                     pipeline_run_id_label = labels.get('org.switchyard.pipeline_run_id')
+                    # PRReviewStage phase containers carry which phase/cycle they belong
+                    # to (see claude/docker_runner.py's launch labels) so a recovered
+                    # container's real output can be checkpointed under the right slot
+                    # instead of being posted as a stray terminal comment.
+                    pr_review_phase_label = labels.get('org.switchyard.pr_review_phase')
+                    pr_review_cycle_label = labels.get('org.switchyard.pr_review_cycle')
                     docker_runner.reconnect_to_container(
                         container_name=container_name,
                         project=project,
@@ -625,6 +631,8 @@ class AgentContainerRecovery:
                         task_id=task_id,
                         column=column,  # Pass column for proper execution state matching
                         pipeline_run_id=pipeline_run_id_label,
+                        pr_review_phase=pr_review_phase_label,
+                        pr_review_cycle=pr_review_cycle_label,
                     )
                     logger.info(f"✓ Recovered container with monitoring: {container_name}")
                 else:
