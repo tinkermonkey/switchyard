@@ -135,6 +135,7 @@ class PipelineRun:
     context_dir: Optional[str] = None  # Path to pipeline context directory on host volume
     branch_name: Optional[str] = None  # Git branch resolved for this run by resolve_workspace() (issue #120)
     project_dir: Optional[str] = None  # Epic worktree path resolved by resolve_workspace() (issue #120) -- resolve_workspace() always creates/adopts an epic worktree for the workspace types it handles; never a shared base-clone path
+    epic_id: Optional[str] = None  # Epic id resolve_workspace() scoped project_dir's worktree by (issue #121 review) -- lets callers read it directly instead of reverse-engineering it from project_dir's path layout
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -459,14 +460,14 @@ class PipelineRunManager:
 
         Args:
             pipeline_run: The run to resolve a workspace for. Mutated in place
-                with branch_name/project_dir and saved back to Redis/Elasticsearch.
+                with branch_name/project_dir/epic_id and saved back to Redis/Elasticsearch.
             github_integration: GitHubIntegration instance used to resolve the
                 parent issue (see FeatureBranchManager.get_parent_issue).
             workspace_type: The dispatch's workspace type ('issues', 'hybrid',
                 'discussions', ...). Only 'issues'/'hybrid' are resolved.
 
         Returns:
-            pipeline_run, with branch_name/project_dir populated for 'issues'/
+            pipeline_run, with branch_name/project_dir/epic_id populated for 'issues'/
             'hybrid' runs (unchanged for any other workspace_type).
 
         Raises:
@@ -479,21 +480,27 @@ class PipelineRunManager:
                 to source the worktree from.
             RuntimeError: The underlying git worktree add command failed.
 
-        Callers MUST catch and handle both of these -- this method deliberately does not
-        swallow them itself, matching project_monitor.py's _resolve_epic_worktree_target()
-        (added after an earlier bug left pipeline locks stuck forever when a similar
-        failure propagated unhandled): a caller wiring this into real dispatch needs to
-        decide how to fail the pipeline run / release its lock on a resolution failure,
-        not have that decision made silently here.
+        This method deliberately does not swallow either exception itself -- a caller
+        wiring this into real dispatch must let them reach whatever failure handling
+        keeps a pipeline run/lock from getting stuck (the bug an earlier version of this
+        logic, project_monitor.py's _resolve_epic_worktree_target(), was fixed for after
+        leaving pipeline locks stuck forever on an unhandled failure). That does NOT
+        require distinguishing ValueError from RuntimeError, or handling either
+        specially: propagating both to one generic outer exception handler -- this
+        codebase's established uniform retry/escalation pattern (see
+        count_consecutive_failures()/MAX_CONSECUTIVE_DISPATCH_FAILURES), rather than
+        special-casing errors that merely look permanent for immediate termination -- is
+        a correct, intended way to satisfy this contract, and is what this method's
+        current production caller does.
         """
         if workspace_type not in ('issues', 'hybrid'):
             return pipeline_run
 
-        if pipeline_run.branch_name and pipeline_run.project_dir:
+        if pipeline_run.branch_name and pipeline_run.project_dir and pipeline_run.epic_id:
             logger.debug(
                 f"Workspace already resolved for pipeline run {pipeline_run.id}: "
                 f"branch_name={pipeline_run.branch_name}, "
-                f"project_dir={pipeline_run.project_dir}"
+                f"project_dir={pipeline_run.project_dir}, epic_id={pipeline_run.epic_id}"
             )
             return pipeline_run
 
@@ -555,7 +562,9 @@ class PipelineRunManager:
         # locally-resolved branch_name blindly -- persisting a branch_name that doesn't
         # match what's actually checked out at project_dir would silently mis-target any
         # later git push/PR-base operation that trusts this field.
-        actual_branch = workspace_manager._current_worktree_branch(project_dir)
+        actual_branch = await asyncio.to_thread(
+            workspace_manager._current_worktree_branch, project_dir
+        )
         if actual_branch and actual_branch != branch_name:
             logger.warning(
                 f"Resolved branch_name={branch_name!r} for pipeline run {pipeline_run.id} "
@@ -566,6 +575,7 @@ class PipelineRunManager:
 
         pipeline_run.branch_name = branch_name
         pipeline_run.project_dir = str(project_dir)
+        pipeline_run.epic_id = epic_id
         try:
             self.update_resolved_workspace(pipeline_run)
         except Exception:
@@ -576,11 +586,12 @@ class PipelineRunManager:
             # persisting, silently losing the resolution forever.
             pipeline_run.branch_name = None
             pipeline_run.project_dir = None
+            pipeline_run.epic_id = None
             raise
 
         logger.info(
             f"Resolved workspace for pipeline run {pipeline_run.id} "
-            f"({pipeline_run.project} epic #{epic_id}): branch_name={branch_name}, "
+            f"({pipeline_run.project} epic #{pipeline_run.epic_id}): branch_name={branch_name}, "
             f"project_dir={pipeline_run.project_dir}"
         )
         return pipeline_run
