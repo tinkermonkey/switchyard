@@ -42,6 +42,23 @@ was called with this issue's number — proving the call reached a genuine
 successful outcome, not just "didn't raise."
 """
 
+import os
+import tempfile
+
+# services.work_execution_state module-level-constructs a WorkExecutionStateTracker
+# singleton at IMPORT time, which tries to mkdir ORCHESTRATOR_ROOT (default '/app')
+# -- fine inside the real orchestrator container, but this repo isn't checked out
+# at /app in a plain sandbox/local test run, so that raises PermissionError/
+# FileNotFoundError and the import itself fails outright. _start_repair_cycle_for_
+#_issue now imports work_execution_tracker unconditionally at its own top (so every
+# exception path can record a failure outcome, not just the ones that happened to
+# run after wherever this used to be imported) -- meaning EVERY test in this file
+# now transitively imports this module, not just the ones reaching the container-
+# launch success path. Must happen before ANYTHING else in this file imports
+# services.project_monitor (transitively) or services.work_execution_state
+# directly, so this runs at module-collection time, before any test function body.
+os.environ.setdefault('ORCHESTRATOR_ROOT', tempfile.mkdtemp(prefix='switchyard-test-'))
+
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, MagicMock, AsyncMock, patch
@@ -62,6 +79,7 @@ def _run_start_repair_cycle(
     pipeline_manager_capture=None,
     test_types=None,
     subprocess_side_effect=None,
+    get_project_dir_side_effect=None,
 ):
     """
     Shared harness for every test in this file. Sets up the common
@@ -90,6 +108,11 @@ def _run_start_repair_cycle(
     caller can assert on end_phantom_pipeline_run()/end_pipeline_run() calls
     without changing this function's return signature.
 
+    get_project_dir_side_effect lets a caller (TestRepairCycleStartupErrorDoesNot
+    ReleaseLock below) make the epic-worktree resolution step itself fail --
+    simulating the real git-level branch collision this behavior was found and
+    fixed for -- without needing its own bespoke mock setup.
+
     Returns (result, launch_mock, stage_config) so callers can assert on the
     function's actual return value as well as whether/how dispatch proceeded.
     """
@@ -112,6 +135,8 @@ def _run_start_repair_cycle(
                return_value=Path('/workspace/test-project')) as mock_get_project_dir:
 
         mock_get_parent_issue.return_value = parent_issue_number
+        if get_project_dir_side_effect is not None:
+            mock_get_project_dir.side_effect = get_project_dir_side_effect
 
         mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
         mock_pipeline_mgr.return_value.end_phantom_pipeline_run.return_value = True
@@ -674,3 +699,111 @@ class TestPhantomRunCleanup:
 
         assert result == stage_config.default_agent
         capture['manager'].end_phantom_pipeline_run.assert_not_called()
+
+
+class TestRepairCycleStartupErrorDoesNotReleaseLock:
+    """Found live in production: a repair cycle's epic-worktree creation
+    colliding with ordinary dispatch's shared-branch checkout on the base
+    clone (see services/project_workspace.py's _free_branch_from_base_clone
+    for the git-level fix) was releasing the pipeline lock on every failed
+    attempt -- opening a window for a SIBLING sub-issue of the same epic to
+    dispatch in between retries, exactly the scenario the epic-worktree model
+    assumes can't happen (an epic's sub-issues are meant to be single-
+    threaded). Confirmed live: one project's repair cycle failed this way
+    every hour for 10+ consecutive hours, each failure silently re-opening
+    that window, with no cap and no operator-visible signal.
+
+    The fix: once get_or_create_pipeline_run() has resolved a real pipeline
+    run, ANY exception in the rest of this method must leave that run (and
+    the lock it holds) untouched -- retry/threshold/mark_failed() is left
+    entirely to trigger_agent_for_status (this method's caller), which
+    already has that logic for ordinary dispatch failures and needs no
+    repair-cycle-specific duplicate."""
+
+    def _configure_no_competing_holder(self, mock_pipeline_lock_manager_auto):
+        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
+
+    def test_epic_worktree_collision_does_not_release_the_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+        capture = {}
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            pipeline_manager_capture=capture,
+            get_project_dir_side_effect=RuntimeError(
+                "Failed to add worktree for existing branch feature/issue-42-epic: "
+                "fatal: 'feature/issue-42-epic' is already used by worktree at "
+                "'/workspace/test-project'"
+            ),
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        # The real regression: this must NOT be called on this path -- doing so
+        # released the lock every time, letting a sibling sub-issue dispatch in
+        # the window before the next retry.
+        capture['manager'].end_pipeline_run.assert_not_called()
+        # But the run WAS resolved (we got well past get_or_create_pipeline_run,
+        # proving this isn't just the "never acquired anything" phantom case).
+        capture['manager'].get_or_create_pipeline_run.assert_called_once()
+
+    def test_generic_startup_exception_also_does_not_release_the_lock(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The fix isn't special-cased to worktree-collision errors specifically
+        -- ANY exception once the run is resolved leaves the lock alone, matching
+        how the pre-existing outer except was already a catch-all for this whole
+        method."""
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+        capture = {}
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            pipeline_manager_capture=capture,
+            get_project_dir_side_effect=ValueError("something unrelated went wrong"),
+        )
+
+        assert result is None
+        capture['manager'].end_pipeline_run.assert_not_called()
+
+    def test_no_parent_epic_found_hard_error_is_a_different_code_path_unaffected_by_this_fix(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Boundary check, not a regression test: the epic-id-resolution failure
+        handler (a separate, earlier except block for a genuinely non-retryable
+        error -- no parent epic exists at all) is intentionally untouched by this
+        fix and keeps its own existing immediate-retain behavior via
+        end_pipeline_run(outcome='failed'). Reached via parent_issue_number=None
+        instead of get_project_dir_side_effect -- a DIFFERENT code path from the
+        rest of this test class, still calling end_pipeline_run() as before."""
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+        capture = {}
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            pipeline_manager_capture=capture,
+            parent_issue_number=None,
+        )
+
+        assert result is None
+        # Unlike the worktree-collision case above, this earlier handler still
+        # explicitly retains via outcome='failed' -- it's out of scope for this
+        # fix (see TestEpicWorktreeResolution.
+        # test_aborts_without_launching_when_no_parent_epic_is_found for its own
+        # dedicated coverage); asserting the call happened (not its outcome
+        # kwarg) is enough to show this test reached that different branch.
+        capture['manager'].end_pipeline_run.assert_called_once()

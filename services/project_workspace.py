@@ -587,13 +587,80 @@ class ProjectWorkspaceManager:
             )
 
     @staticmethod
+    def _free_branch_from_base_clone(base_repo_dir: Path, branch_name: str, default_branch: str) -> None:
+        """If branch_name is currently checked out in the base clone itself, check
+        the base clone out to default_branch first -- best-effort, never raises.
+
+        `git worktree add` unconditionally refuses to check a branch out into a
+        NEW worktree if that same branch is already checked out ANYWHERE else --
+        including the primary checkout (git counts it as worktree #0). Ordinary
+        ('issues'-workspace) dispatch checks an epic's shared branch out directly
+        on this same base clone (FeatureBranchManager.prepare_feature_branch,
+        deliberately not worktree-isolated -- see agent_executor.py's
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist comment), and _update_repository
+        (this class's startup sync) deliberately never resets the base clone back
+        to default_branch afterward ("agents always prepare the correct branch when
+        they launch"). Once nothing else ever moves it off, EVERY subsequent
+        `worktree add` for that same branch is doomed -- not a rare race, but a
+        deterministic, permanent failure (confirmed live: one project's repair
+        cycle failed this way every hour for 10+ consecutive hours). This call is
+        what makes that safe: freeing the branch here, once, before the epic's
+        worktree is first created, so the worktree (not the base clone) ends up
+        holding it from then on.
+
+        Safe by construction, not by assumption: a plain `git checkout` (no
+        --force) refuses outright if the base clone has uncommitted changes it
+        can't reconcile -- exactly the signal that something is genuinely, actively
+        using it right now. In that case this just logs and returns, leaving the
+        base clone untouched; the caller's `worktree add` attempt proceeds and
+        fails with the same error it always has, rather than risking destroying
+        another dispatch's in-flight work by forcing the checkout through.
+        """
+        try:
+            current = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=10
+            )
+            if current.returncode != 0 or current.stdout.strip() != branch_name:
+                return
+
+            result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'checkout', default_branch],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                logger.info(
+                    f"Freed branch {branch_name!r} from base clone {base_repo_dir} "
+                    f"(checked out {default_branch!r} there instead) so its epic "
+                    "worktree can be created"
+                )
+            else:
+                logger.warning(
+                    f"Could not free branch {branch_name!r} from base clone "
+                    f"{base_repo_dir} (checkout to {default_branch!r} failed: "
+                    f"{result.stderr.strip()}) -- something may be actively using "
+                    "it; leaving it as-is"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to check/free branch {branch_name!r} from base clone "
+                f"{base_repo_dir}: {e}"
+            )
+
+    @staticmethod
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
         """Run the actual `git worktree add` for a new epic worktree.
 
         Tries the existing-branch path first (fetch origin/<branch_name> then a plain
         `worktree add`); falls back to creating a brand-new branch from
         origin/<default_branch> when branch_name doesn't exist on origin yet.
+
+        Frees branch_name from the base clone first if it's checked out there --
+        see _free_branch_from_base_clone's own docstring for why this is needed
+        and why it's safe.
         """
+        ProjectWorkspaceManager._free_branch_from_base_clone(base_repo_dir, branch_name, default_branch)
+
         fetch_existing = subprocess.run(
             ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
              f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
