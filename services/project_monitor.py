@@ -6616,11 +6616,16 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 (duplicate container, lock-state-unknown, locked-by-another-repair-
                 cycle, no test configs), and on the "superseded, not reused" case
                 right after it. Once get_or_create_pipeline_run() resolves the real
-                run, `_owned_is_real_run` is set — some specific failures after that
-                point (steal_lock() failure, epic-id-resolution failure) still go
-                through their own full end_pipeline_run(board=board_name, ...) call,
-                never _end_owned_run_if_pending(), because only end_pipeline_run()
-                knows how to release a lock steal_lock() may have already acquired.
+                run, `_owned_is_real_run` is set — several specific failure handlers
+                after that point (steal_lock() failure, epic-id-resolution failure,
+                context-save failure, container-launch failure — see each one's own
+                comment for its exact call, since they aren't all identical: not
+                every one passes `board=`, and retain-vs-release policy varies) still
+                call end_pipeline_run() directly, never _end_owned_run_if_pending(),
+                because only end_pipeline_run() knows how to release a lock
+                steal_lock() may have already acquired. This list is illustrative,
+                not exhaustive by construction — check the actual call sites, not
+                just this comment, before assuming a given failure's lock behavior.
                 The generic outer except (anything with nothing more specific to do)
                 is the one exception to that: it deliberately does NOT end the run —
                 see its own comment for why (a repeated collision here releasing the
@@ -6814,10 +6819,15 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 _end_owned_run_if_pending("Superseded by the actual repair cycle pipeline run - ending phantom run")
 
             # From here on, `pipeline_run` is the run this method is driving, and
-            # steal_lock() below may hand it the pipeline lock. Any failure past this
-            # point must go through a full end_pipeline_run(board=board_name, ...)
-            # call (see this method's docstring) — never _end_owned_run_if_pending(),
-            # which deliberately never touches the lock.
+            # steal_lock() below may hand it the pipeline lock. Failures past this
+            # point never go through _end_owned_run_if_pending() (which deliberately
+            # never touches the lock) — but they no longer uniformly go through a
+            # full end_pipeline_run() either. Some specific handlers still do (see
+            # this method's docstring for exactly which); the generic outer except
+            # deliberately does NOT, so a startup failure retries with the lock
+            # still held instead of releasing it and reopening a window for a
+            # sibling sub-issue of the same epic to race in — see that except
+            # block's own comment for why.
             _owned_run_id = pipeline_run.id
             _settled = False
             _owned_is_real_run = True
@@ -6902,6 +6912,34 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             logger.info(
                 f"Starting repair cycle for issue #{issue_number} in Docker container "
                 f"(agent: {stage_config.default_agent}, test types: {[tc.test_type for tc in test_configs]})"
+            )
+
+            # Record execution start in work execution state HERE, not right before
+            # container launch (where this used to sit): epic-worktree resolution
+            # (a few dozen lines below) is a real failure point (the exact git-level
+            # branch collision this method's outer except was found and fixed for),
+            # and record_execution_outcome()'s "no in_progress entry found" fallback
+            # only creates a bare new record on its FIRST call for a given
+            # (column, agent) -- every call after that hits its `already_finalized`
+            # de-dup guard and silently no-ops (same failure, same outcome, matched
+            # by that guard's own equality check). Without a real in_progress entry
+            # for THIS attempt to finalize, that meant a repair cycle that failed at
+            # epic-worktree resolution on every retry only ever wrote ONE failure
+            # record, ever -- count_consecutive_failures() in trigger_agent_for_status
+            # (this method's caller) stayed pinned at 1 forever, MAX_CONSECUTIVE_
+            # DISPATCH_FAILURES was never reached, and mark_failed() never fired.
+            # The lock this method's except block now deliberately holds instead of
+            # releasing (see that comment) would have stayed held FOREVER with no
+            # escalation and no operator-visible signal -- worse than the bug this
+            # whole fix exists to close. Recording the start here, before the first
+            # real failure point, means every attempt gets its own in_progress entry
+            # and its own distinct failure record, so the counter actually advances.
+            work_execution_tracker.record_execution_start(
+                issue_number=issue_number,
+                column=status,
+                agent=stage_config.default_agent,
+                trigger_source='manual',
+                project_name=project_name
             )
 
             # Build context for stage execution
@@ -7164,16 +7202,10 @@ _Repair cycle initiated by Switchyard_
             except Exception as e:
                 logger.warning(f"Failed to post initial comment: {e}")
 
-            # Record execution start in work execution state FIRST
-            # CRITICAL: Must happen before launching container to prevent race condition
-            # (work_execution_tracker imported at the top of this method now.)
-            work_execution_tracker.record_execution_start(
-                issue_number=issue_number,
-                column=status,
-                agent=stage_config.default_agent,
-                trigger_source='manual',
-                project_name=project_name
-            )
+            # (record_execution_start now happens much earlier -- right after the
+            # steal_lock() success/"Starting repair cycle" log above -- so a failure
+            # anywhere between there and here, notably epic-worktree resolution, has
+            # a real in_progress entry to finalize. See that call site's comment.)
 
             # Launch Docker container
             container_name = _launch_repair_cycle_container(
@@ -7278,12 +7310,16 @@ _Repair cycle initiated by Switchyard_
             # column+agent failed -- it counts consecutive failures via
             # work_execution_tracker.count_consecutive_failures() and calls
             # mark_failed() (durably retaining the lock) once
-            # MAX_CONSECUTIVE_DISPATCH_FAILURES is reached, exactly mirroring
-            # how ordinary agent dispatch failures are already handled a few
-            # hundred lines up in that same function. record_execution_outcome()
-            # below is what feeds that counter; get_or_create_pipeline_run() at
-            # the top of this method already reuses an existing active run
-            # cleanly, so the next retry doesn't create a duplicate.
+            # MAX_CONSECUTIVE_DISPATCH_FAILURES is reached, exactly mirroring how
+            # ordinary agent dispatch failures are already handled elsewhere in
+            # trigger_agent_for_status (search for count_consecutive_failures in
+            # this same file, not a line-distance reference -- that logic moves).
+            # record_execution_outcome() below is what feeds that counter (fed by
+            # record_execution_start(), moved earlier in THIS method specifically
+            # so every attempt gets its own entry -- see that call site's own
+            # comment for why); get_or_create_pipeline_run() at the top of this
+            # method already reuses an existing active run cleanly, so the next
+            # retry doesn't create a duplicate.
             if 'pipeline_run' not in dir():
                 # Exception fired before get_or_create_pipeline_run() ever ran —
                 # no lock was acquired by THIS attempt at all, so there's

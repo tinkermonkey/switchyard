@@ -57,7 +57,8 @@ import tempfile
 # launch success path. Must happen before ANYTHING else in this file imports
 # services.project_monitor (transitively) or services.work_execution_state
 # directly, so this runs at module-collection time, before any test function body.
-os.environ.setdefault('ORCHESTRATOR_ROOT', tempfile.mkdtemp(prefix='switchyard-test-'))
+if 'ORCHESTRATOR_ROOT' not in os.environ:
+    os.environ['ORCHESTRATOR_ROOT'] = tempfile.mkdtemp(prefix='switchyard-test-')
 
 import pytest
 from pathlib import Path
@@ -179,6 +180,13 @@ def _run_start_repair_cycle(
         column = MagicMock()
         column.type = 'standard'
         stage_config = MagicMock()
+        # A real string, not a bare MagicMock -- work_execution_tracker's
+        # record_execution_start/outcome persist this to a real YAML file
+        # (this file sets ORCHESTRATOR_ROOT so that write actually lands),
+        # and yaml.dump cannot represent an arbitrary MagicMock, silently
+        # failing the whole save (caught by save_state's own broad except)
+        # if this were left as the default auto-generated Mock attribute.
+        stage_config.default_agent = 'senior_software_engineer'
 
         result = monitor._start_repair_cycle_for_issue(
             project_name='test-project',
@@ -807,3 +815,53 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
         # dedicated coverage); asserting the call happened (not its outcome
         # kwarg) is enough to show this test reached that different branch.
         capture['manager'].end_pipeline_run.assert_called_once()
+
+    def test_epic_worktree_collision_records_a_failure_outcome_for_the_retry_counter_to_see(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The whole safety argument for NOT releasing the lock rests on
+        trigger_agent_for_status's retry/threshold logic actually seeing this
+        failure via work_execution_tracker -- assert that directly, not just
+        that end_pipeline_run was skipped. Uses the REAL work_execution_tracker
+        (this file sets ORCHESTRATOR_ROOT at collection time -- see the top of
+        this file), not a mock, so this is a genuine integration check: it
+        would have failed against the original version of this fix, where
+        record_execution_start() ran too late (right before container launch,
+        well after epic-worktree resolution) for record_execution_outcome() to
+        find an in_progress entry to finalize on this exact failure path."""
+        from services.work_execution_state import work_execution_tracker
+
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+        capture = {}
+
+        # A unique issue_number, not the file's shared default (100) -- the real
+        # work_execution_tracker singleton persists execution history to real,
+        # project+issue-scoped files across every test in this module (this file
+        # sets ORCHESTRATOR_ROOT once at collection time, not per-test), so
+        # sharing issue_number=100 with other tests that ALSO now use the same
+        # realistic agent string would let their records leak into this one's
+        # count.
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=999001,
+            pipeline_manager_capture=capture,
+            get_project_dir_side_effect=RuntimeError(
+                "Failed to add worktree for existing branch feature/issue-42-epic: "
+                "fatal: 'feature/issue-42-epic' is already used by worktree at "
+                "'/workspace/test-project'"
+            ),
+        )
+
+        assert result is None
+        history = work_execution_tracker.get_execution_history("test-project", 999001)
+        failures = [
+            e for e in history
+            if e.get('column') == 'Testing' and e.get('outcome') == 'failure'
+            and e.get('agent') == stage_config.default_agent
+        ]
+        assert len(failures) == 1, f"expected exactly one failure record, got: {history}"
+        assert 'worktree' in failures[0].get('error', '')
