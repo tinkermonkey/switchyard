@@ -587,13 +587,129 @@ class ProjectWorkspaceManager:
             )
 
     @staticmethod
+    def _free_branch_from_base_clone(base_repo_dir: Path, branch_name: str, default_branch: str) -> None:
+        """If branch_name is currently checked out in the base clone itself, free
+        it (detach the base clone's HEAD) so an epic worktree can claim it --
+        best-effort, never raises.
+
+        `git worktree add` unconditionally refuses to check a branch out into a
+        NEW worktree if that same branch is already checked out ANYWHERE else --
+        including the primary checkout (git counts it as worktree #0). Ordinary
+        ('issues'-workspace) dispatch checks an epic's shared branch out directly
+        on this same base clone (FeatureBranchManager.prepare_feature_branch,
+        deliberately not worktree-isolated -- see agent_executor.py's
+        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist comment), and _update_repository
+        (this class's startup sync) deliberately never resets the base clone back
+        to default_branch afterward ("agents always prepare the correct branch when
+        they launch"). Once nothing else ever moves it off, EVERY subsequent
+        `worktree add` for that same branch is doomed -- not a rare race, but a
+        deterministic, permanent failure (confirmed live: one project's repair
+        cycle failed this way every hour for 10+ consecutive hours). This call is
+        what makes that safe: freeing the branch here, once, before the epic's
+        worktree is first created, so the worktree (not the base clone) ends up
+        holding it from then on.
+
+        Safe by construction, not by assumption -- but "by construction" here means
+        an EXPLICIT `git status --porcelain` guard, not relying on `git checkout`'s
+        own refusal behavior: a plain checkout only refuses when switching branches
+        would overwrite a file that actually DIFFERS between the two commits. A
+        file with uncommitted changes that happens to be IDENTICAL on both branches
+        (the common case -- most files in a repo aren't touched by any one epic's
+        commits) checks out cleanly and SILENTLY CARRIES THE UNCOMMITTED CHANGES
+        OVER onto default_branch (verified empirically -- this is real git
+        behavior, not a hypothetical). Repair cycles steal the pipeline lock from a
+        non-retained ordinary holder (see steal_lock() in project_monitor.py), so a
+        live 'issues'-workspace agent genuinely can be mid-edit in this exact base
+        clone when this runs. So: bail out entirely (no checkout attempted at all)
+        if the tree is dirty in ANY way, regardless of which files. When it's
+        clean, `--detach` is used rather than a plain branch checkout -- it frees
+        branch_name just the same (HEAD no longer references it) without leaving
+        the base clone itself parked on default_branch as a named checkout, which
+        would just reproduce this exact bug for whichever OTHER epic uses
+        default_branch's name as a starting point.
+        """
+        try:
+            status = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'status', '--porcelain'],
+                capture_output=True, text=True, timeout=10
+            )
+            if status.returncode != 0:
+                logger.warning(
+                    f"Could not check working-tree cleanliness for base clone "
+                    f"{base_repo_dir} (git status failed: {status.stderr.strip()}) "
+                    "-- not attempting to free any branch from it"
+                )
+                return
+            if status.stdout.strip():
+                logger.info(
+                    f"Base clone {base_repo_dir} has uncommitted changes -- not "
+                    f"attempting to free branch {branch_name!r} from it (something "
+                    "may be actively using it)"
+                )
+                return
+
+            current = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'rev-parse', '--abbrev-ref', 'HEAD'],
+                capture_output=True, text=True, timeout=10
+            )
+            if current.returncode != 0:
+                logger.warning(
+                    f"Could not determine base clone {base_repo_dir}'s current "
+                    f"branch (rev-parse failed: {current.stderr.strip()}) -- not "
+                    f"attempting to free branch {branch_name!r} from it"
+                )
+                return
+            if current.stdout.strip() != branch_name:
+                return
+
+            result = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'checkout', '--detach', default_branch],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0:
+                logger.info(
+                    f"Freed branch {branch_name!r} from base clone {base_repo_dir} "
+                    f"(detached HEAD at {default_branch!r} there instead) so its "
+                    "epic worktree can be created"
+                )
+            else:
+                logger.warning(
+                    f"Could not free branch {branch_name!r} from base clone "
+                    f"{base_repo_dir} (detach to {default_branch!r} failed: "
+                    f"{result.stderr.strip()}) -- leaving it as-is"
+                )
+        except subprocess.SubprocessError as e:
+            logger.warning(
+                f"Failed to check/free branch {branch_name!r} from base clone "
+                f"{base_repo_dir} (subprocess error, e.g. a timeout -- possibly a "
+                f"stale git index.lock): {e}"
+            )
+        except OSError as e:
+            logger.warning(
+                f"Failed to check/free branch {branch_name!r} from base clone "
+                f"{base_repo_dir} (OS error, e.g. git binary or path issue): {e}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error checking/freeing branch {branch_name!r} from "
+                f"base clone {base_repo_dir}: {e}",
+                exc_info=True
+            )
+
+    @staticmethod
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
         """Run the actual `git worktree add` for a new epic worktree.
 
         Tries the existing-branch path first (fetch origin/<branch_name> then a plain
         `worktree add`); falls back to creating a brand-new branch from
         origin/<default_branch> when branch_name doesn't exist on origin yet.
+
+        Frees branch_name from the base clone first if it's checked out there --
+        see _free_branch_from_base_clone's own docstring for why this is needed
+        and why it's safe.
         """
+        ProjectWorkspaceManager._free_branch_from_base_clone(base_repo_dir, branch_name, default_branch)
+
         fetch_existing = subprocess.run(
             ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
              f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
