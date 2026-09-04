@@ -1251,6 +1251,16 @@ git push --force-with-lease
 
         Returns: dict with pr_url, all_complete, etc.
         """
+        # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
+        # commit_agent_changes() -- which has no other callers and can safely
+        # require project_dir -- this method is also called directly/standalone
+        # (see tests/integration/test_feature_branch_workflow.py and others)
+        # without an override, where falling back to the shared base clone is
+        # the correct, intended behavior, not a bug. The danger this docstring
+        # warns about is specific to IssuesWorkspaceContext/HybridWorkspaceContext,
+        # which always pass project_dir_override themselves and guard against it
+        # being unset before calling this method at all -- the silent fallback
+        # here is deliberately kept for this method's other, legitimate callers.
         project_dir = project_dir_override or os.path.join(self.workspace_root, project)
 
         feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
