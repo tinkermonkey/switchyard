@@ -196,9 +196,7 @@ class ReviewCycleExecutor:
     async def _resolve_epic_id_for_cycle(self, cycle_state: ReviewCycleState) -> None:
         """
         Best-effort resolution of cycle_state.epic_id -- the parent epic issue number
-        that will eventually scope this sub-issue's isolated git worktree, once a
-        dedicated fast-follow reconciles FeatureBranchManager's independent branch
-        resolution with the epic worktree model (#47/#48).
+        this sub-issue's isolated git worktree is scoped by.
 
         NOT CURRENTLY CALLED from any ReviewCycleState construction path (pass-1
         review of #47 found that calling this eagerly at cycle start/resume put a
@@ -206,28 +204,18 @@ class ReviewCycleExecutor:
         backoff, since the underlying get_parent_issue() -> github_client.graphql()
         chain is synchronous I/O with no thread offload -- ahead of the
         active_cycles[key] dict write those paths depend on, widening a real
-        concurrent-dispatch race for a value nothing downstream consumes yet).
-        Kept as tested, ready plumbing. #48 investigated every remaining
-        get_project_dir() call site in this file and confirmed none can safely
-        become a real consumer yet: 'issues'/'hybrid' review cycles still mount
-        their agent container from the shared base clone (see the
-        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate note below), so every one of them
-        deliberately keeps calling get_project_dir() with no epic_id. Still stays
-        None here until whichever future change actually reconciles the two
-        branch-resolution paths lands and gives this a real consumer.
-
-        IMPORTANT for whoever wires this in: services/agent_executor.py's
-        equivalent resolve_epic_id() call is guarded by an explicit
-        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist (currently just
-        'discussions') for exactly the reason above -- 'issues'/'hybrid' cycles
-        must NOT get this called on their hot construction path without either
-        the same gate or a non-blocking (e.g. asyncio.to_thread-offloaded, or
-        deferred-until-after-the-dict-write) resolution strategy.
+        concurrent-dispatch race). This file's own git operations resolve epic_id
+        (and project_dir/branch_name) via _resolve_project_dir_for_cycle() instead,
+        which reads it off the pipeline run's own resolve_workspace() result rather
+        than a separate call to this method -- so cycle_state.epic_id stays a
+        read-only/observability field, not a real dependency of that resolution.
+        Kept as tested, ready plumbing for a future caller that specifically wants
+        it on cycle_state itself.
 
         Idempotent: a no-op if epic_id is already set (e.g. restored via from_dict
-        from a prior save). Uses FeatureBranchManager.resolve_epic_id() (added in
-        #46; a 1h-TTL cached parent-issue lookup that resolves to the issue's own
-        number when it has no parent).
+        from a prior save). Uses FeatureBranchManager.resolve_epic_id() (a 1h-TTL
+        cached parent-issue lookup that resolves to the issue's own number when it
+        has no parent).
 
         Deliberately best-effort: any resolution failure is logged as a warning and
         swallowed, leaving epic_id=None, and MUST NEVER raise or otherwise disrupt
@@ -250,6 +238,82 @@ class ReviewCycleExecutor:
                 f"Failed to resolve epic_id for issue #{cycle_state.issue_number} "
                 f"(project={cycle_state.project_name}): {e} -- leaving epic_id=None"
             )
+
+    async def _resolve_project_dir_for_cycle(self, cycle_state: 'ReviewCycleState') -> 'Path':
+        """
+        Resolve the directory this file's own git operations (diff-building for the
+        reviewer's context, mechanical lint, pre-flight context fetch, HEAD
+        snapshots, and branch checkout) must read from and write to.
+
+        For 'issues'/'hybrid' workspace types this MUST be the SAME epic worktree
+        the maker agent's own dispatch (_execute_agent_directly() ->
+        agent_executor.execute_agent() -> PipelineRunManager.resolve_workspace(),
+        issue #122) resolved and committed into -- not an independent resolution
+        against the shared base clone. Before this fix, this file's own
+        get_project_dir() calls (no epic_id) and checkout_branch() calls always
+        targeted the base clone while the maker's commits landed in the epic
+        worktree: the reviewer's diff came back empty (both the pre_maker_commit
+        and HEAD~1 fallback), and once an epic worktree existed, checkout_branch()
+        on the base clone crashed outright ("already used by worktree at ...") --
+        see issue #123.
+
+        Uses PipelineRunManager.get_pipeline_run()/resolve_workspace() the same way
+        agent_executor.py's epic-resolution block and project_monitor.py's
+        repair-cycle dispatch (#121) do. Idempotent: by the time a review cycle's
+        own git operations run, the maker's own dispatch for this same
+        pipeline_run has always already resolved and persisted the workspace, so
+        this is a cache-hit read, not a fresh resolution.
+
+        'discussions' workspace_type is git-free (resolve_workspace() is a no-op
+        for it) and stays on the shared base clone, matching this file's
+        pre-existing behavior for that type.
+
+        Raises:
+            RuntimeError: cycle_state.pipeline_run_id is unset, or no PipelineRun
+                exists for it -- both indicate a construction bug upstream (the
+                maker's own dispatch requires a resolvable pipeline_run_id for
+                'issues'/'hybrid', issue #122), not a condition recoverable by
+                silently falling back to the base clone here (that fallback is
+                exactly the bug this method exists to fix).
+            ValueError, RuntimeError: propagated, not swallowed, from
+                resolve_workspace() itself -- see its own docstring for why this
+                is deliberate.
+        """
+        from pathlib import Path
+        from services.project_workspace import workspace_manager
+
+        if cycle_state.workspace_type not in ('issues', 'hybrid'):
+            return workspace_manager.get_project_dir(cycle_state.project_name)
+
+        if not cycle_state.pipeline_run_id:
+            raise RuntimeError(
+                f"Cannot resolve workspace for {cycle_state.project_name}/"
+                f"#{cycle_state.issue_number}: cycle_state.pipeline_run_id is not "
+                "set, so the epic worktree the maker agent's own dispatch used "
+                "cannot be identified."
+            )
+
+        from services.pipeline_run import get_pipeline_run_manager
+        pipeline_run_manager = get_pipeline_run_manager()
+        pipeline_run = pipeline_run_manager.get_pipeline_run(cycle_state.pipeline_run_id)
+        if pipeline_run is None:
+            raise RuntimeError(
+                f"No pipeline run found for pipeline_run_id={cycle_state.pipeline_run_id!r} "
+                f"({cycle_state.project_name}/#{cycle_state.issue_number}) -- cannot "
+                "resolve the same workspace the maker agent's dispatch used."
+            )
+
+        github_integration = self._get_github_integration(cycle_state)
+        pipeline_run = await pipeline_run_manager.resolve_workspace(
+            pipeline_run, github_integration, cycle_state.workspace_type
+        )
+        if not pipeline_run.project_dir:
+            raise RuntimeError(
+                f"resolve_workspace() did not populate project_dir for pipeline "
+                f"run {pipeline_run.id} ({cycle_state.project_name}/"
+                f"#{cycle_state.issue_number})."
+            )
+        return Path(pipeline_run.project_dir)
 
     def _ensure_context_writer(
         self,
@@ -1355,19 +1419,9 @@ class ReviewCycleExecutor:
 
                 # Store current commit hash for future scoped reviews (issues workspace)
                 if cycle_state.workspace_type == 'issues':
-                    from services.project_workspace import workspace_manager
-                    # NOTE (#47/#48): deliberately NOT passing epic_id=cycle_state.epic_id
-                    # here. Epic-worktree resolution is gated off for 'issues'/'hybrid'
-                    # workspace types (see agent_executor.py's
-                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- #48
-                    # investigated this call site and confirmed the gate still applies: the
-                    # real agent container for this sub-issue is still mounted from this
-                    # same base clone today, so scoping this call to the epic worktree would
-                    # silently point it at a directory the agent never touched. Stays this
-                    # way until a dedicated fast-follow reconciles
-                    # FeatureBranchManager.prepare_feature_branch()'s independent branch
-                    # resolution with the epic worktree model.
-                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    # Read from the same epic worktree the maker agent's dispatch
+                    # committed into (issue #123) -- not an independent resolution.
+                    project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
                     current_commit = self._get_git_commit_hash(str(project_dir))
                     if current_commit:
                         cycle_state.last_approved_commit = current_commit
@@ -1413,43 +1467,29 @@ class ReviewCycleExecutor:
                     full_discussion_context=fresh_context
                 )
 
-                # Ensure we're on the correct branch (for issues workspace)
+                # Ensure the epic worktree this maker revision will run in is
+                # resolved (issue #123). No explicit checkout_branch() needed for
+                # 'issues'/'hybrid' any more: resolve_workspace()/
+                # get_or_create_epic_worktree() already guarantee the epic
+                # worktree it returns is checked out on the right branch --
+                # unlike the shared base clone this used to switch branches on
+                # (which multiple issues could contend over), each epic gets its
+                # own dedicated worktree that never needs to change branches
+                # mid-cycle. The old git_workflow_manager.get_branch_info()/
+                # checkout_branch() dance here independently resolved a branch
+                # that could (and, once an epic worktree existed, did -- "already
+                # used by worktree at ...") disagree with the maker's own
+                # dispatch resolution.
                 if cycle_state.workspace_type == 'issues':
-                    from services.project_workspace import workspace_manager
-                    from services.git_workflow_manager import git_workflow_manager
-
-                    branch_info = git_workflow_manager.get_branch_info(
-                        cycle_state.project_name,
-                        cycle_state.issue_number
-                    )
-
-                    if branch_info:
-                        # Checkout existing branch
-                        from services.git_workflow_manager import git_workflow_manager
-                        # NOTE (#47/#48/#49): deliberately NOT epic_id-scoped, and this
-                        # checkout_branch() call itself is a #49 target. The base clone is
-                        # genuinely what the agent container mounts for 'issues'/'hybrid'
-                        # workspace types -- #48 investigated every get_project_dir() call
-                        # site in this file and CONFIRMED the #46 gating decision stays in
-                        # place (no fast-follow date set for the FeatureBranchManager/
-                        # epic-worktree reconciliation this would need), so switching this
-                        # branch on the base clone remains necessary for now. If/when that
-                        # reconciliation lands and #49 retires most of checkout_branch()'s
-                        # logic, a per-epic worktree will already be on the right branch by
-                        # construction -- this call likely becomes unnecessary rather than
-                        # needing redirection to a different directory.
-                        project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-                        await git_workflow_manager.checkout_branch(str(project_dir), branch_info.branch_name)
-                        logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
+                    project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
+                    logger.info(f"Maker revision will run in {project_dir}")
 
                 # Execute maker agent
                 cycle_state.status = 'maker_working'
                 if cycle_state.workspace_type == 'issues':
-                    from services.project_workspace import workspace_manager
-                    # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating
-                    # decision (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. The agent
-                    # container for this sub-issue still mounts the base clone today.
-                    _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                    # Read from the same epic worktree the maker agent's dispatch
+                    # commits into (issue #123) -- not an independent resolution.
+                    _pd = await self._resolve_project_dir_for_cycle(cycle_state)
                     commit_hash = self._get_git_commit_hash(str(_pd))
                     if commit_hash:
                         cycle_state.pre_maker_commit = commit_hash
@@ -1477,6 +1517,7 @@ class ReviewCycleExecutor:
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
+                            project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
                             issue_number=cycle_state.issue_number,
                             custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}"
                         )
@@ -1639,7 +1680,7 @@ class ReviewCycleExecutor:
                 cycle_state, org, iteration
             )
 
-            reviewer_task_context = self._create_review_task_context(
+            reviewer_task_context = await self._create_review_task_context(
                 cycle_state,
                 column,
                 issue_data,
@@ -1738,11 +1779,9 @@ class ReviewCycleExecutor:
                 # Invoke maker with updated review feedback
                 cycle_state.status = 'maker_working'
                 if cycle_state.workspace_type == 'issues':
-                    from services.project_workspace import workspace_manager
-                    # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating
-                    # decision (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. The agent
-                    # container for this sub-issue still mounts the base clone today.
-                    _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                    # Read from the same epic worktree the maker agent's dispatch
+                    # commits into (issue #123) -- not an independent resolution.
+                    _pd = await self._resolve_project_dir_for_cycle(cycle_state)
                     commit_hash = self._get_git_commit_hash(str(_pd))
                     if commit_hash:
                         cycle_state.pre_maker_commit = commit_hash
@@ -2062,7 +2101,7 @@ class ReviewCycleExecutor:
                 fresh_context = await self._get_fresh_discussion_context(cycle_state, org, iteration)
 
                 # Create reviewer task context with post-human-feedback flag
-                reviewer_task_context = self._create_review_task_context(
+                reviewer_task_context = await self._create_review_task_context(
                     cycle_state,
                     column,
                     issue_data,
@@ -2302,7 +2341,7 @@ class ReviewCycleExecutor:
                 logger.debug(f"Fresh discussion context length: {len(fresh_context)}")
 
             # Step 1: Execute reviewer agent directly with full context
-            review_task_context = self._create_review_task_context(
+            review_task_context = await self._create_review_task_context(
                 cycle_state,
                 column,
                 issue_data,
@@ -2321,7 +2360,7 @@ class ReviewCycleExecutor:
 
             # Mechanical lint gate — runs before LLM reviewer if enabled for this column
             if getattr(column, 'pre_review_lint', False) and cycle_state.workspace_type == 'issues':
-                lint_result = self._run_mechanical_lint(cycle_state, review_task_context)
+                lint_result = await self._run_mechanical_lint(cycle_state, review_task_context)
                 if not lint_result.passed:
                     lint_comment = lint_result.failure.format_comment()
                     current_violation_count = len(lint_result.failure.violations)
@@ -2368,12 +2407,10 @@ class ReviewCycleExecutor:
                         pipeline_run_id=cycle_state.pipeline_run_id,
                     )
 
-                    # Snapshot HEAD before maker runs
-                    from services.project_workspace import workspace_manager as _wsm
-                    # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating
-                    # decision (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. The agent
-                    # container for this sub-issue still mounts the base clone today.
-                    _pd = _wsm.get_project_dir(cycle_state.project_name)
+                    # Snapshot HEAD before maker runs. Read from the same epic
+                    # worktree the maker agent's dispatch commits into (issue
+                    # #123) -- not an independent resolution.
+                    _pd = await self._resolve_project_dir_for_cycle(cycle_state)
                     _commit = self._get_git_commit_hash(str(_pd))
                     if _commit:
                         cycle_state.pre_maker_commit = _commit
@@ -2404,6 +2441,7 @@ class ReviewCycleExecutor:
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"lint_fix_iter_{iteration}",
+                            project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
                             issue_number=cycle_state.issue_number,
                             custom_message=f"Fix mechanical lint violations (iteration {iteration})\n\nIssue #{cycle_state.issue_number}",
                         )
@@ -2440,7 +2478,7 @@ class ReviewCycleExecutor:
 
                 # Lint passed — fetch preflight context and attach to review context
                 _lint_prev_violation_count = None  # reset stalemate tracker on pass
-                preflight = self._fetch_preflight_context(cycle_state, review_task_context)
+                preflight = await self._fetch_preflight_context(cycle_state, review_task_context)
                 if preflight and cycle_state.context_writer:
                     try:
                         cycle_state.context_writer.write_preflight_context(preflight)  # fix #5
@@ -2543,19 +2581,9 @@ class ReviewCycleExecutor:
 
                 # Store current commit hash for future scoped reviews (issues workspace)
                 if cycle_state.workspace_type == 'issues':
-                    from services.project_workspace import workspace_manager
-                    # NOTE (#47/#48): deliberately NOT passing epic_id=cycle_state.epic_id
-                    # here. Epic-worktree resolution is gated off for 'issues'/'hybrid'
-                    # workspace types (see agent_executor.py's
-                    # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES, #46's gating decision) -- #48
-                    # investigated this call site and confirmed the gate still applies: the
-                    # real agent container for this sub-issue is still mounted from this
-                    # same base clone today, so scoping this call to the epic worktree would
-                    # silently point it at a directory the agent never touched. Stays this
-                    # way until a dedicated fast-follow reconciles
-                    # FeatureBranchManager.prepare_feature_branch()'s independent branch
-                    # resolution with the epic worktree model.
-                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+                    # Read from the same epic worktree the maker agent's dispatch
+                    # committed into (issue #123) -- not an independent resolution.
+                    project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
                     current_commit = self._get_git_commit_hash(str(project_dir))
                     if current_commit:
                         cycle_state.last_approved_commit = current_commit
@@ -2694,89 +2722,26 @@ class ReviewCycleExecutor:
                 full_discussion_context=fresh_context
             )
 
-            # Ensure we're on the correct branch for git workflow
+            # Ensure the epic worktree this maker revision will run in is
+            # resolved (issue #123). No explicit branch creation/checkout needed
+            # for 'issues'/'hybrid' any more: resolve_workspace()/
+            # get_or_create_epic_worktree() already get-or-create the epic's
+            # worktree on the right branch. The old
+            # git_workflow_manager.get_branch_info()/checkout_branch()/
+            # FeatureBranchManager.prepare_feature_branch() dance here
+            # independently resolved a branch (via a different algorithm than
+            # resolve_workspace()'s) that could -- and, once an epic worktree
+            # existed, did -- collide with the maker's own dispatch resolution
+            # ("already used by worktree at ...").
             if cycle_state.workspace_type == 'issues':
-                from services.project_workspace import workspace_manager
-                from services.git_workflow_manager import git_workflow_manager
+                project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
+                logger.info(f"Maker revision will run in {project_dir}")
 
-                # Get or create feature branch
-                branch_info = git_workflow_manager.get_branch_info(
-                    cycle_state.project_name,
-                    cycle_state.issue_number
-                )
-
-                if branch_info:
-                    # Switch to existing branch
-                    from services.git_workflow_manager import git_workflow_manager
-                    # NOTE (#47/#48/#49): deliberately NOT epic_id-scoped, and this
-                    # checkout_branch() call itself is a #49 target. The base clone is
-                    # genuinely what the agent container mounts for 'issues'/'hybrid'
-                    # workspace types -- #48 investigated every get_project_dir() call
-                    # site in this file and CONFIRMED the #46 gating decision stays in
-                    # place (no fast-follow date set for the FeatureBranchManager/
-                    # epic-worktree reconciliation this would need), so switching this
-                    # branch on the base clone remains necessary for now. If/when that
-                    # reconciliation lands and #49 retires most of checkout_branch()'s
-                    # logic, a per-epic worktree will already be on the right branch by
-                    # construction -- this call likely becomes unnecessary rather than
-                    # needing redirection to a different directory.
-                    project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
-                    await git_workflow_manager.checkout_branch(str(project_dir), branch_info.branch_name)
-                    logger.info(f"Switched to branch {branch_info.branch_name} for maker revision")
-                else:
-                    # Create branch if it doesn't exist - use FeatureBranchManager to respect parent/sub-issue relationships
-                    from services.feature_branch_manager import feature_branch_manager
-                    from services.github_integration import GitHubIntegration
-
-                    # Get github integration instance
-                    github_integration = self._get_github_for_project(cycle_state.project_name, cycle_state.repository)
-
-                    try:
-                        # NOTE (#47): project_dir was previously fetched here but never used --
-                        # prepare_feature_branch() below derives its own project_dir
-                        # internally and does not take one as an argument. Dead code, removed.
-                        # Use FeatureBranchManager which handles parent/sub-issue detection
-                        branch_name = await feature_branch_manager.prepare_feature_branch(
-                            project=cycle_state.project_name,
-                            issue_number=cycle_state.issue_number,
-                            github_integration=github_integration,
-                            issue_title=issue_data.get('title') or f"Issue {cycle_state.issue_number}"
-                        )
-                        
-                        # Track the branch for git workflow (this will be done by feature_branch_manager too, but ensure it)
-                        if not git_workflow_manager.get_branch_info(cycle_state.project_name, cycle_state.issue_number):
-                            # Check if this is a sub-issue
-                            feature_branch = await feature_branch_manager.get_feature_branch_for_issue(cycle_state.project_name, cycle_state.issue_number, github_integration)
-                            if feature_branch:
-                                # Track against parent for PR creation
-                                git_workflow_manager.track_branch(
-                                    cycle_state.project_name,
-                                    feature_branch.parent_issue,  # Track with parent issue number
-                                    branch_name
-                                )
-                                logger.info(f"Tracked sub-issue #{cycle_state.issue_number} branch {branch_name} under parent #{feature_branch.parent_issue}")
-                            else:
-                                # Standalone issue
-                                git_workflow_manager.track_branch(
-                                    cycle_state.project_name,
-                                    cycle_state.issue_number,
-                                    branch_name
-                                )
-                                logger.info(f"Tracked standalone issue #{cycle_state.issue_number} branch {branch_name}")
-                        
-                        logger.info(f"Prepared branch {branch_name} for maker revision using FeatureBranchManager")
-                    except Exception as e:
-                        logger.error(f"Failed to prepare branch for issue #{cycle_state.issue_number}: {e}")
-                        # Continue without branch - agent will work on current branch
-                        logger.warning(f"Continuing on current branch for issue #{cycle_state.issue_number}")
-
-            # Snapshot HEAD before the maker runs so the reviewer diffs only this iteration
+            # Snapshot HEAD before the maker runs so the reviewer diffs only this
+            # iteration. Read from the same epic worktree the maker agent's
+            # dispatch commits into (issue #123) -- not an independent resolution.
             if cycle_state.workspace_type == 'issues':
-                from services.project_workspace import workspace_manager
-                # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating decision
-                # (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. The agent container for
-                # this sub-issue still mounts the base clone today.
-                _pd = workspace_manager.get_project_dir(cycle_state.project_name)
+                _pd = await self._resolve_project_dir_for_cycle(cycle_state)
                 commit_hash = self._get_git_commit_hash(str(_pd))
                 if commit_hash:
                     cycle_state.pre_maker_commit = commit_hash
@@ -2806,6 +2771,7 @@ class ReviewCycleExecutor:
                         project=cycle_state.project_name,
                         agent=cycle_state.maker_agent,
                         task_id=f"review_cycle_iter_{iteration}",
+                        project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
                         issue_number=cycle_state.issue_number,
                         custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
                     )
@@ -2913,7 +2879,7 @@ class ReviewCycleExecutor:
             f"- Single file: `git diff {base_commit[:8]} HEAD -- <path/to/file>`"
         )
 
-    def _run_mechanical_lint(
+    async def _run_mechanical_lint(
         self,
         cycle_state: 'ReviewCycleState',
         review_task_context: Dict[str, Any],
@@ -2922,13 +2888,11 @@ class ReviewCycleExecutor:
         from services.code_review_lint import CodeReviewLintRunner, LintResult
         from services.code_review_lint.config import LintConfig
         from config.manager import config_manager
-        from services.project_workspace import workspace_manager
 
-        # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating decision
-        # (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. Lint must run against the
-        # same directory the agent's own commits landed in, which is still the base
-        # clone today.
-        project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+        # Lint must run against the SAME directory the agent's own commits landed
+        # in -- the epic worktree the maker's dispatch resolved (issue #123), not
+        # an independent resolution.
+        project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
         project_config = config_manager.get_project_config(cycle_state.project_name)
         lint_config_data = getattr(project_config, 'code_review_lint', None) or {}
         lint_config = LintConfig.from_dict(lint_config_data) if lint_config_data else LintConfig()
@@ -2961,17 +2925,15 @@ class ReviewCycleExecutor:
         except Exception:
             return 'main'
 
-    def _fetch_preflight_context(
+    async def _fetch_preflight_context(
         self,
         cycle_state: 'ReviewCycleState',
         review_task_context: Dict[str, Any],
     ) -> str:
         """Fetch current main-branch state of changed files for the LLM reviewer."""
         import subprocess
-        from pathlib import Path
         from config.manager import config_manager
         from services.code_review_lint.config import LintConfig
-        from services.project_workspace import workspace_manager
 
         project_config = config_manager.get_project_config(cycle_state.project_name)
         lint_config_data = getattr(project_config, 'code_review_lint', None) or {}
@@ -2980,10 +2942,10 @@ class ReviewCycleExecutor:
         if not lint_config.pre_flight_context_fetch:
             return ""
 
-        # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating decision
-        # (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. Must read the same directory
-        # the agent's own commits landed in, which is still the base clone today.
-        project_dir = Path(str(workspace_manager.get_project_dir(cycle_state.project_name)))
+        # Must read the same directory the agent's own commits landed in -- the
+        # epic worktree the maker's dispatch resolved (issue #123), not an
+        # independent resolution.
+        project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
         base_commit = cycle_state.pre_maker_commit or 'HEAD~1'
 
         try:
@@ -3044,7 +3006,7 @@ class ReviewCycleExecutor:
 
         return "## Pre-flight Context (current `main` state)\n\n" + "\n\n".join(sections)
 
-    def _create_review_task_context(
+    async def _create_review_task_context(
         self,
         cycle_state: ReviewCycleState,
         column: WorkflowColumn,
@@ -3062,12 +3024,10 @@ class ReviewCycleExecutor:
         # Build a compact change manifest for issues workspace
         change_manifest = ""
         if cycle_state.workspace_type == 'issues':
-            from services.project_workspace import workspace_manager
-            # NOTE (#47): deliberately NOT epic_id-scoped -- see #46's gating decision
-            # (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES) and #48. Must diff the same
-            # directory the agent's own commits landed in, which is still the base
-            # clone today.
-            project_dir = workspace_manager.get_project_dir(cycle_state.project_name)
+            # Must diff the SAME directory the agent's own commits landed in --
+            # the epic worktree the maker's dispatch resolved (issue #123), not
+            # an independent resolution.
+            project_dir = await self._resolve_project_dir_for_cycle(cycle_state)
 
             # Primary: changes since the HEAD snapshot taken just before the maker ran
             base_commit = cycle_state.pre_maker_commit

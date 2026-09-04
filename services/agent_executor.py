@@ -1659,18 +1659,28 @@ class AgentExecutor:
         from services.project_workspace import workspace_manager
 
         try:
-            # Resolve the SAME directory the agent actually ran in (issue #46):
-            # if this task resolved an epic worktree, task_context carries epic_id/
-            # branch_name and get_project_dir() idempotently returns the existing
-            # worktree (no git calls on a cache hit) rather than the shared base
-            # clone. Checking the base clone here while the agent actually wrote to
-            # an isolated worktree would find nothing dirty and silently skip real
-            # uncommitted work.
-            project_dir = str(workspace_manager.get_project_dir(
-                project_name,
-                epic_id=task_context.get('epic_id'),
-                branch_name=task_context.get('branch_name'),
-            ))
+            # Resolve the SAME directory the agent actually ran in. Read it
+            # straight off task_context['project_dir'] -- set by execute_agent()'s
+            # epic-resolution block (PipelineRunManager.resolve_workspace(), issue
+            # #122) and/or by workspace_context.prepare_execution()'s prep_result
+            # -- rather than independently re-deriving it via get_project_dir(
+            # epic_id=...) (issue #123, WI-D of #119): the latter reaches the same
+            # directory today (get_or_create_epic_worktree() is idempotent), but
+            # is a second, divergence-prone resolution path for a value already
+            # known. Falls back to epic_id/branch_name-based resolution only when
+            # project_dir was never set on task_context (e.g. a 'discussions'
+            # dispatch, or a genuinely unresolved workspace) -- checking the base
+            # clone there while the agent actually wrote to an isolated worktree
+            # would find nothing dirty and silently skip real uncommitted work.
+            existing_project_dir = task_context.get('project_dir')
+            if existing_project_dir:
+                project_dir = str(existing_project_dir)
+            else:
+                project_dir = str(workspace_manager.get_project_dir(
+                    project_name,
+                    epic_id=task_context.get('epic_id'),
+                    branch_name=task_context.get('branch_name'),
+                ))
             issue_number = task_context.get('issue_number')
 
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")

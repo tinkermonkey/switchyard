@@ -1111,14 +1111,14 @@ class FeatureBranchManager:
         import subprocess
         from services.git_workflow_manager import git_workflow_manager
 
-        # NOTE (#49): all checkout_branch() calls in this method are base-clone-
-        # scoped -- project_dir is the SHARED base clone for 'issues'/'hybrid'
-        # workspace types today (EPIC_WORKTREE_SAFE_WORKSPACE_TYPES in
-        # agent_executor.py gates worktree resolution to 'discussions' only,
-        # which never reaches this method). checkout_branch()'s stash/dirty/
-        # tracking-repair logic stays load-bearing here until
-        # prepare_feature_branch() (this method's only caller) is migrated to
-        # the epic worktree model -- see #46/#47/#48; not yet scheduled.
+        # NOTE (updated for #122/#123, #119): all checkout_branch() calls in this
+        # method are base-clone-scoped -- project_dir is whatever the caller
+        # passes, and this method's only caller, prepare_feature_branch(), has
+        # no production callers left as of #122/#123 ('issues'/'hybrid' dispatch
+        # migrated to resolve_workspace()/get_or_create_epic_worktree()
+        # instead). checkout_branch()'s stash/dirty/tracking-repair logic stays
+        # load-bearing here for whichever future caller reaches
+        # prepare_feature_branch() against the shared base clone.
         # Ensure we're on main and up to date
         await git_workflow_manager.checkout_branch(project_dir, "main")
         pull_success = await git_workflow_manager.pull_branch(project_dir)
@@ -1176,16 +1176,14 @@ class FeatureBranchManager:
 
         Raises MergeConflictError if conflicts detected
 
-        NOTE (#49): this method's only two callers are both inside
-        prepare_feature_branch(), which runs against the SHARED base clone for
-        'issues'/'hybrid' workspace types today (see the
-        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate in agent_executor.py --
-        'discussions' is the only worktree-isolated workspace type, and it is
-        git-free, so it never reaches this method). GitWorkflowManager.
-        pull_rebase()'s push-then-reset defensive logic therefore remains
-        genuinely necessary here; do not remove this call. Retiring it is
-        conditional on prepare_feature_branch() being migrated to the epic
-        worktree model -- see #46/#47/#48; not yet scheduled.
+        NOTE (updated for #122/#123, #119): this method's only two callers are
+        both inside prepare_feature_branch(), which runs against the SHARED base
+        clone whenever it is reached -- but has no production callers left as of
+        #122/#123 ('issues'/'hybrid' dispatch migrated to resolve_workspace()/
+        get_or_create_epic_worktree() instead). GitWorkflowManager.
+        pull_rebase()'s push-then-reset defensive logic remains load-bearing for
+        whichever future caller reaches prepare_feature_branch(); do not remove
+        this call.
         """
         from services.git_workflow_manager import git_workflow_manager
 

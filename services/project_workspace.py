@@ -595,19 +595,23 @@ class ProjectWorkspaceManager:
         `git worktree add` unconditionally refuses to check a branch out into a
         NEW worktree if that same branch is already checked out ANYWHERE else --
         including the primary checkout (git counts it as worktree #0). Ordinary
-        ('issues'-workspace) dispatch checks an epic's shared branch out directly
-        on this same base clone (FeatureBranchManager.prepare_feature_branch,
-        deliberately not worktree-isolated -- see agent_executor.py's
-        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist comment), and _update_repository
-        (this class's startup sync) deliberately never resets the base clone back
-        to default_branch afterward ("agents always prepare the correct branch when
-        they launch"). Once nothing else ever moves it off, EVERY subsequent
-        `worktree add` for that same branch is doomed -- not a rare race, but a
-        deterministic, permanent failure (confirmed live: one project's repair
-        cycle failed this way every hour for 10+ consecutive hours). This call is
-        what makes that safe: freeing the branch here, once, before the epic's
-        worktree is first created, so the worktree (not the base clone) ends up
-        holding it from then on.
+        ('issues'/'hybrid') dispatch no longer independently checks an epic's
+        branch out on this base clone (that used to be
+        FeatureBranchManager.prepare_feature_branch(); #122/#123 migrated
+        'issues'/'hybrid' dispatch to resolve_workspace()/
+        get_or_create_epic_worktree() instead, so this specific collision source
+        is gone), but _update_repository (this class's startup sync)
+        deliberately never resets the base clone back to default_branch on its
+        own, and other stray/leftover local state (an orchestrator restart
+        mid-checkout, a manual debugging session, an older worktree that was
+        never cleaned up) can still leave the base clone sitting on a branch a
+        worktree now needs. When it does, EVERY subsequent `worktree add` for
+        that same branch is doomed -- not a rare race, but a deterministic,
+        permanent failure (confirmed live: one project's repair cycle failed
+        this way every hour for 10+ consecutive hours, before that specific
+        collision source was fixed). This call is what makes that safe: freeing
+        the branch here, once, before the epic's worktree is first created, so
+        the worktree (not the base clone) ends up holding it from then on.
 
         Safe by construction, not by assumption -- but "by construction" here means
         an EXPLICIT `git status --porcelain` guard, not relying on `git checkout`'s

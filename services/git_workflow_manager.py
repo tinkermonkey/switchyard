@@ -538,27 +538,22 @@ class GitWorkflowManager:
     async def checkout_branch(self, project_dir: str, branch_name: str) -> bool:
         """Checkout a git branch, handling dirty working directory
 
-        NOTE (#49, confirming #46/#47/#48's finding still holds): under the
-        (not-yet-operative) epic-worktree model, `git worktree add -b` already
+        NOTE (updated for #122/#123, #119): under the epic-worktree model now in
+        effect for 'issues'/'hybrid' pipeline runs, `git worktree add -b` already
         performs the checkout, making this stash-if-dirty / branch-doesn't-
         exist-locally / discard-and-reset defensive logic dead weight for a
-        worktree-backed path. But today `EPIC_WORKTREE_SAFE_WORKSPACE_TYPES` in
-        services/agent_executor.py gates worktree resolution to the
-        'discussions' workspace type only -- and DiscussionsWorkspaceContext is
-        git-free (supports_git_operations=False), so it never calls this method
-        at all. Every real call site -- FeatureBranchManager's
-        create_branch_from_main/detect_and_clean_invalid_branches, its
-        git_checkout() wrapper (called 4x inside prepare_feature_branch()), and
-        review_cycle.py's maker-revision branch switches (reachable via
-        cycle_state.workspace_type == 'issues'; prepare_feature_branch() itself
-        is also reachable via 'hybrid', through HybridWorkspaceContext) --
-        still operates on the single SHARED base clone, where a previous
-        (possibly unrelated-epic) task's dirty/stale local state is a real,
-        ongoing risk this logic is the only thing guarding against. Do
-        NOT remove or weaken any of it until FeatureBranchManager's
-        prepare_feature_branch()/finalize_feature_branch_work() are migrated to
-        the epic worktree model (tracked as a dependency of #49 on #46/#47/#48;
-        not yet scheduled).
+        worktree-backed path -- and review_cycle.py no longer calls this method
+        at all (issue #123 removed its two call sites; the epic worktree
+        resolve_workspace() returns is already on the right branch by
+        construction). The remaining call sites -- FeatureBranchManager's
+        create_branch_from_main/detect_and_clean_invalid_branches, and its
+        git_checkout() wrapper inside prepare_feature_branch() -- still operate
+        on the single SHARED base clone; prepare_feature_branch() itself
+        currently has no production callers left ('issues'/'hybrid' dispatch
+        migrated to resolve_workspace()/get_or_create_epic_worktree() instead,
+        #122/#123), but this stash/dirty-state defensive logic must stay in
+        place for whichever of these methods a future caller does reach against
+        the shared base clone.
         """
         try:
             # Check for uncommitted changes
@@ -772,22 +767,19 @@ class GitWorkflowManager:
         """
         Sync the workspace to the remote branch state via fetch + push-then-reset.
 
-        NOTE (#49, confirming #46/#47/#48's finding still holds): this method
-        exists to cope with a SHARED checkout accumulating a previous agent's
-        uncommitted/unpushed local state before the next agent's run -- see the
-        rest of this docstring. Under the (not-yet-operative) epic-worktree
-        model, each epic would get its own fresh worktree reused only by that
-        epic's own tasks, and this coping logic would become unnecessary. That
-        model is NOT yet operative for 'issues'/'hybrid' workspace types today:
-        `EPIC_WORKTREE_SAFE_WORKSPACE_TYPES` in services/agent_executor.py
-        gates worktree resolution to 'discussions' only (which is git-free and
-        never calls this method), while FeatureBranchManager.
-        prepare_feature_branch() -- the sole real caller, via git_pull_rebase()
-        -- still runs against the single shared base clone, where sequential
-        unrelated epics' tasks genuinely can leave exactly the leftover state
-        this method defends against. Do NOT retire this method until that
-        migration lands (tracked as a dependency of #49 on #46/#47/#48; not
-        yet scheduled).
+        NOTE (updated for #122/#123, #119): this method exists to cope with a
+        SHARED checkout accumulating a previous agent's uncommitted/unpushed
+        local state before the next agent's run -- see the rest of this
+        docstring. Under the epic-worktree model now in effect for 'issues'/
+        'hybrid' workspace types (resolve_workspace()/
+        get_or_create_epic_worktree(), #120/#122), each epic gets its own fresh
+        worktree reused only by that epic's own tasks, and this coping logic is
+        unnecessary there. Its sole real caller remains FeatureBranchManager.
+        prepare_feature_branch() (via git_pull_rebase()), which currently has no
+        production callers left -- 'issues'/'hybrid' dispatch migrated to
+        resolve_workspace() instead (#122/#123). Do NOT retire this method:
+        it must stay in place for whichever future caller reaches
+        prepare_feature_branch() against the shared base clone.
 
         Replaces the previous `git pull --rebase` approach, which could produce
         "both added" merge conflicts when the shared workspace held local commits

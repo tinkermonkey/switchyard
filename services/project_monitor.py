@@ -5121,21 +5121,18 @@ _Review cycle initiated by Switchyard_
                         from services.git_workflow_manager import git_workflow_manager
                         from services.project_workspace import workspace_manager
 
-                        # INTENTIONALLY base-clone-scoped, not migrated to
-                        # epic-worktree resolution (#48). create_or_update_pr()
-                        # itself is checkout-free (it only runs `gh pr create
-                        # --head <branch>` with this dir as cwd, referencing the
-                        # already-pushed remote branch by name -- no local checkout
-                        # of that branch is required), but this call only ever
-                        # fires for pipeline.workspace == 'issues', which
-                        # agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
-                        # gate excludes from epic-worktree resolution (#46): for
-                        # 'issues', FeatureBranchManager.prepare_feature_branch()
-                        # still independently resolves and checks out its own
-                        # branch on this same base clone elsewhere in this
-                        # dispatch. Scoping just this read to an epic worktree
-                        # would be inconsistent with that -- and gains nothing,
-                        # since gh doesn't need local branch content anyway.
+                        # INTENTIONALLY base-clone-scoped (audited, issue #123):
+                        # create_or_update_pr() itself is checkout-free (it only
+                        # runs `gh pr create --head <branch>` with this dir as
+                        # cwd, referencing the already-pushed remote branch by
+                        # name -- no local checkout of that branch, or any
+                        # particular directory at all, is required). Any git repo
+                        # for this project pointed at the right GitHub remote
+                        # works identically here, so there is nothing to gain
+                        # from threading the resolved epic worktree through to
+                        # this one `gh` invocation -- unlike this file's git-
+                        # mutating call sites (repair-cycle dispatch, #121),
+                        # which DO now read pipeline_run.project_dir.
                         project_dir = workspace_manager.get_project_dir(project_name)
 
                         pr_result = loop.run_until_complete(
@@ -5630,16 +5627,23 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         workflow_template,
         agent_name: str,
         pipeline_run_id: Optional[str] = None,
-        epic_id: Optional[str] = None,
-        epic_branch_name: Optional[str] = None
+        project_dir: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
-        
+
         Runs in background thread, waits for container to finish, then:
         - Posts summary comment
         - Auto-advances if successful
         - Records execution outcome
+
+        Args:
+            project_dir: The SAME directory the repair-cycle container actually
+                mounted and worked in (pipeline_run.project_dir, resolved by
+                resolve_workspace() before the container was launched) -- passed
+                straight through to commit_agent_changes() below rather than
+                that method re-deriving it independently via epic_id/branch_name
+                (issue #123, WI-D of #119).
         """
         import threading
         import subprocess
@@ -5902,10 +5906,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 project=project_name,
                                 agent='repair_cycle',
                                 task_id=f'repair_cycle_{issue_number}',
+                                project_dir=project_dir,
                                 issue_number=issue_number,
                                 custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
-                                epic_id=epic_id,
-                                branch_name=epic_branch_name
                             )
                         )
                         
@@ -7261,8 +7264,7 @@ _Repair cycle initiated by Switchyard_
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
                 pipeline_run_id=pipeline_run.id,
-                epic_id=epic_id,
-                epic_branch_name=branch_name
+                project_dir=project_dir
             )
 
             return stage_config.default_agent
