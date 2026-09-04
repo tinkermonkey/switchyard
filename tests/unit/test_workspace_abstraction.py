@@ -83,48 +83,74 @@ class TestIssuesWorkspaceContext:
     """Test Issues workspace context"""
 
     @pytest.mark.asyncio
-    async def test_prepare_execution_creates_branch(self):
-        """Issues workspace should prepare feature branch"""
+    async def test_prepare_execution_resolves_workspace_via_pipeline_run(self):
+        """Issues workspace should resolve its branch/worktree via the
+        centralized PipelineRunManager.resolve_workspace() (#122), against
+        the pipeline_run it was constructed with -- not its own independent
+        FeatureBranchManager.prepare_feature_branch() checkout on the shared
+        base clone (the pre-#122 behavior this replaced)."""
         mock_gh = MagicMock()
+        mock_pipeline_run = MagicMock()
+        mock_pipeline_run.id = 'run-1'
         context = IssuesWorkspaceContext(
             project='test-project',
             issue_number=123,
             task_context={'issue_title': 'Test feature'},
-            github_integration=mock_gh
+            github_integration=mock_gh,
+            pipeline_run=mock_pipeline_run
         )
 
-        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('services.project_workspace.workspace_manager') as mock_wm:
+        async def fake_resolve_workspace(pipeline_run, github, workspace_type):
+            pipeline_run.branch_name = 'feature/issue-123-test'
+            pipeline_run.project_dir = '/workspace/.orchestrator/worktrees/test-project/42'
+            return pipeline_run
 
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                return_value='feature/issue-123-test'
-            )
-            mock_wm.get_project_dir.return_value = Path('/workspace/test-project')
+        mock_prm = MagicMock()
+        mock_prm.resolve_workspace = AsyncMock(side_effect=fake_resolve_workspace)
 
+        with patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm):
             result = await context.prepare_execution()
 
-            # Verify branch was prepared
-            mock_fbm.prepare_feature_branch.assert_called_once_with(
-                project='test-project',
-                issue_number=123,
-                github_integration=mock_gh,
-                issue_title='Test feature'
-            )
+        # Verify resolution was delegated to the centralized resolver
+        mock_prm.resolve_workspace.assert_called_once_with(mock_pipeline_run, mock_gh, 'issues')
 
-            # Verify result
-            assert result['branch_name'] == 'feature/issue-123-test'
-            assert '/workspace/test-project' in result['work_dir']
-            assert context.branch_name == 'feature/issue-123-test'
+        # Verify result
+        assert result['branch_name'] == 'feature/issue-123-test'
+        assert result['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+        assert context.branch_name == 'feature/issue-123-test'
 
     @pytest.mark.asyncio
-    async def test_finalize_execution_commits_and_creates_pr(self):
-        """Issues workspace should finalize with git operations"""
+    async def test_prepare_execution_without_pipeline_run_raises(self):
+        """No pipeline_run to resolve against is a construction error, not a
+        silent fallback to the shared base clone -- #122 removed that
+        fallback path entirely (WorkspaceContextFactory.create() must be
+        given the dispatch's PipelineRun instance for 'issues')."""
         mock_gh = MagicMock()
         context = IssuesWorkspaceContext(
             project='test-project',
             issue_number=123,
             task_context={},
             github_integration=mock_gh
+        )
+
+        with pytest.raises(ValueError, match='pipeline_run'):
+            await context.prepare_execution()
+
+    @pytest.mark.asyncio
+    async def test_finalize_execution_commits_and_creates_pr(self):
+        """Issues workspace should finalize with git operations, committing from
+        the SAME resolved epic worktree prepare_execution() worked in -- not the
+        shared base clone (issue #122/WI-C review finding: finalize_feature_branch_work()
+        defaults to the base clone unless project_dir_override is passed)."""
+        mock_gh = MagicMock()
+        mock_pipeline_run = MagicMock()
+        mock_pipeline_run.project_dir = '/workspace/.orchestrator/worktrees/test-project/42'
+        context = IssuesWorkspaceContext(
+            project='test-project',
+            issue_number=123,
+            task_context={},
+            github_integration=mock_gh,
+            pipeline_run=mock_pipeline_run
         )
 
         with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm:
@@ -141,17 +167,45 @@ class TestIssuesWorkspaceContext:
                 commit_message='Test commit'
             )
 
-            # Verify finalization was called
+            # Verify finalization was called against the resolved epic worktree,
+            # not the shared base clone.
             mock_fbm.finalize_feature_branch_work.assert_called_once_with(
                 project='test-project',
                 issue_number=123,
                 commit_message='Test commit',
-                github_integration=mock_gh
+                github_integration=mock_gh,
+                project_dir_override='/workspace/.orchestrator/worktrees/test-project/42'
             )
 
             # Verify result
             assert result['success'] == True
             assert 'pr_url' in result
+
+    @pytest.mark.asyncio
+    async def test_finalize_execution_without_pipeline_run_raises(self):
+        """No pipeline_run on the context (shouldn't normally happen post-prepare_execution)
+        must fail loud, matching prepare_execution()'s guard -- code review finding, issue
+        #122: silently passing project_dir_override=None here would make
+        finalize_feature_branch_work() default to the shared base clone, exactly the
+        silent-wrong-directory bug class this migration exists to fix."""
+        mock_gh = MagicMock()
+        context = IssuesWorkspaceContext(
+            project='test-project',
+            issue_number=123,
+            task_context={},
+            github_integration=mock_gh
+        )
+
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm:
+            mock_fbm.finalize_feature_branch_work = AsyncMock()
+
+            with pytest.raises(ValueError, match="no resolved project_dir"):
+                await context.finalize_execution(
+                    result={'status': 'success'},
+                    commit_message='Test commit'
+                )
+
+            mock_fbm.finalize_feature_branch_work.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_post_output_to_issue(self):
@@ -378,8 +432,14 @@ class TestHybridWorkspaceContext:
 
     @pytest.mark.asyncio
     async def test_prepare_execution_issues_mode(self):
-        """Hybrid in issues mode should prepare branch"""
+        """Hybrid in issues mode should resolve its branch/worktree via the
+        centralized PipelineRunManager.resolve_workspace() (#122), same as
+        IssuesWorkspaceContext -- not its own independent FeatureBranchManager.
+        prepare_feature_branch() checkout on the shared base clone (the
+        pre-#122 behavior this replaced)."""
         mock_gh = MagicMock()
+        mock_pipeline_run = MagicMock()
+        mock_pipeline_run.id = 'run-1'
         context = HybridWorkspaceContext(
             project='test-project',
             issue_number=99,
@@ -387,22 +447,42 @@ class TestHybridWorkspaceContext:
                 'column': 'Development',
                 'issue_title': 'Test'
             },
+            github_integration=mock_gh,
+            pipeline_run=mock_pipeline_run
+        )
+
+        async def fake_resolve_workspace(pipeline_run, github, workspace_type):
+            pipeline_run.branch_name = 'feature/issue-99-test'
+            pipeline_run.project_dir = '/workspace/.orchestrator/worktrees/test-project/42'
+            return pipeline_run
+
+        mock_prm = MagicMock()
+        mock_prm.resolve_workspace = AsyncMock(side_effect=fake_resolve_workspace)
+
+        with patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm):
+            result = await context.prepare_execution()
+
+        mock_prm.resolve_workspace.assert_called_once_with(mock_pipeline_run, mock_gh, 'hybrid')
+
+        assert result['current_workspace'] == 'issues'
+        assert result['branch_name'] == 'feature/issue-99-test'
+        assert result['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+
+    @pytest.mark.asyncio
+    async def test_prepare_execution_issues_mode_without_pipeline_run_raises(self):
+        """No pipeline_run to resolve against is a construction error, not a
+        silent fallback to the shared base clone (#122 removed that fallback
+        path entirely)."""
+        mock_gh = MagicMock()
+        context = HybridWorkspaceContext(
+            project='test-project',
+            issue_number=99,
+            task_context={'column': 'Development'},
             github_integration=mock_gh
         )
 
-        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
-             patch('services.project_workspace.workspace_manager') as mock_wm:
-
-            mock_fbm.prepare_feature_branch = AsyncMock(
-                return_value='feature/issue-99-test'
-            )
-            mock_wm.get_project_dir.return_value = Path('/workspace/test-project')
-
-            result = await context.prepare_execution()
-
-            assert result['current_workspace'] == 'issues'
-            assert result['branch_name'] == 'feature/issue-99-test'
-            mock_fbm.prepare_feature_branch.assert_called_once()
+        with pytest.raises(ValueError, match='pipeline_run'):
+            await context.prepare_execution()
 
     @pytest.mark.asyncio
     async def test_supports_git_operations_varies_by_mode(self):

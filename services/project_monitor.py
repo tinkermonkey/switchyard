@@ -6951,7 +6951,6 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             )
 
             # Build context for stage execution
-            from services.project_workspace import workspace_manager
             from services.github_integration import GitHubIntegration
             from monitoring.observability import get_observability_manager
             import concurrent.futures
@@ -6981,37 +6980,36 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # pipeline_run first, and get_or_create_pipeline_run() above will
             # happily hand this method a run created by (or already active
             # from) any prior column. So yes, that scenario is genuinely
-            # reachable. It is NOT, however, a new failure mode introduced by
-            # this change: resolve_workspace() has exactly ONE production
-            # caller as of this method's fix (this one) -- `implementation`
-            # doesn't call it either -- so pipeline_run.branch_name/project_dir
-            # are unresolved on the FIRST repair-cycle dispatch for a run
-            # regardless of whether `implementation` ran first or was skipped
-            # entirely. resolve_workspace() is built for exactly this: it
-            # performs the resolution itself when unresolved (identical to
-            # what this method used to do inline), and no-ops when a prior
-            # call (a retried repair-cycle attempt against the same
-            # pipeline_run, or a future `implementation`-stage caller) already
-            # resolved it. It only fails loudly -- a ValueError that
+            # reachable. It is NOT, however, a failure mode: resolve_workspace()
+            # is built for exactly this -- it performs the resolution itself
+            # when unresolved (identical to what this method used to do
+            # inline), and no-ops when a prior call already resolved it. As of
+            # #122 (WI-C of #119), `implementation` DOES also call
+            # resolve_workspace() now (agent_executor.py's epic-resolution
+            # block, for ordinary 'issues'/'hybrid' dispatch) -- whichever
+            # stage reaches it first does the real resolution, and every
+            # subsequent call from either stage against the same pipeline_run
+            # (a retried repair-cycle attempt, `implementation` running before
+            # or after `testing`, ...) is a cheap idempotent no-op reading back
+            # the same answer. It only fails loudly -- a ValueError that
             # propagates out of this method to its own outer except block,
             # deliberately not caught here -- when there's genuinely no parent
             # epic to scope isolation by; that case must never be silently
             # improvised around.
-            if workspace_type == 'issues':
+            if workspace_type in ('issues', 'hybrid'):
                 # resolve_workspace() is scoped to 'issues'/'hybrid' (WI-A,
-                # #120's own docstring), but only call it here for 'issues'.
-                # agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate
-                # still excludes 'hybrid' from isolation on the ordinary-
-                # dispatch side (its own comment explains why: prepare_
-                # feature_branch() checks out the epic branch on the shared
-                # base clone there). Calling resolve_workspace() here for
-                # 'hybrid' today would create a real epic worktree the
-                # (still base-clone-only) 'implementation' stage for the same
-                # epic knows nothing about -- reintroducing, for 'hybrid'
-                # instead of 'issues', exactly the asymmetric-resolution
-                # collision #118/#119 exist to eliminate. Matches this
-                # method's pre-#121 behavior exactly, which also only ever
-                # resolved an epic worktree for workspace_type == 'issues'.
+                # #120's own docstring), and by #122 (WI-C of #119) ordinary
+                # dispatch's IssuesWorkspaceContext/HybridWorkspaceContext now
+                # resolve via this exact same resolver for both -- the
+                # asymmetry that used to justify restricting this call to
+                # 'issues' only (agent_executor.py's now-removed
+                # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate excluded 'hybrid'
+                # from isolation on the ordinary-dispatch side, because
+                # prepare_feature_branch() checked out the epic branch on the
+                # shared base clone there) is gone: both sides isolate 'hybrid'
+                # together now, so restricting it here would only reintroduce
+                # the same asymmetric-resolution collision #118/#119 exist to
+                # eliminate, just flipped onto 'hybrid' instead of 'issues'.
                 github = GitHubIntegration(
                     repo_owner=project_config.github['org'],
                     repo_name=repository
@@ -7071,14 +7069,19 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 branch_name = pipeline_run.branch_name
                 epic_id = pipeline_run.epic_id
             else:
-                # Preserve pre-#121 behavior for anything other than 'issues'
-                # (in practice, 'hybrid') exactly: shared base clone, no epic
-                # scoping. See the comment above -- this stays until a
-                # follow-up migrates ordinary 'hybrid' dispatch onto
-                # resolve_workspace() too, so both sides isolate together.
-                project_dir = str(workspace_manager.get_project_dir(project_name))
-                branch_name = None
-                epic_id = None
+                # Should be unreachable today: repair_cycle-type stages only exist
+                # under sdlc_execution, whose workspace is always 'issues' (per
+                # config/foundations/pipelines.yaml) -- 'hybrid' is schema-supported
+                # but not currently used by any shipped repair_cycle pipeline, and
+                # 'discussions' pipelines have no repair_cycle stage at all. Hard-fail
+                # with a clear diagnostic rather than an UnboundLocalError below if
+                # that assumption ever breaks (code review, issue #122).
+                raise ValueError(
+                    f"Repair cycle for {project_name}/#{issue_number} has "
+                    f"workspace_type={workspace_type!r}, which resolve_workspace() "
+                    "does not support (only 'issues'/'hybrid') -- refusing to guess "
+                    "a project_dir/branch_name/epic_id for it."
+                )
 
             stage_context = {
                 'project': project_name,

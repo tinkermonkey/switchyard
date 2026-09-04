@@ -204,12 +204,15 @@ class TestResolveWorkspaceIdempotent:
         assert second.project_dir == "/workspace/.orchestrator/worktrees/context-studio/42"
 
 
-class TestResolveWorkspaceHybridUsesLenientFallback:
+class TestResolveWorkspaceUsesLenientFallback:
     """
-    'hybrid', unlike 'issues', has no precedent guaranteeing a parent issue (a
-    directly-dispatched epic or standalone issue can legitimately have none) --
-    it must use resolve_epic_id()'s established lenient fallback, not the
-    'issues'-only hard-fail. Code-review finding from this item's own review pass.
+    Both 'issues' and 'hybrid' use resolve_epic_id()'s established lenient
+    fallback (the issue's own number when it has no parent) -- NOT a hard fail.
+    An earlier version of this method hard-failed for 'issues' specifically,
+    reasoning that sdlc_execution's sub-issues always have a parent by
+    construction -- true of sdlc_execution, but not of 'issues' as a workspace
+    type in general (environment_support also uses 'issues' for genuinely
+    standalone tickets). Code-review finding, issue #122's own review pass.
     """
 
     @pytest.mark.asyncio
@@ -235,6 +238,33 @@ class TestResolveWorkspaceHybridUsesLenientFallback:
 
         mock_epic_id.assert_called_once()
         mock_parent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_issues_also_falls_back_to_resolve_epic_id_for_a_standalone_ticket(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        """environment_support's standalone tickets (config/foundations/pipelines.yaml:
+        workspace: "issues", no parent by design) must resolve, not hard-fail."""
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import workspace_manager
+
+        with patch.object(feature_branch_manager, 'resolve_epic_id', new=AsyncMock(return_value="42")) as mock_epic_id, \
+             patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock()) as mock_parent, \
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name', return_value=None), \
+             patch.object(feature_branch_manager, 'create_feature_branch_name',
+                           return_value="feature/issue-42-feature"), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
+             patch.object(workspace_manager, '_current_worktree_branch',
+                           return_value="feature/issue-42-feature"):
+
+            result = await pipeline_run_manager.resolve_workspace(
+                pipeline_run, mock_github_integration, workspace_type='issues'
+            )
+
+        mock_epic_id.assert_called_once()
+        mock_parent.assert_not_called()
+        assert result.branch_name == "feature/issue-42-feature"
         assert result.branch_name == "feature/issue-42-feature"
 
 
@@ -258,33 +288,45 @@ class TestResolveWorkspaceScopeGuard:
         assert result.project_dir is None
 
 
-class TestResolveWorkspaceNoParentHardFails:
+class TestResolveWorkspaceNoParentUsesOwnNumber:
     """
-    Missing parent issue must hard-fail, matching project_monitor.py's
-    _resolve_epic_worktree_target() -- silently falling back to the sub-issue's
-    own number (resolve_epic_id()'s behavior, deliberately not used here) would
-    defeat cross-sub-issue isolation. Code-review finding from this item's own
-    review pass.
+    A genuinely standalone issue (resolve_epic_id() resolves to its own number,
+    not a parent) must NOT hard-fail -- see TestResolveWorkspaceUsesLenientFallback
+    above for why (issue #122's own review pass). This class covers the
+    end-to-end "own number becomes epic_id" case specifically, using the real
+    (unmocked) resolve_epic_id() -- only get_parent_issue() is mocked, at the
+    layer resolve_epic_id() itself calls.
     """
 
     @pytest.mark.asyncio
-    async def test_raises_value_error_when_no_parent_issue_found(
+    async def test_standalone_issue_resolves_using_its_own_number_as_epic_id(
         self, pipeline_run_manager, pipeline_run, mock_github_integration
     ):
         from services.feature_branch_manager import feature_branch_manager
         from services.project_workspace import workspace_manager
 
         with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=None)), \
-             patch.object(workspace_manager, 'get_or_create_epic_worktree') as mock_worktree:
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name', return_value=None) as mock_resolve_branch, \
+             patch.object(feature_branch_manager, 'create_feature_branch_name',
+                           return_value="feature/issue-42-standalone") as mock_create_name, \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/test-project/42") as mock_worktree, \
+             patch.object(workspace_manager, '_current_worktree_branch',
+                           return_value="feature/issue-42-standalone"):
 
-            with pytest.raises(ValueError, match="could not resolve a parent epic issue"):
-                await pipeline_run_manager.resolve_workspace(
-                    pipeline_run, mock_github_integration, workspace_type='issues'
-                )
+            result = await pipeline_run_manager.resolve_workspace(
+                pipeline_run, mock_github_integration, workspace_type='issues'
+            )
 
-        mock_worktree.assert_not_called()
-        assert pipeline_run.branch_name is None
-        assert pipeline_run.project_dir is None
+        # pipeline_run fixture's issue_number is 42 -- with no parent, epic_id
+        # resolves to the issue's own number.
+        mock_resolve_branch.assert_called_once_with("context-studio", "42")
+        mock_create_name.assert_called_once_with(42, "")
+        mock_worktree.assert_called_once_with(
+            "context-studio", "42", "feature/issue-42-standalone"
+        )
+        assert result.branch_name == "feature/issue-42-standalone"
+        assert result.project_dir == "/workspace/.orchestrator/worktrees/test-project/42"
 
 
 class TestResolveWorkspacePersistenceFailureReverts:

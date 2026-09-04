@@ -1970,14 +1970,24 @@ Waiting for human decision...
         project: str,
         issue_number: int,
         commit_message: str,
-        github_integration
+        github_integration,
+        project_dir_override: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Commit changes, push, update state, check completion
 
+        Args:
+            project_dir_override: Commit/push from this directory instead of the
+                shared base clone (services/pipeline_run.py's resolve_workspace(),
+                issue #122/WI-C -- when the caller's agent actually did its work in
+                an isolated epic worktree rather than the shared base clone, this
+                MUST be passed, or this method silently commits/pushes from the
+                wrong directory: none of the agent's real changes, and possibly on
+                whatever branch the base clone happens to be on at the time).
+
         Returns: dict with pr_url, all_complete, etc.
         """
-        project_dir = os.path.join(self.workspace_root, project)
+        project_dir = project_dir_override or os.path.join(self.workspace_root, project)
 
         feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
 

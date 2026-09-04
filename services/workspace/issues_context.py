@@ -21,9 +21,16 @@ class IssuesWorkspaceContext(WorkspaceContext):
     - Posts output to issue comments
     """
 
-    def __init__(self, project, issue_number, task_context, github_integration):
+    def __init__(self, project, issue_number, task_context, github_integration, pipeline_run=None):
         super().__init__(project, issue_number, task_context, github_integration)
         self.branch_name = None
+        # The dispatch's PipelineRun (#122) -- resolve_workspace() reads/writes
+        # branch_name/project_dir/epic_id directly onto this same instance, so
+        # prepare_execution()/get_working_directory() below need it in scope
+        # rather than resolving their own, independent branch (the pre-#122
+        # behavior this replaced: FeatureBranchManager.prepare_feature_branch(),
+        # checking out directly on the shared base clone).
+        self.pipeline_run = pipeline_run
 
     @property
     def supports_git_operations(self) -> bool:
@@ -35,29 +42,48 @@ class IssuesWorkspaceContext(WorkspaceContext):
 
     async def prepare_execution(self) -> Dict[str, Any]:
         """
-        Prepare feature branch and checkout for development work.
+        Resolve this issue's epic branch and isolated git worktree.
+
+        Reads (and, on first call for this run, resolves) branch_name/project_dir
+        via PipelineRunManager.resolve_workspace() against self.pipeline_run --
+        the same centralized resolver repair-cycle uses for the same epic (#122,
+        WI-C of #119), instead of independently resolving and checking out a
+        branch on the shared base clone via FeatureBranchManager.
+        prepare_feature_branch() (the pre-#122 behavior this replaced). Idempotent:
+        a second call against an already-resolved pipeline_run is a cheap no-op.
 
         Returns:
             Dict containing:
-                - branch_name: Name of the prepared feature branch
-                - work_dir: Working directory path
-        """
-        from services.feature_branch_manager import feature_branch_manager
+                - branch_name: Name of the resolved feature branch
+                - work_dir: Working directory path (the epic's isolated worktree)
 
-        issue_title = self.task_context.get('issue_title', '')
+        Raises:
+            ValueError: No pipeline_run was supplied to construct this context, or
+                (propagated from resolve_workspace()) no resolvable parent epic.
+            RuntimeError: (propagated from resolve_workspace()) the worktree add
+                failed.
+        """
+        if self.pipeline_run is None:
+            raise ValueError(
+                f"IssuesWorkspaceContext for {self.project}/#{self.issue_number} has no "
+                "pipeline_run to resolve a workspace against -- WorkspaceContextFactory."
+                "create() must be given the dispatch's PipelineRun instance for the "
+                "'issues' workspace type (#122)."
+            )
+
+        from services.pipeline_run import get_pipeline_run_manager
 
         self._logger.info(
-            f"Preparing feature branch for issue #{self.issue_number} in project {self.project}"
+            f"Resolving workspace for issue #{self.issue_number} in project {self.project} "
+            f"via pipeline run {self.pipeline_run.id}"
         )
 
-        self.branch_name = await feature_branch_manager.prepare_feature_branch(
-            project=self.project,
-            issue_number=self.issue_number,
-            github_integration=self.github,
-            issue_title=issue_title
+        self.pipeline_run = await get_pipeline_run_manager().resolve_workspace(
+            self.pipeline_run, self.github, self.workspace_type
         )
+        self.branch_name = self.pipeline_run.branch_name
 
-        self._logger.info(f"Prepared feature branch: {self.branch_name}")
+        self._logger.info(f"Resolved feature branch: {self.branch_name}")
 
         return {
             'branch_name': self.branch_name,
@@ -89,11 +115,27 @@ class IssuesWorkspaceContext(WorkspaceContext):
             f"Finalizing feature branch work for issue #{self.issue_number}"
         )
 
+        if self.pipeline_run is None or not self.pipeline_run.project_dir:
+            # Fail loud, matching prepare_execution()'s guard above -- silently
+            # passing None here would make finalize_feature_branch_work() default
+            # to the shared base clone (code review finding, issue #122), exactly
+            # the silent-wrong-directory bug class this migration exists to fix.
+            raise ValueError(
+                f"Cannot finalize issue #{self.issue_number} ({self.project}) -- no "
+                "resolved project_dir. prepare_execution() must run (and succeed) "
+                "before finalize_execution() is called."
+            )
+
         finalize_result = await feature_branch_manager.finalize_feature_branch_work(
             project=self.project,
             issue_number=self.issue_number,
             commit_message=commit_message,
-            github_integration=self.github
+            github_integration=self.github,
+            # Commit/push from the SAME isolated epic worktree prepare_execution()
+            # resolved and the agent actually worked in (issue #122/WI-C review
+            # finding) -- without this, finalize_feature_branch_work() defaults to
+            # the shared base clone, which has none of the agent's real changes.
+            project_dir_override=self.pipeline_run.project_dir
         )
 
         if finalize_result.get('success'):
@@ -137,29 +179,23 @@ class IssuesWorkspaceContext(WorkspaceContext):
 
     def get_working_directory(self) -> Path:
         """
-        Get project git repository directory.
+        Get the epic's isolated git worktree directory.
 
         Returns:
-            Path to the project's git repository
+            Path to the epic worktree resolved onto self.pipeline_run by
+            resolve_workspace() -- see prepare_execution() above (#122, WI-C of
+            #119). Only valid once prepare_execution() has run.
         """
-        # INTENTIONALLY base-clone-scoped, NOT worktree-aware (#48). This is one of
-        # the two sites #46's review flagged as needing the full rearchitecture:
-        # FeatureBranchManager.prepare_feature_branch() (called from
-        # prepare_execution() elsewhere in this class) independently resolves its
-        # OWN branch via confidence-matching over related branches -- which can
-        # legitimately disagree with the epic-worktree branch resolution used by
-        # get_project_dir(epic_id=...) -- and checks it out directly on the shared
-        # base clone. If an epic worktree already held that same branch checked
-        # out, git would refuse the base-clone checkout and crash the execution
-        # (see agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate, which
-        # excludes 'issues' for exactly this reason). Reconciling the two
-        # independent branch-resolution paths, or migrating prepare_feature_branch/
-        # finalize_feature_branch_work to operate on the epic worktree instead of
-        # the base clone, is real, substantial work #48 explicitly scoped OUT --
-        # left for a dedicated fast-follow. Do not migrate this call without that
-        # rearchitecture landing first.
-        from services.project_workspace import workspace_manager
-        return workspace_manager.get_project_dir(self.project)
+        if self.pipeline_run is None or not self.pipeline_run.project_dir:
+            # Fail with a clear diagnostic, not Path(None)'s opaque TypeError
+            # (code review finding, issue #122) -- this means prepare_execution()
+            # either wasn't called first, or didn't successfully resolve.
+            raise ValueError(
+                f"IssuesWorkspaceContext for {self.project}/#{self.issue_number} has no "
+                "resolved project_dir -- prepare_execution() must run (and succeed) "
+                "before get_working_directory() is called."
+            )
+        return Path(self.pipeline_run.project_dir)
 
     async def get_execution_metadata(self) -> Dict[str, Any]:
         """

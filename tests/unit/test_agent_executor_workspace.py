@@ -534,7 +534,18 @@ class TestExecuteAgentEpicResolution:
         before the per-project opt-in flag (#52) was added -- that flag is its
         own, separately-tested dimension (see TestExecuteAgentEpicResolution's
         opt-in-flag tests further down), not something every workspace-type
-        test needs to also vary.
+        test needs to also vary. It is now relevant to 'discussions' only
+        (#122, WI-C of #119): 'issues'/'hybrid' resolution is unconditional.
+
+        Two independent resolution chains are mocked here, matching
+        agent_executor.py's two branches:
+        - 'discussions': feature_branch_manager.resolve_epic_id()/
+          resolve_epic_branch_name()/create_feature_branch_name() (unchanged
+          by #122).
+        - 'issues'/'hybrid': PipelineRunManager.get_pipeline_run()/
+          resolve_workspace(), mocked below via a minimal fake PipelineRun
+          that resolve_workspace() mutates in place and returns, mirroring
+          its documented contract.
         """
         captured = {}
 
@@ -548,6 +559,29 @@ class TestExecuteAgentEpicResolution:
         mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
         mock_project_config.worktree_isolation_enabled = worktree_isolation_enabled
 
+        class FakePipelineRun:
+            """Minimal stand-in for services.pipeline_run.PipelineRun -- only
+            the fields agent_executor.py's epic-resolution block reads."""
+            def __init__(self, issue_number):
+                self.id = f'run-{issue_number}'
+                self.issue_number = issue_number
+                self.epic_id = None
+                self.branch_name = None
+                self.project_dir = None
+
+        fake_pipeline_run = FakePipelineRun(task_context.get('issue_number'))
+
+        async def fake_resolve_workspace(pipeline_run, github, workspace_type):
+            resolved_epic_id = str(parent_issue) if parent_issue else str(pipeline_run.issue_number)
+            pipeline_run.epic_id = resolved_epic_id
+            pipeline_run.branch_name = 'feature/issue-42-shared'
+            pipeline_run.project_dir = f'/workspace/.orchestrator/worktrees/test-project/{resolved_epic_id}'
+            return pipeline_run
+
+        mock_prm = MagicMock()
+        mock_prm.get_pipeline_run.return_value = fake_pipeline_run
+        mock_prm.resolve_workspace = AsyncMock(side_effect=fake_resolve_workspace)
+
         with patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor, '_build_execution_context',
                           side_effect=fake_build_execution_context), \
@@ -558,6 +592,7 @@ class TestExecuteAgentEpicResolution:
              patch.object(agent_executor.obs, 'emit_agent_completed'), \
              patch.object(agent_executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
              patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm), \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',
                    new_callable=AsyncMock) as mock_resolve_epic_id, \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_branch_name',
@@ -596,32 +631,44 @@ class TestExecuteAgentEpicResolution:
         return captured
 
     @pytest.mark.asyncio
-    async def test_issues_workspace_type_does_not_resolve_epic_id(self, agent_executor):
-        """A sub-issue dispatch through the DEFAULT 'issues' workspace type must NOT
-        resolve/pass an epic_id -- IssuesWorkspaceContext.prepare_execution() ->
-        FeatureBranchManager.prepare_feature_branch() still checks out its own
-        (independently-resolved) branch directly on the shared base clone, which
-        would conflict with a worktree already holding that same branch checked
-        out. Epic worktree isolation for this workspace type is deferred to #48;
-        until then it must keep exactly its pre-migration base-clone behavior."""
-        task_context = {'issue_number': 100, 'workspace_type': 'issues'}
+    async def test_issues_workspace_type_resolves_epic_id_via_resolve_workspace(self, agent_executor):
+        """#122 (WI-C of #119): a sub-issue dispatch through the 'issues' workspace
+        type now resolves its epic branch/worktree via the SAME centralized
+        PipelineRunManager.resolve_workspace() repair-cycle uses for the same
+        epic -- IssuesWorkspaceContext no longer independently resolves and
+        checks out its own branch on the shared base clone (FeatureBranchManager.
+        prepare_feature_branch(), the pre-#122 behavior this replaced), so there
+        is nothing left for this early resolution to collide with. Unconditional,
+        unlike 'discussions' below (#52's per-project opt-in flag never applied
+        to 'issues'/'hybrid')."""
+        task_context = {
+            'issue_number': 100,
+            'workspace_type': 'issues',
+            'pipeline_run_id': 'run-100',
+        }
 
         captured = await self._run(agent_executor, task_context, parent_issue=42)
 
-        assert captured['epic_id'] is None
-        assert 'epic_id' not in task_context
+        assert captured['epic_id'] == '42'
+        assert task_context['epic_id'] == '42'
+        assert task_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
 
     @pytest.mark.asyncio
-    async def test_hybrid_workspace_type_does_not_resolve_epic_id(self, agent_executor):
-        """HybridWorkspaceContext also calls prepare_feature_branch() on the base
-        clone (same conflict risk as 'issues') -- must be excluded from epic
-        worktree resolution for the same reason."""
-        task_context = {'issue_number': 150, 'workspace_type': 'hybrid'}
+    async def test_hybrid_workspace_type_resolves_epic_id_via_resolve_workspace(self, agent_executor):
+        """HybridWorkspaceContext also now reads its branch/worktree off the
+        pipeline run resolve_workspace() resolves here -- same reasoning as
+        'issues' above (#122)."""
+        task_context = {
+            'issue_number': 150,
+            'workspace_type': 'hybrid',
+            'pipeline_run_id': 'run-150',
+        }
 
         captured = await self._run(agent_executor, task_context, parent_issue=42)
 
-        assert captured['epic_id'] is None
-        assert 'epic_id' not in task_context
+        assert captured['epic_id'] == '42'
+        assert task_context['epic_id'] == '42'
+        assert task_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
 
     @pytest.mark.asyncio
     async def test_planning_design_style_dispatch_falls_back_to_its_own_number(self, agent_executor):

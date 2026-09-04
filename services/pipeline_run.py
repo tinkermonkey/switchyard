@@ -418,14 +418,16 @@ class PipelineRunManager:
         Resolve (and persist) the git branch and isolated epic worktree this
         pipeline run's work should land on.
 
-        Purely additive infrastructure (issue #120, WI-A of #119): builds the single
-        canonical branch/worktree decision meant to eventually replace the two
-        independent algorithms in use today -- FeatureBranchManager.
+        Introduced as purely additive infrastructure (issue #120, WI-A of #119):
+        the single canonical branch/worktree decision meant to replace the two
+        independent algorithms that used to exist -- FeatureBranchManager.
         find_related_branches() (ordinary 'issues'/'hybrid' dispatch's
         prepare_feature_branch(), checking out on the shared base clone) and
         resolve_epic_branch_name()/get_or_create_epic_worktree() (the repair-cycle
-        path in project_monitor.py). Not yet called from any production dispatch
-        path -- see #119 for the follow-up work items that wire it in.
+        path in project_monitor.py). Both are now wired to this method instead:
+        project_monitor.py's repair-cycle dispatch (#121, WI-B) and ordinary
+        'issues'/'hybrid' dispatch via IssuesWorkspaceContext/HybridWorkspaceContext
+        (#122, WI-C) -- the latter no longer calls prepare_feature_branch() at all.
 
         Scoped to 'issues'/'hybrid' workspace types only; any other workspace_type
         is a no-op that returns pipeline_run unchanged ('discussions' is git-free).
@@ -435,17 +437,21 @@ class PipelineRunManager:
         returns immediately without touching git or GitHub again.
 
         Resolution order:
-        1. Resolve the epic id. For workspace_type == 'issues', matches
-           project_monitor.py's _resolve_epic_worktree_target() exactly, including its
-           hard-failure behavior: sdlc_execution's 'issues' sub-issues always have a
-           parent epic by construction, so a missing parent is a hard ValueError (NOT
-           resolve_epic_id()'s lenient fallback to the issue's own number -- silently
-           scoping isolation to the wrong number would defeat the whole point). For
-           workspace_type == 'hybrid', there is no equivalent precedent guaranteeing a
-           parent (e.g. a directly-dispatched epic or a standalone issue can legitimately
-           have none), so this uses FeatureBranchManager.resolve_epic_id()'s existing,
-           already-established fallback instead of inventing a hard-fail this workspace
-           type has never required.
+        1. Resolve the epic id via FeatureBranchManager.resolve_epic_id() -- the
+           issue's parent, or its own number when it has no parent (safe: a
+           standalone issue has no siblings to isolate FROM, so scoping a worktree
+           by its own number is simply correct, not a degradation). Uniform across
+           'issues' and 'hybrid' (code review correction, issue #122): an earlier
+           version of this method hard-failed on no resolvable parent for
+           workspace_type == 'issues' specifically, reasoning that sdlc_execution's
+           sub-issues always have a parent epic by construction -- true of
+           sdlc_execution, but NOT of 'issues' as a workspace type in general:
+           environment_support also declares workspace: "issues"
+           (config/foundations/pipelines.yaml) for genuinely standalone tickets that
+           are never sub-issues of anything. That wrongly-generalized invariant broke
+           every environment_support dispatch once ordinary dispatch started calling
+           this method unconditionally (#122) rather than only repair-cycle's
+           always-sdlc_execution call site (#121).
         2. Look up an already-established branch for that epic via
            resolve_epic_branch_name() (cache, then a git branch listing keyed on
            the epic id) -- covers the exact-issue, parent-issue, and cached match
@@ -471,13 +477,9 @@ class PipelineRunManager:
             'hybrid' runs (unchanged for any other workspace_type).
 
         Raises:
-            ValueError: For workspace_type == 'issues', no parent epic issue could be
-                resolved (see step 1 above) -- this is deliberately ambiguous between
-                "genuinely no parent" and "the GitHub API call failed/errored", since
-                FeatureBranchManager.get_parent_issue() itself doesn't distinguish those
-                cases; check its own logs for the underlying cause before assuming this
-                issue truly has no parent. Also raised if the project has no base clone
-                to source the worktree from.
+            ValueError: The project has no base clone to source the worktree from
+                (resolve_epic_id() itself never raises -- it always resolves to
+                either the real parent or the issue's own number).
             RuntimeError: The underlying git worktree add command failed.
 
         This method deliberately does not swallow either exception itself -- a caller
@@ -491,7 +493,9 @@ class PipelineRunManager:
         count_consecutive_failures()/MAX_CONSECUTIVE_DISPATCH_FAILURES), rather than
         special-casing errors that merely look permanent for immediate termination -- is
         a correct, intended way to satisfy this contract, and is what this method's
-        current production caller does.
+        production callers (project_monitor.py's repair-cycle dispatch, and
+        agent_executor.py's epic-resolution block for ordinary 'issues'/'hybrid'
+        dispatch) do.
         """
         if workspace_type not in ('issues', 'hybrid'):
             return pipeline_run
@@ -507,33 +511,29 @@ class PipelineRunManager:
         from services.feature_branch_manager import feature_branch_manager
         from services.project_workspace import workspace_manager
 
-        if workspace_type == 'issues':
-            # sdlc_execution's 'issues' sub-issues always have a parent epic by
-            # construction -- matches _resolve_epic_worktree_target()'s identical
-            # hard-fail for exactly this workspace_type. Deliberately NOT
-            # resolve_epic_id(): silently scoping isolation to this sub-issue's own
-            # number instead of its real epic would defeat the whole point.
-            parent_issue = await feature_branch_manager.get_parent_issue(
-                github_integration, pipeline_run.issue_number, project=pipeline_run.project
-            )
-            if not parent_issue:
-                raise ValueError(
-                    f"Pipeline run {pipeline_run.id} ({pipeline_run.project}/#{pipeline_run.issue_number}, "
-                    f"workspace_type={workspace_type!r}) could not resolve a parent epic issue via GitHub's "
-                    "structured sub-issue API -- either it genuinely has none, or the API call itself "
-                    "failed/errored (get_parent_issue() doesn't distinguish the two; check its logs). "
-                    "'issues' dispatch must have a parent to scope an isolated worktree by -- silently "
-                    "falling back to this issue's own number would defeat cross-sub-issue isolation. "
-                    "Matches project_monitor.py's _resolve_epic_worktree_target()."
-                )
-            epic_id = str(parent_issue)
-        else:
-            # 'hybrid': no equivalent precedent guarantees a parent (a directly-
-            # dispatched epic or a standalone issue can legitimately have none) --
-            # use the same established, lenient fallback every other existing
-            # caller of resolve_epic_id() already relies on.
-            epic_id = await feature_branch_manager.resolve_epic_id(
-                github_integration, pipeline_run.issue_number, project=pipeline_run.project
+        # Code review correction (issue #122): this used to hard-fail on no
+        # resolvable parent for workspace_type == 'issues', reasoning that
+        # "'issues' sub-issues always have a parent epic by construction." That's
+        # true of sdlc_execution's sub-issues specifically -- NOT of 'issues' as a
+        # workspace type in general: environment_support ALSO declares
+        # workspace: "issues" (config/foundations/pipelines.yaml) for genuinely
+        # standalone tickets (Dockerfile fixes, dependency troubleshooting) that
+        # are never sub-issues of anything. Once ordinary dispatch started calling
+        # this method unconditionally for every 'issues'-workspace pipeline (#122,
+        # not just sdlc_execution's repair-cycle path, #121's only caller when this
+        # hard-fail was written), that wrongly-generalized invariant broke every
+        # environment_support dispatch. Use resolve_epic_id()'s lenient fallback
+        # (the issue's own number when it has no parent) for BOTH 'issues' and
+        # 'hybrid' uniformly -- safe even for sdlc_execution: a genuinely standalone
+        # issue has no siblings to isolate FROM, so scoping a worktree by its own
+        # number is simply correct, not a degradation. An sdlc_execution sub-issue
+        # missing its real parent link (a genuinely anomalous, not normal, state)
+        # would fall back the same way rather than hard-failing -- an acceptable
+        # trade for not breaking every environment_support dispatch; project_monitor.py's
+        # repair-cycle call site can layer its own stricter check if that anomaly
+        # ever needs distinct handling.
+        epic_id = await feature_branch_manager.resolve_epic_id(
+            github_integration, pipeline_run.issue_number, project=pipeline_run.project
             )
 
         # resolve_epic_branch_name() and get_or_create_epic_worktree() are both
