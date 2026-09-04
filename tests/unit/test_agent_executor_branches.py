@@ -36,7 +36,7 @@ class TestFeatureBranchPreparation:
 
         # Mock dependencies using the workspace abstraction layer
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -87,7 +87,7 @@ class TestFeatureBranchPreparation:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -119,7 +119,7 @@ class TestFeatureBranchPreparation:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -164,7 +164,7 @@ class TestFeatureBranchFinalization:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -220,7 +220,7 @@ class TestFeatureBranchFinalization:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -263,7 +263,7 @@ class TestFeatureBranchFinalization:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
@@ -317,7 +317,7 @@ class TestCommitMessages:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor.obs, 'emit_task_received'), \

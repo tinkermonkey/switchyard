@@ -460,16 +460,12 @@ class TestEpicWorktreeResolution:
         mock_task_queue.redis_client.get.return_value = None
         mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
 
-        with patch(
-            'services.feature_branch_manager.feature_branch_manager.prepare_feature_branch',
-            new_callable=AsyncMock,
-        ) as mock_prepare_feature_branch:
-            result, launch_mock, stage_config = _run_start_repair_cycle(
-                mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-                mock_state_manager, mock_task_queue,
-                issue_number=100,
-                parent_issue_number=42,
-            )
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+        )
 
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
@@ -485,8 +481,11 @@ class TestEpicWorktreeResolution:
         # prepare_feature_branch() (invoked later, in a "for issues
         # workspace" branch-prep fallback) -- that whole fallback is gone as
         # of WI-B (resolve_workspace() already guarantees a consistent
-        # branch/worktree), so prepare_feature_branch() is asserted below to
-        # never even be reached any more, structurally, not just mocked away.
+        # branch/worktree). prepare_feature_branch() itself no longer exists
+        # at all as of #124/WI-E (removed as dead code, zero production
+        # callers), so there is nothing left to mock/assert-not-awaited here
+        # any more -- the old fallback's unreachability is now structural,
+        # not just runtime-verified.
         mocks['resolve_workspace'].assert_awaited_once()
         awaited_pipeline_run, _github_integration, workspace_type = mocks['resolve_workspace'].await_args.args
         assert awaited_pipeline_run.id == 'run-repair-100'
@@ -513,8 +512,9 @@ class TestEpicWorktreeResolution:
         # The redundant, conflicting base-clone checkout must never be
         # attempted -- the "elif workspace_type == 'issues'" fallback that
         # used to call this is gone (dead code once resolve_workspace()
-        # guarantees the branch/worktree, removed by WI-B).
-        mock_prepare_feature_branch.assert_not_awaited()
+        # guarantees the branch/worktree, removed by WI-B), and the method it
+        # would have called, prepare_feature_branch(), no longer exists at all
+        # (#124/WI-E).
 
     def test_hybrid_workspace_type_also_resolves_workspace_and_mounts_its_worktree(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
@@ -535,17 +535,13 @@ class TestEpicWorktreeResolution:
         mock_task_queue.redis_client.get.return_value = None
         mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
 
-        with patch(
-            'services.feature_branch_manager.feature_branch_manager.prepare_feature_branch',
-            new_callable=AsyncMock,
-        ) as mock_prepare_feature_branch:
-            result, launch_mock, stage_config = _run_start_repair_cycle(
-                mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-                mock_state_manager, mock_task_queue,
-                issue_number=100,
-                parent_issue_number=42,
-                workspace_type_override='hybrid',
-            )
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+            workspace_type_override='hybrid',
+        )
 
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
@@ -568,8 +564,6 @@ class TestEpicWorktreeResolution:
         assert saved_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
         assert saved_context['branch_name'] == 'feature/issue-42-epic'
         assert saved_context['epic_id'] == '42'
-
-        mock_prepare_feature_branch.assert_not_awaited()
 
     def test_no_parent_epic_found_scopes_worktree_by_the_sub_issue_s_own_number(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,

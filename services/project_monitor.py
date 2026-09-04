@@ -6970,9 +6970,14 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # both gone -- resolve_workspace() already guarantees the branch/
             # worktree are consistent, so there's nothing left to special-case
             # around here). resolve_workspace() is the SAME logic that used to
-            # live in _resolve_epic_worktree_target(), centralized -- including
-            # its identical hard-fail on no resolvable parent epic for
-            # workspace_type == 'issues' (see its own docstring).
+            # live in _resolve_epic_worktree_target(), centralized -- but NOT
+            # including its original hard-fail on no resolvable parent epic:
+            # that was found to be wrongly scoped (a #122 code review
+            # correction -- true of sdlc_execution specifically, not of
+            # 'issues' as a workspace type in general, since environment_support
+            # also uses 'issues' for genuinely standalone tickets) and replaced
+            # with resolve_epic_id()'s lenient own-number fallback, uniformly
+            # for 'issues'/'hybrid' (see resolve_workspace()'s own docstring).
             #
             # Reachability of "pipeline_run has no resolved workspace yet" by
             # the time this method runs (e.g. a card manually dragged straight
@@ -6983,11 +6988,17 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # pipeline_run first, and get_or_create_pipeline_run() above will
             # happily hand this method a run created by (or already active
             # from) any prior column. So yes, that scenario is genuinely
-            # reachable. It is NOT, however, a failure mode: resolve_workspace()
-            # is built for exactly this -- it performs the resolution itself
-            # when unresolved (identical to what this method used to do
-            # inline), and no-ops when a prior call already resolved it. As of
-            # #122 (WI-C of #119), `implementation` DOES also call
+            # reachable -- RE-CONFIRMED (#124/WI-E, #119) by independently
+            # re-tracing trigger_agent_for_status()'s column -> stage_mapping ->
+            # pipeline_template.stages -> stage_type == 'repair_cycle' dispatch:
+            # nothing gates it on prior stage history, and a GitHub Projects
+            # card can be moved to any column at any time (human drag, or the
+            # GraphQL API directly), not just via this orchestrator's own
+            # designed column progression. It is NOT, however, a failure mode:
+            # resolve_workspace() is built for exactly this -- it performs the
+            # resolution itself when unresolved (identical to what this method
+            # used to do inline), and no-ops when a prior call already resolved
+            # it. As of #122 (WI-C of #119), `implementation` DOES also call
             # resolve_workspace() now (agent_executor.py's epic-resolution
             # block, for ordinary 'issues'/'hybrid' dispatch) -- whichever
             # stage reaches it first does the real resolution, and every
@@ -6999,6 +7010,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # deliberately not caught here -- when there's genuinely no parent
             # epic to scope isolation by; that case must never be silently
             # improvised around.
+            #
+            # Test coverage for the "repair-cycle is the FIRST resolution
+            # attempt" case specifically (not just "already resolved by an
+            # earlier stage"): tests/unit/services/test_pipeline_run_workspace_resolver.py's
+            # TestResolveWorkspaceColdStart (and every other class there
+            # besides TestResolveWorkspaceIdempotent) exercises
+            # resolve_workspace() against a freshly-constructed, wholly
+            # unresolved PipelineRun -- resolve_workspace() has no branching
+            # logic keyed on which caller reaches it first, so this covers
+            # repair-cycle being first exactly as much as it covers
+            # `implementation` being first. tests/unit/orchestrator/
+            # test_repair_cycle_lock_steal.py's TestEpicWorktreeResolution
+            # tests (mock_run.branch_name/project_dir/epic_id all start as
+            # None) confirm THIS call site reaches resolve_workspace() with
+            # exactly such an unresolved run, end to end.
             if workspace_type in ('issues', 'hybrid'):
                 # resolve_workspace() is scoped to 'issues'/'hybrid' (WI-A,
                 # #120's own docstring), and by #122 (WI-C of #119) ordinary

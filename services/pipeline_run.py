@@ -428,13 +428,19 @@ class PipelineRunManager:
         project_monitor.py's repair-cycle dispatch (#121, WI-B) and ordinary
         'issues'/'hybrid' dispatch via IssuesWorkspaceContext/HybridWorkspaceContext
         (#122, WI-C) -- the latter no longer calls prepare_feature_branch() at all.
+        prepare_feature_branch()/find_related_branches() themselves were removed
+        outright once confirmed to have zero production callers left (#124/WI-E) --
+        the references below describe what this method's resolution order
+        deliberately does NOT reproduce from that removed algorithm, not a live
+        call site.
 
         Scoped to 'issues'/'hybrid' workspace types only; any other workspace_type
         is a no-op that returns pipeline_run unchanged ('discussions' is git-free).
 
-        Idempotent: once pipeline_run.branch_name and pipeline_run.project_dir are
-        both already set (e.g. a second call against an already-resolved run),
-        returns immediately without touching git or GitHub again.
+        Idempotent: once pipeline_run.branch_name, pipeline_run.project_dir, AND
+        pipeline_run.epic_id are all already set (e.g. a second call against an
+        already-resolved run), returns immediately without touching git or
+        GitHub again.
 
         Resolution order:
         1. Resolve the epic id via FeatureBranchManager.resolve_epic_id() -- the

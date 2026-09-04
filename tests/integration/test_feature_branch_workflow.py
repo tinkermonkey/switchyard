@@ -1,12 +1,18 @@
 """
 Integration tests for feature branch workflow
 
-Tests the complete lifecycle:
-1. Parent issue detection
-2. Feature branch creation
-3. Sub-issue contributions
-4. PR creation and updates
-5. Completion detection
+Covers FeatureBranch state tracking (creation, sub-issue attach/complete),
+finalize_feature_branch_work()'s commit/push/PR/completion-detection flow, and
+PR checklist body generation.
+
+Does NOT cover branch resolution/checkout (prepare_feature_branch(),
+find_related_branches(), parent-issue-triggered branch creation) -- that
+end-to-end flow was removed as dead code, zero production callers, #124/WI-E
+of #119 (resolve_workspace()/get_or_create_epic_worktree() replaced it; see
+tests/unit/services/test_pipeline_run_workspace_resolver.py for that path's
+coverage).
+Parent-issue detection alone is still covered independently in
+tests/unit/services/test_feature_branch_parent_detection.py.
 """
 
 import pytest
@@ -21,7 +27,6 @@ from services.feature_branch_manager import (
     FeatureBranchManager,
     FeatureBranch,
     SubIssueState,
-    MergeConflictError
 )
 
 
@@ -239,112 +244,6 @@ class TestFeatureBranchLifecycle:
     """Test complete feature branch lifecycle"""
 
     @pytest.mark.asyncio
-    async def test_prepare_feature_branch_first_sub_issue(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test preparing feature branch for first sub-issue"""
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Prepare branch
-        branch_name = await feature_branch_manager.prepare_feature_branch(
-            project="test-project",
-            issue_number=51,
-            github_integration=mock_github_integration,
-            issue_title="Login form UI"
-        )
-
-        # Verify branch created
-        assert branch_name.startswith("feature/issue-50-")
-        assert "user-authentication" in branch_name.lower()
-
-        # Verify state saved
-        fb = feature_branch_manager.get_feature_branch_state("test-project", 50)
-        assert fb is not None
-        assert fb.branch_name == branch_name
-        assert any(si.number == 51 for si in fb.sub_issues)
-
-        # Verify git operations called
-        mock_git_workflow.create_branch.assert_called()
-        mock_git_workflow.checkout_branch.assert_called()
-        mock_git_workflow.pull_rebase.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_prepare_feature_branch_subsequent_sub_issue(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test preparing feature branch for subsequent sub-issue"""
-        # Create existing feature branch state
-        feature_branch_manager.create_feature_branch_state(
-            project="test-project",
-            parent_issue=50,
-            branch_name="feature/issue-50-user-authentication",
-            sub_issues=[51]
-        )
-
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Prepare branch for second sub-issue
-        branch_name = await feature_branch_manager.prepare_feature_branch(
-            project="test-project",
-            issue_number=52,
-            github_integration=mock_github_integration,
-            issue_title="Password validation"
-        )
-
-        # Verify same branch used
-        assert branch_name == "feature/issue-50-user-authentication"
-
-        # Verify sub-issue added
-        fb = feature_branch_manager.get_feature_branch_state("test-project", 50)
-        assert len(fb.sub_issues) == 2
-        assert any(si.number == 52 for si in fb.sub_issues)
-
-        # Verify git pull happened
-        mock_git_workflow.pull_rebase.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_prepare_feature_branch_standalone_issue(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test preparing branch for standalone issue (no parent)"""
-        # Issue 100 already configured in mock_github_integration with no parent reference
-
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Prepare branch
-        branch_name = await feature_branch_manager.prepare_feature_branch(
-            project="test-project",
-            issue_number=100,
-            github_integration=mock_github_integration,
-            issue_title="Standalone feature"
-        )
-
-        # Verify standalone branch created
-        assert branch_name.startswith("feature/issue-100-")
-
-        # Verify no parent state created
-        fb = feature_branch_manager.get_feature_branch_state("test-project", 50)
-        assert fb is None
-
-    @pytest.mark.asyncio
     async def test_finalize_feature_branch_work(
         self,
         feature_branch_manager,
@@ -435,126 +334,6 @@ class TestFeatureBranchLifecycle:
 
         # Verify completion comment posted
         mock_github_integration.post_comment.assert_called()
-
-
-class TestConflictHandling:
-    """Test merge conflict detection and escalation"""
-
-    @pytest.mark.asyncio
-    async def test_merge_conflict_detection(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test that merge conflicts are detected and escalated"""
-        # Create existing feature branch
-        feature_branch_manager.create_feature_branch_state(
-            project="test-project",
-            parent_issue=50,
-            branch_name="feature/issue-50-auth",
-            sub_issues=[51]
-        )
-
-        # Mock conflict on pull - needs to contain "conflict" keyword for MergeConflictError detection
-        mock_git_workflow.pull_rebase = AsyncMock(side_effect=Exception("CONFLICT: Merge conflict in auth.py"))
-        mock_git_workflow.get_conflicting_files = AsyncMock(return_value=["auth.py", "config.js"])
-
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Attempt to prepare branch - should raise MergeConflictError
-        with pytest.raises(MergeConflictError) as exc_info:
-            await feature_branch_manager.prepare_feature_branch(
-                project="test-project",
-                issue_number=52,
-                github_integration=mock_github_integration,
-                issue_title="Password validation"
-            )
-
-        # Verify escalation comment posted
-        mock_github_integration.post_comment.assert_called()
-        call_args = mock_github_integration.post_comment.call_args
-        assert "Merge Conflict Detected" in call_args[0][1]
-
-
-class TestStaleBranchDetection:
-    """Test stale branch detection and warnings"""
-
-    @pytest.mark.asyncio
-    async def test_stale_branch_warning(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test that stale branches trigger warnings"""
-        # Create feature branch
-        feature_branch_manager.create_feature_branch_state(
-            project="test-project",
-            parent_issue=50,
-            branch_name="feature/issue-50-auth",
-            sub_issues=[51]
-        )
-
-        # Mock 25 commits behind (warning threshold - between 20 and 50)
-        mock_git_workflow.get_commits_behind = AsyncMock(return_value=25)
-
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Prepare branch
-        await feature_branch_manager.prepare_feature_branch(
-            project="test-project",
-            issue_number=52,
-            github_integration=mock_github_integration,
-            issue_title="Password validation"
-        )
-
-        # Verify state updated with commits_behind
-        fb = feature_branch_manager.get_feature_branch_state("test-project", 50)
-        assert fb.commits_behind_main == 25
-
-    @pytest.mark.asyncio
-    async def test_very_stale_branch_escalation(
-        self,
-        feature_branch_manager,
-        mock_github_integration,
-        mock_git_workflow,
-        temp_workspace
-    ):
-        """Test that very stale branches trigger escalation"""
-        # Create feature branch
-        feature_branch_manager.create_feature_branch_state(
-            project="test-project",
-            parent_issue=50,
-            branch_name="feature/issue-50-auth",
-            sub_issues=[51]
-        )
-
-        # Mock 60 commits behind (escalation threshold > 50)
-        mock_git_workflow.get_commits_behind = AsyncMock(return_value=60)
-
-        # Create project directory
-        project_dir = Path(temp_workspace) / "test-project"
-        project_dir.mkdir(parents=True)
-
-        # Prepare branch
-        await feature_branch_manager.prepare_feature_branch(
-            project="test-project",
-            issue_number=52,
-            github_integration=mock_github_integration,
-            issue_title="Password validation"
-        )
-
-        # Verify escalation comment posted
-        mock_github_integration.post_comment.assert_called()
-        call_args = mock_github_integration.post_comment.call_args
-        assert "Branch Maintenance Required" in call_args[0][1]
 
 
 class TestPRManagement:

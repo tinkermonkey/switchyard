@@ -2,13 +2,14 @@
 Tests for ProjectConfig.worktree_isolation_enabled (#52's per-project scoping
 flag for real epic-worktree isolation).
 
-services/agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist
-(currently just 'discussions', i.e. the planning_design pipeline) says which
-workspace TYPES are safe to isolate; this flag is the separate, per-PROJECT
-dimension that actually turns isolation on for one, without affecting every
-other project using the same workspace type. Defaults to False so every
-existing project keeps today's shared-base-clone behavior unless a chosen
-pilot project explicitly opts in.
+services/agent_executor.py's inline workspace_type_for_epic_gate == 'discussions'
+check (the EPIC_WORKTREE_SAFE_WORKSPACE_TYPES allowlist this replaced was removed
+as dead code, #123/WI-D, #119 -- 'discussions', i.e. the planning_design pipeline,
+was always its only member) says which workspace TYPES are safe to isolate; this
+flag is the separate, per-PROJECT dimension that actually turns isolation on for
+one, without affecting every other project using the same workspace type.
+Defaults to False so every existing project keeps today's shared-base-clone
+behavior unless a chosen pilot project explicitly opts in.
 
 Uses the real foundations/ directory (so pipeline template lookups resolve
 normally) with an isolated tmp projects/ directory, rather than mocking

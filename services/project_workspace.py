@@ -312,7 +312,9 @@ class ProjectWorkspaceManager:
 
         - New-branch case (branch_name doesn't exist on origin yet): fetches
           origin/<default_branch> and runs `git worktree add -b <branch_name> <path>
-          origin/<default_branch>` — mirrors FeatureBranchManager.create_branch_from_main.
+          origin/<default_branch>` — the same fetch-then-branch-from-main pattern
+          FeatureBranchManager.create_branch_from_main used against the shared base
+          clone before that method was removed as dead code (#124/WI-E, #119).
         - Existing-branch case: fetches origin/<branch_name>, then runs a plain
           `git worktree add <path> <branch_name>`.
 
@@ -791,11 +793,12 @@ class ProjectWorkspaceManager:
                 )
 
         if created_new_branch:
-            # Push the brand-new branch immediately, mirroring
-            # FeatureBranchManager.create_branch_from_main's established pattern: without
-            # an initial push+tracking setup, a plain `git pull` inside the worktree fails
-            # with "no tracking information", and the push-before-removal safety net in
-            # _push_local_commits_if_any has no origin/<branch> ref to compare against.
+            # Push the brand-new branch immediately (the same push+tracking-setup
+            # pattern FeatureBranchManager.create_branch_from_main used before it was
+            # removed as dead code, #124/WI-E): without it, a plain `git pull` inside
+            # the worktree fails with "no tracking information", and the
+            # push-before-removal safety net in _push_local_commits_if_any has no
+            # origin/<branch> ref to compare against.
             push_result = subprocess.run(
                 ['git', '-C', str(worktree_path), 'push', '-u', 'origin', branch_name],
                 capture_output=True, text=True, timeout=30

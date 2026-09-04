@@ -1695,6 +1695,34 @@ class AgentContainerRecovery:
                         "cycle container actually worked in."
                     )
 
+                # Best-effort re-registration into ProjectWorkspaceManager's in-memory
+                # _epic_worktrees tracking (code review finding, issue #124): reading
+                # project_dir straight from context.json, rather than through
+                # get_or_create_epic_worktree()'s adopt-on-restart path, means this
+                # worktree is otherwise never re-registered after an orchestrator
+                # restart. Without that, main.py's startup prune_epic_worktrees() sweep
+                # sees an untracked, no-container-running worktree and force-removes it
+                # right after this recovery uses it -- if the commit below also can't
+                # push (e.g. the same restart that triggered recovery also lost
+                # connectivity), the just-completed repair-cycle fix would be
+                # permanently lost. Failure here must not block the actual commit
+                # attempt above/below it -- it's a tracking side effect, not required
+                # for correctness of this commit itself.
+                epic_id_for_recovery = context.get('epic_id')
+                branch_name_for_recovery = context.get('branch_name')
+                if epic_id_for_recovery and branch_name_for_recovery:
+                    try:
+                        from services.project_workspace import workspace_manager
+                        workspace_manager.get_or_create_epic_worktree(
+                            project, epic_id_for_recovery, branch_name_for_recovery
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not re-register epic worktree for {project}/#{issue_number} "
+                            f"into in-memory tracking after restart recovery: {e}. The startup "
+                            "prune sweep may remove this worktree if it can't push below."
+                        )
+
                 def do_commit():
                     return asyncio.run(
                         auto_commit_service.commit_agent_changes(

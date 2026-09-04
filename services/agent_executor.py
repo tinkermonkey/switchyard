@@ -281,18 +281,46 @@ class AgentExecutor:
                     )
                 else:
                     gh_integration_for_workspace = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
-                    # Deliberately NOT wrapped in a try/except that swallows
-                    # ValueError/RuntimeError -- resolve_workspace()'s own
-                    # documented contract requires both to reach whatever
-                    # generic failure handling this dispatch already has,
-                    # matching project_monitor.py's repair-cycle call site
-                    # (#121) exactly. See resolve_workspace()'s docstring for
-                    # why: this codebase's established uniform retry/escalation
-                    # pattern, not special-casing errors that merely look
-                    # permanent.
-                    pipeline_run_for_workspace = await pipeline_run_manager_for_workspace.resolve_workspace(
-                        pipeline_run_for_workspace, gh_integration_for_workspace, workspace_type_for_epic_gate
-                    )
+                    # Not swallowed -- resolve_workspace()'s own documented
+                    # contract requires ValueError/RuntimeError to reach whatever
+                    # generic failure handling this dispatch already has, this
+                    # codebase's established uniform retry/escalation pattern,
+                    # not special-casing errors that merely look permanent.
+                    # BUT this block runs well before this method's own big
+                    # try/except (which is what actually calls
+                    # work_execution_tracker.record_execution_outcome() on
+                    # failure) -- unlike project_monitor.py's repair-cycle call
+                    # site, where the equivalent resolve_workspace() call already
+                    # sits inside that method's own enclosing try/except. Without
+                    # this explicit record here (code review finding, issue
+                    # #124), a resolve_workspace() failure at this point would
+                    # propagate out of execute_agent() with the record_execution_
+                    # start() "in_progress" entry never paired with a terminal
+                    # outcome -- the exact "escalation never fires" bug class
+                    # fixed by 76e7adc for the repair-cycle path, reproduced here
+                    # for ordinary dispatch.
+                    try:
+                        pipeline_run_for_workspace = await pipeline_run_manager_for_workspace.resolve_workspace(
+                            pipeline_run_for_workspace, gh_integration_for_workspace, workspace_type_for_epic_gate
+                        )
+                    except Exception as resolve_err:
+                        if 'issue_number' in task_context:
+                            from services.work_execution_state import work_execution_tracker
+                            try:
+                                work_execution_tracker.record_execution_outcome(
+                                    issue_number=task_context['issue_number'],
+                                    column=task_context.get('column', 'unknown'),
+                                    agent=agent_name,
+                                    outcome='failure',
+                                    project_name=project_name,
+                                    error=f"Workspace resolution failed: {resolve_err}"
+                                )
+                            except Exception as record_err:
+                                logger.warning(
+                                    f"Failed to record workspace-resolution failure outcome for "
+                                    f"{project_name}/#{task_context['issue_number']}: {record_err}"
+                                )
+                        raise
                     epic_id = pipeline_run_for_workspace.epic_id
                     epic_branch_name = pipeline_run_for_workspace.branch_name
                     task_context['epic_id'] = epic_id

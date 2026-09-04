@@ -36,7 +36,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -91,7 +91,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -172,7 +172,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -211,7 +211,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -258,7 +258,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
@@ -325,7 +325,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch('services.github_integration.GitHubIntegration') as mock_github_cls, \
              patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_prm, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
@@ -396,7 +396,7 @@ class TestAgentExecutorWorkspaceIntegration:
         }
 
         with patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
-             patch('config.manager.config_manager') as mock_config, \
+             patch('services.agent_executor.config_manager') as mock_config, \
              patch('services.github_integration.GitHubIntegration') as mock_github_cls, \
              patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_prm, \
              patch.object(agent_executor.factory, 'create_agent') as mock_create, \
