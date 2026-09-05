@@ -483,25 +483,35 @@ class PipelineRunManager:
             'hybrid' runs (unchanged for any other workspace_type).
 
         Raises:
-            ValueError: The project has no base clone to source the worktree from
-                (resolve_epic_id() itself never raises -- it always resolves to
-                either the real parent or the issue's own number).
+            feature_branch_manager.ParentIssueLookupError: resolve_epic_id()'s
+                underlying get_parent_issue() lookup could not be completed (a
+                transient GitHub API/network failure, or missing repo config) --
+                issue #126, code review correction. Superseded the previous
+                docstring's claim that "resolve_epic_id() itself never raises": that
+                was true only because get_parent_issue() used to swallow every
+                lookup failure to None indistinguishably from a confirmed "no
+                parent," which let this exact method silently mis-scope a run's
+                epic worktree by the sub-issue's own number instead of its real
+                parent, permanently (this method's own idempotency guard above never
+                re-resolves once branch_name/project_dir/epic_id are set). Fixed at
+                the source rather than special-cased here.
+            ValueError: The project has no base clone to source the worktree from.
             RuntimeError: The underlying git worktree add command failed.
 
-        This method deliberately does not swallow either exception itself -- a caller
-        wiring this into real dispatch must let them reach whatever failure handling
-        keeps a pipeline run/lock from getting stuck (the bug an earlier version of this
-        logic, project_monitor.py's _resolve_epic_worktree_target(), was fixed for after
-        leaving pipeline locks stuck forever on an unhandled failure). That does NOT
-        require distinguishing ValueError from RuntimeError, or handling either
-        specially: propagating both to one generic outer exception handler -- this
-        codebase's established uniform retry/escalation pattern (see
-        count_consecutive_failures()/MAX_CONSECUTIVE_DISPATCH_FAILURES), rather than
-        special-casing errors that merely look permanent for immediate termination -- is
-        a correct, intended way to satisfy this contract, and is what this method's
-        production callers (project_monitor.py's repair-cycle dispatch, and
-        agent_executor.py's epic-resolution block for ordinary 'issues'/'hybrid'
-        dispatch) do.
+        This method deliberately does not swallow any of these exceptions itself --
+        a caller wiring this into real dispatch must let them reach whatever failure
+        handling keeps a pipeline run/lock from getting stuck (the bug an earlier
+        version of this logic, project_monitor.py's _resolve_epic_worktree_target(),
+        was fixed for after leaving pipeline locks stuck forever on an unhandled
+        failure). That does NOT require distinguishing which of these three was
+        raised, or handling any specially: propagating all of them to one generic
+        outer exception handler -- this codebase's established uniform retry/
+        escalation pattern (see count_consecutive_failures()/
+        MAX_CONSECUTIVE_DISPATCH_FAILURES), rather than special-casing errors that
+        merely look permanent for immediate termination -- is a correct, intended
+        way to satisfy this contract, and is what this method's production callers
+        (project_monitor.py's repair-cycle dispatch, and agent_executor.py's
+        epic-resolution block for ordinary 'issues'/'hybrid' dispatch) do.
         """
         if workspace_type not in ('issues', 'hybrid'):
             return pipeline_run
