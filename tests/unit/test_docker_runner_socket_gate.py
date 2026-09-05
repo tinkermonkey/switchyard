@@ -179,8 +179,14 @@ class TestGateWiringForDockerSocketAgents:
 
             fake_gate.acquire.assert_awaited_once_with("phone-home", "task-3")
             # The MCP config temp file must still be cleaned up despite acquire()
-            # raising before the container was ever launched.
-            mock_remove.assert_called_once_with("/tmp/mcp-config-fake.json")
+            # raising before the container was ever launched. (Also removes a
+            # worktree-gitdir-override file that, per this test's own blanket
+            # os.path.exists=True patch, "exists" too -- issue #127's
+            # _cleanup_worktree_git_override() runs unconditionally in the same
+            # finally block and is a genuine no-op here in practice, since
+            # _build_docker_command is mocked out above and never actually wrote
+            # one; this test isn't about that cleanup path.)
+            mock_remove.assert_any_call("/tmp/mcp-config-fake.json")
             # Nothing was ever acquired -- release() must not be called at all.
             fake_gate.release.assert_not_called()
 
