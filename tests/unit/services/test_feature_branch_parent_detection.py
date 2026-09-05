@@ -254,3 +254,72 @@ class TestResolveEpicWorktreeTarget:
             branch_name = manager.resolve_epic_branch_name('test-project', '42')
 
             assert branch_name is None
+
+
+class TestFindBranchForParentNumericPrefixRegression:
+    """
+    Regression coverage for a real past production incident (originally covered
+    by the now-deleted tests/unit/services/test_feature_branch_related_branch_matching.py,
+    which tested the since-removed FeatureBranchManager.find_related_branches()
+    directly -- code review finding, issue #124): issue #2 on phone-home had its
+    work silently attached to `feature/issue-216-token-efficiency-program-trac`,
+    a fully-merged, unrelated branch, because an OLDER matching implementation
+    used a plain substring check (`f"issue-{n}" in branch`), and "issue-2" is a
+    substring of "issue-216".
+
+    _find_branch_for_parent()/_parse_issue_from_branch_name() (below) are the
+    fixed primitives that replaced that substring check -- and, since #122/#124,
+    are the SOLE production path for resolving an epic's branch
+    (get_feature_branch_state() -> resolve_epic_branch_name(), no independent
+    caller remains). Unlike the tests above (which mock get_feature_branch_state
+    itself), these exercise the real matching logic against an adversarial
+    branch listing, unmocked past the git-subprocess boundary -- the actual
+    regression case, not just resolve_epic_branch_name()'s pass-through.
+    """
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    def test_does_not_match_a_branch_whose_number_starts_with_the_same_digits(self, manager):
+        """The exact regression case: parent #2 must not match
+        feature/issue-216-... (or issue-20-, issue-200-, etc.)."""
+        with patch.object(
+            manager, '_get_all_feature_branches_sync',
+            return_value=[
+                'feature/issue-216-token-efficiency-program-trac',
+                'feature/issue-20-something-else',
+                'feature/issue-200-yet-another-thing',
+            ],
+        ):
+            result = manager._find_branch_for_parent('/workspace/phone-home', 2)
+
+        assert result is None
+
+    def test_still_finds_the_correctly_named_branch(self, manager):
+        """Control case: the fix must not break the actual intended match --
+        a genuine feature/issue-2-... branch must still be found, even
+        alongside the numeric-prefix decoys."""
+        with patch.object(
+            manager, '_get_all_feature_branches_sync',
+            return_value=[
+                'feature/issue-2-deterministic-health-check',
+                'feature/issue-216-token-efficiency-program-trac',
+                'feature/issue-20-something-else',
+            ],
+        ):
+            result = manager._find_branch_for_parent('/workspace/phone-home', 2)
+
+        assert result == 'feature/issue-2-deterministic-health-check'
+
+    @pytest.mark.parametrize("branch,expected", [
+        ('feature/issue-216-token-efficiency-program-trac', 216),
+        ('feature/issue-2-deterministic-health-check', 2),
+        ('feature/issue-123', 123),
+        ('main', None),
+        ('feature/some-other-branch', None),
+    ])
+    def test_parse_issue_from_branch_name_exact_match_only(self, manager, branch, expected):
+        """The underlying primitive: extracts the FULL number, never a prefix
+        substring match."""
+        assert manager._parse_issue_from_branch_name(branch) == expected

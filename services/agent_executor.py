@@ -216,56 +216,144 @@ class AgentExecutor:
                                     execution_type=execution_type,
                                     pipeline_run_id=pipeline_run_id)
 
-        # Resolve the epic id (and, if already known, its shared branch) so the
-        # container-mount directory built below is the epic's isolated worktree
-        # instead of the shared base clone. If a caller already resolved this
-        # earlier in the same dispatch (e.g. a repair cycle stashed 'epic_id' /
-        # 'branch_name' into task_context before calling us with
-        # skip_workspace_prep=True), reuse it rather than re-resolving. Otherwise
-        # resolve it fresh here -- cheap and side-effect-free: get_parent_issue is
-        # 1h-TTL-cached, and the branch lookup is a plain read-only git query, never
-        # a checkout, on the shared base clone. Best-effort: a resolution failure
-        # here must not break executions that worked fine before this migration --
-        # fall back to the pre-migration shared-base-clone behavior instead.
+        # Resolve this run's git branch and isolated epic worktree so the
+        # container-mount directory built below (via _build_execution_context) is
+        # the epic's isolated worktree instead of the shared base clone. If a
+        # caller already resolved this earlier in the same dispatch (e.g. a
+        # repair cycle stashed 'epic_id' / 'branch_name' into task_context before
+        # calling us with skip_workspace_prep=True), reuse it rather than
+        # re-resolving.
         #
-        # IMPORTANT (issue #46 review, pass 2): this is deliberately an ALLOWLIST
-        # (only 'discussions' today), not a denylist of 'issues' alone. Both
-        # IssuesWorkspaceContext AND HybridWorkspaceContext call
-        # FeatureBranchManager.prepare_feature_branch(), which resolves its OWN
-        # branch (via independent confidence-matching over related branches, which
-        # can legitimately disagree with resolve_epic_branch_name()'s pick here) and
-        # checks it out directly on the shared BASE CLONE, after this block would
-        # otherwise have already created a worktree with the SAME branch checked
-        # out -- git refuses to check out a branch that's already checked out in
-        # another worktree, breaking every such dispatch. Only DiscussionsWorkspace
-        # Context is verified git-free (supports_git_operations=False, no call to
-        # prepare_feature_branch) and therefore safe to isolate today. Reconciling
-        # the two branch-resolution paths (or migrating prepare_feature_branch/
-        # finalize_feature_branch_work to operate on the epic worktree instead of
-        # the base clone) is real, nontrivial work that belongs to issue #48, which
-        # already explicitly scopes services/workspace/issues_context.py's and
-        # hybrid_context.py's get_working_directory() as its own targets. Until
-        # that lands, 'issues'/'hybrid' dispatch keeps its pre-migration shared-
-        # base-clone behavior exactly -- honest, non-regressing, and consistent
-        # with this migration's own 'byte-identical behavior at concurrency=1'
-        # requirement.
-        #
-        # This workspace-type allowlist is necessary but not sufficient (#52): even
-        # for 'discussions' dispatch, isolation only actually happens for a project
-        # that has opted in via ProjectConfig.worktree_isolation_enabled (checked
-        # further down, once project_config_for_epic is loaded) -- so merging this
-        # allowlist doesn't roll out isolation to every planning_design project at
-        # once, only to whichever project(s) explicitly enable it.
-        EPIC_WORKTREE_SAFE_WORKSPACE_TYPES = {'discussions'}
+        # Two independent gates used to live here (issue #46): a 'discussions'-
+        # only allowlist calling FeatureBranchManager.resolve_epic_id()/
+        # resolve_epic_branch_name() directly, which explicitly excluded
+        # 'issues'/'hybrid' because IssuesWorkspaceContext/HybridWorkspaceContext's
+        # prepare_execution() independently resolved and checked out its OWN
+        # branch on the shared base clone -- a second, uncoordinated resolution
+        # that could disagree with this one and collide (git refuses to check out
+        # a branch already checked out in another worktree). #122 (WI-C of #119)
+        # removes that second resolution entirely: both workspace-context classes
+        # now read the SAME PipelineRunManager.resolve_workspace() result this
+        # block produces, via the pipeline_run threaded into
+        # WorkspaceContextFactory.create() below. There is nothing left to
+        # collide with, so 'issues'/'hybrid' resolution is unconditional here too
+        # -- no per-project opt-in, unlike 'discussions' below (#52's
+        # worktree_isolation_enabled flag was only ever a rollout control for the
+        # allowlist this replaces, not a requirement of resolve_workspace() itself).
         workspace_type_for_epic_gate = task_context.get('workspace_type', 'issues')
         epic_id = task_context.get('epic_id')
         epic_branch_name = task_context.get('branch_name')
+        pipeline_run_for_workspace = None
+
         if (
             epic_id is None
             and 'issue_number' in task_context
             and not task_context.get('skip_workspace_prep', False)
-            and workspace_type_for_epic_gate in EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
+            and workspace_type_for_epic_gate in ('issues', 'hybrid')
         ):
+            project_config_for_workspace = config_manager.get_project_config(project_name)
+            repo_owner = None
+            repo_name = None
+            if project_config_for_workspace and hasattr(project_config_for_workspace, 'github'):
+                repo_owner = project_config_for_workspace.github.get('org')
+                repo_name = project_config_for_workspace.github.get('repo')
+
+            if pipeline_run_id and repo_owner and repo_name:
+                from services.github_integration import GitHubIntegration
+                from services.pipeline_run import get_pipeline_run_manager
+
+                pipeline_run_manager_for_workspace = get_pipeline_run_manager()
+                pipeline_run_for_workspace = pipeline_run_manager_for_workspace.get_pipeline_run(pipeline_run_id)
+
+                if pipeline_run_for_workspace is None:
+                    # NOT a fallback: pipeline_run_for_workspace stays None, which
+                    # WorkspaceContextFactory/IssuesWorkspaceContext.prepare_execution()
+                    # (issue #122/WI-C) treats as a hard ValueError, not a silent
+                    # base-clone degradation -- a silent fallback here would
+                    # reintroduce exactly the per-caller resolution inconsistency
+                    # #119 exists to eliminate. If this warning fires in practice,
+                    # that ValueError is the actual, intended outcome.
+                    logger.warning(
+                        f"No pipeline run found for pipeline_run_id={pipeline_run_id!r} "
+                        f"({project_name} issue #{task_context.get('issue_number')}) -- "
+                        "cannot resolve an isolated workspace. This dispatch will fail "
+                        "when the workspace context requires a resolved pipeline run."
+                    )
+                else:
+                    gh_integration_for_workspace = GitHubIntegration(repo_owner=repo_owner, repo_name=repo_name)
+                    # Not swallowed -- resolve_workspace()'s own documented
+                    # contract requires ValueError/RuntimeError to reach whatever
+                    # generic failure handling this dispatch already has, this
+                    # codebase's established uniform retry/escalation pattern,
+                    # not special-casing errors that merely look permanent.
+                    # BUT this block runs well before this method's own big
+                    # try/except (which is what actually calls
+                    # work_execution_tracker.record_execution_outcome() on
+                    # failure) -- unlike project_monitor.py's repair-cycle call
+                    # site, where the equivalent resolve_workspace() call already
+                    # sits inside that method's own enclosing try/except. Without
+                    # this explicit record here (code review finding, issue
+                    # #124), a resolve_workspace() failure at this point would
+                    # propagate out of execute_agent() with the record_execution_
+                    # start() "in_progress" entry never paired with a terminal
+                    # outcome -- the exact "escalation never fires" bug class
+                    # fixed by 76e7adc for the repair-cycle path, reproduced here
+                    # for ordinary dispatch.
+                    try:
+                        pipeline_run_for_workspace = await pipeline_run_manager_for_workspace.resolve_workspace(
+                            pipeline_run_for_workspace, gh_integration_for_workspace, workspace_type_for_epic_gate
+                        )
+                    except Exception as resolve_err:
+                        if 'issue_number' in task_context:
+                            from services.work_execution_state import work_execution_tracker
+                            try:
+                                work_execution_tracker.record_execution_outcome(
+                                    issue_number=task_context['issue_number'],
+                                    column=task_context.get('column', 'unknown'),
+                                    agent=agent_name,
+                                    outcome='failure',
+                                    project_name=project_name,
+                                    error=f"Workspace resolution failed: {resolve_err}"
+                                )
+                            except Exception as record_err:
+                                logger.warning(
+                                    f"Failed to record workspace-resolution failure outcome for "
+                                    f"{project_name}/#{task_context['issue_number']}: {record_err}"
+                                )
+                        raise
+                    epic_id = pipeline_run_for_workspace.epic_id
+                    epic_branch_name = pipeline_run_for_workspace.branch_name
+                    task_context['epic_id'] = epic_id
+                    task_context['project_dir'] = pipeline_run_for_workspace.project_dir
+            else:
+                # NOT a fallback -- see the comment above on the pipeline_run_for_workspace
+                # is None branch; the same "this dispatch will fail" outcome applies here.
+                logger.warning(
+                    f"Cannot resolve an isolated workspace for {project_name} "
+                    f"issue #{task_context.get('issue_number')} (workspace_type="
+                    f"{workspace_type_for_epic_gate!r}): missing pipeline_run_id or repo "
+                    "org/repo. This dispatch will fail when the workspace context "
+                    "requires a resolved pipeline run."
+                )
+
+        elif (
+            epic_id is None
+            and 'issue_number' in task_context
+            and not task_context.get('skip_workspace_prep', False)
+            and workspace_type_for_epic_gate == 'discussions'
+        ):
+            # This workspace-type allowlist is necessary but not sufficient (#52): even
+            # for 'discussions' dispatch, isolation only actually happens for a project
+            # that has opted in via ProjectConfig.worktree_isolation_enabled (checked
+            # further down, once project_config_for_epic is loaded) -- so this doesn't
+            # roll out isolation to every planning_design project at once, only to
+            # whichever project(s) explicitly enable it. Unlike 'issues'/'hybrid' above,
+            # 'discussions' is verified git-free (supports_git_operations=False, no call
+            # to prepare_feature_branch/resolve_workspace from DiscussionsWorkspaceContext)
+            # and was never at risk of the collision #122 fixed for 'issues'/'hybrid' --
+            # it keeps its own pre-existing, best-effort resolution here rather than
+            # moving onto resolve_workspace() (which is scoped to 'issues'/'hybrid' only;
+            # see its own docstring).
             try:
                 project_config_for_epic = config_manager.get_project_config(project_name)
                 # Per-project opt-in (#52): the workspace_type allowlist above says
@@ -365,7 +453,15 @@ class AgentExecutor:
                             project=project_name,
                             issue_number=task_context['issue_number'],
                             task_context=task_context,
-                            github_integration=gh_integration
+                            github_integration=gh_integration,
+                            # The same PipelineRun this method's epic-resolution
+                            # block (above) already resolved via
+                            # resolve_workspace() -- IssuesWorkspaceContext/
+                            # HybridWorkspaceContext read branch_name/project_dir
+                            # directly off of it (#122). Idempotent to call
+                            # resolve_workspace() again against it, which those
+                            # classes' prepare_execution() does.
+                            pipeline_run=pipeline_run_for_workspace
                         )
 
                         logger.info(
@@ -396,7 +492,16 @@ class AgentExecutor:
                         if workspace_context.supports_git_operations and branch_name:
                             from services.feature_branch_manager import feature_branch_manager
                             import subprocess
-                            project_dir = f"/workspace/{project_name}"
+                            # The directory the agent actually works in -- the shared
+                            # base clone for workspace types that stay there, or the
+                            # resolved isolated epic worktree for 'issues'/'hybrid'
+                            # (issue #122/WI-C review finding: this was hardcoded to
+                            # the shared base clone, which is no longer where 'issues'/
+                            # 'hybrid' dispatch's branch actually lives -- verifying
+                            # against it there would fail this check on every such
+                            # dispatch, halting execution that was actually prepared
+                            # correctly).
+                            project_dir = str(workspace_context.get_working_directory())
 
                             try:
                                 actual_branch = await feature_branch_manager.get_current_branch(project_dir)
@@ -1582,18 +1687,28 @@ class AgentExecutor:
         from services.project_workspace import workspace_manager
 
         try:
-            # Resolve the SAME directory the agent actually ran in (issue #46):
-            # if this task resolved an epic worktree, task_context carries epic_id/
-            # branch_name and get_project_dir() idempotently returns the existing
-            # worktree (no git calls on a cache hit) rather than the shared base
-            # clone. Checking the base clone here while the agent actually wrote to
-            # an isolated worktree would find nothing dirty and silently skip real
-            # uncommitted work.
-            project_dir = str(workspace_manager.get_project_dir(
-                project_name,
-                epic_id=task_context.get('epic_id'),
-                branch_name=task_context.get('branch_name'),
-            ))
+            # Resolve the SAME directory the agent actually ran in. Read it
+            # straight off task_context['project_dir'] -- set by execute_agent()'s
+            # epic-resolution block (PipelineRunManager.resolve_workspace(), issue
+            # #122) and/or by workspace_context.prepare_execution()'s prep_result
+            # -- rather than independently re-deriving it via get_project_dir(
+            # epic_id=...) (issue #123, WI-D of #119): the latter reaches the same
+            # directory today (get_or_create_epic_worktree() is idempotent), but
+            # is a second, divergence-prone resolution path for a value already
+            # known. Falls back to epic_id/branch_name-based resolution only when
+            # project_dir was never set on task_context (e.g. a 'discussions'
+            # dispatch, or a genuinely unresolved workspace) -- checking the base
+            # clone there while the agent actually wrote to an isolated worktree
+            # would find nothing dirty and silently skip real uncommitted work.
+            existing_project_dir = task_context.get('project_dir')
+            if existing_project_dir:
+                project_dir = str(existing_project_dir)
+            else:
+                project_dir = str(workspace_manager.get_project_dir(
+                    project_name,
+                    epic_id=task_context.get('epic_id'),
+                    branch_name=task_context.get('branch_name'),
+                ))
             issue_number = task_context.get('issue_number')
 
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")

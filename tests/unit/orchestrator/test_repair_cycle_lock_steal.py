@@ -61,7 +61,6 @@ if 'ORCHESTRATOR_ROOT' not in os.environ:
     os.environ['ORCHESTRATOR_ROOT'] = tempfile.mkdtemp(prefix='switchyard-test-')
 
 import pytest
-from pathlib import Path
 from unittest.mock import Mock, MagicMock, AsyncMock, patch
 
 from tests.unit.orchestrator.conftest import create_test_issue
@@ -80,7 +79,8 @@ def _run_start_repair_cycle(
     pipeline_manager_capture=None,
     test_types=None,
     subprocess_side_effect=None,
-    get_project_dir_side_effect=None,
+    resolve_workspace_side_effect=None,
+    workspace_type_override=None,
 ):
     """
     Shared harness for every test in this file. Sets up the common
@@ -90,16 +90,31 @@ def _run_start_repair_cycle(
     mocked out so nothing here ever touches real Docker/subprocess machinery
     or starts a real background thread.
 
-    Also mocks the epic-worktree resolution chain
-    (feature_branch_manager.get_parent_issue / resolve_epic_branch_name and
-    workspace_manager.get_project_dir) added by issue #46 — real calls
-    would try genuine GraphQL/git subprocess work against a nonexistent
-    'test-project' repo. parent_issue_number controls what get_parent_issue
-    resolves to (default 42, a plausible parent epic); pass None for tests
-    covering the "no parent found" hard-error path. The three mocks are
-    stashed onto the returned stage_config as `_epic_mocks` (a dict) so
-    tests needing to assert on them can, without changing this function's
-    long-established 3-tuple return signature.
+    Also mocks PipelineRunManager.resolve_workspace() -- the single call
+    _start_repair_cycle_for_issue now makes (issue #119 WI-B) to resolve the
+    epic branch/worktree for this run, replacing the independent
+    get_parent_issue()/resolve_epic_branch_name()/get_project_dir() chain this
+    file used to mock directly (that chain is now internal to
+    resolve_workspace() itself -- see test_pipeline_run_workspace_resolver.py
+    for its own dedicated coverage). By default the mock behaves like a
+    successful resolution: it mutates the pipeline_run it's given (mirroring
+    resolve_workspace()'s real in-place-mutation contract) with a branch_name/
+    project_dir scoped to parent_issue_number (default 42, a plausible parent
+    epic). Two variants:
+      - parent_issue_number=None reproduces resolve_workspace()'s real lenient
+        fallback for a genuinely standalone issue (no parent) -- scopes the
+        worktree by the sub-issue's own number (issue_number) instead, NOT a
+        failure (code review correction, issue #122 -- an earlier version of
+        this method hard-failed here, which broke environment_support's
+        genuinely-standalone tickets, which also use workspace_type == 'issues').
+      - resolve_workspace_side_effect overrides the default entirely (an
+        exception instance/class, or a callable) -- used by
+        TestRepairCycleStartupErrorDoesNotReleaseLock to simulate the
+        real git-level worktree-collision RuntimeError this behavior was
+        found and fixed for.
+    The mock is stashed onto the returned stage_config as `_epic_mocks` (a
+    dict) so tests needing to assert on it can, without changing this
+    function's long-established 3-tuple return signature.
 
     phantom_run_id and pipeline_manager_capture support TestPhantomRunCleanup
     below: pass phantom_run_id to thread a caller-supplied phantom id through
@@ -109,16 +124,31 @@ def _run_start_repair_cycle(
     caller can assert on end_phantom_pipeline_run()/end_pipeline_run() calls
     without changing this function's return signature.
 
-    get_project_dir_side_effect lets a caller (TestRepairCycleStartupErrorDoesNot
-    ReleaseLock below) make the epic-worktree resolution step itself fail --
-    simulating the real git-level branch collision this behavior was found and
-    fixed for -- without needing its own bespoke mock setup.
-
     Returns (result, launch_mock, stage_config) so callers can assert on the
     function's actual return value as well as whether/how dispatch proceeded.
     """
     mock_run = Mock()
     mock_run.id = 'run-repair-100'
+    mock_run.branch_name = None
+    mock_run.project_dir = None
+    mock_run.epic_id = None
+
+    async def _default_resolve_workspace(pipeline_run, github_integration, workspace_type):
+        # No parent (parent_issue_number=None) is resolve_epic_id()'s established
+        # lenient fallback, not a hard-fail (code review correction, issue #122):
+        # a genuinely standalone issue has no siblings to isolate FROM, so scoping
+        # a worktree by its own number is correct, not a degradation. Mirrors
+        # resolve_workspace()'s real behavior exactly.
+        effective_epic_id = parent_issue_number if parent_issue_number is not None else issue_number
+        pipeline_run.branch_name = f'feature/issue-{effective_epic_id}-epic'
+        pipeline_run.project_dir = f'/workspace/.orchestrator/worktrees/test-project/{effective_epic_id}'
+        pipeline_run.epic_id = str(effective_epic_id)
+        return pipeline_run
+
+    mock_resolve_workspace = AsyncMock(
+        side_effect=resolve_workspace_side_effect if resolve_workspace_side_effect is not None
+        else _default_resolve_workspace
+    )
 
     with patch('services.project_monitor.ConfigManager', return_value=mock_config_manager), \
          patch('config.state_manager.state_manager', mock_state_manager), \
@@ -127,19 +157,10 @@ def _run_start_repair_cycle(
          patch('services.project_monitor.subprocess.run') as mock_subprocess, \
          patch('services.project_monitor._launch_repair_cycle_container') as launch_mock, \
          patch('services.project_monitor._save_repair_cycle_context',
-               return_value='/workspace/switchyard/orchestrator_data/repair_cycles/test-project/100/context.json'), \
-         patch('services.feature_branch_manager.feature_branch_manager.get_parent_issue',
-               new_callable=AsyncMock) as mock_get_parent_issue, \
-         patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_branch_name',
-               return_value='feature/issue-42-epic') as mock_resolve_epic_branch, \
-         patch('services.project_workspace.workspace_manager.get_project_dir',
-               return_value=Path('/workspace/test-project')) as mock_get_project_dir:
-
-        mock_get_parent_issue.return_value = parent_issue_number
-        if get_project_dir_side_effect is not None:
-            mock_get_project_dir.side_effect = get_project_dir_side_effect
+               return_value='/workspace/switchyard/orchestrator_data/repair_cycles/test-project/100/context.json') as mock_save_context:
 
         mock_pipeline_mgr.return_value.get_or_create_pipeline_run.return_value = (mock_run, False)
+        mock_pipeline_mgr.return_value.resolve_workspace = mock_resolve_workspace
         mock_pipeline_mgr.return_value.end_phantom_pipeline_run.return_value = True
         mock_pipeline_mgr.return_value.end_pipeline_run.return_value = True
         if pipeline_manager_capture is not None:
@@ -170,6 +191,8 @@ def _run_start_repair_cycle(
             monitor_mutator(monitor)
 
         project_config = mock_config_manager.get_project_config('test-project')
+        if workspace_type_override is not None:
+            project_config.pipelines[0].workspace = workspace_type_override
         # test_configs building requires a real dict here (project_config is
         # otherwise a Mock) — without at least one test type, the function
         # returns None via the "no test configurations found" branch before
@@ -203,9 +226,8 @@ def _run_start_repair_cycle(
         )
 
         stage_config._epic_mocks = {
-            'get_parent_issue': mock_get_parent_issue,
-            'resolve_epic_branch_name': mock_resolve_epic_branch,
-            'get_project_dir': mock_get_project_dir,
+            'resolve_workspace': mock_resolve_workspace,
+            'save_context': mock_save_context,
         }
 
         return result, launch_mock, stage_config
@@ -410,14 +432,19 @@ class TestStealLockCallSiteWiring:
         launch_mock.assert_called_once()
 
 class TestEpicWorktreeResolution:
-    """Issue #46: _start_repair_cycle_for_issue must resolve the sub-issue's
-    parent epic and pass it through to workspace_manager.get_project_dir so
-    the repair cycle container mounts the epic's isolated worktree, not the
-    shared base clone. Repair cycles only exist for sdlc_execution
-    sub-issues, so (unlike agent_executor's generic dispatch path, which
-    also has to serve planning_design's directly-dispatched epics and
-    standalone issues) a missing parent here is a hard error, not a silent
-    self-scoped fallback -- see the second test below.
+    """Issue #46, updated by #119/WI-B: _start_repair_cycle_for_issue must
+    resolve the run's git branch and isolated epic worktree by calling
+    PipelineRunManager.resolve_workspace() against its pipeline_run, and
+    mount the container on whatever it resolves. Repair cycles only exist
+    for sdlc_execution sub-issues, so (unlike agent_executor's generic
+    dispatch path, which also has to serve planning_design's
+    directly-dispatched epics and standalone issues) resolve_workspace()
+    hard-fails when it can't resolve a parent epic for workspace_type ==
+    'issues' -- see the second test below. This call site no longer performs
+    or mocks any of the individual resolution steps (get_parent_issue,
+    resolve_epic_branch_name, get_or_create_epic_worktree) directly -- those
+    are resolve_workspace()'s own internals now, covered by
+    test_pipeline_run_workspace_resolver.py.
     """
 
     def _configure_no_competing_holder(self, mock_pipeline_lock_manager_auto):
@@ -425,7 +452,7 @@ class TestEpicWorktreeResolution:
         # navigate around.
         mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
 
-    def test_resolves_parent_epic_and_mounts_its_worktree(
+    def test_resolves_workspace_and_mounts_its_worktree(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
         mock_state_manager, mock_task_queue,
     ):
@@ -444,36 +471,114 @@ class TestEpicWorktreeResolution:
         launch_mock.assert_called_once()
 
         mocks = stage_config._epic_mocks
-        # Called exactly once, by this call site's own epic resolution. A final
-        # whole-PR review pass on #87 found and fixed a real bug where this used
-        # to ALSO be called a second time internally by prepare_feature_branch()
-        # (invoked later, "for issues workspace" branch prep) -- which resolved
-        # the SAME branch independently and tried to check it out on the shared
-        # base clone, conflicting with the epic worktree already checked out to
-        # it (git refuses -- "already used by worktree"). See
-        # TestSkipsRedundantPrepareFeatureBranchWhenEpicResolved below for the
-        # direct regression test.
-        mocks['get_parent_issue'].assert_awaited()
-        for call in mocks['get_parent_issue'].await_args_list:
-            assert call.args[1] == 100
+        # Called exactly once, against THIS run's pipeline_run and the
+        # 'issues' workspace_type -- resolve_workspace() is the single call
+        # this method now makes for branch/worktree resolution; there is no
+        # longer a second, independent resolution step of any kind further
+        # down this method to duplicate or conflict with it. A final whole-PR
+        # review pass on #87 found and fixed a real bug where the old
+        # per-step mocks were resolved a second time by
+        # prepare_feature_branch() (invoked later, in a "for issues
+        # workspace" branch-prep fallback) -- that whole fallback is gone as
+        # of WI-B (resolve_workspace() already guarantees a consistent
+        # branch/worktree). prepare_feature_branch() itself no longer exists
+        # at all as of #124/WI-E (removed as dead code, zero production
+        # callers), so there is nothing left to mock/assert-not-awaited here
+        # any more -- the old fallback's unreachability is now structural,
+        # not just runtime-verified.
+        mocks['resolve_workspace'].assert_awaited_once()
+        awaited_pipeline_run, _github_integration, workspace_type = mocks['resolve_workspace'].await_args.args
+        assert awaited_pipeline_run.id == 'run-repair-100'
+        assert workspace_type == 'issues'
 
-        # get_project_dir must be scoped to the PARENT epic (42), not the
-        # sub-issue's own number (100) -- this is what makes two sequential
-        # sub-issues of the same epic share one worktree.
-        mocks['resolve_epic_branch_name'].assert_called_once_with('test-project', '42')
-        mocks['get_project_dir'].assert_called_once_with(
-            'test-project', epic_id='42', branch_name='feature/issue-42-epic'
+        # project_dir/branch_name mounted into the container must be exactly
+        # what resolve_workspace() resolved onto pipeline_run -- scoped to the
+        # PARENT epic (42), not the sub-issue's own number (100) -- this is
+        # what makes two sequential sub-issues of the same epic share one
+        # worktree.
+        launch_mock.assert_called_once_with(
+            project_name='test-project',
+            issue_number=100,
+            pipeline_run_id='run-repair-100',
+            stage_name='Testing',
+            context_file='/workspace/switchyard/orchestrator_data/repair_cycles/test-project/100/context.json',
+            project_dir='/workspace/.orchestrator/worktrees/test-project/42',
         )
+        saved_context = mocks['save_context'].call_args.kwargs['context']
+        assert saved_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+        assert saved_context['branch_name'] == 'feature/issue-42-epic'
+        assert saved_context['epic_id'] == '42'
 
-    def test_aborts_without_launching_when_no_parent_epic_is_found(
+        # The redundant, conflicting base-clone checkout must never be
+        # attempted -- the "elif workspace_type == 'issues'" fallback that
+        # used to call this is gone (dead code once resolve_workspace()
+        # guarantees the branch/worktree, removed by WI-B), and the method it
+        # would have called, prepare_feature_branch(), no longer exists at all
+        # (#124/WI-E).
+
+    def test_hybrid_workspace_type_also_resolves_workspace_and_mounts_its_worktree(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
         mock_state_manager, mock_task_queue,
     ):
-        """A repair-cycle sub-issue with no resolvable parent must abort
-        rather than silently scope the worktree to its own issue number (the
-        planning_design/standalone-issue fallback used elsewhere) -- that
-        would defeat the cross-sub-issue isolation this migration exists to
-        deliver, for an issue this call site assumes is always a sub-issue.
+        """#122 (WI-C of #119): once ordinary dispatch's HybridWorkspaceContext
+        also resolves via resolve_workspace() instead of independently
+        checking out a branch on the shared base clone, restricting THIS call
+        site to 'issues' only (the #121-era behavior this replaces --
+        agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate used to
+        exclude 'hybrid' from isolation on the ordinary-dispatch side) would
+        flip the exact asymmetric-resolution collision #118/#119 exist to
+        eliminate onto 'hybrid' instead of 'issues': ordinary dispatch
+        isolating while repair-cycle didn't. Both sides isolate 'hybrid'
+        together now, so 'hybrid' dispatch here is byte-for-byte identical to
+        'issues' (test_resolves_workspace_and_mounts_its_worktree above)."""
+        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+            workspace_type_override='hybrid',
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+        mocks = stage_config._epic_mocks
+        mocks['resolve_workspace'].assert_awaited_once()
+        awaited_pipeline_run, _github_integration, workspace_type = mocks['resolve_workspace'].await_args.args
+        assert awaited_pipeline_run.id == 'run-repair-100'
+        assert workspace_type == 'hybrid'
+
+        launch_mock.assert_called_once_with(
+            project_name='test-project',
+            issue_number=100,
+            pipeline_run_id='run-repair-100',
+            stage_name='Testing',
+            context_file='/workspace/switchyard/orchestrator_data/repair_cycles/test-project/100/context.json',
+            project_dir='/workspace/.orchestrator/worktrees/test-project/42',
+        )
+        saved_context = mocks['save_context'].call_args.kwargs['context']
+        assert saved_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
+        assert saved_context['branch_name'] == 'feature/issue-42-epic'
+        assert saved_context['epic_id'] == '42'
+
+    def test_no_parent_epic_found_scopes_worktree_by_the_sub_issue_s_own_number(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Code review correction (issue #122): resolve_workspace() no longer
+        hard-fails for 'issues' on a missing parent -- environment_support ALSO
+        uses workspace_type == 'issues' for genuinely standalone tickets that
+        never have a parent by design, and that hard-fail broke every one of
+        its dispatches once ordinary dispatch started calling resolve_workspace()
+        unconditionally (#122). A sdlc_execution sub-issue missing its real
+        parent link is a genuinely anomalous state (structurally shouldn't
+        happen), but this call site tolerates it the same way rather than
+        aborting: scope the worktree by the sub-issue's own number, matching
+        resolve_epic_id()'s established lenient fallback. Launch proceeds.
         """
         self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
         mock_task_queue.redis_client.get.return_value = None
@@ -482,51 +587,15 @@ class TestEpicWorktreeResolution:
         result, launch_mock, stage_config = _run_start_repair_cycle(
             mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
             mock_state_manager, mock_task_queue,
+            issue_number=100,
             parent_issue_number=None,
         )
 
-        assert result is None
-        launch_mock.assert_not_called()
-        stage_config._epic_mocks['get_project_dir'].assert_not_called()
-
-
-class TestSkipsRedundantPrepareFeatureBranchWhenEpicResolved:
-    """Final whole-PR review pass on #87: once the epic worktree is resolved
-    and checked out (the common case for a repair-cycle sub-issue), the
-    "Prepare workspace branch for issues workspace" block must NOT also call
-    FeatureBranchManager.prepare_feature_branch() -- that call independently
-    resolves the same branch and checks it out on the shared BASE CLONE,
-    which git refuses once the epic worktree already has it checked out.
-    Previously silently caught by a broad except (no crash), but that also
-    silently discarded every one of prepare_feature_branch()'s other side
-    effects (sub-issue tracking, stale-branch escalation) for every
-    repair-cycle-dispatched sub-issue."""
-
-    def test_prepare_feature_branch_not_called_when_epic_resolves(
-        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-        mock_state_manager, mock_task_queue,
-    ):
-        mock_pipeline_lock_manager_auto.get_lock_fail_closed.return_value = (None, True)
-        mock_task_queue.redis_client.get.return_value = None
-        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
-
-        with patch(
-            'services.feature_branch_manager.feature_branch_manager.prepare_feature_branch',
-            new_callable=AsyncMock,
-        ) as mock_prepare_feature_branch:
-            result, launch_mock, stage_config = _run_start_repair_cycle(
-                mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-                mock_state_manager, mock_task_queue,
-                issue_number=100,
-                parent_issue_number=42,
-            )
-
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
-
-        # The redundant, conflicting base-clone checkout must never be attempted
-        # -- this is the actual regression this test exists to catch.
-        mock_prepare_feature_branch.assert_not_awaited()
+        saved_context = stage_config._epic_mocks['save_context'].call_args.kwargs['context']
+        assert saved_context['epic_id'] == '100'
+        assert saved_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/100'
 
 
 class TestPhantomRunCleanup:
@@ -744,7 +813,7 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
             mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
             mock_state_manager, mock_task_queue,
             pipeline_manager_capture=capture,
-            get_project_dir_side_effect=RuntimeError(
+            resolve_workspace_side_effect=RuntimeError(
                 "Failed to add worktree for existing branch feature/issue-42-epic: "
                 "fatal: 'feature/issue-42-epic' is already used by worktree at "
                 "'/workspace/test-project'"
@@ -778,43 +847,11 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
             mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
             mock_state_manager, mock_task_queue,
             pipeline_manager_capture=capture,
-            get_project_dir_side_effect=ValueError("something unrelated went wrong"),
+            resolve_workspace_side_effect=ValueError("something unrelated went wrong"),
         )
 
         assert result is None
         capture['manager'].end_pipeline_run.assert_not_called()
-
-    def test_no_parent_epic_found_hard_error_is_a_different_code_path_unaffected_by_this_fix(
-        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-        mock_state_manager, mock_task_queue,
-    ):
-        """Boundary check, not a regression test: the epic-id-resolution failure
-        handler (a separate, earlier except block for a genuinely non-retryable
-        error -- no parent epic exists at all) is intentionally untouched by this
-        fix and keeps its own existing immediate-retain behavior via
-        end_pipeline_run(outcome='failed'). Reached via parent_issue_number=None
-        instead of get_project_dir_side_effect -- a DIFFERENT code path from the
-        rest of this test class, still calling end_pipeline_run() as before."""
-        self._configure_no_competing_holder(mock_pipeline_lock_manager_auto)
-        mock_task_queue.redis_client.get.return_value = None
-        mock_pipeline_lock_manager_auto.steal_lock.return_value = (True, "acquired")
-        capture = {}
-
-        result, launch_mock, stage_config = _run_start_repair_cycle(
-            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-            mock_state_manager, mock_task_queue,
-            pipeline_manager_capture=capture,
-            parent_issue_number=None,
-        )
-
-        assert result is None
-        # Unlike the worktree-collision case above, this earlier handler still
-        # explicitly retains via outcome='failed' -- it's out of scope for this
-        # fix (see TestEpicWorktreeResolution.
-        # test_aborts_without_launching_when_no_parent_epic_is_found for its own
-        # dedicated coverage); asserting the call happened (not its outcome
-        # kwarg) is enough to show this test reached that different branch.
-        capture['manager'].end_pipeline_run.assert_called_once()
 
     def test_epic_worktree_collision_records_a_failure_outcome_for_the_retry_counter_to_see(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
@@ -849,7 +886,7 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
             mock_state_manager, mock_task_queue,
             issue_number=999001,
             pipeline_manager_capture=capture,
-            get_project_dir_side_effect=RuntimeError(
+            resolve_workspace_side_effect=RuntimeError(
                 "Failed to add worktree for existing branch feature/issue-42-epic: "
                 "fatal: 'feature/issue-42-epic' is already used by worktree at "
                 "'/workspace/test-project'"

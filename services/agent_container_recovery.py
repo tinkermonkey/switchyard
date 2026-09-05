@@ -1125,18 +1125,19 @@ class AgentContainerRecovery:
             board_name = None
             effective_run_id = run_id          # fallback to caller-supplied (may be truncated)
             agent_name = 'senior_software_engineer'
-            # epic_id/branch_name: needed so the eventual auto-commit (once this
-            # reconnected container finishes) resolves the SAME epic worktree the
-            # container was actually launched against, not the shared base clone.
-            # Found and fixed alongside #48's identical whitelist gap in
-            # _save_repair_cycle_context -- this is that same context.json, which
-            # already carries both fields; this path just never read them before.
-            # None here (context file missing/unreadable, or an old container
-            # started before #48 landed) falls back to _monitor_repair_cycle_
-            # container's own base-clone-resolving default -- pre-#46 behavior,
-            # not a new failure mode.
-            epic_id = None
-            epic_branch_name = None
+            # project_dir: needed so the eventual auto-commit (once this
+            # reconnected container finishes) resolves the SAME directory the
+            # container was actually launched against, not an independent
+            # re-derivation (issue #123, WI-D of #119 -- this replaces the
+            # epic_id/branch_name fields this path used to thread through).
+            # context.json carries it (_save_repair_cycle_context writes
+            # pipeline_run.project_dir into it). None here (context file
+            # missing/unreadable, or an old container started before this field
+            # existed) falls back to _monitor_repair_cycle_container's own
+            # default (project_dir=None; that path's own auto-commit then has
+            # nothing to resolve from and will fail loudly rather than silently
+            # guessing the wrong directory).
+            project_dir = None
 
             if context_file.exists():
                 try:
@@ -1146,13 +1147,12 @@ class AgentContainerRecovery:
                     board_name = saved_context.get('board')
                     effective_run_id = saved_context.get('pipeline_run_id') or run_id
                     agent_name = saved_context.get('agent_name') or agent_name
-                    epic_id = saved_context.get('epic_id')
-                    epic_branch_name = saved_context.get('branch_name')
+                    project_dir = saved_context.get('project_dir')
 
                     logger.info(
                         f"Loaded reconnect context from file: board={board_name}, "
                         f"run_id={effective_run_id}, agent={agent_name}, "
-                        f"epic_id={epic_id}"
+                        f"project_dir={project_dir}"
                     )
                 except Exception as e:
                     logger.warning(f"Could not load context file, falling back to heuristics: {e}")
@@ -1205,8 +1205,7 @@ class AgentContainerRecovery:
                 workflow_template=workflow_template,
                 agent_name=agent_name,
                 pipeline_run_id=effective_run_id,
-                epic_id=epic_id,
-                epic_branch_name=epic_branch_name
+                project_dir=project_dir
             )
 
             logger.info(f"✓ Reconnected to repair cycle container: {container_name}")
@@ -1682,21 +1681,57 @@ class AgentContainerRecovery:
                 logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
                 from services.auto_commit import auto_commit_service
 
+                # The SAME directory the repair-cycle container actually mounted and
+                # worked in (an epic worktree, for 'issues' workspace type) --
+                # context.json carries this (project_monitor.py's
+                # _save_repair_cycle_context writes pipeline_run.project_dir into it;
+                # issue #123, WI-D of #119 -- commit_agent_changes() no longer
+                # re-derives it independently via epic_id/branch_name).
+                repair_cycle_project_dir = context.get('project_dir')
+                if not repair_cycle_project_dir:
+                    raise ValueError(
+                        f"context.json for {project}/#{issue_number} has no project_dir -- "
+                        "cannot auto-commit without knowing which directory the repair "
+                        "cycle container actually worked in."
+                    )
+
+                # Best-effort re-registration into ProjectWorkspaceManager's in-memory
+                # _epic_worktrees tracking (code review finding, issue #124): reading
+                # project_dir straight from context.json, rather than through
+                # get_or_create_epic_worktree()'s adopt-on-restart path, means this
+                # worktree is otherwise never re-registered after an orchestrator
+                # restart. Without that, main.py's startup prune_epic_worktrees() sweep
+                # sees an untracked, no-container-running worktree and force-removes it
+                # right after this recovery uses it -- if the commit below also can't
+                # push (e.g. the same restart that triggered recovery also lost
+                # connectivity), the just-completed repair-cycle fix would be
+                # permanently lost. Failure here must not block the actual commit
+                # attempt above/below it -- it's a tracking side effect, not required
+                # for correctness of this commit itself.
+                epic_id_for_recovery = context.get('epic_id')
+                branch_name_for_recovery = context.get('branch_name')
+                if epic_id_for_recovery and branch_name_for_recovery:
+                    try:
+                        from services.project_workspace import workspace_manager
+                        workspace_manager.get_or_create_epic_worktree(
+                            project, epic_id_for_recovery, branch_name_for_recovery
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Could not re-register epic worktree for {project}/#{issue_number} "
+                            f"into in-memory tracking after restart recovery: {e}. The startup "
+                            "prune sweep may remove this worktree if it can't push below."
+                        )
+
                 def do_commit():
                     return asyncio.run(
                         auto_commit_service.commit_agent_changes(
                             project=project,
                             agent='repair_cycle',
                             task_id=f'repair_cycle_{issue_number}',
+                            project_dir=repair_cycle_project_dir,
                             issue_number=issue_number,
                             custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
-                            # Match the mount source the repair-cycle container actually
-                            # used (an epic worktree, for 'issues' workspace type -- see
-                            # #48/auto_commit.py's docstring). context.json now carries
-                            # these (project_monitor.py's _save_repair_cycle_context was
-                            # fixed alongside this to forward them).
-                            epic_id=context.get('epic_id'),
-                            branch_name=context.get('branch_name')
                         )
                     )
 

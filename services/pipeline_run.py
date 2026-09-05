@@ -5,6 +5,7 @@ Tracks the lifecycle of an issue's journey through the workflow pipeline.
 All observability events and logs are tagged with pipeline_run_id for traceability.
 """
 
+import asyncio
 import logging
 import redis
 import json
@@ -132,6 +133,9 @@ class PipelineRun:
     discussion_id: Optional[str] = None  # GitHub discussion node ID for context continuity
     outcome: Optional[str] = None  # success, failed, or None for unknown
     context_dir: Optional[str] = None  # Path to pipeline context directory on host volume
+    branch_name: Optional[str] = None  # Git branch resolved for this run by resolve_workspace() (issue #120)
+    project_dir: Optional[str] = None  # Epic worktree path resolved by resolve_workspace() (issue #120) -- resolve_workspace() always creates/adopts an epic worktree for the workspace types it handles; never a shared base-clone path
+    epic_id: Optional[str] = None  # Epic id resolve_workspace() scoped project_dir's worktree by (issue #121 review) -- lets callers read it directly instead of reverse-engineering it from project_dir's path layout
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for storage"""
@@ -361,12 +365,14 @@ class PipelineRunManager:
 
         return pipeline_run
 
-    def update_context_dir(self, pipeline_run: 'PipelineRun') -> None:
+    def _persist_run_update(self, pipeline_run: 'PipelineRun') -> None:
         """
-        Persist an updated context_dir field back to Redis and Elasticsearch.
-
-        Called after the pipeline context directory is created so that subsequent
-        task lookups (including feedback tasks) can find the directory path.
+        Shared write-through: save the run's current full state to Redis and
+        Elasticsearch. Extracted (code review, issue #120) so update_context_dir()
+        and update_resolved_workspace() -- which both save the whole run after a
+        single field changes -- share one persistence path instead of drifting
+        independently. create_pipeline_run()'s own initial-write copy is left
+        separate (a bigger, separately-established method, out of this item's scope).
         """
         redis_key = self._get_redis_key(pipeline_run.id)
         self.redis.setex(
@@ -375,9 +381,226 @@ class PipelineRunManager:
             json.dumps(pipeline_run.to_dict())
         )
         self._persist_to_elasticsearch(pipeline_run)
+
+    def update_context_dir(self, pipeline_run: 'PipelineRun') -> None:
+        """
+        Persist an updated context_dir field back to Redis and Elasticsearch.
+
+        Called after the pipeline context directory is created so that subsequent
+        task lookups (including feedback tasks) can find the directory path.
+        """
+        self._persist_run_update(pipeline_run)
         logger.debug(
             f"Updated context_dir for pipeline run {pipeline_run.id}: {pipeline_run.context_dir}"
         )
+
+    def update_resolved_workspace(self, pipeline_run: 'PipelineRun') -> None:
+        """
+        Persist resolved branch_name/project_dir fields back to Redis and Elasticsearch.
+
+        Called by resolve_workspace() once the epic branch/worktree decision is made,
+        so a later idempotent call of resolve_workspace() (or any other lookup) for
+        the same run sees the persisted values instead of re-resolving.
+        """
+        self._persist_run_update(pipeline_run)
+        logger.debug(
+            f"Updated resolved workspace for pipeline run {pipeline_run.id}: "
+            f"branch_name={pipeline_run.branch_name}, project_dir={pipeline_run.project_dir}"
+        )
+
+    async def resolve_workspace(
+        self,
+        pipeline_run: 'PipelineRun',
+        github_integration,
+        workspace_type: str,
+    ) -> 'PipelineRun':
+        """
+        Resolve (and persist) the git branch and isolated epic worktree this
+        pipeline run's work should land on.
+
+        Introduced as purely additive infrastructure (issue #120, WI-A of #119):
+        the single canonical branch/worktree decision meant to replace the two
+        independent algorithms that used to exist -- FeatureBranchManager.
+        find_related_branches() (ordinary 'issues'/'hybrid' dispatch's
+        prepare_feature_branch(), checking out on the shared base clone) and
+        resolve_epic_branch_name()/get_or_create_epic_worktree() (the repair-cycle
+        path in project_monitor.py). Both are now wired to this method instead:
+        project_monitor.py's repair-cycle dispatch (#121, WI-B) and ordinary
+        'issues'/'hybrid' dispatch via IssuesWorkspaceContext/HybridWorkspaceContext
+        (#122, WI-C) -- the latter no longer calls prepare_feature_branch() at all.
+        prepare_feature_branch()/find_related_branches() themselves were removed
+        outright once confirmed to have zero production callers left (#124/WI-E) --
+        the references below describe what this method's resolution order
+        deliberately does NOT reproduce from that removed algorithm, not a live
+        call site.
+
+        Scoped to 'issues'/'hybrid' workspace types only; any other workspace_type
+        is a no-op that returns pipeline_run unchanged ('discussions' is git-free).
+
+        Idempotent: once pipeline_run.branch_name, pipeline_run.project_dir, AND
+        pipeline_run.epic_id are all already set (e.g. a second call against an
+        already-resolved run), returns immediately without touching git or
+        GitHub again.
+
+        Resolution order:
+        1. Resolve the epic id via FeatureBranchManager.resolve_epic_id() -- the
+           issue's parent, or its own number when it has no parent (safe: a
+           standalone issue has no siblings to isolate FROM, so scoping a worktree
+           by its own number is simply correct, not a degradation). Uniform across
+           'issues' and 'hybrid' (code review correction, issue #122): an earlier
+           version of this method hard-failed on no resolvable parent for
+           workspace_type == 'issues' specifically, reasoning that sdlc_execution's
+           sub-issues always have a parent epic by construction -- true of
+           sdlc_execution, but NOT of 'issues' as a workspace type in general:
+           environment_support also declares workspace: "issues"
+           (config/foundations/pipelines.yaml) for genuinely standalone tickets that
+           are never sub-issues of anything. That wrongly-generalized invariant broke
+           every environment_support dispatch once ordinary dispatch started calling
+           this method unconditionally (#122) rather than only repair-cycle's
+           always-sdlc_execution call site (#121).
+        2. Look up an already-established branch for that epic via
+           resolve_epic_branch_name() (cache, then a git branch listing keyed on
+           the epic id) -- covers the exact-issue, parent-issue, and cached match
+           tiers of find_related_branches() in one lookup, since epic_id already
+           IS the number those tiers match against.
+        3. If nothing exists yet, the single authoritative fallback name:
+           create_feature_branch_name(). find_related_branches()'s
+           semantic-similarity guess (its 4th, weakest tier) is deliberately not
+           consulted here.
+        4. Get-or-create the epic's isolated worktree for that branch via
+           ProjectWorkspaceManager.get_or_create_epic_worktree().
+
+        Args:
+            pipeline_run: The run to resolve a workspace for. Mutated in place
+                with branch_name/project_dir/epic_id and saved back to Redis/Elasticsearch.
+            github_integration: GitHubIntegration instance used to resolve the
+                parent issue (see FeatureBranchManager.get_parent_issue).
+            workspace_type: The dispatch's workspace type ('issues', 'hybrid',
+                'discussions', ...). Only 'issues'/'hybrid' are resolved.
+
+        Returns:
+            pipeline_run, with branch_name/project_dir/epic_id populated for 'issues'/
+            'hybrid' runs (unchanged for any other workspace_type).
+
+        Raises:
+            ValueError: The project has no base clone to source the worktree from
+                (resolve_epic_id() itself never raises -- it always resolves to
+                either the real parent or the issue's own number).
+            RuntimeError: The underlying git worktree add command failed.
+
+        This method deliberately does not swallow either exception itself -- a caller
+        wiring this into real dispatch must let them reach whatever failure handling
+        keeps a pipeline run/lock from getting stuck (the bug an earlier version of this
+        logic, project_monitor.py's _resolve_epic_worktree_target(), was fixed for after
+        leaving pipeline locks stuck forever on an unhandled failure). That does NOT
+        require distinguishing ValueError from RuntimeError, or handling either
+        specially: propagating both to one generic outer exception handler -- this
+        codebase's established uniform retry/escalation pattern (see
+        count_consecutive_failures()/MAX_CONSECUTIVE_DISPATCH_FAILURES), rather than
+        special-casing errors that merely look permanent for immediate termination -- is
+        a correct, intended way to satisfy this contract, and is what this method's
+        production callers (project_monitor.py's repair-cycle dispatch, and
+        agent_executor.py's epic-resolution block for ordinary 'issues'/'hybrid'
+        dispatch) do.
+        """
+        if workspace_type not in ('issues', 'hybrid'):
+            return pipeline_run
+
+        if pipeline_run.branch_name and pipeline_run.project_dir and pipeline_run.epic_id:
+            logger.debug(
+                f"Workspace already resolved for pipeline run {pipeline_run.id}: "
+                f"branch_name={pipeline_run.branch_name}, "
+                f"project_dir={pipeline_run.project_dir}, epic_id={pipeline_run.epic_id}"
+            )
+            return pipeline_run
+
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import workspace_manager
+
+        # Code review correction (issue #122): this used to hard-fail on no
+        # resolvable parent for workspace_type == 'issues', reasoning that
+        # "'issues' sub-issues always have a parent epic by construction." That's
+        # true of sdlc_execution's sub-issues specifically -- NOT of 'issues' as a
+        # workspace type in general: environment_support ALSO declares
+        # workspace: "issues" (config/foundations/pipelines.yaml) for genuinely
+        # standalone tickets (Dockerfile fixes, dependency troubleshooting) that
+        # are never sub-issues of anything. Once ordinary dispatch started calling
+        # this method unconditionally for every 'issues'-workspace pipeline (#122,
+        # not just sdlc_execution's repair-cycle path, #121's only caller when this
+        # hard-fail was written), that wrongly-generalized invariant broke every
+        # environment_support dispatch. Use resolve_epic_id()'s lenient fallback
+        # (the issue's own number when it has no parent) for BOTH 'issues' and
+        # 'hybrid' uniformly -- safe even for sdlc_execution: a genuinely standalone
+        # issue has no siblings to isolate FROM, so scoping a worktree by its own
+        # number is simply correct, not a degradation. An sdlc_execution sub-issue
+        # missing its real parent link (a genuinely anomalous, not normal, state)
+        # would fall back the same way rather than hard-failing -- an acceptable
+        # trade for not breaking every environment_support dispatch; project_monitor.py's
+        # repair-cycle call site can layer its own stricter check if that anomaly
+        # ever needs distinct handling.
+        epic_id = await feature_branch_manager.resolve_epic_id(
+            github_integration, pipeline_run.issue_number, project=pipeline_run.project
+            )
+
+        # resolve_epic_branch_name() and get_or_create_epic_worktree() are both
+        # synchronous and can do blocking git subprocess work (a branch listing;
+        # git fetch/worktree add for a cold epic). Run them off the event loop
+        # thread so they can't stall other coroutines scheduled on it -- same
+        # precaution agent_executor.py's near-identical resolution already takes,
+        # for the same reason.
+        branch_name = await asyncio.to_thread(
+            feature_branch_manager.resolve_epic_branch_name, pipeline_run.project, epic_id
+        )
+        if not branch_name:
+            branch_name = feature_branch_manager.create_feature_branch_name(int(epic_id), "")
+
+        project_dir = await asyncio.to_thread(
+            workspace_manager.get_or_create_epic_worktree, pipeline_run.project, epic_id, branch_name
+        )
+
+        # get_or_create_epic_worktree() can silently adopt a pre-existing worktree that's
+        # actually on a different branch than branch_name requested (e.g. after an
+        # orchestrator restart with an empty in-memory cache -- see its own "Adopting
+        # pre-existing epic worktree" warning). It logs that mismatch internally but only
+        # returns a bare Path, not the branch it actually settled on. Re-derive the real
+        # branch directly from the worktree, using the same best-effort check
+        # get_or_create_epic_worktree() itself uses internally, rather than trusting the
+        # locally-resolved branch_name blindly -- persisting a branch_name that doesn't
+        # match what's actually checked out at project_dir would silently mis-target any
+        # later git push/PR-base operation that trusts this field.
+        actual_branch = await asyncio.to_thread(
+            workspace_manager._current_worktree_branch, project_dir
+        )
+        if actual_branch and actual_branch != branch_name:
+            logger.warning(
+                f"Resolved branch_name={branch_name!r} for pipeline run {pipeline_run.id} "
+                f"but the epic worktree at {project_dir} is actually on {actual_branch!r} -- "
+                "persisting the worktree's real branch instead."
+            )
+            branch_name = actual_branch
+
+        pipeline_run.branch_name = branch_name
+        pipeline_run.project_dir = str(project_dir)
+        pipeline_run.epic_id = epic_id
+        try:
+            self.update_resolved_workspace(pipeline_run)
+        except Exception:
+            # Revert the in-memory mutation on a persistence failure -- otherwise a
+            # caller that catches this and retries resolve_workspace() against the
+            # SAME pipeline_run object hits the idempotency guard above (both fields
+            # already look set) and returns immediately without ever actually
+            # persisting, silently losing the resolution forever.
+            pipeline_run.branch_name = None
+            pipeline_run.project_dir = None
+            pipeline_run.epic_id = None
+            raise
+
+        logger.info(
+            f"Resolved workspace for pipeline run {pipeline_run.id} "
+            f"({pipeline_run.project} epic #{pipeline_run.epic_id}): branch_name={branch_name}, "
+            f"project_dir={pipeline_run.project_dir}"
+        )
+        return pipeline_run
 
     def get_recent_pipeline_run_id(
         self,

@@ -87,18 +87,20 @@ def _save_repair_cycle_context(
         'pipeline_run_id': context.get('pipeline_run_id'),
         'project_dir': context.get('project_dir'),  # Keep original project_dir path
         'epic_id': context.get('epic_id'),
-        # NOTE (#48 review): this 'branch_name' is stage_context['branch_name'], set
-        # later in _start_repair_cycle_for_issue() by prepare_feature_branch()'s
-        # SUB-ISSUE-scoped branch resolution -- which can legitimately differ from
-        # epic_branch_name (used to actually create this epic's worktree a few lines
-        # earlier, via resolve_epic_branch_name()/create_feature_branch_name()). A
-        # mismatch here is harmless for its actual consumer today: agent_container_
-        # recovery.py's restart-recovery auto-commit only uses this as an advisory
-        # hint on a cache-miss adoption of an ALREADY-EXISTING worktree
-        # (ProjectWorkspaceManager.get_or_create_epic_worktree() reads the worktree's
-        # real on-disk branch and only warns, never acts, on a mismatch). Still worth
-        # unifying properly if/when #48's deferred FeatureBranchManager reconciliation
-        # lands, rather than relying on that adoption-path safety net indefinitely.
+        # NOTE (#48 review, updated by #119/WI-B): this 'branch_name' is
+        # stage_context['branch_name'], set in _start_repair_cycle_for_issue()
+        # from pipeline_run.branch_name -- the same value
+        # PipelineRunManager.resolve_workspace() uses to create/adopt this
+        # epic's worktree, via the same call. Pre-WI-B, this could legitimately
+        # diverge from the worktree's actual branch (prepare_feature_branch()'s
+        # own independent sub-issue-scoped resolution set this field
+        # separately from epic-worktree creation); resolve_workspace() removed
+        # that separate resolution path, so the two cannot disagree on a fresh
+        # resolution. Not an absolute guarantee across time, though: resolve_
+        # workspace()'s idempotency guard skips re-verifying the on-disk branch
+        # on a later call against an already-resolved run, so a persisted
+        # branch_name could still go stale if the worktree's actual branch were
+        # ever changed externally between resolutions.
         'branch_name': context.get('branch_name'),
         'use_docker': True,
         'task_id': context.get('task_id'),
@@ -5119,21 +5121,18 @@ _Review cycle initiated by Switchyard_
                         from services.git_workflow_manager import git_workflow_manager
                         from services.project_workspace import workspace_manager
 
-                        # INTENTIONALLY base-clone-scoped, not migrated to
-                        # epic-worktree resolution (#48). create_or_update_pr()
-                        # itself is checkout-free (it only runs `gh pr create
-                        # --head <branch>` with this dir as cwd, referencing the
-                        # already-pushed remote branch by name -- no local checkout
-                        # of that branch is required), but this call only ever
-                        # fires for pipeline.workspace == 'issues', which
-                        # agent_executor.py's EPIC_WORKTREE_SAFE_WORKSPACE_TYPES
-                        # gate excludes from epic-worktree resolution (#46): for
-                        # 'issues', FeatureBranchManager.prepare_feature_branch()
-                        # still independently resolves and checks out its own
-                        # branch on this same base clone elsewhere in this
-                        # dispatch. Scoping just this read to an epic worktree
-                        # would be inconsistent with that -- and gains nothing,
-                        # since gh doesn't need local branch content anyway.
+                        # INTENTIONALLY base-clone-scoped (audited, issue #123):
+                        # create_or_update_pr() itself is checkout-free (it only
+                        # runs `gh pr create --head <branch>` with this dir as
+                        # cwd, referencing the already-pushed remote branch by
+                        # name -- no local checkout of that branch, or any
+                        # particular directory at all, is required). Any git repo
+                        # for this project pointed at the right GitHub remote
+                        # works identically here, so there is nothing to gain
+                        # from threading the resolved epic worktree through to
+                        # this one `gh` invocation -- unlike this file's git-
+                        # mutating call sites (repair-cycle dispatch, #121),
+                        # which DO now read pipeline_run.project_dir.
                         project_dir = workspace_manager.get_project_dir(project_name)
 
                         pr_result = loop.run_until_complete(
@@ -5628,16 +5627,23 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         workflow_template,
         agent_name: str,
         pipeline_run_id: Optional[str] = None,
-        epic_id: Optional[str] = None,
-        epic_branch_name: Optional[str] = None
+        project_dir: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
-        
+
         Runs in background thread, waits for container to finish, then:
         - Posts summary comment
         - Auto-advances if successful
         - Records execution outcome
+
+        Args:
+            project_dir: The SAME directory the repair-cycle container actually
+                mounted and worked in (pipeline_run.project_dir, resolved by
+                resolve_workspace() before the container was launched) -- passed
+                straight through to commit_agent_changes() below rather than
+                that method re-deriving it independently via epic_id/branch_name
+                (issue #123, WI-D of #119).
         """
         import threading
         import subprocess
@@ -5900,10 +5906,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 project=project_name,
                                 agent='repair_cycle',
                                 task_id=f'repair_cycle_{issue_number}',
+                                project_dir=project_dir,
                                 issue_number=issue_number,
                                 custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
-                                epic_id=epic_id,
-                                branch_name=epic_branch_name
                             )
                         )
                         
@@ -6616,21 +6621,27 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 (duplicate container, lock-state-unknown, locked-by-another-repair-
                 cycle, no test configs), and on the "superseded, not reused" case
                 right after it. Once get_or_create_pipeline_run() resolves the real
-                run, `_owned_is_real_run` is set — several specific failure handlers
-                after that point (steal_lock() failure, epic-id-resolution failure,
-                context-save failure, container-launch failure — see each one's own
-                comment for its exact call, since they aren't all identical: not
-                every one passes `board=`, and retain-vs-release policy varies) still
-                call end_pipeline_run() directly, never _end_owned_run_if_pending(),
-                because only end_pipeline_run() knows how to release a lock
-                steal_lock() may have already acquired. This list is illustrative,
-                not exhaustive by construction — check the actual call sites, not
-                just this comment, before assuming a given failure's lock behavior.
-                The generic outer except (anything with nothing more specific to do)
-                is the one exception to that: it deliberately does NOT end the run —
-                see its own comment for why (a repeated collision here releasing the
-                lock every failed attempt was a real, live production bug — #87
-                follow-up).
+                run, `_owned_is_real_run` is set — a couple of specific failure
+                handlers after that point (steal_lock() failure, context-save
+                failure, container-launch failure — see each one's own comment for
+                its exact call, since they aren't all identical: not every one
+                passes `board=`) still call end_pipeline_run() directly, never
+                _end_owned_run_if_pending(), because only end_pipeline_run() knows
+                how to release a lock steal_lock() may have already acquired. This
+                list is illustrative, not exhaustive by construction — check the
+                actual call sites, not just this comment, before assuming a given
+                failure's lock behavior. Workspace-resolution failure (resolve_workspace()
+                raising — no parent epic, or a worktree add failure) is deliberately
+                NOT one of these dedicated handlers as of #119/WI-B: it used to be
+                (an immediate end_pipeline_run(outcome='failed') on no-parent-epic
+                specifically), but that duplicated resolve_workspace()'s own
+                well-tested failure contract with a second, independent policy
+                decision here. It now falls through to the generic outer except
+                below like any other startup failure. The generic outer except
+                (anything with nothing more specific to do) deliberately does NOT
+                end the run — see its own comment for why (a repeated collision
+                here releasing the lock every failed attempt was a real, live
+                production bug — #87 follow-up).
         """
         # Imported here (not at module level, matching this file's other local
         # imports) but hoisted to the TOP of this method rather than closer to
@@ -6943,103 +6954,163 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             )
 
             # Build context for stage execution
-            from services.project_workspace import workspace_manager
-            from services.feature_branch_manager import feature_branch_manager
             from services.github_integration import GitHubIntegration
             from monitoring.observability import get_observability_manager
             import concurrent.futures
 
             obs = get_observability_manager()
 
-            # Resolve the epic (parent issue) BEFORE computing project_dir, so the
-            # repair cycle container mounts the epic's isolated worktree instead of
-            # the shared base clone. The repair_cycle stage only exists in the
-            # sdlc_execution pipeline template, so every issue reaching this
-            # function is a sub-issue of a parent epic -- unlike the generic
-            # agent_executor dispatch path (which also has to serve
-            # planning_design's directly-dispatched epics and standalone issues),
-            # a missing parent here is a real error: silently scoping the worktree
-            # to this sub-issue's own number instead would silently defeat the
-            # cross-sub-issue isolation this migration exists to deliver.
-            epic_id = None
-            epic_branch_name = None
-            github = None
-            if workspace_type == 'issues':
+            # Resolve this run's git branch and isolated epic worktree via the
+            # centralized resolver (PipelineRunManager.resolve_workspace(),
+            # issue #120 / WI-A of #119) instead of this method's own
+            # epic-id/branch resolution + get_or_create_epic_worktree() call
+            # (the _resolve_epic_worktree_target() closure this replaces, and
+            # the "epic worktree already exists, skip prepare_feature_branch's
+            # redundant checkout" special-casing that used to follow it, are
+            # both gone -- resolve_workspace() already guarantees the branch/
+            # worktree are consistent, so there's nothing left to special-case
+            # around here). resolve_workspace() is the SAME logic that used to
+            # live in _resolve_epic_worktree_target(), centralized -- but NOT
+            # including its original hard-fail on no resolvable parent epic:
+            # that was found to be wrongly scoped (a #122 code review
+            # correction -- true of sdlc_execution specifically, not of
+            # 'issues' as a workspace type in general, since environment_support
+            # also uses 'issues' for genuinely standalone tickets) and replaced
+            # with resolve_epic_id()'s lenient own-number fallback, uniformly
+            # for 'issues'/'hybrid' (see resolve_workspace()'s own docstring).
+            #
+            # Reachability of "pipeline_run has no resolved workspace yet" by
+            # the time this method runs (e.g. a card manually dragged straight
+            # to `testing`, bypassing `implementation`): board dispatch
+            # (trigger_agent_for_status) routes purely on the ISSUE'S CURRENT
+            # COLUMN via stage_mapping -> stage_type == 'repair_cycle' -- it
+            # never checks whether an earlier stage actually ran for this
+            # pipeline_run first, and get_or_create_pipeline_run() above will
+            # happily hand this method a run created by (or already active
+            # from) any prior column. So yes, that scenario is genuinely
+            # reachable -- RE-CONFIRMED (#124/WI-E, #119) by independently
+            # re-tracing trigger_agent_for_status()'s column -> stage_mapping ->
+            # pipeline_template.stages -> stage_type == 'repair_cycle' dispatch:
+            # nothing gates it on prior stage history, and a GitHub Projects
+            # card can be moved to any column at any time (human drag, or the
+            # GraphQL API directly), not just via this orchestrator's own
+            # designed column progression. It is NOT, however, a failure mode:
+            # resolve_workspace() is built for exactly this -- it performs the
+            # resolution itself when unresolved (identical to what this method
+            # used to do inline), and no-ops when a prior call already resolved
+            # it. As of #122 (WI-C of #119), `implementation` DOES also call
+            # resolve_workspace() now (agent_executor.py's epic-resolution
+            # block, for ordinary 'issues'/'hybrid' dispatch) -- whichever
+            # stage reaches it first does the real resolution, and every
+            # subsequent call from either stage against the same pipeline_run
+            # (a retried repair-cycle attempt, `implementation` running before
+            # or after `testing`, ...) is a cheap idempotent no-op reading back
+            # the same answer. It only fails loudly -- a ValueError that
+            # propagates out of this method to its own outer except block,
+            # deliberately not caught here -- when there's genuinely no parent
+            # epic to scope isolation by; that case must never be silently
+            # improvised around.
+            #
+            # Test coverage for the "repair-cycle is the FIRST resolution
+            # attempt" case specifically (not just "already resolved by an
+            # earlier stage"): tests/unit/services/test_pipeline_run_workspace_resolver.py's
+            # TestResolveWorkspaceColdStart (and every other class there
+            # besides TestResolveWorkspaceIdempotent) exercises
+            # resolve_workspace() against a freshly-constructed, wholly
+            # unresolved PipelineRun -- resolve_workspace() has no branching
+            # logic keyed on which caller reaches it first, so this covers
+            # repair-cycle being first exactly as much as it covers
+            # `implementation` being first. tests/unit/orchestrator/
+            # test_repair_cycle_lock_steal.py's TestEpicWorktreeResolution
+            # tests (mock_run.branch_name/project_dir/epic_id all start as
+            # None) confirm THIS call site reaches resolve_workspace() with
+            # exactly such an unresolved run, end to end.
+            if workspace_type in ('issues', 'hybrid'):
+                # resolve_workspace() is scoped to 'issues'/'hybrid' (WI-A,
+                # #120's own docstring), and by #122 (WI-C of #119) ordinary
+                # dispatch's IssuesWorkspaceContext/HybridWorkspaceContext now
+                # resolve via this exact same resolver for both -- the
+                # asymmetry that used to justify restricting this call to
+                # 'issues' only (agent_executor.py's now-removed
+                # EPIC_WORKTREE_SAFE_WORKSPACE_TYPES gate excluded 'hybrid'
+                # from isolation on the ordinary-dispatch side, because
+                # prepare_feature_branch() checked out the epic branch on the
+                # shared base clone there) is gone: both sides isolate 'hybrid'
+                # together now, so restricting it here would only reintroduce
+                # the same asymmetric-resolution collision #118/#119 exist to
+                # eliminate, just flipped onto 'hybrid' instead of 'issues'.
                 github = GitHubIntegration(
                     repo_owner=project_config.github['org'],
                     repo_name=repository
                 )
-
-                async def _resolve_epic_worktree_target():
-                    parent_issue = await feature_branch_manager.get_parent_issue(
-                        github, issue_number, project=project_name
-                    )
-                    if not parent_issue:
-                        raise ValueError(
-                            f"Repair cycle for {project_name}/#{issue_number} could not "
-                            f"resolve a parent epic issue via GitHub's structured "
-                            f"sub-issue API. sdlc_execution sub-issues must have a "
-                            f"parent to scope an isolated worktree by."
-                        )
-                    eid = str(parent_issue)
-                    existing_branch = feature_branch_manager.resolve_epic_branch_name(project_name, eid)
-                    ebranch = existing_branch or feature_branch_manager.create_feature_branch_name(parent_issue, "")
-                    return eid, ebranch
-
-                # Handle both running-loop and no-loop contexts, same pattern used
-                # by the feature-branch preparation call below.
+                # Handle both running-loop and no-loop contexts, same pattern
+                # used by the feature-branch preparation call this replaces --
+                # a fresh resolve_workspace() call in each branch (NOT a
+                # coroutine built once and reused across both): asyncio.run()
+                # cannot re-await an already-consumed coroutine, and reusing
+                # one here would mask a genuine RuntimeError raised BY
+                # resolve_workspace() itself (its documented "worktree add
+                # failed" failure mode) as a confusing "cannot reuse already
+                # awaited coroutine" error from the fallback branch instead.
+                # Isolate the "is a loop already running" check into its own
+                # try/except -- it must catch ONLY asyncio.get_running_loop()'s
+                # own RuntimeError, never one raised BY resolve_workspace()
+                # itself (its documented "worktree add failed" failure mode)
+                # propagating out of pool.submit(...).result() below. Both are
+                # plain RuntimeError, so a single try wrapping both calls would
+                # catch a genuine resolution failure here too, and then mask
+                # it entirely by re-raising a second, unrelated "asyncio.run()
+                # cannot be called from a running event loop" error instead.
                 try:
-                    try:
-                        asyncio.get_running_loop()
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            epic_id, epic_branch_name = pool.submit(
-                                asyncio.run, _resolve_epic_worktree_target()
-                            ).result()
-                    except RuntimeError:
-                        epic_id, epic_branch_name = asyncio.run(_resolve_epic_worktree_target())
-                except Exception as e:
-                    logger.error(
-                        f"Failed to resolve epic worktree target for repair cycle on "
-                        f"issue #{issue_number}: {e}. Refusing to fall back to the "
-                        f"shared base clone -- aborting repair cycle launch.",
-                        exc_info=True
-                    )
-                    # This runs AFTER steal_lock() already succeeded and a pipeline run
-                    # was created above -- without explicitly ending that run, the lock
-                    # stays claimed and the run stays active forever (this board's only
-                    # other recovery paths -- _reconcile_active_runs at startup, and the
-                    # periodic FAILSAFE sweep -- both explicitly skip locked boards).
-                    # Mirrors the existing container-launch-failure cleanup below.
-                    try:
-                        self.pipeline_run_manager.end_pipeline_run(
-                            project=project_name,
-                            issue_number=issue_number,
-                            reason=f"Failed to resolve epic worktree target: {e}",
-                            outcome='failed'
-                        )
-                    except Exception as cleanup_e:
-                        logger.error(
-                            f"Failed to end pipeline run after epic resolution failure: {cleanup_e}"
-                        )
-                    try:
-                        # work_execution_tracker imported at the top of this method now.
-                        work_execution_tracker.record_execution_outcome(
-                            issue_number=issue_number,
-                            column=status,
-                            agent=stage_config.default_agent,
-                            outcome='failure',
-                            project_name=project_name,
-                            error=f"Failed to resolve epic worktree target: {e}"
-                        )
-                    except Exception as cleanup_e:
-                        logger.error(
-                            f"Failed to record execution failure after epic resolution failure: {cleanup_e}"
-                        )
-                    return None
+                    asyncio.get_running_loop()
+                    has_running_loop = True
+                except RuntimeError:
+                    has_running_loop = False
 
-            project_dir = workspace_manager.get_project_dir(
-                project_name, epic_id=epic_id, branch_name=epic_branch_name
-            ) if epic_id else workspace_manager.get_project_dir(project_name)
+                if has_running_loop:
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(
+                            asyncio.run,
+                            self.pipeline_run_manager.resolve_workspace(
+                                pipeline_run, github, workspace_type
+                            )
+                        ).result()
+                else:
+                    asyncio.run(
+                        self.pipeline_run_manager.resolve_workspace(
+                            pipeline_run, github, workspace_type
+                        )
+                    )
+
+                if not pipeline_run.project_dir:
+                    # Should be unreachable -- resolve_workspace() always either
+                    # raises or fully populates project_dir. Hard-fail rather than
+                    # silently falling back to the shared base clone if that
+                    # contract ever breaks: the deleted _resolve_epic_worktree_target()
+                    # explicitly refused this exact fallback for the same reason.
+                    raise RuntimeError(
+                        f"resolve_workspace() returned without raising but left "
+                        f"project_dir unresolved for pipeline run {pipeline_run.id} "
+                        f"({project_name}/#{issue_number}) -- refusing to silently "
+                        "fall back to the shared base clone."
+                    )
+                project_dir = pipeline_run.project_dir
+                branch_name = pipeline_run.branch_name
+                epic_id = pipeline_run.epic_id
+            else:
+                # Should be unreachable today: repair_cycle-type stages only exist
+                # under sdlc_execution, whose workspace is always 'issues' (per
+                # config/foundations/pipelines.yaml) -- 'hybrid' is schema-supported
+                # but not currently used by any shipped repair_cycle pipeline, and
+                # 'discussions' pipelines have no repair_cycle stage at all. Hard-fail
+                # with a clear diagnostic rather than an UnboundLocalError below if
+                # that assumption ever breaks (code review, issue #122).
+                raise ValueError(
+                    f"Repair cycle for {project_name}/#{issue_number} has "
+                    f"workspace_type={workspace_type!r}, which resolve_workspace() "
+                    "does not support (only 'issues'/'hybrid') -- refusing to guess "
+                    "a project_dir/branch_name/epic_id for it."
+                )
 
             stage_context = {
                 'project': project_name,
@@ -7062,72 +7133,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 'checkpoint_interval': checkpoint_interval,
                 'stage_name': status
             }
-
-            # Prepare workspace branch for issues workspace (git checkout feature branch)
-            branch_name = None
-            if workspace_type == 'issues' and epic_id is not None:
-                # The epic worktree resolved above already exists, checked out to
-                # epic_branch_name (worktree creation performs the checkout
-                # atomically) -- running prepare_feature_branch()'s own independent
-                # branch resolution + checkout here would target that SAME branch on
-                # the shared BASE CLONE, which git refuses once the epic worktree
-                # already has it checked out ("already used by worktree at ...").
-                # Found in a final whole-PR review pass on #87: previously this was
-                # silently caught by the except block below (no crash), but that
-                # also silently discarded ALL of prepare_feature_branch()'s other
-                # side effects for repair-cycle-dispatched sub-issues (feature-branch
-                # state/sub-issue tracking, stale-branch escalation comments) -- not
-                # just the checkout. epic_branch_name is already the correct answer,
-                # so use it directly instead.
-                branch_name = epic_branch_name
+            if branch_name:
                 stage_context['branch_name'] = branch_name
-                logger.info(
-                    f"Repair cycle for issue #{issue_number}: epic worktree already "
-                    f"on branch {branch_name!r} -- skipping prepare_feature_branch()'s "
-                    "redundant (and conflicting) base-clone checkout"
-                )
-            elif workspace_type == 'issues':
-                # Defensive fallback, not currently reachable: the epic-resolution
-                # block above already returns None (aborting the whole repair cycle
-                # launch) on ANY failure, so epic_id is guaranteed non-None here for
-                # 'issues' workspace type today. Kept in case that early-return
-                # behavior is ever relaxed upstream -- preserves the pre-#46
-                # behavior of resolving and checking out a branch on the shared base
-                # clone directly when there's no worktree/branch already established.
-                try:
-                    issue_title = issue_data.get('title', '')
 
-                    logger.info(
-                        f"Preparing feature branch for repair cycle on issue #{issue_number}"
-                    )
-
-                    # Prepare feature branch - handle both running-loop and no-loop contexts.
-                    # asyncio.run() fails if a loop is already running in this thread;
-                    # run_until_complete() on a new loop also fails for the same reason.
-                    # Use the same pattern as lines 950-963: detect the running loop and
-                    # dispatch to a fresh ThreadPoolExecutor thread if one is found.
-                    coro = feature_branch_manager.prepare_feature_branch(
-                        project=project_name,
-                        issue_number=issue_number,
-                        github_integration=github,
-                        issue_title=issue_title
-                    )
-                    try:
-                        asyncio.get_running_loop()
-                        # Running loop in this thread - dispatch to a fresh thread
-                        with concurrent.futures.ThreadPoolExecutor() as pool:
-                            branch_name = pool.submit(asyncio.run, coro).result()
-                    except RuntimeError:
-                        branch_name = asyncio.run(coro)
-
-                    logger.info(f"Checked out feature branch for repair cycle: {branch_name}")
-                    stage_context['branch_name'] = branch_name
-
-                except Exception as e:
-                    logger.error(f"Failed to prepare feature branch for repair cycle: {e}", exc_info=True)
-                    # Don't fail the repair cycle if branch prep fails - it might still work
-                    logger.warning("Continuing with repair cycle despite branch preparation failure")
-            
             # Save context to JSON file
             try:
                 context_file = _save_repair_cycle_context(
@@ -7282,8 +7290,7 @@ _Repair cycle initiated by Switchyard_
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
                 pipeline_run_id=pipeline_run.id,
-                epic_id=epic_id,
-                epic_branch_name=epic_branch_name
+                project_dir=project_dir
             )
 
             return stage_config.default_agent

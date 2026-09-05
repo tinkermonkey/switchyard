@@ -3,11 +3,13 @@ Unit tests for ReviewCycleState.epic_id resolution (issue #47).
 
 Covers ReviewCycleExecutor._resolve_epic_id_for_cycle(): the best-effort,
 non-raising resolution of a sub-issue's parent epic, stored on
-ReviewCycleState.epic_id for #48 to consume later. Per #46's gating decision
-(EPIC_WORKTREE_SAFE_WORKSPACE_TYPES), nothing in review_cycle.py's
-get_project_dir() call sites consumes epic_id yet -- these tests only cover
-the resolution/storage/persistence of the value itself, not any directory
-resolution behavior change.
+ReviewCycleState.epic_id. review_cycle.py's own git operations resolve their
+project_dir (and, internally, epic_id) via a separate path --
+_resolve_project_dir_for_cycle(), which reads PipelineRunManager.
+resolve_workspace()'s result (issue #123) -- rather than consuming
+cycle_state.epic_id directly, so these tests only cover the resolution/
+storage/persistence of the value itself, not any directory resolution
+behavior.
 
 NOTE: this method is deliberately not called from any ReviewCycleState
 construction path today (pass-1 review of #47 found that calling it eagerly

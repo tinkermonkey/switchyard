@@ -5,10 +5,13 @@ what still blocks issue #52's pilot rollout:
 
 1. reconnect_repair_cycle_container() -- used when a repair-cycle container
    survives an orchestrator restart and is STILL RUNNING (the most common
-   recovery case) -- loaded context.json but never extracted epic_id/branch_name
+   recovery case) -- loaded context.json but never extracted project_dir
    from it, so the reconnected monitor thread's eventual auto-commit resolved
-   the shared base clone instead of the epic worktree the container was
-   actually using, silently finding "nothing to commit" and losing the fix.
+   the wrong directory instead of the one the container was actually using,
+   silently finding "nothing to commit" and losing the fix. Updated for issue
+   #123 (WI-D of #119): project_dir replaces the epic_id/branch_name fields
+   this path originally threaded through -- commit_agent_changes() no longer
+   re-derives a directory from those itself.
 
 2. _process_completed_repair_cycle()'s auto-advance step only checked
    overall_success (did tests pass), never whether the auto-commit itself
@@ -34,10 +37,10 @@ def _make_recovery():
     return AgentContainerRecovery(redis_client=MagicMock())
 
 
-class TestReconnectThreadsEpicIdAndBranchName:
-    """reconnect_repair_cycle_container() must extract epic_id/branch_name from
-    context.json and pass them through to _monitor_repair_cycle_container(), so
-    the eventual auto-commit resolves the same epic worktree the container is
+class TestReconnectThreadsProjectDir:
+    """reconnect_repair_cycle_container() must extract project_dir from
+    context.json and pass it through to _monitor_repair_cycle_container(), so
+    the eventual auto-commit resolves the same directory the container is
     actually mounted from."""
 
     def _run(self, saved_context_json):
@@ -70,34 +73,30 @@ class TestReconnectThreadsEpicIdAndBranchName:
 
             return mock_monitor
 
-    def test_epic_id_and_branch_name_threaded_through_from_context_file(self):
+    def test_project_dir_threaded_through_from_context_file(self):
         saved_context = json.dumps({
             "board": "Dev",
             "pipeline_run_id": "run-abc12345",
             "agent_name": "senior_software_engineer",
-            "epic_id": "42",
-            "branch_name": "feature/issue-42-epic",
+            "project_dir": "/workspace/.orchestrator/worktrees/my-project/42",
         })
 
         mock_monitor = self._run(saved_context)
 
         mock_monitor._monitor_repair_cycle_container.assert_called_once()
         call_kwargs = mock_monitor._monitor_repair_cycle_container.call_args.kwargs
-        assert call_kwargs["epic_id"] == "42"
-        assert call_kwargs["epic_branch_name"] == "feature/issue-42-epic"
+        assert call_kwargs["project_dir"] == "/workspace/.orchestrator/worktrees/my-project/42"
         assert call_kwargs["board_name"] == "Dev"
 
     def test_missing_context_file_falls_back_to_none_not_a_crash(self):
-        """No context.json (e.g. a container from before #48) must not raise --
-        epic_id/branch_name fall back to None, matching this path's pre-#48
-        (still correct, just unisolated) behavior. Heuristic board search takes
+        """No context.json (e.g. a container from before this field existed) must
+        not raise -- project_dir falls back to None. Heuristic board search takes
         over ('SDLC'/'dev' in board name)."""
         mock_monitor = self._run(None)
 
         mock_monitor._monitor_repair_cycle_container.assert_called_once()
         call_kwargs = mock_monitor._monitor_repair_cycle_container.call_args.kwargs
-        assert call_kwargs["epic_id"] is None
-        assert call_kwargs["epic_branch_name"] is None
+        assert call_kwargs["project_dir"] is None
 
 
 class TestAutoAdvanceGatedOnCommitSuccess:
@@ -114,6 +113,7 @@ class TestAutoAdvanceGatedOnCommitSuccess:
             "pipeline_run_id": "run-1234",
             "epic_id": "42",
             "branch_name": "feature/issue-42-epic",
+            "project_dir": "/workspace/.orchestrator/worktrees/my-project/42",
             "workspace_type": "issues",
         })
         result = {"overall_success": True, "total_agent_calls": 3, "duration_seconds": 12.0}

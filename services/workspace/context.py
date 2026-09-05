@@ -155,7 +155,8 @@ class WorkspaceContextFactory:
         project: str,
         issue_number: int,
         task_context: Dict[str, Any],
-        github_integration
+        github_integration,
+        pipeline_run: Optional[Any] = None
     ) -> WorkspaceContext:
         """
         Create appropriate workspace context based on type.
@@ -166,6 +167,13 @@ class WorkspaceContextFactory:
             issue_number: GitHub issue/discussion number
             task_context: Task execution context
             github_integration: GitHub integration instance
+            pipeline_run: The dispatch's PipelineRun instance (services.pipeline_run.
+                PipelineRun), already resolved (or resolvable) via
+                PipelineRunManager.resolve_workspace() by the caller. Required by
+                IssuesWorkspaceContext/HybridWorkspaceContext, which read their
+                branch/worktree directly off of it (#122) instead of independently
+                resolving one via FeatureBranchManager.prepare_feature_branch().
+                Ignored for 'discussions' (git-free, no resolution needed).
 
         Returns:
             Appropriate WorkspaceContext instance
@@ -176,7 +184,8 @@ class WorkspaceContextFactory:
         if workspace_type == 'issues':
             from .issues_context import IssuesWorkspaceContext
             return IssuesWorkspaceContext(
-                project, issue_number, task_context, github_integration
+                project, issue_number, task_context, github_integration,
+                pipeline_run=pipeline_run
             )
         elif workspace_type == 'discussions':
             from .discussions_context import DiscussionsWorkspaceContext
@@ -186,7 +195,8 @@ class WorkspaceContextFactory:
         elif workspace_type == 'hybrid':
             from .hybrid_context import HybridWorkspaceContext
             return HybridWorkspaceContext(
-                project, issue_number, task_context, github_integration
+                project, issue_number, task_context, github_integration,
+                pipeline_run=pipeline_run
             )
         else:
             raise ValueError(f"Unknown workspace type: {workspace_type}")
