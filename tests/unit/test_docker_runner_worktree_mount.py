@@ -63,10 +63,9 @@ class TestPrepareWorktreeGitMount:
             result = runner._prepare_worktree_git_mount(worktree_dir, '/host/workspace', 'c1')
 
         assert result is not None
-        host_git_base_path, host_override_path = result
-
-        assert host_git_base_path == '/host/workspace/phone-home/.git'
-        assert host_override_path == str(override_file)
+        assert result.host_git_base_path == '/host/workspace/phone-home/.git'
+        assert result.worktree_admin_id == '204'
+        assert result.host_override_path == str(override_file)
 
         override_content = override_file.read_text()
         assert override_content == 'gitdir: /git-base/worktrees/204\n'
@@ -149,16 +148,25 @@ class TestBuildDockerCommandWiring:
 
         assert '/git-base' not in ' '.join(cmd)
 
+    @staticmethod
+    def _fake_mount():
+        return DockerAgentRunner.WorktreeGitMount(
+            host_git_base_path='/host/workspace/phone-home/.git',
+            worktree_admin_id='204',
+            host_override_path='/host/workspace/.orchestrator/tmp/override.git',
+        )
+
     def test_worktree_mounts_are_read_write_when_workspace_is(self, runner, tmp_path):
         with patch.object(
             DockerAgentRunner, '_prepare_worktree_git_mount',
-            return_value=('/host/workspace/phone-home/.git', '/host/workspace/.orchestrator/tmp/override.git'),
+            return_value=self._fake_mount(),
         ):
             project_dir = tmp_path / 'workspace' / '.orchestrator' / 'worktrees' / 'phone-home' / '204'
             project_dir.mkdir(parents=True)
             cmd = _run_build_docker_command(runner, project_dir, filesystem_write_allowed=True)
 
         assert '/host/workspace/phone-home/.git:/git-base:rw' in cmd
+        assert '/host/workspace/phone-home/.git/worktrees/204:/git-base/worktrees/204:rw' in cmd
         assert '/host/workspace/.orchestrator/tmp/override.git:/workspace/.git:rw' in cmd
 
     def test_worktree_mounts_are_read_only_when_workspace_is(self, runner, tmp_path):
@@ -167,14 +175,40 @@ class TestBuildDockerCommandWiring:
         this second mount just because it's a different mount point."""
         with patch.object(
             DockerAgentRunner, '_prepare_worktree_git_mount',
-            return_value=('/host/workspace/phone-home/.git', '/host/workspace/.orchestrator/tmp/override.git'),
+            return_value=self._fake_mount(),
         ):
             project_dir = tmp_path / 'workspace' / '.orchestrator' / 'worktrees' / 'phone-home' / '204'
             project_dir.mkdir(parents=True)
             cmd = _run_build_docker_command(runner, project_dir, filesystem_write_allowed=False)
 
         assert '/host/workspace/phone-home/.git:/git-base:ro' in cmd
+        assert '/host/workspace/phone-home/.git/worktrees/204:/git-base/worktrees/204:ro' in cmd
         assert '/host/workspace/.orchestrator/tmp/override.git:/workspace/.git:ro' in cmd
+
+    def test_worktree_mounts_mask_sibling_worktrees(self, runner, tmp_path):
+        """Code review finding, issue #127 review pass 2: mounting the whole
+        origin clone's .git at /git-base would also expose every OTHER epic's
+        own worktree admin subdirectory (all epics of one project share a
+        single base clone) -- a tmpfs must mask /git-base/worktrees before
+        this worktree's own admin subdir is remounted back on top of it."""
+        with patch.object(
+            DockerAgentRunner, '_prepare_worktree_git_mount',
+            return_value=self._fake_mount(),
+        ):
+            project_dir = tmp_path / 'workspace' / '.orchestrator' / 'worktrees' / 'phone-home' / '204'
+            project_dir.mkdir(parents=True)
+            cmd = _run_build_docker_command(runner, project_dir, filesystem_write_allowed=True)
+
+        assert '--tmpfs' in cmd
+        tmpfs_index = cmd.index('--tmpfs')
+        assert cmd[tmpfs_index + 1] == '/git-base/worktrees:size=1k'
+        # The mask must come after the base /git-base mount and before the
+        # specific-subdir remount, or Docker's mount resolution won't layer
+        # them the way this fix depends on (verified empirically -- see the
+        # PR/commit description).
+        git_base_index = cmd.index('/host/workspace/phone-home/.git:/git-base:rw')
+        remount_index = cmd.index('/host/workspace/phone-home/.git/worktrees/204:/git-base/worktrees/204:rw')
+        assert git_base_index < tmpfs_index < remount_index
 
 
 class TestCleanupWorktreeGitOverride:

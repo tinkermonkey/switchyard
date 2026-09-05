@@ -15,7 +15,7 @@ Covers:
 """
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -179,14 +179,21 @@ class TestGateWiringForDockerSocketAgents:
 
             fake_gate.acquire.assert_awaited_once_with("phone-home", "task-3")
             # The MCP config temp file must still be cleaned up despite acquire()
-            # raising before the container was ever launched. (Also removes a
-            # worktree-gitdir-override file that, per this test's own blanket
-            # os.path.exists=True patch, "exists" too -- issue #127's
-            # _cleanup_worktree_git_override() runs unconditionally in the same
-            # finally block and is a genuine no-op here in practice, since
+            # raising before the container was ever launched. The finally block
+            # also unconditionally calls _cleanup_worktree_git_override(), which
+            # -- per this test's own blanket os.path.exists=True patch -- "finds"
+            # its deterministic override path and removes it too, even though
             # _build_docker_command is mocked out above and never actually wrote
-            # one; this test isn't about that cleanup path.)
-            mock_remove.assert_any_call("/tmp/mcp-config-fake.json")
+            # one; this test isn't about that cleanup path, but asserting the
+            # exact pair of calls (rather than just assert_any_call) keeps this
+            # test able to catch a future regression that removes an extra or
+            # wrong path here.
+            expected_override_path = runner._worktree_git_override_path("claude-agent-phone-home-task-3")
+            mock_remove.assert_has_calls(
+                [call("/tmp/mcp-config-fake.json"), call(expected_override_path)],
+                any_order=True,
+            )
+            assert mock_remove.call_count == 2
             # Nothing was ever acquired -- release() must not be called at all.
             fake_gate.release.assert_not_called()
 

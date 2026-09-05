@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import threading
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -523,30 +523,39 @@ class DockerAgentRunner:
         # Always use stdin for passing prompts (avoids command-line length limits and escaping issues)
         use_stdin = True
 
-        docker_cmd, image_name = self._build_docker_command(
-            container_name=container_name,
-            project_dir=project_dir,
-            mcp_config_path=mcp_config_path,
-            context=context,
-            use_stdin=use_stdin
-        )
-
+        # _build_docker_command() itself now happens INSIDE the try block below
+        # (issue #127 review pass 2), not out here -- it can write a
+        # worktree-gitdir-override temp file (_prepare_worktree_git_mount) and
+        # then still raise afterward (e.g. the filesystem write-verification
+        # check further down the same method); before this, that exception
+        # propagated out of run_agent_in_container without ever reaching the
+        # finally block, leaking the override file (and, pre-existing, the
+        # MCP config file below) on every such failure.
+        #
         # Concurrency gate for docker-socket-bearing agents (see switchyard #51):
         # independent of, and in addition to, general pipeline-dispatch
         # concurrency. Both the requires-check and the actual (potentially
         # long-blocking, up to DockerSocketAccessGate's max_wait_seconds)
-        # acquire() call happen INSIDE the try block below, not out here -- so
-        # if either raises (found in #51 review, pass 2: _requires_docker_
-        # socket_access() only catches ConfigurationError, so a different
-        # exception from re-reading the project config here could still leak
-        # the MCP config temp file the same way an un-caught acquire() failure
-        # could) or the awaiting task is cancelled, the finally block's
-        # MCP-config-file cleanup still runs instead of leaking that temp file
-        # (it was written to disk a few lines above, before this gate existed).
+        # acquire() call happen INSIDE the try block below too -- so if either
+        # raises (found in #51 review, pass 2: _requires_docker_socket_access()
+        # only catches ConfigurationError, so a different exception from
+        # re-reading the project config here could still leak the MCP config
+        # temp file the same way an un-caught acquire() failure could) or the
+        # awaiting task is cancelled, the finally block's MCP-config-file
+        # cleanup still runs instead of leaking that temp file (it was written
+        # to disk a few lines above, before this gate existed).
         docker_socket_gate = None
         docker_socket_holder_id = None
 
         try:
+            docker_cmd, image_name = self._build_docker_command(
+                container_name=container_name,
+                project_dir=project_dir,
+                mcp_config_path=mcp_config_path,
+                context=context,
+                use_stdin=use_stdin
+            )
+
             if self._requires_docker_socket_access(agent, project):
                 from services.docker_socket_access_gate import get_docker_socket_access_gate
                 docker_socket_gate = get_docker_socket_access_gate()
@@ -715,6 +724,16 @@ class DockerAgentRunner:
 
         return selected_path
 
+    class WorktreeGitMount(NamedTuple):
+        """Everything _build_docker_command() needs to mount a worktree's
+        originating clone safely (issue #127, review pass 2). host_git_base_path
+        and host_override_path are ready to use directly as `-v` mount sources;
+        worktree_admin_id is needed separately to build the sibling-masking
+        mounts (see _prepare_worktree_git_mount's docstring)."""
+        host_git_base_path: str
+        worktree_admin_id: str
+        host_override_path: str
+
     def _worktree_git_override_path(self, container_name: str) -> str:
         """Deterministic path for one launch's worktree-gitdir-override temp file
         (issue #127) -- derivable from container_name alone, the same way
@@ -738,7 +757,7 @@ class DockerAgentRunner:
 
     def _prepare_worktree_git_mount(
         self, project_dir: Path, host_workspace: str, container_name: str
-    ) -> Optional[tuple[str, str]]:
+    ) -> Optional["DockerAgentRunner.WorktreeGitMount"]:
         """
         If project_dir is a linked git worktree (issue #127) rather than a normal
         repository, mounting it ALONE at /workspace breaks its own git functionality
@@ -765,12 +784,30 @@ class DockerAgentRunner:
         A normal (non-worktree) project_dir's .git is a real directory, not a
         file -- returns None, a no-op for the common case.
 
+        Sibling-worktree isolation (issue #127 review pass 2): mounting the WHOLE
+        origin clone's .git at /git-base would also expose every OTHER epic's own
+        worktree admin subdirectory under .git/worktrees/ -- all epics of one
+        project share a single base clone (see
+        ProjectWorkspaceManager.get_or_create_epic_worktree), so without this, a
+        write-allowed container for epic A would gain direct write access to
+        epic B's HEAD/index/locks, letting a buggy or malicious tool call in one
+        epic's container corrupt a completely unrelated epic's worktree. The
+        caller masks that off with an empty tmpfs over /git-base/worktrees and
+        remounts only THIS worktree's own admin subdir back on top of the mask
+        (verified end-to-end: siblings become invisible, this worktree's own
+        git status/commit/push still work, and the shared object database
+        under /git-base itself -- outside worktrees/ -- stays visible, since
+        objects are content-addressed and refs are per-branch, not a
+        cross-epic isolation concern the way the admin subdirs are).
+
         Returns:
-            (host_origin_clone_git_path, host_override_file_path) if project_dir is
-            a worktree, else None. Both are HOST filesystem paths, ready to use
-            directly as `-v` mount sources -- the caller still needs to apply the
-            correct :ro/:rw suffix (matching whatever mode the rest of /workspace
-            is mounted with; this method has no opinion on that).
+            A WorktreeGitMount if project_dir is a worktree, else None.
+            host_git_base_path and host_override_path are HOST filesystem paths,
+            ready to use directly as `-v` mount sources; worktree_admin_id is
+            the plain directory name (not a path) used to build the
+            sibling-masking mounts. The caller still needs to apply the correct
+            :ro/:rw suffix (matching whatever mode the rest of /workspace is
+            mounted with; this method has no opinion on that).
         """
         git_pointer_path = project_dir / '.git'
         if not git_pointer_path.is_file():
@@ -811,7 +848,11 @@ class DockerAgentRunner:
                 f"mounted separately -- mounting {host_origin_clone_path}/.git -> "
                 "/git-base and overriding /workspace/.git with a corrected pointer"
             )
-            return f'{host_origin_clone_path}/.git', host_override_path
+            return DockerAgentRunner.WorktreeGitMount(
+                host_git_base_path=f'{host_origin_clone_path}/.git',
+                worktree_admin_id=worktree_admin_id,
+                host_override_path=host_override_path,
+            )
         except Exception as e:
             logger.warning(
                 f"Could not prepare git-worktree mount fix for {project_dir} "
@@ -972,10 +1013,25 @@ class DockerAgentRunner:
         # SAME :ro/:rw mode as /workspace itself -- a read-only agent must not
         # get a backdoor to mutate the origin clone's real refs/object database
         # through this second mount just because it's a different mount point.
+        #
+        # The tmpfs + remount pair masks off every OTHER epic's own worktree
+        # admin subdirectory under /git-base/worktrees/ (see
+        # _prepare_worktree_git_mount's docstring, review pass 2) -- without
+        # it, /git-base alone would hand a write-allowed container direct
+        # write access to every sibling epic's HEAD/index/locks, since all
+        # epics of one project share this one base clone. Verified end-to-end
+        # that this mount order (base dir, then tmpfs mask, then the one
+        # real subdir remounted on top) actually resolves this way in Docker
+        # before writing it -- see the PR/commit for that verification.
         if worktree_git_mount_paths:
-            host_git_base_path, host_override_path = worktree_git_mount_paths
+            host_git_base_path = worktree_git_mount_paths.host_git_base_path
+            worktree_admin_id = worktree_git_mount_paths.worktree_admin_id
+            host_override_path = worktree_git_mount_paths.host_override_path
+            host_worktree_admin_path = f'{host_git_base_path}/worktrees/{worktree_admin_id}'
             cmd.extend([
                 '-v', f'{host_git_base_path}:/git-base:{workspace_mount_mode}',
+                '--tmpfs', '/git-base/worktrees:size=1k',
+                '-v', f'{host_worktree_admin_path}:/git-base/worktrees/{worktree_admin_id}:{workspace_mount_mode}',
                 '-v', f'{host_override_path}:/workspace/.git:{workspace_mount_mode}',
             ])
 
