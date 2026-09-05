@@ -415,6 +415,77 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
         assert result.project_dir == "/workspace/.orchestrator/worktrees/test-project/42"
 
 
+class TestResolveWorkspacePropagatesParentLookupFailure:
+    """
+    Issue #126: a transient get_parent_issue() failure (GraphQL error, network
+    blip) must propagate all the way out of resolve_workspace() as
+    ParentIssueLookupError, NOT be silently absorbed into the lenient
+    "no parent -- use the issue's own number" fallback that
+    TestResolveWorkspaceUsesLenientFallback/TestResolveWorkspaceNoParentUsesOwnNumber
+    cover above. Those two fallback paths are for a CONFIRMED absence of a
+    parent (get_parent_issue() returns None); this class is for the lookup
+    itself failing, which resolve_epic_id() now re-raises instead of masking
+    (see its own docstring). Using the real, unmocked resolve_epic_id() here --
+    only get_parent_issue() is mocked -- exactly like
+    TestResolveWorkspaceNoParentUsesOwnNumber does for the fallback case, so
+    this exercises the actual propagation path, not a re-test of
+    resolve_epic_id() in isolation.
+
+    Why this matters more here than at get_parent_issue()'s own level: this
+    method's idempotency guard (branch_name/project_dir/epic_id all set ->
+    return unchanged) means a wrongly-resolved epic_id from a swallowed
+    failure would never self-correct on a later retry -- it would be baked
+    into the pipeline run for its entire lifetime.
+    """
+
+    @pytest.mark.asyncio
+    async def test_issues_workspace_raises_rather_than_falling_back_to_own_number(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        from services.feature_branch_manager import feature_branch_manager, ParentIssueLookupError
+        from services.project_workspace import workspace_manager
+
+        with patch.object(
+            feature_branch_manager, 'get_parent_issue',
+            new=AsyncMock(side_effect=ParentIssueLookupError("GraphQL rate limited")),
+        ), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree') as mock_worktree:
+
+            with pytest.raises(ParentIssueLookupError):
+                await pipeline_run_manager.resolve_workspace(
+                    pipeline_run, mock_github_integration, workspace_type='issues'
+                )
+
+        # Must fail before ever touching the worktree -- no epic_id was
+        # resolved to create one from.
+        mock_worktree.assert_not_called()
+        # And the run must be left unresolved, not partially/incorrectly
+        # populated -- a later retry must see a wholly-unresolved run again.
+        assert pipeline_run.branch_name is None
+        assert pipeline_run.project_dir is None
+        assert pipeline_run.epic_id is None
+
+    @pytest.mark.asyncio
+    async def test_hybrid_workspace_also_raises_rather_than_falling_back(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        from services.feature_branch_manager import feature_branch_manager, ParentIssueLookupError
+        from services.project_workspace import workspace_manager
+
+        with patch.object(
+            feature_branch_manager, 'get_parent_issue',
+            new=AsyncMock(side_effect=ParentIssueLookupError("network error")),
+        ), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree') as mock_worktree:
+
+            with pytest.raises(ParentIssueLookupError):
+                await pipeline_run_manager.resolve_workspace(
+                    pipeline_run, mock_github_integration, workspace_type='hybrid'
+                )
+
+        mock_worktree.assert_not_called()
+
+
 class TestResolveWorkspacePersistenceFailureReverts:
     """
     A persistence failure must revert the in-memory branch_name/project_dir

@@ -16,6 +16,7 @@ if not os.path.isdir('/app'):
 
 from unittest.mock import Mock, AsyncMock, patch
 from services.project_monitor import ProjectMonitor
+from services.feature_branch_manager import ParentIssueLookupError
 from config.manager import ConfigManager
 
 
@@ -96,3 +97,48 @@ class TestCheckPrReadyOnIssueExitRetry:
         assert result['get_issue'].call_count == 3
         assert result['sleep'].call_count == 2
         result['sub_issues'].assert_not_called()
+
+
+class TestCheckPrReadyOnIssueExitParentLookupFailure:
+    """Issue #126 code review finding: the Step 2 get_parent_issue() call (BEFORE
+    the get_issue() retry loop tested above -- a different, earlier failure point)
+    must handle ParentIssueLookupError explicitly, via a dedicated try/except, not
+    rely on this method's own unrelated outer except Exception (written for a
+    different purpose) to avoid crashing. Explicit handling here is directly
+    testable and won't silently stop being safe if that outer handler is ever
+    narrowed or refactored for its own reasons."""
+
+    @pytest.fixture
+    def project_config(self):
+        config = Mock()
+        config.github = {'org': 'test-org', 'repo': 'test-repo'}
+        return config
+
+    @pytest.fixture
+    def mock_config_manager(self, project_config):
+        config_manager = Mock(spec=ConfigManager)
+        config_manager.list_projects.return_value = []
+        config_manager.get_project_config.return_value = project_config
+        return config_manager
+
+    @pytest.fixture
+    def monitor(self, mock_config_manager):
+        return ProjectMonitor(Mock(), mock_config_manager)
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_is_caught_and_skips_cleanly(self, monitor):
+        """Must return cleanly (not raise, not fall through to the get_issue()
+        retry loop below it) when the parent lookup itself fails."""
+        mock_github = AsyncMock()
+
+        with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
+             patch('services.github_integration.GitHubIntegration', return_value=mock_github):
+
+            mock_fbm.get_parent_issue = AsyncMock(side_effect=ParentIssueLookupError("rate limited"))
+
+            # Must not raise.
+            await monitor._check_pr_ready_on_issue_exit('test-project', 826, 'Staged')
+
+            # Must not proceed past Step 2 -- no attempt to look up the (unknown)
+            # parent's issue details.
+            mock_github.get_issue.assert_not_called()

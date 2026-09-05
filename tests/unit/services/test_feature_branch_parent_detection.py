@@ -9,7 +9,7 @@ Tests cover the fix for:
 
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
-from services.feature_branch_manager import FeatureBranchManager
+from services.feature_branch_manager import FeatureBranchManager, ParentIssueLookupError
 
 
 class TestParentIssueDetection:
@@ -113,27 +113,30 @@ class TestParentIssueDetection:
     @pytest.mark.asyncio
     async def test_parent_detection_graphql_failure(self, manager, mock_github_integration):
         """
-        Test that get_parent_issue() handles GraphQL failures gracefully.
+        Issue #126: a GraphQL failure must RAISE ParentIssueLookupError, not
+        return None -- returning None here is indistinguishable from a
+        confirmed "this issue has no parent," which let resolve_epic_id()
+        silently mis-scope an epic worktree on a transient API error (see
+        TestGetParentIssueLookupFailures below for the full regression suite).
         """
         with patch('services.feature_branch_manager.get_github_client') as mock_get_client:
             mock_client = Mock()
             mock_client.graphql.return_value = (False, {'error': 'rate_limited'})
             mock_get_client.return_value = mock_client
 
-            parent_number = await manager.get_parent_issue(
-                mock_github_integration,
-                issue_number=214,
-                project="documentation_robotics"
-            )
-
-            # Should return None on GraphQL failure
-            assert parent_number is None, \
-                "Should return None when GraphQL query fails"
+            with pytest.raises(ParentIssueLookupError):
+                await manager.get_parent_issue(
+                    mock_github_integration,
+                    issue_number=214,
+                    project="documentation_robotics"
+                )
 
     @pytest.mark.asyncio
     async def test_parent_detection_missing_org_repo(self, manager):
         """
-        Test that get_parent_issue() validates org/repo before making API calls.
+        Issue #126: missing org/repo config must RAISE ParentIssueLookupError,
+        not return None -- a misconfiguration is a lookup failure, not a
+        confirmed "no parent."
         """
         # Mock GitHub integration with missing org/repo
         mock_integration = Mock()
@@ -144,15 +147,12 @@ class TestParentIssueDetection:
             mock_client = Mock()
             mock_get_client.return_value = mock_client
 
-            parent_number = await manager.get_parent_issue(
-                mock_integration,
-                issue_number=214,
-                project="documentation_robotics"
-            )
-
-            # Should return None without making GraphQL call
-            assert parent_number is None, \
-                "Should return None when org/repo not configured"
+            with pytest.raises(ParentIssueLookupError):
+                await manager.get_parent_issue(
+                    mock_integration,
+                    issue_number=214,
+                    project="documentation_robotics"
+                )
 
             # Verify no GraphQL call was made
             assert not mock_client.graphql.called, \
@@ -200,6 +200,163 @@ class TestParentIssueDetection:
 
 # Note: _get_sub_issues_from_parent() uses a different signature and data flow
 # The critical bug fix was in get_parent_issue() which is fully tested above
+
+
+class TestGetParentIssueLookupFailures:
+    """Issue #126: get_parent_issue() used to swallow EVERY failure mode to a bare
+    None, making a genuine lookup failure indistinguishable from GitHub's structured
+    API confirming the issue has no parent. These tests cover the remaining failure
+    mode not already exercised above (an unexpected exception from the GraphQL call
+    itself, e.g. a network error) and the caching contract for failures."""
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    @pytest.fixture
+    def mock_github_integration(self):
+        mock = Mock()
+        mock.github_org = "test-org"
+        mock.repo_name = "test-repo"
+        return mock
+
+    @pytest.mark.asyncio
+    async def test_unexpected_exception_is_wrapped_and_raised_not_swallowed(
+        self, manager, mock_github_integration
+    ):
+        """A network error (or any other unexpected exception) inside the GraphQL
+        call must surface as ParentIssueLookupError, not vanish into a None that
+        looks like a confirmed no-parent answer."""
+        with patch('services.feature_branch_manager.get_github_client') as mock_get_client:
+            mock_client = Mock()
+            mock_client.graphql.side_effect = ConnectionError("network unreachable")
+            mock_get_client.return_value = mock_client
+
+            with pytest.raises(ParentIssueLookupError) as exc_info:
+                await manager.get_parent_issue(
+                    mock_github_integration, issue_number=214, project="documentation_robotics"
+                )
+
+            # The original exception must still be discoverable (chained), not lost.
+            assert isinstance(exc_info.value.__cause__, ConnectionError)
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_is_not_cached(self, manager, mock_github_integration):
+        """A failed attempt must never poison the cache -- the next call has to
+        actually retry against GitHub, not silently replay a stale failure (or,
+        worse, a stale None that looks like a confirmed no-parent)."""
+        with patch('services.feature_branch_manager.get_github_client') as mock_get_client:
+            mock_client = Mock()
+            mock_client.graphql.return_value = (False, {'error': 'rate_limited'})
+            mock_get_client.return_value = mock_client
+
+            with pytest.raises(ParentIssueLookupError):
+                await manager.get_parent_issue(
+                    mock_github_integration, issue_number=214, project="documentation_robotics"
+                )
+
+            cache_key = ("test-org", "test-repo", 214)
+            assert cache_key not in manager._parent_cache, \
+                "A failed lookup must not be cached -- the next call must retry"
+
+            # Second call, now succeeding, must actually hit GraphQL again (not
+            # return a cached failure) and get the real answer.
+            mock_client.graphql.return_value = (True, {
+                'repository': {'issue': {'number': 214, 'parent': {'number': 188, 'title': 'Epic'}}}
+            })
+            parent_number = await manager.get_parent_issue(
+                mock_github_integration, issue_number=214, project="documentation_robotics"
+            )
+            assert parent_number == 188
+            assert mock_client.graphql.call_count == 2
+
+
+class TestParentIssueLookupErrorPerCallerHandling:
+    """Issue #126's core fix: get_parent_issue() no longer collapses "lookup
+    failed" and "confirmed no parent" into the same None -- so each caller must
+    now make its own explicit choice about which behavior is correct for it.
+    Both of resolve_epic_id()/get_feature_branch_for_issue() below turn out to
+    need the SAME choice (propagate) -- an initial version of this PR had
+    get_feature_branch_for_issue() catch and fall back to None instead, reasoned
+    to be safe because it has no persisted state of its own to poison. Code
+    review found that reasoning incomplete: its own most consequential caller,
+    finalize_feature_branch_work() (see TestFinalizeFeatureBranchWorkPropagatesLookupFailure
+    below), treats a falsy result as a confirmed standalone issue and skips
+    completion tracking/PR creation entirely -- silently reintroducing this
+    issue's exact ambiguity one call frame up. These tests confirm the
+    (corrected) propagation, on the real (unmocked) methods rather than
+    re-testing get_parent_issue() itself."""
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    @pytest.mark.asyncio
+    async def test_resolve_epic_id_propagates_lookup_failure_instead_of_guessing(self, manager):
+        """The critical regression case: resolve_epic_id() feeds
+        PipelineRunManager.resolve_workspace(), whose idempotency guard makes a
+        wrong answer PERMANENT for the pipeline run's lifetime. On a transient
+        lookup failure it must raise -- letting the caller's own retry/threshold
+        handling get a real second attempt -- rather than silently falling back
+        to the sub-issue's own number as if it had confirmed there was no parent."""
+        with patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent:
+            mock_get_parent.side_effect = ParentIssueLookupError("GraphQL rate limited")
+
+            with pytest.raises(ParentIssueLookupError):
+                await manager.resolve_epic_id(Mock(), 101, project='test-project')
+
+    @pytest.mark.asyncio
+    async def test_get_feature_branch_for_issue_propagates_lookup_failure(self, manager):
+        """Must propagate, not degrade to "no feature branch found" -- see
+        TestFinalizeFeatureBranchWorkPropagatesLookupFailure below for why a
+        swallowed failure here is unsafe."""
+        with patch.object(manager, 'get_feature_branch_state', return_value=None), \
+             patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent:
+            mock_get_parent.side_effect = ParentIssueLookupError("GraphQL rate limited")
+
+            with pytest.raises(ParentIssueLookupError):
+                await manager.get_feature_branch_for_issue('test-project', 101, Mock())
+
+
+class TestFinalizeFeatureBranchWorkPropagatesLookupFailure:
+    """The actual regression case that overturned get_feature_branch_for_issue()'s
+    original "fall back to None" design (code review finding on this PR):
+    finalize_feature_branch_work() -- the live production finalize step for every
+    'issues'/'hybrid' dispatch (services/workspace/issues_context.py and
+    hybrid_context.py both call it) -- treats a falsy get_feature_branch_for_issue()
+    result as "this issue is genuinely standalone" and skips
+    mark_sub_issue_complete()/create_or_update_feature_pr() entirely, returning
+    success with no error. A caught-and-swallowed ParentIssueLookupError here
+    would have silently reproduced that exact failure mode for a REAL sub-issue
+    hitting a transient lookup failure at exactly the wrong moment."""
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_during_finalize_raises_not_silently_treated_as_standalone(
+        self, manager, tmp_path
+    ):
+        with patch.object(manager, 'get_feature_branch_state', return_value=None), \
+             patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent, \
+             patch.object(manager, 'git_add_all', new_callable=AsyncMock) as mock_add, \
+             patch.object(manager, 'git_commit', new_callable=AsyncMock) as mock_commit:
+            mock_get_parent.side_effect = ParentIssueLookupError("GraphQL rate limited")
+
+            with pytest.raises(ParentIssueLookupError):
+                await manager.finalize_feature_branch_work(
+                    project='test-project',
+                    issue_number=101,
+                    commit_message='test commit',
+                    github_integration=Mock(),
+                    project_dir_override=str(tmp_path),
+                )
+
+            # Must fail before ever touching git -- no commit/push attempted
+            # against a workspace whose completion status couldn't be determined.
+            mock_add.assert_not_called()
+            mock_commit.assert_not_called()
 
 
 class TestResolveEpicWorktreeTarget:

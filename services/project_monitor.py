@@ -3931,7 +3931,7 @@ class ProjectMonitor:
             exit_column: The exit column name (Done, Staged, etc.)
         """
         try:
-            from services.feature_branch_manager import feature_branch_manager
+            from services.feature_branch_manager import feature_branch_manager, ParentIssueLookupError
             from services.github_integration import GitHubIntegration
 
             # Step 1: Initialize GitHub integration
@@ -3955,11 +3955,33 @@ class ProjectMonitor:
 
             # Step 2: Check if this issue has a parent (is it a sub-issue?)
             # FIX: Use correct async method get_parent_issue instead of non-existent _get_parent_issue_number
-            parent_issue_number = await feature_branch_manager.get_parent_issue(
-                github,
-                issue_number,
-                project=project_name
-            )
+            #
+            # Explicit try/except here (code review finding, #126's own PR) rather
+            # than relying on this method's outer except Exception below (written
+            # for a different purpose, and not a dedicated/tested guarantee for
+            # this specific call): a lookup failure degrades to the same "skip
+            # this exit event's PR-ready check" outcome as a confirmed no-parent
+            # answer, NOT silently -- logged at warning, not debug, since unlike a
+            # genuine no-parent issue this IS an anomaly worth an operator's
+            # attention. Safe to just skip (not retry) because this check re-runs
+            # naturally: every OTHER sub-issue of the same epic re-triggers this
+            # exact "all sub-issues complete?" check on its own exit, so a single
+            # transient failure here doesn't permanently lose the PR-ready
+            # transition the way a persisted, idempotency-guarded resolution
+            # (resolve_epic_id() -> resolve_workspace()) would.
+            try:
+                parent_issue_number = await feature_branch_manager.get_parent_issue(
+                    github,
+                    issue_number,
+                    project=project_name
+                )
+            except ParentIssueLookupError as e:
+                logger.warning(
+                    f"Could not determine parent for issue #{issue_number} while "
+                    f"checking PR-ready on exit ({e}) -- skipping this exit event's "
+                    "check; a sibling sub-issue's own exit will re-attempt it."
+                )
+                return
 
             if not parent_issue_number:
                 logger.debug(f"Issue #{issue_number} has no parent, skipping PR ready check")
