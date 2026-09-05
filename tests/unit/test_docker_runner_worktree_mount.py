@@ -15,9 +15,13 @@ Fix: _prepare_worktree_git_mount() detects a worktree project_dir and returns
 HOST paths for (a) the originating clone's .git directory and (b) a freshly
 written, corrected gitdir-pointer file -- _build_docker_command() mounts (a) at
 /git-base and (b) as an override at /workspace/.git, both with the SAME :ro/:rw
-mode /workspace itself gets. Verified end-to-end with a real git worktree (not
-just these mocked unit tests) before this file was written -- see the PR
-description/commit message for that manual verification.
+mode /workspace itself gets. Review pass 3: the worktrees/ mask alone still
+left hooks/, config, and packed-refs in the shared .git writable (an
+arbitrary-code-execution vector via hooks); each is now remounted read-only
+on top of /git-base, unconditionally, when it exists in the origin clone.
+Verified end-to-end with a real git worktree (not just these mocked unit
+tests) before this file was written -- see the PR description/commit message
+for that manual verification.
 """
 
 import os
@@ -66,6 +70,13 @@ class TestPrepareWorktreeGitMount:
         assert result.host_git_base_path == '/host/workspace/phone-home/.git'
         assert result.worktree_admin_id == '204'
         assert result.host_override_path == str(override_file)
+        # /workspace/phone-home isn't a real path in THIS test process, so
+        # the origin clone's hooks/config/packed-refs can't be found here --
+        # covered instead by test_protected_relative_paths_reflect_what_
+        # actually_exists below, which points the pointer file at a real
+        # tmp_path-based origin clone so the existence checks have something
+        # real to check against.
+        assert result.protected_relative_paths == ()
 
         override_content = override_file.read_text()
         assert override_content == 'gitdir: /git-base/worktrees/204\n'
@@ -74,6 +85,45 @@ class TestPrepareWorktreeGitMount:
         # consumers (the orchestrator's own process, repair-cycle containers)
         # use a different mount layout and depend on the original content.
         assert (worktree_dir / '.git').read_text() == 'gitdir: /workspace/phone-home/.git/worktrees/204\n' 
+
+    def test_protected_relative_paths_reflect_what_actually_exists(self, runner, tmp_path):
+        """Review pass 3: hooks/config/packed-refs must each be reported only
+        if they actually exist in the origin clone -- guessing wrong (e.g.
+        assuming packed-refs always exists) would make the caller mount a
+        nonexistent host path, which Docker auto-vivifies as an unwanted
+        empty directory inside the REAL base clone's .git."""
+        # Use a passthrough (non /workspace, non /app) origin path so this
+        # method's own existence checks land on a real, test-controlled
+        # directory instead of the unrelated real /workspace on this machine.
+        origin_clone_path = tmp_path / 'origin-clone'
+        origin_git_dir = origin_clone_path / '.git'
+        origin_git_dir.mkdir(parents=True)
+        (origin_git_dir / 'hooks').mkdir()
+        (origin_git_dir / 'config').write_text('[core]\n')
+        # packed-refs deliberately NOT created.
+
+        worktree_dir = tmp_path / 'worktree-content'
+        worktree_dir.mkdir(parents=True)
+        (worktree_dir / '.git').write_text(
+            f'gitdir: {origin_clone_path}/.git/worktrees/204\n'
+        )
+        override_file = tmp_path / 'worktree_gitdir_override_c1.git'
+        with patch.object(
+            DockerAgentRunner, '_worktree_git_override_path', return_value=str(override_file)
+        ):
+            result = runner._prepare_worktree_git_mount(worktree_dir, '/host/workspace', 'c1')
+
+        assert result is not None
+        assert set(result.protected_relative_paths) == {'hooks', 'config'}
+        assert 'packed-refs' not in result.protected_relative_paths
+
+        # Now add packed-refs and confirm it's picked up too.
+        (origin_git_dir / 'packed-refs').write_text('# pack-refs\n')
+        with patch.object(
+            DockerAgentRunner, '_worktree_git_override_path', return_value=str(override_file)
+        ):
+            result2 = runner._prepare_worktree_git_mount(worktree_dir, '/host/workspace', 'c1')
+        assert set(result2.protected_relative_paths) == {'hooks', 'config', 'packed-refs'}
 
     def test_malformed_pointer_falls_back_to_none_without_crashing(self, runner, tmp_path):
         """A .git file that exists but doesn't parse as a worktree pointer
@@ -149,11 +199,12 @@ class TestBuildDockerCommandWiring:
         assert '/git-base' not in ' '.join(cmd)
 
     @staticmethod
-    def _fake_mount():
+    def _fake_mount(protected_relative_paths=()):
         return DockerAgentRunner.WorktreeGitMount(
             host_git_base_path='/host/workspace/phone-home/.git',
             worktree_admin_id='204',
             host_override_path='/host/workspace/.orchestrator/tmp/override.git',
+            protected_relative_paths=protected_relative_paths,
         )
 
     def test_worktree_mounts_are_read_write_when_workspace_is(self, runner, tmp_path):
@@ -209,6 +260,39 @@ class TestBuildDockerCommandWiring:
         git_base_index = cmd.index('/host/workspace/phone-home/.git:/git-base:rw')
         remount_index = cmd.index('/host/workspace/phone-home/.git/worktrees/204:/git-base/worktrees/204:rw')
         assert git_base_index < tmpfs_index < remount_index
+
+    def test_hooks_config_packed_refs_remounted_read_only_even_when_workspace_is_rw(self, runner, tmp_path):
+        """Code review finding, issue #127 review pass 3: hooks is an
+        arbitrary-code-execution vector (a container could plant a hook that
+        runs inside a LATER container on a sibling epic) and config/
+        packed-refs could redirect remotes or bulk-rewrite ref positions --
+        none of the three are ever legitimately written to by an agent's
+        ordinary git operations, so they stay read-only regardless of
+        workspace_mount_mode."""
+        with patch.object(
+            DockerAgentRunner, '_prepare_worktree_git_mount',
+            return_value=self._fake_mount(protected_relative_paths=('hooks', 'config')),
+        ):
+            project_dir = tmp_path / 'workspace' / '.orchestrator' / 'worktrees' / 'phone-home' / '204'
+            project_dir.mkdir(parents=True)
+            cmd = _run_build_docker_command(runner, project_dir, filesystem_write_allowed=True)
+
+        assert '/host/workspace/phone-home/.git/hooks:/git-base/hooks:ro' in cmd
+        assert '/host/workspace/phone-home/.git/config:/git-base/config:ro' in cmd
+        assert '/git-base/packed-refs' not in ' '.join(cmd)
+
+    def test_no_protected_path_mounts_when_none_exist(self, runner, tmp_path):
+        with patch.object(
+            DockerAgentRunner, '_prepare_worktree_git_mount',
+            return_value=self._fake_mount(protected_relative_paths=()),
+        ):
+            project_dir = tmp_path / 'workspace' / '.orchestrator' / 'worktrees' / 'phone-home' / '204'
+            project_dir.mkdir(parents=True)
+            cmd = _run_build_docker_command(runner, project_dir, filesystem_write_allowed=True)
+
+        assert '/git-base/hooks' not in ' '.join(cmd)
+        assert '/git-base/config' not in ' '.join(cmd)
+        assert '/git-base/packed-refs' not in ' '.join(cmd)
 
 
 class TestCleanupWorktreeGitOverride:

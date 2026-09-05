@@ -726,13 +726,21 @@ class DockerAgentRunner:
 
     class WorktreeGitMount(NamedTuple):
         """Everything _build_docker_command() needs to mount a worktree's
-        originating clone safely (issue #127, review pass 2). host_git_base_path
-        and host_override_path are ready to use directly as `-v` mount sources;
-        worktree_admin_id is needed separately to build the sibling-masking
-        mounts (see _prepare_worktree_git_mount's docstring)."""
+        originating clone safely (issue #127, review passes 2 and 3).
+        host_git_base_path and host_override_path are ready to use directly as
+        `-v` mount sources; worktree_admin_id is needed separately to build the
+        sibling-masking mounts (see _prepare_worktree_git_mount's docstring).
+        protected_relative_paths lists which of hooks/config/packed-refs
+        actually exist in the origin clone -- each gets remounted read-only on
+        top of /git-base regardless of workspace_mount_mode, since none of
+        them are ever legitimately written to by an agent's ordinary git
+        operations, but a write-allowed container could otherwise use hooks
+        for arbitrary code execution in a LATER container on a sibling epic,
+        or config/packed-refs to redirect remotes or bulk-rewrite refs."""
         host_git_base_path: str
         worktree_admin_id: str
         host_override_path: str
+        protected_relative_paths: tuple
 
     def _worktree_git_override_path(self, container_name: str) -> str:
         """Deterministic path for one launch's worktree-gitdir-override temp file
@@ -800,6 +808,26 @@ class DockerAgentRunner:
         objects are content-addressed and refs are per-branch, not a
         cross-epic isolation concern the way the admin subdirs are).
 
+        Review pass 3: the worktrees/ mask alone still left hooks/, config,
+        and packed-refs in the shared .git writable -- hooks especially is an
+        arbitrary-code-execution vector (a container could plant a
+        post-checkout/pre-commit hook that runs inside a LATER container on a
+        sibling epic the next time an ordinary git command triggers it), and
+        config/packed-refs could redirect remotes or bulk-rewrite ref
+        positions across epics. The caller remounts each path this method
+        reports existing as read-only on top of /git-base, unconditionally
+        (even when the rest of /workspace is mounted read-write) -- none of
+        the three are ever legitimately written to by an agent's ordinary git
+        operations, only by `git init`/`git pack-refs`/manual hook
+        installation, none of which agents do as part of normal SDLC work.
+        Per-branch write isolation for refs/heads itself (so one epic can't
+        overwrite another epic's branch pointer) is a deeper problem --
+        packed-refs materialization, arbitrarily nested branch-name paths --
+        deliberately deferred as a separate follow-up rather than rushed in
+        here; the residual risk is ref-pointer corruption in the LOCAL base
+        clone only, not code execution, and not the real GitHub state the
+        rescued-commits workflow actually depends on.
+
         Returns:
             A WorktreeGitMount if project_dir is a worktree, else None.
             host_git_base_path and host_override_path are HOST filesystem paths,
@@ -843,6 +871,20 @@ class DockerAgentRunner:
                 override_container_path, host_workspace
             )
 
+            # Determine which of hooks/config/packed-refs actually exist in the
+            # origin clone, checked via the CONTAINER-visible path (this
+            # process's own /workspace or /app view, not the host path it
+            # can't stat directly) -- review pass 3. packed-refs in particular
+            # is genuinely optional (a clone that's never had `git pack-refs`
+            # run against it won't have one); guessing wrong and mounting a
+            # nonexistent host path would make Docker auto-create an unwanted
+            # empty directory at that path in the REAL base clone's .git.
+            origin_clone_git_dir = Path(origin_clone_container_path) / '.git'
+            protected_relative_paths = tuple(
+                name for name in ('hooks', 'config', 'packed-refs')
+                if (origin_clone_git_dir / name).exists()
+            )
+
             logger.info(
                 f"Worktree at {project_dir} needs its originating clone's .git "
                 f"mounted separately -- mounting {host_origin_clone_path}/.git -> "
@@ -852,6 +894,7 @@ class DockerAgentRunner:
                 host_git_base_path=f'{host_origin_clone_path}/.git',
                 worktree_admin_id=worktree_admin_id,
                 host_override_path=host_override_path,
+                protected_relative_paths=protected_relative_paths,
             )
         except Exception as e:
             logger.warning(
@@ -1034,6 +1077,20 @@ class DockerAgentRunner:
                 '-v', f'{host_worktree_admin_path}:/git-base/worktrees/{worktree_admin_id}:{workspace_mount_mode}',
                 '-v', f'{host_override_path}:/workspace/.git:{workspace_mount_mode}',
             ])
+            # Review pass 3: hooks/config/packed-refs, unlike the rest of
+            # /git-base, are NEVER legitimately written to by an agent's
+            # ordinary git operations -- remount each one that exists
+            # read-only on top, unconditionally (regardless of
+            # workspace_mount_mode), closing the arbitrary-code-execution
+            # (hooks) and bulk-ref-rewrite (packed-refs) exposure the plain
+            # /git-base mount above would otherwise leave open. See
+            # _prepare_worktree_git_mount's docstring for the full reasoning,
+            # including why full per-branch refs/heads isolation is a
+            # separate, deliberately deferred follow-up.
+            for protected_name in worktree_git_mount_paths.protected_relative_paths:
+                cmd.extend([
+                    '-v', f'{host_git_base_path}/{protected_name}:/git-base/{protected_name}:ro',
+                ])
 
         # Mount Claude Code wrapper script for container-side Redis writes
         wrapper_host_path = f'{host_workspace}/switchyard/scripts/docker-claude-wrapper.py'
