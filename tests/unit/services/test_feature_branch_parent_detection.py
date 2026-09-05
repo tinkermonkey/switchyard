@@ -275,8 +275,17 @@ class TestParentIssueLookupErrorPerCallerHandling:
     """Issue #126's core fix: get_parent_issue() no longer collapses "lookup
     failed" and "confirmed no parent" into the same None -- so each caller must
     now make its own explicit choice about which behavior is correct for it.
-    These tests confirm both existing choices, on the real (unmocked) methods
-    rather than re-testing get_parent_issue() itself."""
+    Both of resolve_epic_id()/get_feature_branch_for_issue() below turn out to
+    need the SAME choice (propagate) -- an initial version of this PR had
+    get_feature_branch_for_issue() catch and fall back to None instead, reasoned
+    to be safe because it has no persisted state of its own to poison. Code
+    review found that reasoning incomplete: its own most consequential caller,
+    finalize_feature_branch_work() (see TestFinalizeFeatureBranchWorkPropagatesLookupFailure
+    below), treats a falsy result as a confirmed standalone issue and skips
+    completion tracking/PR creation entirely -- silently reintroducing this
+    issue's exact ambiguity one call frame up. These tests confirm the
+    (corrected) propagation, on the real (unmocked) methods rather than
+    re-testing get_parent_issue() itself."""
 
     @pytest.fixture
     def manager(self):
@@ -297,20 +306,57 @@ class TestParentIssueLookupErrorPerCallerHandling:
                 await manager.resolve_epic_id(Mock(), 101, project='test-project')
 
     @pytest.mark.asyncio
-    async def test_get_feature_branch_for_issue_falls_back_to_none_on_lookup_failure(self, manager):
-        """Deliberately the OTHER choice: this method's answer is a fresh,
-        non-persisted read on every call (plain branch/PR bookkeeping, not
-        worktree scoping), so degrading to "no feature branch found" on a lookup
-        failure is correct and must not raise out to its callers."""
+    async def test_get_feature_branch_for_issue_propagates_lookup_failure(self, manager):
+        """Must propagate, not degrade to "no feature branch found" -- see
+        TestFinalizeFeatureBranchWorkPropagatesLookupFailure below for why a
+        swallowed failure here is unsafe."""
         with patch.object(manager, 'get_feature_branch_state', return_value=None), \
              patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent:
             mock_get_parent.side_effect = ParentIssueLookupError("GraphQL rate limited")
 
-            result = await manager.get_feature_branch_for_issue(
-                'test-project', 101, Mock()
-            )
+            with pytest.raises(ParentIssueLookupError):
+                await manager.get_feature_branch_for_issue('test-project', 101, Mock())
 
-            assert result is None
+
+class TestFinalizeFeatureBranchWorkPropagatesLookupFailure:
+    """The actual regression case that overturned get_feature_branch_for_issue()'s
+    original "fall back to None" design (code review finding on this PR):
+    finalize_feature_branch_work() -- the live production finalize step for every
+    'issues'/'hybrid' dispatch (services/workspace/issues_context.py and
+    hybrid_context.py both call it) -- treats a falsy get_feature_branch_for_issue()
+    result as "this issue is genuinely standalone" and skips
+    mark_sub_issue_complete()/create_or_update_feature_pr() entirely, returning
+    success with no error. A caught-and-swallowed ParentIssueLookupError here
+    would have silently reproduced that exact failure mode for a REAL sub-issue
+    hitting a transient lookup failure at exactly the wrong moment."""
+
+    @pytest.fixture
+    def manager(self):
+        return FeatureBranchManager()
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_during_finalize_raises_not_silently_treated_as_standalone(
+        self, manager, tmp_path
+    ):
+        with patch.object(manager, 'get_feature_branch_state', return_value=None), \
+             patch.object(manager, 'get_parent_issue', new_callable=AsyncMock) as mock_get_parent, \
+             patch.object(manager, 'git_add_all', new_callable=AsyncMock) as mock_add, \
+             patch.object(manager, 'git_commit', new_callable=AsyncMock) as mock_commit:
+            mock_get_parent.side_effect = ParentIssueLookupError("GraphQL rate limited")
+
+            with pytest.raises(ParentIssueLookupError):
+                await manager.finalize_feature_branch_work(
+                    project='test-project',
+                    issue_number=101,
+                    commit_message='test commit',
+                    github_integration=Mock(),
+                    project_dir_override=str(tmp_path),
+                )
+
+            # Must fail before ever touching git -- no commit/push attempted
+            # against a workspace whose completion status couldn't be determined.
+            mock_add.assert_not_called()
+            mock_commit.assert_not_called()
 
 
 class TestResolveEpicWorktreeTarget:

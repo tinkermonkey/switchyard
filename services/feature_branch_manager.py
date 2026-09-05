@@ -49,13 +49,18 @@ class ParentIssueLookupError(Exception):
     permanently mis-scope its epic worktree to the sub-issue's own number instead
     (permanently, because PipelineRunManager.resolve_workspace()'s idempotency guard
     never re-resolves once branch_name/project_dir/epic_id are set), with no error or
-    operator-visible signal. Callers must decide individually whether to propagate
-    this (resolve_epic_id() does -- see its own docstring) or fall back to a
-    best-effort None (get_feature_branch_for_issue() does, for its own non-critical
-    branch/PR bookkeeping use case) -- there is no single correct answer for every
-    caller, which is exactly why this is a distinct exception rather than a bare
-    return value: propagating vs. swallowing is now an explicit choice at each call
-    site instead of an implicit, uniform one buried inside get_parent_issue() itself.
+    operator-visible signal. Every direct caller of get_parent_issue() (and of
+    resolve_epic_id() and get_feature_branch_for_issue(), both built on top of it)
+    now propagates this rather than swallowing it -- see each method's own
+    docstring for why a fallback would be unsafe for it specifically. A caller for
+    whom a best-effort fallback genuinely IS correct isn't left without one: it
+    already wraps its call in its own broad try/except for unrelated reasons (e.g.
+    git_workflow_manager.py's create_or_update_feature_pr(), project_monitor.py's
+    output-gathering and PR-ready-on-exit paths), which now also catches this
+    exception type the same as any other. Making this a distinct exception rather
+    than a bare return value is still the point: propagating vs. swallowing is an
+    explicit choice visible at each call site instead of an implicit, uniform one
+    buried inside get_parent_issue() itself.
     """
     pass
 
@@ -468,14 +473,27 @@ class FeatureBranchManager:
             github_integration: GitHubIntegration instance for API calls
 
         Returns:
-            FeatureBranch object if found, None otherwise -- including when the
-            parent-issue lookup itself fails (#126): unlike resolve_epic_id(), this
-            method has no durable state that a wrong answer could permanently poison
-            (it's a plain read used for branch/PR bookkeeping, re-derived fresh on
-            every call), so a caught ParentIssueLookupError degrades to the same
-            "no parent found" result a confirmed no-parent answer would, rather than
-            propagating -- an explicit per-caller choice, not the uniform swallow
-            get_parent_issue() itself used to do.
+            FeatureBranch object if found, None if the issue is confirmed to have
+            no parent (or no state tracked for one it does have).
+
+        Raises:
+            ParentIssueLookupError: propagated from get_parent_issue(), deliberately
+                NOT caught here (#126, code review correction on this PR). This
+                method's single most consequential caller,
+                finalize_feature_branch_work(), treats a falsy result as "this is a
+                genuinely standalone issue" and skips mark_sub_issue_complete()/
+                create_or_update_feature_pr() entirely -- so swallowing a lookup
+                failure to None here would silently reintroduce, one call frame up,
+                exactly the "lookup failure indistinguishable from confirmed
+                absence" ambiguity this issue set out to eliminate: a transient
+                GraphQL blip during finalization could cause a real sub-issue's
+                push to silently skip completion tracking and PR creation/update,
+                reporting success with no operator-visible signal. Callers for whom
+                a best-effort fallback genuinely is correct (e.g.
+                git_workflow_manager.py's create_or_update_feature_pr(), an
+                auto-tracking convenience) already wrap this call in their own
+                broad try/except for unrelated reasons and need no special handling
+                here.
         """
         # Step 1: Check if this issue itself has a branch (it's a parent)
         direct_branch = self.get_feature_branch_state(project, issue_number)
@@ -484,14 +502,7 @@ class FeatureBranchManager:
             return direct_branch
 
         # Step 2: Check if it's a sub-issue - find parent
-        try:
-            parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
-        except ParentIssueLookupError as e:
-            logger.warning(
-                f"Parent issue lookup failed for #{issue_number} (treating as no "
-                f"feature branch found, not a confirmed standalone issue): {e}"
-            )
-            return None
+        parent_issue = await self.get_parent_issue(github_integration, issue_number, project=project)
 
         if parent_issue:
             # Get parent's branch
@@ -1023,6 +1034,16 @@ class FeatureBranchManager:
         # worktree by the sub-issue's own number just because repo config wasn't
         # ready yet.
         if not github_integration.github_org or not github_integration.repo_name:
+            # Logged here, not just left to whichever caller catches this (code
+            # review finding, this PR): the old return-None version logged at the
+            # point of failure too, and a future caller that catches this for its
+            # own best-effort fallback (this exception's docstring explicitly
+            # anticipates that) could otherwise forget to log at all, producing a
+            # fully silent failure where the old code structurally couldn't.
+            logger.warning(
+                f"Cannot get parent issue for #{issue_number}: "
+                f"github_org={github_integration.github_org}, repo_name={github_integration.repo_name}"
+            )
             raise ParentIssueLookupError(
                 f"Cannot get parent issue for #{issue_number}: "
                 f"github_org={github_integration.github_org}, repo_name={github_integration.repo_name}"
@@ -1060,7 +1081,10 @@ class FeatureBranchManager:
                 # #126: a GraphQL failure is a lookup failure, not a confirmed
                 # absence of a parent -- raise rather than return None so callers
                 # like resolve_epic_id() don't silently mis-scope on a transient
-                # API error.
+                # API error. Logged here for the same reason as the config-check
+                # raise above: a structural guarantee, not left to whichever
+                # caller happens to catch it.
+                logger.error(f"GraphQL query failed for issue #{issue_number} parent: {result}")
                 raise ParentIssueLookupError(
                     f"GraphQL query failed for issue #{issue_number} parent: {result}"
                 )
@@ -1106,7 +1130,9 @@ class FeatureBranchManager:
             # #126: this used to swallow every unexpected error to None here too --
             # the same "indistinguishable from confirmed no parent" problem as the
             # two raise sites above, just for the catch-all case. Wrap and raise
-            # instead (chained via `from e` for the original traceback).
+            # instead (chained via `from e` for the original traceback), logged
+            # here for the same structural-guarantee reason as both raises above.
+            logger.error(f"Failed to get parent issue for #{issue_number}: {e}")
             raise ParentIssueLookupError(
                 f"Failed to get parent issue for #{issue_number}: {e}"
             ) from e
