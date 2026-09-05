@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import threading
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -523,30 +523,39 @@ class DockerAgentRunner:
         # Always use stdin for passing prompts (avoids command-line length limits and escaping issues)
         use_stdin = True
 
-        docker_cmd, image_name = self._build_docker_command(
-            container_name=container_name,
-            project_dir=project_dir,
-            mcp_config_path=mcp_config_path,
-            context=context,
-            use_stdin=use_stdin
-        )
-
+        # _build_docker_command() itself now happens INSIDE the try block below
+        # (issue #127 review pass 2), not out here -- it can write a
+        # worktree-gitdir-override temp file (_prepare_worktree_git_mount) and
+        # then still raise afterward (e.g. the filesystem write-verification
+        # check further down the same method); before this, that exception
+        # propagated out of run_agent_in_container without ever reaching the
+        # finally block, leaking the override file (and, pre-existing, the
+        # MCP config file below) on every such failure.
+        #
         # Concurrency gate for docker-socket-bearing agents (see switchyard #51):
         # independent of, and in addition to, general pipeline-dispatch
         # concurrency. Both the requires-check and the actual (potentially
         # long-blocking, up to DockerSocketAccessGate's max_wait_seconds)
-        # acquire() call happen INSIDE the try block below, not out here -- so
-        # if either raises (found in #51 review, pass 2: _requires_docker_
-        # socket_access() only catches ConfigurationError, so a different
-        # exception from re-reading the project config here could still leak
-        # the MCP config temp file the same way an un-caught acquire() failure
-        # could) or the awaiting task is cancelled, the finally block's
-        # MCP-config-file cleanup still runs instead of leaking that temp file
-        # (it was written to disk a few lines above, before this gate existed).
+        # acquire() call happen INSIDE the try block below too -- so if either
+        # raises (found in #51 review, pass 2: _requires_docker_socket_access()
+        # only catches ConfigurationError, so a different exception from
+        # re-reading the project config here could still leak the MCP config
+        # temp file the same way an un-caught acquire() failure could) or the
+        # awaiting task is cancelled, the finally block's MCP-config-file
+        # cleanup still runs instead of leaking that temp file (it was written
+        # to disk a few lines above, before this gate existed).
         docker_socket_gate = None
         docker_socket_holder_id = None
 
         try:
+            docker_cmd, image_name = self._build_docker_command(
+                container_name=container_name,
+                project_dir=project_dir,
+                mcp_config_path=mcp_config_path,
+                context=context,
+                use_stdin=use_stdin
+            )
+
             if self._requires_docker_socket_access(agent, project):
                 from services.docker_socket_access_gate import get_docker_socket_access_gate
                 docker_socket_gate = get_docker_socket_access_gate()
@@ -572,6 +581,9 @@ class DockerAgentRunner:
             self._unregister_active_container(container_name)
             # Clean up reference repo worktrees created for this launch
             self._cleanup_reference_worktrees(container_name)
+            # Clean up the worktree-gitdir-override temp file, if one was
+            # written for this launch (issue #127) -- a no-op otherwise.
+            self._cleanup_worktree_git_override(container_name)
             # Clean up MCP config file
             if mcp_config_path and os.path.exists(mcp_config_path):
                 try:
@@ -712,6 +724,197 @@ class DockerAgentRunner:
 
         return selected_path
 
+    class WorktreeGitMount(NamedTuple):
+        """Everything _build_docker_command() needs to mount a worktree's
+        originating clone safely (issue #127, review passes 2 and 3).
+        host_git_base_path and host_override_path are ready to use directly as
+        `-v` mount sources; worktree_admin_id is needed separately to build the
+        sibling-masking mounts (see _prepare_worktree_git_mount's docstring).
+        protected_relative_paths lists which of hooks/config/packed-refs
+        actually exist in the origin clone -- each gets remounted read-only on
+        top of /git-base regardless of workspace_mount_mode, since none of
+        them are ever legitimately written to by an agent's ordinary git
+        operations, but a write-allowed container could otherwise use hooks
+        for arbitrary code execution in a LATER container on a sibling epic,
+        or config/packed-refs to redirect remotes or bulk-rewrite refs."""
+        host_git_base_path: str
+        worktree_admin_id: str
+        host_override_path: str
+        protected_relative_paths: tuple
+
+    def _worktree_git_override_path(self, container_name: str) -> str:
+        """Deterministic path for one launch's worktree-gitdir-override temp file
+        (issue #127) -- derivable from container_name alone, the same way
+        _cleanup_reference_worktrees() already keys its own cleanup, so the
+        caller's finally block can remove it without _build_docker_command
+        needing to change its return signature to report it back."""
+        return f'/workspace/.orchestrator/tmp/worktree_gitdir_override_{container_name}.git'
+
+    def _cleanup_worktree_git_override(self, container_name: str) -> None:
+        """Remove the temp file _prepare_worktree_git_mount() wrote for this launch,
+        if any (issue #127) -- mirrors the existing mcp_config_path/
+        _cleanup_reference_worktrees() cleanup already done in this method's
+        caller's finally block."""
+        override_path = self._worktree_git_override_path(container_name)
+        if os.path.exists(override_path):
+            try:
+                os.remove(override_path)
+                logger.debug(f"Cleaned up worktree gitdir override file: {override_path}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up worktree gitdir override file {override_path}: {e}")
+
+    def _prepare_worktree_git_mount(
+        self, project_dir: Path, host_workspace: str, container_name: str
+    ) -> Optional["DockerAgentRunner.WorktreeGitMount"]:
+        """
+        If project_dir is a linked git worktree (issue #127) rather than a normal
+        repository, mounting it ALONE at /workspace breaks its own git functionality
+        from inside the container: a worktree's .git is not a repository, it's a
+        pointer file (`gitdir: <path>`) to admin data (HEAD, index, refs) living in
+        the ORIGINATING clone's .git/worktrees/<id>/ -- a path outside the mount
+        entirely. Any git command the agent runs itself (status, add, commit, ...)
+        sees "fatal: not a git repository" and, observed live in production,
+        "self-repairs" with `git init` -- silently orphaning the worktree from the
+        real branch/remote, with subsequent commits trapped in a disconnected local
+        repo that never reaches GitHub.
+
+        Fix: leave the worktree mounted at /workspace exactly as before (its own
+        tracked files, and the agent's own /workspace convention, are both
+        unchanged), but ALSO mount the *originating clone's* .git directory at a
+        dedicated path outside /workspace, and override /workspace/.git with a
+        corrected pointer file that resolves against it. commondir inside a
+        worktree's admin subdirectory is a relative path (../..), so this
+        correctly restores access to the shared object database too, not just the
+        worktree's own HEAD/index. Verified end-to-end (a real worktree, mounted
+        this way, correctly reports its branch, commits, and has that commit
+        visible from the base clone afterward) before writing this.
+
+        A normal (non-worktree) project_dir's .git is a real directory, not a
+        file -- returns None, a no-op for the common case.
+
+        Sibling-worktree isolation (issue #127 review pass 2): mounting the WHOLE
+        origin clone's .git at /git-base would also expose every OTHER epic's own
+        worktree admin subdirectory under .git/worktrees/ -- all epics of one
+        project share a single base clone (see
+        ProjectWorkspaceManager.get_or_create_epic_worktree), so without this, a
+        write-allowed container for epic A would gain direct write access to
+        epic B's HEAD/index/locks, letting a buggy or malicious tool call in one
+        epic's container corrupt a completely unrelated epic's worktree. The
+        caller masks that off with an empty tmpfs over /git-base/worktrees and
+        remounts only THIS worktree's own admin subdir back on top of the mask
+        (verified end-to-end: siblings become invisible, this worktree's own
+        git status/commit/push still work, and the shared object database
+        under /git-base itself -- outside worktrees/ -- stays visible, since
+        objects are content-addressed and refs are per-branch, not a
+        cross-epic isolation concern the way the admin subdirs are).
+
+        Review pass 3: the worktrees/ mask alone still left hooks/, config,
+        and packed-refs in the shared .git writable -- hooks especially is an
+        arbitrary-code-execution vector (a container could plant a
+        post-checkout/pre-commit hook that runs inside a LATER container on a
+        sibling epic the next time an ordinary git command triggers it), and
+        config/packed-refs could redirect remotes or bulk-rewrite ref
+        positions across epics. The caller remounts each path this method
+        reports existing as read-only on top of /git-base, unconditionally
+        (even when the rest of /workspace is mounted read-write) -- none of
+        the three are ever legitimately written to by an agent's ordinary git
+        operations, only by `git init`/`git pack-refs`/manual hook
+        installation, none of which agents do as part of normal SDLC work.
+        Per-branch write isolation for refs/heads itself (so one epic can't
+        overwrite another epic's branch pointer) is a deeper problem --
+        packed-refs materialization, arbitrarily nested branch-name paths --
+        deliberately deferred as a separate follow-up rather than rushed in
+        here; the residual risk is ref-pointer corruption in the LOCAL base
+        clone only, not code execution, and not the real GitHub state the
+        rescued-commits workflow actually depends on.
+
+        Returns:
+            A WorktreeGitMount if project_dir is a worktree, else None.
+            host_git_base_path and host_override_path are HOST filesystem paths,
+            ready to use directly as `-v` mount sources; worktree_admin_id is
+            the plain directory name (not a path) used to build the
+            sibling-masking mounts. The caller still needs to apply the correct
+            :ro/:rw suffix (matching whatever mode the rest of /workspace is
+            mounted with; this method has no opinion on that).
+        """
+        git_pointer_path = project_dir / '.git'
+        if not git_pointer_path.is_file():
+            return None
+
+        try:
+            pointer_content = git_pointer_path.read_text().strip()
+            # Expected form: "gitdir: /workspace/<project>/.git/worktrees/<id>"
+            if not pointer_content.startswith('gitdir:'):
+                raise ValueError(f"Unexpected worktree pointer format: {pointer_content!r}")
+            origin_gitdir = pointer_content.split(':', 1)[1].strip()
+            marker = '/.git/worktrees/'
+            marker_index = origin_gitdir.rindex(marker)
+            origin_clone_container_path = origin_gitdir[:marker_index]
+            worktree_admin_id = origin_gitdir[marker_index + len(marker):]
+            host_origin_clone_path = self._container_workspace_path_to_host(
+                origin_clone_container_path, host_workspace
+            )
+
+            # Write the corrected pointer to a per-launch temp file (never modify
+            # the real worktree .git -- other consumers, e.g. the orchestrator's
+            # own process and repair-cycle containers, use a DIFFERENT mount
+            # layout and depend on the original content). /workspace/.orchestrator/
+            # tmp is the same location _write_mcp_config_file() already uses and
+            # already knows how to translate to a host path -- reuse that, rather
+            # than a second, independent temp-file strategy.
+            override_container_path = self._worktree_git_override_path(container_name)
+            override_container_dir = os.path.dirname(override_container_path)
+            os.makedirs(override_container_dir, exist_ok=True)
+            with open(override_container_path, 'w') as f:
+                f.write(f'gitdir: /git-base/worktrees/{worktree_admin_id}\n')
+            host_override_path = self._container_workspace_path_to_host(
+                override_container_path, host_workspace
+            )
+
+            # Determine which of hooks/config/packed-refs actually exist in the
+            # origin clone, checked via the CONTAINER-visible path (this
+            # process's own /workspace or /app view, not the host path it
+            # can't stat directly) -- review pass 3. packed-refs in particular
+            # is genuinely optional (a clone that's never had `git pack-refs`
+            # run against it won't have one); guessing wrong and mounting a
+            # nonexistent host path would make Docker auto-create an unwanted
+            # empty directory at that path in the REAL base clone's .git.
+            origin_clone_git_dir = Path(origin_clone_container_path) / '.git'
+            protected_relative_paths = tuple(
+                name for name in ('hooks', 'config', 'packed-refs')
+                if (origin_clone_git_dir / name).exists()
+            )
+
+            logger.info(
+                f"Worktree at {project_dir} needs its originating clone's .git "
+                f"mounted separately -- mounting {host_origin_clone_path}/.git -> "
+                "/git-base and overriding /workspace/.git with a corrected pointer"
+            )
+            return DockerAgentRunner.WorktreeGitMount(
+                host_git_base_path=f'{host_origin_clone_path}/.git',
+                worktree_admin_id=worktree_admin_id,
+                host_override_path=host_override_path,
+                protected_relative_paths=protected_relative_paths,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not prepare git-worktree mount fix for {project_dir} "
+                f"(falling back to the original, possibly-broken mount): {e}"
+            )
+            return None
+
+    @staticmethod
+    def _container_workspace_path_to_host(container_path: str, host_workspace: str) -> str:
+        """Translate a container-side /app/... or /workspace/... path (the
+        orchestrator's own view) to its host filesystem equivalent -- the same
+        translation _build_docker_command() already performs independently for
+        project_dir, the MCP config path, and the pipeline context dir."""
+        if container_path.startswith('/workspace/'):
+            return f'{host_workspace}/{container_path[len("/workspace/"):]}'
+        if container_path.startswith('/app/'):
+            return f'{host_workspace}/switchyard/{container_path[len("/app/"):]}'
+        return container_path
+
     def _build_docker_command(
         self,
         container_name: str,
@@ -741,6 +944,15 @@ class DockerAgentRunner:
             host_project_path = container_path_str
 
         logger.info(f"Mounting project: container={container_path_str}, host={host_project_path}")
+
+        # See _prepare_worktree_git_mount()'s own docstring (issue #127) --
+        # None for a normal (non-worktree) project_dir, the common case. The
+        # actual -v args (with the correct :ro/:rw suffix, matching whatever
+        # mode /workspace itself ends up mounted with) are built further down,
+        # once that mode is known.
+        worktree_git_mount_paths = self._prepare_worktree_git_mount(
+            project_dir, host_workspace, container_name
+        )
 
         # Get agent config to check filesystem write permission
         # Fall back to context-provided agent_config for system-level agents that don't
@@ -838,6 +1050,47 @@ class DockerAgentRunner:
             # Mount git config
             '-v', f'{host_home}/.gitconfig:/home/orchestrator/.gitconfig',
         ])
+
+        # See _prepare_worktree_git_mount() above (issue #127) -- None for a
+        # normal (non-worktree) project_dir, the common case. Mounted with the
+        # SAME :ro/:rw mode as /workspace itself -- a read-only agent must not
+        # get a backdoor to mutate the origin clone's real refs/object database
+        # through this second mount just because it's a different mount point.
+        #
+        # The tmpfs + remount pair masks off every OTHER epic's own worktree
+        # admin subdirectory under /git-base/worktrees/ (see
+        # _prepare_worktree_git_mount's docstring, review pass 2) -- without
+        # it, /git-base alone would hand a write-allowed container direct
+        # write access to every sibling epic's HEAD/index/locks, since all
+        # epics of one project share this one base clone. Verified end-to-end
+        # that this mount order (base dir, then tmpfs mask, then the one
+        # real subdir remounted on top) actually resolves this way in Docker
+        # before writing it -- see the PR/commit for that verification.
+        if worktree_git_mount_paths:
+            host_git_base_path = worktree_git_mount_paths.host_git_base_path
+            worktree_admin_id = worktree_git_mount_paths.worktree_admin_id
+            host_override_path = worktree_git_mount_paths.host_override_path
+            host_worktree_admin_path = f'{host_git_base_path}/worktrees/{worktree_admin_id}'
+            cmd.extend([
+                '-v', f'{host_git_base_path}:/git-base:{workspace_mount_mode}',
+                '--tmpfs', '/git-base/worktrees:size=1k',
+                '-v', f'{host_worktree_admin_path}:/git-base/worktrees/{worktree_admin_id}:{workspace_mount_mode}',
+                '-v', f'{host_override_path}:/workspace/.git:{workspace_mount_mode}',
+            ])
+            # Review pass 3: hooks/config/packed-refs, unlike the rest of
+            # /git-base, are NEVER legitimately written to by an agent's
+            # ordinary git operations -- remount each one that exists
+            # read-only on top, unconditionally (regardless of
+            # workspace_mount_mode), closing the arbitrary-code-execution
+            # (hooks) and bulk-ref-rewrite (packed-refs) exposure the plain
+            # /git-base mount above would otherwise leave open. See
+            # _prepare_worktree_git_mount's docstring for the full reasoning,
+            # including why full per-branch refs/heads isolation is a
+            # separate, deliberately deferred follow-up.
+            for protected_name in worktree_git_mount_paths.protected_relative_paths:
+                cmd.extend([
+                    '-v', f'{host_git_base_path}/{protected_name}:/git-base/{protected_name}:ro',
+                ])
 
         # Mount Claude Code wrapper script for container-side Redis writes
         wrapper_host_path = f'{host_workspace}/switchyard/scripts/docker-claude-wrapper.py'
