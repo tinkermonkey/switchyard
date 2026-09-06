@@ -180,20 +180,32 @@ class TestGateWiringForDockerSocketAgents:
             fake_gate.acquire.assert_awaited_once_with("phone-home", "task-3")
             # The MCP config temp file must still be cleaned up despite acquire()
             # raising before the container was ever launched. The finally block
-            # also unconditionally calls _cleanup_worktree_git_override(), which
-            # -- per this test's own blanket os.path.exists=True patch -- "finds"
-            # its deterministic override path and removes it too, even though
-            # _build_docker_command is mocked out above and never actually wrote
-            # one; this test isn't about that cleanup path, but asserting the
-            # exact pair of calls (rather than just assert_any_call) keeps this
-            # test able to catch a future regression that removes an extra or
-            # wrong path here.
+            # also unconditionally calls _cleanup_worktree_git_override() and
+            # (issue #129) _cleanup_worktree_refs_heads_staging(), both of
+            # which -- per this test's own blanket os.path.exists=True patch --
+            # "find" their deterministic paths and remove them too, even
+            # though _build_docker_command is mocked out above and never
+            # actually wrote either one (the refs/heads cleanup's own
+            # meta-file open() then fails for real, since only os.path.exists
+            # and os.remove are patched here, not open() -- caught and logged
+            # as a warning, then its own finally still reaches os.remove() for
+            # the meta path); this test isn't about either cleanup path, but
+            # asserting the exact set of calls (rather than just
+            # assert_any_call) keeps this test able to catch a future
+            # regression that removes an extra or wrong path here.
             expected_override_path = runner._worktree_git_override_path("claude-agent-phone-home-task-3")
+            expected_refs_heads_meta_path = runner._worktree_refs_heads_staging_meta_path(
+                "claude-agent-phone-home-task-3"
+            )
             mock_remove.assert_has_calls(
-                [call("/tmp/mcp-config-fake.json"), call(expected_override_path)],
+                [
+                    call("/tmp/mcp-config-fake.json"),
+                    call(expected_override_path),
+                    call(expected_refs_heads_meta_path),
+                ],
                 any_order=True,
             )
-            assert mock_remove.call_count == 2
+            assert mock_remove.call_count == 3
             # Nothing was ever acquired -- release() must not be called at all.
             fake_gate.release.assert_not_called()
 
