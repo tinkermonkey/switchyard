@@ -764,6 +764,62 @@ class TestPruneEpicWorktrees:
                 manager.prune_epic_worktrees()  # must not raise
 
 
+class TestIsCorruptedNonEmptyWorktree:
+    """Third-pass code review finding: the shared corruption-detection helper
+    (factored out of get_or_create_epic_worktree()/prune_epic_worktrees() after
+    the same condition was hand-written independently at each) must tolerate a
+    directory changing out from under it between the .exists() checks and
+    any(iterdir()) -- unlike Path.exists(), Path.iterdir() does not swallow
+    OSError, and an uncaught one inside prune_epic_worktrees()'s per-worktree
+    loop would abort the ENTIRE startup sweep via that method's single
+    top-level except, not just skip the one worktree that raced."""
+
+    def test_true_for_a_real_corrupted_worktree(self, tmp_path):
+        corrupted = tmp_path / 'corrupted'
+        corrupted.mkdir()
+        (corrupted / 'real_file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(corrupted) is True
+
+    def test_false_for_a_healthy_worktree(self, tmp_path):
+        healthy = tmp_path / 'healthy'
+        healthy.mkdir()
+        (healthy / '.git').mkdir()
+        (healthy / 'real_file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(healthy) is False
+
+    def test_false_for_a_genuinely_empty_directory(self, tmp_path):
+        empty = tmp_path / 'empty'
+        empty.mkdir()
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(empty) is False
+
+    def test_false_for_a_path_that_does_not_exist(self, tmp_path):
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(tmp_path / 'nope') is False
+
+    def test_race_where_directory_vanishes_returns_false_not_raise(self, tmp_path):
+        """Simulates the exact TOCTOU code review caught: the directory is
+        removed (by a concurrent container self-repair, or the same race
+        prune_epic_worktrees()'s own docstring already documents against
+        concurrent worktree creation/adoption) between this check's own
+        .exists() calls and its any(iterdir()) call."""
+        vanishing = tmp_path / 'vanishing'
+        vanishing.mkdir()
+        (vanishing / 'real_file.txt').write_text("content")
+
+        with patch.object(Path, 'iterdir', side_effect=FileNotFoundError("gone")):
+            # Must not raise -- treated as "not corrupted" instead.
+            assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(vanishing) is False
+
+    def test_race_where_directory_becomes_a_file_returns_false_not_raise(self, tmp_path):
+        target = tmp_path / 'was-a-dir'
+        target.mkdir()
+
+        with patch.object(Path, 'iterdir', side_effect=NotADirectoryError("not a directory")):
+            assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(target) is False
+
+
 class TestPruneCorruptedWorktreeSkip:
     """Second-pass code review finding: prune_epic_worktrees()'s startup sweep was
     a SECOND, unprotected path to the identical destructive operation

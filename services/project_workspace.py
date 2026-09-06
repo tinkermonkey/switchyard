@@ -466,23 +466,17 @@ class ProjectWorkspaceManager:
                 )
                 return worktree_path
 
-            if worktree_path.exists() and any(worktree_path.iterdir()):
+            if self._is_corrupted_non_empty_worktree(worktree_path):
                 # On disk, non-empty, but .git is completely missing --
                 # corrupted, not a recognized worktree to adopt above. See
                 # this method's own docstring (Raises section) for the full
                 # rationale on why this deliberately does not attempt any
-                # automatic cleanup.
-                #
-                # Non-empty is the specific condition that matters (code
-                # review correction): a genuinely EMPTY pre-existing
-                # directory (e.g. a stray leftover from a `git worktree add`
-                # that failed before ever registering, or a prior removal
-                # that got the directory itself but not some other transient
-                # state) has nothing to lose and nothing git considers
-                # ambiguous -- `git worktree add` succeeds into an empty,
-                # unregistered directory (verified empirically) exactly as it
-                # always has, self-healing via the normal path below rather
-                # than being needlessly escalated to manual intervention.
+                # automatic cleanup, and _is_corrupted_non_empty_worktree()'s
+                # own docstring for why non-empty is the specific condition
+                # that matters (a genuinely empty pre-existing directory has
+                # nothing to lose -- `git worktree add` succeeds into it
+                # exactly as it always has, self-healing via the normal path
+                # below instead of being needlessly escalated).
                 raise RuntimeError(
                     f"Epic worktree directory for {project_name} epic #{epic_id} "
                     f"exists at {worktree_path} but has no .git at all -- corrupted "
@@ -602,6 +596,47 @@ class ProjectWorkspaceManager:
                 f"Baked-dependency extraction lookup for {project_name} raised "
                 f"unexpectedly ({e}); continuing without it."
             )
+
+    @staticmethod
+    def _is_corrupted_non_empty_worktree(worktree_path: Path) -> bool:
+        """True if worktree_path exists, has real content, but no .git at all --
+        the specific shape get_or_create_epic_worktree() and
+        prune_epic_worktrees() both refuse to auto-clean-up (see
+        get_or_create_epic_worktree()'s own docstring for the full rationale:
+        it's not safely distinguishable from real, precious uncommitted work).
+        Third-pass code review: this exact condition used to be hand-written
+        independently at both call sites (plus a simpler .git-only variant at
+        a third, the in-process cache-hit check) -- one shared, tested
+        implementation instead.
+
+        Race-tolerant (also third-pass code review): `any(iterdir())` -- unlike
+        `Path.exists()` -- does not swallow OSError, so a directory removed or
+        replaced by something else between the .exists() checks and this call
+        (both call sites already document their own broader raciness against
+        concurrent worktree creation/adoption/removal on another thread) would
+        otherwise raise FileNotFoundError/NotADirectoryError instead of this
+        method's clean bool contract. In get_or_create_epic_worktree() that
+        surprises callers expecting only the documented ValueError/RuntimeError;
+        in prune_epic_worktrees() it's worse -- uncaught there, it reaches that
+        method's single top-level except and aborts pruning EVERY OTHER
+        project's/epic's worktree for that startup, not just the one that
+        raced. Treated as "not this corrupted shape" (False) instead: the
+        caller's own subsequent real operation (`git worktree add`/`remove`)
+        already raises its own clear, well-handled failure for whatever the
+        directory turns out to actually be by the time that runs.
+        """
+        try:
+            return (
+                worktree_path.exists()
+                and not (worktree_path / '.git').exists()
+                and any(worktree_path.iterdir())
+            )
+        except OSError as e:
+            logger.warning(
+                f"Could not determine whether {worktree_path} is a corrupted "
+                f"worktree (treating as no): {e}"
+            )
+            return False
 
     @staticmethod
     def _current_worktree_branch(worktree_path: Path) -> Optional[str]:
@@ -1251,7 +1286,7 @@ class ProjectWorkspaceManager:
                     # human to resolve the same way get_or_create_epic_worktree()
                     # asks them to -- unless it's genuinely empty, which has
                     # nothing to lose either way.
-                    if not (worktree_path / '.git').exists() and any(worktree_path.iterdir()):
+                    if self._is_corrupted_non_empty_worktree(worktree_path):
                         logger.warning(
                             f"Skipping prune of {worktree_path} -- has no .git at all "
                             "(corrupted, not a recognized worktree) but is non-empty, so "
