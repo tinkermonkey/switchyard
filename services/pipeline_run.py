@@ -496,7 +496,13 @@ class PipelineRunManager:
                 re-resolves once branch_name/project_dir/epic_id are set). Fixed at
                 the source rather than special-cased here.
             ValueError: The project has no base clone to source the worktree from.
-            RuntimeError: The underlying git worktree add command failed.
+            RuntimeError: The underlying git worktree add command failed, OR (code
+                review finding on a later fix) the epic's worktree directory exists
+                but has no .git at all -- a corrupted state get_or_create_epic_worktree()
+                deliberately does not attempt to auto-recover from; see that
+                method's own docstring for why. Unlike a transient `worktree add`
+                failure, this one is not expected to self-resolve on a plain
+                retry -- it needs manual inspection first.
 
         This method deliberately does not swallow any of these exceptions itself --
         a caller wiring this into real dispatch must let them reach whatever failure
