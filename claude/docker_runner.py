@@ -489,6 +489,8 @@ class DockerAgentRunner:
         Returns:
             Agent output as string
         """
+        import asyncio
+
         agent = context.get('agent', 'unknown')
         task_id = context.get('task_id', 'unknown')
         project = context.get('project', 'unknown')
@@ -549,7 +551,22 @@ class DockerAgentRunner:
         docker_socket_holder_id = None
 
         try:
-            docker_cmd, image_name = self._build_docker_command(
+            # Offloaded to a thread (code review finding, issue #129): before
+            # #129, _build_docker_command()'s worktree-mount preparation
+            # (_prepare_worktree_git_mount()) did only fast, local filesystem
+            # checks. #129 added two real `git` subprocess calls there
+            # (symbolic-ref, rev-parse), each with a 10s timeout -- run
+            # in-line on the event loop thread, a contended .git lock or slow
+            # disk could block EVERY other concurrent pipeline operation
+            # (GitHub polling, other agents' dispatch bookkeeping) for up to
+            # ~20s on every single worktree-based container launch. Wrapping
+            # the whole call (not just the two new subprocess calls) avoids
+            # threading async/await through _build_docker_command's and
+            # _prepare_worktree_git_mount's own signatures -- both stay plain
+            # sync methods, unchanged for their many existing direct
+            # (non-async) callers in tests.
+            docker_cmd, image_name = await asyncio.to_thread(
+                self._build_docker_command,
                 container_name=container_name,
                 project_dir=project_dir,
                 mcp_config_path=mcp_config_path,
@@ -754,13 +771,24 @@ class DockerAgentRunner:
         is a REAL per-launch staging directory (NOT a tmpfs -- see
         _prepare_worktree_git_mount's docstring for why a tmpfs+single-file
         remount, #129's originally-proposed approach, empirically breaks the
-        container's own `git commit`) containing only this worktree's own
-        branch ref file, at the relative path own_branch_relative_ref_path
-        (e.g. "feature/issue-129-epic-a") within it -- mounted whole onto
-        /git-base/refs/heads. The caller must also wire
+        container's own `git commit`) containing this worktree's own branch
+        ref file (at the relative path own_branch_relative_ref_path, e.g.
+        "feature/issue-129-epic-a") PLUS, best-effort, a read-visible copy of
+        the project's default branch (e.g. "main") -- code review finding:
+        masking refs/heads down to only the current branch also hid every
+        OTHER local branch agents commonly reference directly (`git diff
+        main...HEAD`, `git merge main`; `origin/main`, a separate ref
+        namespace this never touches, doesn't cover that) -- mounted whole
+        onto /git-base/refs/heads. own_branch_relative_ref_path is also
+        duplicated into the metadata file _cleanup_worktree_refs_heads_staging()
+        reads (both written from the SAME local variable at the SAME point in
+        _prepare_worktree_git_mount, so they cannot diverge); it's kept here
+        too mainly for tests to assert against, not because any current
+        caller of THIS NamedTuple reads it back. The caller must also wire
         _cleanup_worktree_refs_heads_staging() into its launch teardown to
-        sync the (possibly agent-updated) ref value back into the real origin
-        clone and remove the staging directory -- see that method's docstring."""
+        sync the (possibly agent-updated) branch value back into the real
+        origin clone and remove the staging directory -- see that method's
+        docstring."""
         host_git_base_path: str
         worktree_admin_id: str
         host_override_path: str
@@ -840,9 +868,24 @@ class DockerAgentRunner:
                 meta = json.load(f)
             origin_clone_container_path = meta['origin_clone_container_path']
             own_branch_relative_ref_path = meta['own_branch_relative_ref_path']
+            # Absent for a meta.json written before this field existed (a
+            # launch straddling a deploy) -- falls back to an unconditional
+            # (non-CAS) write below, the pre-this-fix behavior, rather than
+            # crashing on a KeyError.
+            original_sha = meta.get('original_sha')
 
             staged_ref_path = os.path.join(staging_dir, own_branch_relative_ref_path)
-            if os.path.exists(staged_ref_path):
+            if not os.path.exists(staged_ref_path):
+                # Code review finding: log even the "nothing to sync" case --
+                # every other branch of this function does, and an operator
+                # investigating "the epic branch didn't advance after this
+                # launch" needs a trace here too (e.g. the container ran
+                # `git branch -m`/`-d` on its own checked-out branch).
+                logger.info(
+                    f"No staged ref file found for refs/heads/{own_branch_relative_ref_path} "
+                    f"(container {container_name}) -- nothing to sync back"
+                )
+            else:
                 with open(staged_ref_path, 'r') as f:
                     final_value = f.read().strip()
 
@@ -855,28 +898,56 @@ class DockerAgentRunner:
                 # Leaving the real ref at its old (still valid) value on a
                 # failed validation is strictly safer than propagating an
                 # unvalidated write.
-                if re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', final_value):
-                    real_ref_path = os.path.join(
-                        origin_clone_container_path, '.git', 'refs', 'heads',
-                        own_branch_relative_ref_path
-                    )
-                    os.makedirs(os.path.dirname(real_ref_path), exist_ok=True)
-                    tmp_path = f'{real_ref_path}.tmp{os.getpid()}'
-                    with open(tmp_path, 'w') as f:
-                        f.write(final_value + '\n')
-                    os.replace(tmp_path, real_ref_path)
-                    logger.debug(
-                        f"Synced refs/heads/{own_branch_relative_ref_path} = "
-                        f"{final_value} back to {origin_clone_container_path} "
-                        f"(container {container_name})"
-                    )
-                else:
+                if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', final_value):
                     logger.warning(
                         f"Staged ref value for refs/heads/{own_branch_relative_ref_path} "
                         f"({container_name}) doesn't look like a valid SHA "
                         f"({final_value!r}) -- leaving the real origin clone's ref "
                         "untouched rather than syncing back a possibly-corrupt value."
                     )
+                else:
+                    # Code review finding: sync back via `git update-ref
+                    # <ref> <new> <old>` -- a compare-and-swap, not an
+                    # unconditional overwrite -- rather than a manual
+                    # tmp-file-plus-rename. Two benefits: (1) reflog
+                    # auditability for free, using the same primitive every
+                    # other ref mutation in this codebase goes through,
+                    # instead of a bespoke write invisible to `git reflog`;
+                    # (2) safety under the launch-teardown overlap this
+                    # codebase's own concurrency model doesn't fully rule out
+                    # yet (steal_lock() lets a repair cycle claim a lock
+                    # without confirming the previous holder's container has
+                    # finished tearing down; PipelineSemaphoreManager's
+                    # per-epic exclusivity is explicitly "NOT yet wired into
+                    # any live dispatch path") -- if a DIFFERENT, overlapping
+                    # teardown already moved this same ref past what THIS
+                    # launch staged as its starting point, the <old> guard
+                    # (original_sha, captured at prepare-time) makes git
+                    # refuse the write instead of silently rolling the ref
+                    # backward and discarding that other commit's advance.
+                    # Falls back to an unconditional write (old code's
+                    # behavior) only if original_sha wasn't captured at
+                    # prepare-time (see the .get() above).
+                    real_ref_name = f'refs/heads/{own_branch_relative_ref_path}'
+                    update_ref_cmd = ['git', '-C', origin_clone_container_path,
+                                       'update-ref', real_ref_name, final_value]
+                    if original_sha:
+                        update_ref_cmd.append(original_sha)
+                    update_result = subprocess.run(
+                        update_ref_cmd, capture_output=True, text=True, timeout=10
+                    )
+                    if update_result.returncode == 0:
+                        logger.debug(
+                            f"Synced {real_ref_name} = {final_value} back to "
+                            f"{origin_clone_container_path} (container {container_name})"
+                        )
+                    else:
+                        logger.warning(
+                            f"Failed to sync {real_ref_name} = {final_value} back to "
+                            f"{origin_clone_container_path} (container {container_name}"
+                            f"{', likely concurrent update since this launch started' if original_sha else ''}"
+                            f"): {update_result.stderr.strip()}"
+                        )
         except Exception as e:
             logger.warning(
                 f"Failed to sync refs/heads staging back for container "
@@ -885,13 +956,15 @@ class DockerAgentRunner:
         finally:
             # Always clean up the staging area, even if the sync-back above
             # failed -- mirrors _cleanup_worktree_git_override's own
-            # never-leak-the-temp-resource guarantee.
+            # never-leak-the-temp-resource guarantee. rmtree and remove are
+            # two independent operations against two independent paths (code
+            # review finding) -- logged/caught separately so a failure on one
+            # is never misattributed to the other.
+            shutil.rmtree(staging_dir, ignore_errors=True)
             try:
-                shutil.rmtree(staging_dir, ignore_errors=True)
                 os.remove(meta_path)
-                logger.debug(f"Cleaned up refs/heads staging directory: {staging_dir}")
             except Exception as e:
-                logger.warning(f"Failed to clean up refs/heads staging directory {staging_dir}: {e}")
+                logger.warning(f"Failed to clean up refs/heads staging metadata file {meta_path}: {e}")
 
     def _prepare_worktree_git_mount(
         self, project_dir: Path, host_workspace: str, container_name: str
@@ -961,32 +1034,54 @@ class DockerAgentRunner:
         creates at that exact leaf path, so the container's own `git commit`
         fails outright (confirmed: `fatal: couldn't set 'refs/heads/...'`).
         Fixed instead by giving refs/heads a real per-launch STAGING
-        DIRECTORY (not a tmpfs) containing only this worktree's own branch ref
+        DIRECTORY (not a tmpfs) containing this worktree's own branch ref
         file, mounted whole -- a real directory has no such boundary, so
         lockfile-then-rename works normally inside it. The caller must also
         call _cleanup_worktree_refs_heads_staging() in its launch teardown to
         sync the (possibly agent-updated) value back into the real origin
-        clone and remove the staging directory -- see that method's own
-        docstring for why, and WorktreeGitMount's docstring for the two
-        fields this produces. Also incidentally simpler than the originally-
+        clone (via `git update-ref <ref> <new> <old>`, a compare-and-swap
+        against the value captured here at prepare-time -- code review
+        finding: this codebase's own concurrency model doesn't yet fully
+        rule out an overlapping teardown for the same branch, so an
+        unconditional overwrite could silently roll a ref backward past a
+        different launch's more recent commit; the CAS makes git refuse that
+        instead) and remove the staging directory -- see that method's own
+        docstring for why, and WorktreeGitMount's docstring for the fields
+        this produces. Also incidentally simpler than the originally-
         imagined design for the packed-vs-loose materialization concern
         (issue #129's own "why this wasn't fixed in #128" point 3): since the
         staging file is synthesized fresh from `git rev-parse` (which
         transparently resolves either loose or packed refs) rather than
         needing the REAL origin clone's ref to be pre-materialized as loose,
         there's no special-casing needed for a branch that's still
-        packed-only. Verified end-to-end (a real worktree with its branch
-        packed-only, mounted this way, correctly commits inside the
-        container, the commit is absent from a sibling epic's branch, and the
-        real origin clone's ref reflects the new commit after the launch's
-        teardown syncs it back) before writing this. Best-effort: if the
-        current branch can't be determined (e.g. detached HEAD, genuinely
-        never expected for these worktrees but not asserted against) or
-        anything in this sub-step fails, refs/heads is left exposed exactly
-        as it was pre-#129 rather than failing the whole worktree-mount fix
-        over it -- the residual risk in that fallback case is unchanged from
-        #128's own documented one: ref-pointer corruption in the LOCAL base
-        clone only, not code execution, and not the real GitHub state the
+        packed-only. (The real origin clone's OWN packed-refs entry for this
+        branch, if any, is left as-is by the sync-back -- ordinary, harmless
+        git behavior: a loose ref always takes precedence over a stale
+        packed-refs entry for the same name, exactly as happens whenever
+        anyone runs `git pack-refs` and then makes another commit.) Code
+        review finding: also stages the project's default branch alongside
+        the current one (see WorktreeGitMount's docstring) -- masking
+        refs/heads down to ONLY the current branch, this method's first cut,
+        hid every OTHER local branch from the container too, including the
+        shared default branch every epic branches from, which was visible
+        pre-#129 and which agents commonly reference directly. Verified
+        end-to-end (a real worktree with its branch packed-only, mounted
+        this way, correctly commits inside the container, the commit is
+        absent from a sibling epic's branch, the container can still see and
+        diff against the staged default branch, and the real origin clone's
+        ref reflects the new commit after the launch's teardown syncs it
+        back) before writing this -- this covers the write-isolation and
+        sync-back path and the default-branch read-visibility fix; it does
+        NOT mean every OTHER local branch remains reachable by name from
+        inside the container (by design: that's the isolation itself).
+        Best-effort: if the current branch can't be determined (e.g.
+        detached HEAD, genuinely never expected for these worktrees but not
+        asserted against) or anything in this sub-step fails, refs/heads is
+        left exposed exactly as it was pre-#129 rather than failing the
+        whole worktree-mount fix over it -- the residual risk in that
+        fallback case is unchanged from #128's own documented one:
+        ref-pointer corruption in the LOCAL base clone only, not code
+        execution, and not the real GitHub state the
         rescued-commits workflow actually depends on.
 
         Returns:
@@ -1090,19 +1185,79 @@ class DockerAgentRunner:
                             f"Could not resolve refs/heads/{branch_name} in the origin "
                             f"clone: {sha_result.stderr.strip()}"
                         )
-                    sha = sha_result.stdout.strip()
+                    original_sha = sha_result.stdout.strip()
 
                     staging_dir_container_path = self._worktree_refs_heads_staging_dir(container_name)
                     staged_ref_path = os.path.join(staging_dir_container_path, branch_name)
                     os.makedirs(os.path.dirname(staged_ref_path), exist_ok=True)
                     with open(staged_ref_path, 'w') as f:
-                        f.write(sha + '\n')
+                        f.write(original_sha + '\n')
+
+                    # Also stage the project's default branch (e.g. "main"),
+                    # READ-ONLY IN EFFECT though mounted with the same mode as
+                    # everything else in the staging dir -- code review
+                    # finding: masking refs/heads down to ONLY the current
+                    # branch also hid every other local branch, including the
+                    # shared default branch every epic branches from, which
+                    # was visible pre-#129. Agents commonly reference it
+                    # directly (e.g. `git diff main...HEAD`, `git merge main`)
+                    # -- `origin/main` alone (refs/remotes/, a separate
+                    # namespace this method never touches) doesn't cover that.
+                    # Safe to include with no additional write protection:
+                    # _cleanup_worktree_refs_heads_staging() below only ever
+                    # reads back and syncs own_branch_relative_ref_path (from
+                    # the metadata file) -- any write a container makes to
+                    # this staged default-branch copy is simply discarded
+                    # with the rest of the staging directory on cleanup,
+                    # exactly like an attempted write to a sibling epic's
+                    # branch already is. Best-effort within the already-best-
+                    # effort refs/heads block: resolving the default branch
+                    # name can fail (e.g. an origin clone set up without
+                    # refs/remotes/origin/HEAD) without losing the current
+                    # branch's own write-isolation staging above.
+                    default_branch_name = None
+                    try:
+                        default_head_result = subprocess.run(
+                            ['git', '-C', origin_clone_container_path, 'symbolic-ref',
+                             '--short', 'refs/remotes/origin/HEAD'],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if default_head_result.returncode == 0:
+                            # "origin/main" -> "main"
+                            default_branch_name = default_head_result.stdout.strip().split('/', 1)[-1]
+                    except Exception:
+                        default_branch_name = None
+
+                    if (
+                        default_branch_name
+                        and default_branch_name != branch_name
+                        and '..' not in default_branch_name.split('/')
+                    ):
+                        default_sha_result = subprocess.run(
+                            ['git', '-C', origin_clone_container_path, 'rev-parse', '--verify',
+                             f'refs/heads/{default_branch_name}'],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if default_sha_result.returncode == 0:
+                            staged_default_ref_path = os.path.join(
+                                staging_dir_container_path, default_branch_name
+                            )
+                            os.makedirs(os.path.dirname(staged_default_ref_path), exist_ok=True)
+                            with open(staged_default_ref_path, 'w') as f:
+                                f.write(default_sha_result.stdout.strip() + '\n')
+                        else:
+                            logger.info(
+                                f"Default branch {default_branch_name!r} for {project_dir} "
+                                f"doesn't resolve in the origin clone ({default_sha_result.stderr.strip()}) "
+                                "-- proceeding without it staged for read visibility"
+                            )
 
                     meta_path = self._worktree_refs_heads_staging_meta_path(container_name)
                     with open(meta_path, 'w') as f:
                         json.dump({
                             'origin_clone_container_path': origin_clone_container_path,
                             'own_branch_relative_ref_path': branch_name,
+                            'original_sha': original_sha,
                         }, f)
 
                     host_refs_heads_staging_path = self._container_workspace_path_to_host(

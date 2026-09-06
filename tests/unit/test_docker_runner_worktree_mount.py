@@ -81,6 +81,43 @@ def _make_real_worktree(tmp_path, branch_name='feature/issue-129-epic-a', pack_r
     return origin, worktree
 
 
+def _make_real_worktree_with_default_branch_remote(
+    tmp_path, branch_name='feature/issue-129-epic-a', default_branch='main'
+):
+    """Like _make_real_worktree, but origin_clone is a REAL `git clone` of an
+    upstream repo (mirroring ProjectWorkspaceManager._clone_repository's
+    `git clone --branch <default_branch> ...`) rather than a bare `git init`
+    -- needed to exercise refs/remotes/origin/HEAD-based default-branch
+    resolution (issue #129 code review finding), which only exists after a
+    real clone, not a local-only `git init`.
+
+    Returns (origin_clone_path, worktree_path).
+    """
+    upstream = tmp_path / 'upstream'
+    upstream.mkdir()
+    _git(upstream, 'init', '-q', '-b', default_branch)
+    _git(upstream, 'config', 'user.email', 'test@test.com')
+    _git(upstream, 'config', 'user.name', 'Test')
+    (upstream / 'file.txt').write_text('hello\n')
+    _git(upstream, 'add', '.')
+    _git(upstream, 'commit', '-q', '-m', 'initial')
+
+    origin = tmp_path / 'origin_clone'
+    _git(tmp_path, 'clone', '--branch', default_branch, '-q', str(upstream), str(origin))
+    _git(origin, 'config', 'user.email', 'test@test.com')
+    _git(origin, 'config', 'user.name', 'Test')
+    _git(origin, 'checkout', '-q', '-b', branch_name)
+    (origin / 'work.txt').write_text('work\n')
+    _git(origin, 'add', '.')
+    _git(origin, 'commit', '-q', '-m', 'epic work')
+    _git(origin, 'checkout', '-q', '--detach', 'HEAD')
+
+    worktree = tmp_path / 'the_worktree'
+    _git(origin, 'worktree', 'add', str(worktree), branch_name)
+
+    return origin, worktree
+
+
 @pytest.fixture
 def runner():
     return DockerAgentRunner()
@@ -237,6 +274,46 @@ class TestPrepareRefsHeadsStaging:
         meta = json.loads(meta_file.read_text())
         assert meta['origin_clone_container_path'] == str(origin)
         assert meta['own_branch_relative_ref_path'] == 'feature/issue-129-epic-a'
+        # Captured for _cleanup_worktree_refs_heads_staging()'s compare-and-
+        # swap sync-back (code review finding) -- must be the value AT
+        # PREPARE TIME, not re-derived later.
+        assert meta['original_sha'] == expected_sha
+
+    def test_stages_the_default_branch_too_for_read_visibility(self, runner, tmp_path):
+        """Code review finding: masking refs/heads down to ONLY the current
+        branch also hid every other local branch, including the shared
+        default branch every epic branches from (visible pre-#129, and
+        commonly referenced directly by agents -- `git diff main...HEAD`,
+        `git merge main`; `origin/main`, a separate ref namespace, doesn't
+        cover that). Needs a REAL `git clone` origin (not _make_real_worktree's
+        bare `git init`) for refs/remotes/origin/HEAD to exist at all."""
+        origin, worktree = _make_real_worktree_with_default_branch_remote(tmp_path)
+        expected_main_sha = _git(origin, 'rev-parse', 'main').stdout.strip()
+
+        result, staging_dir, _meta_file = self._prepare(runner, worktree, tmp_path)
+
+        assert result.own_branch_relative_ref_path == 'feature/issue-129-epic-a'
+        staged_main_file = staging_dir / 'main'
+        assert staged_main_file.is_file()
+        assert staged_main_file.read_text().strip() == expected_main_sha
+        # The epic's own branch must still be staged too -- this is additive,
+        # not a replacement.
+        assert (staging_dir / 'feature' / 'issue-129-epic-a').is_file()
+
+    def test_no_default_branch_file_staged_without_an_origin_remote(self, runner, tmp_path):
+        """_make_real_worktree's origin_clone has no "origin" remote at all
+        (a bare `git init`, not a clone) -- refs/remotes/origin/HEAD doesn't
+        exist, so default-branch staging must degrade gracefully (no file,
+        no crash), leaving only the epic's own branch staged."""
+        origin, worktree = _make_real_worktree(tmp_path)
+
+        result, staging_dir, _meta_file = self._prepare(runner, worktree, tmp_path)
+
+        assert result.host_refs_heads_staging_path is not None  # own-branch isolation still applies
+        staged_files = sorted(
+            str(p.relative_to(staging_dir)) for p in staging_dir.rglob('*') if p.is_file()
+        )
+        assert staged_files == [os.path.join('feature', 'issue-129-epic-a')]
 
     def test_detached_head_worktree_skips_refs_heads_staging(self, runner, tmp_path):
         """Not expected in practice for these worktrees (get_or_create_epic_
@@ -494,25 +571,46 @@ class TestCleanupWorktreeRefsHeadsStaging:
     copy), then removes the staging directory."""
 
     @staticmethod
-    def _set_up_staging(tmp_path, origin, staged_value, branch_name='feature/issue-129-epic-a'):
+    def _set_up_staging(tmp_path, origin, staged_value, branch_name='feature/issue-129-epic-a',
+                         original_sha=None):
         staging_dir = tmp_path / 'refs_heads_staging_c1'
         staged_ref_path = staging_dir / branch_name
         staged_ref_path.parent.mkdir(parents=True)
         staged_ref_path.write_text(staged_value + '\n')
 
-        meta_path = tmp_path / 'refs_heads_staging_c1.meta.json'
-        meta_path.write_text(json.dumps({
+        meta = {
             'origin_clone_container_path': str(origin),
             'own_branch_relative_ref_path': branch_name,
-        }))
+        }
+        if original_sha is not None:
+            meta['original_sha'] = original_sha
+        meta_path = tmp_path / 'refs_heads_staging_c1.meta.json'
+        meta_path.write_text(json.dumps(meta))
         return staging_dir, meta_path
 
     def test_syncs_the_updated_sha_back_and_removes_staging(self, runner, tmp_path):
+        """The sync-back now goes through `git update-ref` (code review
+        finding: gets reflog auditability, and a real integrity check --
+        unlike the old direct-file-write, update-ref refuses a value that
+        isn't a real object in the repository), so the staged value must be a
+        genuine commit that already exists in the origin clone's object
+        database -- exactly what a real container commit would produce
+        (objects land directly in the shared, unmasked object store even
+        though the ref pointer itself only lives in the ephemeral staging
+        copy until this sync-back runs)."""
         origin, worktree = _make_real_worktree(tmp_path)
-        # Simulate the container having made a new commit: a plausible-looking
-        # but different SHA staged for its own branch.
-        new_sha = '1' * 40
-        staging_dir, meta_path = self._set_up_staging(tmp_path, origin, new_sha)
+        original_sha = _git(origin, 'rev-parse', 'feature/issue-129-epic-a').stdout.strip()
+        # A real second commit, simulating what the container's own `git
+        # commit` produced -- a genuine object in origin's database already.
+        (worktree / 'container_change.txt').write_text('from the container\n')
+        _git(worktree, 'add', '.')
+        _git(worktree, 'commit', '-q', '-m', 'container commit')
+        new_sha = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        assert new_sha != original_sha
+
+        staging_dir, meta_path = self._set_up_staging(
+            tmp_path, origin, new_sha, original_sha=original_sha
+        )
 
         with patch.object(DockerAgentRunner, '_worktree_refs_heads_staging_dir',
                            return_value=str(staging_dir)), \
@@ -520,10 +618,76 @@ class TestCleanupWorktreeRefsHeadsStaging:
                            return_value=str(meta_path)):
             runner._cleanup_worktree_refs_heads_staging('c1')
 
-        real_ref_path = origin / '.git' / 'refs' / 'heads' / 'feature' / 'issue-129-epic-a'
-        assert real_ref_path.read_text().strip() == new_sha
+        assert _git(origin, 'rev-parse', 'feature/issue-129-epic-a').stdout.strip() == new_sha
         assert not staging_dir.exists()
         assert not meta_path.exists()
+
+    def test_sync_back_refuses_a_stale_write_via_compare_and_swap(self, runner, tmp_path):
+        """The concurrency regression case (code review finding): if some
+        OTHER, overlapping teardown already moved this branch's real ref past
+        what THIS launch staged as its starting point, the compare-and-swap
+        (`git update-ref <ref> <new> <old>`) must refuse the write rather
+        than silently rolling the ref backward and discarding that other
+        commit's advance."""
+        origin, worktree = _make_real_worktree(tmp_path)
+        stale_original_sha = _git(origin, 'rev-parse', 'feature/issue-129-epic-a').stdout.strip()
+
+        # This launch's own (real, valid-object) staged value.
+        (worktree / 'this_launch.txt').write_text('this launch\n')
+        _git(worktree, 'add', '.')
+        _git(worktree, 'commit', '-q', '-m', 'this launch commit')
+        this_launch_sha = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+
+        # Simulate a DIFFERENT, overlapping teardown having already advanced
+        # the real ref past stale_original_sha in the meantime.
+        _git(origin, 'update-ref', 'refs/heads/feature/issue-129-epic-a', this_launch_sha)
+        (worktree / 'concurrent_launch.txt').write_text('concurrent\n')
+        _git(worktree, 'add', '.')
+        _git(worktree, 'commit', '-q', '-m', 'concurrent launch commit')
+        concurrent_sha = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        _git(origin, 'update-ref', 'refs/heads/feature/issue-129-epic-a', concurrent_sha)
+
+        # THIS launch's own staging still (staled) records the ORIGINAL value
+        # as its expected starting point -- it never saw the concurrent update.
+        staging_dir, meta_path = self._set_up_staging(
+            tmp_path, origin, this_launch_sha, original_sha=stale_original_sha
+        )
+
+        with patch.object(DockerAgentRunner, '_worktree_refs_heads_staging_dir',
+                           return_value=str(staging_dir)), \
+             patch.object(DockerAgentRunner, '_worktree_refs_heads_staging_meta_path',
+                           return_value=str(meta_path)):
+            # Must not raise.
+            runner._cleanup_worktree_refs_heads_staging('c1')
+
+        # The concurrent update must survive -- NOT rolled back to
+        # this_launch_sha.
+        assert _git(origin, 'rev-parse', 'feature/issue-129-epic-a').stdout.strip() == concurrent_sha
+        # Staging is still cleaned up even though the sync was refused.
+        assert not staging_dir.exists()
+        assert not meta_path.exists()
+
+    def test_sync_back_without_a_captured_original_sha_falls_back_to_unconditional_write(
+        self, runner, tmp_path
+    ):
+        """A meta.json written before the original_sha field existed (a
+        launch straddling a deploy) must still sync back -- unconditionally,
+        the pre-CAS behavior -- rather than crash on a missing key."""
+        origin, worktree = _make_real_worktree(tmp_path)
+        (worktree / 'container_change.txt').write_text('from the container\n')
+        _git(worktree, 'add', '.')
+        _git(worktree, 'commit', '-q', '-m', 'container commit')
+        new_sha = _git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+
+        staging_dir, meta_path = self._set_up_staging(tmp_path, origin, new_sha)  # no original_sha
+
+        with patch.object(DockerAgentRunner, '_worktree_refs_heads_staging_dir',
+                           return_value=str(staging_dir)), \
+             patch.object(DockerAgentRunner, '_worktree_refs_heads_staging_meta_path',
+                           return_value=str(meta_path)):
+            runner._cleanup_worktree_refs_heads_staging('c1')
+
+        assert _git(origin, 'rev-parse', 'feature/issue-129-epic-a').stdout.strip() == new_sha
 
     def test_rejects_a_value_that_does_not_look_like_a_sha(self, runner, tmp_path):
         """Defense against a corrupted/unexpected staged file -- must leave
