@@ -391,6 +391,29 @@ class ProjectWorkspaceManager:
                 )
                 return worktree_path
 
+            if worktree_path.exists():
+                # On disk but .git is completely missing -- corrupted, not a
+                # recognized worktree to adopt above. Same failure class as
+                # the container-side "no .git present at all" gap found in
+                # code-wrapper's agent-entrypoint.sh (a container's own
+                # self-repair removing a broken .git, or a host-level mishap,
+                # can leave exactly this: a real, populated directory with no
+                # .git at all). Left alone, `git worktree add` below would
+                # unconditionally refuse with an opaque "fatal: ... already
+                # exists" (verified empirically) that doesn't diagnose what's
+                # actually wrong -- clean it up explicitly here instead, so
+                # the create-worktree call that follows gets a genuinely
+                # empty target and a clear log trail, rather than a confusing
+                # git-level error surfacing through whatever retry/escalation
+                # path this call's caller uses.
+                logger.warning(
+                    f"Epic worktree directory for {project_name} epic #{epic_id} "
+                    f"exists at {worktree_path} but has no .git at all -- corrupted "
+                    "(not a recognized worktree), removing it so a fresh one can "
+                    "be created"
+                )
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
             self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)

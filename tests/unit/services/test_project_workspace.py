@@ -413,6 +413,40 @@ class TestReuseExistingEpicWorktree:
         assert manager._epic_worktree_branches[("my-project", "900")] == "feature/issue-900-real"
         assert manager._epic_worktrees[("my-project", "900")] == str(pre_existing)
 
+    def test_corrupted_worktree_directory_with_no_git_at_all_is_removed_and_recreated(
+        self, manager, tmp_path
+    ):
+        """Same failure class found in code-wrapper's agent-entrypoint.sh gap
+        (issue investigation, 2026-09-06): the worktree directory exists on
+        disk, populated with real files, but .git is completely missing --
+        not the pre-existing-worktree-to-adopt case above (that requires .git
+        to exist), and NOT a genuinely fresh target either. Left alone, `git
+        worktree add` refuses outright with an opaque "already exists" for a
+        non-empty directory (verified empirically against a real git repo) --
+        must be detected and cleaned up explicitly instead, so worktree
+        creation gets a real chance to succeed."""
+        _make_base_clone(tmp_path, "my-project")
+        corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '901'
+        corrupted.mkdir(parents=True)
+        (corrupted / 'some_real_file.txt').write_text("leftover project content\n")
+        assert not (corrupted / '.git').exists()
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            result = manager.get_or_create_epic_worktree(
+                "my-project", "901", branch_name="feature/issue-901"
+            )
+
+        assert result == corrupted
+        # The corrupted leftover content must be gone -- not merged with, or
+        # left alongside, whatever `git worktree add` created.
+        assert not (corrupted / 'some_real_file.txt').exists()
+        # A real `worktree add` attempt was made (not silently skipped/adopted
+        # like the pre-existing-valid-worktree case above).
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any('worktree' in c and 'add' in c for c in calls)
+        assert manager._epic_worktrees[("my-project", "901")] == str(corrupted)
+
 
 class TestEpicWorktreePathGuard:
     """_epic_worktree_path() must reject an empty/falsy epic_id rather than silently
