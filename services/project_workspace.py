@@ -336,7 +336,14 @@ class ProjectWorkspaceManager:
         Raises:
             ValueError: No worktree exists yet for this epic and branch_name was not
                 given, or the project has no base clone to source the worktree from.
-            RuntimeError: The underlying git worktree add command failed.
+            RuntimeError: The underlying git worktree add command failed, OR the
+                worktree directory exists on disk but has no .git at all -- a
+                corrupted state this method deliberately does not attempt to
+                auto-recover from (see the inline comment at that check for why:
+                the realistic trigger leaves the base clone's own worktree
+                registration intact regardless of what happens to the target
+                directory, and no automatic cleanup can safely tell "empty
+                checkout, fine to discard" apart from "real uncommitted work").
         """
         key = (project_name, str(epic_id))
         newly_created = False
@@ -398,21 +405,58 @@ class ProjectWorkspaceManager:
                 # code-wrapper's agent-entrypoint.sh (a container's own
                 # self-repair removing a broken .git, or a host-level mishap,
                 # can leave exactly this: a real, populated directory with no
-                # .git at all). Left alone, `git worktree add` below would
-                # unconditionally refuse with an opaque "fatal: ... already
-                # exists" (verified empirically) that doesn't diagnose what's
-                # actually wrong -- clean it up explicitly here instead, so
-                # the create-worktree call that follows gets a genuinely
-                # empty target and a clear log trail, rather than a confusing
-                # git-level error surfacing through whatever retry/escalation
-                # path this call's caller uses.
-                logger.warning(
+                # .git at all).
+                #
+                # Deliberately does NOT clean this up automatically (an
+                # earlier version of this fix did, via shutil.rmtree, and was
+                # caught by code review before merging -- kept here as an
+                # explicit warning against re-attempting it):
+                #   1. It doesn't even work for the realistic trigger. git
+                #      tracks a worktree by metadata under the base repo's
+                #      OWN .git/worktrees/<id>/, not by whether the target
+                #      directory exists -- when agent-entrypoint.sh's
+                #      self-repair removes just the worktree's .git pointer
+                #      (its own cleanup is deliberately scoped to ONLY that,
+                #      never the real file content around it), that
+                #      registration survives untouched. Verified empirically:
+                #      even deleting the ENTIRE directory first, `git
+                #      worktree add` for that same path still refuses --
+                #      "fatal: '<path>' is a missing but already registered
+                #      worktree; use 'add -f' to override, or 'prune' or
+                #      'remove' to clear" -- a *different* opaque error, not a
+                #      fix. `git worktree remove --force` (or `prune`) is the
+                #      actual, git-aware way to clear that registration.
+                #   2. Even done correctly (via `git worktree remove --force`
+                #      rather than a raw rmtree), it's still fundamentally
+                #      unsafe here: without .git, there is NO way to tell
+                #      "just the unmodified checkout, safe to discard" apart
+                #      from "an agent's real, uncommitted work sitting in a
+                #      directory that happens to be missing .git" -- and both
+                #      git's own --force removal and a raw rmtree destroy
+                #      either one identically. Two other call sites reach
+                #      this exact directory expecting to commit real content
+                #      from it afterward (agent_container_recovery.py's
+                #      restart-recovery flow, agent_executor.py's
+                #      _failsafe_commit_check()) -- silently destroying their
+                #      target before they ever see it would be permanent,
+                #      undiagnosed data loss for a just-completed fix, not a
+                #      recoverable retry.
+                # Raising loudly instead reaches this call's existing retry/
+                # escalation path (the same uniform pattern every other
+                # exception here relies on -- see this method's own Raises
+                # section) with a clear diagnostic, and -- critically --
+                # leaves the directory and whatever it contains untouched for
+                # a human to inspect and decide how to proceed.
+                raise RuntimeError(
                     f"Epic worktree directory for {project_name} epic #{epic_id} "
                     f"exists at {worktree_path} but has no .git at all -- corrupted "
-                    "(not a recognized worktree), removing it so a fresh one can "
-                    "be created"
+                    "(not a recognized worktree, and not safely auto-recoverable: "
+                    "see this method's docstring for why). Needs manual inspection "
+                    "(the directory may hold real uncommitted work) followed by "
+                    f"`git worktree remove --force {worktree_path}` (or `git "
+                    "worktree prune`) run against the base clone before this epic "
+                    "can be retried."
                 )
-                shutil.rmtree(worktree_path, ignore_errors=True)
 
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
 

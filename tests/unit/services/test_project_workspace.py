@@ -413,18 +413,30 @@ class TestReuseExistingEpicWorktree:
         assert manager._epic_worktree_branches[("my-project", "900")] == "feature/issue-900-real"
         assert manager._epic_worktrees[("my-project", "900")] == str(pre_existing)
 
-    def test_corrupted_worktree_directory_with_no_git_at_all_is_removed_and_recreated(
+    def test_corrupted_worktree_directory_with_no_git_at_all_raises_without_touching_it(
         self, manager, tmp_path
     ):
         """Same failure class found in code-wrapper's agent-entrypoint.sh gap
         (issue investigation, 2026-09-06): the worktree directory exists on
         disk, populated with real files, but .git is completely missing --
         not the pre-existing-worktree-to-adopt case above (that requires .git
-        to exist), and NOT a genuinely fresh target either. Left alone, `git
-        worktree add` refuses outright with an opaque "already exists" for a
-        non-empty directory (verified empirically against a real git repo) --
-        must be detected and cleaned up explicitly instead, so worktree
-        creation gets a real chance to succeed."""
+        to exist), and NOT a genuinely fresh target either.
+
+        Code review correction on the FIRST version of this fix: it called
+        shutil.rmtree() on the directory before retrying `git worktree add`.
+        Caught before merging -- (1) it doesn't even work for the realistic
+        trigger, since git tracks a worktree by metadata in the base repo's
+        OWN .git/worktrees/<id>/, not by the target directory's existence, so
+        `git worktree add` still refuses afterward (a DIFFERENT opaque error:
+        "is a missing but already registered worktree"); and (2) even a
+        correct git-aware cleanup (`git worktree remove --force`) would be
+        just as unsafe, since without .git there's no way to tell "empty
+        checkout, fine to discard" apart from "an agent's real uncommitted
+        work" -- and two other call sites (agent_container_recovery.py's
+        restart-recovery flow, agent_executor.py's _failsafe_commit_check())
+        reach this exact directory expecting to commit real content from it.
+        The fix must raise loudly and leave the directory completely
+        untouched instead -- verified explicitly here."""
         _make_base_clone(tmp_path, "my-project")
         corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '901'
         corrupted.mkdir(parents=True)
@@ -432,20 +444,21 @@ class TestReuseExistingEpicWorktree:
         assert not (corrupted / '.git').exists()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
-            result = manager.get_or_create_epic_worktree(
-                "my-project", "901", branch_name="feature/issue-901"
-            )
+            with pytest.raises(RuntimeError, match="no .git at all"):
+                manager.get_or_create_epic_worktree(
+                    "my-project", "901", branch_name="feature/issue-901"
+                )
+            # No git subprocess calls at all -- must fail before ever
+            # attempting `worktree add` against the corrupted path.
+            mock_run.assert_not_called()
 
-        assert result == corrupted
-        # The corrupted leftover content must be gone -- not merged with, or
-        # left alongside, whatever `git worktree add` created.
-        assert not (corrupted / 'some_real_file.txt').exists()
-        # A real `worktree add` attempt was made (not silently skipped/adopted
-        # like the pre-existing-valid-worktree case above).
-        calls = [c.args[0] for c in mock_run.call_args_list]
-        assert any('worktree' in c and 'add' in c for c in calls)
-        assert manager._epic_worktrees[("my-project", "901")] == str(corrupted)
+        # The directory and its real content must be completely untouched --
+        # the whole point of raising instead of cleaning up automatically.
+        assert corrupted.exists()
+        assert (corrupted / 'some_real_file.txt').read_text() == "leftover project content\n"
+        # Not adopted into the in-memory cache either -- a later retry must
+        # see the same unresolved state, not a poisoned "already handled" one.
+        assert ("my-project", "901") not in manager._epic_worktrees
 
 
 class TestEpicWorktreePathGuard:
