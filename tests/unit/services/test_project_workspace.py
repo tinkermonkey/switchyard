@@ -348,6 +348,12 @@ class TestReuseExistingEpicWorktree:
             first = manager.get_project_dir(
                 "my-project", epic_id="500", branch_name="feature/issue-500"
             )
+        # subprocess is mocked above, so the real `git worktree add` that would
+        # create .git on disk never actually runs -- simulate what it would
+        # have left behind, since the cache-hit reuse below now also checks
+        # for it (issue: dead-code corruption check on cache hits, code review).
+        first.mkdir(parents=True, exist_ok=True)
+        (first / '.git').mkdir()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
             # No branch_name needed on reuse, and no git calls should happen
@@ -366,6 +372,9 @@ class TestReuseExistingEpicWorktree:
             sub_issue_1_dir = manager.get_project_dir(
                 "my-project", epic_id="600", branch_name="feature/issue-600"
             )
+        # See test_second_call_reuses_without_git_calls above for why.
+        sub_issue_1_dir.mkdir(parents=True, exist_ok=True)
+        (sub_issue_1_dir / '.git').mkdir()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
             mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]  # would be used if (wrongly) recreated
@@ -459,6 +468,64 @@ class TestReuseExistingEpicWorktree:
         # Not adopted into the in-memory cache either -- a later retry must
         # see the same unresolved state, not a poisoned "already handled" one.
         assert ("my-project", "901") not in manager._epic_worktrees
+
+    def test_corruption_after_being_cached_this_process_is_also_caught(self, manager, tmp_path):
+        """Second-pass code review finding: the corruption check above only ran
+        on the not-yet-cached path -- dead code for any epic ALREADY tracked in
+        self._epic_worktrees this process. A running container's own self-repair
+        can remove .git from an already-cached worktree with no orchestrator
+        restart in between (the exact trigger this whole check exists for) --
+        must be caught on a cache hit too, not just cold resolution."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '902'
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text("gitdir: /fake/base/.git/worktrees/902\n")
+        (worktree / 'real_work.py').write_text("# real work\n")
+
+        # Cache it first, exactly like a real first call would.
+        manager._epic_worktrees[("my-project", "902")] = str(worktree)
+        manager._epic_worktree_branches[("my-project", "902")] = "feature/issue-902"
+
+        # Simulate a container's self-repair removing .git with no restart --
+        # the in-memory cache entry is untouched, but the real state on disk
+        # has changed underneath it.
+        (worktree / '.git').unlink()
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            with pytest.raises(RuntimeError, match="lost its .git"):
+                manager.get_or_create_epic_worktree("my-project", "902")
+            mock_run.assert_not_called()
+
+        # Untouched, same as the cold-resolution case.
+        assert worktree.exists()
+        assert (worktree / 'real_work.py').read_text() == "# real work\n"
+
+    def test_genuinely_empty_pre_existing_directory_is_not_treated_as_corrupted(
+        self, manager, tmp_path
+    ):
+        """Second-pass code review correction: the corruption check must only
+        fire for a NON-EMPTY directory. A genuinely empty pre-existing
+        directory (e.g. a stray leftover from an interrupted worktree
+        creation that never got far enough to register with git) has nothing
+        to lose -- `git worktree add` succeeds into it exactly as it always
+        has (verified empirically) -- so this must fall through to the normal
+        creation path instead of raising and demanding manual intervention
+        for something with nothing actually at risk."""
+        _make_base_clone(tmp_path, "my-project")
+        empty_dir = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '903'
+        empty_dir.mkdir(parents=True)
+        assert list(empty_dir.iterdir()) == []
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            result = manager.get_or_create_epic_worktree(
+                "my-project", "903", branch_name="feature/issue-903"
+            )
+
+        assert result == empty_dir
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert any('worktree' in c and 'add' in c for c in calls)
+        assert manager._epic_worktrees[("my-project", "903")] == str(empty_dir)
 
 
 class TestEpicWorktreePathGuard:
@@ -565,6 +632,10 @@ class TestEpicWorktreeConcurrencySafety:
             first = manager.get_project_dir(
                 "my-project", epic_id="900", branch_name="feature/issue-900"
             )
+        # See TestReuseExistingEpicWorktree.test_second_call_reuses_without_git_calls
+        # for why this is needed now that cache hits also check for .git.
+        first.mkdir(parents=True, exist_ok=True)
+        (first / '.git').mkdir()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
             with caplog.at_level("WARNING"):
@@ -631,6 +702,10 @@ class TestPruneEpicWorktrees:
         orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'
         orphan.mkdir(parents=True)
         (orphan / "leftover.txt").write_text("stale")
+        # A normal, non-corrupted (just untracked) worktree has .git -- distinct
+        # from TestPruneCorruptedWorktreeSkip below, which covers the "no .git
+        # at all" case this method must NOT blindly remove.
+        (orphan / '.git').write_text("gitdir: /fake/base/.git/worktrees/900\n")
 
         # Fresh manager instance (simulating orchestrator restart) has no in-memory
         # tracking of this worktree at all.
@@ -687,6 +762,71 @@ class TestPruneEpicWorktrees:
             mock_run.return_value = _ok()
             with patch.object(Path, 'iterdir', side_effect=OSError("permission denied")):
                 manager.prune_epic_worktrees()  # must not raise
+
+
+class TestPruneCorruptedWorktreeSkip:
+    """Second-pass code review finding: prune_epic_worktrees()'s startup sweep was
+    a SECOND, unprotected path to the identical destructive operation
+    get_or_create_epic_worktree()'s own corruption guard exists to prevent --
+    neither the tracked-check nor the liveness check catches a worktree that's
+    corrupted (no .git) but currently untracked and unmounted, and
+    _push_local_commits_if_any() is a no-op with no .git to run git commands
+    against, so the "safe to remove, cheaply recreated" assumption the rest of
+    this method's design relies on does not hold for this specific shape."""
+
+    def test_skips_a_non_empty_corrupted_worktree_instead_of_removing_it(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '960'
+        corrupted.mkdir(parents=True)
+        (corrupted / 'real_uncommitted_work.py').write_text("# precious\n")
+        assert not (corrupted / '.git').exists()
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        # Left completely untouched, same guarantee get_or_create_epic_worktree()
+        # makes for the identical shape.
+        assert corrupted.exists()
+        assert (corrupted / 'real_uncommitted_work.py').read_text() == "# precious\n"
+        # No `worktree remove`/`rmtree` attempted against it at all.
+        remove_calls = [c for c in mock_run.call_args_list if 'remove' in c.args[0]]
+        assert remove_calls == []
+
+    def test_still_removes_a_genuinely_empty_corrupted_worktree(self, manager, tmp_path):
+        """No .git AND nothing in it either -- has nothing to lose, so this
+        stays on the normal (pre-existing) removal path rather than being
+        needlessly escalated to manual intervention."""
+        _make_base_clone(tmp_path, "my-project")
+        empty_corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '961'
+        empty_corrupted.mkdir(parents=True)
+        assert list(empty_corrupted.iterdir()) == []
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert not empty_corrupted.exists()
+
+    def test_non_empty_corrupted_sibling_does_not_protect_other_worktrees(
+        self, manager, tmp_path
+    ):
+        """A skipped corrupted worktree must not accidentally short-circuit the
+        sweep for its siblings -- each is still evaluated independently."""
+        _make_base_clone(tmp_path, "my-project")
+        corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '962'
+        corrupted.mkdir(parents=True)
+        (corrupted / 'real_work.txt').write_text("precious")
+        healthy_orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '963'
+        healthy_orphan.mkdir(parents=True)
+        (healthy_orphan / '.git').write_text("gitdir: /fake/base/.git/worktrees/963\n")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert corrupted.exists()
+        assert not healthy_orphan.exists()
 
 
 class TestPushLocalCommitsBeforeRemoval:
@@ -851,10 +991,14 @@ class TestBakedDependencyExtractionIntegration:
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
                     mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
-                    manager.get_project_dir(
+                    created = manager.get_project_dir(
                         "my-project", epic_id="303", branch_name="feature/issue-303"
                     )
                 assert mock_extract.call_count == 1
+                # See TestReuseExistingEpicWorktree.test_second_call_reuses_without_git_calls
+                # for why this is needed now that cache hits also check for .git.
+                created.mkdir(parents=True, exist_ok=True)
+                (created / '.git').mkdir()
 
                 # Second call for the same epic reuses the in-flight worktree -- no
                 # new git calls, and critically no repeat extraction attempt.
@@ -1158,8 +1302,14 @@ class TestPruneEpicWorktreesLivenessCheck:
         is_dir_calls = [True, True, True, True, True]
         iterdir_calls = [[project_staging], [worktree_path], [worktree_path]]
 
+        # Path.exists patched True (represents a healthy worktree with .git
+        # present) -- this class's own new corrupted-worktree skip (code
+        # review finding) would otherwise treat every worktree here as "no
+        # .git" by default, since .exists() is unpatched by default and
+        # always False against this simulated, non-real /workspace path.
         with patch.object(Path, 'is_dir', side_effect=is_dir_calls), \
              patch.object(Path, 'iterdir', side_effect=iterdir_calls), \
+             patch.object(Path, 'exists', return_value=True), \
              patch.object(ProjectWorkspaceManager, '_get_running_container_mount_sources',
                            return_value={'/host/workspace/.orchestrator/worktrees/some-other-project/99'}), \
              patch.object(ProjectWorkspaceManager, '_push_local_commits_if_any') as mock_push, \
@@ -1191,8 +1341,14 @@ class TestPruneEpicWorktreesLivenessCheck:
         is_dir_calls = [True, True, True, True, True]
         iterdir_calls = [[project_staging], [worktree_path], [worktree_path]]
 
+        # Path.exists patched True (represents a healthy worktree with .git
+        # present) -- this class's own new corrupted-worktree skip (code
+        # review finding) would otherwise treat every worktree here as "no
+        # .git" by default, since .exists() is unpatched by default and
+        # always False against this simulated, non-real /workspace path.
         with patch.object(Path, 'is_dir', side_effect=is_dir_calls), \
              patch.object(Path, 'iterdir', side_effect=iterdir_calls), \
+             patch.object(Path, 'exists', return_value=True), \
              patch.object(ProjectWorkspaceManager, '_get_running_container_mount_sources',
                            return_value={'/host/workspace/.orchestrator/worktrees/my-project/42'}), \
              patch.object(ProjectWorkspaceManager, '_push_local_commits_if_any') as mock_push, \

@@ -336,30 +336,98 @@ class ProjectWorkspaceManager:
         Raises:
             ValueError: No worktree exists yet for this epic and branch_name was not
                 given, or the project has no base clone to source the worktree from.
-            RuntimeError: The underlying git worktree add command failed, OR the
-                worktree directory exists on disk but has no .git at all -- a
-                corrupted state this method deliberately does not attempt to
-                auto-recover from (see the inline comment at that check for why:
-                the realistic trigger leaves the base clone's own worktree
-                registration intact regardless of what happens to the target
-                directory, and no automatic cleanup can safely tell "empty
-                checkout, fine to discard" apart from "real uncommitted work").
+            RuntimeError: Either the underlying `git worktree add` command failed
+                (the pre-existing cause), OR (issue found investigating a
+                code-wrapper dev-container block, 2026-09-06) the worktree
+                directory exists on disk, non-empty, but has no .git at all --
+                corrupted, checked both on a fresh resolution and on a cache hit
+                for an epic already tracked in this process (e.g. a container's
+                own git-state self-repair can remove a worktree's .git with no
+                orchestrator restart in between).
+
+                This deliberately does NOT attempt automatic cleanup (an earlier
+                version of this fix did, via shutil.rmtree, caught by code review
+                before merging):
+                1. It wouldn't even work for the realistic trigger. git tracks a
+                   worktree by metadata under the base repo's OWN
+                   .git/worktrees/<id>/, not by whether the target directory
+                   exists -- a container's self-repair removes only the
+                   worktree's own .git pointer, never that base-repo-side
+                   registration, so a subsequent `git worktree add` for the same
+                   path still refuses ("is a missing but already registered
+                   worktree") even after the directory itself is gone. Only `git
+                   worktree remove --force` (or `prune`), run against the base
+                   clone, actually clears it (verified empirically).
+                2. Even done via that correct command instead of a raw rmtree,
+                   it's still fundamentally unsafe to do automatically: without
+                   .git there is no way to tell "just the unmodified checkout,
+                   safe to discard" apart from "an agent's real, uncommitted
+                   work sitting in a directory that happens to be missing
+                   .git" -- both destroy either one identically. Two callers
+                   reach this exact directory expecting to commit real content
+                   from it afterward (agent_container_recovery.py's
+                   restart-recovery flow, agent_executor.py's
+                   _failsafe_commit_check()); silently destroying their target
+                   first would be permanent, undiagnosed data loss for a
+                   just-completed fix, not a recoverable retry.
+
+                A genuinely EMPTY pre-existing directory is NOT treated as this
+                corrupted case -- it has nothing to lose, and `git worktree add`
+                succeeds into it exactly as it always has, so that case falls
+                through to the normal creation path below instead.
+
+                Note this raise does not universally guarantee an existing
+                retry/escalation mechanism sees it -- that depends entirely on
+                what this method's various callers each do with it (some
+                propagate to a durable, GitHub-visible retry/escalation path;
+                at least one known caller, agent_executor.py's best-effort
+                _failsafe_commit_check(), logs and continues by its own
+                pre-existing design). What this raise DOES guarantee
+                unconditionally is that nothing on disk is touched or destroyed.
         """
         key = (project_name, str(epic_id))
         newly_created = False
         with self._epic_worktree_lock:
             existing = self._epic_worktrees.get(key)
             if existing is not None:
-                tracked_branch = self._epic_worktree_branches.get(key)
-                if branch_name and tracked_branch and branch_name != tracked_branch:
-                    logger.warning(
-                        f"get_or_create_epic_worktree called for {project_name} epic #{epic_id} "
-                        f"with branch_name={branch_name!r}, but its existing worktree is already "
-                        f"on {tracked_branch!r}; worktrees are per-epic (not per-branch), so the "
-                        "existing worktree is returned unchanged."
-                    )
-                logger.debug(f"Reusing existing worktree for {project_name} epic #{epic_id}: {existing}")
-                return Path(existing)
+                # Code review finding on this method's own corruption check
+                # further down: that check only runs on the NOT-yet-cached
+                # path, so it was dead code for any epic already tracked in
+                # this process -- e.g. a running container's own self-repair
+                # removes .git from an ALREADY-cached worktree with no
+                # orchestrator restart in between (the exact trigger this
+                # whole safety check exists for). Re-check here too, on every
+                # cache hit: cheap (a single stat, not a git subprocess call)
+                # and closes that gap without duplicating the corruption
+                # branch itself -- just falls through to it below instead of
+                # returning early.
+                if (Path(existing) / '.git').exists():
+                    tracked_branch = self._epic_worktree_branches.get(key)
+                    if branch_name and tracked_branch and branch_name != tracked_branch:
+                        logger.warning(
+                            f"get_or_create_epic_worktree called for {project_name} epic #{epic_id} "
+                            f"with branch_name={branch_name!r}, but its existing worktree is already "
+                            f"on {tracked_branch!r}; worktrees are per-epic (not per-branch), so the "
+                            "existing worktree is returned unchanged."
+                        )
+                    logger.debug(f"Reusing existing worktree for {project_name} epic #{epic_id}: {existing}")
+                    return Path(existing)
+                # Raised directly here rather than falling through to the
+                # not-yet-cached code path below: that path assumes it might
+                # be a genuine first-time creation and requires branch_name
+                # to be given for that case -- a cache-hit reuse call
+                # legitimately omits it, relying on the cache, which would
+                # make the fall-through raise the WRONG (branch_name-missing)
+                # error here instead of this one.
+                raise RuntimeError(
+                    f"Cached epic worktree for {project_name} epic #{epic_id} at {existing} "
+                    "has lost its .git since it was last used this process -- corrupted "
+                    "(not a recognized worktree, and not safely auto-recoverable: see this "
+                    "method's docstring for why). Needs manual inspection (the directory may "
+                    f"hold real uncommitted work) followed by `git worktree remove --force "
+                    f"{existing}` (or `git worktree prune`) run against the base clone before "
+                    "this epic can be retried."
+                )
 
             if not branch_name:
                 raise ValueError(
@@ -398,55 +466,23 @@ class ProjectWorkspaceManager:
                 )
                 return worktree_path
 
-            if worktree_path.exists():
-                # On disk but .git is completely missing -- corrupted, not a
-                # recognized worktree to adopt above. Same failure class as
-                # the container-side "no .git present at all" gap found in
-                # code-wrapper's agent-entrypoint.sh (a container's own
-                # self-repair removing a broken .git, or a host-level mishap,
-                # can leave exactly this: a real, populated directory with no
-                # .git at all).
+            if worktree_path.exists() and any(worktree_path.iterdir()):
+                # On disk, non-empty, but .git is completely missing --
+                # corrupted, not a recognized worktree to adopt above. See
+                # this method's own docstring (Raises section) for the full
+                # rationale on why this deliberately does not attempt any
+                # automatic cleanup.
                 #
-                # Deliberately does NOT clean this up automatically (an
-                # earlier version of this fix did, via shutil.rmtree, and was
-                # caught by code review before merging -- kept here as an
-                # explicit warning against re-attempting it):
-                #   1. It doesn't even work for the realistic trigger. git
-                #      tracks a worktree by metadata under the base repo's
-                #      OWN .git/worktrees/<id>/, not by whether the target
-                #      directory exists -- when agent-entrypoint.sh's
-                #      self-repair removes just the worktree's .git pointer
-                #      (its own cleanup is deliberately scoped to ONLY that,
-                #      never the real file content around it), that
-                #      registration survives untouched. Verified empirically:
-                #      even deleting the ENTIRE directory first, `git
-                #      worktree add` for that same path still refuses --
-                #      "fatal: '<path>' is a missing but already registered
-                #      worktree; use 'add -f' to override, or 'prune' or
-                #      'remove' to clear" -- a *different* opaque error, not a
-                #      fix. `git worktree remove --force` (or `prune`) is the
-                #      actual, git-aware way to clear that registration.
-                #   2. Even done correctly (via `git worktree remove --force`
-                #      rather than a raw rmtree), it's still fundamentally
-                #      unsafe here: without .git, there is NO way to tell
-                #      "just the unmodified checkout, safe to discard" apart
-                #      from "an agent's real, uncommitted work sitting in a
-                #      directory that happens to be missing .git" -- and both
-                #      git's own --force removal and a raw rmtree destroy
-                #      either one identically. Two other call sites reach
-                #      this exact directory expecting to commit real content
-                #      from it afterward (agent_container_recovery.py's
-                #      restart-recovery flow, agent_executor.py's
-                #      _failsafe_commit_check()) -- silently destroying their
-                #      target before they ever see it would be permanent,
-                #      undiagnosed data loss for a just-completed fix, not a
-                #      recoverable retry.
-                # Raising loudly instead reaches this call's existing retry/
-                # escalation path (the same uniform pattern every other
-                # exception here relies on -- see this method's own Raises
-                # section) with a clear diagnostic, and -- critically --
-                # leaves the directory and whatever it contains untouched for
-                # a human to inspect and decide how to proceed.
+                # Non-empty is the specific condition that matters (code
+                # review correction): a genuinely EMPTY pre-existing
+                # directory (e.g. a stray leftover from a `git worktree add`
+                # that failed before ever registering, or a prior removal
+                # that got the directory itself but not some other transient
+                # state) has nothing to lose and nothing git considers
+                # ambiguous -- `git worktree add` succeeds into an empty,
+                # unregistered directory (verified empirically) exactly as it
+                # always has, self-healing via the normal path below rather
+                # than being needlessly escalated to manual intervention.
                 raise RuntimeError(
                     f"Epic worktree directory for {project_name} epic #{epic_id} "
                     f"exists at {worktree_path} but has no .git at all -- corrupted "
@@ -1105,10 +1141,19 @@ class ProjectWorkspaceManager:
         narrower, still-not-fully-closed version of this same class of race), but
         together they cover the two realistic startup scenarios: a just-adopted
         worktree, and a still-running container's worktree neither adopted nor
-        finished. A worktree matching NEITHER check is still safe to remove
-        unconditionally -- it will be transparently recreated (fetch + worktree
-        add, cheap) the next time get_project_dir()/get_or_create_epic_worktree()
-        is called for that epic.
+        finished. A worktree matching NEITHER check is safe to remove
+        unconditionally IF it still has a working .git -- it will be
+        transparently recreated (fetch + worktree add, cheap) the next time
+        get_project_dir()/get_or_create_epic_worktree() is called for that
+        epic, and _push_local_commits_if_any() below is a real safety net for
+        it (anything genuinely uncommitted gets a chance to reach origin
+        first). A THIRD case, added after code review found this sweep was an
+        unprotected second path to the same risk get_or_create_epic_worktree()
+        guards against: a non-empty worktree with NO .git at all (corrupted)
+        is explicitly skipped rather than force-removed -- _push_local_commits_
+        if_any() is a no-op with no .git to run git commands against, so the
+        "cheap, no real loss" assumption this paragraph otherwise relies on
+        does not hold for it.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
@@ -1186,6 +1231,35 @@ class ProjectWorkspaceManager:
                                     f"Failed to check container liveness for "
                                     f"{worktree_path}, proceeding with prune: {e}"
                                 )
+
+                    # Code review finding on get_or_create_epic_worktree()'s own
+                    # new corruption guard: this sweep was a second, unprotected
+                    # path to the identical destructive operation that guard
+                    # exists to prevent -- neither the tracked-check nor the
+                    # liveness check above catches a worktree that's corrupted
+                    # (no .git at all) but currently untracked and unmounted,
+                    # and _push_local_commits_if_any() below is a no-op with no
+                    # .git to run git commands against, so the safety net that
+                    # normally justifies "safe to remove unconditionally, cheaply
+                    # recreated on demand" for this method's whole design doesn't
+                    # apply here: there is no way to tell "just the unmodified
+                    # checkout, safe to lose" apart from "an agent's real,
+                    # uncommitted work that never got the chance to be pushed
+                    # before whatever caused the corruption interrupted it" --
+                    # exactly the scenario a corrupted (not merely idle) worktree
+                    # is more likely to correlate with. Skip it here too, for a
+                    # human to resolve the same way get_or_create_epic_worktree()
+                    # asks them to -- unless it's genuinely empty, which has
+                    # nothing to lose either way.
+                    if not (worktree_path / '.git').exists() and any(worktree_path.iterdir()):
+                        logger.warning(
+                            f"Skipping prune of {worktree_path} -- has no .git at all "
+                            "(corrupted, not a recognized worktree) but is non-empty, so "
+                            "it may hold real uncommitted work. Needs manual inspection, "
+                            f"then `git worktree remove --force {worktree_path}` (or "
+                            "`git worktree prune`) run against the base clone."
+                        )
+                        continue
 
                     self._push_local_commits_if_any(worktree_path)
                     try:
