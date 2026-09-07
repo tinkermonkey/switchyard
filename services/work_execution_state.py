@@ -1297,6 +1297,15 @@ class WorkExecutionStateTracker:
 
         logger.info(f"Watchdog: Checking {len(state_files)} execution state files for empty outputs")
 
+        # Cache project_config across every state file in this sweep, keyed
+        # by project name (found in #58 review round 3: get_project_config()
+        # re-reads and re-parses the project's YAML from disk on every call,
+        # no caching of its own -- state files for the same project are
+        # common in one sweep, so fetching it once per state file instead of
+        # once per project multiplies disk I/O by issue count rather than
+        # project count on this periodic maintenance path).
+        project_config_cache = {}
+
         for state_file in state_files:
             try:
                 from utils.file_lock import file_lock
@@ -1368,11 +1377,15 @@ class WorkExecutionStateTracker:
                     from services.pipeline_lock_manager import get_pipeline_lock_manager
                     from config.manager import config_manager
 
-                    project_config = None
-                    try:
-                        project_config = config_manager.get_project_config(project_name)
-                    except Exception as e:
-                        logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+                    if project_name in project_config_cache:
+                        project_config = project_config_cache[project_name]
+                    else:
+                        project_config = None
+                        try:
+                            project_config = config_manager.get_project_config(project_name)
+                        except Exception as e:
+                            logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+                        project_config_cache[project_name] = project_config
 
                     try:
                         lock_manager = get_pipeline_lock_manager()

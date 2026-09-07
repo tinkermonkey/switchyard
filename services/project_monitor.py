@@ -6942,9 +6942,10 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     logger.error(
                         f"Repair cycle for issue #{issue_number} cannot acquire the "
                         f"pipeline lock for {project_name}/{board_name} — it is "
-                        f"retained due to a failed run ({reason}). A human must run "
-                        f"scripts/release_lock.py before this board can be used "
-                        f"by any other issue."
+                        f"retained due to a failed run "
+                        f"({_current_lock_for_classification.retained_reason}). A human "
+                        f"must run scripts/release_lock.py before this board can be "
+                        f"used by any other issue."
                     )
                 elif reason == "lock_state_unknown_failing_closed":
                     logger.error(
