@@ -200,8 +200,17 @@ async def main():
     github_project_manager = GitHubProjectManager(config_manager, github_state_manager)
 
     # Initialize all project workspaces on startup
+    #
+    # Run off the event loop (#54 follow-up): initialize_all_projects() ->
+    # initialize_project() now acquires the project_checkout lock via
+    # project_checkout_lock_sync(), which polls with time.sleep() for up to
+    # DEFAULT_TIMEOUT_SECONDS (1900s) on contention (e.g. a stale lock left
+    # by a crashed prior process). Calling it directly here would freeze
+    # this entire single-threaded event loop for that whole wait -- /health
+    # never comes up, and nothing else (including the container-recovery
+    # step that would free a stale holder) can run until it returns.
     logger.info("Initializing project workspaces")
-    projects_needing_setup = workspace_manager.initialize_all_projects()
+    projects_needing_setup = await asyncio.to_thread(workspace_manager.initialize_all_projects)
     logger.info("Project workspaces initialized")
 
     # Wait for Elasticsearch to be ready before cleanup operations

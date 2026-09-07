@@ -120,6 +120,32 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             raise Exception(f"Project directory does not exist: {project_dir}")
 
         # Run in Docker container - if this fails, we MUST fail, not fall back
+        #
+        # project_checkout lock (#54): the container bind-mounts project_dir for
+        # its whole run, so if project_dir is the shared base clone (not an
+        # isolated epic worktree -- see is_base_clone_dir()) this run must
+        # serialize against every other operation touching that same base clone
+        # (another board's container run, the startup clone/update, etc.) rather
+        # than race it. Epic-worktree-scoped runs are deliberately NOT locked
+        # here -- they don't share a directory with anything else, and locking
+        # them too would serialize sibling epics for no reason.
+        if workspace_manager.is_base_clone_dir(project, project_dir):
+            from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
+
+            issue_number_for_lock = (
+                task_context_for_dir.get('issue_number')
+                or context.get('issue_number')
+                or next_anonymous_holder_id()
+            )
+            async with project_checkout_lock_async(project, issue_number_for_lock):
+                return await docker_runner.run_agent_in_container(
+                    prompt=prompt,
+                    context=context,
+                    project_dir=project_dir,
+                    mcp_servers=mcp_servers,
+                    stream_callback=context.get('stream_callback')
+                )
+
         return await docker_runner.run_agent_in_container(
             prompt=prompt,
             context=context,
@@ -127,6 +153,51 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             mcp_servers=mcp_servers,
             stream_callback=context.get('stream_callback')
         )
+
+    # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
+    #
+    # project_checkout lock (#54): dev_environment_setup/verifier's cwd is
+    # normally an isolated epic worktree (its own issue number, resolved
+    # unconditionally for 'issues'/'hybrid' workspace types -- see
+    # agent_executor.py's epic-resolution block) and does NOT need this lock.
+    # Only lock when work_dir genuinely IS the shared base clone (e.g. a
+    # workspace-resolution fallback) -- see is_base_clone_dir()'s docstring
+    # for why locking epic-worktree-scoped runs too would be wrong.
+    work_dir_for_lock = Path(context.get('work_dir', '.'))
+    if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
+        from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
+
+        task_context_for_lock = context.get('context', {}) or {}
+        issue_number_for_lock = (
+            task_context_for_lock.get('issue_number')
+            or context.get('issue_number')
+            or next_anonymous_holder_id()
+        )
+        async with project_checkout_lock_async(project, issue_number_for_lock):
+            return await _run_claude_code_locally(prompt, context, agent)
+
+    return await _run_claude_code_locally(prompt, context, agent)
+
+
+async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: str) -> str:
+    """
+    Execute Claude Code locally (non-Docker) for agents with requires_docker=False
+    (dev_environment_setup, dev_environment_verifier only).
+
+    Split out of run_claude_code() (#54) purely so the project_checkout lock
+    decision above it can wrap this entire local execution in one
+    `async with` without reindenting its whole body -- no behavior change
+    versus the code that used to run inline in run_claude_code() itself.
+    """
+    # Re-derive these from context exactly as run_claude_code() itself does at
+    # the top of that function -- this body used to run inline there and read
+    # these as closure-local variables; now that it's a separate function they
+    # must be recomputed here instead (pure re-reads of the same context dict,
+    # so this is not a behavior change).
+    obs = context.get('observability')
+    task_id = context.get('task_id', 'unknown')
+    project = context.get('project', 'unknown')
+    mcp_servers = context.get('mcp_servers', [])
 
     # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
     logger.warning(f"Running agent {agent} locally (not in Docker) - this should ONLY be dev_environment_setup or dev_environment_verifier!")

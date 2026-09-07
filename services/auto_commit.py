@@ -67,51 +67,87 @@ class AutoCommitService:
             return False
 
         try:
-            # Ensure we're on a feature branch (not main/master)
-            current_branch = self._get_current_branch(project_dir)
-            if current_branch in ['main', 'master']:
-                logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
-                logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
-                logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
-                logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
-                return False
+            # project_checkout lock (#54): if project_dir is the shared base
+            # clone (not an isolated epic worktree -- see is_base_clone_dir()),
+            # this commit/add/push must serialize against every other operation
+            # touching that same directory (another board's checkout, the
+            # startup clone/update, a container run bind-mounting it) instead of
+            # racing it. Epic-worktree-scoped commits are deliberately NOT
+            # locked -- they don't share a directory with anything else.
+            from services.project_workspace import workspace_manager
+            if workspace_manager.is_base_clone_dir(project, project_dir):
+                from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
 
-            # Check if there are changes to commit
-            has_changes = self._check_for_changes(project_dir)
+                async with project_checkout_lock_async(project, issue_number or next_anonymous_holder_id()):
+                    return await self._commit_and_push(
+                        project, agent, task_id, project_dir, issue_number, custom_message
+                    )
 
-            if has_changes:
-                # Stage all changes
-                self._stage_changes(project_dir)
-
-                # Create commit message
-                if custom_message:
-                    commit_message = custom_message
-                else:
-                    commit_message = self._generate_commit_message(agent, task_id, issue_number)
-
-                # Commit
-                success = self._commit(project_dir, commit_message)
-                if not success:
-                    logger.error("Failed to commit changes")
-                    return False
-
-                logger.info(f"Successfully committed changes for {project} (agent: {agent})")
-            else:
-                logger.info(f"No changes to commit for {project} after {agent} execution")
-
-            # Always push branch to remote (even if no new commits, there may be unpushed commits)
-            if current_branch and current_branch not in ['main', 'master']:
-                push_success = self._push_branch(project_dir, current_branch)
-                if push_success:
-                    logger.info(f"Successfully pushed branch {current_branch} to remote")
-                else:
-                    logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
-
-            return True
+            return await self._commit_and_push(
+                project, agent, task_id, project_dir, issue_number, custom_message
+            )
 
         except Exception as e:
             logger.error(f"Failed to auto-commit changes for {project}: {e}")
             return False
+
+    async def _commit_and_push(
+        self,
+        project: str,
+        agent: str,
+        task_id: str,
+        project_dir: Path,
+        issue_number: Optional[int],
+        custom_message: Optional[str],
+    ) -> bool:
+        """
+        The actual git add/commit/push sequence, split out of
+        commit_agent_changes() (#54) so its caller can wrap it in the
+        project_checkout lock only when needed, without duplicating the
+        try/except that still lives in commit_agent_changes() around both the
+        locked and unlocked call paths.
+        """
+        # Ensure we're on a feature branch (not main/master)
+        current_branch = self._get_current_branch(project_dir)
+        if current_branch in ['main', 'master']:
+            logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
+            logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
+            logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
+            logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
+            return False
+
+        # Check if there are changes to commit
+        has_changes = self._check_for_changes(project_dir)
+
+        if has_changes:
+            # Stage all changes
+            self._stage_changes(project_dir)
+
+            # Create commit message
+            if custom_message:
+                commit_message = custom_message
+            else:
+                commit_message = self._generate_commit_message(agent, task_id, issue_number)
+
+            # Commit
+            success = self._commit(project_dir, commit_message)
+            if not success:
+                logger.error("Failed to commit changes")
+                return False
+
+            logger.info(f"Successfully committed changes for {project} (agent: {agent})")
+        else:
+            logger.info(f"No changes to commit for {project} after {agent} execution")
+
+        # Always push branch to remote (even if no new commits, there may be unpushed commits)
+        if current_branch and current_branch not in ['main', 'master']:
+            push_success = self._push_branch(project_dir, current_branch)
+            if push_success:
+                logger.info(f"Successfully pushed branch {current_branch} to remote")
+            else:
+                logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
+
+        return True
 
     def _check_for_changes(self, project_dir: Path) -> bool:
         """Check if there are uncommitted changes"""

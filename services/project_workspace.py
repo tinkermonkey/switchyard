@@ -101,38 +101,51 @@ class ProjectWorkspaceManager:
         Returns:
             True if project was newly cloned, False if it already existed
         """
-        repo_url = project_config.github.get('repo_url')
-        default_branch = project_config.github.get('branch', 'main')
+        # Serialize against every other operation on this project's shared base
+        # clone (#54): today this runs once per project at startup, before the
+        # dispatch loop begins, so it is safe only by ordering accident -- a
+        # future on-demand re-initialization call (or a slow startup racing an
+        # operator-triggered early dispatch) would otherwise be able to clone/
+        # fetch/checkout into the exact directory another operation is already
+        # reading or building from. No real GitHub issue is in scope at
+        # project-initialization time, so a freshly-minted anonymous holder id
+        # is used instead of a shared sentinel (see next_anonymous_holder_id()'s
+        # docstring for why a shared constant would be a correctness bug here).
+        from services.project_checkout_lock import project_checkout_lock_sync, next_anonymous_holder_id
 
-        if not repo_url:
-            raise ValueError(f"No repo_url configured for project {project_name}")
+        with project_checkout_lock_sync(project_name, next_anonymous_holder_id()):
+            repo_url = project_config.github.get('repo_url')
+            default_branch = project_config.github.get('branch', 'main')
 
-        project_dir = self.workspace_root / project_name
-        was_cloned = False
+            if not repo_url:
+                raise ValueError(f"No repo_url configured for project {project_name}")
 
-        if project_dir.exists() and (project_dir / '.git').exists():
-            logger.info(f"Project {project_name} found at {project_dir}")
-            # Ensure we're on the default branch and up to date
-            self._update_repository(project_dir, default_branch)
-        else:
-            # Try to clone if directory doesn't exist
-            # Note: In container environments with mounted host directories, projects should already exist
-            logger.warning(f"Project {project_name} not found at {project_dir}")
-            logger.info(f"Attempting to clone from {self._redact_url(repo_url)}")
-            try:
-                self._clone_repository(repo_url, project_dir, default_branch)
-                was_cloned = True
-            except Exception as e:
-                logger.error(f"Failed to clone {project_name}: {e}")
-                logger.info("If running in Docker, ensure project is checked out on host and mounted correctly")
-                raise
+            project_dir = self.workspace_root / project_name
+            was_cloned = False
 
-        # Ensure the remote uses SSH — agent containers have SSH keys but no HTTPS
-        # credentials, so an HTTPS remote (e.g. from a prior HTTPS clone) will break
-        # every git fetch/pull/push.
-        self._ensure_ssh_remote(project_dir)
+            if project_dir.exists() and (project_dir / '.git').exists():
+                logger.info(f"Project {project_name} found at {project_dir}")
+                # Ensure we're on the default branch and up to date
+                self._update_repository(project_dir, default_branch)
+            else:
+                # Try to clone if directory doesn't exist
+                # Note: In container environments with mounted host directories, projects should already exist
+                logger.warning(f"Project {project_name} not found at {project_dir}")
+                logger.info(f"Attempting to clone from {self._redact_url(repo_url)}")
+                try:
+                    self._clone_repository(repo_url, project_dir, default_branch)
+                    was_cloned = True
+                except Exception as e:
+                    logger.error(f"Failed to clone {project_name}: {e}")
+                    logger.info("If running in Docker, ensure project is checked out on host and mounted correctly")
+                    raise
 
-        return was_cloned
+            # Ensure the remote uses SSH — agent containers have SSH keys but no HTTPS
+            # credentials, so an HTTPS remote (e.g. from a prior HTTPS clone) will break
+            # every git fetch/pull/push.
+            self._ensure_ssh_remote(project_dir)
+
+            return was_cloned
 
     @staticmethod
     def _redact_url(url: str) -> str:
@@ -276,6 +289,38 @@ class ProjectWorkspaceManager:
         return self.get_or_create_epic_worktree(
             project_name, epic_id, branch_name, default_branch=default_branch
         )
+
+    def is_base_clone_dir(self, project_name: str, project_dir) -> bool:
+        """
+        True if `project_dir` IS project_name's shared base clone (the
+        get_project_dir(project_name, epic_id=None) path) rather than an
+        isolated epic worktree or some other directory.
+
+        Used (#54) to scope the project_checkout resource lock
+        (services/project_checkout_lock.py) to genuinely shared-directory
+        operations only. Locking epic-worktree-scoped operations too would
+        serialize sibling epics of the same project against each other even
+        though they never touch the same physical directory -- exactly the
+        cross-epic throughput cost the epic-worktree isolation work (#119)
+        exists to avoid, which would violate #54's own "no behavior change
+        for the common case" requirement.
+
+        Compares resolved (symlink-following, absolute) paths rather than the
+        raw strings a caller might pass in a different but equivalent form
+        (relative, trailing slash, unresolved symlink, ...). Fails closed --
+        if path resolution raises for any reason, returns True (assume it IS
+        the shared base clone) rather than silently skipping the lock this
+        method exists to gate.
+        """
+        try:
+            return Path(project_dir).resolve() == self.get_project_dir(project_name).resolve()
+        except Exception as e:
+            logger.warning(
+                f"is_base_clone_dir() could not resolve paths for project "
+                f"{project_name!r}, dir={project_dir!r}: {e} -- treating as the "
+                "shared base clone (fail closed)"
+            )
+            return True
 
     def _epic_worktree_path(self, project_name: str, epic_id: str) -> Path:
         """Staging path for an epic's worktree: .orchestrator/worktrees/<project>/<epic_id>/
