@@ -111,6 +111,25 @@ class AutoCommitService:
                     # make with the pre-lock value; the actual push must use
                     # fresh state.
                     fresh_branch = self._get_current_branch(project_dir)
+                    # CRITICAL, found in a later review pass: _commit_and_push()
+                    # itself has no main/master guard around staging/committing
+                    # -- it only gates the PUSH on current_branch, so without
+                    # re-checking here too, a fresh_branch that raced onto
+                    # main/master during the lock wait would still get a real
+                    # commit staged onto the shared clone's main branch (just
+                    # silently skipping the push). Re-apply the same
+                    # WORKFLOW BUG refusal the pre-lock fast-fail check above
+                    # already does, using the fresh (post-lock) value.
+                    if fresh_branch in ['main', 'master']:
+                        logger.error(
+                            f"WORKFLOW BUG: {project_dir} is on {fresh_branch} after "
+                            f"acquiring the project_checkout lock (was on a feature "
+                            f"branch before the wait) -- another operation must have "
+                            f"checked out {fresh_branch} in this shared directory "
+                            f"while we waited. Project: {project}, Agent: {agent}, "
+                            f"Issue: {issue_number}. Refusing to commit."
+                        )
+                        return False
                     return await self._commit_and_push(
                         project, agent, task_id, project_dir, fresh_branch, issue_number, custom_message
                     )
@@ -141,7 +160,25 @@ class AutoCommitService:
         locked and unlocked call paths. `current_branch` is resolved once by
         the caller (before the lock -- see commit_agent_changes()'s own
         comment, #56 review) rather than re-read here.
+
+        Defense-in-depth main/master guard, found in a later review pass:
+        both callers already refuse to reach this method with current_branch
+        on main/master, but a bare stage-and-commit here with no guard of
+        its own meant that guarantee lived ONLY in the callers -- a future
+        third call site (or a caller's own logic change) could silently
+        reintroduce a real commit onto the shared clone's main branch. This
+        check makes the invariant hold structurally, not just by caller
+        discipline.
         """
+        if current_branch in ['main', 'master']:
+            logger.error(
+                f"WORKFLOW BUG: _commit_and_push() called with current_branch="
+                f"{current_branch!r} for {project_dir} -- refusing to stage or "
+                f"commit onto {current_branch}. Project: {project}, Agent: "
+                f"{agent}, Issue: {issue_number}."
+            )
+            return False
+
         # Check if there are changes to commit
         has_changes = self._check_for_changes(project_dir)
 

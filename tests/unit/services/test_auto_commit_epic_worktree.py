@@ -217,3 +217,40 @@ class TestCurrentBranchReReadAfterTheLock:
             # The push must use the SECOND (post-lock, fresh) value, never
             # the first (stale, pre-lock) one.
             mock_push.assert_called_once_with(tmp_path, 'feature/fresh')
+
+    @pytest.mark.asyncio
+    async def test_branch_racing_onto_main_during_the_lock_wait_refuses_to_commit(self, service, tmp_path):
+        """
+        CRITICAL regression, found in the SAME final review pass that added
+        this class: the fresh post-lock re-read closes the stale-branch-push
+        bug, but re-reading alone isn't enough -- _commit_and_push() itself
+        has no main/master guard (it only gates the PUSH, not staging/
+        committing). Without re-validating the fresh value here too, a
+        branch that raced onto main/master during the lock wait would still
+        get a real commit staged onto the shared clone's main branch, only
+        silently skipping the push.
+        """
+        with patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=True), \
+             patch(
+                 'services.project_checkout_lock.project_checkout_lock_async',
+                 side_effect=self._async_noop_lock_cm,
+             ), \
+             patch.object(service, '_get_current_branch', side_effect=['feature/stale', 'main']) as mock_branch, \
+             patch.object(service, '_check_for_changes') as mock_check, \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='some_agent',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=42,
+            )
+
+            assert result is False
+            assert mock_branch.call_count == 2
+            # Must refuse before ever touching git -- no staging, no commit.
+            mock_check.assert_not_called()
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
