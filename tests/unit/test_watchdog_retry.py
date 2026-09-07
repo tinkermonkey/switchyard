@@ -115,6 +115,105 @@ class TestEmptyOutputDetection:
                         last_exec = updated_state['execution_history'][-1]
                         assert last_exec['outcome'] == 'success'  # Still success
 
+    def test_skips_when_already_waiting_in_pipeline_queue(self, tracker, temp_state_dir):
+        """Issue #57 PROTECTION 3 fix: this used to import a nonexistent
+        get_pipeline_queue() (only get_pipeline_queue_manager(project, board)
+        exists), so the queue-status check was a silent no-op (ImportError
+        swallowed by the broad except). Now that it actually calls
+        get_pipeline_queue_manager(...).get_issue_status(), an issue already
+        'waiting' in the queue must be skipped rather than marked failed -
+        it's already about to be legitimately processed."""
+        state_file = temp_state_dir / "test_project_issue_123.yaml"
+        state_data = {
+            'project_name': 'test-project',
+            'issue_number': 123,
+            'execution_history': [
+                {
+                    'agent': 'test-agent',
+                    'column': 'In Progress',
+                    'outcome': 'success',
+                    'completed_at': '2025-01-01T12:00:00Z',
+                    'timestamp': '2025-01-01T11:00:00Z'
+                }
+            ]
+        }
+
+        with open(state_file, 'w') as f:
+            yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.return_value = 'waiting'
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                                return_value=mock_queue_manager
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 0
+        mock_queue_manager.get_issue_status.assert_called_once_with(123)
+
+        with open(state_file) as f:
+            updated_state = yaml.safe_load(f)
+        assert updated_state['execution_history'][-1]['outcome'] == 'success'
+
+    def test_proceeds_when_not_in_pipeline_queue(self, tracker, temp_state_dir):
+        """Control case: get_issue_status() returns None (not in queue at
+        all) - the watchdog must proceed exactly as before this fix."""
+        state_file = temp_state_dir / "test_project_issue_123.yaml"
+        state_data = {
+            'project_name': 'test-project',
+            'issue_number': 123,
+            'execution_history': [
+                {
+                    'agent': 'test-agent',
+                    'column': 'In Progress',
+                    'outcome': 'success',
+                    'completed_at': '2025-01-01T12:00:00Z',
+                    'timestamp': '2025-01-01T11:00:00Z'
+                }
+            ]
+        }
+
+        with open(state_file, 'w') as f:
+            yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.return_value = None
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                                return_value=mock_queue_manager
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 1
+        with open(state_file) as f:
+            updated_state = yaml.safe_load(f)
+        assert updated_state['execution_history'][-1]['outcome'] == 'failure'
+
     def test_ignores_failed_executions(self, tracker, temp_state_dir):
         """Test only checks successful executions"""
         state_file = temp_state_dir / "test_project_issue_123.yaml"

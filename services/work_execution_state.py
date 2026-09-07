@@ -1359,13 +1359,42 @@ class WorkExecutionStateTracker:
                         logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
 
                     # PROTECTION 3: Check queue state
+                    #
+                    # Issue #57: this used to import a nonexistent
+                    # get_pipeline_queue() (only get_pipeline_queue_manager
+                    # (project, board) / PipelineQueueManager actually exist in
+                    # services/pipeline_queue_manager.py), so this protection
+                    # was a silent no-op -- the ImportError was swallowed by
+                    # the broad except below and only ever logged at debug
+                    # level. Implemented properly now that the queue manager
+                    # exposes get_issue_status(): skip retry-marking if the
+                    # issue is already 'waiting' or 'active' in the queue for
+                    # any of its pipelines' boards -- it's already about to be
+                    # (or currently being) legitimately processed, so marking
+                    # it 'failure' here to force a retry would race with that.
                     try:
-                        from services.pipeline_queue_manager import get_pipeline_queue
+                        from services.pipeline_queue_manager import get_pipeline_queue_manager
+                        from config.manager import config_manager
 
-                        queue_manager = get_pipeline_queue()
-                        # Check if issue is already queued or active
-                        # Note: This is a simple check - queue manager would need to expose status API
-                        # For now, skip this protection as it requires queue manager changes
+                        already_queued_or_active = False
+                        project_config_for_queue = config_manager.get_project_config(project_name)
+                        for pipeline_cfg in getattr(project_config_for_queue, 'pipelines', None) or []:
+                            board_name = getattr(pipeline_cfg, 'board_name', None)
+                            if not board_name:
+                                continue
+                            queue_status = get_pipeline_queue_manager(
+                                project_name, board_name
+                            ).get_issue_status(issue_number)
+                            if queue_status in ('waiting', 'active'):
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"already '{queue_status}' in pipeline queue for board '{board_name}'"
+                                )
+                                already_queued_or_active = True
+                                break
+
+                        if already_queued_or_active:
+                            continue
                     except Exception as e:
                         logger.debug(f"Watchdog: Could not check queue status: {e}")
 

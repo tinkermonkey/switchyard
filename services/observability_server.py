@@ -4512,7 +4512,18 @@ def get_pipeline_queue_status(project, board):
 
         # Add lock holder info
         if lock and lock.lock_status == 'locked':
-            active_issue = queue_summary.get('active_issue')
+            # Phase 2 (issue #57): get_queue_summary() now returns the full
+            # 'active_issues' list instead of a single 'active_issue' (which
+            # silently dropped every entry past the first). Find the one that
+            # matches the actual lock holder; fall back to the first entry
+            # (pre-#57 behavior) if none matches, which shouldn't normally
+            # happen but keeps this endpoint from going empty on a transient
+            # mismatch.
+            active_issues = queue_summary.get('active_issues', [])
+            active_issue = next(
+                (i for i in active_issues if i.get('issue_number') == lock.locked_by_issue),
+                active_issues[0] if active_issues else None
+            )
             if active_issue:
                 response['locked_by'] = {
                     'issue_number': lock.locked_by_issue,

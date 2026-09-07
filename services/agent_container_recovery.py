@@ -1758,8 +1758,29 @@ class AgentContainerRecovery:
 
                 if commit_success[0]:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                elif thread.is_alive():
+                    # #57 review: the join itself timed out (thread still
+                    # running) -- distinct from "commit_agent_changes()
+                    # returned False" (real failure/no-changes/lock-timeout,
+                    # already logged with its specific reason by
+                    # commit_agent_changes() itself). commit_success[0]'s
+                    # initial value (False) is indistinguishable from a real
+                    # False return unless we also check is_alive() here --
+                    # without this, an engineer investigating a stuck repair
+                    # cycle would misread "No changes to commit" as the
+                    # actual outcome when the commit may still be in flight.
+                    logger.warning(
+                        f"Auto-commit thread for repair cycle issue #{issue_number} did not "
+                        f"finish within the join timeout ({_CHECKOUT_LOCK_TIMEOUT + 60}s) -- "
+                        "still running in the background; its eventual result won't be "
+                        "reflected in this recovery pass"
+                    )
                 else:
-                    logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
+                    logger.warning(
+                        f"Auto-commit for repair cycle issue #{issue_number} did not succeed "
+                        "(no changes to commit, or a failure already logged above by "
+                        "commit_agent_changes() itself)"
+                    )
             except Exception as e:
                 logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
 

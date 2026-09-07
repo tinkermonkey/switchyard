@@ -6,6 +6,48 @@ Uses GitHub board column order as the source of truth for execution order.
 
 Only ONE issue can execute at a time per pipeline (enforced by PipelineLockManager).
 Other issues wait in queue based on their position in the GitHub board column.
+
+Phase 2 item of the concurrency redesign (issue #57, parent #88, umbrella #34):
+generalized get_next_waiting_issue() -> get_next_n_waiting_issues(n) and
+get_queue_summary()'s 'active_issue' (singular) -> 'active_issues' (full list),
+so the code shape is ready for a real multi-slot count once Phase 3a actually
+raises one. This is a pure refactor: every call site today still passes n=1
+(or, equivalently, still evaluates "available slots" to exactly 1), so
+observable dispatch behavior is unchanged.
+
+Dispatch call site count vs #57's original text
+-------------------------------------------------
+#57 was filed describing 4 duplicated "get next -> try_acquire_lock ->
+mark_issue_active" dispatch call sites: two in services/project_monitor.py,
+one in services/pipeline_progression.py, one in services/pipeline_run.py.
+By the time this fix landed, a fifth had been added to project_monitor.py
+(inside _start_review_cycle_for_issue()'s background-thread completion
+handler, ~line 5300 -- dispatching the next queued issue after a review
+cycle ends at an exit column) that duplicates the exact same pattern used by
+services/pipeline_run.py's end_pipeline_run() post-release dispatch. #57's
+own design decision -- do NOT consolidate these into shared code, keep them
+as independently-updated call sites -- was applied to all 5 found, not just
+the original 4, to avoid leaving one of them with the pre-#57 single-shot
+shape while its siblings are loop-ified (exactly the kind of
+independently-diverging duplication #57 itself warns against for item 1).
+The other four sites matched #57's description as filed once re-located
+(line numbers had drifted from other work landing on this file in the
+interim).
+
+IMPORTANT for whoever wires up Phase 3a
+------------------------------------------
+Raising a dispatch call site's `available_slots` above 1 is NOT sufficient
+on its own to actually enable concurrent dispatch. Every one of the 5 sites
+still gates the winning candidate through PipelineLockManager.try_acquire_lock(),
+which remains a strictly single-holder (project, board) lock -- found in
+code review (#57): it was never generalized to a real N-holder model as
+part of this phase (that's what #55's PipelineSemaphoreManager exists for,
+built exactly to fill this gap, but not wired into any dispatch call site
+yet -- see #63). If `available_slots` is bumped without also swapping the
+acquire call at each site to a capacity-aware primitive, every candidate
+after the first in a given dispatch loop will simply fail to acquire and
+the loop will silently behave as if still at capacity 1 -- not a crash, but
+not the intended increase in throughput either.
 """
 
 import yaml
@@ -653,17 +695,31 @@ class PipelineQueueManager:
         # Default fallback
         return "Development"
 
-    def get_next_waiting_issue(
+    def get_next_n_waiting_issues(
         self,
+        n: int,
         prefetched_board_data: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict]:
+    ) -> List[Dict]:
         """
-        Get the next issue that should execute based on CURRENT GitHub board order.
+        Get up to `n` issues that should execute next, based on CURRENT GitHub
+        board order.
 
         This method first syncs with GitHub to ensure queue state is accurate,
-        then selects the highest priority waiting issue.
+        then selects the top `n` highest priority waiting issues (board column
+        order, top to bottom -- NOT FIFO-by-arrival).
+
+        Phase 2 of the concurrency redesign (issue #57, parent #88, umbrella
+        #34): generalizes what used to be get_next_waiting_issue()'s hardcoded
+        "take 1" truncation into "take up to n". This is a pure refactor --
+        nothing here raises any actual concurrency limit (that's Phase 3a's
+        job). Every dispatch call site today still passes n=1 (its "available
+        slots" is still hardcoded to 1, since PipelineLockManager only ever
+        grants one lock per (project, board)), so behavior is unchanged; the
+        sort/selection logic itself is untouched from before #57, just no
+        longer truncated to a single element inside this method.
 
         Args:
+            n: Maximum number of candidates to return. n <= 0 returns [].
             prefetched_board_data: Optional pre-fetched raw board data,
                 forwarded as-is to sync_queue_with_github() /
                 get_issues_in_column_order() - see the latter's docstring for
@@ -671,10 +727,15 @@ class PipelineQueueManager:
                 unchanged: the board is fetched here.
 
         Returns:
-            Issue dict with 'issue_number', 'position', etc., or None
+            List of up to `n` issue dicts with 'issue_number', 'position', etc.,
+            in board-priority order (highest priority first). Empty list if no
+            issues are waiting.
 
         Note: Uses atomic read under lock after sync to prevent race conditions.
         """
+        if n <= 0:
+            return []
+
         # STEP 1: Sync with GitHub first to ensure accurate state (has its own locking)
         logger.info(
             f"Syncing queue with GitHub for {self.project_name}/{self.board_name}"
@@ -696,26 +757,58 @@ class PipelineQueueManager:
                     f"No waiting issues in pipeline queue for "
                     f"{self.project_name}/{self.board_name}"
                 )
-                return None
+                return []
 
             # Sort by position (lowest = topmost on board = highest priority)
             waiting_issues.sort(key=lambda x: x.get('position_in_column', 999))
-            next_issue = waiting_issues[0]
+            next_issues = waiting_issues[:n]
 
         trigger_column = self._get_pipeline_trigger_column()
-        logger.info(
-            f"Next issue to execute: #{next_issue['issue_number']} "
-            f"(position {next_issue['position_in_column']} in '{trigger_column}')"
-        )
+        for next_issue in next_issues:
+            logger.info(
+                f"Next issue to execute: #{next_issue['issue_number']} "
+                f"(position {next_issue['position_in_column']} in '{trigger_column}')"
+            )
 
-        return next_issue
+        return next_issues
+
+    def get_next_waiting_issue(
+        self,
+        prefetched_board_data: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict]:
+        """
+        Get the single next issue that should execute based on CURRENT GitHub
+        board order.
+
+        Thin wrapper around get_next_n_waiting_issues(1) -- issue #57 -- kept
+        for the callers that only ever want one candidate. Byte-identical to
+        the pre-#57 implementation (same sync, same lock, same sort, same
+        logging), just delegating the "take 1" truncation.
+
+        Args:
+            prefetched_board_data: Optional pre-fetched raw board data,
+                forwarded as-is - see get_next_n_waiting_issues()'s docstring.
+
+        Returns:
+            Issue dict with 'issue_number', 'position', etc., or None
+        """
+        next_issues = self.get_next_n_waiting_issues(
+            1, prefetched_board_data=prefetched_board_data
+        )
+        return next_issues[0] if next_issues else None
 
     def get_queue_summary(self) -> Dict[str, Any]:
         """
         Get summary of current queue state.
 
         Returns:
-            Dictionary with queue statistics and waiting issues
+            Dictionary with queue statistics, 'active_issues' (the full list
+            of status=='active' entries -- issue #57 fix: this used to be
+            'active_issue', singular, silently dropping every entry past the
+            first via active_issues[0] -- already reachable today since
+            nothing at the queue-manager level prevents mark_issue_active()
+            from being called more than once for the same board; the cap is
+            enforced elsewhere, in PipelineLockManager), and 'waiting_issues'.
 
         Uses lock to prevent reading partially written queue state.
         """
@@ -731,7 +824,7 @@ class PipelineQueueManager:
                 'total_issues': len(queue),
                 'active_count': len(active_issues),
                 'waiting_count': len(waiting_issues),
-                'active_issue': active_issues[0] if active_issues else None,
+                'active_issues': active_issues,
                 'waiting_issues': waiting_issues,
                 'last_updated': datetime.now(timezone.utc).isoformat()
             }
