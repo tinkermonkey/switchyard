@@ -206,9 +206,11 @@ async def main():
     # project_checkout_lock_sync(), which polls with time.sleep() for up to
     # DEFAULT_TIMEOUT_SECONDS (1900s) on contention (e.g. a stale lock left
     # by a crashed prior process). Calling it directly here would freeze
-    # this entire single-threaded event loop for that whole wait -- /health
-    # never comes up, and nothing else (including the container-recovery
-    # step that would free a stale holder) can run until it returns.
+    # THIS process's event loop for that whole wait -- not /health itself
+    # (served by the separate observability-server process/container, which
+    # is unaffected), but every other asyncio task this same event loop will
+    # go on to run later in startup (the monitor loop, scheduler, etc.) would
+    # be unable to even begin until this returns.
     logger.info("Initializing project workspaces")
     projects_needing_setup = await asyncio.to_thread(workspace_manager.initialize_all_projects)
     logger.info("Project workspaces initialized")

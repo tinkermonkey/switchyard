@@ -108,12 +108,12 @@ class ProjectWorkspaceManager:
         # operator-triggered early dispatch) would otherwise be able to clone/
         # fetch/checkout into the exact directory another operation is already
         # reading or building from. No real GitHub issue is in scope at
-        # project-initialization time, so a freshly-minted anonymous holder id
-        # is used instead of a shared sentinel (see next_anonymous_holder_id()'s
-        # docstring for why a shared constant would be a correctness bug here).
-        from services.project_checkout_lock import project_checkout_lock_sync, next_anonymous_holder_id
+        # project-initialization time -- pass None (log attribution only, not
+        # the lock's holder identity; see project_checkout_lock.py's module
+        # docstring).
+        from services.project_checkout_lock import project_checkout_lock_sync
 
-        with project_checkout_lock_sync(project_name, next_anonymous_holder_id()):
+        with project_checkout_lock_sync(project_name, None):
             repo_url = project_config.github.get('repo_url')
             default_branch = project_config.github.get('branch', 'main')
 

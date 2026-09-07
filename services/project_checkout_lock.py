@@ -48,11 +48,37 @@ serialize correctly ... instead of racing"), this module polls
 acquire_resource() with a sleep between attempts until it succeeds or a
 generous bounded timeout elapses, then raises loudly (never silently skips
 the guarded operation, and never proceeds unlocked).
+
+Why every acquisition gets its own unique holder id, not the caller's real
+issue_number
+------------------------------------------------------------------------
+Found in code review: PipelineLockManager.try_acquire_lock() treats a
+MATCHING issue_number as reentrant ("already_holds_lock") with no other
+identity check -- correct for its original design (one active dispatch per
+issue at a time), wrong for this lock's actual job (mutual exclusion between
+independent, possibly-concurrent operations that merely happen to share a
+project or an issue number). If two genuinely different concurrent
+operations for the SAME real issue number both called acquire_resource()
+with that issue number directly (e.g. a Docker agent run and an unrelated
+auto-commit/watchdog redispatch both tagged issue #42), each would be told
+"already_holds_lock" and both would proceed concurrently against the shared
+base clone -- exactly the race this lock exists to close -- and whichever
+finished first would release the lock out from under the other still-running
+one. So `issue_number` here is ONLY for log attribution; the identity
+actually passed to acquire_resource()/release_resource() is always a fresh,
+process-unique id minted by _mint_unique_holder_id(), guaranteeing every
+acquisition is judged strictly on its own, never treated as a reentrant hold
+of some other concurrent caller's lock. The tradeoff: a stuck lock inspected
+via get_all_locks()/PipelineLock.locked_by_issue shows this synthetic id, not
+a real GitHub issue number -- an operator needs this module's logs (which do
+include the real issue_number) for that attribution, not the lock state
+itself.
 """
 
 import asyncio
 import itertools
 import logging
+import os
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -77,29 +103,35 @@ RESOURCE_NAME = "project_checkout"
 DEFAULT_TIMEOUT_SECONDS = 1900.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 
-# Used to mint a unique holder id for call sites with no real GitHub issue in
-# scope (e.g. startup project initialization, which runs before any board is
-# polled or any issue/epic exists). Deliberately NOT a single shared
-# constant: PipelineLockManager.try_acquire_lock() treats a matching
-# issue_number as reentrant ("already_holds_lock") with no other identity
-# check, so a shared sentinel would let two genuinely different concurrent
-# anonymous callers each be told they already hold the lock and both proceed
-# concurrently -- exactly the race this lock exists to close. Counts DOWN
-# from -1 so every anonymous holder id is unique and, since real GitHub issue
-# numbers are always positive, can never collide with one.
-_anonymous_holder_ids = itertools.count(start=-1, step=-1)
-_anonymous_holder_ids_guard = threading.Lock()
+# Seeds _mint_unique_holder_id()'s counter so it differs across process
+# restarts, not just within one process's lifetime. Found in code review: a
+# counter that always started at a fixed value (e.g. -1) would let a lock
+# left behind by a crashed process (Redis TTL 7200s, or the non-expiring
+# YAML copy) collide with the very first id the NEW process mints -- which,
+# combined with config_manager.list_projects()'s deterministic sorted()
+# ordering, would deterministically hit the alphabetically-first project on
+# every single restart. Combining the pid with a high-resolution timestamp
+# makes two process incarnations' id ranges collide only by astronomical
+# coincidence, without needing true randomness.
+_PROCESS_HOLDER_ID_SEED = -(abs(hash((os.getpid(), time.time_ns()))) % 10**15 + 1)
+_unique_holder_ids = itertools.count(start=_PROCESS_HOLDER_ID_SEED, step=-1)
+_unique_holder_ids_guard = threading.Lock()
 
 
-def next_anonymous_holder_id() -> int:
+def _mint_unique_holder_id() -> int:
     """
-    Mint a unique negative "issue number" to attribute a lock hold to, for a
-    call site with no real GitHub issue in scope. Call this fresh at the
-    point of acquisition (not once at import time or cached) so each
-    concurrent anonymous acquire attempt gets its own distinct identity.
+    Mint a holder id guaranteed unique for the lifetime of this process (and,
+    via _PROCESS_HOLDER_ID_SEED, vanishingly unlikely to collide with a
+    previous process incarnation's abandoned lock either). Always negative,
+    so it can never collide with a real GitHub issue number (always
+    positive). Called once per acquisition attempt by
+    project_checkout_lock_async()/_sync() -- see this module's docstring
+    ("Why every acquisition gets its own unique holder id") for why this is
+    used for EVERY acquisition, not just ones with no real issue_number in
+    scope.
     """
-    with _anonymous_holder_ids_guard:
-        return next(_anonymous_holder_ids)
+    with _unique_holder_ids_guard:
+        return next(_unique_holder_ids)
 
 
 class ProjectCheckoutLockTimeoutError(RuntimeError):
@@ -108,10 +140,40 @@ class ProjectCheckoutLockTimeoutError(RuntimeError):
     skipping (or silently running unlocked) the guarded operation."""
 
 
+def _attribution(issue_number: Optional[int]) -> str:
+    return f"issue #{issue_number}" if issue_number is not None else "no issue in scope"
+
+
+def _timeout_error(project: str, issue_number: Optional[int], timeout_seconds: float, reason: str) -> ProjectCheckoutLockTimeoutError:
+    return ProjectCheckoutLockTimeoutError(
+        f"Could not acquire '{RESOURCE_NAME}' lock for project {project!r} "
+        f"({_attribution(issue_number)}) within {timeout_seconds}s: {reason}"
+    )
+
+
+def _log_busy(project: str, issue_number: Optional[int], reason: str, poll_interval_seconds: float) -> None:
+    logger.info(
+        f"'{RESOURCE_NAME}' lock busy for project {project!r} ({_attribution(issue_number)}): "
+        f"{reason} -- waiting {poll_interval_seconds}s before retrying"
+    )
+
+
+def _release_and_warn(
+    facade: ProjectResourceLockManager, project: str, holder_id: int, issue_number: Optional[int]
+) -> None:
+    released = facade.release_resource(project, RESOURCE_NAME, holder_id)
+    if not released:
+        logger.warning(
+            f"'{RESOURCE_NAME}' lock release for project {project!r} "
+            f"({_attribution(issue_number)}) returned False -- lock may already be "
+            "released or retained"
+        )
+
+
 @asynccontextmanager
 async def project_checkout_lock_async(
     project: str,
-    issue_number: int,
+    issue_number: Optional[int] = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     facade: Optional[ProjectResourceLockManager] = None,
@@ -128,10 +190,11 @@ async def project_checkout_lock_async(
 
     Args:
         project: Project name.
-        issue_number: GitHub issue number to attribute this hold to. When no
-            real issue is in scope at the call site, pass
-            next_anonymous_holder_id() (freshly called, not cached/shared) --
-            document why at the call site.
+        issue_number: GitHub issue number to attribute this hold to in LOG
+            MESSAGES only -- not used as the lock's holder identity (see this
+            module's docstring, "Why every acquisition gets its own unique
+            holder id"). Pass None (the default) when no real issue is in
+            scope at the call site.
         timeout_seconds / poll_interval_seconds: override only for tests.
         facade: injected ProjectResourceLockManager (e.g. one built on a
             temp-dir PipelineLockManager + mock Redis, matching
@@ -144,38 +207,27 @@ async def project_checkout_lock_async(
         ProjectCheckoutLockTimeoutError: not acquired within timeout_seconds.
     """
     facade = facade if facade is not None else ProjectResourceLockManager()
+    holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
     while True:
-        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, issue_number)
+        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
         if can_execute:
             break
         if time.monotonic() >= deadline:
-            raise ProjectCheckoutLockTimeoutError(
-                f"Could not acquire '{RESOURCE_NAME}' lock for project {project!r} "
-                f"(issue #{issue_number}) within {timeout_seconds}s: {reason}"
-            )
-        logger.info(
-            f"'{RESOURCE_NAME}' lock busy for project {project!r} (issue #{issue_number}): "
-            f"{reason} -- waiting {poll_interval_seconds}s before retrying"
-        )
+            raise _timeout_error(project, issue_number, timeout_seconds, reason)
+        _log_busy(project, issue_number, reason, poll_interval_seconds)
         await asyncio.sleep(poll_interval_seconds)
 
     try:
         yield
     finally:
-        released = facade.release_resource(project, RESOURCE_NAME, issue_number)
-        if not released:
-            logger.warning(
-                f"'{RESOURCE_NAME}' lock release for project {project!r} "
-                f"(issue #{issue_number}) returned False -- lock may already be "
-                "released, retained, or held by a different issue number"
-            )
+        _release_and_warn(facade, project, holder_id, issue_number)
 
 
 @contextmanager
 def project_checkout_lock_sync(
     project: str,
-    issue_number: int,
+    issue_number: Optional[int] = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     facade: Optional[ProjectResourceLockManager] = None,
@@ -188,32 +240,22 @@ def project_checkout_lock_sync(
     coroutine running on an asyncio event loop, which it would block.
 
     See project_checkout_lock_async() for the full contract (including the
-    `facade` test-injection parameter); identical semantics otherwise.
+    `facade` test-injection parameter and the `issue_number` log-only
+    caveat); identical semantics otherwise.
     """
     facade = facade if facade is not None else ProjectResourceLockManager()
+    holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
     while True:
-        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, issue_number)
+        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
         if can_execute:
             break
         if time.monotonic() >= deadline:
-            raise ProjectCheckoutLockTimeoutError(
-                f"Could not acquire '{RESOURCE_NAME}' lock for project {project!r} "
-                f"(issue #{issue_number}) within {timeout_seconds}s: {reason}"
-            )
-        logger.info(
-            f"'{RESOURCE_NAME}' lock busy for project {project!r} (issue #{issue_number}): "
-            f"{reason} -- waiting {poll_interval_seconds}s before retrying"
-        )
+            raise _timeout_error(project, issue_number, timeout_seconds, reason)
+        _log_busy(project, issue_number, reason, poll_interval_seconds)
         time.sleep(poll_interval_seconds)
 
     try:
         yield
     finally:
-        released = facade.release_resource(project, RESOURCE_NAME, issue_number)
-        if not released:
-            logger.warning(
-                f"'{RESOURCE_NAME}' lock release for project {project!r} "
-                f"(issue #{issue_number}) returned False -- lock may already be "
-                "released, retained, or held by a different issue number"
-            )
+        _release_and_warn(facade, project, holder_id, issue_number)

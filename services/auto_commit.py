@@ -76,9 +76,13 @@ class AutoCommitService:
             # locked -- they don't share a directory with anything else.
             from services.project_workspace import workspace_manager
             if workspace_manager.is_base_clone_dir(project, project_dir):
-                from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
+                from services.project_checkout_lock import project_checkout_lock_async
 
-                async with project_checkout_lock_async(project, issue_number or next_anonymous_holder_id()):
+                # issue_number here is log attribution only, not the lock's
+                # holder identity -- see project_checkout_lock.py's module
+                # docstring ("Why every acquisition gets its own unique
+                # holder id").
+                async with project_checkout_lock_async(project, issue_number):
                     return await self._commit_and_push(
                         project, agent, task_id, project_dir, issue_number, custom_message
                     )

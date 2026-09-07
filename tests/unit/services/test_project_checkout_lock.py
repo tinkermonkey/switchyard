@@ -50,7 +50,7 @@ from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_checkout_lock import (
     project_checkout_lock_async,
     project_checkout_lock_sync,
-    next_anonymous_holder_id,
+    _mint_unique_holder_id,
     ProjectCheckoutLockTimeoutError,
     RESOURCE_NAME,
 )
@@ -155,12 +155,16 @@ class TestProjectCheckoutLockSyncMechanics(unittest.TestCase):
         shutil.rmtree(self.test_dir)
 
     def test_acquires_and_releases_when_uncontended(self):
+        # issue_number=111 is log attribution only -- the lock's actual
+        # holder identity is an internally-minted unique id (always
+        # negative), never the caller's real issue_number. See this module's
+        # "Why every acquisition gets its own unique holder id" docstring.
         entered = []
         with project_checkout_lock_sync("proj", 111, facade=self.facade, timeout_seconds=5, poll_interval_seconds=0.01):
             entered.append(True)
             lock = self.facade.get_resource_lock("proj", RESOURCE_NAME)
             self.assertIsNotNone(lock)
-            self.assertEqual(lock.locked_by_issue, 111)
+            self.assertLess(lock.locked_by_issue, 0)
 
         self.assertEqual(entered, [True])
         # Released on exit
@@ -194,7 +198,9 @@ class TestProjectCheckoutLockSyncMechanics(unittest.TestCase):
             with project_checkout_lock_sync("proj", 2, facade=self.facade, timeout_seconds=5, poll_interval_seconds=0.02):
                 elapsed = time.monotonic() - start
                 lock = self.facade.get_resource_lock("proj", RESOURCE_NAME)
-                self.assertEqual(lock.locked_by_issue, 2)
+                # Not issue 1 (the released prior holder) and not literally
+                # "2" either -- an internally-minted unique id (see above).
+                self.assertLess(lock.locked_by_issue, 0)
             # Genuinely waited for the release, not an instant no-op success
             self.assertGreaterEqual(elapsed, 0.15)
         finally:
@@ -224,9 +230,11 @@ class TestProjectCheckoutLockAsyncMechanics:
         shutil.rmtree(self.test_dir)
 
     async def test_acquires_and_releases_when_uncontended(self):
+        # issue_number=111 is log attribution only -- see the sync test's
+        # comment above for why the lock's real holder id is never this.
         async with project_checkout_lock_async("proj", 111, facade=self.facade, timeout_seconds=5, poll_interval_seconds=0.01):
             lock = self.facade.get_resource_lock("proj", RESOURCE_NAME)
-            assert lock.locked_by_issue == 111
+            assert lock.locked_by_issue < 0
 
         assert self.facade.get_resource_lock("proj", RESOURCE_NAME) is None
 
@@ -327,19 +335,15 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
         self.assertEqual(max_concurrent, 1)
         self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
 
-    def test_two_anonymous_callers_still_serialize_and_do_not_falsely_reenter(self):
+    def test_two_callers_with_no_issue_number_still_serialize(self):
         """
-        Regression for a real bug found in review: PipelineLockManager.
-        try_acquire_lock() treats a matching issue_number as reentrant
-        ("already_holds_lock") with no other identity check. A call site with
-        no real GitHub issue in scope (e.g. project_workspace.initialize_project()
-        at startup) must mint a FRESH next_anonymous_holder_id() per acquire
-        attempt, not reuse a shared constant -- otherwise two genuinely
-        different anonymous callers racing the same project would each be
-        told they already hold the lock and both proceed concurrently,
-        defeating the whole point of this lock. This test races two callers
-        each using their own next_anonymous_holder_id() call (mirroring every
-        real call site) and confirms they still serialize correctly.
+        issue_number=None (no real GitHub issue in scope, e.g.
+        project_workspace.initialize_project() at startup) must not prevent
+        two genuinely different concurrent callers from serializing --
+        every acquisition mints its own internal holder id regardless of
+        what issue_number was passed for logging (see
+        test_two_callers_with_the_SAME_real_issue_number_still_serialize for
+        why this matters even more when issue_number IS given).
         """
         concurrent_count = {"value": 0}
         max_concurrent = {"value": 0}
@@ -347,9 +351,8 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
         completed = {"count": 0}
 
         def worker():
-            issue_number = next_anonymous_holder_id()
             with project_checkout_lock_sync(
-                "shared-project", issue_number, facade=self.facade,
+                "shared-project", None, facade=self.facade,
                 timeout_seconds=5, poll_interval_seconds=0.01,
             ):
                 with count_lock:
@@ -371,18 +374,64 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
         self.assertEqual(max_concurrent["value"], 1)  # ...but never at the same time
         self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
 
+    def test_two_callers_with_the_SAME_real_issue_number_still_serialize(self):
+        """
+        THE critical regression this round of review found:
+        PipelineLockManager.try_acquire_lock() treats a MATCHING issue_number
+        as reentrant ("already_holds_lock") with no other identity check. If
+        this lock passed the caller's real issue_number straight through as
+        the holder identity, two genuinely different concurrent operations
+        that happen to share a real issue number (e.g. a Docker agent run
+        and an unrelated auto-commit/watchdog redispatch both tagged the same
+        issue) would each be told they already hold the lock and both run
+        concurrently -- and whichever finished first would release the lock
+        out from under the other still-running one. Passing the SAME
+        issue_number for both racing callers here (instead of two different
+        ones, as the other tests in this class use) is the whole point: it
+        proves the fix holds even in the worst case the old design got wrong.
+        """
+        concurrent_count = {"value": 0}
+        max_concurrent = {"value": 0}
+        count_lock = threading.Lock()
+        completed = {"count": 0}
+        SAME_ISSUE_NUMBER = 42
 
-class TestNextAnonymousHolderId(unittest.TestCase):
-    """next_anonymous_holder_id() must be unique per call (never a shared
-    constant) and never collide with a real, always-positive GitHub issue
-    number -- see its docstring for why a shared sentinel is a correctness
-    bug for this lock's reentrancy check."""
+        def worker():
+            with project_checkout_lock_sync(
+                "shared-project", SAME_ISSUE_NUMBER, facade=self.facade,
+                timeout_seconds=5, poll_interval_seconds=0.01,
+            ):
+                with count_lock:
+                    concurrent_count["value"] += 1
+                    max_concurrent["value"] = max(max_concurrent["value"], concurrent_count["value"])
+                time.sleep(0.1)
+                with count_lock:
+                    concurrent_count["value"] -= 1
+                    completed["count"] += 1
+
+        t1 = threading.Thread(target=worker)
+        t2 = threading.Thread(target=worker)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        self.assertEqual(completed["count"], 2)  # both got to run
+        self.assertEqual(max_concurrent["value"], 1)  # ...but never at the same time (the old bug: this would be 2)
+        self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
+
+
+class TestMintUniqueHolderId(unittest.TestCase):
+    """_mint_unique_holder_id() must be unique per call (never a shared
+    constant, and never the caller's real issue_number -- see this module's
+    "Why every acquisition gets its own unique holder id" docstring) and
+    never collide with a real, always-positive GitHub issue number."""
 
     def test_is_negative(self):
-        self.assertLess(next_anonymous_holder_id(), 0)
+        self.assertLess(_mint_unique_holder_id(), 0)
 
     def test_successive_calls_are_unique(self):
-        ids = [next_anonymous_holder_id() for _ in range(50)]
+        ids = [_mint_unique_holder_id() for _ in range(50)]
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_concurrent_calls_across_threads_are_unique(self):
@@ -390,7 +439,7 @@ class TestNextAnonymousHolderId(unittest.TestCase):
         ids_lock = threading.Lock()
 
         def worker():
-            holder_id = next_anonymous_holder_id()
+            holder_id = _mint_unique_holder_id()
             with ids_lock:
                 ids.append(holder_id)
 

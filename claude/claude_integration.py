@@ -130,13 +130,13 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         # here -- they don't share a directory with anything else, and locking
         # them too would serialize sibling epics for no reason.
         if workspace_manager.is_base_clone_dir(project, project_dir):
-            from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
+            from services.project_checkout_lock import project_checkout_lock_async
 
-            issue_number_for_lock = (
-                task_context_for_dir.get('issue_number')
-                or context.get('issue_number')
-                or next_anonymous_holder_id()
-            )
+            # issue_number here is log attribution only, not the lock's holder
+            # identity (every acquisition mints its own -- see
+            # project_checkout_lock.py's module docstring), so it's fine for
+            # this to be None when no real issue is in scope.
+            issue_number_for_lock = task_context_for_dir.get('issue_number') or context.get('issue_number')
             async with project_checkout_lock_async(project, issue_number_for_lock):
                 return await docker_runner.run_agent_in_container(
                     prompt=prompt,
@@ -165,14 +165,12 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     # for why locking epic-worktree-scoped runs too would be wrong.
     work_dir_for_lock = Path(context.get('work_dir', '.'))
     if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
-        from services.project_checkout_lock import project_checkout_lock_async, next_anonymous_holder_id
+        from services.project_checkout_lock import project_checkout_lock_async
 
+        # issue_number here is log attribution only -- see the comment at the
+        # Docker-branch call site above.
         task_context_for_lock = context.get('context', {}) or {}
-        issue_number_for_lock = (
-            task_context_for_lock.get('issue_number')
-            or context.get('issue_number')
-            or next_anonymous_holder_id()
-        )
+        issue_number_for_lock = task_context_for_lock.get('issue_number') or context.get('issue_number')
         async with project_checkout_lock_async(project, issue_number_for_lock):
             return await _run_claude_code_locally(prompt, context, agent)
 

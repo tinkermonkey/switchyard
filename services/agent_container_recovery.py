@@ -1741,7 +1741,20 @@ class AgentContainerRecovery:
 
                 thread = threading.Thread(target=commit_thread)
                 thread.start()
-                thread.join(timeout=60)  # Wait up to 60 seconds for commit
+                # #54 review: commit_agent_changes() can now block for up to
+                # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS (1900s)
+                # polling for the shared base-clone lock, when
+                # repair_cycle_project_dir resolves to it (the uncommon case --
+                # normally this is an isolated epic worktree, which the lock
+                # doesn't gate at all). A fixed 60s join here predates that and
+                # would time out with commit_success[0] still False while the
+                # commit is genuinely still in progress (not stuck) -- read as
+                # "no changes to commit" below and silently skip auto-advance
+                # even though the fix will land moments later. Join for at
+                # least as long as the lock itself is willing to wait, plus
+                # headroom for the actual git add/commit/push.
+                from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
+                thread.join(timeout=_CHECKOUT_LOCK_TIMEOUT + 60)
 
                 if commit_success[0]:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")

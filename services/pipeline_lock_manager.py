@@ -11,6 +11,7 @@ import yaml
 import redis
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -1323,11 +1324,28 @@ class PipelineLockManager:
 
 # Singleton instance
 _pipeline_lock_manager = None
+_pipeline_lock_manager_init_guard = threading.Lock()
 
 
 def get_pipeline_lock_manager() -> PipelineLockManager:
-    """Get singleton instance of PipelineLockManager"""
+    """
+    Get singleton instance of PipelineLockManager.
+
+    Double-checked locking around the lazy init (#54 review): this used to be
+    a bare check-then-set with no guard, which was fine while every caller
+    ran on the same thread at startup. #54 added a genuinely concurrent
+    caller (main.py's asyncio.to_thread(initialize_all_projects), racing the
+    event-loop thread's own ProjectResourceLockManager()-default-construction
+    callers), so two threads could otherwise both observe
+    `_pipeline_lock_manager is None` and each construct their own
+    PipelineLockManager -- each opening its own Redis connection, with the
+    loser's silently orphaned and any caller holding a reference to it
+    missing lock state updates made through the winning instance's
+    connection.
+    """
     global _pipeline_lock_manager
     if _pipeline_lock_manager is None:
-        _pipeline_lock_manager = PipelineLockManager()
+        with _pipeline_lock_manager_init_guard:
+            if _pipeline_lock_manager is None:
+                _pipeline_lock_manager = PipelineLockManager()
     return _pipeline_lock_manager
