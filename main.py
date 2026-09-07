@@ -232,8 +232,20 @@ async def main():
     logger.info(f"Container recovery: {recovered} recovered, {killed} killed, {errors} errors")
 
     # NEW: Recover or cleanup running repair cycle containers
+    #
+    # Run off the event loop (#54 review, round 3): this can reach
+    # AutoCommitService.commit_agent_changes() (via _process_completed_repair_cycle()),
+    # which now blocks synchronously (thread.join()) for up to
+    # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS+60s per orphaned
+    # repair-cycle container found, on the same project_checkout lock
+    # contention this whole PR is about -- exactly the event-loop-freezing
+    # risk initialize_all_projects() above was already moved off the loop
+    # for, on a call site that's live right after every crash/restart (the
+    # most likely time for that lock to actually be contended).
     logger.info("Recovering or cleaning up running repair cycle containers")
-    rc_recovered, rc_killed, rc_errors = container_recovery.recover_or_cleanup_repair_cycle_containers()
+    rc_recovered, rc_killed, rc_errors = await asyncio.to_thread(
+        container_recovery.recover_or_cleanup_repair_cycle_containers
+    )
     logger.info(f"Repair cycle container recovery: {rc_recovered} recovered, {rc_killed} killed, {rc_errors} errors")
 
     # Clean up orphaned Redis keys from agent containers that completed after orchestrator restart

@@ -96,10 +96,23 @@ RESOURCE_NAME = "project_checkout"
 # Generous enough to outlast the longest legitimate holder of this lock -- a
 # Docker-executed agent run, hard-timeout up to 1800s for build-type agents
 # per config/foundations/agents.yaml -- without waiting forever on a
-# genuinely stuck/crashed holder. PipelineLockManager's own staleness/TTL
-# recovery (inherited unchanged through the ProjectResourceLockManager
-# facade) is what actually reclaims a dead holder's lock; this timeout is
-# just this caller's patience for that recovery to take effect.
+# genuinely stuck/crashed holder.
+#
+# Corrected in review round 3: this does NOT outlast PipelineLockManager's
+# own staleness/TTL recovery (inherited unchanged through the
+# ProjectResourceLockManager facade) -- that takes 7200s (Redis lock key
+# TTL) to 14400s (the YAML-fallback 4-hour staleness threshold), both far
+# longer than this timeout. A crashed holder's lock is therefore NOT
+# reliably recoverable within one call's wait here. The actual design
+# intent is fail LOUD and relatively promptly (raising
+# ProjectCheckoutLockTimeoutError) so this specific call attempt gives up
+# and lets whatever triggers it again (the next board poll, the next
+# dispatch, an operator retry) try again later, rather than pinning a
+# thread/coroutine for up to 4 hours waiting out the staleness window in
+# one blocking call. In a genuine crash, expect this to raise repeatedly
+# (roughly every DEFAULT_TIMEOUT_SECONDS) until the underlying lock
+# actually becomes recoverable -- noisy, but not stuck, and never silently
+# proceeding unlocked.
 DEFAULT_TIMEOUT_SECONDS = 1900.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 

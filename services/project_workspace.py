@@ -308,12 +308,24 @@ class ProjectWorkspaceManager:
         Compares resolved (symlink-following, absolute) paths rather than the
         raw strings a caller might pass in a different but equivalent form
         (relative, trailing slash, unresolved symlink, ...). Fails closed --
-        if path resolution raises for any reason, returns True (assume it IS
-        the shared base clone) rather than silently skipping the lock this
-        method exists to gate.
+        if path resolution raises for any reason, OR project_dir doesn't
+        exist on disk at all (e.g. a caller's default/unset placeholder like
+        Path('.') from a missing context field -- Path.resolve() succeeds
+        without error even for a nonexistent path, so an existence check is
+        needed too), returns True (assume it IS the shared base clone)
+        rather than silently skipping the lock this method exists to gate.
         """
         try:
-            return Path(project_dir).resolve() == self.get_project_dir(project_name).resolve()
+            resolved_dir = Path(project_dir).resolve()
+            if not resolved_dir.exists():
+                logger.warning(
+                    f"is_base_clone_dir() called with a directory that doesn't exist "
+                    f"for project {project_name!r}: {project_dir!r} (resolved to "
+                    f"{resolved_dir}) -- treating as the shared base clone (fail closed) "
+                    "rather than silently assuming it isn't"
+                )
+                return True
+            return resolved_dir == self.get_project_dir(project_name).resolve()
         except Exception as e:
             logger.warning(
                 f"is_base_clone_dir() could not resolve paths for project "
