@@ -740,3 +740,96 @@ class TestWatchdogIncrementsRetryCount:
                         last_exec = updated_state['execution_history'][-1]
                         assert last_exec['watchdog_retry_count'] == 2  # Incremented
                         assert 'watchdog_last_retry_at' in last_exec
+
+
+class TestProjectConfigCacheDoesNotPoisonOnFailure:
+    """
+    Regression (found in final whole-PR review, #60): the per-sweep
+    project_config_cache added to share one config fetch across PROTECTION
+    2/3 must NOT cache a failure. A transient error on the first state file
+    for a project must not silently degrade both protections into no-ops
+    for every OTHER state file of that same project in the same sweep --
+    only the state file that hit the actual failure should be affected.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    def test_a_later_state_file_for_the_same_project_still_gets_protected_after_an_earlier_failure(
+        self, tracker, temp_state_dir
+    ):
+        # Two state files for the SAME project -- issue #123 (processed
+        # first alphabetically) and #456.
+        for issue_number in (123, 456):
+            state_file = temp_state_dir / f"test_project_issue_{issue_number}.yaml"
+            state_data = {
+                'project_name': 'test-project',
+                'issue_number': issue_number,
+                'execution_history': [
+                    {
+                        'agent': 'test-agent',
+                        'column': 'In Progress',
+                        'outcome': 'success',
+                        'completed_at': '2025-01-01T12:00:00Z',
+                        'timestamp': '2025-01-01T11:00:00Z',
+                    }
+                ],
+            }
+            with open(state_file, 'w') as f:
+                yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        real_project_config = MagicMock()
+        real_project_config.pipelines = [pipeline_cfg]
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a DIFFERENT issue
+
+        # First call (for whichever state file is processed first) raises;
+        # every subsequent call succeeds.
+        mock_config_manager = MagicMock()
+        mock_config_manager.get_project_config.side_effect = [
+            Exception("transient config read failure"),
+            real_project_config,
+        ]
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager', mock_config_manager):
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager,
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        # get_project_config() must have been retried for the second file,
+        # not served a poisoned None from the cache.
+        assert mock_config_manager.get_project_config.call_count == 2
+
+        # The state file whose iteration hit the actual transient failure
+        # legitimately proceeds without PROTECTION 2's lock check that one
+        # time (config genuinely wasn't available for it) -- exactly 1 of
+        # the 2 issues gets marked for retry. What this test actually
+        # guards against is the SECOND file also losing protection due to a
+        # poisoned cache entry: both issues are genuinely locked by a
+        # different issue (#999), so whichever file's config fetch
+        # SUCCEEDED must have PROTECTION 2 correctly skip it.
+        assert retried_count == 1
+        outcomes = {}
+        for issue_number in (123, 456):
+            with open(temp_state_dir / f"test_project_issue_{issue_number}.yaml") as f:
+                state = yaml.safe_load(f)
+            outcomes[issue_number] = state['execution_history'][-1]['outcome']
+        # Exactly one 'failure' (the file whose config fetch genuinely
+        # raised) and one 'success' (the file that must have been protected
+        # by a real, non-poisoned config fetch).
+        assert sorted(outcomes.values()) == ['failure', 'success']

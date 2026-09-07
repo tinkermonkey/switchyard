@@ -66,16 +66,12 @@ class AutoCommitService:
             logger.error(f"Project directory does not exist: {project_dir}")
             return False
 
-        # Ensure we're on a feature branch (not main/master) BEFORE acquiring
-        # the project_checkout lock below (#56 review): this is a cheap,
-        # instant validation catching a workflow bug that should fail fast --
-        # moving it behind the lock would mean a project_dir stuck on
-        # main/master (which is always going to return False here regardless
-        # of the lock) could first sit polling for up to
-        # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS if the lock
-        # happened to be contended, turning an instant rejection into a long
-        # stall for no benefit -- this check's outcome cannot change based on
-        # whether the lock is held.
+        # Fast-fail pre-check (not main/master) BEFORE acquiring the
+        # project_checkout lock below (#56 review): a project_dir stuck on
+        # main/master will fail this check regardless of lock state, so
+        # checking first avoids turning an instant rejection into a long
+        # stall if the lock happens to be contended. This is ONLY an early
+        # exit, not the value actually used to commit/push -- see below.
         current_branch = self._get_current_branch(project_dir)
         if current_branch in ['main', 'master']:
             logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
@@ -101,8 +97,22 @@ class AutoCommitService:
                 # docstring ("Why every acquisition gets its own unique
                 # holder id").
                 async with project_checkout_lock_async(project, issue_number):
+                    # CRITICAL: re-read current_branch here, AFTER acquiring
+                    # the lock, not the value read before it (found in final
+                    # whole-PR review): the pre-lock read above can be stale
+                    # by the time we actually get here -- this exact lock
+                    # exists because a DIFFERENT operation (another board of
+                    # the same project) can check out a DIFFERENT branch in
+                    # this same shared directory while we wait for it. Using
+                    # the stale branch name would push the on-disk tree
+                    # (whatever the lock's previous holder left checked out)
+                    # to the WRONG branch ref, corrupting it with unrelated
+                    # commits. Only the fast-fail decision above is safe to
+                    # make with the pre-lock value; the actual push must use
+                    # fresh state.
+                    fresh_branch = self._get_current_branch(project_dir)
                     return await self._commit_and_push(
-                        project, agent, task_id, project_dir, current_branch, issue_number, custom_message
+                        project, agent, task_id, project_dir, fresh_branch, issue_number, custom_message
                     )
 
             return await self._commit_and_push(

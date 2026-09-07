@@ -1380,12 +1380,20 @@ class WorkExecutionStateTracker:
                     if project_name in project_config_cache:
                         project_config = project_config_cache[project_name]
                     else:
-                        project_config = None
+                        # Only cache a SUCCESSFUL lookup, not a failure (found
+                        # in final whole-PR review): caching None on the
+                        # first exception would silently degrade PROTECTION
+                        # 2/3 to no-ops for every remaining state file of
+                        # this project in the same sweep, with no retry --
+                        # a transient error on file #1 shouldn't poison
+                        # files #2..N when the underlying config read might
+                        # well succeed on a later attempt.
                         try:
                             project_config = config_manager.get_project_config(project_name)
+                            project_config_cache[project_name] = project_config
                         except Exception as e:
+                            project_config = None
                             logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
-                        project_config_cache[project_name] = project_config
 
                     try:
                         lock_manager = get_pipeline_lock_manager()

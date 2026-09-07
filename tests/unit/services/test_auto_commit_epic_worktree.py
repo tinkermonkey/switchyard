@@ -16,6 +16,7 @@ bare Mock/fake path.
 """
 
 import pytest
+from contextlib import asynccontextmanager
 from unittest.mock import patch
 
 from services.auto_commit import AutoCommitService
@@ -169,3 +170,50 @@ class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
 
             assert result is True
             mock_branch.assert_called_once_with(tmp_path)
+
+
+class TestCurrentBranchReReadAfterTheLock:
+    """
+    CRITICAL regression (found in final whole-PR review, #60): when the
+    project_checkout lock IS taken, current_branch must be re-read AFTER
+    acquiring it, not reused from the pre-lock fast-fail read. This lock
+    exists specifically because a DIFFERENT operation (another board of the
+    same project) can check out a DIFFERENT branch in this same shared
+    directory while we wait for it -- using the stale pre-lock branch name
+    would push the on-disk tree (whatever the lock's previous holder left
+    checked out) to the WRONG branch ref.
+    """
+
+    @staticmethod
+    def _async_noop_lock_cm(*args, **kwargs):
+        @asynccontextmanager
+        async def _cm():
+            yield
+        return _cm()
+
+    @pytest.mark.asyncio
+    async def test_branch_is_re_read_after_acquiring_the_lock_and_the_fresh_value_is_used(self, service, tmp_path):
+        with patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=True), \
+             patch(
+                 'services.project_checkout_lock.project_checkout_lock_async',
+                 side_effect=self._async_noop_lock_cm,
+             ), \
+             patch.object(service, '_get_current_branch', side_effect=['feature/stale', 'feature/fresh']) as mock_branch, \
+             patch.object(service, '_check_for_changes', return_value=False), \
+             patch.object(service, '_push_branch', return_value=True) as mock_push:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='some_agent',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=42,
+            )
+
+            assert result is True
+            # Read twice: once for the pre-lock fast-fail check, once again
+            # after acquiring the lock.
+            assert mock_branch.call_count == 2
+            # The push must use the SECOND (post-lock, fresh) value, never
+            # the first (stale, pre-lock) one.
+            mock_push.assert_called_once_with(tmp_path, 'feature/fresh')
