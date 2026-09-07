@@ -66,6 +66,11 @@ logger = logging.getLogger(__name__)
 # pipeline board. Deliberately contains no ':' -- see module docstring.
 RESOURCE_BOARD_PREFIX = "__resource__"
 
+# Comfortably under typical filesystem filename limits (e.g. 255 bytes on
+# ext4) even after the project name, this prefix, and the ".yaml" suffix are
+# all concatenated into a single on-disk filename component.
+MAX_RESOURCE_NAME_LENGTH = 150
+
 
 class InvalidResourceNameError(ValueError):
     """Raised when a resource_name would corrupt the namespaced board value."""
@@ -111,16 +116,51 @@ class ProjectResourceLockManager:
         compatibility risk this module's docstring documents guarding against).
 
         Raises:
-            InvalidResourceNameError: if resource_name is empty or contains ':',
-                '/', '\\', or a '..' path segment.
+            InvalidResourceNameError: if resource_name is not a non-empty str,
+                has leading/trailing whitespace, contains a control character
+                (including a null byte), contains ':', '/', or '\\', or exceeds
+                MAX_RESOURCE_NAME_LENGTH.
         """
-        if not resource_name or not resource_name.strip():
+        if not isinstance(resource_name, str):
+            raise InvalidResourceNameError(
+                f"resource_name must be a str, got {type(resource_name).__name__}"
+            )
+        if not resource_name:
             raise InvalidResourceNameError("resource_name must be non-empty")
-        if any(c in resource_name for c in (":", "/", "\\")) or ".." in resource_name:
+        if resource_name != resource_name.strip():
+            # Not just cosmetic: _resource_board("db_migration") and
+            # _resource_board(" db_migration") would otherwise produce distinct
+            # board strings that name the SAME logical resource in every
+            # caller's intent, silently defeating mutual exclusion between them.
+            raise InvalidResourceNameError(
+                f"resource_name {resource_name!r} has leading/trailing whitespace"
+            )
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in resource_name):
+            # A control character (e.g. a null byte) survives this method's
+            # other checks but can make the on-disk YAML write fail while the
+            # Redis write succeeds -- PipelineLockManager treats "at least one
+            # store wrote" as success, so the lock would silently exist only in
+            # Redis, invisible to get_all_locks()'s YAML glob scan and to
+            # restart recovery, and would vanish on a Redis flush/TTL expiry
+            # even though nothing released it.
+            raise InvalidResourceNameError(
+                f"resource_name {resource_name!r} contains a control character"
+            )
+        if len(resource_name) > MAX_RESOURCE_NAME_LENGTH:
+            # An overlong board value can make the YAML lock file's path exceed
+            # the filesystem's filename length limit. Path.exists() does not
+            # swallow the resulting OSError (verified: ENAMETOOLONG), so an
+            # unbounded resource_name can crash the caller instead of failing
+            # with this documented exception.
+            raise InvalidResourceNameError(
+                f"resource_name is {len(resource_name)} chars, exceeding the "
+                f"{MAX_RESOURCE_NAME_LENGTH}-char limit"
+            )
+        if any(c in resource_name for c in (":", "/", "\\")):
             raise InvalidResourceNameError(
                 f"resource_name {resource_name!r} contains a disallowed character "
-                f"(':', '/', '\\') or '..' -- these would corrupt the namespaced "
-                f"board value's Redis key format or its on-disk lock file path"
+                f"(':', '/', '\\') -- these would corrupt the namespaced board "
+                f"value's Redis key format or its on-disk lock file path"
             )
         return f"{RESOURCE_BOARD_PREFIX}{resource_name}"
 

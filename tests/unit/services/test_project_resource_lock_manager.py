@@ -242,6 +242,62 @@ class TestProjectResourceLockManagerRetainedAndStaleness(unittest.TestCase):
         self.assertFalse(result)
 
 
+class TestGetAllLocksRedisKeyScan(unittest.TestCase):
+    """
+    TestGetAllLocksCompatibility below exercises get_all_locks() with
+    redis_client=None, which only proves the YAML-glob discovery path --
+    the Redis-key `key.count(':') != 2` filter this module's docstring and
+    issue #53's own acceptance criteria call out is never actually executed
+    there. This class uses a real (mocked) redis_client so that filter is
+    genuinely exercised, with a resource lock that exists ONLY in Redis (no
+    YAML file at all) so a broken filter or a broken Redis-scan path would
+    be caught rather than masked by the YAML fallback.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_malformed_three_colon_key_is_skipped_while_resource_lock_key_is_discovered(self):
+        resource_board = ProjectResourceLockManager._resource_board("db_migration")
+        real_key = self.lock_manager._get_lock_key("proj", resource_board)
+        self.assertEqual(real_key.count(':'), 2)
+
+        # A hypothetical corrupted/pre-validation key with an embedded colon --
+        # exactly the shape get_all_locks()'s "!= 2" filter exists to drop.
+        malformed_key = "pipeline_lock:proj:__resource__nightly:backup"
+        self.assertEqual(malformed_key.count(':'), 3)
+
+        self.mock_redis.keys.return_value = [malformed_key, real_key]
+
+        def hgetall_side_effect(key):
+            if key == real_key:
+                return {
+                    'project': 'proj',
+                    'board': resource_board,
+                    'locked_by_issue': '222',
+                    'lock_acquired_at': '2026-09-06T00:00:00+00:00',
+                    'lock_status': 'locked',
+                    'retained_reason': '',
+                    'retained_at': '',
+                }
+            # The malformed key must never reach here -- it should be dropped
+            # by the colon-count filter before any per-key read is attempted.
+            raise AssertionError(f"hgetall() called for a key that should have been filtered: {key!r}")
+
+        self.mock_redis.hgetall.side_effect = hgetall_side_effect
+
+        locks = self.lock_manager.get_all_locks()
+
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(locks[0].board, resource_board)
+        self.assertEqual(locks[0].locked_by_issue, 222)
+
+
 class TestGetAllLocksCompatibility(unittest.TestCase):
     """
     Verifies the compatibility risk flagged in issue #53: PipelineLockManager.
@@ -330,15 +386,62 @@ class TestResourceNameValidation(unittest.TestCase):
         with self.assertRaises(InvalidResourceNameError):
             self.facade.acquire_resource("proj", "sub\\path", 123)
 
-    def test_rejects_dotdot_segment_without_slash(self):
-        with self.assertRaises(InvalidResourceNameError):
-            self.facade.acquire_resource("proj", "..", 123)
+    def test_dots_alone_are_not_rejected(self):
+        """
+        '..' is only dangerous as a path segment; since '/' and '\\' are
+        already rejected, board can never become more than a single filename
+        component (state_dir / f"{project}_{board}.yaml"), so a resource_name
+        that merely contains consecutive dots (e.g. a version-range-style
+        name) can never actually traverse a directory and must be accepted.
+        """
+        pipeline = self.mock_redis.pipeline.return_value
+        pipeline.__enter__.return_value = pipeline
+        self.mock_redis.transaction.side_effect = (
+            lambda func, *keys, **kwargs: func(MagicMock(hgetall=MagicMock(return_value={})))
+        )
+
+        success, _ = self.facade.acquire_resource("proj", "v1..2-migration", 123)
+
+        self.assertTrue(success)
 
     def test_release_and_get_lock_also_validate(self):
         with self.assertRaises(InvalidResourceNameError):
             self.facade.release_resource("proj", "a:b", 123)
         with self.assertRaises(InvalidResourceNameError):
             self.facade.get_resource_lock("proj", "a:b")
+
+    def test_rejects_leading_or_trailing_whitespace(self):
+        """
+        Without this, ' db_migration' and 'db_migration' would map to
+        different board strings for what every caller intends as the same
+        resource, silently defeating mutual exclusion between them.
+        """
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", " db_migration", 123)
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", "db_migration ", 123)
+
+    def test_rejects_null_byte(self):
+        """A null byte survives the other character checks but makes the
+        on-disk YAML write fail while Redis succeeds, silently degrading the
+        lock's durability -- reject it outright instead."""
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", "cache\x00flush", 123)
+
+    def test_rejects_other_control_characters(self):
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", "cache\nflush", 123)
+
+    def test_rejects_non_string_resource_name(self):
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", 12345, 123)
+
+    def test_rejects_overlong_resource_name(self):
+        """An unbounded resource_name can push the YAML lock file's path past
+        the filesystem's filename length limit, raising an uncaught OSError
+        deeper in PipelineLockManager instead of failing cleanly here."""
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", "x" * 300, 123)
 
     def test_valid_resource_name_with_hyphens_and_underscores_is_accepted(self):
         pipeline = self.mock_redis.pipeline.return_value
