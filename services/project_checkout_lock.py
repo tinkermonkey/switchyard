@@ -73,6 +73,17 @@ via get_all_locks()/PipelineLock.locked_by_issue shows this synthetic id, not
 a real GitHub issue number -- an operator needs this module's logs (which do
 include the real issue_number) for that attribution, not the lock state
 itself.
+
+Acquisition order relative to services/dev_container_build_lock.py
+--------------------------------------------------------------------
+The one call site that nests both locks (claude/claude_integration.py's
+run_claude_code(), local-execution branch) always acquires
+dev_container_build_lock OUTER and this module's lock INNER. Found in code
+review as a forward-looking risk (not a live bug -- confirmed no call site
+does the reverse today): nothing enforces this ordering mechanically, so a
+future call site nesting them in the opposite order could deadlock/mutually
+timeout two concurrent operations against each other. If you need both
+locks together, acquire dev_container_build_lock first.
 """
 
 import asyncio

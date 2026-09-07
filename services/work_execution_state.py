@@ -1336,6 +1336,26 @@ class WorkExecutionStateTracker:
                         continue
 
                     # PROTECTION 2: Check pipeline lock
+                    #
+                    # Found in #57 review: this previously did
+                    # project_config.get('pipelines', {}).get('enabled', [])
+                    # on a ProjectConfig dataclass (which has no .get() at
+                    # all -- `pipelines` is a plain `List[ProjectPipeline]`
+                    # attribute) and called lock_manager.get_lock_status(...),
+                    # a method that doesn't exist on PipelineLockManager --
+                    # both raised AttributeError on every single invocation,
+                    # silently swallowed by the except below exactly like
+                    # PROTECTION 3's own dead get_pipeline_queue() import
+                    # (fixed above in this same commit), making this
+                    # protection a permanent no-op too. Separately, the inner
+                    # `continue` only continued the `for pipeline_config`
+                    # loop, not the outer per-state-file loop -- even with a
+                    # real API call, it would not actually have skipped this
+                    # execution. Fixed to use the real
+                    # ProjectPipeline.board_name attribute and
+                    # PipelineLockManager.get_lock_holder(), and to use the
+                    # same locked-flag + break + outer-continue shape
+                    # PROTECTION 3 already gets right.
                     try:
                         from services.pipeline_lock_manager import get_pipeline_lock_manager
                         from config.manager import config_manager
@@ -1343,18 +1363,22 @@ class WorkExecutionStateTracker:
                         lock_manager = get_pipeline_lock_manager()
                         project_config = config_manager.get_project_config(project_name)
 
-                        if project_config:
-                            # Get pipeline config for this project
-                            pipeline_configs = project_config.get('pipelines', {}).get('enabled', [])
-                            for pipeline_config in pipeline_configs:
-                                board_name = pipeline_config.get('workflow', 'unknown')
-                                lock_status = lock_manager.get_lock_status(project_name, board_name)
-                                if lock_status and lock_status.issue_number:
-                                    logger.debug(
-                                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                        f"pipeline locked by issue #{lock_status.issue_number}"
-                                    )
-                                    continue
+                        locked_by_another_issue = False
+                        for pipeline_config in getattr(project_config, 'pipelines', None) or []:
+                            board_name = getattr(pipeline_config, 'board_name', None)
+                            if not board_name:
+                                continue
+                            holder_issue = lock_manager.get_lock_holder(project_name, board_name)
+                            if holder_issue:
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"pipeline locked by issue #{holder_issue}"
+                                )
+                                locked_by_another_issue = True
+                                break
+
+                        if locked_by_another_issue:
+                            continue
                     except Exception as e:
                         logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
 

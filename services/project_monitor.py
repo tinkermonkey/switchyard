@@ -8483,6 +8483,32 @@ _Repair cycle initiated by Switchyard_
                                 # loop above, which still adds a board to due_board_keys
                                 # once it's confirmed due, before it's known whether the
                                 # batch fetch for it will succeed).
+                                #
+                                # Deliberately still get_next_waiting_issue() (the n=1
+                                # wrapper), not get_next_n_waiting_issues() directly --
+                                # considered switching during #57 review for API
+                                # consistency with the other 4 dispatch sites, but this
+                                # site has extensive existing test coverage
+                                # (test_project_monitor_failsafe.py,
+                                # test_project_monitor_failsafe_batching.py) asserting
+                                # calls against get_next_waiting_issue() specifically,
+                                # including detailed prefetched_board_data-forwarding and
+                                # batching-call-count assertions; get_next_waiting_issue()
+                                # already IS get_next_n_waiting_issues(1) internally (pure
+                                # delegation, byte-identical behavior), so switching the
+                                # call site here would have been a cosmetic-only change
+                                # with no functional benefit, at the cost of rewriting
+                                # that whole test suite. NOTE for whoever wires up Phase 3a
+                                # here: raising available_slots at this specific site
+                                # would call this whole block N times (N separate
+                                # GitHub-board resyncs via n=1 each), not one batched
+                                # N-candidate fetch like the other 4 sites -- correct, but
+                                # resync-per-slot rather than resync-once; a real
+                                # multi-slot version of this site should restructure to
+                                # fetch get_next_n_waiting_issues(available_slots) ONCE
+                                # before this loop, which the stalled-issue-check
+                                # interleaving here makes more involved than the other
+                                # sites' simpler shape.
                                 next_issue = pipeline_queue.get_next_waiting_issue(
                                     prefetched_board_data=prefetched_board_data.get(board_key)
                                 )

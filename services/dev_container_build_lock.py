@@ -133,6 +133,15 @@ project-scoped mutual-exclusion lock via the same ProjectResourceLockManager
 facade). Rather than re-derive that fix (and risk re-deriving the bug it was
 found to fix), this module imports and reuses that exact function, so both
 locks mint from the same process-wide, process-restart-safe counter.
+
+Acquisition order relative to services/project_checkout_lock.py
+-------------------------------------------------------------------
+When a call site needs both locks (today, only claude/claude_integration.py's
+run_claude_code() local-execution branch does), acquire THIS lock
+(dev_container_build) OUTER and project_checkout_lock INNER -- see
+project_checkout_lock.py's own module docstring for why a future call site
+reversing this order would risk a deadlock/mutual-timeout between two
+concurrent operations.
 """
 
 import asyncio

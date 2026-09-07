@@ -214,6 +214,112 @@ class TestEmptyOutputDetection:
             updated_state = yaml.safe_load(f)
         assert updated_state['execution_history'][-1]['outcome'] == 'failure'
 
+    def test_skips_when_pipeline_lock_held_by_another_issue(self, tracker, temp_state_dir):
+        """Issue #57 review: PROTECTION 2 previously called
+        project_config.get('pipelines', {}).get('enabled', []) on a
+        ProjectConfig dataclass (which has no .get() at all) and
+        lock_manager.get_lock_status(...), a method that doesn't exist on
+        PipelineLockManager -- both raised AttributeError on every single
+        call, silently swallowed by the broad except, making this
+        protection a permanent no-op (the same bug class already fixed for
+        PROTECTION 3's dead get_pipeline_queue() import). Now uses the real
+        ProjectPipeline.board_name attribute and
+        PipelineLockManager.get_lock_holder() -- a pipeline board genuinely
+        locked by a different issue must skip marking this execution for
+        retry rather than racing the in-progress run."""
+        state_file = temp_state_dir / "test_project_issue_123.yaml"
+        state_data = {
+            'project_name': 'test-project',
+            'issue_number': 123,
+            'execution_history': [
+                {
+                    'agent': 'test-agent',
+                    'column': 'In Progress',
+                    'outcome': 'success',
+                    'completed_at': '2025-01-01T12:00:00Z',
+                    'timestamp': '2025-01-01T11:00:00Z'
+                }
+            ]
+        }
+
+        with open(state_file, 'w') as f:
+            yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a different issue
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 0
+        mock_lock_manager.get_lock_holder.assert_called_once_with('test-project', 'SDLC Execution')
+
+        with open(state_file) as f:
+            updated_state = yaml.safe_load(f)
+        assert updated_state['execution_history'][-1]['outcome'] == 'success'
+
+    def test_proceeds_when_pipeline_lock_is_free(self, tracker, temp_state_dir):
+        """Control case: get_lock_holder() returns None (board unlocked) --
+        the watchdog must proceed exactly as before this fix, and must not
+        raise despite the real ProjectPipeline/PipelineLockManager objects
+        now actually being called."""
+        state_file = temp_state_dir / "test_project_issue_123.yaml"
+        state_data = {
+            'project_name': 'test-project',
+            'issue_number': 123,
+            'execution_history': [
+                {
+                    'agent': 'test-agent',
+                    'column': 'In Progress',
+                    'outcome': 'success',
+                    'completed_at': '2025-01-01T12:00:00Z',
+                    'timestamp': '2025-01-01T11:00:00Z'
+                }
+            ]
+        }
+
+        with open(state_file, 'w') as f:
+            yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder.return_value = None
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 1
+        with open(state_file) as f:
+            updated_state = yaml.safe_load(f)
+        assert updated_state['execution_history'][-1]['outcome'] == 'failure'
+
     def test_ignores_failed_executions(self, tracker, temp_state_dir):
         """Test only checks successful executions"""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
