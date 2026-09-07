@@ -218,6 +218,27 @@ class ProjectResourceLockManager:
         """
         return self._lock_manager.get_lock(project, self._resource_board(resource_name))
 
+    def touch_resource(self, project: str, resource_name: str, issue_number: int) -> bool:
+        """
+        Refresh an already-held resource lock's liveness markers (TTL AND
+        acquired-at timestamp) without changing its holder.
+
+        Delegates directly to PipelineLockManager.touch_lock() -- see its
+        docstring for why this exists separately from acquire_resource()'s
+        own TTL-only refresh-on-reentry behavior. Used by
+        services/project_checkout_lock.py's heartbeat mechanism to keep a
+        long-held lock from being mistaken for an abandoned one by the
+        staleness heuristic while it's still genuinely alive.
+
+        Returns:
+            True if the lock was found (held by issue_number) and refreshed,
+            False if not currently held by issue_number, or if both stores
+            failed to write.
+        """
+        return self._lock_manager.touch_lock(
+            project, self._resource_board(resource_name), issue_number
+        )
+
     def mark_resource_failed(
         self, project: str, resource_name: str, issue_number: int, reason: str
     ) -> bool:

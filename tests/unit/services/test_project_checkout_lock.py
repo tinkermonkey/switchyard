@@ -466,39 +466,44 @@ class TestHeldWithHeartbeatSync(unittest.TestCase):
     by direct source reading) a second caller's acquire attempt at that
     point would succeed immediately -- a real double-acquisition of a
     mutual-exclusion lock. _held_with_heartbeat_sync()/_async() close this by
-    periodically re-calling acquire_resource() with the same holder_id
-    (safe: PipelineLockManager treats this as a TTL-refreshing no-op, not a
-    new acquisition) for as long as the `with` body is still running.
+    periodically calling touch_resource() with the same holder_id (safe:
+    PipelineLockManager treats this as a liveness refresh of an already-held
+    lock, never a new acquisition -- and unlike re-calling acquire_resource(),
+    it also resets lock_acquired_at, so the separate 4-hour staleness
+    heuristic can't steal an actively-heartbeating lock either) for as long
+    as the `with` body is still running.
     """
 
-    def test_heartbeat_calls_acquire_resource_again_with_the_same_holder_id_while_held(self):
+    def test_heartbeat_calls_touch_resource_again_with_the_same_holder_id_while_held(self):
         facade = MagicMock()
-        facade.acquire_resource.return_value = (True, "already_holds_lock")
+        facade.touch_resource.return_value = True
 
         with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
             time.sleep(0.09)  # long enough for several heartbeat ticks
 
         # At least one heartbeat refresh call, always with the SAME holder_id
         # (never a fresh id -- that would be a new acquisition attempt, not
-        # a refresh of this hold).
-        self.assertGreaterEqual(facade.acquire_resource.call_count, 2)
-        for call in facade.acquire_resource.call_args_list:
+        # a refresh of this hold), and never acquire_resource() (which would
+        # only refresh the TTL, not lock_acquired_at).
+        self.assertGreaterEqual(facade.touch_resource.call_count, 2)
+        for call in facade.touch_resource.call_args_list:
             self.assertEqual(call.args, ("proj", "proj_checkout", -42))
+        facade.acquire_resource.assert_not_called()
 
     def test_heartbeat_stops_once_the_with_block_exits(self):
         facade = MagicMock()
-        facade.acquire_resource.return_value = (True, "already_holds_lock")
+        facade.touch_resource.return_value = True
 
         with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
             pass
 
-        count_at_exit = facade.acquire_resource.call_count
+        count_at_exit = facade.touch_resource.call_count
         time.sleep(0.08)  # give a stray heartbeat thread every chance to fire again
-        self.assertEqual(facade.acquire_resource.call_count, count_at_exit)
+        self.assertEqual(facade.touch_resource.call_count, count_at_exit)
 
     def test_heartbeat_refresh_failure_does_not_propagate_or_stop_the_with_block(self):
         facade = MagicMock()
-        facade.acquire_resource.side_effect = Exception("redis blip")
+        facade.touch_resource.side_effect = Exception("redis blip")
 
         # Must not raise, and the body must still run to completion.
         ran = []
@@ -508,33 +513,88 @@ class TestHeldWithHeartbeatSync(unittest.TestCase):
 
         self.assertEqual(ran, [True])
 
+    def test_heartbeat_finding_lock_lost_does_not_raise_or_stop_the_with_block(self):
+        """touch_resource() returning False (lock lost to a competing holder,
+        e.g. staleness recovery winning a race) is logged, not raised --
+        there is no safe way to interrupt the `with` body from a background
+        heartbeat thread."""
+        facade = MagicMock()
+        facade.touch_resource.return_value = False
+
+        ran = []
+        with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+            time.sleep(0.05)
+            ran.append(True)
+
+        self.assertEqual(ran, [True])
+
+    def test_release_waits_for_an_in_flight_heartbeat_call_to_finish(self):
+        """
+        Regression for a real race found in review: a bounded join (the
+        original implementation used timeout=5) could return while a
+        heartbeat's in-flight touch_resource() call was still running; the
+        outer code would then release the lock, and the orphaned call could
+        complete AFTER that release and silently re-establish it under the
+        now-abandoned holder_id. The join must wait for real, however long
+        the in-flight call takes.
+        """
+        call_finished = threading.Event()
+
+        def slow_touch(*args):
+            time.sleep(0.15)  # longer than the old hardcoded 5s join would
+            call_finished.set()  # ...well, longer than this test's patience;
+            return True         # the assertion below is what actually proves it
+
+        facade = MagicMock()
+        facade.touch_resource.side_effect = slow_touch
+
+        with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+            time.sleep(0.03)  # let exactly one heartbeat tick start its (slow) call
+
+        # By the time the `with` block has exited, the slow in-flight call
+        # must have already completed -- proving the join genuinely waited
+        # for it rather than returning early.
+        self.assertTrue(call_finished.is_set())
+
 
 @pytest.mark.asyncio
 class TestHeldWithHeartbeatAsync:
     """Async counterpart of TestHeldWithHeartbeatSync -- see its class
     docstring for the full rationale."""
 
-    async def test_heartbeat_calls_acquire_resource_again_with_the_same_holder_id_while_held(self):
+    async def test_heartbeat_calls_touch_resource_again_with_the_same_holder_id_while_held(self):
         facade = MagicMock()
-        facade.acquire_resource.return_value = (True, "already_holds_lock")
+        facade.touch_resource.return_value = True
 
         async with _held_with_heartbeat_async(facade, "dev_container_build", "proj", holder_id=-7, heartbeat_interval_seconds=0.02):
             await asyncio.sleep(0.09)
 
-        assert facade.acquire_resource.call_count >= 2
-        for call in facade.acquire_resource.call_args_list:
+        assert facade.touch_resource.call_count >= 2
+        for call in facade.touch_resource.call_args_list:
             assert call.args == ("proj", "dev_container_build", -7)
+        facade.acquire_resource.assert_not_called()
 
     async def test_heartbeat_stops_once_the_with_block_exits(self):
         facade = MagicMock()
-        facade.acquire_resource.return_value = (True, "already_holds_lock")
+        facade.touch_resource.return_value = True
 
         async with _held_with_heartbeat_async(facade, "dev_container_build", "proj", holder_id=-7, heartbeat_interval_seconds=0.02):
             pass
 
-        count_at_exit = facade.acquire_resource.call_count
+        count_at_exit = facade.touch_resource.call_count
         await asyncio.sleep(0.08)
-        assert facade.acquire_resource.call_count == count_at_exit
+        assert facade.touch_resource.call_count == count_at_exit
+
+    async def test_heartbeat_finding_lock_lost_does_not_raise_or_stop_the_with_block(self):
+        facade = MagicMock()
+        facade.touch_resource.return_value = False
+
+        ran = []
+        async with _held_with_heartbeat_async(facade, "dev_container_build", "proj", holder_id=-7, heartbeat_interval_seconds=0.02):
+            await asyncio.sleep(0.05)
+            ran.append(True)
+
+        assert ran == [True]
 
 
 if __name__ == '__main__':

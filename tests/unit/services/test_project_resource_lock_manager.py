@@ -23,6 +23,7 @@ import sys
 import os
 import tempfile
 import shutil
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -578,6 +579,42 @@ class TestProjectResourceLockManagerDefaultConstruction(unittest.TestCase):
 
         mock_getter.assert_not_called()
         self.assertIs(facade._lock_manager, explicit)
+
+
+class TestTouchResource(unittest.TestCase):
+    """touch_resource() delegates to PipelineLockManager.touch_lock() -- see
+    its own tests (test_pipeline_lock_manager.py::TestTouchLock) for the full
+    liveness-refresh contract this passes through unchanged."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_refreshes_lock_acquired_at_for_the_current_holder(self):
+        self.facade.acquire_resource("proj", "db_migration", 123)
+        original = self.facade.get_resource_lock("proj", "db_migration")
+
+        time.sleep(0.01)
+        result = self.facade.touch_resource("proj", "db_migration", 123)
+
+        self.assertTrue(result)
+        refreshed = self.facade.get_resource_lock("proj", "db_migration")
+        self.assertGreater(refreshed.lock_acquired_at, original.lock_acquired_at)
+
+    def test_returns_false_for_a_different_holder(self):
+        self.facade.acquire_resource("proj", "db_migration", 123)
+
+        result = self.facade.touch_resource("proj", "db_migration", 456)
+
+        self.assertFalse(result)
+
+    def test_validates_resource_name(self):
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.touch_resource("proj", "a:b", 123)
 
 
 if __name__ == '__main__':

@@ -231,18 +231,38 @@ async def _held_with_heartbeat_async(
 ):
     """
     Wraps an already-acquired lock's held duration with a background
-    heartbeat that periodically re-calls acquire_resource() with the SAME
+    heartbeat that periodically calls touch_resource() with the SAME
     holder_id -- see HEARTBEAT_INTERVAL_SECONDS above for why this is
-    necessary, not just defensive. Re-acquiring with the same holder_id is
-    safe by design: PipelineLockManager treats it as a TTL-refreshing no-op
-    ("already_holds_lock"), never as a new/competing acquisition.
+    necessary, not just defensive.
 
-    This performs the refresh's blocking Redis/YAML I/O directly on the
-    event loop (no asyncio.to_thread offload) -- the same known tradeoff
-    project_checkout_lock's own poll loop already makes (see #140), but at a
-    far lower frequency (every 1800s here vs every ~5s while polling to
-    acquire), so the incremental cost is small next to the alternative (a
-    confirmed silent double-acquisition bug).
+    Uses touch_resource(), NOT acquire_resource(): found in a later review
+    round that acquire_resource()'s "already_holds_lock" reentry branch
+    refreshes ONLY the Redis TTL, never lock_acquired_at -- so the 4-hour
+    staleness heuristic would still eventually judge a long-held, actively
+    heartbeating lock as abandoned and hand it to a different caller.
+    touch_resource() (PipelineLockManager.touch_lock()) resets both.
+
+    If a heartbeat ever reports the lock is NOT held by this holder_id
+    anymore (touch_resource() returns False), this is logged as an ERROR --
+    it means the lock was lost (e.g. a heartbeat delayed past the Redis TTL
+    under scheduling starvation let a competing caller acquire it first) and
+    the guarded operation is very likely now racing that competing caller.
+    This cannot safely cancel/interrupt the `with` body from here (that
+    would need real task cancellation wired through every caller), so it can
+    only surface the condition loudly rather than silently continue as if
+    nothing happened.
+
+    On exit, joins the heartbeat thread/task with NO timeout before
+    releasing -- found in review: a bounded join (e.g. 5s) could return
+    while a heartbeat's in-flight touch_resource() call is still running;
+    the outer code would then release the lock, and the orphaned call could
+    complete AFTER that release and silently re-establish the lock under
+    this now-abandoned holder_id, leaking it until the next staleness
+    recovery. An unbounded join is safe here specifically because the only
+    thing that can still be running after stop_event is set is at most one
+    single touch_resource() call already in flight, itself bounded by
+    PipelineLockManager's own Redis socket timeouts -- not a genuinely
+    unbounded wait.
     """
     stop_event = asyncio.Event()
 
@@ -254,7 +274,15 @@ async def _held_with_heartbeat_async(
             except asyncio.TimeoutError:
                 pass
             try:
-                facade.acquire_resource(project, resource_name, holder_id)
+                still_held = facade.touch_resource(project, resource_name, holder_id)
+                if not still_held:
+                    logger.error(
+                        f"'{resource_name}' lock heartbeat for project {project!r} found "
+                        "the lock is NO LONGER held by this holder -- it was lost "
+                        "(e.g. to staleness recovery while a refresh was delayed); the "
+                        "operation this heartbeat guards may now be racing a different "
+                        "holder of the same resource"
+                    )
             except Exception as e:
                 logger.warning(
                     f"'{resource_name}' lock heartbeat refresh failed for project "
@@ -284,7 +312,15 @@ def _held_with_heartbeat_sync(
     def _heartbeat():
         while not stop_event.wait(heartbeat_interval_seconds):
             try:
-                facade.acquire_resource(project, resource_name, holder_id)
+                still_held = facade.touch_resource(project, resource_name, holder_id)
+                if not still_held:
+                    logger.error(
+                        f"'{resource_name}' lock heartbeat for project {project!r} found "
+                        "the lock is NO LONGER held by this holder -- it was lost "
+                        "(e.g. to staleness recovery while a refresh was delayed); the "
+                        "operation this heartbeat guards may now be racing a different "
+                        "holder of the same resource"
+                    )
             except Exception as e:
                 logger.warning(
                     f"'{resource_name}' lock heartbeat refresh failed for project "
@@ -299,7 +335,11 @@ def _held_with_heartbeat_sync(
         yield
     finally:
         stop_event.set()
-        heartbeat_thread.join(timeout=5)
+        # No timeout -- see this function's docstring for why a bounded join
+        # here would risk releasing the lock while a heartbeat's in-flight
+        # touch_resource() call is still running, which could then re-leak
+        # the lock after release.
+        heartbeat_thread.join()
 
 
 @asynccontextmanager

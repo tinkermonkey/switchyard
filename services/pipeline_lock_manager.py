@@ -553,6 +553,79 @@ class PipelineLockManager:
         )
         return True
 
+    def touch_lock(self, project: str, board: str, issue_number: int) -> bool:
+        """
+        Refresh an ALREADY-HELD lock's liveness markers -- both the Redis TTL
+        AND lock_acquired_at -- without changing its holder.
+
+        Added for services/project_checkout_lock.py's heartbeat mechanism
+        (found necessary in code review, #56): try_acquire_lock()'s
+        "already_holds_lock" branch already refreshes the Redis TTL on a
+        repeat call from the same issue_number, but it does NOT reset
+        lock_acquired_at -- so a lock held by a caller that only ever
+        re-calls try_acquire_lock() (never this method) would still be
+        judged stale by the 4-hour age-based heuristic elsewhere in this
+        class and could be handed to a different caller while the original
+        holder is still genuinely alive and heartbeating. This method exists
+        specifically to reset that clock too.
+
+        Callers must already know they hold this lock (e.g. a heartbeat loop
+        started immediately after a successful try_acquire_lock() for this
+        exact issue_number) -- this does NOT acquire on behalf of a new
+        holder and is not atomic with respect to a concurrent acquire/release
+        for the same lock (acceptable here: it's a periodic liveness refresh
+        for a lock this same process already holds, not the acquisition path
+        itself, which is what needs the atomic transaction).
+
+        Returns:
+            True if the lock was found (held by issue_number) and refreshed
+            in at least one durable store, False if it isn't currently held
+            by issue_number at all (including "no lock exists"), or if both
+            stores failed to write.
+        """
+        lock = self.get_lock(project, board)
+        if not lock or lock.locked_by_issue != issue_number:
+            return False
+
+        refreshed = PipelineLock(
+            project=project,
+            board=board,
+            locked_by_issue=issue_number,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked',
+            # Preserve retained state rather than silently clearing it --
+            # mirrors _create_lock_yaml_only()'s own defensive preservation.
+            # In practice this lock should never be retained while something
+            # is still successfully heartbeating it (mark_lock_failed() is
+            # for a run that has already ended), but this stays defensive
+            # against that edge case rather than relying on a single layer
+            # of protection.
+            retained_reason=lock.retained_reason,
+            retained_at=lock.retained_at,
+        )
+
+        redis_ok = False
+        if self.redis_client:
+            try:
+                lock_key = self._get_lock_key(project, board)
+                self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
+                self.redis_client.expire(lock_key, 7200)
+                redis_ok = True
+            except Exception as e:
+                logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+
+        yaml_ok = self._save_lock_to_yaml(refreshed)
+
+        if not redis_ok and not yaml_ok:
+            logger.error(
+                f"touch_lock: BOTH Redis and YAML refresh writes failed for "
+                f"{project}/{board} issue #{issue_number} -- liveness was NOT "
+                f"extended, this lock may be stolen by the staleness heuristic"
+            )
+            return False
+
+        return True
+
     def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
         """
         Release pipeline lock safely.
