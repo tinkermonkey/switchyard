@@ -18,7 +18,7 @@ get_all_locks()'s `key.count(':') != 2` filter.
 """
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import sys
 import os
 import tempfile
@@ -404,6 +404,24 @@ class TestResourceNameValidation(unittest.TestCase):
 
         self.assertTrue(success)
 
+    def test_bare_dotdot_is_also_not_rejected(self):
+        """
+        Same reasoning as test_dots_alone_are_not_rejected, exercised for the
+        exact bare ".." input specifically -- pinned as its own test so a
+        future refactor of _resource_board()/_get_state_file() that changes
+        how project/board are joined into a path can't silently reintroduce a
+        real traversal hole for this exact input without a test noticing.
+        """
+        pipeline = self.mock_redis.pipeline.return_value
+        pipeline.__enter__.return_value = pipeline
+        self.mock_redis.transaction.side_effect = (
+            lambda func, *keys, **kwargs: func(MagicMock(hgetall=MagicMock(return_value={})))
+        )
+
+        success, _ = self.facade.acquire_resource("proj", "..", 123)
+
+        self.assertTrue(success)
+
     def test_release_and_get_lock_also_validate(self):
         with self.assertRaises(InvalidResourceNameError):
             self.facade.release_resource("proj", "a:b", 123)
@@ -442,6 +460,20 @@ class TestResourceNameValidation(unittest.TestCase):
         deeper in PipelineLockManager instead of failing cleanly here."""
         with self.assertRaises(InvalidResourceNameError):
             self.facade.acquire_resource("proj", "x" * 300, 123)
+
+    def test_rejects_overlong_multibyte_resource_name_under_the_char_count_but_not_the_byte_count(self):
+        """
+        The limit is enforced in UTF-8 BYTES, not code points, since ext4's
+        NAME_MAX is byte-based. A multi-byte string can stay under a
+        char-count limit while still exceeding the byte limit -- this pins
+        that the check is actually byte-based, not just character-based.
+        """
+        multibyte_name = "漢" * 140  # 140 chars, but 3 bytes each in UTF-8 = 420 bytes
+        self.assertLess(len(multibyte_name), 150)
+        self.assertGreater(len(multibyte_name.encode("utf-8")), 150)
+
+        with self.assertRaises(InvalidResourceNameError):
+            self.facade.acquire_resource("proj", multibyte_name, 123)
 
     def test_valid_resource_name_with_hyphens_and_underscores_is_accepted(self):
         pipeline = self.mock_redis.pipeline.return_value
@@ -515,6 +547,37 @@ class TestProjectResourceLockManagerRetainedReasonPassthrough(unittest.TestCase)
         marked = self.facade.mark_resource_failed("proj", "db_migration", 123, "")
 
         self.assertFalse(marked)
+
+
+class TestProjectResourceLockManagerDefaultConstruction(unittest.TestCase):
+    """
+    Omitting `lock_manager` must default to the process-wide
+    get_pipeline_lock_manager() singleton (a shared, already-warmed Redis
+    connection), not a fresh PipelineLockManager() -- constructing a fresh
+    one opens its own Redis connection (including its connect timeout) on
+    every call, an easy footgun for a future caller that does
+    ProjectResourceLockManager() per-request instead of threading a shared
+    instance through explicitly.
+    """
+
+    def test_default_construction_uses_the_shared_singleton(self):
+        sentinel = MagicMock(name="shared_pipeline_lock_manager")
+        with patch(
+            "services.project_resource_lock_manager.get_pipeline_lock_manager",
+            return_value=sentinel,
+        ) as mock_getter:
+            facade = ProjectResourceLockManager()
+
+        mock_getter.assert_called_once()
+        self.assertIs(facade._lock_manager, sentinel)
+
+    def test_explicit_lock_manager_is_not_overridden_by_the_singleton(self):
+        explicit = MagicMock(name="explicit_lock_manager")
+        with patch("services.project_resource_lock_manager.get_pipeline_lock_manager") as mock_getter:
+            facade = ProjectResourceLockManager(lock_manager=explicit)
+
+        mock_getter.assert_not_called()
+        self.assertIs(facade._lock_manager, explicit)
 
 
 if __name__ == '__main__':

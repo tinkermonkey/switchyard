@@ -57,7 +57,7 @@ not wired into any call site by this issue -- that is a follow-up (#54).
 import logging
 from typing import Optional, Tuple
 
-from services.pipeline_lock_manager import PipelineLockManager, PipelineLock
+from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, get_pipeline_lock_manager
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,12 @@ logger = logging.getLogger(__name__)
 # pipeline board. Deliberately contains no ':' -- see module docstring.
 RESOURCE_BOARD_PREFIX = "__resource__"
 
-# Comfortably under typical filesystem filename limits (e.g. 255 bytes on
+# Comfortably under typical filesystem filename limits (e.g. 255 BYTES on
 # ext4) even after the project name, this prefix, and the ".yaml" suffix are
-# all concatenated into a single on-disk filename component.
-MAX_RESOURCE_NAME_LENGTH = 150
+# all concatenated into a single on-disk filename component. Enforced as a
+# UTF-8 byte count, not a character count -- ext4's limit is byte-based, and
+# resource_name may contain multi-byte characters (see _resource_board).
+MAX_RESOURCE_NAME_BYTES = 150
 
 
 class InvalidResourceNameError(ValueError):
@@ -93,13 +95,15 @@ class ProjectResourceLockManager:
         """
         Args:
             lock_manager: PipelineLockManager instance to delegate to.
-                Optional -- when omitted, a new PipelineLockManager is
-                constructed with its own Redis client and state_dir. Callers
-                that want to share the process-wide singleton (and its Redis
-                connection / on-disk state) must pass
-                get_pipeline_lock_manager() explicitly.
+                Optional -- when omitted, defaults to the process-wide
+                get_pipeline_lock_manager() singleton so callers share its
+                already-warmed Redis connection and on-disk state by default.
+                Constructing a fresh PipelineLockManager() opens a new Redis
+                connection (including its connect timeout) on every call, so
+                pass one explicitly only when a genuinely isolated instance
+                is wanted (e.g. tests).
         """
-        self._lock_manager = lock_manager if lock_manager is not None else PipelineLockManager()
+        self._lock_manager = lock_manager if lock_manager is not None else get_pipeline_lock_manager()
 
     @staticmethod
     def _resource_board(resource_name: str) -> str:
@@ -118,8 +122,8 @@ class ProjectResourceLockManager:
         Raises:
             InvalidResourceNameError: if resource_name is not a non-empty str,
                 has leading/trailing whitespace, contains a control character
-                (including a null byte), contains ':', '/', or '\\', or exceeds
-                MAX_RESOURCE_NAME_LENGTH.
+                (including a null byte), contains ':', '/', or '\\', or its
+                UTF-8 encoding exceeds MAX_RESOURCE_NAME_BYTES.
         """
         if not isinstance(resource_name, str):
             raise InvalidResourceNameError(
@@ -146,15 +150,19 @@ class ProjectResourceLockManager:
             raise InvalidResourceNameError(
                 f"resource_name {resource_name!r} contains a control character"
             )
-        if len(resource_name) > MAX_RESOURCE_NAME_LENGTH:
+        resource_name_bytes = len(resource_name.encode("utf-8"))
+        if resource_name_bytes > MAX_RESOURCE_NAME_BYTES:
             # An overlong board value can make the YAML lock file's path exceed
-            # the filesystem's filename length limit. Path.exists() does not
-            # swallow the resulting OSError (verified: ENAMETOOLONG), so an
-            # unbounded resource_name can crash the caller instead of failing
-            # with this documented exception.
+            # the filesystem's filename length limit (byte-based, e.g. ext4's
+            # 255-byte NAME_MAX -- checked in UTF-8 bytes, not code points, so
+            # a multi-byte resource_name can't sneak past a char-count check
+            # while still being too many bytes on disk). Path.exists() does
+            # not swallow the resulting OSError (verified: ENAMETOOLONG), so
+            # an unbounded resource_name can crash the caller instead of
+            # failing with this documented exception.
             raise InvalidResourceNameError(
-                f"resource_name is {len(resource_name)} chars, exceeding the "
-                f"{MAX_RESOURCE_NAME_LENGTH}-char limit"
+                f"resource_name is {resource_name_bytes} UTF-8 bytes, exceeding "
+                f"the {MAX_RESOURCE_NAME_BYTES}-byte limit"
             )
         if any(c in resource_name for c in (":", "/", "\\")):
             raise InvalidResourceNameError(
