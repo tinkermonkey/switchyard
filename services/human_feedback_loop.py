@@ -524,6 +524,36 @@ class HumanFeedbackLoopExecutor:
 
         except Exception as e:
             logger.error(f"Conversational loop failed for issue #{issue_number}: {e}")
+            # Route through the shared mark_failed() entry point -- the same one
+            # _conversational_loop()'s own finally block below already uses for a
+            # failure mid-loop. Without this, a failure here (the INITIAL
+            # _execute_agent() call, before _conversational_loop() is ever
+            # entered -- e.g. issue #68's worktree-creation RuntimeError) left the
+            # PipelineRun stuck at status="active" forever and the board lock
+            # released with no durable failure record: invisible to the operator,
+            # and never picked up by the stalled-issue detector (which explicitly
+            # skips issues with an active PipelineRun). mark_failed() ends the run
+            # with outcome="failed" and durably retains the pipeline lock, exactly
+            # like every other agent-dispatch path in this codebase already does.
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                marked_ok = get_pipeline_run_manager().mark_failed(
+                    project=project_name,
+                    board=board_name,
+                    issue_number=issue_number,
+                    reason=f"Conversational feedback loop failed during initial dispatch: {e}",
+                )
+                if not marked_ok:
+                    logger.critical(
+                        f"Pipeline lock for {project_name}/#{issue_number} could NOT be "
+                        "durably marked failed after an initial-dispatch feedback-loop "
+                        "failure -- this issue may be silently re-dispatched."
+                    )
+            except Exception as mark_err:
+                logger.critical(
+                    f"Failed to mark pipeline run failed for {project_name}#{issue_number} "
+                    f"after conversational loop dispatch failure: {mark_err}"
+                )
             raise
         finally:
             # Clean up in-memory state
