@@ -101,3 +101,71 @@ class TestCommitAgentChangesProjectDir:
         )
 
         assert result is False
+
+
+class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
+    """
+    #56 review: the main/master workflow-bug check must run BEFORE the
+    project_checkout lock is ever acquired -- its outcome can't change based
+    on lock state, so checking it first means a project stuck on main/master
+    fails instantly instead of first polling for up to
+    project_checkout_lock's own (multi-thousand-second) timeout if the lock
+    happened to be contended.
+    """
+
+    @pytest.mark.asyncio
+    async def test_main_branch_returns_false_without_ever_acquiring_the_lock(self, service, tmp_path):
+        with patch.object(service, '_get_current_branch', return_value='main') as mock_branch, \
+             patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=True) as mock_is_base, \
+             patch('services.project_checkout_lock.project_checkout_lock_async') as mock_lock:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='some_agent',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=42,
+            )
+
+            assert result is False
+            mock_branch.assert_called_once_with(tmp_path)
+            # The fast-fail must happen before the lock decision is even
+            # consulted -- is_base_clone_dir()/the lock context manager
+            # itself must never be reached for this outcome.
+            mock_is_base.assert_not_called()
+            mock_lock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_master_branch_also_fails_fast(self, service, tmp_path):
+        with patch.object(service, '_get_current_branch', return_value='master'), \
+             patch('services.project_checkout_lock.project_checkout_lock_async') as mock_lock:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='some_agent',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=42,
+            )
+
+            assert result is False
+            mock_lock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_feature_branch_proceeds_past_the_check_and_does_not_recompute_it(self, service, tmp_path):
+        """current_branch is resolved exactly once (by the caller, before the
+        lock) and threaded into _commit_and_push -- not re-read a second time
+        there."""
+        with patch.object(service, '_get_current_branch', return_value='feature/issue-9') as mock_branch, \
+             patch.object(service, '_check_for_changes', return_value=False):
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='some_agent',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=42,
+            )
+
+            assert result is True
+            mock_branch.assert_called_once_with(tmp_path)

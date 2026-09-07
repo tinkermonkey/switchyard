@@ -156,25 +156,40 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
 
     # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
     #
-    # project_checkout lock (#54): dev_environment_setup/verifier's cwd is
-    # normally an isolated epic worktree (its own issue number, resolved
-    # unconditionally for 'issues'/'hybrid' workspace types -- see
-    # agent_executor.py's epic-resolution block) and does NOT need this lock.
-    # Only lock when work_dir genuinely IS the shared base clone (e.g. a
-    # workspace-resolution fallback) -- see is_base_clone_dir()'s docstring
-    # for why locking epic-worktree-scoped runs too would be wrong.
-    work_dir_for_lock = Path(context.get('work_dir', '.'))
-    if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
-        from services.project_checkout_lock import project_checkout_lock_async
+    # dev_container_build lock (#56): this local execution IS this project's
+    # dev-container build (dev_environment_setup) or verify (dev_environment_
+    # verifier) session -- the Claude Code subprocess started below issues the
+    # actual `docker build`/`docker inspect` calls itself, via its own Bash
+    # tool, against the orchestrator's own docker socket. There is no other
+    # orchestrator-side hook around that work (see
+    # services/dev_container_build_lock.py's module docstring for the full
+    # investigation), so this call is where the lock is acquired -- for BOTH
+    # agents unconditionally, since only they ever reach this branch.
+    task_context_for_dev_lock = context.get('context', {}) or {}
+    issue_number_for_dev_lock = task_context_for_dev_lock.get('issue_number') or context.get('issue_number')
 
-        # issue_number here is log attribution only -- see the comment at the
-        # Docker-branch call site above.
-        task_context_for_lock = context.get('context', {}) or {}
-        issue_number_for_lock = task_context_for_lock.get('issue_number') or context.get('issue_number')
-        async with project_checkout_lock_async(project, issue_number_for_lock):
-            return await _run_claude_code_locally(prompt, context, agent)
+    from services.dev_container_build_lock import dev_container_build_lock_async
 
-    return await _run_claude_code_locally(prompt, context, agent)
+    async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
+        # project_checkout lock (#54): dev_environment_setup/verifier's cwd is
+        # normally an isolated epic worktree (its own issue number, resolved
+        # unconditionally for 'issues'/'hybrid' workspace types -- see
+        # agent_executor.py's epic-resolution block) and does NOT need this lock.
+        # Only lock when work_dir genuinely IS the shared base clone (e.g. a
+        # workspace-resolution fallback) -- see is_base_clone_dir()'s docstring
+        # for why locking epic-worktree-scoped runs too would be wrong. Distinct
+        # resource from dev_container_build above, so nesting the two here is
+        # safe -- neither lock is ever acquired twice for the same resource.
+        work_dir_for_lock = Path(context.get('work_dir', '.'))
+        if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
+            from services.project_checkout_lock import project_checkout_lock_async
+
+            # issue_number here is log attribution only -- see the comment at the
+            # Docker-branch call site above.
+            async with project_checkout_lock_async(project, issue_number_for_dev_lock):
+                return await _run_claude_code_locally(prompt, context, agent)
+
+        return await _run_claude_code_locally(prompt, context, agent)
 
 
 async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: str) -> str:

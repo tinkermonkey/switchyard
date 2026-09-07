@@ -93,12 +93,16 @@ logger = logging.getLogger(__name__)
 # any other resource this facade may be asked to lock in the future.
 RESOURCE_NAME = "project_checkout"
 
-# Generous enough to outlast the longest legitimate holder of this lock -- a
-# Docker-executed agent run, hard-timeout up to 1800s for build-type agents
-# per config/foundations/agents.yaml -- without waiting forever on a
-# genuinely stuck/crashed holder.
+# Generous enough to outlast the longest legitimate holder of this lock.
+# claude/claude_integration.py wraps ANY Docker-executed agent run against
+# the shared base clone in this lock (gated on is_base_clone_dir(), not
+# restricted to any particular agent), and config/foundations/agents.yaml's
+# per-agent `timeout` ranges up to 10800s (senior_software_engineer) -- found
+# in review (#56) after the original 1900s value here was calibrated against
+# a stale "1800s for build-type agents" assumption that undercounted the
+# real ceiling. 100s of margin over that longest configured agent timeout.
 #
-# Corrected in review round 3: this does NOT outlast PipelineLockManager's
+# Corrected in review round 3 (of #54): this does NOT outlast PipelineLockManager's
 # own staleness/TTL recovery (inherited unchanged through the
 # ProjectResourceLockManager facade) -- that takes 7200s (Redis lock key
 # TTL) to 14400s (the YAML-fallback 4-hour staleness threshold), both far
@@ -113,7 +117,7 @@ RESOURCE_NAME = "project_checkout"
 # (roughly every DEFAULT_TIMEOUT_SECONDS) until the underlying lock
 # actually becomes recoverable -- noisy, but not stuck, and never silently
 # proceeding unlocked.
-DEFAULT_TIMEOUT_SECONDS = 1900.0
+DEFAULT_TIMEOUT_SECONDS = 10900.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 
 # Seeds _mint_unique_holder_id()'s counter so it differs across process
@@ -157,27 +161,42 @@ def _attribution(issue_number: Optional[int]) -> str:
     return f"issue #{issue_number}" if issue_number is not None else "no issue in scope"
 
 
-def _timeout_error(project: str, issue_number: Optional[int], timeout_seconds: float, reason: str) -> ProjectCheckoutLockTimeoutError:
-    return ProjectCheckoutLockTimeoutError(
-        f"Could not acquire '{RESOURCE_NAME}' lock for project {project!r} "
+def _timeout_error(
+    resource_name: str,
+    project: str,
+    issue_number: Optional[int],
+    timeout_seconds: float,
+    reason: str,
+    error_cls: type = ProjectCheckoutLockTimeoutError,
+) -> Exception:
+    """
+    Shared by every project-scoped resource lock built on this pattern (this
+    module's own project_checkout lock, and services/dev_container_build_lock.py's
+    dev_container_build lock) -- see this module's docstring for why every
+    such lock shares this poll/timeout/release shape and its holder-id
+    minting. `error_cls` lets each lock raise its own distinct exception type
+    while sharing this message format.
+    """
+    return error_cls(
+        f"Could not acquire '{resource_name}' lock for project {project!r} "
         f"({_attribution(issue_number)}) within {timeout_seconds}s: {reason}"
     )
 
 
-def _log_busy(project: str, issue_number: Optional[int], reason: str, poll_interval_seconds: float) -> None:
+def _log_busy(resource_name: str, project: str, issue_number: Optional[int], reason: str, poll_interval_seconds: float) -> None:
     logger.info(
-        f"'{RESOURCE_NAME}' lock busy for project {project!r} ({_attribution(issue_number)}): "
+        f"'{resource_name}' lock busy for project {project!r} ({_attribution(issue_number)}): "
         f"{reason} -- waiting {poll_interval_seconds}s before retrying"
     )
 
 
 def _release_and_warn(
-    facade: ProjectResourceLockManager, project: str, holder_id: int, issue_number: Optional[int]
+    facade: ProjectResourceLockManager, resource_name: str, project: str, holder_id: int, issue_number: Optional[int]
 ) -> None:
-    released = facade.release_resource(project, RESOURCE_NAME, holder_id)
+    released = facade.release_resource(project, resource_name, holder_id)
     if not released:
         logger.warning(
-            f"'{RESOURCE_NAME}' lock release for project {project!r} "
+            f"'{resource_name}' lock release for project {project!r} "
             f"({_attribution(issue_number)}) returned False -- lock may already be "
             "released or retained"
         )
@@ -227,14 +246,14 @@ async def project_checkout_lock_async(
         if can_execute:
             break
         if time.monotonic() >= deadline:
-            raise _timeout_error(project, issue_number, timeout_seconds, reason)
-        _log_busy(project, issue_number, reason, poll_interval_seconds)
+            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
+        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
         await asyncio.sleep(poll_interval_seconds)
 
     try:
         yield
     finally:
-        _release_and_warn(facade, project, holder_id, issue_number)
+        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 
 @contextmanager
@@ -264,11 +283,11 @@ def project_checkout_lock_sync(
         if can_execute:
             break
         if time.monotonic() >= deadline:
-            raise _timeout_error(project, issue_number, timeout_seconds, reason)
-        _log_busy(project, issue_number, reason, poll_interval_seconds)
+            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
+        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
         time.sleep(poll_interval_seconds)
 
     try:
         yield
     finally:
-        _release_and_warn(facade, project, holder_id, issue_number)
+        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)

@@ -66,6 +66,24 @@ class AutoCommitService:
             logger.error(f"Project directory does not exist: {project_dir}")
             return False
 
+        # Ensure we're on a feature branch (not main/master) BEFORE acquiring
+        # the project_checkout lock below (#56 review): this is a cheap,
+        # instant validation catching a workflow bug that should fail fast --
+        # moving it behind the lock would mean a project_dir stuck on
+        # main/master (which is always going to return False here regardless
+        # of the lock) could first sit polling for up to
+        # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS if the lock
+        # happened to be contended, turning an instant rejection into a long
+        # stall for no benefit -- this check's outcome cannot change based on
+        # whether the lock is held.
+        current_branch = self._get_current_branch(project_dir)
+        if current_branch in ['main', 'master']:
+            logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
+            logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
+            logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
+            logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
+            return False
+
         try:
             # project_checkout lock (#54): if project_dir is the shared base
             # clone (not an isolated epic worktree -- see is_base_clone_dir()),
@@ -84,11 +102,11 @@ class AutoCommitService:
                 # holder id").
                 async with project_checkout_lock_async(project, issue_number):
                     return await self._commit_and_push(
-                        project, agent, task_id, project_dir, issue_number, custom_message
+                        project, agent, task_id, project_dir, current_branch, issue_number, custom_message
                     )
 
             return await self._commit_and_push(
-                project, agent, task_id, project_dir, issue_number, custom_message
+                project, agent, task_id, project_dir, current_branch, issue_number, custom_message
             )
 
         except Exception as e:
@@ -101,6 +119,7 @@ class AutoCommitService:
         agent: str,
         task_id: str,
         project_dir: Path,
+        current_branch: Optional[str],
         issue_number: Optional[int],
         custom_message: Optional[str],
     ) -> bool:
@@ -109,17 +128,10 @@ class AutoCommitService:
         commit_agent_changes() (#54) so its caller can wrap it in the
         project_checkout lock only when needed, without duplicating the
         try/except that still lives in commit_agent_changes() around both the
-        locked and unlocked call paths.
+        locked and unlocked call paths. `current_branch` is resolved once by
+        the caller (before the lock -- see commit_agent_changes()'s own
+        comment, #56 review) rather than re-read here.
         """
-        # Ensure we're on a feature branch (not main/master)
-        current_branch = self._get_current_branch(project_dir)
-        if current_branch in ['main', 'master']:
-            logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
-            logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
-            logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
-            logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
-            return False
-
         # Check if there are changes to commit
         has_changes = self._check_for_changes(project_dir)
 
