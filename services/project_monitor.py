@@ -6929,7 +6929,16 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 issue_number=issue_number
             )
             if not can_execute:
-                if reason.endswith("_failed"):
+                # Classify via the current lock's own retained_reason field,
+                # not by string-matching try_acquire_lock()'s informal
+                # `reason` text (found in #58 review: this was the only one
+                # of ~9 call sites in the repo parsing `reason` instead of
+                # just logging it, fragile against that string format ever
+                # changing -- get_lock() + .retained_reason mirrors the
+                # structured approach get_retained_reason()'s own docstring
+                # documents other direct-lock-object callers already use).
+                _current_lock_for_classification = lock_manager.get_lock(project_name, board_name)
+                if _current_lock_for_classification and _current_lock_for_classification.retained_reason:
                     logger.error(
                         f"Repair cycle for issue #{issue_number} cannot acquire the "
                         f"pipeline lock for {project_name}/{board_name} — it is "

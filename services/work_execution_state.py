@@ -1356,12 +1356,26 @@ class WorkExecutionStateTracker:
                     # PipelineLockManager.get_lock_holder(), and to use the
                     # same locked-flag + break + outer-continue shape
                     # PROTECTION 3 already gets right.
-                    try:
-                        from services.pipeline_lock_manager import get_pipeline_lock_manager
-                        from config.manager import config_manager
+                    #
+                    # Fetches project_config once, shared with PROTECTION 3
+                    # below (found in #58 review: each protection previously
+                    # called config_manager.get_project_config(project_name)
+                    # separately for the same project in the same loop
+                    # iteration -- get_project_config() re-reads and
+                    # re-parses the project's YAML from disk on every call,
+                    # no caching, so this was a redundant disk read + parse
+                    # every single state-file iteration).
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    from config.manager import config_manager
 
-                        lock_manager = get_pipeline_lock_manager()
+                    project_config = None
+                    try:
                         project_config = config_manager.get_project_config(project_name)
+                    except Exception as e:
+                        logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+
+                    try:
+                        lock_manager = get_pipeline_lock_manager()
 
                         locked_by_another_issue = False
                         for pipeline_config in getattr(project_config, 'pipelines', None) or []:
@@ -1408,11 +1422,11 @@ class WorkExecutionStateTracker:
                     # it 'failure' here to force a retry would race with that.
                     try:
                         from services.pipeline_queue_manager import get_pipeline_queue_manager
-                        from config.manager import config_manager
 
                         already_queued_or_active = False
-                        project_config_for_queue = config_manager.get_project_config(project_name)
-                        for pipeline_cfg in getattr(project_config_for_queue, 'pipelines', None) or []:
+                        # Reuses project_config fetched once above PROTECTION 2 --
+                        # see the comment there.
+                        for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
                             board_name = getattr(pipeline_cfg, 'board_name', None)
                             if not board_name:
                                 continue
