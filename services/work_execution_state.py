@@ -1369,7 +1369,17 @@ class WorkExecutionStateTracker:
                             if not board_name:
                                 continue
                             holder_issue = lock_manager.get_lock_holder(project_name, board_name)
-                            if holder_issue:
+                            # CRITICAL fix (found in #58 review): this must only
+                            # skip when the lock is held by a DIFFERENT issue.
+                            # The original version fired for ANY holder,
+                            # including this exact issue holding its own
+                            # lock -- which is the common case right after an
+                            # issue finishes a stage (locks release only at
+                            # specific exit columns, not after every stage),
+                            # so this protection was skipping almost every
+                            # retry check, not just the ones actually racing
+                            # a different issue's in-progress work.
+                            if holder_issue and holder_issue != issue_number:
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
                                     f"pipeline locked by issue #{holder_issue}"

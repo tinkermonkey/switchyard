@@ -2588,6 +2588,19 @@ class ProjectMonitor:
                     else:
                         # CRITICAL: Check if this issue is next in line based on GitHub board order
                         # This ensures we respect the user's ordering on the GitHub board
+                        #
+                        # Not migrated to #57's available_slots/get_next_n_waiting_issues()
+                        # pattern (found in #58 review): unlike the 5 "pick N candidates from
+                        # the queue" dispatch sites #57 generalized, this is a binary gate for
+                        # a SPECIFIC issue already in hand -- "is this exact issue allowed to go
+                        # now, or must it wait" -- via equality against the single top-priority
+                        # pick, not a loop over open slots. Harmless today (available_slots=1
+                        # everywhere), but if a future change raises available_slots elsewhere,
+                        # this gate would still only ever let the single top-priority issue
+                        # through, incorrectly blocking an issue that's 2nd (or later) in line
+                        # even when enough slots are free for it too. A real fix means changing
+                        # this check from "equals the top pick" to "is within the top N picks",
+                        # not a mechanical swap -- tracked in #140, not fixed here.
                         next_issue = pipeline_queue.get_next_waiting_issue()
                         if next_issue and next_issue['issue_number'] != issue_number:
                             logger.info(
@@ -6655,17 +6668,22 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 `_owned_run_id`/`_settled`/`_owned_is_real_run` below, mirroring
                 _start_pr_review_for_issue exactly: `_end_owned_run_if_pending()` is
                 called on every early-return guard before get_or_create_pipeline_run()
-                (duplicate container, lock-state-unknown, locked-by-another-repair-
-                cycle, no test configs), and on the "superseded, not reused" case
-                right after it. Once get_or_create_pipeline_run() resolves the real
-                run, `_owned_is_real_run` is set — a couple of specific failure
-                handlers after that point (steal_lock() failure, context-save
+                (duplicate container, lock-state-unknown, no test configs), and
+                on the "superseded, not reused" case right after it. (The
+                "locked-by-another-repair-cycle" early-return that used to be
+                listed here is gone along with steal_lock() itself — #58,
+                Phase 2 of #34's concurrency redesign: repair cycles now go
+                through try_acquire_lock() exactly like ordinary dispatch, so
+                a busy lock is discovered there, not via a bespoke pre-check.)
+                Once get_or_create_pipeline_run() resolves the real run,
+                `_owned_is_real_run` is set — a couple of specific failure
+                handlers after that point (lock-acquire failure, context-save
                 failure, container-launch failure — see each one's own comment for
                 its exact call, since they aren't all identical: not every one
                 passes `board=`) still call end_pipeline_run() directly, never
                 _end_owned_run_if_pending(), because only end_pipeline_run() knows
-                how to release a lock steal_lock() may have already acquired. This
-                list is illustrative, not exhaustive by construction — check the
+                how to release a lock try_acquire_lock() may have already acquired.
+                This list is illustrative, not exhaustive by construction — check the
                 actual call sites, not just this comment, before assuming a given
                 failure's lock behavior. Workspace-resolution failure (resolve_workspace()
                 raising — no parent epic, or a worktree add failure) is deliberately
@@ -6772,37 +6790,31 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     logger.warning(f"Error checking for existing repair cycle container: {e}")
                     # Continue anyway - better to risk a duplicate than block work
 
-            # CRITICAL: Check if pipeline is locked by ANOTHER repair cycle
-            # Repair cycles can steal locks from Development, but not from other repair cycles
-            # Only one repair cycle should run at a time per pipeline
-            from services.pipeline_lock_manager import get_pipeline_lock_manager
-            lock_manager = get_pipeline_lock_manager()
-            current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
-            if not lock_reads_healthy:
-                logger.error(
-                    f"Could not determine lock state for {project_name}/{board_name} "
-                    f"(both Redis and YAML reads failed) — refusing to start a "
-                    f"repair cycle for issue #{issue_number} rather than risk "
-                    f"competing with a repair cycle we can't actually see"
-                )
-                _end_owned_run_if_pending("Lock state unreadable before launch - ending phantom run")
-                return None
-
-            if current_lock and current_lock.locked_by_issue != issue_number:
-                # Another issue holds the lock - check if it's also a repair cycle
-                # by checking for repair cycle container in Redis
-                if self.task_queue.redis_client:
-                    other_redis_key = f"repair_cycle:container:{project_name}:{current_lock.locked_by_issue}"
-                    other_container = self.task_queue.redis_client.get(other_redis_key)
-
-                    if other_container:
-                        # Another repair cycle is running - don't compete with it
-                        logger.warning(
-                            f"Pipeline locked by another repair cycle (issue #{current_lock.locked_by_issue}). "
-                            f"Skipping repair cycle launch for issue #{issue_number} to prevent competition."
-                        )
-                        _end_owned_run_if_pending("Pipeline locked by another repair cycle - ending phantom run")
-                        return None
+            # NOTE (#58, Phase 2 of #34's concurrency redesign): this used to be a
+            # dedicated "is the current lock holder ALSO a repair cycle?" pre-check
+            # here (cross-referencing current_lock.locked_by_issue against the
+            # repair_cycle:container Redis key), whose entire purpose was to stop
+            # steal_lock() further down from evicting another already-running
+            # repair cycle out from under itself — ordinary Development holders
+            # were always fair game for eviction, so only the "other holder is
+            # also a repair cycle" case needed special detection.
+            #
+            # Now that steal_lock() is gone and this method acquires the lock via
+            # plain try_acquire_lock() below (the same primitive every other
+            # dispatch call site uses), that distinction is moot: try_acquire_lock()
+            # refuses uniformly whenever the lock is held by ANY other issue,
+            # repair cycle or not — there is no eviction left for a same-holder-
+            # type check to guard against. Re-adding an early duplicate of that
+            # check here would just be a second, separately-maintained copy of the
+            # busy-lock read try_acquire_lock() already performs (a real drift risk
+            # this class's docstrings elsewhere warn about), for no behavioral
+            # benefit. Decision: removed, not kept — the single try_acquire_lock()
+            # call below is now the sole authority on lock state for this method,
+            # exactly like the ordinary trigger-column dispatch path.
+            #
+            # (The OTHER Redis check in this method — the duplicate-container check
+            # a few lines above, keyed on THIS issue's own container — is unrelated
+            # to lock stealing and is unaffected by this change.)
 
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -6867,7 +6879,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 _end_owned_run_if_pending("Superseded by the actual repair cycle pipeline run - ending phantom run")
 
             # From here on, `pipeline_run` is the run this method is driving, and
-            # steal_lock() below may hand it the pipeline lock. Failures past this
+            # try_acquire_lock() below may hand it the pipeline lock. Failures past this
             # point never go through _end_owned_run_if_pending() (which deliberately
             # never touches the lock) — but they no longer uniformly go through a
             # full end_pipeline_run() either. Some specific handlers still do (see
@@ -6881,34 +6893,51 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             _owned_is_real_run = True
 
             # CRITICAL: Acquire pipeline lock before starting repair cycle
-            # Note: We've already checked above that no OTHER repair cycle is running
-            # Repair cycles have PRIORITY over Development items - they can steal the lock if needed
-            # But repair cycles do NOT compete with each other (checked above)
+            #
+            # #58 (Phase 2 of #34's concurrency redesign) removed the old
+            # steal_lock()-based eviction here: repair cycles used to have
+            # PRIORITY over whatever ordinary agent held this board's lock and
+            # would force-evict it unconditionally. That model was single-
+            # holder-shaped (steal_lock()'s only real decision was "held by
+            # someone else? evict them" — fine with exactly one other possible
+            # holder, ill-defined once a future phase's semaphores allow
+            # several). Resolved design decision (see #58's issue text): that
+            # priority is dropped, not preserved. Repair cycles now acquire via
+            # plain try_acquire_lock() — the exact same primitive every other
+            # dispatchable column uses — so if the lock is free (or already
+            # ours) we take it, and if another issue holds it we simply don't
+            # launch this cycle. There is no explicit queue write for that
+            # "wait" case (see the comment above the now-removed duplicate-
+            # repair-cycle pre-check for why PipelineQueueManager's queue file
+            # doesn't apply to this non-trigger-column stage) — returning None
+            # is itself "enqueue and retry on a later poll cycle", because the
+            # normal board-polling loop re-evaluates this issue's column, and
+            # therefore re-calls this method, on every cycle regardless.
+            #
+            # The retained/failed-lock refusal this call site used to rely on
+            # steal_lock() to enforce (never touch a retained lock, since that
+            # would silently erase the durable failure record and hand the
+            # board to an unrelated issue) doesn't need separate replication —
+            # try_acquire_lock()'s own upfront fail-closed/retained_reason
+            # checks already cover it for this normal acquire path.
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
 
-            # Repair cycles have priority over whatever ordinary agent currently
-            # holds this board's lock — but a retained/failed lock must NEVER be
-            # stolen, since that would silently erase the durable failure record
-            # (retained_reason/retained_at) and hand the board to an unrelated
-            # issue, exactly the "silently re-dispatched" failure this whole
-            # mechanism exists to prevent. steal_lock() is the single place that
-            # enforces this (fail-closed lock-state read, retained_reason check,
-            # and the actual release+create) so this call site can no longer
-            # bypass the check the way _create_lock() called directly here once
-            # did — a real, deterministic gap found and fixed across three PR
-            # review rounds before this was centralized.
-            ok, result = lock_manager.steal_lock(project_name, board_name, issue_number)
-            if not ok:
-                if result.startswith("retained:"):
+            can_execute, reason = lock_manager.try_acquire_lock(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number
+            )
+            if not can_execute:
+                if reason.endswith("_failed"):
                     logger.error(
-                        f"Repair cycle for issue #{issue_number} cannot steal the "
-                        f"pipeline lock — it is retained due to a failed run "
-                        f"({result.split(':', 1)[1]}). A human must run "
+                        f"Repair cycle for issue #{issue_number} cannot acquire the "
+                        f"pipeline lock for {project_name}/{board_name} — it is "
+                        f"retained due to a failed run ({reason}). A human must run "
                         f"scripts/release_lock.py before this board can be used "
                         f"by any other issue."
                     )
-                elif result == "lock_state_unknown":
+                elif reason == "lock_state_unknown_failing_closed":
                     logger.error(
                         f"Could not determine lock state for {project_name}/{board_name} "
                         f"(both Redis and YAML reads failed) — refusing to start a "
@@ -6916,16 +6945,17 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"creating a lock while a retained one might actually be held"
                     )
                 else:
-                    logger.error(
-                        f"Repair cycle for issue #{issue_number} could not acquire "
-                        f"the pipeline lock for {project_name}/{board_name} "
-                        f"(steal_lock result: {result})"
+                    logger.info(
+                        f"Repair cycle for issue #{issue_number} cannot acquire the "
+                        f"pipeline lock for {project_name}/{board_name} yet ({reason}) "
+                        f"— waiting for it to free up rather than evicting the "
+                        f"current holder; will retry on a later poll cycle"
                     )
-                # steal_lock() failed outright, so this issue never actually holds
-                # the lock — end_pipeline_run() will correctly no-op its lock-release
-                # logic (locked_by_issue won't match). Full end_pipeline_run(), not
-                # _end_owned_run_if_pending(): pipeline_run is real by this point, not
-                # a phantom (see this method's docstring).
+                # try_acquire_lock() failed outright, so this issue never actually
+                # holds the lock — end_pipeline_run() will correctly no-op its
+                # lock-release logic (locked_by_issue won't match). Full
+                # end_pipeline_run(), not _end_owned_run_if_pending(): pipeline_run
+                # is real by this point, not a phantom (see this method's docstring).
                 if _owned_is_real_run and _owned_run_id and not _settled:
                     _settled = True
                     try:
@@ -6933,18 +6963,15 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             project=project_name,
                             issue_number=issue_number,
                             board=board_name,
-                            reason=f"Could not acquire pipeline lock for repair cycle: {result}",
+                            reason=f"Could not acquire pipeline lock for repair cycle: {reason}",
                         )
                     except Exception as cleanup_e:
                         logger.error(f"Failed to end pipeline run after lock-acquire failure: {cleanup_e}")
                 return None
-            elif result == "stolen":
-                logger.warning(
-                    f"Repair cycle for issue #{issue_number} stole pipeline lock "
-                    f"from its prior holder (repair cycles have priority over {status})"
+            elif reason in ("lock_acquired", "stale_lock_recovered"):
+                logger.info(
+                    f"Repair cycle for issue #{issue_number} acquired pipeline lock ({reason})"
                 )
-            elif result == "acquired":
-                logger.info(f"Repair cycle for issue #{issue_number} acquired pipeline lock")
             else:
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
@@ -7182,7 +7209,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
             except Exception as e:
                 logger.error(f"Failed to save repair cycle context: {e}", exc_info=True)
-                # By this point steal_lock() above succeeded, so this issue genuinely
+                # By this point try_acquire_lock() above succeeded, so this issue genuinely
                 # holds the pipeline lock — full end_pipeline_run() releases it (or
                 # retains it, per its normal retain/outcome rules), unlike
                 # _end_owned_run_if_pending() which deliberately never touches locks.
@@ -7248,7 +7275,7 @@ _Repair cycle initiated by Switchyard_
                 logger.warning(f"Failed to post initial comment: {e}")
 
             # (record_execution_start now happens much earlier -- right after the
-            # steal_lock() success/"Starting repair cycle" log above -- so a failure
+            # try_acquire_lock() success/"Starting repair cycle" log above -- so a failure
             # anywhere between there and here, notably epic-worktree resolution, has
             # a real in_progress entry to finalize. See that call site's comment.)
 

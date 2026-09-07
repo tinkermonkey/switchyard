@@ -320,6 +320,58 @@ class TestEmptyOutputDetection:
             updated_state = yaml.safe_load(f)
         assert updated_state['execution_history'][-1]['outcome'] == 'failure'
 
+    def test_proceeds_when_the_issue_holds_its_own_lock(self, tracker, temp_state_dir):
+        """CRITICAL regression (found in #58 review): the original PROTECTION 2
+        fix skipped whenever ANYONE held the board lock, without checking
+        whether the holder was this exact issue. Since an issue very often
+        still holds its own lock right after finishing a stage (locks
+        release only at specific exit columns, not after every stage), that
+        version would have skipped almost every retry check, not just ones
+        actually racing a different issue's in-progress work. get_lock_holder()
+        returning this SAME issue_number must proceed exactly as if unlocked."""
+        state_file = temp_state_dir / "test_project_issue_123.yaml"
+        state_data = {
+            'project_name': 'test-project',
+            'issue_number': 123,
+            'execution_history': [
+                {
+                    'agent': 'test-agent',
+                    'column': 'In Progress',
+                    'outcome': 'success',
+                    'completed_at': '2025-01-01T12:00:00Z',
+                    'timestamp': '2025-01-01T11:00:00Z'
+                }
+            ]
+        }
+
+        with open(state_file, 'w') as f:
+            yaml.dump(state_data, f)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder.return_value = 123  # this SAME issue holds it
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 1
+        with open(state_file) as f:
+            updated_state = yaml.safe_load(f)
+        assert updated_state['execution_history'][-1]['outcome'] == 'failure'
+
     def test_ignores_failed_executions(self, tracker, temp_state_dir):
         """Test only checks successful executions"""
         state_file = temp_state_dir / "test_project_issue_123.yaml"

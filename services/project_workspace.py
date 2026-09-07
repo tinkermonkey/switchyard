@@ -824,10 +824,17 @@ class ProjectWorkspaceManager:
         (the common case -- most files in a repo aren't touched by any one epic's
         commits) checks out cleanly and SILENTLY CARRIES THE UNCOMMITTED CHANGES
         OVER onto default_branch (verified empirically -- this is real git
-        behavior, not a hypothetical). Repair cycles steal the pipeline lock from a
-        non-retained ordinary holder (see steal_lock() in project_monitor.py), so a
-        live 'issues'-workspace agent genuinely can be mid-edit in this exact base
-        clone when this runs. So: bail out entirely (no checkout attempted at all)
+        behavior, not a hypothetical). Historically (before #58, Phase 2 of #34's
+        concurrency redesign), repair cycles stole the pipeline lock from a
+        non-retained ordinary holder via steal_lock() -- since removed -- so a
+        live 'issues'-workspace agent could genuinely be mid-edit in this exact
+        base clone when this ran. Repair cycles now wait for the lock instead of
+        forcing their way in, but the other leftover-state causes described above
+        (an orchestrator restart mid-checkout, a manual debugging session, an
+        older worktree never cleaned up, PipelineLockManager's own stale-lock
+        auto-recovery) remain live, so a dirty base clone here is still a real,
+        reachable case, not a fossil this guard is holding onto out of caution
+        alone. So: bail out entirely (no checkout attempted at all)
         if the tree is dirty in ANY way, regardless of which files. When it's
         clean, `--detach` is used rather than a plain branch checkout -- it frees
         branch_name just the same (HEAD no longer references it) without leaving
