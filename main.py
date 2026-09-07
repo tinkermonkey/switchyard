@@ -204,7 +204,7 @@ async def main():
     # Run off the event loop (#54 follow-up): initialize_all_projects() ->
     # initialize_project() now acquires the project_checkout lock via
     # project_checkout_lock_sync(), which polls with time.sleep() for up to
-    # DEFAULT_TIMEOUT_SECONDS (1900s) on contention (e.g. a stale lock left
+    # DEFAULT_TIMEOUT_SECONDS (~3h, and now heartbeat-refreshed for the full duration of a hold -- see project_checkout_lock.py) on contention (e.g. a stale lock left
     # by a crashed prior process). Calling it directly here would freeze
     # THIS process's event loop for that whole wait -- not /health itself
     # (served by the separate observability-server process/container, which

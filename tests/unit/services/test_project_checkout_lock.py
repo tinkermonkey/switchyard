@@ -40,6 +40,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 import tempfile
 import shutil
 
@@ -50,6 +51,8 @@ from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_checkout_lock import (
     project_checkout_lock_async,
     project_checkout_lock_sync,
+    _held_with_heartbeat_async,
+    _held_with_heartbeat_sync,
     _mint_unique_holder_id,
     ProjectCheckoutLockTimeoutError,
     RESOURCE_NAME,
@@ -451,6 +454,87 @@ class TestMintUniqueHolderId(unittest.TestCase):
 
         self.assertEqual(len(ids), 20)
         self.assertEqual(len(ids), len(set(ids)))
+
+
+class TestHeldWithHeartbeatSync(unittest.TestCase):
+    """
+    CRITICAL regression (found in code review): PipelineLockManager's Redis
+    lock-key TTL is fixed at 7200s and refreshed ONLY as a side effect of a
+    repeat acquire_resource() call for the SAME holder_id -- never
+    proactively. A hold that outlives 7200s with no heartbeat would have its
+    Redis copy silently expire while still legitimately held, and (confirmed
+    by direct source reading) a second caller's acquire attempt at that
+    point would succeed immediately -- a real double-acquisition of a
+    mutual-exclusion lock. _held_with_heartbeat_sync()/_async() close this by
+    periodically re-calling acquire_resource() with the same holder_id
+    (safe: PipelineLockManager treats this as a TTL-refreshing no-op, not a
+    new acquisition) for as long as the `with` body is still running.
+    """
+
+    def test_heartbeat_calls_acquire_resource_again_with_the_same_holder_id_while_held(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "already_holds_lock")
+
+        with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+            time.sleep(0.09)  # long enough for several heartbeat ticks
+
+        # At least one heartbeat refresh call, always with the SAME holder_id
+        # (never a fresh id -- that would be a new acquisition attempt, not
+        # a refresh of this hold).
+        self.assertGreaterEqual(facade.acquire_resource.call_count, 2)
+        for call in facade.acquire_resource.call_args_list:
+            self.assertEqual(call.args, ("proj", "proj_checkout", -42))
+
+    def test_heartbeat_stops_once_the_with_block_exits(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "already_holds_lock")
+
+        with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+            pass
+
+        count_at_exit = facade.acquire_resource.call_count
+        time.sleep(0.08)  # give a stray heartbeat thread every chance to fire again
+        self.assertEqual(facade.acquire_resource.call_count, count_at_exit)
+
+    def test_heartbeat_refresh_failure_does_not_propagate_or_stop_the_with_block(self):
+        facade = MagicMock()
+        facade.acquire_resource.side_effect = Exception("redis blip")
+
+        # Must not raise, and the body must still run to completion.
+        ran = []
+        with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+            time.sleep(0.05)
+            ran.append(True)
+
+        self.assertEqual(ran, [True])
+
+
+@pytest.mark.asyncio
+class TestHeldWithHeartbeatAsync:
+    """Async counterpart of TestHeldWithHeartbeatSync -- see its class
+    docstring for the full rationale."""
+
+    async def test_heartbeat_calls_acquire_resource_again_with_the_same_holder_id_while_held(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "already_holds_lock")
+
+        async with _held_with_heartbeat_async(facade, "dev_container_build", "proj", holder_id=-7, heartbeat_interval_seconds=0.02):
+            await asyncio.sleep(0.09)
+
+        assert facade.acquire_resource.call_count >= 2
+        for call in facade.acquire_resource.call_args_list:
+            assert call.args == ("proj", "dev_container_build", -7)
+
+    async def test_heartbeat_stops_once_the_with_block_exits(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "already_holds_lock")
+
+        async with _held_with_heartbeat_async(facade, "dev_container_build", "proj", holder_id=-7, heartbeat_interval_seconds=0.02):
+            pass
+
+        count_at_exit = facade.acquire_resource.call_count
+        await asyncio.sleep(0.08)
+        assert facade.acquire_resource.call_count == count_at_exit
 
 
 if __name__ == '__main__':

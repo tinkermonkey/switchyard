@@ -1742,7 +1742,7 @@ class AgentContainerRecovery:
                 thread = threading.Thread(target=commit_thread)
                 thread.start()
                 # #54 review: commit_agent_changes() can now block for up to
-                # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS (1900s)
+                # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS (~3h, and now heartbeat-refreshed for the full duration of a hold -- see project_checkout_lock.py)
                 # polling for the shared base-clone lock, when
                 # repair_cycle_project_dir resolves to it (the uncommon case --
                 # normally this is an isolated epic worktree, which the lock

@@ -202,6 +202,106 @@ def _release_and_warn(
         )
 
 
+# How often to refresh the Redis lock key's TTL while legitimately holding a
+# lock built on this pattern. CRITICAL, found in code review and confirmed by
+# direct source reading of PipelineLockManager.try_acquire_lock(): the Redis
+# TTL is fixed at 7200s and is refreshed ONLY as a side effect of a repeat
+# acquire_resource() call for the SAME holder_id (the "already_holds_lock"
+# transaction branch does `pipe.expire(lock_key, 7200)`) -- it is never
+# refreshed proactively. This module's own acquire-then-yield-then-release
+# usage calls acquire_resource() exactly ONCE per hold, so a hold that
+# outlives 7200s with no heartbeat would have its Redis copy silently expire
+# while still legitimately held. Worse: the acquire transaction's own check
+# (`if lock_data and lock_data.get('lock_status') == 'locked'`) reads an
+# expired key back as an EMPTY dict, which is falsy -- so a second caller's
+# acquire attempt at that point succeeds immediately, with no check against
+# the still-valid YAML copy at that point in the code path. Comfortably
+# under half the 7200s TTL so at least one heartbeat always lands before
+# expiry even under scheduling jitter.
+HEARTBEAT_INTERVAL_SECONDS = 1800.0
+
+
+@asynccontextmanager
+async def _held_with_heartbeat_async(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+):
+    """
+    Wraps an already-acquired lock's held duration with a background
+    heartbeat that periodically re-calls acquire_resource() with the SAME
+    holder_id -- see HEARTBEAT_INTERVAL_SECONDS above for why this is
+    necessary, not just defensive. Re-acquiring with the same holder_id is
+    safe by design: PipelineLockManager treats it as a TTL-refreshing no-op
+    ("already_holds_lock"), never as a new/competing acquisition.
+
+    This performs the refresh's blocking Redis/YAML I/O directly on the
+    event loop (no asyncio.to_thread offload) -- the same known tradeoff
+    project_checkout_lock's own poll loop already makes (see #140), but at a
+    far lower frequency (every 1800s here vs every ~5s while polling to
+    acquire), so the incremental cost is small next to the alternative (a
+    confirmed silent double-acquisition bug).
+    """
+    stop_event = asyncio.Event()
+
+    async def _heartbeat():
+        while True:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=heartbeat_interval_seconds)
+                return  # stop_event was set -- the `with` body has finished
+            except asyncio.TimeoutError:
+                pass
+            try:
+                facade.acquire_resource(project, resource_name, holder_id)
+            except Exception as e:
+                logger.warning(
+                    f"'{resource_name}' lock heartbeat refresh failed for project "
+                    f"{project!r}: {e} -- will retry at the next heartbeat interval"
+                )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await heartbeat_task
+
+
+@contextmanager
+def _held_with_heartbeat_sync(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+):
+    """Synchronous counterpart of _held_with_heartbeat_async() -- see its
+    docstring for the full rationale, identical otherwise."""
+    stop_event = threading.Event()
+
+    def _heartbeat():
+        while not stop_event.wait(heartbeat_interval_seconds):
+            try:
+                facade.acquire_resource(project, resource_name, holder_id)
+            except Exception as e:
+                logger.warning(
+                    f"'{resource_name}' lock heartbeat refresh failed for project "
+                    f"{project!r}: {e} -- will retry at the next heartbeat interval"
+                )
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat, daemon=True, name=f"lock-heartbeat-{resource_name}-{project}"
+    )
+    heartbeat_thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=5)
+
+
 @asynccontextmanager
 async def project_checkout_lock_async(
     project: str,
@@ -251,7 +351,8 @@ async def project_checkout_lock_async(
         await asyncio.sleep(poll_interval_seconds)
 
     try:
-        yield
+        async with _held_with_heartbeat_async(facade, RESOURCE_NAME, project, holder_id):
+            yield
     finally:
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
@@ -288,6 +389,7 @@ def project_checkout_lock_sync(
         time.sleep(poll_interval_seconds)
 
     try:
-        yield
+        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
+            yield
     finally:
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)

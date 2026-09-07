@@ -142,6 +142,8 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 from services.project_checkout_lock import (
+    _held_with_heartbeat_async,
+    _held_with_heartbeat_sync,
     _log_busy,
     _mint_unique_holder_id,
     _release_and_warn,
@@ -243,7 +245,8 @@ async def dev_container_build_lock_async(
         await asyncio.sleep(poll_interval_seconds)
 
     try:
-        yield
+        async with _held_with_heartbeat_async(facade, RESOURCE_NAME, project, holder_id):
+            yield
     finally:
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
@@ -281,6 +284,7 @@ def dev_container_build_lock_sync(
         time.sleep(poll_interval_seconds)
 
     try:
-        yield
+        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
+            yield
     finally:
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)

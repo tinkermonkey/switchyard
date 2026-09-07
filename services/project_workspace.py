@@ -101,6 +101,18 @@ class ProjectWorkspaceManager:
         Returns:
             True if project was newly cloned, False if it already existed
         """
+        # Cheap config validation BEFORE acquiring the lock below (#56 review,
+        # mirroring the same fix applied to auto_commit.py's branch check):
+        # this outcome can't change based on lock state, so checking it first
+        # means a misconfigured project fails instantly instead of first
+        # polling for up to project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS
+        # if the lock happened to be contended at startup.
+        repo_url = project_config.github.get('repo_url')
+        default_branch = project_config.github.get('branch', 'main')
+
+        if not repo_url:
+            raise ValueError(f"No repo_url configured for project {project_name}")
+
         # Serialize against every other operation on this project's shared base
         # clone (#54): today this runs once per project at startup, before the
         # dispatch loop begins, so it is safe only by ordering accident -- a
@@ -114,12 +126,6 @@ class ProjectWorkspaceManager:
         from services.project_checkout_lock import project_checkout_lock_sync
 
         with project_checkout_lock_sync(project_name, None):
-            repo_url = project_config.github.get('repo_url')
-            default_branch = project_config.github.get('branch', 'main')
-
-            if not repo_url:
-                raise ValueError(f"No repo_url configured for project {project_name}")
-
             project_dir = self.workspace_root / project_name
             was_cloned = False
 
