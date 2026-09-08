@@ -111,15 +111,14 @@ class AutoCommitService:
                     # make with the pre-lock value; the actual push must use
                     # fresh state.
                     fresh_branch = self._get_current_branch(project_dir)
-                    # CRITICAL, found in a later review pass: _commit_and_push()
-                    # itself has no main/master guard around staging/committing
-                    # -- it only gates the PUSH on current_branch, so without
-                    # re-checking here too, a fresh_branch that raced onto
-                    # main/master during the lock wait would still get a real
-                    # commit staged onto the shared clone's main branch (just
-                    # silently skipping the push). Re-apply the same
-                    # WORKFLOW BUG refusal the pre-lock fast-fail check above
-                    # already does, using the fresh (post-lock) value.
+                    # Re-apply the same WORKFLOW BUG refusal the pre-lock
+                    # fast-fail check above already does, using the fresh
+                    # (post-lock) value -- belt-and-suspenders with
+                    # _commit_and_push()'s own main/master guard below: this
+                    # refuses with a message specific to "raced onto
+                    # main/master during the lock wait," while that guard is
+                    # the structural backstop that holds even if a future
+                    # caller skips this check.
                     if fresh_branch in ['main', 'master']:
                         logger.error(
                             f"WORKFLOW BUG: {project_dir} is on {fresh_branch} after "

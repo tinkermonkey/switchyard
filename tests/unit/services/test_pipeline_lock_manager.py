@@ -176,5 +176,48 @@ class TestTouchLock(unittest.TestCase):
         self.assertEqual(lock.retained_reason, "agent crashed")
 
 
+class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
+    """
+    CRITICAL regression (found in PR #138 review, /pr-review-toolkit:review-pr):
+    touch_lock() used to read via plain get_lock(), which collapses
+    "confirmed unlocked" and "both Redis and YAML reads raised" into the
+    same None -- so a transient dual-store outage was indistinguishable
+    from "lock genuinely lost to another holder" to callers, and
+    project_checkout_lock.py's heartbeat logs the latter as a specific,
+    alarming ERROR. Must use get_lock_fail_closed() instead so a read
+    failure returns False WITHOUT being conflated with confirmed loss.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_returns_false_when_both_reads_fail_without_a_healthy_read_ever_happening(self):
+        # Redis read raises.
+        self.mock_redis.hgetall.side_effect = Exception("redis down")
+        # YAML read also fails: corrupt the state file directly.
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertFalse(result)
+
+    def test_still_works_normally_once_reads_are_healthy_again(self):
+        """Not a general regression test of the happy path (see TestTouchLock
+        above) -- specifically confirms the fail-closed branch doesn't
+        permanently wedge the method once reads recover."""
+        self.mock_redis.hgetall.return_value = {}  # empty dict: healthy, "not locked in Redis"
+        self.manager._create_lock("proj", "board", 123)
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertTrue(result)
+
+
 if __name__ == '__main__':
     unittest.main()

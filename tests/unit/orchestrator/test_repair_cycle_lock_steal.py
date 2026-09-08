@@ -387,6 +387,81 @@ class TestLockAcquisitionGate:
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
 
+
+class TestCheapLockProbeSkipsExpensiveWorkWhenBusy:
+    """
+    Found in PR #138 review (/pr-review-toolkit:review-pr): #58 removed the
+    old steal_lock()-era pre-check entirely, leaving try_acquire_lock() below
+    as the sole lock-state authority -- correct, but it meant a repair cycle
+    waiting behind a long-running ordinary holder paid a GitHub API call
+    (get_issue_details()) and created+immediately-ended a full PipelineRun
+    on EVERY ~30s poll cycle it was re-evaluated, purely to discover what a
+    plain get_lock() read already knows. A cheap, non-mutating probe was
+    added back before that expensive work -- these tests prove it actually
+    short-circuits, not just that the method still returns the right thing.
+    """
+
+    def test_busy_lock_skips_get_issue_details_and_returns_none(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=999)
+        spy_get_issue_details = Mock(side_effect=AssertionError(
+            "get_issue_details() must not be called when the cheap lock probe "
+            "already knows the board is busy"
+        ))
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            monitor_mutator=lambda monitor: setattr(monitor, 'get_issue_details', spy_get_issue_details),
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        spy_get_issue_details.assert_not_called()
+        # The real acquire attempt further down must never even be reached --
+        # this probe is a read-only early-out, not a second copy of the
+        # acquire decision.
+        mock_pipeline_lock_manager_auto.try_acquire_lock.assert_not_called()
+
+    def test_probe_held_by_this_same_issue_does_not_skip(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """This issue already holding its own lock (carried over from a
+        prior stage) must proceed normally -- the probe only short-circuits
+        for a DIFFERENT issue's hold."""
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=100)  # == issue_number below
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "already_holds_lock")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+    def test_free_lock_does_not_skip(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """get_lock() returning None (the fixture default, "no existing
+        lock") must proceed normally -- confirms the probe doesn't
+        accidentally gate the common, uncontended case."""
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+
+
 class TestEpicWorktreeResolution:
     """Issue #46, updated by #119/WI-B: _start_repair_cycle_for_issue must
     resolve the run's git branch and isolated epic worktree by calling

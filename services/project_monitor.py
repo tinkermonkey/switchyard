@@ -6678,13 +6678,17 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 Once get_or_create_pipeline_run() resolves the real run,
                 `_owned_is_real_run` is set — a couple of specific failure
                 handlers after that point (lock-acquire failure, context-save
-                failure, container-launch failure — see each one's own comment for
-                its exact call, since they aren't all identical: not every one
-                passes `board=`) still call end_pipeline_run() directly, never
-                _end_owned_run_if_pending(), because only end_pipeline_run() knows
-                how to release a lock try_acquire_lock() may have already acquired.
-                This list is illustrative, not exhaustive by construction — check the
-                actual call sites, not just this comment, before assuming a given
+                failure, container-launch failure) still call end_pipeline_run()
+                directly, never _end_owned_run_if_pending(), because only
+                end_pipeline_run() knows how to release a lock try_acquire_lock()
+                may have already acquired. (Corrected in PR #138 review,
+                /pr-review-toolkit:review-pr: all three currently pass
+                board=board_name — verified directly against each call site.
+                Kept the "check the actual call sites" caveat below regardless,
+                since this list is illustrative by construction and could
+                still drift.) This list is illustrative, not exhaustive by
+                construction — check the actual call sites, not just this
+                comment, before assuming a given
                 failure's lock behavior. Workspace-resolution failure (resolve_workspace()
                 raising — no parent epic, or a worktree add failure) is deliberately
                 NOT one of these dedicated handlers as of #119/WI-B: it used to be
@@ -6752,6 +6756,30 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             import threading
             import subprocess
             from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
+
+            # Cheap, non-mutating early-out if the board lock is already busy
+            # (found in PR #138 review, /pr-review-toolkit:review-pr): #58 moved
+            # this method's lock acquisition to plain try_acquire_lock() below,
+            # removing the old steal_lock()-era pre-check entirely (see the
+            # longer comment further down explaining why that removal is
+            # correct). But without ANY probe before this point, a repair cycle
+            # waiting behind a long-running ordinary holder (hours, for
+            # senior_software_engineer's 10800s timeout) now pays a GitHub API
+            # call (get_issue_details()) and creates+immediately-ends a full
+            # PipelineRun (ES pipeline-run-events churn) on EVERY ~30s poll
+            # cycle it's re-evaluated, purely to discover what this cheap read
+            # already knows. try_acquire_lock() below remains the SOLE
+            # authority on whether the lock is actually acquired -- this is
+            # only a read-only probe to skip expensive work when it obviously
+            # won't succeed, not a second copy of the acquire decision itself.
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            _lock_probe = get_pipeline_lock_manager().get_lock(project_name, board_name)
+            if _lock_probe and _lock_probe.locked_by_issue != issue_number:
+                _end_owned_run_if_pending(
+                    f"Pipeline lock for {project_name}/{board_name} busy "
+                    f"(held by issue #{_lock_probe.locked_by_issue}) -- skipping this cycle"
+                )
+                return None
 
             # CRITICAL: Check if a repair cycle container is already running for this issue
             # This prevents duplicate containers when recovery reconnects to an existing container

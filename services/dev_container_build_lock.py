@@ -41,24 +41,33 @@ call sites) as part of this issue specifically to close that.
 
 Investigation: where does the actual build+verify orchestration run?
 ----------------------------------------------------------------------
-config/foundations/agents.yaml sets `requires_docker: false` for BOTH
-dev_environment_setup and dev_environment_verifier ("ONLY agent[s] allowed to
-run outside Docker"). claude/claude_integration.py's run_claude_code() acts
-on that flag: for these two agents it does NOT hand off to
+config/foundations/agents.yaml sets `requires_docker: false` for
+dev_environment_setup and dev_environment_verifier -- its own inline comment
+calls dev_environment_setup the "ONLY agent allowed to run outside Docker,"
+but that comment is itself stale: a third agent, pipeline_analysis, also
+sets `requires_docker: false` (found in PR #138 review,
+/pr-review-toolkit:review-pr -- see #140 for the resulting lock-acquisition
+gap: pipeline_analysis unconditionally acquires THIS lock too, scoped to a
+hardcoded project="switchyard" regardless of which project actually ran,
+via services/pipeline_run_analysis.py). claude/claude_integration.py's
+run_claude_code() acts on the `use_docker` flag alone, not agent identity:
+for any of these three agents it does NOT hand off to
 docker_runner.run_agent_in_container() (which is what wraps a normal agent's
 Claude Code session in its own nested container) -- it calls
 _run_claude_code_locally() instead, which runs the Claude Code CLI as a
-subprocess of the orchestrator process itself. That subprocess is what
-issues the actual `docker build` / `docker inspect` calls (via its own Bash
-tool, against the orchestrator's own docker socket mount) -- there is no
-separate, monitorable "the build" step in orchestrator-side Python distinct
-from "run this agent's Claude Code session". So the real orchestrator-side
-hook around the build+verify window is exactly the hook #54 already uses for
-the SAME two agents' local-execution path: run_claude_code()'s
-_run_claude_code_locally() call site. This module's lock is acquired there,
-gated on agent identity (see claude/claude_integration.py), mirroring the
-existing is_base_clone_dir()-gated project_checkout_lock acquisition
-immediately above it in the same function.
+subprocess of the orchestrator process itself. For dev_environment_setup/
+verifier specifically, that subprocess is what issues the actual
+`docker build` / `docker inspect` calls (via its own Bash tool, against the
+orchestrator's own docker socket mount) -- there is no separate, monitorable
+"the build" step in orchestrator-side Python distinct from "run this agent's
+Claude Code session". So the real orchestrator-side hook around the
+build+verify window is exactly the hook #54 already uses for these agents'
+local-execution path: run_claude_code()'s _run_claude_code_locally() call
+site. This module's lock is acquired there, gated on the same `use_docker`
+flag (see claude/claude_integration.py) that also lets pipeline_analysis
+reach it, mirroring the existing is_base_clone_dir()-gated
+project_checkout_lock acquisition immediately above it in the same
+function.
 
 Why dev_container_state.set_status() itself is deliberately left unlocked
 ---------------------------------------------------------------------------

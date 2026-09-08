@@ -156,15 +156,21 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
 
     # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
     #
-    # dev_container_build lock (#56): this local execution IS this project's
-    # dev-container build (dev_environment_setup) or verify (dev_environment_
-    # verifier) session -- the Claude Code subprocess started below issues the
-    # actual `docker build`/`docker inspect` calls itself, via its own Bash
-    # tool, against the orchestrator's own docker socket. There is no other
+    # dev_container_build lock (#56): for dev_environment_setup/verifier,
+    # this local execution IS this project's dev-container build/verify
+    # session -- the Claude Code subprocess started below issues the actual
+    # `docker build`/`docker inspect` calls itself, via its own Bash tool,
+    # against the orchestrator's own docker socket. There is no other
     # orchestrator-side hook around that work (see
     # services/dev_container_build_lock.py's module docstring for the full
-    # investigation), so this call is where the lock is acquired -- for BOTH
-    # agents unconditionally, since only they ever reach this branch.
+    # investigation), so this call is where the lock is acquired --
+    # unconditionally for every agent that reaches this branch, gated only
+    # on the `use_docker` flag, not agent identity. A third agent,
+    # pipeline_analysis, also has requires_docker: false and reaches here
+    # too (found in PR #138 review, /pr-review-toolkit:review-pr -- see
+    # #140), acquiring this same lock even though it never builds/inspects
+    # anything -- a known, tracked gap, not a correctness issue for
+    # dev_environment_setup/verifier themselves.
     task_context_for_dev_lock = context.get('context', {}) or {}
     issue_number_for_dev_lock = task_context_for_dev_lock.get('issue_number') or context.get('issue_number')
 

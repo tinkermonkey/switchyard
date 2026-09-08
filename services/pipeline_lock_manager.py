@@ -581,10 +581,31 @@ class PipelineLockManager:
         Returns:
             True if the lock was found (held by issue_number) and refreshed
             in at least one durable store, False if it isn't currently held
-            by issue_number at all (including "no lock exists"), or if both
-            stores failed to write.
+            by issue_number at all (including "no lock exists"), if both
+            reads failed (state genuinely unknown), or if both writes failed.
+
+        Note (found in PR #138 review, /pr-review-toolkit:review-pr): reads via
+        get_lock_fail_closed(), not the plain get_lock() this method used
+        before -- get_lock() collapses "confirmed unlocked" and "both Redis
+        and YAML reads raised" into the same None, so a transient dual-store
+        outage would be indistinguishable from "lock genuinely lost to
+        another holder" to this method's caller. project_checkout_lock.py's
+        heartbeat treats a False return as proof of the latter and logs a
+        specific, alarming "lock lost to a competing holder" ERROR -- which
+        would have been a false alarm for a momentary storage hiccup. Reads
+        being unhealthy is logged distinctly below rather than folded into
+        the same False the "genuinely not held" case returns.
         """
-        lock = self.get_lock(project, board)
+        lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        if not reads_healthy:
+            logger.error(
+                f"touch_lock: could not determine lock state for {project}/{board} "
+                f"(both Redis and YAML reads failed) -- cannot confirm issue "
+                f"#{issue_number} still holds this lock, but this is NOT confirmed "
+                f"loss to another holder either; refusing to refresh liveness "
+                f"rather than silently reporting a false 'lock lost' condition"
+            )
+            return False
         if not lock or lock.locked_by_issue != issue_number:
             return False
 

@@ -41,6 +41,15 @@ def queue_manager(temp_state_dir):
     # get_issues_in_column_order() first; returning [] makes it a no-op
     # against the queue state seeded directly via save_queue() below.
     manager.get_issues_in_column_order = Mock(return_value=[])
+    # Avoid a real config_manager.get_project_config('test_project') lookup
+    # (found in PR #138 review, /pr-review-toolkit:review-pr): sync_queue_with_github()
+    # also calls _get_pipeline_trigger_column(), which loads this project's
+    # real config -- 'test_project' has no config/projects/test_project.yaml
+    # in a fresh checkout (that directory is gitignored), so this raised
+    # ConfigurationError on any machine but one with that untracked fixture
+    # file left over locally. Mirrors test_pipeline_queue_manager_batching.py's
+    # existing fixture, which already avoids this the same way.
+    manager._get_pipeline_trigger_column = Mock(return_value='Development')
     return manager
 
 

@@ -90,13 +90,34 @@ class ProjectWorkspaceManager:
 
         return needs_setup
 
-    def initialize_project(self, project_name: str, project_config) -> bool:
+    def initialize_project(
+        self, project_name: str, project_config, checkout_lock_timeout_seconds: float = 120.0
+    ) -> bool:
         """
         Initialize a project workspace by checking if it exists
 
         Args:
             project_name: Name of the project
             project_config: Project configuration object
+            checkout_lock_timeout_seconds: How long to wait for the
+                project_checkout lock below before giving up (found in PR
+                #138 review, /pr-review-toolkit:review-pr). Deliberately
+                short by default: this method's only caller today
+                (initialize_all_projects()) runs once per project at
+                orchestrator STARTUP, before the dispatch loop begins, and
+                already catches and logs a per-project failure rather than
+                aborting the whole startup sequence. Waiting out
+                project_checkout_lock's own default (~3h,
+                DEFAULT_TIMEOUT_SECONDS) here would mean a single stale lock
+                left by a crashed prior process -- which startup's own later
+                stale-lock recovery step doesn't cover for resource locks
+                like this one -- stalls the ENTIRE startup sequence (every
+                other, unrelated project) for hours, with no automated way
+                out. A restart is itself the natural retry for this specific
+                call site, so failing fast and letting the per-project
+                except handle it is strictly better than a multi-hour wait.
+                A future on-demand (non-startup) caller of this method can
+                pass a longer value if a real wait is actually wanted there.
 
         Returns:
             True if project was newly cloned, False if it already existed
@@ -125,7 +146,9 @@ class ProjectWorkspaceManager:
         # docstring).
         from services.project_checkout_lock import project_checkout_lock_sync
 
-        with project_checkout_lock_sync(project_name, None):
+        with project_checkout_lock_sync(
+            project_name, None, timeout_seconds=checkout_lock_timeout_seconds
+        ):
             project_dir = self.workspace_root / project_name
             was_cloned = False
 
