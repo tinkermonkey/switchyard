@@ -1636,23 +1636,25 @@ class PipelineRunManager:
                                         f"Task creation failed for issue #{next_issue['issue_number']}, "
                                         f"rolling back lock acquisition to prevent deadlock"
                                     )
-                                    try:
-                                        lock_manager.release_lock(project, pipeline_run.board, next_issue['issue_number'])
-                                        logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
-                                    except Exception as rollback_error:
-                                        logger.error(f"Failed to rollback lock: {rollback_error}")
-
                                     # MUST also undo the mark_issue_active() above, or
                                     # get_next_n_waiting_issues() never selects this issue
                                     # again (it filters strictly on status=='waiting') —
                                     # the lock is freed but the queue entry stays 'active'
                                     # forever, silently dropping the issue from every
                                     # future dispatch with no automated recovery (#142).
-                                    # Deliberately NOT gated on the release above having
-                                    # succeeded: if the lock is retained due to an
-                                    # unrelated failure, try_acquire_lock() refuses this
-                                    # issue anyway, so leaving the entry 'active' only
-                                    # guarantees permanent loss without buying anything.
+                                    #
+                                    # ORDER MATTERS: reset the queue entry BEFORE
+                                    # releasing the lock. While the lock is still held no
+                                    # competing dispatcher can acquire it, so the two
+                                    # pieces of state can never be observed in the
+                                    # dangerous combination "lock free, entry still
+                                    # 'active'". Released first, the 30s monitor poll can
+                                    # slip in, re-acquire, re-activate and dispatch this
+                                    # issue for real — and the reset would then flip a
+                                    # genuinely-running, lock-holding issue back to
+                                    # 'waiting', making it a selectable candidate for a
+                                    # SECOND dispatch (try_acquire_lock returns True /
+                                    # "already_holds_lock" for the current holder).
                                     try:
                                         pipeline_queue.reset_issue_to_waiting(next_issue['issue_number'])
                                     except Exception as reset_error:
@@ -1663,6 +1665,16 @@ class PipelineRunManager:
                                             f"dispatch on {project}/{pipeline_run.board} until a human "
                                             f"intervenes: {reset_error}"
                                         )
+
+                                    # Released unconditionally, even if the reset above
+                                    # failed: holding the lock on top of a lost queue
+                                    # entry deadlocks the whole board rather than just
+                                    # this issue.
+                                    try:
+                                        lock_manager.release_lock(project, pipeline_run.board, next_issue['issue_number'])
+                                        logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                                    except Exception as rollback_error:
+                                        logger.error(f"Failed to rollback lock: {rollback_error}")
 
                                 logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                 import traceback

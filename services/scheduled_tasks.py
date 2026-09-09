@@ -710,15 +710,41 @@ class ScheduledTasksService:
 
         Fails CLOSED at every step: an entry is only reset when this method can
         positively establish that nothing is running it. Anything it can't
-        determine — no `activated_at` to age against, an unreadable lock, an
-        errored pipeline-run lookup — leaves the entry alone.
+        determine — no `activated_at` to age against, a lock whose state could
+        not be read, a pipeline-run lookup that errored, a work-execution check
+        that errored — leaves the entry alone.
+
+        Note that "fails closed" here has to be built deliberately, because the
+        underlying probes do NOT fail closed on their own:
+          - get_lock() swallows store read failures into a plain None
+            (_read_redis_lock_only/_read_yaml_lock_only return (None, False) and
+            get_lock() discards the flag), making "unreadable" indistinguishable
+            from "unlocked". get_lock_fail_closed() is used instead, exactly as
+            try_acquire_lock does, and an unhealthy read aborts the whole board.
+          - get_active_pipeline_run() returns None for BOTH "no run" and
+            "couldn't tell": its Elasticsearch fallback logs at debug and falls
+            through to None, and self.es is None outright when the client could
+            not be constructed. A run whose Redis key has aged out (routine for
+            long conversational loops) plus any ES trouble therefore reads as
+            "nothing running". So it is not trusted alone.
 
         An entry is reset only when ALL of:
           - it is older than STRANDED_ACTIVE_GRACE_MINUTES (not a dispatch in flight)
-          - it does not hold this (project, board)'s pipeline lock
-          - it has no active PipelineRun (this is what keeps conversational
-            issues, which are marked active WITHOUT ever taking the lock, from
-            being reset out from under a running agent)
+          - this (project, board)'s lock state was readable, and the entry does
+            not hold that lock
+          - work_execution_tracker.has_active_execution() says nothing is running
+            for it — the canonical liveness predicate, covering regular agent
+            executions, review cycles, repair-cycle containers and conversational
+            feedback loops. This is the guard that matters for conversational
+            issues, which are marked active WITHOUT ever taking the lock, so the
+            lock check can never protect them.
+          - it has no active PipelineRun
+          - its `activated_at` has not changed since it was sampled (the reset is
+            a compare-and-swap): the liveness checks above are slow enough — a
+            YAML file-lock acquisition plus, possibly, an ES round trip — that a
+            concurrent dispatcher can legitimately re-activate the issue in
+            between, and flipping THAT activation to 'waiting' would make a
+            running issue a selectable dispatch candidate.
 
         Returns:
             Number of entries reset to 'waiting'.
@@ -731,8 +757,20 @@ class ScheduledTasksService:
 
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             from services.pipeline_run import get_pipeline_run_manager
+            from services.work_execution_state import work_execution_tracker
 
-            lock = get_pipeline_lock_manager().get_lock(project_name, board_name)
+            lock, reads_healthy = get_pipeline_lock_manager().get_lock_fail_closed(
+                project_name, board_name
+            )
+            if not reads_healthy:
+                logger.error(
+                    f"Could not determine pipeline lock state for "
+                    f"{project_name}/{board_name} (both Redis and YAML reads failed) — "
+                    f"skipping the stranded 'active' sweep for this board rather than "
+                    f"risk resetting an issue that genuinely holds the lock"
+                )
+                return 0
+
             lock_holder = (
                 lock.locked_by_issue
                 if lock and lock.lock_status == 'locked'
@@ -780,6 +818,23 @@ class ScheduledTasksService:
             if age_minutes < STRANDED_ACTIVE_GRACE_MINUTES:
                 continue
 
+            # Positive liveness check, and the ONLY one that protects
+            # conversational issues: they are marked active without ever taking
+            # the pipeline lock, and the run lookup below returns None both for
+            # "no run" and for "couldn't tell" (see this method's docstring).
+            # has_active_execution() covers regular executions, review cycles,
+            # repair-cycle containers and feedback loops, and fails closed
+            # internally when its own sub-checks degrade.
+            try:
+                if work_execution_tracker.has_active_execution(project_name, issue_number):
+                    continue
+            except Exception as e:
+                logger.warning(
+                    f"Could not check for active work on #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
             try:
                 active_run = run_manager.get_active_pipeline_run(
                     project_name, issue_number, board=board_name
@@ -795,13 +850,20 @@ class ScheduledTasksService:
                 continue
 
             try:
-                if queue_manager.reset_issue_to_waiting(issue_number):
+                # Compare-and-swap on the activation this entry was aged
+                # against: the checks above take long enough (file lock, ES
+                # round trip) for a concurrent dispatcher to have re-activated
+                # the issue since get_queue_summary() sampled it.
+                if queue_manager.reset_issue_to_waiting(
+                    issue_number, expected_activated_at=activated_at
+                ):
                     reset_count += 1
                     logger.warning(
                         f"Reset stranded queue entry for issue #{issue_number} on "
                         f"{project_name}/{board_name} from 'active' back to 'waiting' — "
-                        f"active for {age_minutes:.0f}m with no pipeline lock and no "
-                        f"active pipeline run (dispatch rollback almost certainly leaked)"
+                        f"active for {age_minutes:.0f}m with no pipeline lock, no active "
+                        f"work execution and no active pipeline run (dispatch rollback "
+                        f"almost certainly leaked)"
                     )
             except Exception as e:
                 logger.error(

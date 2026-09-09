@@ -970,30 +970,39 @@ class TestResetStrandedActiveIssues:
         lock.locked_by_issue = locked_by_issue
         return lock
 
-    def _sweep(self, scheduled_tasks_service, queue_manager, lock=None, active_run=None):
+    def _sweep(self, scheduled_tasks_service, queue_manager, lock=None,
+               active_run=None, reads_healthy=True, has_active_execution=False):
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock.return_value = lock
+        mock_lock_manager.get_lock_fail_closed.return_value = (lock, reads_healthy)
 
         mock_run_manager = MagicMock()
         mock_run_manager.get_active_pipeline_run.return_value = active_run
 
+        mock_tracker = MagicMock()
+        mock_tracker.has_active_execution.return_value = has_active_execution
+
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
                    return_value=mock_lock_manager), \
              patch('services.pipeline_run.get_pipeline_run_manager',
-                   return_value=mock_run_manager):
+                   return_value=mock_run_manager), \
+             patch('services.work_execution_state.work_execution_tracker', mock_tracker):
             return scheduled_tasks_service._reset_stranded_active_issues(
                 queue_manager, 'test-project', 'dev'
             )
 
     def test_resets_stranded_entry_with_no_lock_and_no_run(self, scheduled_tasks_service):
         """REGRESSION (#142): the leaked-rollback state — 'active', past the
-        grace period, no lock holder, no active pipeline run."""
-        queue_manager = self._queue_manager([self._entry(200)])
+        grace period, no lock holder, no active work, no active pipeline run."""
+        entry = self._entry(200)
+        queue_manager = self._queue_manager([entry])
 
         reset_count = self._sweep(scheduled_tasks_service, queue_manager)
 
         assert reset_count == 1
-        queue_manager.reset_issue_to_waiting.assert_called_once_with(200)
+        # Compare-and-swap on the activation that was actually aged.
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=entry['activated_at']
+        )
 
     def test_skips_entry_that_holds_the_pipeline_lock(self, scheduled_tasks_service):
         """The normal case: the active issue is the one actually executing."""
@@ -1008,12 +1017,30 @@ class TestResetStrandedActiveIssues:
 
     def test_skips_entry_with_an_active_pipeline_run(self, scheduled_tasks_service):
         """Conversational issues are marked active WITHOUT ever taking the
-        lock — the active-run check is what stops the sweep from resetting one
-        out from under a running agent."""
+        lock — the run check is one of the two guards that stops the sweep
+        from resetting one out from under a running agent."""
         queue_manager = self._queue_manager([self._entry(200)])
 
         reset_count = self._sweep(
             scheduled_tasks_service, queue_manager, active_run=MagicMock()
+        )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_entry_with_active_work_execution(self, scheduled_tasks_service):
+        """REGRESSION: get_active_pipeline_run() returns None for BOTH 'no run'
+        and 'could not tell' (its ES fallback logs at debug and falls through,
+        and self.es is None outright when the client couldn't be built). A live
+        conversational loop whose Redis run key has aged out therefore looks
+        run-less. has_active_execution() is the canonical liveness predicate —
+        it covers feedback loops, review cycles and repair containers — and
+        must keep such an issue from being reset."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager,
+            active_run=None, has_active_execution=True
         )
 
         assert reset_count == 0
@@ -1041,36 +1068,55 @@ class TestResetStrandedActiveIssues:
         queue_manager.reset_issue_to_waiting.assert_not_called()
 
     def test_skips_everything_when_lock_state_is_unreadable(self, scheduled_tasks_service):
-        """Can't establish ground truth -> reset nothing, rather than risk
-        re-dispatching an issue that is genuinely running."""
+        """REGRESSION: this must be driven by the REAL degraded behavior, not a
+        raise. get_lock() never raises on an unreadable store — both
+        _read_redis_lock_only and _read_yaml_lock_only swallow their exception
+        and return (None, False), and get_lock() then discards the health flag —
+        so 'unreadable' was indistinguishable from 'unlocked' and the sweep
+        silently lost its lock guard. get_lock_fail_closed() reports the flag;
+        an unhealthy read must abort the whole board."""
         queue_manager = self._queue_manager([self._entry(200)])
 
-        mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock.side_effect = RuntimeError("redis down")
-
-        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
-                   return_value=mock_lock_manager), \
-             patch('services.pipeline_run.get_pipeline_run_manager'):
-            reset_count = scheduled_tasks_service._reset_stranded_active_issues(
-                queue_manager, 'test-project', 'dev'
-            )
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager, lock=None, reads_healthy=False
+        )
 
         assert reset_count == 0
         queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_uses_fail_closed_lock_read_not_plain_get_lock(self, scheduled_tasks_service):
+        """Guard against a future edit quietly reverting to get_lock(), which
+        cannot report an unreadable store."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_fail_closed.return_value = (None, True)
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager), \
+             patch('services.pipeline_run.get_pipeline_run_manager'), \
+             patch('services.work_execution_state.work_execution_tracker'):
+            scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+        mock_lock_manager.get_lock_fail_closed.assert_called_once_with('test-project', 'dev')
+        mock_lock_manager.get_lock.assert_not_called()
 
     def test_skips_entry_when_run_lookup_errors(self, scheduled_tasks_service):
         """Same fail-closed rule, per entry."""
         queue_manager = self._queue_manager([self._entry(200)])
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock.return_value = None
+        mock_lock_manager.get_lock_fail_closed.return_value = (None, True)
         mock_run_manager = MagicMock()
         mock_run_manager.get_active_pipeline_run.side_effect = RuntimeError("redis down")
 
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
                    return_value=mock_lock_manager), \
              patch('services.pipeline_run.get_pipeline_run_manager',
-                   return_value=mock_run_manager):
+                   return_value=mock_run_manager), \
+             patch('services.work_execution_state.work_execution_tracker'):
             reset_count = scheduled_tasks_service._reset_stranded_active_issues(
                 queue_manager, 'test-project', 'dev'
             )
@@ -1078,18 +1124,60 @@ class TestResetStrandedActiveIssues:
         assert reset_count == 0
         queue_manager.reset_issue_to_waiting.assert_not_called()
 
+    def test_skips_entry_when_work_execution_lookup_errors(self, scheduled_tasks_service):
+        """Same fail-closed rule for the liveness predicate."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_fail_closed.return_value = (None, True)
+        mock_tracker = MagicMock()
+        mock_tracker.has_active_execution.side_effect = RuntimeError("state unreadable")
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager), \
+             patch('services.pipeline_run.get_pipeline_run_manager'), \
+             patch('services.work_execution_state.work_execution_tracker', mock_tracker):
+            reset_count = scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_reset_is_a_compare_and_swap_on_activated_at(self, scheduled_tasks_service):
+        """REGRESSION: the sweep samples the queue once, then does a file-lock
+        lock read and (possibly) an ES round trip before writing. A concurrent
+        dispatcher can re-activate the issue in that window; the reset must be
+        conditional on the activation it actually aged, or it flips a running,
+        lock-holding issue back to 'waiting' and makes it double-dispatchable.
+        reset_issue_to_waiting() returning False (CAS mismatch) must not be
+        counted as a reset."""
+        entry = self._entry(200)
+        queue_manager = self._queue_manager([entry])
+        queue_manager.reset_issue_to_waiting.return_value = False
+
+        reset_count = self._sweep(scheduled_tasks_service, queue_manager)
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=entry['activated_at']
+        )
+
     def test_sweeps_siblings_of_the_lock_holder(self, scheduled_tasks_service):
         """A board can carry more than one 'active' entry (nothing at the
         queue-manager level prevents it) — the lock holder is kept, the
         stranded sibling is reset."""
-        queue_manager = self._queue_manager([self._entry(200), self._entry(300)])
+        stranded = self._entry(300)
+        queue_manager = self._queue_manager([self._entry(200), stranded])
 
         reset_count = self._sweep(
             scheduled_tasks_service, queue_manager, lock=self._lock(200)
         )
 
         assert reset_count == 1
-        queue_manager.reset_issue_to_waiting.assert_called_once_with(300)
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(
+            300, expected_activated_at=stranded['activated_at']
+        )
 
     def test_no_active_entries_short_circuits(self, scheduled_tasks_service):
         """Common case: nothing active, no lock or run lookups performed."""
@@ -1103,7 +1191,7 @@ class TestResetStrandedActiveIssues:
             )
 
         assert reset_count == 0
-        mock_lock_manager.get_lock.assert_not_called()
+        mock_lock_manager.get_lock_fail_closed.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_reconciliation_runs_the_sweep_after_force_sync(self, scheduled_tasks_service):

@@ -578,11 +578,14 @@ class TestReleaseLockAndProcessNext:
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = True
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'}
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
         ]
 
         mock_run_manager = Mock()
         mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
+        # The column is resolved from GitHub, not from the queue entry -- queue
+        # entries never carry one (see _mocks() in the rollback suite below).
+        mock_run_manager._get_issue_column_from_github.return_value = 'Development'
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -640,7 +643,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
     status=='waiting', so that issue was silently excluded from every future
     dispatch, forever, with no automated recovery."""
 
-    def _mocks(self, agent='senior_software_engineer'):
+    def _mocks(self, agent='senior_software_engineer', github_column='Development'):
         our_lock = Mock()
         our_lock.locked_by_issue = 100
 
@@ -653,6 +656,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         mock_queue.is_issue_in_queue.return_value = True
 
         mock_run_manager = Mock()
+        mock_run_manager._get_issue_column_from_github.return_value = github_column
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -699,7 +703,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'}
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
         ]
         # ensure_pipeline_run_for_task() returning None is one of the real
         # failure modes this block raises on.
@@ -723,7 +727,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'}
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
         ]
 
         mock_task_queue = Mock()
@@ -754,7 +758,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks(agent=None)
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'}
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
         ]
 
         mock_task_queue = Mock()
@@ -774,8 +778,8 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'},
-            {'issue_number': 300, 'position_in_column': 1, 'column': 'Development'},
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'},
+            {'issue_number': 300, 'position_in_column': 1, 'status': 'waiting', 'initial_column': 'Development'},
         ]
         # First candidate fails, second succeeds.
         mock_run_manager.ensure_pipeline_run_for_task.side_effect = [None, 'run-300']
@@ -792,4 +796,114 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         mock_task_queue.enqueue.assert_called_once()
         dispatched_task = mock_task_queue.enqueue.call_args[0][0]
         assert dispatched_task.context['issue_number'] == 300
+
+    def test_dispatches_production_shaped_queue_entry_with_no_column_key(self):
+        """REGRESSION: queue entries have NO 'column' key. enqueue_issue()
+        writes 'initial_column'; sync_queue_with_github()/
+        force_sync_with_github() write no column field at all. Reading
+        next_issue.get('column') therefore yielded None on every real
+        invocation, no workflow column ever matched, and this site took the
+        no-agent branch 100% of the time -- so it could never dispatch
+        anything. The column must come from GitHub, like both sibling sites."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        # Exactly what force_sync_with_github() produces: no column of any kind.
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {
+                'issue_number': 200,
+                'position_in_column': 0,
+                'status': 'waiting',
+                'added_at': '2026-01-01T00:00:00+00:00',
+                'last_position_check': '2026-01-01T00:00:00+00:00',
+                'title': 'Next issue',
+            }
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
+
+        mock_task_queue = Mock()
+        self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                  workflow_template, project_config, mock_task_queue)
+
+        mock_run_manager._get_issue_column_from_github.assert_called_once()
+        assert mock_run_manager._get_issue_column_from_github.call_args[0][2] == 200
+
+        mock_task_queue.enqueue.assert_called_once()
+        dispatched_task = mock_task_queue.enqueue.call_args[0][0]
+        assert dispatched_task.context['issue_number'] == 200
+        assert dispatched_task.context['column'] == 'Development'
+        assert dispatched_task.agent == 'senior_software_engineer'
+
+        # Nothing failed, so nothing is rolled back.
+        mock_queue.reset_issue_to_waiting.assert_not_called()
+        mock_lock_manager.release_lock.assert_called_once_with('test-project', 'dev', 100)
+
+    def test_rolls_back_when_column_cannot_be_resolved_from_github(self):
+        """A GitHub read that can't place the issue on the board must roll
+        back both halves rather than dispatch against a stale cached column."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks(github_column=None)
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
+             'initial_column': 'Development'}
+        ]
+
+        mock_task_queue = Mock()
+        self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                  workflow_template, project_config, mock_task_queue)
+
+        mock_task_queue.enqueue.assert_not_called()
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
+
+    def test_rollback_resets_queue_entry_before_releasing_the_lock(self):
+        """ORDER REGRESSION: releasing the lock first leaves a window where the
+        lock is free while the entry still reads 'active'. The 30s monitor poll
+        can acquire it, mark it active and dispatch for real in that window --
+        and the reset would then flip a genuinely-running, lock-holding issue
+        back to 'waiting', making it double-dispatchable (try_acquire_lock
+        returns True/"already_holds_lock" for the current holder)."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
+             'initial_column': 'Development'}
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = None
+
+        call_order = []
+        mock_queue.reset_issue_to_waiting.side_effect = (
+            lambda *a, **kw: call_order.append('reset')
+        )
+        mock_lock_manager.release_lock.side_effect = (
+            lambda *a, **kw: call_order.append(f'release-{a[2]}') or True
+        )
+
+        mock_task_queue = Mock()
+        self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                  workflow_template, project_config, mock_task_queue)
+
+        # release-100 is the exiting issue's own release, before dispatch.
+        assert call_order == ['release-100', 'reset', 'release-200']
+
+    def test_rollback_still_releases_lock_when_queue_reset_raises(self):
+        """The reset moving first must not be able to strand the lock: a
+        failing reset loses one issue, a retained lock deadlocks the board."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
+             'initial_column': 'Development'}
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = None
+        mock_queue.reset_issue_to_waiting.side_effect = RuntimeError("queue file unwritable")
+
+        mock_task_queue = Mock()
+        self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                  workflow_template, project_config, mock_task_queue)
+
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
 

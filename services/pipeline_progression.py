@@ -515,13 +515,33 @@ class PipelineProgression:
                     # PipelineRunManager.end_pipeline_run().
                     dispatched = False
                     try:
-                        # Get current column for next issue
-                        current_column = next_issue.get('column')
-
                         # Get agent for this column
                         project_config = config_manager.get_project_config(project_name)
                         pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
                         workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+
+                        # SAFETY: resolve the column from GitHub, not from the
+                        # queue entry. This used to read next_issue.get('column')
+                        # — a key PipelineQueueManager NEVER writes (entries carry
+                        # 'initial_column' from enqueue_issue(), or no column field
+                        # at all from sync_queue_with_github()/
+                        # force_sync_with_github()), so current_column was always
+                        # None, no workflow column ever matched, and this site
+                        # could never dispatch anything. Both sibling dispatch
+                        # sites already re-resolve from GitHub for the same reason
+                        # the cached column would be wrong anyway: the user may
+                        # have moved the issue since it was queued
+                        # (PipelineRunManager._get_issue_column_from_github(),
+                        # ProjectMonitor.get_issue_column_sync()).
+                        current_column = pipeline_run_manager._get_issue_column_from_github(
+                            project_config, pipeline_config, next_issue['issue_number']
+                        )
+
+                        if not current_column:
+                            raise Exception(
+                                f"Issue #{next_issue['issue_number']} not found on board "
+                                f"'{board_name}' — cannot determine which agent to dispatch"
+                            )
 
                         agent = None
                         for col in workflow_template.columns:
@@ -533,7 +553,8 @@ class PipelineProgression:
                             # Fetch issue details
                             issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
 
-                            # Get or create pipeline run for next issue.
+                            # Get or create pipeline run for next issue, reusing the
+                            # manager resolved at the top of this method.
                             # get_pipeline_run_manager is already imported at module
                             # level above — a redundant local import here previously
                             # shadowed it for this ENTIRE function (Python's scoping
@@ -548,7 +569,6 @@ class PipelineProgression:
                             # via this path. Pre-existing (2026-01-14, unrelated to
                             # this PR), found while adding regression coverage for
                             # a different fix to this same method.
-                            pipeline_run_manager = get_pipeline_run_manager()
                             pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
                                 project=project_name,
                                 board=board_name,
@@ -618,19 +638,19 @@ class PipelineProgression:
                                 f"#{next_issue['issue_number']}, rolling back lock "
                                 f"acquisition and queue status to prevent deadlock"
                             )
-                            try:
-                                lock_manager.release_lock(
-                                    project_name, board_name, next_issue['issue_number']
-                                )
-                                logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
-                            except Exception as rollback_error:
-                                logger.error(f"Failed to rollback lock: {rollback_error}")
-
-                            # Deliberately NOT gated on the release above having
-                            # succeeded: if the lock is retained due to an unrelated
-                            # failure, try_acquire_lock() refuses this issue anyway,
-                            # so leaving the entry 'active' only guarantees permanent
-                            # loss without buying anything.
+                            # ORDER MATTERS: reset the queue entry BEFORE releasing
+                            # the lock. While the lock is still held no competing
+                            # dispatcher can acquire it (try_acquire_lock refuses,
+                            # and project_monitor's non-conversational path returns
+                            # before mark_issue_active), so the two pieces of state
+                            # can never be observed in the dangerous combination
+                            # "lock free, entry still 'active'". Released first, the
+                            # 30s monitor poll can slip in, re-acquire, re-activate
+                            # and dispatch #N for real -- and the reset below would
+                            # then flip a genuinely-running, lock-holding issue back
+                            # to 'waiting', making it a selectable candidate for a
+                            # SECOND dispatch (try_acquire_lock returns True /
+                            # "already_holds_lock" for the current holder).
                             try:
                                 pipeline_queue.reset_issue_to_waiting(next_issue['issue_number'])
                             except Exception as reset_error:
@@ -641,6 +661,17 @@ class PipelineProgression:
                                     f"dispatch on {project_name}/{board_name} until a human "
                                     f"intervenes: {reset_error}"
                                 )
+
+                            # Released unconditionally, even if the reset above
+                            # failed: holding the lock on top of a lost queue entry
+                            # deadlocks the whole board rather than just this issue.
+                            try:
+                                lock_manager.release_lock(
+                                    project_name, board_name, next_issue['issue_number']
+                                )
+                                logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                            except Exception as rollback_error:
+                                logger.error(f"Failed to rollback lock: {rollback_error}")
 
                         logger.error(
                             f"Error dispatching agent for next issue "

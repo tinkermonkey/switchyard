@@ -619,7 +619,9 @@ class PipelineQueueManager:
                 f"({removed_count} removed, {added_count} added, {updated_count} updated)"
             )
 
-    def reset_issue_to_waiting(self, issue_number: int):
+    def reset_issue_to_waiting(
+        self, issue_number: int, expected_activated_at: Optional[str] = None
+    ):
         """
         Reset an issue from active back to waiting status.
 
@@ -627,6 +629,17 @@ class PipelineQueueManager:
 
         Args:
             issue_number: Issue number to reset
+            expected_activated_at: Optional compare-and-swap token. When given,
+                the reset is applied ONLY if the entry's current `activated_at`
+                still matches — i.e. this is the same activation the caller
+                observed. mark_issue_active() always stamps a fresh
+                `activated_at`, so a mismatch means a concurrent dispatcher
+                re-activated the issue between the caller's read and this write,
+                and resetting would flip a genuinely-running issue back to
+                'waiting'. Callers that sample queue state and then perform slow
+                liveness checks (see ScheduledTasksService._reset_stranded_active_issues)
+                MUST pass this; callers rolling back their own mark_issue_active()
+                in the same breath do not need it.
         """
         with self._queue_lock():
             queue = self.load_queue()
@@ -634,6 +647,16 @@ class PipelineQueueManager:
             for issue in queue:
                 if issue['issue_number'] == issue_number:
                     if issue['status'] == 'active':
+                        if (expected_activated_at is not None
+                                and issue.get('activated_at') != expected_activated_at):
+                            logger.info(
+                                f"Not resetting issue #{issue_number} to waiting: it was "
+                                f"re-activated concurrently (activated_at "
+                                f"{issue.get('activated_at')} != expected "
+                                f"{expected_activated_at})"
+                            )
+                            return False
+
                         issue['status'] = 'waiting'
 
                         # Clear activation timestamp

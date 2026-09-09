@@ -244,7 +244,7 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
 
     def test_resets_queue_entry_even_when_lock_rollback_fails(self):
-        """The queue reset is deliberately NOT gated on the lock release
+        """The queue reset runs first and is not gated on the lock release
         succeeding: try_acquire_lock() refuses a retained lock anyway, so
         leaving the entry 'active' only guarantees permanent loss."""
         mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
@@ -255,6 +255,41 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
 
         mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+
+    def test_rollback_resets_queue_entry_before_releasing_the_lock(self):
+        """ORDER REGRESSION: releasing the lock first leaves a window where the
+        lock is free while the entry still reads 'active'. The 30s monitor poll
+        can acquire it, mark it active and dispatch for real in that window --
+        and the reset would then flip a genuinely-running, lock-holding issue
+        back to 'waiting', making it double-dispatchable (try_acquire_lock
+        returns True/"already_holds_lock" for the current holder)."""
+        mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
+
+        call_order = []
+        mock_queue.reset_issue_to_waiting.side_effect = (
+            lambda *a, **kw: call_order.append('reset')
+        )
+        mock_lock_manager.release_lock.side_effect = (
+            lambda *a, **kw: call_order.append(f'release-{a[2]}') or True
+        )
+
+        self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
+
+        # release-100 is the completed issue's own release, before dispatch.
+        self.assertEqual(call_order, ['release-100', 'reset', 'release-200'])
+
+    def test_rollback_still_releases_lock_when_queue_reset_raises(self):
+        """The reset moving first must not be able to strand the lock: a
+        failing reset loses one issue, a retained lock deadlocks the board."""
+        mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
+        mock_queue.reset_issue_to_waiting.side_effect = RuntimeError("queue file unwritable")
+
+        self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
+
+        self.assertIn(
+            unittest.mock.call("proj", "board", 200),
+            mock_lock_manager.release_lock.call_args_list,
+        )
 
     def test_no_queue_reset_on_successful_dispatch(self):
         """Control case: a dispatch that succeeds must NOT reset the entry it

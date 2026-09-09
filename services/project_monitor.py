@@ -5454,6 +5454,38 @@ _Review cycle initiated by Switchyard_
                                                     f"Task creation failed for issue #{next_issue['issue_number']}, "
                                                     f"rolling back lock acquisition to prevent deadlock"
                                                 )
+
+                                                # MUST also undo the mark_issue_active()
+                                                # above, or get_next_n_waiting_issues()
+                                                # never selects this issue again (it
+                                                # filters strictly on status=='waiting') —
+                                                # the lock is freed but the queue entry
+                                                # stays 'active' forever, silently dropping
+                                                # the issue from every future dispatch
+                                                # (#142). The stranded-'active' sweep in
+                                                # scheduled_tasks cannot recover THIS site:
+                                                # ensure_pipeline_run_for_task() has
+                                                # already created an active PipelineRun by
+                                                # the time the enqueue can fail, and the
+                                                # sweep skips any entry with one.
+                                                #
+                                                # ORDER MATTERS: reset before releasing the
+                                                # lock, so no competing dispatcher can ever
+                                                # observe "lock free, entry still 'active'"
+                                                # and double-dispatch this issue.
+                                                try:
+                                                    pipeline_queue.reset_issue_to_waiting(
+                                                        next_issue['issue_number']
+                                                    )
+                                                except Exception as reset_error:
+                                                    logger.critical(
+                                                        f"Could NOT reset queue entry for issue "
+                                                        f"#{next_issue['issue_number']} back to 'waiting' "
+                                                        f"after dispatch failed — it will be excluded from "
+                                                        f"all future dispatch on {project_name}/{board_name} "
+                                                        f"until a human intervenes: {reset_error}"
+                                                    )
+
                                                 try:
                                                     rolled_back = lock_mgr.release_lock(
                                                         project_name, board_name, next_issue['issue_number']

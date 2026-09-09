@@ -201,3 +201,46 @@ class TestGetQueueSummaryActiveIssues:
 
         assert summary['active_issues'] == []
         assert summary['active_count'] == 0
+
+
+class TestResetIssueToWaitingCompareAndSwap:
+    """reset_issue_to_waiting()'s optional `expected_activated_at` token.
+
+    Callers that sample queue state and then run slow liveness checks before
+    writing (ScheduledTasksService._reset_stranded_active_issues does a YAML
+    file-lock lock read and, possibly, an Elasticsearch round trip) can have
+    the entry re-activated underneath them by a concurrent dispatcher.
+    mark_issue_active() always stamps a fresh `activated_at`, so it doubles as
+    a version token: without the check, the sweep flips a genuinely-running,
+    lock-holding issue back to 'waiting' and makes it double-dispatchable.
+    """
+
+    def test_resets_when_activated_at_still_matches(self, queue_manager):
+        entry = _active_issue(901)
+        queue_manager.save_queue([entry])
+
+        assert queue_manager.reset_issue_to_waiting(
+            901, expected_activated_at=entry['activated_at']
+        ) is True
+        assert queue_manager.get_issue_status(901) == 'waiting'
+
+    def test_refuses_when_activated_at_changed(self, queue_manager):
+        """REGRESSION: a concurrent mark_issue_active() re-stamped the entry
+        between the caller's read and this write -- the issue is running now,
+        so it must stay 'active'."""
+        stale_activated_at = _active_issue(902)['activated_at']
+        queue_manager.save_queue([_active_issue(902)])
+        queue_manager.mark_issue_active(902)  # concurrent dispatcher re-activates
+
+        assert queue_manager.reset_issue_to_waiting(
+            902, expected_activated_at=stale_activated_at
+        ) is False
+        assert queue_manager.get_issue_status(902) == 'active'
+
+    def test_unconditional_reset_still_works_without_the_token(self, queue_manager):
+        """Rollback call sites undoing their OWN mark_issue_active() in the
+        same breath don't need the token and must be unaffected."""
+        queue_manager.save_queue([_active_issue(903)])
+
+        assert queue_manager.reset_issue_to_waiting(903) is True
+        assert queue_manager.get_issue_status(903) == 'waiting'
