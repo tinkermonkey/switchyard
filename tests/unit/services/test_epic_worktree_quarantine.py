@@ -73,6 +73,74 @@ class TestQuarantineMarkerLifecycle:
 
         assert marker.is_file()
 
+    def test_prune_skips_the_quarantined_worktree_itself(self, manager):
+        """The marker surviving the sweep is not enough: the sweep force-removes
+        the WORKTREE it names, and that worktree is the whole point.
+
+        prune_epic_worktrees() runs unconditionally at every startup (main.py),
+        and neither of its pre-existing skips protects a quarantined worktree --
+        _epic_worktrees is empty on a fresh process and the agent container that
+        held the bind mount is long gone. So a routine restart deleted exactly the
+        uncommitted work the refusal deliberately preserved (
+        _push_local_commits_if_any() is a no-op for uncommitted changes), left the
+        marker behind, and every subsequent dispatch for that epic was refused by
+        resolve_workspace() over drift that no longer existed and evidence that no
+        longer existed either -- three of them, and
+        MAX_CONSECUTIVE_DISPATCH_FAILURES retains the whole BOARD's lock
+        (#149 WI-4 review).
+        """
+        worktree = manager._epic_worktree_path('test-project', '5')
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text('gitdir: /somewhere')
+        (worktree / 'uncommitted.py').write_text('the work the refusal preserved')
+
+        manager.quarantine_epic_worktree('test-project', '5', 'feature/issue-5-epic',
+                                         'scratch', 'reason')
+
+        with patch('subprocess.run') as mock_run:
+            manager.prune_epic_worktrees()
+            # Not even attempted: no `git worktree remove --force` for this one.
+            assert all(
+                'remove' not in call.args[0]
+                for call in mock_run.call_args_list
+            )
+
+        assert worktree.is_dir()
+        assert (worktree / 'uncommitted.py').read_text() == 'the work the refusal preserved'
+
+    def test_prune_still_removes_an_unquarantined_worktree(self, manager):
+        """The control: the sweep's ordinary job is untouched."""
+        worktree = manager._epic_worktree_path('test-project', '6')
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text('gitdir: /somewhere')
+
+        with patch.object(manager, '_push_local_commits_if_any'), \
+             patch('subprocess.run'):
+            manager.prune_epic_worktrees()
+
+        assert not worktree.exists()
+
+    def test_a_quarantined_worktree_whose_marker_cannot_be_read_is_still_skipped(self, manager):
+        """Fails closed the same way get_epic_worktree_quarantine() does: a read
+        that raised is not evidence of absence."""
+        worktree = manager._epic_worktree_path('test-project', '5')
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text('gitdir: /somewhere')
+
+        unreadable_marker = MagicMock()
+        unreadable_marker.is_file.side_effect = OSError('stat failed')
+
+        with patch.object(manager, '_quarantine_marker_for', return_value=unreadable_marker), \
+             patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             patch('subprocess.run') as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert worktree.is_dir()
+        mock_push.assert_not_called()
+        # Skipped, not crashed out of: the OSError is handled where it happens, so
+        # the sweep's own metadata prune still ran for the project.
+        assert any('prune' in call.args[0] for call in mock_run.call_args_list)
+
     def test_an_unreadable_marker_still_counts_as_quarantined(self, manager):
         """Fails closed: its mere presence is the whole signal, and returning
         None for it would resume exactly the adoption it blocks."""

@@ -432,7 +432,7 @@ class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
 
     @pytest.mark.asyncio
     async def test_the_failsafe_still_runs_and_the_run_continues_when_it_succeeds(self):
-        harness = await _run_finalization(dict(self._UNVERIFIABLE), failsafe_result=True)
+        harness = await _run_finalization(dict(self._UNVERIFIABLE))
 
         harness['failsafe'].assert_called_once()
         assert harness['exception'] is None
@@ -441,7 +441,12 @@ class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
 
     @pytest.mark.asyncio
     async def test_the_pipeline_is_blocked_when_the_failsafe_cannot_confirm_either(self):
-        harness = await _run_finalization(dict(self._UNVERIFIABLE), failsafe_result=False)
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            dict(self._UNVERIFIABLE),
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_UNVERIFIABLE),
+        )
 
         harness['failsafe'].assert_called_once()
         from agents.non_retryable import NonRetryableAgentError
@@ -451,8 +456,200 @@ class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
         body = harness['github'].post_comment.await_args[0][1]
         assert 'Branch Unverifiable' in body
 
+    @pytest.mark.asyncio
+    async def test_an_unreadable_branch_does_not_quarantine_the_epic(self):
+        """The escalation window is a few seconds wide -- two reads in
+        _verify_finalize_branch() a second apart, then one more in
+        _verify_failsafe_branch(). An unlucky index.lock across all three used to
+        quarantine the epic (blocking every issue under it until a human deletes a
+        JSON file inside the container) on top of mark_failed()'s board-wide lock
+        retention, on evidence of exactly nothing: the marker would have recorded
+        actual_branch: null and the comment 'Found: could not be determined'
+        (#149 WI-4 review)."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
 
-async def _run_finalization(finalize_result, failsafe_result=True):
+        harness = await _run_finalization(
+            dict(self._UNVERIFIABLE),
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_UNVERIFIABLE),
+        )
+
+        harness['workspace_manager'].quarantine_epic_worktree.assert_not_called()
+        # Blocking the run is still the right response to an unreadable branch.
+        harness['prm'].mark_failed.assert_called_once()
+
+        body = harness['github'].post_comment.await_args[0][1]
+        # ...and the recovery steps must not tell an operator to delete a marker
+        # that was never written.
+        assert 'branch-quarantine.json' not in body
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_branch_the_failsafe_CAN_read_still_quarantines(self):
+        """The other half: finalization could not read the branch, but the failsafe
+        could -- and found drift. That IS on-disk evidence nothing repairs, so the
+        next dispatch must not be allowed to adopt it."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            dict(self._UNVERIFIABLE),
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_DRIFTED, 'scratch'),
+        )
+
+        harness['workspace_manager'].quarantine_epic_worktree.assert_called_once()
+        kwargs = harness['workspace_manager'].quarantine_epic_worktree.call_args.kwargs
+        assert kwargs['actual_branch'] == 'scratch'
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'branch-quarantine.json' in body
+        # The branch the failsafe read, not 'could not be determined'.
+        assert 'scratch' in body
+
+    @pytest.mark.asyncio
+    async def test_a_failsafe_that_committed_nothing_blocks_the_run(self):
+        """`handled` used to be True for untracked-only changes, for a `git commit`
+        that exited non-zero, for a failed `git add`, and for a push that threw --
+        every one of which let this path record outcome='success' with the work
+        uncommitted on disk."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            dict(self._UNVERIFIABLE),
+            failsafe_result=FailsafeResult(
+                FailsafeOutcome.NOT_COMMITTED, 'feature/issue-5-epic'
+            ),
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+        outcomes = [
+            call.kwargs.get('outcome')
+            for call in harness['tracker'].record_execution_outcome.call_args_list
+        ]
+        assert 'success' not in outcomes
+
+        # Nothing drifted -- the branch was fine, the commit just never happened --
+        # so the epic is not quarantined over it.
+        harness['workspace_manager'].quarantine_epic_worktree.assert_not_called()
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Failsafe' in body
+
+
+class TestTheFailsafesOwnRefusalIsNotSilent:
+    """
+    _verify_failsafe_branch()'s refusal reached only ONE of
+    _failsafe_commit_check()'s four call sites. The other three discarded it, and
+    the highest-frequency of those is the workspace_context is None branch that
+    every skip_workspace_prep dispatch takes -- all of repair_cycle.py's inner
+    agents. A repair_fix container that left the epic worktree on a scratch branch
+    got: no comment, no mark_failed(), no exception, and
+    record_execution_outcome(outcome='success'). The repair cycle then carried on
+    believing the fix had landed, repair_test passed against the still-uncommitted
+    tree, and the PR never contained the fix (#149 WI-4 review).
+    """
+
+    _REPAIR_CONTEXT = {
+        'branch_name': 'feature/issue-5-epic',
+        'project_dir': '/workspace/.orchestrator/worktrees/test-project/5',
+        'epic_id': '5',
+    }
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_workspace_prep_refusal_blocks_instead_of_succeeding(self):
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            None,
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_DRIFTED, 'fix-attempt'),
+            task_context_extra=dict(self._REPAIR_CONTEXT),
+            workspace_context=False,
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+        outcomes = [
+            call.kwargs.get('outcome')
+            for call in harness['tracker'].record_execution_outcome.call_args_list
+        ]
+        assert 'success' not in outcomes
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Wrong Branch' in body
+        assert 'fix-attempt' in body
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_workspace_prep_refusal_quarantines_confirmed_drift(self):
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            None,
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_DRIFTED, 'fix-attempt'),
+            task_context_extra=dict(self._REPAIR_CONTEXT),
+            workspace_context=False,
+        )
+
+        harness['workspace_manager'].quarantine_epic_worktree.assert_called_once()
+        kwargs = harness['workspace_manager'].quarantine_epic_worktree.call_args.kwargs
+        assert kwargs['epic_id'] == '5'
+        assert kwargs['actual_branch'] == 'fix-attempt'
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_workspace_prep_run_that_commits_cleanly_still_succeeds(self):
+        """The control: the ordinary repair-cycle dispatch must be untouched."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            None,
+            failsafe_result=FailsafeResult(FailsafeOutcome.COMMITTED, 'feature/issue-5-epic'),
+            task_context_extra=dict(self._REPAIR_CONTEXT),
+            workspace_context=False,
+        )
+
+        assert harness['exception'] is None
+        harness['prm'].mark_failed.assert_not_called()
+        harness['workspace_manager'].quarantine_epic_worktree.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_finalization_failures_refusal_is_not_silent_either(self):
+        """The second ignoring call site: finalization failed for some other
+        reason (a failed PR creation, say), and the failsafe then refused on branch
+        grounds. That refusal used to be discarded exactly as above."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            {'success': False, 'error': 'PR creation failed'},
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_DRIFTED, 'scratch'),
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_finalization_exceptions_refusal_is_not_silent_either(self):
+        """The third: the failsafe runs from inside the finalization exception
+        handler, whose own `except Exception` would have swallowed the escalation
+        if it were raised in there."""
+        from services.agent_executor import FailsafeOutcome, FailsafeResult
+
+        harness = await _run_finalization(
+            RuntimeError('finalization blew up'),
+            failsafe_result=FailsafeResult(FailsafeOutcome.BRANCH_DRIFTED, 'scratch'),
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+
+async def _run_finalization(
+    finalize_result,
+    failsafe_result=None,
+    task_context_extra=None,
+    workspace_context=True,
+):
     """
     Drive execute_agent() through a real IssuesWorkspaceContext to the
     finalization block, with the agent run and the underlying
@@ -462,8 +659,16 @@ async def _run_finalization(finalize_result, failsafe_result=True):
     Returns a dict of the mocks the assertions above read, plus the exception
     execute_agent() raised (None when it returned normally) -- the escalation
     paths deliberately raise, so the harness cannot simply let it propagate.
+
+    failsafe_result is the FailsafeResult _failsafe_commit_check() is stubbed to
+    answer (defaulting to a committed-and-pushed workspace). workspace_context=False
+    drives the OTHER branch of the finalization block instead -- the one every
+    skip_workspace_prep dispatch takes, where there is no workspace context at all.
     """
-    from services.agent_executor import AgentExecutor
+    from services.agent_executor import AgentExecutor, FailsafeOutcome, FailsafeResult
+
+    if failsafe_result is None:
+        failsafe_result = FailsafeResult(FailsafeOutcome.COMMITTED, 'feature/issue-5-epic')
 
     async def fake_resolve_workspace(pipeline_run, github, workspace_type):
         pipeline_run.branch_name = 'feature/issue-5-epic'
@@ -498,7 +703,11 @@ async def _run_finalization(finalize_result, failsafe_result=True):
          patch.object(executor, '_failsafe_commit_check', new_callable=AsyncMock,
                       return_value=failsafe_result) as mock_failsafe:
 
-        mock_fbm.finalize_feature_branch_work = AsyncMock(return_value=finalize_result)
+        if isinstance(finalize_result, Exception):
+            # Drives the finalization EXCEPTION handler rather than a verdict dict.
+            mock_fbm.finalize_feature_branch_work = AsyncMock(side_effect=finalize_result)
+        else:
+            mock_fbm.finalize_feature_branch_work = AsyncMock(return_value=finalize_result)
 
         mock_project_config = MagicMock()
         mock_project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
@@ -513,23 +722,34 @@ async def _run_finalization(finalize_result, failsafe_result=True):
 
         raised = None
         try:
+            task_context = {
+                'issue_number': 7,
+                'issue_title': 'Test feature',
+                'workspace_type': 'issues',
+                'pipeline_run_id': 'run-1',
+                'board': 'dev_workflow',
+            }
+            if not workspace_context:
+                # What skip_workspace_prep dispatches look like: execute_agent()
+                # builds no workspace context, so the failsafe is the ONLY commit
+                # path (pipeline/repair_cycle.py's inner agents all set this).
+                task_context['skip_workspace_prep'] = True
+            task_context.update(task_context_extra or {})
+
             await executor.execute_agent(
                 agent_name='test_agent',
                 project_name='test-project',
-                task_context={
-                    'issue_number': 7,
-                    'issue_title': 'Test feature',
-                    'workspace_type': 'issues',
-                    'pipeline_run_id': 'run-1',
-                    'board': 'dev_workflow',
-                },
+                task_context=task_context,
             )
         except Exception as e:
             raised = e
 
         # The harness must actually have reached the finalization block --
         # otherwise every assertion above would pass vacuously.
-        mock_fbm.finalize_feature_branch_work.assert_called_once()
+        if workspace_context:
+            mock_fbm.finalize_feature_branch_work.assert_called_once()
+        else:
+            mock_failsafe.assert_called_once()
 
         return {
             'failsafe': mock_failsafe,
