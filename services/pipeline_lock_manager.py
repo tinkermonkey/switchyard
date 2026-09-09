@@ -20,6 +20,17 @@ from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
 
+# TTL applied to every Redis lock key this class writes. Hoisted out of the
+# seven separate `expire(lock_key, 7200)` literals it used to be spelled as
+# (found in review, #146 WI-1): services/project_checkout_lock.py's heartbeat
+# interval and its sustained-failure escalation threshold are both calibrated
+# against this exact number, and nothing tied the two modules together -- so
+# shortening the TTL here to speed up stale-lock recovery would silently leave
+# that heartbeat racing its own key expiry with zero margin. It is imported
+# there rather than restated, and asserted against in
+# tests/unit/services/test_project_checkout_lock.py.
+LOCK_TTL_SECONDS = 7200
+
 
 class TouchResult(Enum):
     """
@@ -380,7 +391,7 @@ class PipelineLockManager:
                                     if locked_by == issue_number:
                                         # Already held by us - refresh TTL
                                         pipe.multi()
-                                        pipe.expire(lock_key, 7200)
+                                        pipe.expire(lock_key, LOCK_TTL_SECONDS)
                                         return "already_holds_lock"
                                     
                                     # Check for stale lock
@@ -412,7 +423,7 @@ class PipelineLockManager:
                                 
                                 pipe.multi()
                                 pipe.hset(lock_key, mapping=self._lock_to_redis_mapping(new_lock))
-                                pipe.expire(lock_key, 7200)
+                                pipe.expire(lock_key, LOCK_TTL_SECONDS)
                                 return "lock_acquired"
 
                             result = self.redis_client.transaction(acquire_lock_tx, lock_key, value_from_callable=True)
@@ -438,7 +449,69 @@ class PipelineLockManager:
         # Fallback to YAML (original logic, but only if Redis failed or not available)
         # Note: If Redis is available but we failed to acquire (locked by other), we returned False above.
         # We only reach here if self.redis_client is None or Redis threw an exception (connection error).
-        
+        #
+        # Serialized across threads AND processes by a dedicated advisory file
+        # lock. Everything in _try_acquire_lock_yaml_unguarded() is a plain
+        # read-modify-write (read the current lock, decide, then create one)
+        # with nothing making it atomic — unlike the Redis branch above, whose
+        # WATCH/MULTI transaction is exactly that. Found in review (#146 WI-1):
+        # while every async acquisition ran inline on the single-threaded event
+        # loop, the loop was accidentally supplying the missing atomicity; once
+        # the attempt is offloaded to a worker thread (see
+        # project_checkout_lock._acquire_and_start_heartbeat_off_loop) several
+        # waiters released by the same poll tick genuinely interleave here and
+        # every one of them reads "no lock" before any of them writes one — so
+        # every one of them is granted the same lock. The guard lives here
+        # rather than in any one caller because it also closes the
+        # cross-process case (scripts/rebuild_project_images.py or
+        # scripts/release_lock.py running alongside the orchestrator).
+        #
+        # Deliberately a DIFFERENT lock file from the '<state>.yaml.lock' that
+        # _read_yaml_lock_only()/_save_lock_to_yaml()/release_lock() take
+        # internally: fcntl.flock() conflicts between two file descriptors of
+        # the same file even within a single process, so reusing that path
+        # would self-deadlock on the first nested read below.
+        from utils.file_lock import file_lock
+
+        state_file = self._get_state_file(project, board)
+        acquire_guard = state_file.with_suffix(state_file.suffix + '.acquire.lock')
+        try:
+            with file_lock(acquire_guard, enforce_timeout=True):
+                return self._try_acquire_lock_yaml_unguarded(project, board, issue_number)
+        except TimeoutError as e:
+            # Refuse rather than fall through unguarded: an unguarded
+            # read-modify-write is precisely the double-grant this exists to
+            # prevent, and every caller of this method polls, so a refusal is
+            # retried rather than fatal.
+            logger.error(
+                f"try_acquire_lock: could not serialize the YAML-fallback acquisition "
+                f"for {project}/{board} (issue #{issue_number}): {e} — refusing rather "
+                f"than performing an unguarded read-modify-write"
+            )
+            return False, "lock_acquire_serialization_timeout"
+        except OSError as e:
+            # The guard file itself could not be opened/locked (unwritable
+            # state dir, fd exhaustion). Same fail-closed posture as the
+            # unhealthy-reads check at the top of this method: refuse rather
+            # than grant a lock this call cannot make safe.
+            logger.error(
+                f"try_acquire_lock: could not take the YAML-fallback acquisition guard "
+                f"for {project}/{board} (issue #{issue_number}): {e} — refusing rather "
+                f"than performing an unguarded read-modify-write"
+            )
+            return False, "lock_acquire_serialization_unavailable"
+
+    def _try_acquire_lock_yaml_unguarded(
+        self,
+        project: str,
+        board: str,
+        issue_number: int
+    ) -> Tuple[bool, str]:
+        """
+        try_acquire_lock()'s YAML-fallback read-modify-write. MUST only be
+        called with that method's acquire guard held — see the comment at its
+        one call site for why this is not atomic on its own.
+        """
         lock = self.get_lock(project, board)
 
         # Case 1: No existing lock - acquire immediately
@@ -564,7 +637,7 @@ class PipelineLockManager:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
-                self.redis_client.expire(lock_key, 7200)  # 2 hours
+                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
                 redis_ok = True
                 logger.debug(f"Created lock in Redis: {lock_key}")
             except Exception as e:
@@ -674,7 +747,7 @@ class PipelineLockManager:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
-                self.redis_client.expire(lock_key, 7200)
+                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
                 redis_ok = True
             except Exception as e:
                 logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
@@ -692,7 +765,7 @@ class PipelineLockManager:
         # A Redis write failure is REFRESH_FAILED even when the YAML write
         # succeeded -- found in a later review round (#146 WI-1). The two
         # stores are NOT interchangeable for this method's purpose: only the
-        # Redis lock key has a TTL (fixed 7200s), and extending it is the
+        # Redis lock key has a TTL (LOCK_TTL_SECONDS), and extending it is the
         # entire reason the heartbeat that calls this exists (see
         # project_checkout_lock.HEARTBEAT_INTERVAL_SECONDS). The YAML copy
         # never expires, so refreshing it alone buys nothing against that
@@ -707,7 +780,7 @@ class PipelineLockManager:
         if self.redis_client and not redis_ok:
             logger.error(
                 f"touch_lock: Redis refresh write failed for {project}/{board} "
-                f"issue #{issue_number} -- the 7200s lock-key TTL was NOT extended "
+                f"issue #{issue_number} -- the {LOCK_TTL_SECONDS}s lock-key TTL was NOT extended "
                 f"(only the TTL-less YAML copy was), so this hold is still on the "
                 f"clock and may be acquired by a second caller when the key lapses"
             )
@@ -999,7 +1072,7 @@ class PipelineLockManager:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
-                self.redis_client.expire(lock_key, 7200)
+                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
                 redis_ok = True
             except Exception as e:
                 logger.error(f"Failed to mark lock failed in Redis: {e}")
@@ -1095,7 +1168,7 @@ class PipelineLockManager:
             try:
                 lock_key = self._get_lock_key(project, board)
                 self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
-                self.redis_client.expire(lock_key, 7200)
+                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
                 redis_ok = True
             except Exception as e:
                 logger.error(f"Failed to clear retained reason in Redis: {e}")
@@ -1280,7 +1353,7 @@ class PipelineLockManager:
                 if not existing_lock:
                     # Lock missing in Redis - sync it
                     self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(lock))
-                    self.redis_client.expire(lock_key, 7200)  # 2 hour TTL
+                    self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
                     logger.info(
                         f"Synced lock to Redis: {lock.project}/{lock.board} "
                         f"held by issue #{lock.locked_by_issue}"

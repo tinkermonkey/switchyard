@@ -292,5 +292,65 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
         self.assertTrue(result)
 
 
+class TestYamlFallbackAcquisitionIsSerialized(unittest.TestCase):
+    """
+    try_acquire_lock()'s YAML fallback (the branch taken whenever Redis is
+    unavailable) is a plain read-modify-write: read the current lock, decide,
+    then create one. Found in review of #146 WI-1 that nothing made it atomic
+    -- the single-threaded event loop had been accidentally supplying that
+    atomicity for every async caller, and moving the acquire attempt into a
+    worker thread let genuinely concurrent callers all read "no lock" before
+    any of them wrote one, granting every one of them the same lock. It is now
+    serialized by a dedicated advisory file lock (across processes too, so
+    scripts/rebuild_project_images.py and scripts/release_lock.py are covered
+    alongside the orchestrator).
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        # Explicit, not just redis_client=None: None makes the constructor
+        # build a real client from REDIS_HOST, which succeeds in the
+        # orchestrator container.
+        self.manager.redis_client = None
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_only_one_of_many_concurrent_threads_is_granted_the_lock(self):
+        import threading
+
+        granted = []
+        granted_lock = threading.Lock()
+        start = threading.Barrier(8)
+
+        def worker(issue_number):
+            start.wait(timeout=10)
+            success, _reason = self.manager.try_acquire_lock("proj", "board", issue_number)
+            if success:
+                with granted_lock:
+                    granted.append(issue_number)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(len(granted), 1, f"the same lock was granted to {granted}")
+        self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, granted[0])
+
+    def test_a_guard_that_cannot_be_taken_refuses_rather_than_granting_unguarded(self):
+        """Fail closed, matching this method's unhealthy-reads check: an
+        unguarded read-modify-write is exactly the double-grant the guard
+        exists to prevent, and every caller polls, so a refusal is retried."""
+        with patch('utils.file_lock.file_lock', side_effect=TimeoutError("guard busy")):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 1)
+
+        self.assertFalse(success)
+        self.assertEqual(reason, "lock_acquire_serialization_timeout")
+        self.assertIsNone(self.manager.get_lock("proj", "board"))
+
+
 if __name__ == '__main__':
     unittest.main()

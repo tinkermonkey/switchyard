@@ -180,6 +180,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional, Tuple
 
+from services.pipeline_lock_manager import LOCK_TTL_SECONDS
 from services.project_resource_lock_manager import ProjectResourceLockManager, TouchResult
 
 logger = logging.getLogger(__name__)
@@ -298,40 +299,50 @@ def _release_and_warn(
         )
 
 
+# The Redis lock-key TTL every constant below is calibrated against.
+# IMPORTED from PipelineLockManager rather than restated here -- found in
+# review (#146 WI-1): this used to be a literal 7200.0 duplicating a bare
+# `7200` spelled out at seven separate expire() call sites in
+# pipeline_lock_manager.py, with nothing tying the two modules together. An
+# operator shortening the real TTL there (e.g. to speed up stale-lock
+# recovery) would have left HEARTBEAT_INTERVAL_SECONDS below racing its own
+# key expiry with zero margin, and HEARTBEAT_FAILURE_ESCALATION_SECONDS
+# unable to fire before the TTL lapsed -- silently, with the whole test suite
+# still green. The relationship between the three is now asserted directly in
+# tests/unit/services/test_project_checkout_lock.py.
+REDIS_LOCK_TTL_SECONDS = float(LOCK_TTL_SECONDS)
+
 # How often to refresh the Redis lock key's TTL while legitimately holding a
 # lock built on this pattern. CRITICAL, found in code review and confirmed by
 # direct source reading of PipelineLockManager.try_acquire_lock(): the Redis
-# TTL is fixed at 7200s and is refreshed ONLY as a side effect of a repeat
-# acquire_resource() call for the SAME holder_id (the "already_holds_lock"
-# transaction branch does `pipe.expire(lock_key, 7200)`) -- it is never
-# refreshed proactively. This module's own acquire-then-yield-then-release
-# usage calls acquire_resource() exactly ONCE per hold, so a hold that
-# outlives 7200s with no heartbeat would have its Redis copy silently expire
-# while still legitimately held. Worse: the acquire transaction's own check
+# TTL is refreshed ONLY as a side effect of a repeat acquire_resource() call
+# for the SAME holder_id (the "already_holds_lock" transaction branch does
+# `pipe.expire(lock_key, LOCK_TTL_SECONDS)`) -- it is never refreshed
+# proactively. This module's own acquire-then-yield-then-release usage calls
+# acquire_resource() exactly ONCE per hold, so a hold that outlives the TTL
+# with no heartbeat would have its Redis copy silently expire while still
+# legitimately held. Worse: the acquire transaction's own check
 # (`if lock_data and lock_data.get('lock_status') == 'locked'`) reads an
 # expired key back as an EMPTY dict, which is falsy -- so a second caller's
 # acquire attempt at that point succeeds immediately, with no check against
 # the still-valid YAML copy at that point in the code path. Comfortably
-# under half the 7200s TTL so at least one heartbeat always lands before
-# expiry even under scheduling jitter.
-HEARTBEAT_INTERVAL_SECONDS = 1800.0
+# under half the TTL so at least one heartbeat always lands before expiry
+# even under scheduling jitter.
+HEARTBEAT_INTERVAL_SECONDS = REDIS_LOCK_TTL_SECONDS / 4.0
 
-# The Redis lock-key TTL a failing heartbeat is racing (PipelineLockManager's
-# own fixed 7200s -- see HEARTBEAT_INTERVAL_SECONDS above), and how long a
-# run of consecutive heartbeat failures may go on before it stops being a
-# transient blip and starts genuinely threatening that TTL. Found in review
-# (#140 item 30): every failed refresh used to log the same WARNING whether
-# it was one Redis hiccup or two hours of sustained failure with the TTL
-# about to lapse under a still-live holder, so an operator had no signal
-# distinguishing the two. Half the TTL leaves at least one more heartbeat
-# interval of margin after the escalation fires.
+# How long a run of consecutive heartbeat failures may go on before it stops
+# being a transient blip and starts genuinely threatening the TTL above.
+# Found in review (#140 item 30): every failed refresh used to log the same
+# WARNING whether it was one Redis hiccup or two hours of sustained failure
+# with the TTL about to lapse under a still-live holder, so an operator had
+# no signal distinguishing the two. Half the TTL leaves at least one more
+# heartbeat interval of margin after the escalation fires.
 #
 # Found in a later review round (#146 WI-1): "a failed refresh" here means
 # TouchResult.REFRESH_FAILED, not an exception. touch_lock() catches every
 # store failure internally and returns rather than raising, so an escalation
 # hung only off `except Exception` around touch_resource() could never fire
 # for the sustained-outage case it was written for -- see _heartbeat_worker.
-REDIS_LOCK_TTL_SECONDS = 7200.0
 HEARTBEAT_FAILURE_ESCALATION_SECONDS = REDIS_LOCK_TTL_SECONDS / 2.0
 
 

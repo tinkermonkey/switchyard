@@ -129,6 +129,19 @@ def _make_facade(tmp_dir: str) -> ProjectResourceLockManager:
     return ProjectResourceLockManager(lock_manager=lock_manager)
 
 
+def _make_yaml_only_facade(tmp_dir: str) -> ProjectResourceLockManager:
+    """
+    Facade over PipelineLockManager's documented YAML-only fallback -- see
+    test_project_checkout_lock.py's helper of the same name for the full
+    rationale. redis_client is cleared explicitly after construction rather
+    than just passed as None, because None makes the constructor build a real
+    client from REDIS_HOST, which succeeds inside the orchestrator container.
+    """
+    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), redis_client=None)
+    lock_manager.redis_client = None
+    return ProjectResourceLockManager(lock_manager=lock_manager)
+
+
 class TestDevContainerBuildLockSyncMechanics(unittest.TestCase):
     """Sequential (single-thread) coverage of the sync context manager's own
     poll/retry/timeout/release mechanics."""
@@ -349,6 +362,86 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
         self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
 
 
+class TestYamlOnlyFallbackConcurrency(unittest.TestCase):
+    """
+    The same acceptance criterion as TestConcurrentCollisionSerializes, but
+    over PipelineLockManager's YAML-only fallback rather than its atomic Redis
+    transaction (see _make_yaml_only_facade, and
+    test_project_checkout_lock.py's equivalent class for the full rationale).
+
+    Both of #56's own named racers reach that branch: a pipeline-driven build
+    through dev_container_build_lock_async()'s off-loop poll, and
+    scripts/rebuild_project_images.py through dev_container_build_lock_sync().
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.facade = _make_yaml_only_facade(self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_asyncio_tasks_racing_the_same_project_serialize_without_redis(self):
+        async def run():
+            inside = []
+            max_concurrent = {"value": 0}
+            completed = []
+
+            async def worker(n):
+                async with dev_container_build_lock_async(
+                    "shared-project", facade=self.facade,
+                    timeout_seconds=20, poll_interval_seconds=0.01,
+                ):
+                    inside.append(n)
+                    max_concurrent["value"] = max(max_concurrent["value"], len(inside))
+                    await asyncio.sleep(0.05)
+                    inside.remove(n)
+                    completed.append(n)
+
+            await asyncio.gather(*(worker(n) for n in range(6)))
+            return max_concurrent["value"], completed
+
+        max_concurrent, completed = asyncio.run(run())
+
+        self.assertEqual(sorted(completed), list(range(6)))
+        self.assertEqual(max_concurrent, 1)
+        self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
+
+    def test_threads_racing_the_same_project_serialize_without_redis(self):
+        inside = []
+        max_concurrent = {"value": 0}
+        count_lock = threading.Lock()
+        completed = []
+        errors = []
+
+        def worker(n):
+            try:
+                with dev_container_build_lock_sync(
+                    "shared-project", facade=self.facade,
+                    timeout_seconds=20, poll_interval_seconds=0.01,
+                ):
+                    with count_lock:
+                        inside.append(n)
+                        max_concurrent["value"] = max(max_concurrent["value"], len(inside))
+                    time.sleep(0.05)
+                    with count_lock:
+                        inside.remove(n)
+                        completed.append(n)
+            except Exception as e:  # pragma: no cover -- surfaced via errors list
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(completed), list(range(6)))
+        self.assertEqual(max_concurrent["value"], 1)
+        self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
+
+
 class TestDistinctFromProjectCheckoutResource(unittest.TestCase):
     """dev_container_build and project_checkout are distinct resources under
     the same facade -- holding one must never block the other for the same
@@ -503,6 +596,59 @@ class TestAsyncPathSharesTheEventLoopFixes:
                 raise _SentinelError("the body's real failure")
 
         facade.release_resource.assert_called_once()
+
+    async def test_a_cancellation_mid_hold_joins_the_heartbeat_then_releases_once(self):
+        """
+        Mirror of test_project_checkout_lock.py's
+        TestCancellationWhileHoldingTheAsyncLock (#140 item 34, found still
+        uncovered in review of #146 WI-1): a cancellation arriving while the
+        guarded body is INSIDE the `async with`. dev_container_build_lock_async()
+        has its own copy of the try/finally that owns the release, so the
+        guarantee has to be pinned here too -- moving the release inside the
+        `async with`, shielding the teardown, or offloading the release would
+        skip it entirely on this path, wedging the build lock under a
+        synthetic, process-local holder id nothing else will ever release.
+        """
+        order = []
+        touch_entered = threading.Event()
+        let_touch_finish = threading.Event()
+        touch_calls = []
+
+        def _touch(*args):
+            touch_calls.append(1)
+            if len(touch_calls) == 1:
+                touch_entered.set()
+                let_touch_finish.wait(timeout=5.0)
+                order.append("touch_returned")
+            return TouchResult.REFRESHED
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.side_effect = _touch
+        facade.release_resource.side_effect = lambda *a: (order.append("released"), True)[1]
+
+        real_start = project_checkout_lock._start_heartbeat_thread
+
+        def _fast_start(facade_, resource_name, project, holder_id, _interval):
+            return real_start(facade_, resource_name, project, holder_id, 0.02)
+
+        async def _hold():
+            async with dev_container_build_lock_async("proj", facade=facade):
+                await asyncio.sleep(30)  # cancelled here, mid-hold
+
+        with patch('services.project_checkout_lock._start_heartbeat_thread', _fast_start):
+            task = asyncio.create_task(_hold())
+            await asyncio.to_thread(touch_entered.wait, 5.0)
+            threading.Timer(0.2, let_touch_finish.set).start()
+            task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert order == ["touch_returned", "released"]
+        facade.release_resource.assert_called_once()
+        assert facade.release_resource.call_args.args[:2] == ("proj", RESOURCE_NAME)
+        assert f"lock-heartbeat-{RESOURCE_NAME}-proj" not in [t.name for t in threading.enumerate()]
 
 
 if __name__ == '__main__':
