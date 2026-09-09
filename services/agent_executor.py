@@ -846,6 +846,25 @@ class AgentExecutor:
                         logger.warning(f"Agent {agent_name} hit non-retryable error: {e}")
                         raise
 
+                    # Resource-lock timeout: contention, not an agent failure — never retry.
+                    # project_checkout_lock/dev_container_build_lock already polled for the
+                    # whole of their (deliberately generous: ~3h / ~1h) timeout before
+                    # raising, so retrying here just re-runs that same wait — turning one
+                    # contention event into ~9h at the default retries=2 — while the only
+                    # thing that can actually change the outcome is a different holder
+                    # finishing. The natural retry point is the next board poll/dispatch,
+                    # exactly as project_checkout_lock.py's "Blocking vs failing" section
+                    # describes. services/circuit_breaker.py separately exempts these from
+                    # this agent+project breaker's failure count (#148).
+                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    if is_lock_timeout_error(e):
+                        logger.warning(
+                            f"Agent {agent_name} could not acquire a project resource lock — "
+                            f"not retrying (contention, not an agent failure): "
+                            f"{describe_lock_timeout(e)}"
+                        )
+                        raise
+
                     # ClaudeCodeRateLimitError: systemic token limit — trip breaker if not open, never retry
                     if isinstance(e, ClaudeCodeRateLimitError):
                         claude_breaker = get_claude_code_breaker()

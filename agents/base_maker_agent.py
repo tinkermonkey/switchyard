@@ -172,4 +172,16 @@ class MakerAgent(PipelineStage, ABC):
             # equivalent fix for the same underlying pattern).
             raise
         except Exception as exc:
+            # Same rule, one more family (#148, from #140 item 25): run_claude_code()
+            # acquires the project_checkout and dev_container_build resource locks
+            # around this execution, and raises ProjectCheckoutLockTimeoutError /
+            # DevContainerBuildLockTimeoutError when it can't get one. Those are
+            # contention outcomes, not agent failures — agent_executor.py's retry
+            # loop and services/circuit_breaker.py both exempt them by type, and
+            # wrapping here would erase that type before either check runs, so a
+            # single ~3h contention wait would be retried into ~9h AND counted
+            # toward this agent+project's own breaker.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(exc):
+                raise
             raise Exception(f"{self.agent_display_name} execution failed: {exc}") from exc

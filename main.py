@@ -520,17 +520,29 @@ async def main():
     # Verify Docker images for all projects marked as verified
     # This handles cases where Docker context changed or images were lost
     logger.info("Verifying Docker images for verified projects")
+    from services.project_workspace import SetupStatus
+
     for project_name in projects_needing_setup.keys():
         image_verified = dev_container_state.verify_and_update_status(project_name)
         if not image_verified:
-            # Image was marked verified but doesn't exist - mark for setup
+            # Image was marked verified but doesn't exist - mark for setup.
+            # This is an independent, positive observation about the Docker image,
+            # so it upgrades an UNKNOWN (initialization never completed — see
+            # SetupStatus) to NEEDED exactly as it always has: a verifiably
+            # missing image needs setup regardless of whether the checkout could
+            # be inspected this startup.
             logger.info(f"Project {project_name} needs dev environment setup (Docker image missing)")
-            projects_needing_setup[project_name] = True
+            projects_needing_setup[project_name] = SetupStatus.NEEDED
 
     # Queue dev_environment_setup tasks for projects that need it
     from task_queue.task_manager import Task, TaskPriority
 
     for project_name, needs_setup in projects_needing_setup.items():
+        # SetupStatus.__bool__ is truthy only for NEEDED, so an UNKNOWN project
+        # (initialization never completed) queues nothing here — the same
+        # end state the old bare False produced, but no longer by asserting a
+        # "confirmed, no setup needed" answer nobody ever determined.
+        # initialize_all_projects() has already logged which projects those are.
         if needs_setup:
             logger.info(f"Queuing dev_environment_setup task for {project_name}")
 

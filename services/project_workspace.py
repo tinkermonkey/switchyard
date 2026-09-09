@@ -2,11 +2,61 @@ import subprocess
 import logging
 import shutil
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 from config.manager import config_manager
 
 logger = logging.getLogger(__name__)
+
+
+class SetupStatus(Enum):
+    """
+    Outcome of initialize_all_projects() for one project -- three genuinely
+    different states that a bare bool collapsed into two.
+
+    Found in review (#148, from #140 item 8): initialize_all_projects() caught
+    EVERY failure out of initialize_project() -- a genuine clone failure, a
+    missing/invalid repo_url, and (newly reachable since #54 put a
+    project_checkout lock around that clone/update) a
+    ProjectCheckoutLockTimeoutError from a stale lock left by a crashed prior
+    process -- and recorded needs_setup[project] = False. But False is an
+    ASSERTION: main.py's startup dispatch-queuing loop reads it as "confirmed,
+    this project does not need dev environment setup". "We could not even
+    attempt it, so we never found out" is categorically different, and
+    silently asserting the confirmed answer for it is the bug.
+
+    UNKNOWN deliberately covers both non-affirmative cases (lock timeout and
+    outright initialization failure) rather than splitting them further: no
+    caller can act differently on the two -- in both, the project's checkout
+    was never inspected -- and the distinction that IS operationally useful
+    (which failure happened) is carried in the per-project log line, which
+    names the exception type. What downstream needs is only "did we actually
+    determine this?", which is exactly the NEEDED/NOT_NEEDED vs UNKNOWN split.
+
+    Why UNKNOWN does not retry in-loop: initialize_project()'s
+    checkout_lock_timeout_seconds is deliberately short (120s) precisely
+    because a restart is the natural retry for this startup-only call site --
+    see its docstring. The dominant cause of contention here is a stale lock
+    from a crashed process, whose own recovery windows (7200s Redis TTL,
+    14400s YAML staleness) are far longer than any retry this loop could
+    justify, so an immediate retry would just double every project's startup
+    delay for no expected gain.
+
+    __bool__ is defined so main.py's existing `if needs_setup:` keeps its
+    original meaning: only NEEDED is truthy, so UNKNOWN queues no setup task,
+    exactly as the old False did -- the change is that it is now visible as
+    unknown rather than indistinguishable from a confirmed answer. Mirrors
+    TouchResult (services/pipeline_lock_manager.py) and ResetResult
+    (services/pipeline_queue_manager.py), introduced for the same reason.
+    """
+
+    NEEDED = "needed"          # confirmed: newly cloned, or Dockerfile.agent missing
+    NOT_NEEDED = "not_needed"  # confirmed: existing checkout that already has Dockerfile.agent
+    UNKNOWN = "unknown"        # never determined: initialization did not complete
+
+    def __bool__(self) -> bool:
+        return self is SetupStatus.NEEDED
 
 
 class ProjectWorkspaceManager:
@@ -49,12 +99,16 @@ class ProjectWorkspaceManager:
         # one create/one cleanup can't race) the same worktree.
         self._epic_worktree_lock = threading.Lock()
 
-    def initialize_all_projects(self) -> Dict[str, bool]:
+    def initialize_all_projects(self) -> Dict[str, 'SetupStatus']:
         """
         Initialize workspaces for all configured projects (excludes hidden/test projects)
 
         Returns:
-            Dict mapping project names to whether they need dev environment setup (True = newly cloned/missing Dockerfile.agent)
+            Dict mapping project names to a SetupStatus: NEEDED (newly cloned
+            or missing Dockerfile.agent), NOT_NEEDED (confirmed neither), or
+            UNKNOWN (initialization never completed -- a lock timeout or an
+            outright failure -- so the question was never answered). See
+            SetupStatus's docstring for why UNKNOWN exists and why it is falsy.
         """
         logger.info("Initializing all project workspaces")
 
@@ -79,14 +133,47 @@ class ProjectWorkspaceManager:
                 dockerfile_agent = project_dir / 'Dockerfile.agent'
 
                 # Need setup if: newly cloned OR missing Dockerfile.agent
-                needs_setup[project_name] = was_cloned or not dockerfile_agent.exists()
+                needs_setup[project_name] = (
+                    SetupStatus.NEEDED
+                    if (was_cloned or not dockerfile_agent.exists())
+                    else SetupStatus.NOT_NEEDED
+                )
 
                 if needs_setup[project_name]:
                     logger.info(f"Project {project_name} needs dev environment setup (newly_cloned={was_cloned}, has_dockerfile={dockerfile_agent.exists()})")
 
             except Exception as e:
-                logger.error(f"Failed to initialize project {project_name}: {e}")
-                needs_setup[project_name] = False
+                # UNKNOWN, never False (#148): this project's checkout was never
+                # inspected, so we cannot assert that it does not need setup.
+                # A lock timeout is called out separately because it is not a
+                # fault of this project's configuration or repository at all --
+                # another holder owned the project_checkout lock for the whole
+                # of initialize_project()'s (deliberately short) wait, most
+                # likely a stale lock left by a crashed prior process.
+                from services.resource_lock_errors import is_lock_timeout_error
+                if is_lock_timeout_error(e):
+                    logger.error(
+                        f"Could not initialize project {project_name}: the project_checkout "
+                        f"lock was held for the whole wait, so the checkout was never "
+                        f"inspected — dev environment setup need is UNKNOWN for this "
+                        f"startup: {e}"
+                    )
+                else:
+                    logger.error(
+                        f"Failed to initialize project {project_name} — dev environment "
+                        f"setup need is UNKNOWN: {type(e).__name__}: {e}"
+                    )
+                needs_setup[project_name] = SetupStatus.UNKNOWN
+
+        unknown = sorted(p for p, status in needs_setup.items() if status is SetupStatus.UNKNOWN)
+        if unknown:
+            logger.warning(
+                f"Project workspace initialization did not complete for {len(unknown)} "
+                f"project(s): {', '.join(unknown)}. Their dev environment setup need was "
+                f"never determined; no setup task will be queued for them on the strength "
+                f"of this startup (one is still queued if the Docker image is verifiably "
+                f"missing). Restart once the underlying cause is cleared."
+            )
 
         return needs_setup
 
