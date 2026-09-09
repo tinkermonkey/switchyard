@@ -110,9 +110,114 @@ class TestPipelineLockManager(unittest.TestCase):
             return func(mock_pipe)
 
         self.mock_redis.transaction.side_effect = side_effect_transaction
-        
+
         result = self.manager.release_lock("proj", "board", 123)
         self.assertFalse(result)
+
+
+class TestTouchLock(unittest.TestCase):
+    """
+    touch_lock() (added for services/project_checkout_lock.py's heartbeat
+    mechanism, #56 review) must refresh BOTH the Redis TTL AND
+    lock_acquired_at -- unlike try_acquire_lock()'s "already_holds_lock"
+    reentry branch, which only refreshes the TTL. Uses redis_client=None
+    (YAML-only) so lock_acquired_at is observable directly from the on-disk
+    state without fighting a stateless Redis mock.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_refreshes_lock_acquired_at_for_the_current_holder(self):
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+
+        # Force a real, observable time difference regardless of clock
+        # resolution/timing flakiness.
+        import time as _time
+        _time.sleep(0.01)
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertTrue(result)
+        refreshed = self.manager.get_lock("proj", "board")
+        self.assertGreater(refreshed.lock_acquired_at, original.lock_acquired_at)
+        self.assertEqual(refreshed.locked_by_issue, 123)
+
+    def test_returns_false_and_does_not_touch_a_lock_held_by_a_different_issue(self):
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+
+        result = self.manager.touch_lock("proj", "board", 456)
+
+        self.assertFalse(result)
+        unchanged = self.manager.get_lock("proj", "board")
+        self.assertEqual(unchanged.lock_acquired_at, original.lock_acquired_at)
+        self.assertEqual(unchanged.locked_by_issue, 123)
+
+    def test_returns_false_when_no_lock_exists_at_all(self):
+        result = self.manager.touch_lock("proj", "board", 123)
+        self.assertFalse(result)
+
+    def test_preserves_retained_reason_if_somehow_set(self):
+        """Defensive: touch_lock() should never called on a retained lock in
+        practice (nothing that calls it also calls mark_lock_failed), but
+        must not silently clear retained_reason if it ever is."""
+        self.manager._create_lock("proj", "board", 123)
+        self.manager.mark_lock_failed("proj", "board", 123, "agent crashed")
+
+        self.manager.touch_lock("proj", "board", 123)
+
+        lock = self.manager.get_lock("proj", "board")
+        self.assertEqual(lock.retained_reason, "agent crashed")
+
+
+class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
+    """
+    CRITICAL regression (found in PR #138 review, /pr-review-toolkit:review-pr):
+    touch_lock() used to read via plain get_lock(), which collapses
+    "confirmed unlocked" and "both Redis and YAML reads raised" into the
+    same None -- so a transient dual-store outage was indistinguishable
+    from "lock genuinely lost to another holder" to callers, and
+    project_checkout_lock.py's heartbeat logs the latter as a specific,
+    alarming ERROR. Must use get_lock_fail_closed() instead so a read
+    failure returns False WITHOUT being conflated with confirmed loss.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_returns_false_when_both_reads_fail_without_a_healthy_read_ever_happening(self):
+        # Redis read raises.
+        self.mock_redis.hgetall.side_effect = Exception("redis down")
+        # YAML read also fails: corrupt the state file directly.
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertFalse(result)
+
+    def test_still_works_normally_once_reads_are_healthy_again(self):
+        """Not a general regression test of the happy path (see TestTouchLock
+        above) -- specifically confirms the fail-closed branch doesn't
+        permanently wedge the method once reads recover."""
+        self.mock_redis.hgetall.return_value = {}  # empty dict: healthy, "not locked in Redis"
+        self.manager._create_lock("proj", "board", 123)
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertTrue(result)
+
 
 if __name__ == '__main__':
     unittest.main()

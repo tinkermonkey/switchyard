@@ -915,11 +915,19 @@ class DockerAgentRunner:
                     # instead of a bespoke write invisible to `git reflog`;
                     # (2) safety under the launch-teardown overlap this
                     # codebase's own concurrency model doesn't fully rule out
-                    # yet (steal_lock() lets a repair cycle claim a lock
-                    # without confirming the previous holder's container has
-                    # finished tearing down; PipelineSemaphoreManager's
-                    # per-epic exclusivity is explicitly "NOT yet wired into
-                    # any live dispatch path") -- if a DIFFERENT, overlapping
+                    # yet (PipelineLockManager's own stale-lock auto-recovery
+                    # -- try_acquire_lock() reclaiming a lock whose holder
+                    # hasn't touched it in 4 hours -- can still hand it to a
+                    # new holder without confirming the previous holder's
+                    # container actually finished tearing down; as of #58,
+                    # Phase 2 of #34's concurrency redesign, this is no longer
+                    # also true of repair cycles specifically -- the old
+                    # steal_lock() they used to call forced this same overlap
+                    # unconditionally, on every acquire, not just the rare
+                    # stale-lock case, and has been removed entirely.
+                    # PipelineSemaphoreManager's per-epic exclusivity is
+                    # separately still "NOT yet wired into any live dispatch
+                    # path") -- if a DIFFERENT, overlapping
                     # teardown already moved this same ref past what THIS
                     # launch staged as its starting point, the <old> guard
                     # (original_sha, captured at prepare-time) makes git

@@ -1297,6 +1297,15 @@ class WorkExecutionStateTracker:
 
         logger.info(f"Watchdog: Checking {len(state_files)} execution state files for empty outputs")
 
+        # Cache project_config across every state file in this sweep, keyed
+        # by project name (found in #58 review round 3: get_project_config()
+        # re-reads and re-parses the project's YAML from disk on every call,
+        # no caching of its own -- state files for the same project are
+        # common in one sweep, so fetching it once per state file instead of
+        # once per project multiplies disk I/O by issue count rather than
+        # project count on this periodic maintenance path).
+        project_config_cache = {}
+
         for state_file in state_files:
             try:
                 from utils.file_lock import file_lock
@@ -1336,36 +1345,125 @@ class WorkExecutionStateTracker:
                         continue
 
                     # PROTECTION 2: Check pipeline lock
+                    #
+                    # Found in #57 review: this previously did
+                    # project_config.get('pipelines', {}).get('enabled', [])
+                    # on a ProjectConfig dataclass (which has no .get() at
+                    # all -- `pipelines` is a plain `List[ProjectPipeline]`
+                    # attribute) and called lock_manager.get_lock_status(...),
+                    # a method that doesn't exist on PipelineLockManager --
+                    # both raised AttributeError on every single invocation,
+                    # silently swallowed by the except below exactly like
+                    # PROTECTION 3's own dead get_pipeline_queue() import
+                    # (fixed above in this same commit), making this
+                    # protection a permanent no-op too. Separately, the inner
+                    # `continue` only continued the `for pipeline_config`
+                    # loop, not the outer per-state-file loop -- even with a
+                    # real API call, it would not actually have skipped this
+                    # execution. Fixed to use the real
+                    # ProjectPipeline.board_name attribute and
+                    # PipelineLockManager.get_lock_holder(), and to use the
+                    # same locked-flag + break + outer-continue shape
+                    # PROTECTION 3 already gets right.
+                    #
+                    # Fetches project_config once, shared with PROTECTION 3
+                    # below (found in #58 review: each protection previously
+                    # called config_manager.get_project_config(project_name)
+                    # separately for the same project in the same loop
+                    # iteration -- get_project_config() re-reads and
+                    # re-parses the project's YAML from disk on every call,
+                    # no caching, so this was a redundant disk read + parse
+                    # every single state-file iteration).
+                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    from config.manager import config_manager
+
+                    if project_name in project_config_cache:
+                        project_config = project_config_cache[project_name]
+                    else:
+                        # Only cache a SUCCESSFUL lookup, not a failure (found
+                        # in final whole-PR review): caching None on the
+                        # first exception would silently degrade PROTECTION
+                        # 2/3 to no-ops for every remaining state file of
+                        # this project in the same sweep, with no retry --
+                        # a transient error on file #1 shouldn't poison
+                        # files #2..N when the underlying config read might
+                        # well succeed on a later attempt.
+                        try:
+                            project_config = config_manager.get_project_config(project_name)
+                            project_config_cache[project_name] = project_config
+                        except Exception as e:
+                            project_config = None
+                            logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+
                     try:
-                        from services.pipeline_lock_manager import get_pipeline_lock_manager
-                        from config.manager import config_manager
-
                         lock_manager = get_pipeline_lock_manager()
-                        project_config = config_manager.get_project_config(project_name)
 
-                        if project_config:
-                            # Get pipeline config for this project
-                            pipeline_configs = project_config.get('pipelines', {}).get('enabled', [])
-                            for pipeline_config in pipeline_configs:
-                                board_name = pipeline_config.get('workflow', 'unknown')
-                                lock_status = lock_manager.get_lock_status(project_name, board_name)
-                                if lock_status and lock_status.issue_number:
-                                    logger.debug(
-                                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                        f"pipeline locked by issue #{lock_status.issue_number}"
-                                    )
-                                    continue
+                        locked_by_another_issue = False
+                        for pipeline_config in getattr(project_config, 'pipelines', None) or []:
+                            board_name = getattr(pipeline_config, 'board_name', None)
+                            if not board_name:
+                                continue
+                            holder_issue = lock_manager.get_lock_holder(project_name, board_name)
+                            # CRITICAL fix (found in #58 review): this must only
+                            # skip when the lock is held by a DIFFERENT issue.
+                            # The original version fired for ANY holder,
+                            # including this exact issue holding its own
+                            # lock -- which is the common case right after an
+                            # issue finishes a stage (locks release only at
+                            # specific exit columns, not after every stage),
+                            # so this protection was skipping almost every
+                            # retry check, not just the ones actually racing
+                            # a different issue's in-progress work.
+                            if holder_issue and holder_issue != issue_number:
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"pipeline locked by issue #{holder_issue}"
+                                )
+                                locked_by_another_issue = True
+                                break
+
+                        if locked_by_another_issue:
+                            continue
                     except Exception as e:
                         logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
 
                     # PROTECTION 3: Check queue state
+                    #
+                    # Issue #57: this used to import a nonexistent
+                    # get_pipeline_queue() (only get_pipeline_queue_manager
+                    # (project, board) / PipelineQueueManager actually exist in
+                    # services/pipeline_queue_manager.py), so this protection
+                    # was a silent no-op -- the ImportError was swallowed by
+                    # the broad except below and only ever logged at debug
+                    # level. Implemented properly now that the queue manager
+                    # exposes get_issue_status(): skip retry-marking if the
+                    # issue is already 'waiting' or 'active' in the queue for
+                    # any of its pipelines' boards -- it's already about to be
+                    # (or currently being) legitimately processed, so marking
+                    # it 'failure' here to force a retry would race with that.
                     try:
-                        from services.pipeline_queue_manager import get_pipeline_queue
+                        from services.pipeline_queue_manager import get_pipeline_queue_manager
 
-                        queue_manager = get_pipeline_queue()
-                        # Check if issue is already queued or active
-                        # Note: This is a simple check - queue manager would need to expose status API
-                        # For now, skip this protection as it requires queue manager changes
+                        already_queued_or_active = False
+                        # Reuses project_config fetched once above PROTECTION 2 --
+                        # see the comment there.
+                        for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
+                            board_name = getattr(pipeline_cfg, 'board_name', None)
+                            if not board_name:
+                                continue
+                            queue_status = get_pipeline_queue_manager(
+                                project_name, board_name
+                            ).get_issue_status(issue_number)
+                            if queue_status in ('waiting', 'active'):
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"already '{queue_status}' in pipeline queue for board '{board_name}'"
+                                )
+                                already_queued_or_active = True
+                                break
+
+                        if already_queued_or_active:
+                            continue
                     except Exception as e:
                         logger.debug(f"Watchdog: Could not check queue status: {e}")
 

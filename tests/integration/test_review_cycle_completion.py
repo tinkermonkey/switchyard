@@ -8,7 +8,7 @@ review cycles complete.
 
 import pytest
 import asyncio
-from unittest.mock import Mock, MagicMock, patch, AsyncMock
+from unittest.mock import Mock, MagicMock, patch, AsyncMock, call
 from datetime import datetime
 from services.project_monitor import ProjectMonitor
 from config.manager import ConfigManager
@@ -332,6 +332,175 @@ class TestReviewCycleCompletion:
 
                             # CRITICAL: Verify lock was NOT released due to error (safe default)
                             mock_lock_mgr.release_lock.assert_not_called()
+
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestReviewCycleCompletionQueueDispatch:
+    """Phase 2 (issue #57): the review-cycle-completion exit-column handler
+    (inside _start_review_cycle_for_issue's background thread finally block)
+    is one of the "get next -> try_acquire_lock -> mark_issue_active" dispatch
+    call sites generalized to loop over available slots. Today's
+    available_slots is hardcoded to 1 (PipelineLockManager still allows only
+    one lock per (project, board)), so get_next_n_waiting_issues(1) must
+    drive the exact same single-dispatch behavior as the pre-#57
+    get_next_waiting_issue() call it replaced.
+
+    Note: is_exit_column here is based on the STARTING status passed into
+    _start_review_cycle_for_issue (i.e. the review cycle already started in
+    an exit column), NOT wherever start_review_cycle() says it moved to --
+    see the sibling tests above documenting the same behavior.
+    """
+
+    async def test_dispatches_single_next_queued_issue_after_exit_column_release(
+        self,
+        project_monitor,
+        mock_config_manager
+    ):
+        """Byte-identical-at-capacity-1 check: with exactly one waiting issue
+        queued, the exit-column finally block must release the lock for the
+        completed issue, fetch the next queued issue, acquire the lock for
+        it, mark it active, and dispatch a task for it -- the same sequence
+        get_next_waiting_issue() drove before #57."""
+        project_config = mock_config_manager.get_project_config("test_project")
+        workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
+        # Use the "Code Review" column object (has a real agent/maker_agent,
+        # needed for run_cycle_in_thread's report text) while passing
+        # status="Done" -- is_exit_column is keyed off the STARTING status
+        # param, not the column object's name (see class docstring).
+        review_column = workflow_template.columns[1]  # "Code Review"
+
+        project_monitor.get_issue_column_sync = Mock(return_value='Development')
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+            mock_lock_mgr = Mock()
+            mock_lock_mgr.try_acquire_lock.return_value = (True, "lock_acquired")
+            mock_lock_mgr.release_lock.return_value = True
+            mock_get_lock_mgr.return_value = mock_lock_mgr
+
+            with patch('services.review_cycle.review_cycle_executor') as mock_review_executor:
+                async def mock_start_review_cycle(*args, **kwargs):
+                    return "Done", True
+
+                mock_review_executor.start_review_cycle = AsyncMock(side_effect=mock_start_review_cycle)
+
+                with patch('services.github_integration.GitHubIntegration') as mock_github_cls:
+                    mock_github = Mock()
+                    mock_github.post_agent_output = AsyncMock()
+                    mock_github_cls.return_value = mock_github
+
+                    with patch('config.state_manager.state_manager') as mock_state_mgr:
+                        mock_state_mgr.get_discussion_for_issue.return_value = None
+
+                        with patch('services.pipeline_queue_manager.get_pipeline_queue_manager') as mock_get_queue_mgr, \
+                             patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_run_mgr:
+                            mock_queue_mgr = Mock()
+                            mock_queue_mgr.get_next_n_waiting_issues.return_value = [
+                                {'issue_number': 456, 'position_in_column': 0}
+                            ]
+                            mock_get_queue_mgr.return_value = mock_queue_mgr
+
+                            mock_run_mgr = Mock()
+                            mock_run_mgr.ensure_pipeline_run_for_task.return_value = 'run-456'
+                            mock_get_run_mgr.return_value = mock_run_mgr
+
+                            project_monitor._start_review_cycle_for_issue(
+                                project_name="test_project",
+                                board_name="SDLC Execution",
+                                issue_number=123,
+                                status="Done",
+                                repository="test-repo",
+                                project_config=project_config,
+                                pipeline_config=project_config.pipelines[0],
+                                workflow_template=workflow_template,
+                                column=review_column
+                            )
+
+                            await asyncio.sleep(0.5)
+
+                        # Lock released for the completed issue (123)
+                        mock_lock_mgr.release_lock.assert_called_once_with(
+                            "test_project", "SDLC Execution", 123
+                        )
+
+                        # Queried for exactly 1 slot (today's hardcoded available_slots)
+                        mock_queue_mgr.get_next_n_waiting_issues.assert_called_once_with(1)
+
+                        # Lock acquired for BOTH the original issue and the next queued one
+                        assert mock_lock_mgr.try_acquire_lock.call_args_list == [
+                            call(project="test_project", board="SDLC Execution", issue_number=123),
+                            call(project="test_project", board="SDLC Execution", issue_number=456),
+                        ]
+
+                        # Next issue marked active and a task dispatched for it
+                        mock_queue_mgr.mark_issue_active.assert_called_once_with(456)
+                        project_monitor.task_queue.enqueue.assert_called_once()
+                        dispatched_task = project_monitor.task_queue.enqueue.call_args[0][0]
+                        assert dispatched_task.context['issue_number'] == 456
+                        assert dispatched_task.context['trigger'] == 'review_cycle_completion_queue_processing'
+
+    async def test_no_dispatch_when_queue_empty(
+        self,
+        project_monitor,
+        mock_config_manager
+    ):
+        """Control case: empty queue (get_next_n_waiting_issues(1) -> []) must
+        release the lock for the completed issue and dispatch nothing --
+        matching the pre-#57 get_next_waiting_issue() -> None behavior."""
+        project_config = mock_config_manager.get_project_config("test_project")
+        workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
+        review_column = workflow_template.columns[1]  # "Code Review"
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+            mock_lock_mgr = Mock()
+            mock_lock_mgr.try_acquire_lock.return_value = (True, "lock_acquired")
+            mock_lock_mgr.release_lock.return_value = True
+            mock_get_lock_mgr.return_value = mock_lock_mgr
+
+            with patch('services.review_cycle.review_cycle_executor') as mock_review_executor:
+                async def mock_start_review_cycle(*args, **kwargs):
+                    return "Done", True
+
+                mock_review_executor.start_review_cycle = AsyncMock(side_effect=mock_start_review_cycle)
+
+                with patch('services.github_integration.GitHubIntegration') as mock_github_cls:
+                    mock_github = Mock()
+                    mock_github.post_agent_output = AsyncMock()
+                    mock_github_cls.return_value = mock_github
+
+                    with patch('config.state_manager.state_manager') as mock_state_mgr:
+                        mock_state_mgr.get_discussion_for_issue.return_value = None
+
+                        with patch('services.pipeline_queue_manager.get_pipeline_queue_manager') as mock_get_queue_mgr:
+                            mock_queue_mgr = Mock()
+                            mock_queue_mgr.get_next_n_waiting_issues.return_value = []
+                            mock_get_queue_mgr.return_value = mock_queue_mgr
+
+                            project_monitor._start_review_cycle_for_issue(
+                                project_name="test_project",
+                                board_name="SDLC Execution",
+                                issue_number=123,
+                                status="Done",
+                                repository="test-repo",
+                                project_config=project_config,
+                                pipeline_config=project_config.pipelines[0],
+                                workflow_template=workflow_template,
+                                column=review_column
+                            )
+
+                            await asyncio.sleep(0.5)
+
+                        mock_lock_mgr.release_lock.assert_called_once_with(
+                            "test_project", "SDLC Execution", 123
+                        )
+                        mock_queue_mgr.get_next_n_waiting_issues.assert_called_once_with(1)
+                        mock_queue_mgr.mark_issue_active.assert_not_called()
+                        # Only the initial try_acquire_lock for issue 123 -- none for a next issue
+                        mock_lock_mgr.try_acquire_lock.assert_called_once_with(
+                            project="test_project", board="SDLC Execution", issue_number=123
+                        )
+                        project_monitor.task_queue.enqueue.assert_not_called()
 
 
 if __name__ == '__main__':

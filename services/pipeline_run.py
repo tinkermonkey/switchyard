@@ -1498,9 +1498,18 @@ class PipelineRunManager:
                     import time
 
                     pipeline_queue = get_pipeline_queue_manager(project, pipeline_run.board)
-                    next_issue = pipeline_queue.get_next_waiting_issue()
-                    
-                    if next_issue:
+                    # Phase 2 (issue #57): "available_slots" is hardcoded to 1 today --
+                    # PipelineLockManager still enforces exactly one concurrent issue per
+                    # (project, board) -- so get_next_n_waiting_issues(1) returns at most
+                    # one candidate and this loop runs its body at most once, identical to
+                    # the pre-#57 get_next_waiting_issue()-based single attempt. Phase 3a
+                    # (out of scope here) is what will eventually make this a real count.
+                    available_slots = 1
+                    next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+                    if not next_issues:
+                        logger.debug(f"No more issues waiting in queue for {project}/{pipeline_run.board}")
+
+                    for next_issue in next_issues:
                         logger.info(f"Attempting to acquire lock for next queued issue #{next_issue['issue_number']} after #{issue_number} completed")
                         
                         # Try to acquire lock for next issue
@@ -1640,8 +1649,6 @@ class PipelineRunManager:
                             logger.info(
                                 f"Could not acquire lock for next issue #{next_issue['issue_number']}: {acquire_reason}"
                             )
-                    else:
-                        logger.debug(f"No more issues waiting in queue for {project}/{pipeline_run.board}")
                 except Exception as queue_error:
                     logger.error(f"Error processing next queued issue for {project}/{pipeline_run.board}: {queue_error}")
                     import traceback

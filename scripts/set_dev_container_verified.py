@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from services.dev_container_state import dev_container_state, DevContainerStatus
+from services.dev_container_build_lock import dev_container_build_lock_sync, DevContainerBuildLockTimeoutError
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
@@ -20,16 +21,27 @@ if __name__ == '__main__':
     project_name = sys.argv[1]
     image_name = f"{project_name}-agent:latest"
 
-    # Set status to VERIFIED
-    dev_container_state.set_status(
-        project_name=project_name,
-        status=DevContainerStatus.VERIFIED,
-        image_name=image_name
-    )
+    # dev_container_build lock (#56): this is one of the two admin scripts
+    # that used to bypass PipelineLockManager entirely and could race a live
+    # pipeline-driven build/verify for the same project. Acquiring the same
+    # project-level lock the pipeline path uses (claude/claude_integration.py)
+    # before touching dev_container_state serializes this operator override
+    # against any in-flight dev_environment_setup/verifier run.
+    try:
+        with dev_container_build_lock_sync(project_name):
+            # Set status to VERIFIED
+            dev_container_state.set_status(
+                project_name=project_name,
+                status=DevContainerStatus.VERIFIED,
+                image_name=image_name
+            )
 
-    print(f"✓ Marked {project_name} dev container as VERIFIED")
-    print(f"  Image: {image_name}")
+            print(f"✓ Marked {project_name} dev container as VERIFIED")
+            print(f"  Image: {image_name}")
 
-    # Verify it was set
-    status = dev_container_state.get_status(project_name)
-    print(f"  Current status: {status.value}")
+            # Verify it was set
+            status = dev_container_state.get_status(project_name)
+            print(f"  Current status: {status.value}")
+    except DevContainerBuildLockTimeoutError as e:
+        print(f"✗ {e}")
+        sys.exit(1)

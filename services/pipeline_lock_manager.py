@@ -11,6 +11,7 @@ import yaml
 import redis
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime, timezone, timedelta
@@ -512,9 +513,10 @@ class PipelineLockManager:
             True if the lock was recorded in at least one durable store
             (mirrors mark_lock_failed's fail-open-across-two-stores pattern),
             False if BOTH the Redis and YAML writes failed — a caller relying
-            on this lock actually existing (e.g. steal_lock(), which reports
-            success to its own caller based on this) must not treat a
-            both-failed write as if the lock was acquired.
+            on this lock actually existing (e.g. try_acquire_lock()'s YAML-
+            fallback path, which reports success to its own caller based on
+            this) must not treat a both-failed write as if the lock was
+            acquired.
         """
         lock = PipelineLock(
             project=project,
@@ -550,6 +552,100 @@ class PipelineLockManager:
         logger.info(
             f"Pipeline lock acquired: {project}/{board} by issue #{issue_number}"
         )
+        return True
+
+    def touch_lock(self, project: str, board: str, issue_number: int) -> bool:
+        """
+        Refresh an ALREADY-HELD lock's liveness markers -- both the Redis TTL
+        AND lock_acquired_at -- without changing its holder.
+
+        Added for services/project_checkout_lock.py's heartbeat mechanism
+        (found necessary in code review, #56): try_acquire_lock()'s
+        "already_holds_lock" branch already refreshes the Redis TTL on a
+        repeat call from the same issue_number, but it does NOT reset
+        lock_acquired_at -- so a lock held by a caller that only ever
+        re-calls try_acquire_lock() (never this method) would still be
+        judged stale by the 4-hour age-based heuristic elsewhere in this
+        class and could be handed to a different caller while the original
+        holder is still genuinely alive and heartbeating. This method exists
+        specifically to reset that clock too.
+
+        Callers must already know they hold this lock (e.g. a heartbeat loop
+        started immediately after a successful try_acquire_lock() for this
+        exact issue_number) -- this does NOT acquire on behalf of a new
+        holder and is not atomic with respect to a concurrent acquire/release
+        for the same lock (acceptable here: it's a periodic liveness refresh
+        for a lock this same process already holds, not the acquisition path
+        itself, which is what needs the atomic transaction).
+
+        Returns:
+            True if the lock was found (held by issue_number) and refreshed
+            in at least one durable store, False if it isn't currently held
+            by issue_number at all (including "no lock exists"), if both
+            reads failed (state genuinely unknown), or if both writes failed.
+
+        Note (found in PR #138 review, /pr-review-toolkit:review-pr): reads via
+        get_lock_fail_closed(), not the plain get_lock() this method used
+        before -- get_lock() collapses "confirmed unlocked" and "both Redis
+        and YAML reads raised" into the same None, so a transient dual-store
+        outage would be indistinguishable from "lock genuinely lost to
+        another holder" to this method's caller. project_checkout_lock.py's
+        heartbeat treats a False return as proof of the latter and logs a
+        specific, alarming "lock lost to a competing holder" ERROR -- which
+        would have been a false alarm for a momentary storage hiccup. Reads
+        being unhealthy is logged distinctly below rather than folded into
+        the same False the "genuinely not held" case returns.
+        """
+        lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        if not reads_healthy:
+            logger.error(
+                f"touch_lock: could not determine lock state for {project}/{board} "
+                f"(both Redis and YAML reads failed) -- cannot confirm issue "
+                f"#{issue_number} still holds this lock, but this is NOT confirmed "
+                f"loss to another holder either; refusing to refresh liveness "
+                f"rather than silently reporting a false 'lock lost' condition"
+            )
+            return False
+        if not lock or lock.locked_by_issue != issue_number:
+            return False
+
+        refreshed = PipelineLock(
+            project=project,
+            board=board,
+            locked_by_issue=issue_number,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked',
+            # Preserve retained state rather than silently clearing it --
+            # mirrors _create_lock_yaml_only()'s own defensive preservation.
+            # In practice this lock should never be retained while something
+            # is still successfully heartbeating it (mark_lock_failed() is
+            # for a run that has already ended), but this stays defensive
+            # against that edge case rather than relying on a single layer
+            # of protection.
+            retained_reason=lock.retained_reason,
+            retained_at=lock.retained_at,
+        )
+
+        redis_ok = False
+        if self.redis_client:
+            try:
+                lock_key = self._get_lock_key(project, board)
+                self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
+                self.redis_client.expire(lock_key, 7200)
+                redis_ok = True
+            except Exception as e:
+                logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+
+        yaml_ok = self._save_lock_to_yaml(refreshed)
+
+        if not redis_ok and not yaml_ok:
+            logger.error(
+                f"touch_lock: BOTH Redis and YAML refresh writes failed for "
+                f"{project}/{board} issue #{issue_number} -- liveness was NOT "
+                f"extended, this lock may be stolen by the staleness heuristic"
+            )
+            return False
+
         return True
 
     def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
@@ -786,128 +882,6 @@ class PipelineLockManager:
             f"Pipeline lock released: {project}/{board} by issue #{issue_number}"
         )
         return True
-
-    def steal_lock(self, project: str, board: str, new_issue_number: int) -> Tuple[bool, str]:
-        """
-        Forcibly transfer the (project, board) lock to new_issue_number,
-        refusing if the current holder's lock is retained-due-to-failure.
-
-        This is the ONLY sanctioned way to hand a lock to a different issue
-        than its current (non-retained) holder — e.g. repair cycles, which
-        have priority over whatever ordinary agent currently holds a board's
-        lock. It exists specifically so _create_lock()/_create_lock_yaml_only()
-        never need to be called directly from outside this class again for
-        this purpose: two real bugs at that one call site (project_monitor.py's
-        repair-cycle dispatch) across this PR's review rounds (rounds 3 and 4)
-        came from the retained_reason check and the lock-construction call
-        being two separately-maintained steps there, where a future edit could
-        drop the check while leaving the construction call intact and
-        unnoticed. Centralizing both here removes that failure mode
-        structurally instead of relying on every caller to re-derive it
-        correctly.
-
-        Uses get_lock_fail_closed() internally — refuses (rather than silently
-        proceeding as if unlocked) when lock state genuinely can't be
-        determined.
-
-        Returns:
-            (True, "stolen") — the lock was released from its prior holder and
-                now belongs to new_issue_number.
-            (True, "already_held") — new_issue_number already held the lock;
-                nothing changed.
-            (True, "acquired") — nothing was locked; a fresh lock was created.
-            (False, "retained:<reason>") — the current holder's lock is
-                retained due to a failed run; refused.
-            (False, "lock_state_unknown") — lock state could not be
-                determined (both Redis and YAML reads failed); refused.
-            (False, "release_failed") — stealing required releasing the prior
-                holder's lock and that release itself failed.
-            (False, "create_failed") — the new lock write itself failed in
-                both Redis and YAML (e.g. a prior holder's lock was
-                successfully released, or nothing was locked at all, but the
-                new lock could not be recorded anywhere) — the board may now
-                be genuinely unlocked with nothing to show for it.
-        """
-        current_lock, reads_healthy = self.get_lock_fail_closed(project, board)
-        if not reads_healthy:
-            logger.error(
-                f"steal_lock: could not determine lock state for {project}/{board} "
-                f"(both Redis and YAML reads failed) — refusing to steal/create "
-                f"rather than risk creating a lock while a retained one might "
-                f"actually be held"
-            )
-            return False, "lock_state_unknown"
-
-        if current_lock and current_lock.locked_by_issue != new_issue_number:
-            if current_lock.retained_reason:
-                logger.error(
-                    f"steal_lock: {project}/{board} cannot be stolen for issue "
-                    f"#{new_issue_number} — it is retained due to a failed run on "
-                    f"issue #{current_lock.locked_by_issue} "
-                    f"({current_lock.retained_reason}). A human must run "
-                    f"scripts/release_lock.py before this board can be used by "
-                    f"any other issue."
-                )
-                return False, f"retained:{current_lock.retained_reason}"
-
-            logger.warning(
-                f"steal_lock: transferring {project}/{board} from issue "
-                f"#{current_lock.locked_by_issue} to issue #{new_issue_number}"
-            )
-            # Defense-in-depth re-check immediately before the destructive
-            # release: the check above and this release aren't atomic, so a
-            # concurrent mark_lock_failed() landing in between isn't provably
-            # impossible (same narrow-race reasoning try_acquire_lock's stale-
-            # lock recovery branch already applies to itself). force=True below
-            # deliberately bypasses release_lock()'s OWN retained_reason guard
-            # (that's what force means — it's the mechanism scripts/
-            # release_lock.py's deliberate override relies on), so without this
-            # re-check here, nothing between the check above and the release
-            # below would actually catch a lock that became retained in that
-            # window.
-            current_lock, reads_healthy = self.get_lock_fail_closed(project, board)
-            if not reads_healthy:
-                logger.error(
-                    f"steal_lock: could not re-confirm lock state for {project}/{board} "
-                    f"immediately before release — refusing to proceed with the steal"
-                )
-                return False, "lock_state_unknown"
-            if current_lock and current_lock.retained_reason:
-                logger.error(
-                    f"steal_lock: {project}/{board} became retained (issue "
-                    f"#{current_lock.locked_by_issue}: {current_lock.retained_reason}) "
-                    f"between the initial check and the release — refusing to steal it."
-                )
-                return False, f"retained:{current_lock.retained_reason}"
-
-            if current_lock:
-                # force=True is safe here: we've now confirmed twice that the
-                # lock isn't retained, so this releases an ordinary,
-                # actively-held lock, not bypassing the recovery flow.
-                released = self.release_lock(project, board, current_lock.locked_by_issue, force=True)
-                if not released:
-                    logger.error(
-                        f"steal_lock: could not release the lock held by issue "
-                        f"#{current_lock.locked_by_issue} for {project}/{board} — "
-                        f"refusing to steal it via a fresh lock creation."
-                    )
-                    return False, "release_failed"
-            # else: someone else already released it between the initial check
-            # and here — nothing left to release, fall through to create.
-            if not self._create_lock(project, board, new_issue_number):
-                # The prior holder's lock is already released at this point —
-                # this is a genuine "board is now unlocked, nothing recorded"
-                # gap, not a no-op. Report failure rather than "stolen" so the
-                # caller doesn't proceed believing it exclusively holds a lock
-                # that doesn't actually exist anywhere.
-                return False, "create_failed"
-            return True, "stolen"
-        elif not current_lock:
-            if not self._create_lock(project, board, new_issue_number):
-                return False, "create_failed"
-            return True, "acquired"
-        else:
-            return True, "already_held"
 
     def mark_lock_failed(self, project: str, board: str, issue_number: int, reason: str) -> bool:
         """
@@ -1323,11 +1297,28 @@ class PipelineLockManager:
 
 # Singleton instance
 _pipeline_lock_manager = None
+_pipeline_lock_manager_init_guard = threading.Lock()
 
 
 def get_pipeline_lock_manager() -> PipelineLockManager:
-    """Get singleton instance of PipelineLockManager"""
+    """
+    Get singleton instance of PipelineLockManager.
+
+    Double-checked locking around the lazy init (#54 review): this used to be
+    a bare check-then-set with no guard, which was fine while every caller
+    ran on the same thread at startup. #54 added a genuinely concurrent
+    caller (main.py's asyncio.to_thread(initialize_all_projects), racing the
+    event-loop thread's own ProjectResourceLockManager()-default-construction
+    callers), so two threads could otherwise both observe
+    `_pipeline_lock_manager is None` and each construct their own
+    PipelineLockManager -- each opening its own Redis connection, with the
+    loser's silently orphaned and any caller holding a reference to it
+    missing lock state updates made through the winning instance's
+    connection.
+    """
     global _pipeline_lock_manager
     if _pipeline_lock_manager is None:
-        _pipeline_lock_manager = PipelineLockManager()
+        with _pipeline_lock_manager_init_guard:
+            if _pipeline_lock_manager is None:
+                _pipeline_lock_manager = PipelineLockManager()
     return _pipeline_lock_manager

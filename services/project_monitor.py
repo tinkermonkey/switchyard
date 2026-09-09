@@ -2588,6 +2588,19 @@ class ProjectMonitor:
                     else:
                         # CRITICAL: Check if this issue is next in line based on GitHub board order
                         # This ensures we respect the user's ordering on the GitHub board
+                        #
+                        # Not migrated to #57's available_slots/get_next_n_waiting_issues()
+                        # pattern (found in #58 review): unlike the 5 "pick N candidates from
+                        # the queue" dispatch sites #57 generalized, this is a binary gate for
+                        # a SPECIFIC issue already in hand -- "is this exact issue allowed to go
+                        # now, or must it wait" -- via equality against the single top-priority
+                        # pick, not a loop over open slots. Harmless today (available_slots=1
+                        # everywhere), but if a future change raises available_slots elsewhere,
+                        # this gate would still only ever let the single top-priority issue
+                        # through, incorrectly blocking an issue that's 2nd (or later) in line
+                        # even when enough slots are free for it too. A real fix means changing
+                        # this check from "equals the top pick" to "is within the top N picks",
+                        # not a mechanical swap -- tracked in #140, not fixed here.
                         next_issue = pipeline_queue.get_next_waiting_issue()
                         if next_issue and next_issue['issue_number'] != issue_number:
                             logger.info(
@@ -3815,9 +3828,20 @@ class ProjectMonitor:
             if not keep_cancelled:
                 signal.clear(project_name, issue_number)
 
-            # Process next waiting issue
-            next_issue = pipeline_queue.get_next_waiting_issue()
-            if next_issue:
+            # Process next waiting issue(s). "available_slots" is hardcoded to 1
+            # today -- PipelineLockManager still enforces exactly one concurrent
+            # issue per (project, board), so get_next_n_waiting_issues(1) returns
+            # at most one candidate and this loop runs its body at most once,
+            # identical to the pre-#57 get_next_waiting_issue()-based single
+            # attempt. Phase 3a (out of scope here) is what will eventually make
+            # this a real slot count (issue #57).
+            available_slots = 1
+            next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+            if not next_issues:
+                logger.info(
+                    f"No waiting issues in pipeline queue for {project_name}/{board_name}"
+                )
+            for next_issue in next_issues:
                 logger.info(
                     f"Processing next queued issue #{next_issue['issue_number']} "
                     f"for {project_name}/{board_name}"
@@ -3882,10 +3906,6 @@ class ProjectMonitor:
                             logger.error(
                                 f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}"
                             )
-            else:
-                logger.info(
-                    f"No waiting issues in pipeline queue for {project_name}/{board_name}"
-                )
 
             # CRITICAL: Check if PR should be marked ready after issue exits pipeline
             # This handles the case where all sub-issues complete after the last finalization
@@ -5307,9 +5327,18 @@ _Review cycle initiated by Switchyard_
                                 import time
 
                                 pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
-                                next_issue = pipeline_queue.get_next_waiting_issue()
+                                # Phase 2 (issue #57): "available_slots" is hardcoded to 1 today --
+                                # PipelineLockManager still enforces exactly one concurrent issue per
+                                # (project, board) -- so get_next_n_waiting_issues(1) returns at most
+                                # one candidate and this loop runs its body at most once, identical to
+                                # the pre-#57 get_next_waiting_issue()-based single attempt. Phase 3a
+                                # (out of scope here) is what will eventually make this a real count.
+                                available_slots = 1
+                                next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+                                if not next_issues:
+                                    logger.debug(f"No more issues waiting in queue for {project_name}/{board_name}")
 
-                                if next_issue:
+                                for next_issue in next_issues:
                                     logger.info(f"Attempting to acquire lock for next queued issue #{next_issue['issue_number']} after review cycle for #{issue_number} completed")
 
                                     # Try to acquire lock for next issue
@@ -5467,8 +5496,7 @@ _Review cycle initiated by Switchyard_
                                         logger.info(
                                             f"Could not acquire lock for next issue #{next_issue['issue_number']}: {acquire_reason}"
                                         )
-                                else:
-                                    logger.debug(f"No more issues waiting in queue for {project_name}/{board_name}")
+
                             except Exception as queue_error:
                                 logger.error(f"Error processing next queued issue for {project_name}/{board_name}: {queue_error}")
                                 import traceback
@@ -6640,18 +6668,27 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 `_owned_run_id`/`_settled`/`_owned_is_real_run` below, mirroring
                 _start_pr_review_for_issue exactly: `_end_owned_run_if_pending()` is
                 called on every early-return guard before get_or_create_pipeline_run()
-                (duplicate container, lock-state-unknown, locked-by-another-repair-
-                cycle, no test configs), and on the "superseded, not reused" case
-                right after it. Once get_or_create_pipeline_run() resolves the real
-                run, `_owned_is_real_run` is set — a couple of specific failure
-                handlers after that point (steal_lock() failure, context-save
-                failure, container-launch failure — see each one's own comment for
-                its exact call, since they aren't all identical: not every one
-                passes `board=`) still call end_pipeline_run() directly, never
-                _end_owned_run_if_pending(), because only end_pipeline_run() knows
-                how to release a lock steal_lock() may have already acquired. This
-                list is illustrative, not exhaustive by construction — check the
-                actual call sites, not just this comment, before assuming a given
+                (duplicate container, lock-state-unknown, no test configs), and
+                on the "superseded, not reused" case right after it. (The
+                "locked-by-another-repair-cycle" early-return that used to be
+                listed here is gone along with steal_lock() itself — #58,
+                Phase 2 of #34's concurrency redesign: repair cycles now go
+                through try_acquire_lock() exactly like ordinary dispatch, so
+                a busy lock is discovered there, not via a bespoke pre-check.)
+                Once get_or_create_pipeline_run() resolves the real run,
+                `_owned_is_real_run` is set — a couple of specific failure
+                handlers after that point (lock-acquire failure, context-save
+                failure, container-launch failure) still call end_pipeline_run()
+                directly, never _end_owned_run_if_pending(), because only
+                end_pipeline_run() knows how to release a lock try_acquire_lock()
+                may have already acquired. (Corrected in PR #138 review,
+                /pr-review-toolkit:review-pr: all three currently pass
+                board=board_name — verified directly against each call site.
+                Kept the "check the actual call sites" caveat below regardless,
+                since this list is illustrative by construction and could
+                still drift.) This list is illustrative, not exhaustive by
+                construction — check the actual call sites, not just this
+                comment, before assuming a given
                 failure's lock behavior. Workspace-resolution failure (resolve_workspace()
                 raising — no parent epic, or a worktree add failure) is deliberately
                 NOT one of these dedicated handlers as of #119/WI-B: it used to be
@@ -6720,6 +6757,30 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             import subprocess
             from pipeline.repair_cycle import RepairCycleStage, RepairTestRunConfig
 
+            # Cheap, non-mutating early-out if the board lock is already busy
+            # (found in PR #138 review, /pr-review-toolkit:review-pr): #58 moved
+            # this method's lock acquisition to plain try_acquire_lock() below,
+            # removing the old steal_lock()-era pre-check entirely (see the
+            # longer comment further down explaining why that removal is
+            # correct). But without ANY probe before this point, a repair cycle
+            # waiting behind a long-running ordinary holder (hours, for
+            # senior_software_engineer's 10800s timeout) now pays a GitHub API
+            # call (get_issue_details()) and creates+immediately-ends a full
+            # PipelineRun (ES pipeline-run-events churn) on EVERY ~30s poll
+            # cycle it's re-evaluated, purely to discover what this cheap read
+            # already knows. try_acquire_lock() below remains the SOLE
+            # authority on whether the lock is actually acquired -- this is
+            # only a read-only probe to skip expensive work when it obviously
+            # won't succeed, not a second copy of the acquire decision itself.
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            _lock_probe = get_pipeline_lock_manager().get_lock(project_name, board_name)
+            if _lock_probe and _lock_probe.locked_by_issue != issue_number:
+                _end_owned_run_if_pending(
+                    f"Pipeline lock for {project_name}/{board_name} busy "
+                    f"(held by issue #{_lock_probe.locked_by_issue}) -- skipping this cycle"
+                )
+                return None
+
             # CRITICAL: Check if a repair cycle container is already running for this issue
             # This prevents duplicate containers when recovery reconnects to an existing container
             # and the normal monitoring loop also tries to start one
@@ -6757,37 +6818,31 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     logger.warning(f"Error checking for existing repair cycle container: {e}")
                     # Continue anyway - better to risk a duplicate than block work
 
-            # CRITICAL: Check if pipeline is locked by ANOTHER repair cycle
-            # Repair cycles can steal locks from Development, but not from other repair cycles
-            # Only one repair cycle should run at a time per pipeline
-            from services.pipeline_lock_manager import get_pipeline_lock_manager
-            lock_manager = get_pipeline_lock_manager()
-            current_lock, lock_reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
-            if not lock_reads_healthy:
-                logger.error(
-                    f"Could not determine lock state for {project_name}/{board_name} "
-                    f"(both Redis and YAML reads failed) — refusing to start a "
-                    f"repair cycle for issue #{issue_number} rather than risk "
-                    f"competing with a repair cycle we can't actually see"
-                )
-                _end_owned_run_if_pending("Lock state unreadable before launch - ending phantom run")
-                return None
-
-            if current_lock and current_lock.locked_by_issue != issue_number:
-                # Another issue holds the lock - check if it's also a repair cycle
-                # by checking for repair cycle container in Redis
-                if self.task_queue.redis_client:
-                    other_redis_key = f"repair_cycle:container:{project_name}:{current_lock.locked_by_issue}"
-                    other_container = self.task_queue.redis_client.get(other_redis_key)
-
-                    if other_container:
-                        # Another repair cycle is running - don't compete with it
-                        logger.warning(
-                            f"Pipeline locked by another repair cycle (issue #{current_lock.locked_by_issue}). "
-                            f"Skipping repair cycle launch for issue #{issue_number} to prevent competition."
-                        )
-                        _end_owned_run_if_pending("Pipeline locked by another repair cycle - ending phantom run")
-                        return None
+            # NOTE (#58, Phase 2 of #34's concurrency redesign): this used to be a
+            # dedicated "is the current lock holder ALSO a repair cycle?" pre-check
+            # here (cross-referencing current_lock.locked_by_issue against the
+            # repair_cycle:container Redis key), whose entire purpose was to stop
+            # steal_lock() further down from evicting another already-running
+            # repair cycle out from under itself — ordinary Development holders
+            # were always fair game for eviction, so only the "other holder is
+            # also a repair cycle" case needed special detection.
+            #
+            # Now that steal_lock() is gone and this method acquires the lock via
+            # plain try_acquire_lock() below (the same primitive every other
+            # dispatch call site uses), that distinction is moot: try_acquire_lock()
+            # refuses uniformly whenever the lock is held by ANY other issue,
+            # repair cycle or not — there is no eviction left for a same-holder-
+            # type check to guard against. Re-adding an early duplicate of that
+            # check here would just be a second, separately-maintained copy of the
+            # busy-lock read try_acquire_lock() already performs (a real drift risk
+            # this class's docstrings elsewhere warn about), for no behavioral
+            # benefit. Decision: removed, not kept — the single try_acquire_lock()
+            # call below is now the sole authority on lock state for this method,
+            # exactly like the ordinary trigger-column dispatch path.
+            #
+            # (The OTHER Redis check in this method — the duplicate-container check
+            # a few lines above, keyed on THIS issue's own container — is unrelated
+            # to lock stealing and is unaffected by this change.)
 
             # Get issue details
             issue_data = self.get_issue_details(repository, issue_number, project_config.github['org'])
@@ -6852,7 +6907,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 _end_owned_run_if_pending("Superseded by the actual repair cycle pipeline run - ending phantom run")
 
             # From here on, `pipeline_run` is the run this method is driving, and
-            # steal_lock() below may hand it the pipeline lock. Failures past this
+            # try_acquire_lock() below may hand it the pipeline lock. Failures past this
             # point never go through _end_owned_run_if_pending() (which deliberately
             # never touches the lock) — but they no longer uniformly go through a
             # full end_pipeline_run() either. Some specific handlers still do (see
@@ -6866,34 +6921,61 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             _owned_is_real_run = True
 
             # CRITICAL: Acquire pipeline lock before starting repair cycle
-            # Note: We've already checked above that no OTHER repair cycle is running
-            # Repair cycles have PRIORITY over Development items - they can steal the lock if needed
-            # But repair cycles do NOT compete with each other (checked above)
+            #
+            # #58 (Phase 2 of #34's concurrency redesign) removed the old
+            # steal_lock()-based eviction here: repair cycles used to have
+            # PRIORITY over whatever ordinary agent held this board's lock and
+            # would force-evict it unconditionally. That model was single-
+            # holder-shaped (steal_lock()'s only real decision was "held by
+            # someone else? evict them" — fine with exactly one other possible
+            # holder, ill-defined once a future phase's semaphores allow
+            # several). Resolved design decision (see #58's issue text): that
+            # priority is dropped, not preserved. Repair cycles now acquire via
+            # plain try_acquire_lock() — the exact same primitive every other
+            # dispatchable column uses — so if the lock is free (or already
+            # ours) we take it, and if another issue holds it we simply don't
+            # launch this cycle. There is no explicit queue write for that
+            # "wait" case (see the comment above the now-removed duplicate-
+            # repair-cycle pre-check for why PipelineQueueManager's queue file
+            # doesn't apply to this non-trigger-column stage) — returning None
+            # is itself "enqueue and retry on a later poll cycle", because the
+            # normal board-polling loop re-evaluates this issue's column, and
+            # therefore re-calls this method, on every cycle regardless.
+            #
+            # The retained/failed-lock refusal this call site used to rely on
+            # steal_lock() to enforce (never touch a retained lock, since that
+            # would silently erase the durable failure record and hand the
+            # board to an unrelated issue) doesn't need separate replication —
+            # try_acquire_lock()'s own upfront fail-closed/retained_reason
+            # checks already cover it for this normal acquire path.
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
 
-            # Repair cycles have priority over whatever ordinary agent currently
-            # holds this board's lock — but a retained/failed lock must NEVER be
-            # stolen, since that would silently erase the durable failure record
-            # (retained_reason/retained_at) and hand the board to an unrelated
-            # issue, exactly the "silently re-dispatched" failure this whole
-            # mechanism exists to prevent. steal_lock() is the single place that
-            # enforces this (fail-closed lock-state read, retained_reason check,
-            # and the actual release+create) so this call site can no longer
-            # bypass the check the way _create_lock() called directly here once
-            # did — a real, deterministic gap found and fixed across three PR
-            # review rounds before this was centralized.
-            ok, result = lock_manager.steal_lock(project_name, board_name, issue_number)
-            if not ok:
-                if result.startswith("retained:"):
+            can_execute, reason = lock_manager.try_acquire_lock(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number
+            )
+            if not can_execute:
+                # Classify via the current lock's own retained_reason field,
+                # not by string-matching try_acquire_lock()'s informal
+                # `reason` text (found in #58 review: this was the only one
+                # of ~9 call sites in the repo parsing `reason` instead of
+                # just logging it, fragile against that string format ever
+                # changing -- get_lock() + .retained_reason mirrors the
+                # structured approach get_retained_reason()'s own docstring
+                # documents other direct-lock-object callers already use).
+                _current_lock_for_classification = lock_manager.get_lock(project_name, board_name)
+                if _current_lock_for_classification and _current_lock_for_classification.retained_reason:
                     logger.error(
-                        f"Repair cycle for issue #{issue_number} cannot steal the "
-                        f"pipeline lock — it is retained due to a failed run "
-                        f"({result.split(':', 1)[1]}). A human must run "
-                        f"scripts/release_lock.py before this board can be used "
-                        f"by any other issue."
+                        f"Repair cycle for issue #{issue_number} cannot acquire the "
+                        f"pipeline lock for {project_name}/{board_name} — it is "
+                        f"retained due to a failed run "
+                        f"({_current_lock_for_classification.retained_reason}). A human "
+                        f"must run scripts/release_lock.py before this board can be "
+                        f"used by any other issue."
                     )
-                elif result == "lock_state_unknown":
+                elif reason == "lock_state_unknown_failing_closed":
                     logger.error(
                         f"Could not determine lock state for {project_name}/{board_name} "
                         f"(both Redis and YAML reads failed) — refusing to start a "
@@ -6901,16 +6983,17 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"creating a lock while a retained one might actually be held"
                     )
                 else:
-                    logger.error(
-                        f"Repair cycle for issue #{issue_number} could not acquire "
-                        f"the pipeline lock for {project_name}/{board_name} "
-                        f"(steal_lock result: {result})"
+                    logger.info(
+                        f"Repair cycle for issue #{issue_number} cannot acquire the "
+                        f"pipeline lock for {project_name}/{board_name} yet ({reason}) "
+                        f"— waiting for it to free up rather than evicting the "
+                        f"current holder; will retry on a later poll cycle"
                     )
-                # steal_lock() failed outright, so this issue never actually holds
-                # the lock — end_pipeline_run() will correctly no-op its lock-release
-                # logic (locked_by_issue won't match). Full end_pipeline_run(), not
-                # _end_owned_run_if_pending(): pipeline_run is real by this point, not
-                # a phantom (see this method's docstring).
+                # try_acquire_lock() failed outright, so this issue never actually
+                # holds the lock — end_pipeline_run() will correctly no-op its
+                # lock-release logic (locked_by_issue won't match). Full
+                # end_pipeline_run(), not _end_owned_run_if_pending(): pipeline_run
+                # is real by this point, not a phantom (see this method's docstring).
                 if _owned_is_real_run and _owned_run_id and not _settled:
                     _settled = True
                     try:
@@ -6918,18 +7001,15 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             project=project_name,
                             issue_number=issue_number,
                             board=board_name,
-                            reason=f"Could not acquire pipeline lock for repair cycle: {result}",
+                            reason=f"Could not acquire pipeline lock for repair cycle: {reason}",
                         )
                     except Exception as cleanup_e:
                         logger.error(f"Failed to end pipeline run after lock-acquire failure: {cleanup_e}")
                 return None
-            elif result == "stolen":
-                logger.warning(
-                    f"Repair cycle for issue #{issue_number} stole pipeline lock "
-                    f"from its prior holder (repair cycles have priority over {status})"
+            elif reason in ("lock_acquired", "stale_lock_recovered"):
+                logger.info(
+                    f"Repair cycle for issue #{issue_number} acquired pipeline lock ({reason})"
                 )
-            elif result == "acquired":
-                logger.info(f"Repair cycle for issue #{issue_number} acquired pipeline lock")
             else:
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
@@ -7167,7 +7247,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
             except Exception as e:
                 logger.error(f"Failed to save repair cycle context: {e}", exc_info=True)
-                # By this point steal_lock() above succeeded, so this issue genuinely
+                # By this point try_acquire_lock() above succeeded, so this issue genuinely
                 # holds the pipeline lock — full end_pipeline_run() releases it (or
                 # retains it, per its normal retain/outcome rules), unlike
                 # _end_owned_run_if_pending() which deliberately never touches locks.
@@ -7233,7 +7313,7 @@ _Repair cycle initiated by Switchyard_
                 logger.warning(f"Failed to post initial comment: {e}")
 
             # (record_execution_start now happens much earlier -- right after the
-            # steal_lock() success/"Starting repair cycle" log above -- so a failure
+            # try_acquire_lock() success/"Starting repair cycle" log above -- so a failure
             # anywhere between there and here, notably epic-worktree resolution, has
             # a real in_progress entry to finalize. See that call site's comment.)
 
@@ -8399,265 +8479,300 @@ _Repair cycle initiated by Switchyard_
                     if not pipeline.active:
                         continue
 
-                    try:
-                        lock_manager = get_pipeline_lock_manager()
-                        pipeline_queue = get_pipeline_queue_manager(
-                            project_name, pipeline.board_name
-                        )
-
-                        # CRITICAL: Check if pipeline is unlocked
-                        lock = lock_manager.get_lock(project_name, pipeline.board_name)
-                        if lock and lock.lock_status == 'locked':
-                            continue  # Pipeline busy, skip
-
-                        # SCENARIO 1: Check for in-flight issues stranded in mid-pipeline
-                        # columns (Code Review, Testing, etc.). These take priority over new
-                        # Development work — an issue already running should resume before the
-                        # next queued issue starts. Uses cached board items to avoid extra API calls.
-                        cached = poll_cycle_items.get((project_name, pipeline.board_name)) if poll_cycle_items else None
-                        stalled_issues = self._find_stalled_issues_for_pipeline(
-                            project_name, pipeline.board_name,
-                            cached_items=cached
-                        )
-
-                        if stalled_issues:
-                            # Found in-flight issue stranded in a mid-pipeline column
-                            next_issue = stalled_issues[0]  # Limited to 1 per pipeline for safety
-                            logger.info(
-                                f"⚡ FAILSAFE (STALLED): Found in-flight issue #{next_issue['issue_number']} "
-                                f"in column '{next_issue['column']}' for {project_name}/{pipeline.board_name} "
-                                f"- resuming before pulling from Development queue"
+                    # Phase 2 (issue #57): loop over available dispatch slots for this
+                    # board instead of a single one-shot attempt. Nothing today provides a
+                    # real >1 slot count for a single pipeline board -- PipelineLockManager
+                    # still enforces exactly one concurrent issue per (project, board) -- so
+                    # this evaluates to 1 and the loop below runs its body exactly once,
+                    # identical to the pre-#57 single-attempt code. Raising this to a real
+                    # count is Phase 3a's job (out of scope here).
+                    available_slots = 1
+                    for _dispatch_slot in range(available_slots):
+                        try:
+                            lock_manager = get_pipeline_lock_manager()
+                            pipeline_queue = get_pipeline_queue_manager(
+                                project_name, pipeline.board_name
                             )
-                        else:
-                            # SCENARIO 2: No in-flight issues - check for waiting Development issues
-                            # This also syncs queue with GitHub (ensures up-to-date state)
-                            board_key = (project_name, pipeline.board_name)
-                            if due_board_keys is not None and board_key not in due_board_keys:
-                                # Not due this cycle (per-board backoff, same as
-                                # monitor_projects()'s item-fetch path) - skip the
-                                # network-touching queue check entirely rather than
-                                # falling back to an individual fetch, which would
-                                # silently re-check every board every cycle anyway
-                                # and defeat the whole point of gating STEP 1.5 on
-                                # due-ness. Bounded by that board's own current
-                                # backoff interval (max _max_poll_interval) before
-                                # it's checked again - acceptable for a failsafe
-                                # explicitly designed for "eventual correctness."
-                                logger.debug(
-                                    f"⚡ FAILSAFE: {project_name}/{pipeline.board_name} not due this "
-                                    f"cycle, skipping Development queue check"
-                                )
-                                continue
-                            logger.debug(f"⚡ FAILSAFE: No in-flight issues for {project_name}/{pipeline.board_name}, checking Development queue...")
-                            # Pass this board's batched-prefetched data (issue #100), if
-                            # any - .get() returns None for a board that was due but
-                            # whose batched fetch failed/was ungatherable, in which case
-                            # get_next_waiting_issue() falls back to fetching this one
-                            # board itself (bounded to just that board, not skipped
-                            # above since due_board_keys wouldn't contain it either in
-                            # the ungatherable-state case - see the batch-gathering
-                            # loop above, which still adds a board to due_board_keys
-                            # once it's confirmed due, before it's known whether the
-                            # batch fetch for it will succeed).
-                            next_issue = pipeline_queue.get_next_waiting_issue(
-                                prefetched_board_data=prefetched_board_data.get(board_key)
+
+                            # CRITICAL: Check if pipeline is unlocked
+                            lock = lock_manager.get_lock(project_name, pipeline.board_name)
+                            if lock and lock.lock_status == 'locked':
+                                break  # Pipeline busy, skip
+
+                            # SCENARIO 1: Check for in-flight issues stranded in mid-pipeline
+                            # columns (Code Review, Testing, etc.). These take priority over new
+                            # Development work — an issue already running should resume before the
+                            # next queued issue starts. Uses cached board items to avoid extra API calls.
+                            cached = poll_cycle_items.get((project_name, pipeline.board_name)) if poll_cycle_items else None
+                            stalled_issues = self._find_stalled_issues_for_pipeline(
+                                project_name, pipeline.board_name,
+                                cached_items=cached
                             )
-                            if next_issue:
-                                # We have: waiting issue + unlocked pipeline = should be processing!
+
+                            if stalled_issues:
+                                # Found in-flight issue stranded in a mid-pipeline column
+                                next_issue = stalled_issues[0]  # Limited to 1 per pipeline for safety
                                 logger.info(
-                                    f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
-                                    f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                    f"⚡ FAILSAFE (STALLED): Found in-flight issue #{next_issue['issue_number']} "
+                                    f"in column '{next_issue['column']}' for {project_name}/{pipeline.board_name} "
+                                    f"- resuming before pulling from Development queue"
                                 )
                             else:
-                                continue  # No in-flight or waiting issues, skip this pipeline
-
-                        # At this point, next_issue is either a waiting issue or a stalled issue
-                        # Process it using the same logic
-
-                        # CRITICAL: Try to acquire lock (atomic operation in Redis)
-                        # If another process is processing this issue, acquisition will fail
-                        issue_number = next_issue['issue_number']
-                        acquired, reason = lock_manager.try_acquire_lock(
-                            project=project_name,
-                            board=pipeline.board_name,
-                            issue_number=issue_number
-                        )
-
-                        if not acquired:
-                            logger.debug(
-                                f"FAILSAFE: Could not acquire lock for issue "
-                                f"#{issue_number}: {reason} "
-                                f"(likely being processed by another path)"
-                            )
-                            continue
-
-                        # Track if this is a stalled issue (has 'column' key) vs waiting issue
-                        is_stalled = 'column' in next_issue
-
-                        # Mark as active in queue (only for waiting issues, not stalled)
-                        if not is_stalled:
-                            pipeline_queue.mark_issue_active(issue_number)
-
-                        # Get current column from GitHub (may have moved since detected)
-                        # For stalled issues, we already have the column, but verify it
-                        current_column = self.get_issue_column_sync(
-                            project_name,
-                            pipeline.board_name,
-                            issue_number
-                        )
-
-                        # For stalled issues, verify column hasn't changed
-                        if is_stalled and current_column != next_issue['column']:
-                            logger.warning(
-                                f"FAILSAFE (STALLED): Issue #{issue_number} moved from "
-                                f"'{next_issue['column']}' to '{current_column}', using current column"
-                            )
-
-                        if current_column:
-                            # Check cancellation signal before triggering
-                            from services.cancellation import get_cancellation_signal
-                            if get_cancellation_signal().is_cancelled(project_name, issue_number):
-                                logger.info(
-                                    f"⚡ FAILSAFE: Skipping cancelled issue #{issue_number} "
-                                    f"in {project_name}/{pipeline.board_name}"
-                                )
-                                if not is_stalled:
-                                    pipeline_queue.remove_issue_from_queue(issue_number)
-                                lock_manager.release_lock(
-                                    project_name, pipeline.board_name, issue_number
-                                )
-                                continue
-
-                            # Skip issues whose pipeline run is in feedback_listening state —
-                            # but only if the loop is actually alive.  A dead loop leaves the
-                            # status permanently at feedback_listening, causing a deadlock where
-                            # the FAILSAFE skips forever and nothing re-triggers.
-                            try:
-                                existing_run = self.pipeline_run_manager.get_active_pipeline_run(
-                                    project_name, issue_number
-                                )
-                                if existing_run and existing_run.status == "feedback_listening":
-                                    import redis as _redis_mod
-                                    _r = _redis_mod.Redis(host='redis', port=6379, decode_responses=True)
-                                    _lock_key  = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
-                                    _hbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
-                                    loop_alive = bool(_r.exists(_lock_key)) or bool(_r.exists(_hbeat_key))
-
-                                    if loop_alive:
-                                        logger.info(
-                                            f"⚡ FAILSAFE: Feedback loop active for #{issue_number} "
-                                            f"in {project_name}, skipping trigger"
-                                        )
-                                        lock_manager.release_lock(
-                                            project_name, pipeline.board_name, issue_number
-                                        )
-                                        continue
-
-                                    # Loop is dead but pipeline run is stuck in feedback_listening.
-                                    # End the stale run so the trigger path below creates a fresh one.
-                                    logger.warning(
-                                        f"⚡ FAILSAFE: Pipeline #{issue_number} in {project_name} is "
-                                        f"stuck in feedback_listening with no active loop — recovering"
+                                # SCENARIO 2: No in-flight issues - check for waiting Development issues
+                                # This also syncs queue with GitHub (ensures up-to-date state)
+                                board_key = (project_name, pipeline.board_name)
+                                if due_board_keys is not None and board_key not in due_board_keys:
+                                    # Not due this cycle (per-board backoff, same as
+                                    # monitor_projects()'s item-fetch path) - skip the
+                                    # network-touching queue check entirely rather than
+                                    # falling back to an individual fetch, which would
+                                    # silently re-check every board every cycle anyway
+                                    # and defeat the whole point of gating STEP 1.5 on
+                                    # due-ness. Bounded by that board's own current
+                                    # backoff interval (max _max_poll_interval) before
+                                    # it's checked again - acceptable for a failsafe
+                                    # explicitly designed for "eventual correctness."
+                                    logger.debug(
+                                        f"⚡ FAILSAFE: {project_name}/{pipeline.board_name} not due this "
+                                        f"cycle, skipping Development queue check"
                                     )
-                                    try:
-                                        self.pipeline_run_manager.end_pipeline_run(
-                                            project_name, issue_number,
-                                            # "feedback_loop_ended" is the convention that suppresses
-                                            # the cancellation signal so the new loop starts cleanly.
-                                            reason="feedback_loop_ended"
-                                        )
-                                    except Exception as _end_err:
-                                        logger.warning(
-                                            f"Could not end stale pipeline run for #{issue_number}: {_end_err}"
-                                        )
-                                    # Clear any stale review cycle state so that if the issue is
-                                    # reset and retried, start_review_cycle won't find an exhausted
-                                    # cycle from this run and incorrectly terminate the new one.
-                                    try:
-                                        from services.review_cycle import get_review_cycle_executor
-                                        get_review_cycle_executor().clear_cycle_state(project_name, issue_number)
-                                        logger.info(
-                                            f"⚡ FAILSAFE: Cleared review cycle state for #{issue_number} "
-                                            f"in {project_name} during feedback_listening recovery"
-                                        )
-                                    except Exception as _cycle_err:
-                                        logger.warning(
-                                            f"Could not clear review cycle state for #{issue_number}: {_cycle_err}"
-                                        )
-                                    # Fall through — the column check below will re-trigger the loop
-                            except Exception as _e:
-                                logger.warning(f"Could not check pipeline run status for #{issue_number}: {_e}")
+                                    break
+                                logger.debug(f"⚡ FAILSAFE: No in-flight issues for {project_name}/{pipeline.board_name}, checking Development queue...")
+                                # Pass this board's batched-prefetched data (issue #100), if
+                                # any - .get() returns None for a board that was due but
+                                # whose batched fetch failed/was ungatherable, in which case
+                                # get_next_waiting_issue() falls back to fetching this one
+                                # board itself (bounded to just that board, not skipped
+                                # above since due_board_keys wouldn't contain it either in
+                                # the ungatherable-state case - see the batch-gathering
+                                # loop above, which still adds a board to due_board_keys
+                                # once it's confirmed due, before it's known whether the
+                                # batch fetch for it will succeed).
+                                #
+                                # Deliberately still get_next_waiting_issue() (the n=1
+                                # wrapper), not get_next_n_waiting_issues() directly --
+                                # considered switching during #57 review for API
+                                # consistency with the other 4 dispatch sites, but this
+                                # site has extensive existing test coverage
+                                # (test_project_monitor_failsafe.py,
+                                # test_project_monitor_failsafe_batching.py) asserting
+                                # calls against get_next_waiting_issue() specifically,
+                                # including detailed prefetched_board_data-forwarding and
+                                # batching-call-count assertions; get_next_waiting_issue()
+                                # already IS get_next_n_waiting_issues(1) internally (pure
+                                # delegation, byte-identical behavior), so switching the
+                                # call site here would have been a cosmetic-only change
+                                # with no functional benefit, at the cost of rewriting
+                                # that whole test suite. NOTE for whoever wires up Phase 3a
+                                # here: raising available_slots at this specific site
+                                # would call this whole block N times (N separate
+                                # GitHub-board resyncs via n=1 each), not one batched
+                                # N-candidate fetch like the other 4 sites -- correct, but
+                                # resync-per-slot rather than resync-once; a real
+                                # multi-slot version of this site should restructure to
+                                # fetch get_next_n_waiting_issues(available_slots) ONCE
+                                # before this loop, which the stalled-issue-check
+                                # interleaving here makes more involved than the other
+                                # sites' simpler shape.
+                                next_issue = pipeline_queue.get_next_waiting_issue(
+                                    prefetched_board_data=prefetched_board_data.get(board_key)
+                                )
+                                if next_issue:
+                                    # We have: waiting issue + unlocked pipeline = should be processing!
+                                    logger.info(
+                                        f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
+                                        f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                    )
+                                else:
+                                    break  # No in-flight or waiting issues, skip this pipeline
 
-                            # Check if the column is conversational — if so, release the
-                            # just-acquired lock before triggering (conversational loops
-                            # run without an exclusive lock).
-                            workflow_tmpl = self.config_manager.get_workflow_template(pipeline.workflow)
-                            col_obj = next(
-                                (c for c in workflow_tmpl.columns if c.name == current_column), None
-                            ) if workflow_tmpl else None
-                            is_conversational_col = (
-                                col_obj and hasattr(col_obj, 'type') and col_obj.type == 'conversational'
+                            # At this point, next_issue is either a waiting issue or a stalled issue
+                            # Process it using the same logic
+
+                            # CRITICAL: Try to acquire lock (atomic operation in Redis)
+                            # If another process is processing this issue, acquisition will fail
+                            issue_number = next_issue['issue_number']
+                            acquired, reason = lock_manager.try_acquire_lock(
+                                project=project_name,
+                                board=pipeline.board_name,
+                                issue_number=issue_number
                             )
 
-                            if is_conversational_col:
-                                lock_manager.release_lock(project_name, pipeline.board_name, issue_number)
-                                logger.info(
-                                    f"⚡ FAILSAFE: Triggering conversational loop for issue "
-                                    f"#{issue_number} in column '{current_column}' (no lock)"
+                            if not acquired:
+                                logger.debug(
+                                    f"FAILSAFE: Could not acquire lock for issue "
+                                    f"#{issue_number}: {reason} "
+                                    f"(likely being processed by another path)"
                                 )
-                                self.trigger_agent_for_status(
-                                    project_name,
-                                    pipeline.board_name,
-                                    issue_number,
-                                    current_column,
-                                    project_config.github['repo']
-                                )
-                            else:
-                                logger.info(
-                                    f"⚡ FAILSAFE: Triggering agent for issue "
-                                    f"#{issue_number} in column '{current_column}'"
-                                )
-                                # Pass lock_already_acquired=True since we just acquired it above
-                                self.trigger_agent_for_status(
-                                    project_name,
-                                    pipeline.board_name,
-                                    issue_number,
-                                    current_column,
-                                    project_config.github['repo'],
-                                    lock_already_acquired=True
-                                )
+                                break
 
-                            # Record metrics for stalled issue recovery
-                            if is_stalled:
-                                try:
-                                    from monitoring.metrics import get_metrics_client
-                                    metrics = get_metrics_client()
-                                    metrics.record_metric('failsafe.stalled_issues_detected', 1)
-                                    metrics.record_metric('failsafe.stalled_issues_recovered', 1)
-                                except Exception:
-                                    pass  # Metrics not critical, continue
-                        else:
-                            # Issue not in any column - clean up
-                            logger.warning(
-                                f"FAILSAFE: Issue #{issue_number} not found "
-                                f"in any column, releasing lock"
-                            )
-                            # Only remove from queue if it's a waiting issue
+                            # Track if this is a stalled issue (has 'column' key) vs waiting issue
+                            is_stalled = 'column' in next_issue
+
+                            # Mark as active in queue (only for waiting issues, not stalled)
                             if not is_stalled:
-                                pipeline_queue.remove_issue_from_queue(issue_number)
-                            lock_manager.release_lock(
+                                pipeline_queue.mark_issue_active(issue_number)
+
+                            # Get current column from GitHub (may have moved since detected)
+                            # For stalled issues, we already have the column, but verify it
+                            current_column = self.get_issue_column_sync(
                                 project_name,
                                 pipeline.board_name,
                                 issue_number
                             )
 
-                    except Exception as e:
-                        logger.error(
-                            f"Error in failsafe check for {project_name}/{pipeline.board_name}: {e}"
-                        )
-                        import traceback
-                        logger.error(traceback.format_exc())
-                        continue
+                            # For stalled issues, verify column hasn't changed
+                            if is_stalled and current_column != next_issue['column']:
+                                logger.warning(
+                                    f"FAILSAFE (STALLED): Issue #{issue_number} moved from "
+                                    f"'{next_issue['column']}' to '{current_column}', using current column"
+                                )
+
+                            if current_column:
+                                # Check cancellation signal before triggering
+                                from services.cancellation import get_cancellation_signal
+                                if get_cancellation_signal().is_cancelled(project_name, issue_number):
+                                    logger.info(
+                                        f"⚡ FAILSAFE: Skipping cancelled issue #{issue_number} "
+                                        f"in {project_name}/{pipeline.board_name}"
+                                    )
+                                    if not is_stalled:
+                                        pipeline_queue.remove_issue_from_queue(issue_number)
+                                    lock_manager.release_lock(
+                                        project_name, pipeline.board_name, issue_number
+                                    )
+                                    break
+
+                                # Skip issues whose pipeline run is in feedback_listening state —
+                                # but only if the loop is actually alive.  A dead loop leaves the
+                                # status permanently at feedback_listening, causing a deadlock where
+                                # the FAILSAFE skips forever and nothing re-triggers.
+                                try:
+                                    existing_run = self.pipeline_run_manager.get_active_pipeline_run(
+                                        project_name, issue_number
+                                    )
+                                    if existing_run and existing_run.status == "feedback_listening":
+                                        import redis as _redis_mod
+                                        _r = _redis_mod.Redis(host='redis', port=6379, decode_responses=True)
+                                        _lock_key  = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
+                                        _hbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+                                        loop_alive = bool(_r.exists(_lock_key)) or bool(_r.exists(_hbeat_key))
+
+                                        if loop_alive:
+                                            logger.info(
+                                                f"⚡ FAILSAFE: Feedback loop active for #{issue_number} "
+                                                f"in {project_name}, skipping trigger"
+                                            )
+                                            lock_manager.release_lock(
+                                                project_name, pipeline.board_name, issue_number
+                                            )
+                                            break
+
+                                        # Loop is dead but pipeline run is stuck in feedback_listening.
+                                        # End the stale run so the trigger path below creates a fresh one.
+                                        logger.warning(
+                                            f"⚡ FAILSAFE: Pipeline #{issue_number} in {project_name} is "
+                                            f"stuck in feedback_listening with no active loop — recovering"
+                                        )
+                                        try:
+                                            self.pipeline_run_manager.end_pipeline_run(
+                                                project_name, issue_number,
+                                                # "feedback_loop_ended" is the convention that suppresses
+                                                # the cancellation signal so the new loop starts cleanly.
+                                                reason="feedback_loop_ended"
+                                            )
+                                        except Exception as _end_err:
+                                            logger.warning(
+                                                f"Could not end stale pipeline run for #{issue_number}: {_end_err}"
+                                            )
+                                        # Clear any stale review cycle state so that if the issue is
+                                        # reset and retried, start_review_cycle won't find an exhausted
+                                        # cycle from this run and incorrectly terminate the new one.
+                                        try:
+                                            from services.review_cycle import get_review_cycle_executor
+                                            get_review_cycle_executor().clear_cycle_state(project_name, issue_number)
+                                            logger.info(
+                                                f"⚡ FAILSAFE: Cleared review cycle state for #{issue_number} "
+                                                f"in {project_name} during feedback_listening recovery"
+                                            )
+                                        except Exception as _cycle_err:
+                                            logger.warning(
+                                                f"Could not clear review cycle state for #{issue_number}: {_cycle_err}"
+                                            )
+                                        # Fall through — the column check below will re-trigger the loop
+                                except Exception as _e:
+                                    logger.warning(f"Could not check pipeline run status for #{issue_number}: {_e}")
+
+                                # Check if the column is conversational — if so, release the
+                                # just-acquired lock before triggering (conversational loops
+                                # run without an exclusive lock).
+                                workflow_tmpl = self.config_manager.get_workflow_template(pipeline.workflow)
+                                col_obj = next(
+                                    (c for c in workflow_tmpl.columns if c.name == current_column), None
+                                ) if workflow_tmpl else None
+                                is_conversational_col = (
+                                    col_obj and hasattr(col_obj, 'type') and col_obj.type == 'conversational'
+                                )
+
+                                if is_conversational_col:
+                                    lock_manager.release_lock(project_name, pipeline.board_name, issue_number)
+                                    logger.info(
+                                        f"⚡ FAILSAFE: Triggering conversational loop for issue "
+                                        f"#{issue_number} in column '{current_column}' (no lock)"
+                                    )
+                                    self.trigger_agent_for_status(
+                                        project_name,
+                                        pipeline.board_name,
+                                        issue_number,
+                                        current_column,
+                                        project_config.github['repo']
+                                    )
+                                else:
+                                    logger.info(
+                                        f"⚡ FAILSAFE: Triggering agent for issue "
+                                        f"#{issue_number} in column '{current_column}'"
+                                    )
+                                    # Pass lock_already_acquired=True since we just acquired it above
+                                    self.trigger_agent_for_status(
+                                        project_name,
+                                        pipeline.board_name,
+                                        issue_number,
+                                        current_column,
+                                        project_config.github['repo'],
+                                        lock_already_acquired=True
+                                    )
+
+                                # Record metrics for stalled issue recovery
+                                if is_stalled:
+                                    try:
+                                        from monitoring.metrics import get_metrics_client
+                                        metrics = get_metrics_client()
+                                        metrics.record_metric('failsafe.stalled_issues_detected', 1)
+                                        metrics.record_metric('failsafe.stalled_issues_recovered', 1)
+                                    except Exception:
+                                        pass  # Metrics not critical, continue
+                            else:
+                                # Issue not in any column - clean up
+                                logger.warning(
+                                    f"FAILSAFE: Issue #{issue_number} not found "
+                                    f"in any column, releasing lock"
+                                )
+                                # Only remove from queue if it's a waiting issue
+                                if not is_stalled:
+                                    pipeline_queue.remove_issue_from_queue(issue_number)
+                                lock_manager.release_lock(
+                                    project_name,
+                                    pipeline.board_name,
+                                    issue_number
+                                )
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error in failsafe check for {project_name}/{pipeline.board_name}: {e}"
+                            )
+                            import traceback
+                            logger.error(traceback.format_exc())
+                            break
 
         except Exception as e:
             logger.error(f"Error in queue processing failsafe: {e}")

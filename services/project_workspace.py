@@ -90,49 +90,91 @@ class ProjectWorkspaceManager:
 
         return needs_setup
 
-    def initialize_project(self, project_name: str, project_config) -> bool:
+    def initialize_project(
+        self, project_name: str, project_config, checkout_lock_timeout_seconds: float = 120.0
+    ) -> bool:
         """
         Initialize a project workspace by checking if it exists
 
         Args:
             project_name: Name of the project
             project_config: Project configuration object
+            checkout_lock_timeout_seconds: How long to wait for the
+                project_checkout lock below before giving up (found in PR
+                #138 review, /pr-review-toolkit:review-pr). Deliberately
+                short by default: this method's only caller today
+                (initialize_all_projects()) runs once per project at
+                orchestrator STARTUP, before the dispatch loop begins, and
+                already catches and logs a per-project failure rather than
+                aborting the whole startup sequence. Waiting out
+                project_checkout_lock's own default (~3h,
+                DEFAULT_TIMEOUT_SECONDS) here would mean a single stale lock
+                left by a crashed prior process -- which startup's own later
+                stale-lock recovery step doesn't cover for resource locks
+                like this one -- stalls the ENTIRE startup sequence (every
+                other, unrelated project) for hours, with no automated way
+                out. A restart is itself the natural retry for this specific
+                call site, so failing fast and letting the per-project
+                except handle it is strictly better than a multi-hour wait.
+                A future on-demand (non-startup) caller of this method can
+                pass a longer value if a real wait is actually wanted there.
 
         Returns:
             True if project was newly cloned, False if it already existed
         """
+        # Cheap config validation BEFORE acquiring the lock below (#56 review,
+        # mirroring the same fix applied to auto_commit.py's branch check):
+        # this outcome can't change based on lock state, so checking it first
+        # means a misconfigured project fails instantly instead of first
+        # polling for up to project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS
+        # if the lock happened to be contended at startup.
         repo_url = project_config.github.get('repo_url')
         default_branch = project_config.github.get('branch', 'main')
 
         if not repo_url:
             raise ValueError(f"No repo_url configured for project {project_name}")
 
-        project_dir = self.workspace_root / project_name
-        was_cloned = False
+        # Serialize against every other operation on this project's shared base
+        # clone (#54): today this runs once per project at startup, before the
+        # dispatch loop begins, so it is safe only by ordering accident -- a
+        # future on-demand re-initialization call (or a slow startup racing an
+        # operator-triggered early dispatch) would otherwise be able to clone/
+        # fetch/checkout into the exact directory another operation is already
+        # reading or building from. No real GitHub issue is in scope at
+        # project-initialization time -- pass None (log attribution only, not
+        # the lock's holder identity; see project_checkout_lock.py's module
+        # docstring).
+        from services.project_checkout_lock import project_checkout_lock_sync
 
-        if project_dir.exists() and (project_dir / '.git').exists():
-            logger.info(f"Project {project_name} found at {project_dir}")
-            # Ensure we're on the default branch and up to date
-            self._update_repository(project_dir, default_branch)
-        else:
-            # Try to clone if directory doesn't exist
-            # Note: In container environments with mounted host directories, projects should already exist
-            logger.warning(f"Project {project_name} not found at {project_dir}")
-            logger.info(f"Attempting to clone from {self._redact_url(repo_url)}")
-            try:
-                self._clone_repository(repo_url, project_dir, default_branch)
-                was_cloned = True
-            except Exception as e:
-                logger.error(f"Failed to clone {project_name}: {e}")
-                logger.info("If running in Docker, ensure project is checked out on host and mounted correctly")
-                raise
+        with project_checkout_lock_sync(
+            project_name, None, timeout_seconds=checkout_lock_timeout_seconds
+        ):
+            project_dir = self.workspace_root / project_name
+            was_cloned = False
 
-        # Ensure the remote uses SSH — agent containers have SSH keys but no HTTPS
-        # credentials, so an HTTPS remote (e.g. from a prior HTTPS clone) will break
-        # every git fetch/pull/push.
-        self._ensure_ssh_remote(project_dir)
+            if project_dir.exists() and (project_dir / '.git').exists():
+                logger.info(f"Project {project_name} found at {project_dir}")
+                # Ensure we're on the default branch and up to date
+                self._update_repository(project_dir, default_branch)
+            else:
+                # Try to clone if directory doesn't exist
+                # Note: In container environments with mounted host directories, projects should already exist
+                logger.warning(f"Project {project_name} not found at {project_dir}")
+                logger.info(f"Attempting to clone from {self._redact_url(repo_url)}")
+                try:
+                    self._clone_repository(repo_url, project_dir, default_branch)
+                    was_cloned = True
+                except Exception as e:
+                    logger.error(f"Failed to clone {project_name}: {e}")
+                    logger.info("If running in Docker, ensure project is checked out on host and mounted correctly")
+                    raise
 
-        return was_cloned
+            # Ensure the remote uses SSH — agent containers have SSH keys but no HTTPS
+            # credentials, so an HTTPS remote (e.g. from a prior HTTPS clone) will break
+            # every git fetch/pull/push.
+            self._ensure_ssh_remote(project_dir)
+
+            return was_cloned
 
     @staticmethod
     def _redact_url(url: str) -> str:
@@ -276,6 +318,50 @@ class ProjectWorkspaceManager:
         return self.get_or_create_epic_worktree(
             project_name, epic_id, branch_name, default_branch=default_branch
         )
+
+    def is_base_clone_dir(self, project_name: str, project_dir) -> bool:
+        """
+        True if `project_dir` IS project_name's shared base clone (the
+        get_project_dir(project_name, epic_id=None) path) rather than an
+        isolated epic worktree or some other directory.
+
+        Used (#54) to scope the project_checkout resource lock
+        (services/project_checkout_lock.py) to genuinely shared-directory
+        operations only. Locking epic-worktree-scoped operations too would
+        serialize sibling epics of the same project against each other even
+        though they never touch the same physical directory -- exactly the
+        cross-epic throughput cost the epic-worktree isolation work (#119)
+        exists to avoid, which would violate #54's own "no behavior change
+        for the common case" requirement.
+
+        Compares resolved (symlink-following, absolute) paths rather than the
+        raw strings a caller might pass in a different but equivalent form
+        (relative, trailing slash, unresolved symlink, ...). Fails closed --
+        if path resolution raises for any reason, OR project_dir doesn't
+        exist on disk at all (e.g. a caller's default/unset placeholder like
+        Path('.') from a missing context field -- Path.resolve() succeeds
+        without error even for a nonexistent path, so an existence check is
+        needed too), returns True (assume it IS the shared base clone)
+        rather than silently skipping the lock this method exists to gate.
+        """
+        try:
+            resolved_dir = Path(project_dir).resolve()
+            if not resolved_dir.exists():
+                logger.warning(
+                    f"is_base_clone_dir() called with a directory that doesn't exist "
+                    f"for project {project_name!r}: {project_dir!r} (resolved to "
+                    f"{resolved_dir}) -- treating as the shared base clone (fail closed) "
+                    "rather than silently assuming it isn't"
+                )
+                return True
+            return resolved_dir == self.get_project_dir(project_name).resolve()
+        except Exception as e:
+            logger.warning(
+                f"is_base_clone_dir() could not resolve paths for project "
+                f"{project_name!r}, dir={project_dir!r}: {e} -- treating as the "
+                "shared base clone (fail closed)"
+            )
+            return True
 
     def _epic_worktree_path(self, project_name: str, epic_id: str) -> Path:
         """Staging path for an epic's worktree: .orchestrator/worktrees/<project>/<epic_id>/
@@ -761,10 +847,17 @@ class ProjectWorkspaceManager:
         (the common case -- most files in a repo aren't touched by any one epic's
         commits) checks out cleanly and SILENTLY CARRIES THE UNCOMMITTED CHANGES
         OVER onto default_branch (verified empirically -- this is real git
-        behavior, not a hypothetical). Repair cycles steal the pipeline lock from a
-        non-retained ordinary holder (see steal_lock() in project_monitor.py), so a
-        live 'issues'-workspace agent genuinely can be mid-edit in this exact base
-        clone when this runs. So: bail out entirely (no checkout attempted at all)
+        behavior, not a hypothetical). Historically (before #58, Phase 2 of #34's
+        concurrency redesign), repair cycles stole the pipeline lock from a
+        non-retained ordinary holder via steal_lock() -- since removed -- so a
+        live 'issues'-workspace agent could genuinely be mid-edit in this exact
+        base clone when this ran. Repair cycles now wait for the lock instead of
+        forcing their way in, but the other leftover-state causes described above
+        (an orchestrator restart mid-checkout, a manual debugging session, an
+        older worktree never cleaned up, PipelineLockManager's own stale-lock
+        auto-recovery) remain live, so a dirty base clone here is still a real,
+        reachable case, not a fossil this guard is holding onto out of caution
+        alone. So: bail out entirely (no checkout attempted at all)
         if the tree is dirty in ANY way, regardless of which files. When it's
         clean, `--detach` is used rather than a plain branch checkout -- it frees
         branch_name just the same (HEAD no longer references it) without leaving

@@ -14,10 +14,21 @@ agent_executor dispatch flow).
 """
 
 import pytest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from claude.claude_integration import run_claude_code
+
+
+@asynccontextmanager
+async def _noop_project_checkout_lock(*args, **kwargs):
+    """Stand-in for project_checkout_lock_async() (#54) in tests that mock
+    workspace_manager entirely: a real ProjectResourceLockManager() would try
+    to construct the process-wide PipelineLockManager singleton (real
+    Redis/filesystem state), which these path-resolution-focused tests have
+    no reason to depend on."""
+    yield
 
 
 def _base_context(task_context=None, **overrides):
@@ -43,8 +54,10 @@ class TestRunClaudeCodeProjectDirResolution:
 
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
+             patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir.return_value = Path('/workspace/test-project')
+            mock_wm.is_base_clone_dir.return_value = True  # this IS the shared base clone (epic_id=None)
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             result = await run_claude_code('do the thing', context)
@@ -71,6 +84,7 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir.return_value = Path('/workspace/.orchestrator/worktrees/test-project/42')
+            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
@@ -98,6 +112,7 @@ class TestRunClaudeCodeProjectDirResolution:
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('pathlib.Path.exists', return_value=True):
+            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
@@ -122,6 +137,7 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir.return_value = Path('/workspace/.orchestrator/worktrees/test-project/200')
+            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)

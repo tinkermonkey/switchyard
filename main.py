@@ -200,8 +200,19 @@ async def main():
     github_project_manager = GitHubProjectManager(config_manager, github_state_manager)
 
     # Initialize all project workspaces on startup
+    #
+    # Run off the event loop (#54 follow-up): initialize_all_projects() ->
+    # initialize_project() now acquires the project_checkout lock via
+    # project_checkout_lock_sync(), which polls with time.sleep() for up to
+    # DEFAULT_TIMEOUT_SECONDS (~3h, and now heartbeat-refreshed for the full duration of a hold -- see project_checkout_lock.py) on contention (e.g. a stale lock left
+    # by a crashed prior process). Calling it directly here would freeze
+    # THIS process's event loop for that whole wait -- not /health itself
+    # (served by the separate observability-server process/container, which
+    # is unaffected), but every other asyncio task this same event loop will
+    # go on to run later in startup (the monitor loop, scheduler, etc.) would
+    # be unable to even begin until this returns.
     logger.info("Initializing project workspaces")
-    projects_needing_setup = workspace_manager.initialize_all_projects()
+    projects_needing_setup = await asyncio.to_thread(workspace_manager.initialize_all_projects)
     logger.info("Project workspaces initialized")
 
     # Wait for Elasticsearch to be ready before cleanup operations
@@ -221,8 +232,20 @@ async def main():
     logger.info(f"Container recovery: {recovered} recovered, {killed} killed, {errors} errors")
 
     # NEW: Recover or cleanup running repair cycle containers
+    #
+    # Run off the event loop (#54 review, round 3): this can reach
+    # AutoCommitService.commit_agent_changes() (via _process_completed_repair_cycle()),
+    # which now blocks synchronously (thread.join()) for up to
+    # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS+60s per orphaned
+    # repair-cycle container found, on the same project_checkout lock
+    # contention this whole PR is about -- exactly the event-loop-freezing
+    # risk initialize_all_projects() above was already moved off the loop
+    # for, on a call site that's live right after every crash/restart (the
+    # most likely time for that lock to actually be contended).
     logger.info("Recovering or cleaning up running repair cycle containers")
-    rc_recovered, rc_killed, rc_errors = container_recovery.recover_or_cleanup_repair_cycle_containers()
+    rc_recovered, rc_killed, rc_errors = await asyncio.to_thread(
+        container_recovery.recover_or_cleanup_repair_cycle_containers
+    )
     logger.info(f"Repair cycle container recovery: {rc_recovered} recovered, {rc_killed} killed, {rc_errors} errors")
 
     # Clean up orphaned Redis keys from agent containers that completed after orchestrator restart

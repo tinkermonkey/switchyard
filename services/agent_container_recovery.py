@@ -1741,12 +1741,46 @@ class AgentContainerRecovery:
 
                 thread = threading.Thread(target=commit_thread)
                 thread.start()
-                thread.join(timeout=60)  # Wait up to 60 seconds for commit
+                # #54 review: commit_agent_changes() can now block for up to
+                # project_checkout_lock's own DEFAULT_TIMEOUT_SECONDS (~3h, and now heartbeat-refreshed for the full duration of a hold -- see project_checkout_lock.py)
+                # polling for the shared base-clone lock, when
+                # repair_cycle_project_dir resolves to it (the uncommon case --
+                # normally this is an isolated epic worktree, which the lock
+                # doesn't gate at all). A fixed 60s join here predates that and
+                # would time out with commit_success[0] still False while the
+                # commit is genuinely still in progress (not stuck) -- read as
+                # "no changes to commit" below and silently skip auto-advance
+                # even though the fix will land moments later. Join for at
+                # least as long as the lock itself is willing to wait, plus
+                # headroom for the actual git add/commit/push.
+                from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
+                thread.join(timeout=_CHECKOUT_LOCK_TIMEOUT + 60)
 
                 if commit_success[0]:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                elif thread.is_alive():
+                    # #57 review: the join itself timed out (thread still
+                    # running) -- distinct from "commit_agent_changes()
+                    # returned False" (real failure/no-changes/lock-timeout,
+                    # already logged with its specific reason by
+                    # commit_agent_changes() itself). commit_success[0]'s
+                    # initial value (False) is indistinguishable from a real
+                    # False return unless we also check is_alive() here --
+                    # without this, an engineer investigating a stuck repair
+                    # cycle would misread "No changes to commit" as the
+                    # actual outcome when the commit may still be in flight.
+                    logger.warning(
+                        f"Auto-commit thread for repair cycle issue #{issue_number} did not "
+                        f"finish within the join timeout ({_CHECKOUT_LOCK_TIMEOUT + 60}s) -- "
+                        "still running in the background; its eventual result won't be "
+                        "reflected in this recovery pass"
+                    )
                 else:
-                    logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
+                    logger.warning(
+                        f"Auto-commit for repair cycle issue #{issue_number} did not succeed "
+                        "(no changes to commit, or a failure already logged above by "
+                        "commit_agent_changes() itself)"
+                    )
             except Exception as e:
                 logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
 

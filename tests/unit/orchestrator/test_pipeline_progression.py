@@ -453,6 +453,9 @@ class TestReleaseLockAndProcessNext:
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = True
         mock_queue.get_next_waiting_issue.return_value = None  # nothing else queued
+        # Phase 2 (issue #57): _release_lock_and_process_next now calls
+        # get_next_n_waiting_issues(1) instead of get_next_waiting_issue().
+        mock_queue.get_next_n_waiting_issues.return_value = []
 
         mock_run_manager = Mock()
 
@@ -487,6 +490,7 @@ class TestReleaseLockAndProcessNext:
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = True
         mock_queue.get_next_waiting_issue.return_value = None
+        mock_queue.get_next_n_waiting_issues.return_value = []
 
         mock_run_manager = Mock()
 
@@ -541,6 +545,7 @@ class TestReleaseLockAndProcessNext:
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = False
         mock_queue.get_next_waiting_issue.return_value = None
+        mock_queue.get_next_n_waiting_issues.return_value = []
 
         mock_run_manager = Mock()
 
@@ -555,3 +560,72 @@ class TestReleaseLockAndProcessNext:
 
         mock_lock_manager.release_lock.assert_not_called()
         mock_run_manager.end_pipeline_run.assert_called_once()
+
+    def test_dispatches_single_next_queued_issue_at_capacity_one(self):
+        """Byte-identical-at-capacity-1 check: with exactly one waiting
+        issue queued, _release_lock_and_process_next must release the lock,
+        query get_next_n_waiting_issues(1), acquire the lock for the
+        returned issue, mark it active, and enqueue a task for it - the
+        same sequence get_next_waiting_issue() drove before #57."""
+        our_lock = Mock()
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = True
+        mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        mock_queue = Mock()
+        mock_queue.is_issue_in_queue.return_value = True
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0, 'column': 'Development'}
+        ]
+
+        mock_run_manager = Mock()
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
+
+        dev_column = Mock()
+        dev_column.name = 'Development'
+        dev_column.agent = 'senior_software_engineer'
+        workflow_template = Mock()
+        workflow_template.columns = [dev_column]
+
+        pipeline_config = Mock()
+        pipeline_config.board_name = 'dev'
+        pipeline_config.name = 'sdlc'
+        pipeline_config.workflow = 'sdlc_execution_workflow'
+
+        project_config = Mock()
+        project_config.pipelines = [pipeline_config]
+        project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+
+        mock_task_queue = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('services.pipeline_progression.config_manager') as mock_config_manager, \
+             patch('services.work_execution_state.work_execution_tracker') as mock_tracker, \
+             patch('monitoring.observability.get_observability_manager'):
+
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_config_manager.get_workflow_template.return_value = workflow_template
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(mock_task_queue)
+            progression._get_issue_details = Mock(return_value={'title': 'Next issue'})
+
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        mock_lock_manager.release_lock.assert_called_once_with('test-project', 'dev', 100)
+        mock_queue.get_next_n_waiting_issues.assert_called_once_with(1)
+        mock_lock_manager.try_acquire_lock.assert_called_once_with(
+            project='test-project', board='dev', issue_number=200
+        )
+        mock_queue.mark_issue_active.assert_called_once_with(200)
+        mock_tracker.record_execution_start.assert_called_once()
+        mock_task_queue.enqueue.assert_called_once()
+        dispatched_task = mock_task_queue.enqueue.call_args[0][0]
+        assert dispatched_task.context['issue_number'] == 200
+        assert dispatched_task.context['trigger'] == 'pipeline_progression'
+

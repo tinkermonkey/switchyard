@@ -478,9 +478,19 @@ class PipelineProgression:
                 outcome="success"
             )
             
-            # Process next waiting issue
-            next_issue = pipeline_queue.get_next_waiting_issue()
-            if next_issue:
+            # Process next waiting issue(s). "available_slots" is hardcoded to 1
+            # today -- PipelineLockManager still enforces exactly one concurrent
+            # issue per (project, board), so get_next_n_waiting_issues(1) returns
+            # at most one candidate and this loop runs its body at most once,
+            # identical to the pre-#57 get_next_waiting_issue()-based single
+            # attempt. Phase 3a (out of scope here) is what will eventually make
+            # this a real slot count (issue #57).
+            available_slots = 1
+            next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+            if not next_issues:
+                logger.info(f"No waiting issues in pipeline queue for {project_name}/{board_name}")
+
+            for next_issue in next_issues:
                 logger.info(f"Processing next queued issue #{next_issue['issue_number']} for {project_name}/{board_name}")
                 
                 # Acquire lock
@@ -581,9 +591,7 @@ class PipelineProgression:
                         logger.warning(f"Next issue #{next_issue['issue_number']} is in column '{current_column}' which has no agent")
                 else:
                     logger.error(f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}")
-            else:
-                logger.info(f"No waiting issues in pipeline queue for {project_name}/{board_name}")
-                
+
         except Exception as e:
             logger.error(f"Error releasing lock and processing next: {e}")
             import traceback

@@ -66,52 +66,150 @@ class AutoCommitService:
             logger.error(f"Project directory does not exist: {project_dir}")
             return False
 
+        # Fast-fail pre-check (not main/master) BEFORE acquiring the
+        # project_checkout lock below (#56 review): a project_dir stuck on
+        # main/master will fail this check regardless of lock state, so
+        # checking first avoids turning an instant rejection into a long
+        # stall if the lock happens to be contended. This is ONLY an early
+        # exit, not the value actually used to commit/push -- see below.
+        current_branch = self._get_current_branch(project_dir)
+        if current_branch in ['main', 'master']:
+            logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
+            logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
+            logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
+            logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
+            return False
+
         try:
-            # Ensure we're on a feature branch (not main/master)
-            current_branch = self._get_current_branch(project_dir)
-            if current_branch in ['main', 'master']:
-                logger.error(f"WORKFLOW BUG: Agent executed on {current_branch} branch without proper branch preparation!")
-                logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
-                logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
-                logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
-                return False
+            # project_checkout lock (#54): if project_dir is the shared base
+            # clone (not an isolated epic worktree -- see is_base_clone_dir()),
+            # this commit/add/push must serialize against every other operation
+            # touching that same directory (another board's checkout, the
+            # startup clone/update, a container run bind-mounting it) instead of
+            # racing it. Epic-worktree-scoped commits are deliberately NOT
+            # locked -- they don't share a directory with anything else.
+            from services.project_workspace import workspace_manager
+            if workspace_manager.is_base_clone_dir(project, project_dir):
+                from services.project_checkout_lock import project_checkout_lock_async
 
-            # Check if there are changes to commit
-            has_changes = self._check_for_changes(project_dir)
+                # issue_number here is log attribution only, not the lock's
+                # holder identity -- see project_checkout_lock.py's module
+                # docstring ("Why every acquisition gets its own unique
+                # holder id").
+                async with project_checkout_lock_async(project, issue_number):
+                    # CRITICAL: re-read current_branch here, AFTER acquiring
+                    # the lock, not the value read before it (found in final
+                    # whole-PR review): the pre-lock read above can be stale
+                    # by the time we actually get here -- this exact lock
+                    # exists because a DIFFERENT operation (another board of
+                    # the same project) can check out a DIFFERENT branch in
+                    # this same shared directory while we wait for it. Using
+                    # the stale branch name would push the on-disk tree
+                    # (whatever the lock's previous holder left checked out)
+                    # to the WRONG branch ref, corrupting it with unrelated
+                    # commits. Only the fast-fail decision above is safe to
+                    # make with the pre-lock value; the actual push must use
+                    # fresh state.
+                    fresh_branch = self._get_current_branch(project_dir)
+                    # Re-apply the same WORKFLOW BUG refusal the pre-lock
+                    # fast-fail check above already does, using the fresh
+                    # (post-lock) value -- belt-and-suspenders with
+                    # _commit_and_push()'s own main/master guard below: this
+                    # refuses with a message specific to "raced onto
+                    # main/master during the lock wait," while that guard is
+                    # the structural backstop that holds even if a future
+                    # caller skips this check.
+                    if fresh_branch in ['main', 'master']:
+                        logger.error(
+                            f"WORKFLOW BUG: {project_dir} is on {fresh_branch} after "
+                            f"acquiring the project_checkout lock (was on a feature "
+                            f"branch before the wait) -- another operation must have "
+                            f"checked out {fresh_branch} in this shared directory "
+                            f"while we waited. Project: {project}, Agent: {agent}, "
+                            f"Issue: {issue_number}. Refusing to commit."
+                        )
+                        return False
+                    return await self._commit_and_push(
+                        project, agent, task_id, project_dir, fresh_branch, issue_number, custom_message
+                    )
 
-            if has_changes:
-                # Stage all changes
-                self._stage_changes(project_dir)
-
-                # Create commit message
-                if custom_message:
-                    commit_message = custom_message
-                else:
-                    commit_message = self._generate_commit_message(agent, task_id, issue_number)
-
-                # Commit
-                success = self._commit(project_dir, commit_message)
-                if not success:
-                    logger.error("Failed to commit changes")
-                    return False
-
-                logger.info(f"Successfully committed changes for {project} (agent: {agent})")
-            else:
-                logger.info(f"No changes to commit for {project} after {agent} execution")
-
-            # Always push branch to remote (even if no new commits, there may be unpushed commits)
-            if current_branch and current_branch not in ['main', 'master']:
-                push_success = self._push_branch(project_dir, current_branch)
-                if push_success:
-                    logger.info(f"Successfully pushed branch {current_branch} to remote")
-                else:
-                    logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
-
-            return True
+            return await self._commit_and_push(
+                project, agent, task_id, project_dir, current_branch, issue_number, custom_message
+            )
 
         except Exception as e:
             logger.error(f"Failed to auto-commit changes for {project}: {e}")
             return False
+
+    async def _commit_and_push(
+        self,
+        project: str,
+        agent: str,
+        task_id: str,
+        project_dir: Path,
+        current_branch: Optional[str],
+        issue_number: Optional[int],
+        custom_message: Optional[str],
+    ) -> bool:
+        """
+        The actual git add/commit/push sequence, split out of
+        commit_agent_changes() (#54) so its caller can wrap it in the
+        project_checkout lock only when needed, without duplicating the
+        try/except that still lives in commit_agent_changes() around both the
+        locked and unlocked call paths. `current_branch` is resolved once by
+        the caller (before the lock -- see commit_agent_changes()'s own
+        comment, #56 review) rather than re-read here.
+
+        Defense-in-depth main/master guard, found in a later review pass:
+        both callers already refuse to reach this method with current_branch
+        on main/master, but a bare stage-and-commit here with no guard of
+        its own meant that guarantee lived ONLY in the callers -- a future
+        third call site (or a caller's own logic change) could silently
+        reintroduce a real commit onto the shared clone's main branch. This
+        check makes the invariant hold structurally, not just by caller
+        discipline.
+        """
+        if current_branch in ['main', 'master']:
+            logger.error(
+                f"WORKFLOW BUG: _commit_and_push() called with current_branch="
+                f"{current_branch!r} for {project_dir} -- refusing to stage or "
+                f"commit onto {current_branch}. Project: {project}, Agent: "
+                f"{agent}, Issue: {issue_number}."
+            )
+            return False
+
+        # Check if there are changes to commit
+        has_changes = self._check_for_changes(project_dir)
+
+        if has_changes:
+            # Stage all changes
+            self._stage_changes(project_dir)
+
+            # Create commit message
+            if custom_message:
+                commit_message = custom_message
+            else:
+                commit_message = self._generate_commit_message(agent, task_id, issue_number)
+
+            # Commit
+            success = self._commit(project_dir, commit_message)
+            if not success:
+                logger.error("Failed to commit changes")
+                return False
+
+            logger.info(f"Successfully committed changes for {project} (agent: {agent})")
+        else:
+            logger.info(f"No changes to commit for {project} after {agent} execution")
+
+        # Always push branch to remote (even if no new commits, there may be unpushed commits)
+        if current_branch and current_branch not in ['main', 'master']:
+            push_success = self._push_branch(project_dir, current_branch)
+            if push_success:
+                logger.info(f"Successfully pushed branch {current_branch} to remote")
+            else:
+                logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
+
+        return True
 
     def _check_for_changes(self, project_dir: Path) -> bool:
         """Check if there are uncommitted changes"""

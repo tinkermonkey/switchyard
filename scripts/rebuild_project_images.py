@@ -53,6 +53,7 @@ if 'ORCHESTRATOR_ROOT' not in os.environ:
 
 from config.manager import config_manager
 from services.dev_container_state import dev_container_state, DevContainerStatus
+from services.dev_container_build_lock import dev_container_build_lock_sync, DevContainerBuildLockTimeoutError
 
 # Configure logging
 logging.basicConfig(
@@ -207,45 +208,59 @@ def rebuild_project_image(
         logger.info(f"[DRY RUN] Would execute: {' '.join(build_cmd)}")
         return True
 
-    # Execute build
-    logger.info(f"Building {image_name}...")
+    # dev_container_build lock (#56): this is one of the two admin scripts
+    # that used to bypass PipelineLockManager entirely and could race a live
+    # pipeline-driven build/verify for the same project (dev_environment_setup
+    # issues this exact same `docker build` itself, from inside its own
+    # Claude Code session -- see services/dev_container_build_lock.py's module
+    # docstring). Acquiring the same project-level lock the pipeline path uses
+    # (claude/claude_integration.py) around the whole build-then-state-update
+    # sequence below serializes this operator-triggered rebuild against any
+    # in-flight dev_environment_setup/verifier run for the same project.
     try:
-        result = subprocess.run(
-            build_cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800  # 30 minute timeout for large builds
-        )
-
-        if result.returncode == 0:
-            logger.info(f"✓ Successfully built {image_name}")
-
-            # Optionally update dev container state
-            if update_state:
-                dev_container_state.set_status(
-                    project_name,
-                    DevContainerStatus.VERIFIED,
-                    image_name=image_name
+        with dev_container_build_lock_sync(project_name):
+            # Execute build
+            logger.info(f"Building {image_name}...")
+            try:
+                result = subprocess.run(
+                    build_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800  # 30 minute timeout for large builds
                 )
-                logger.info(f"  Updated dev container state to VERIFIED")
 
-            return True
-        else:
-            logger.error(f"✗ Failed to build {image_name}")
-            logger.error(f"  Return code: {result.returncode}")
-            if result.stderr:
-                # Show last 20 lines of error output
-                error_lines = result.stderr.strip().split('\n')
-                logger.error(f"  Error output (last 20 lines):")
-                for line in error_lines[-20:]:
-                    logger.error(f"    {line}")
-            return False
+                if result.returncode == 0:
+                    logger.info(f"✓ Successfully built {image_name}")
 
-    except subprocess.TimeoutExpired:
-        logger.error(f"✗ Build timeout for {image_name} (exceeded 30 minutes)")
-        return False
-    except Exception as e:
-        logger.error(f"✗ Failed to build {image_name}: {e}")
+                    # Optionally update dev container state
+                    if update_state:
+                        dev_container_state.set_status(
+                            project_name,
+                            DevContainerStatus.VERIFIED,
+                            image_name=image_name
+                        )
+                        logger.info(f"  Updated dev container state to VERIFIED")
+
+                    return True
+                else:
+                    logger.error(f"✗ Failed to build {image_name}")
+                    logger.error(f"  Return code: {result.returncode}")
+                    if result.stderr:
+                        # Show last 20 lines of error output
+                        error_lines = result.stderr.strip().split('\n')
+                        logger.error(f"  Error output (last 20 lines):")
+                        for line in error_lines[-20:]:
+                            logger.error(f"    {line}")
+                    return False
+
+            except subprocess.TimeoutExpired:
+                logger.error(f"✗ Build timeout for {image_name} (exceeded 30 minutes)")
+                return False
+            except Exception as e:
+                logger.error(f"✗ Failed to build {image_name}: {e}")
+                return False
+    except DevContainerBuildLockTimeoutError as e:
+        logger.error(f"✗ {e}")
         return False
 
 
