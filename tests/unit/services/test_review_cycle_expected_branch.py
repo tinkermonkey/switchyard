@@ -105,11 +105,14 @@ class TestTheResolvedBranchReachesTheCommitCallSite:
     binding between the two -- not just the resolution -- is what is covered.
     """
 
-    async def _captured_commit_kwargs(self, executor, tmp_path, *, makes_code_changes=True):
+    async def _captured_commit_kwargs(self, executor, tmp_path, *, makes_code_changes=True,
+                                      commit_result=None):
         captured = {}
 
         async def _commit(**kwargs):
             captured.update(kwargs)
+            if commit_result is not None:
+                return commit_result
             raise _StopAfterCommit()
 
         state = make_state()
@@ -169,3 +172,28 @@ class TestTheResolvedBranchReachesTheCommitCallSite:
         captured = await self._captured_commit_kwargs(executor, tmp_path)
 
         assert captured['project_dir'] == tmp_path
+
+
+class TestAFailedCommitIsNotSwallowedHere:
+    """
+    This call site discarded commit_agent_changes()'s return entirely, so a
+    FAILED commit -- including the branch-target refusal #149 WI-4 added --
+    left no trace at all. The cycle deliberately still continues (the reviewer
+    reads the maker's GitHub comment, not the branch), but an uncommitted
+    revision must not pass silently, matching the sibling site in
+    _run_revision_iteration() that already logged it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refused_commit_is_logged_as_an_error(self, executor, tmp_path, caplog):
+        from services.auto_commit import CommitResult
+
+        helper = TestTheResolvedBranchReachesTheCommitCallSite()
+        with caplog.at_level('ERROR', logger='services.review_cycle'):
+            await helper._captured_commit_kwargs(
+                executor, tmp_path, commit_result=CommitResult.FAILED
+            )
+
+        assert any(
+            'Auto-commit FAILED' in record.message for record in caplog.records
+        )

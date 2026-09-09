@@ -75,6 +75,10 @@ class TestExpectedBranchIsVerifiedBeforeCommitting:
             assert result['branch_mismatch'] is True
             assert 'scratch' in result['error']
             assert 'feature/issue-5-epic' in result['error']
+            # Carried out structurally so the caller can quarantine the worktree
+            # without re-parsing the message.
+            assert result['expected_branch'] == 'feature/issue-5-epic'
+            assert result['current_branch'] == 'scratch'
 
             mock_add.assert_not_called()
             mock_commit.assert_not_called()
@@ -113,13 +117,15 @@ class TestExpectedBranchIsVerifiedBeforeCommitting:
             mock_push.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_refuses_when_the_branch_cannot_be_read_at_all(self, manager, tmp_path):
-        """get_current_branch() raises on a git failure. Letting that propagate
-        would reach agent_executor.py's generic finalization handler as an
-        unexplained exception; it is this method's own documented refusal
-        instead."""
+    async def test_an_unreadable_branch_is_its_own_verdict_not_a_mismatch(self, manager, tmp_path):
+        """get_current_branch() runs with check=True, so a transient
+        `.git/index.lock` or a timed-out read raises here exactly like a genuine
+        wrong branch does. Reporting that as branch_mismatch would suppress
+        agent_executor.py's failsafe commit -- the path that used to SAVE the
+        work in precisely this case -- so it gets its own key."""
         with patch.object(manager, 'get_current_branch', new_callable=AsyncMock,
-                          side_effect=RuntimeError('not a git repository')), \
+                          side_effect=RuntimeError('index.lock exists')) as mock_branch, \
+             patch('services.feature_branch_manager.asyncio.sleep', new_callable=AsyncMock), \
              patch.object(manager, 'git_add_all', new_callable=AsyncMock) as mock_add, \
              patch.object(manager, 'git_commit', new_callable=AsyncMock) as mock_commit:
 
@@ -133,9 +139,48 @@ class TestExpectedBranchIsVerifiedBeforeCommitting:
             )
 
             assert result['success'] is False
-            assert result['branch_mismatch'] is True
+            assert result['branch_unverifiable'] is True
+            assert result.get('branch_mismatch') is None
+            assert result['expected_branch'] == 'feature/issue-5-epic'
+            # Retried once before giving up -- the dominant cause is transient.
+            assert mock_branch.call_count == 2
             mock_add.assert_not_called()
             mock_commit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_transient_read_failure_is_retried_and_then_proceeds(self, manager, tmp_path):
+        """The retry is the point: a lock held by a dying container is gone a
+        second later, and the run commits normally instead of stalling."""
+        feature_branch = _tracked_feature_branch()
+
+        with patch.object(manager, 'get_current_branch', new_callable=AsyncMock,
+                          side_effect=[RuntimeError('index.lock exists'),
+                                       'feature/issue-5-epic',
+                                       'feature/issue-5-epic']), \
+             patch('services.feature_branch_manager.asyncio.sleep', new_callable=AsyncMock), \
+             patch.object(manager, 'get_feature_branch_for_issue', new_callable=AsyncMock,
+                          return_value=feature_branch), \
+             patch.object(manager, 'git_add_all', new_callable=AsyncMock) as mock_add, \
+             patch.object(manager, 'git_commit', new_callable=AsyncMock, return_value=True), \
+             patch.object(manager, 'branch_exists', new_callable=AsyncMock, return_value=True), \
+             patch.object(manager, 'git_push', new_callable=AsyncMock) as mock_push, \
+             patch.object(manager, 'mark_sub_issue_complete'), \
+             patch.object(manager, 'create_or_update_feature_pr', new_callable=AsyncMock,
+                          return_value={'success': True}):
+
+            result = await manager.finalize_feature_branch_work(
+                project='test-project',
+                issue_number=7,
+                commit_message='Complete work for issue #7',
+                github_integration=Mock(),
+                project_dir_override=str(tmp_path),
+                expected_branch='feature/issue-5-epic',
+            )
+
+            assert result.get('branch_unverifiable') is None
+            assert result.get('branch_mismatch') is None
+            mock_add.assert_called_once()
+            mock_push.assert_called_once_with(str(tmp_path), 'feature/issue-5-epic')
 
     @pytest.mark.asyncio
     async def test_commits_normally_when_the_branch_matches(self, manager, tmp_path):
@@ -263,53 +308,179 @@ class TestWorkspaceContextsBindTheExpectation:
             assert kwargs['expected_branch'] == 'feature/issue-5-epic'
 
 
-class TestFailsafeDoesNotUndoTheRefusal:
+class TestARefusalStopsTheRunInsteadOfAdvancingIt:
     """
-    agent_executor.py's finalization-failure path runs _failsafe_commit_check(),
-    an unguarded `git add -A` + commit + push of ambient HEAD. Running it after
-    a branch-mismatch refusal would land exactly the work the refusal protected
-    on exactly the wrong branch -- so the refusal has to be distinguishable from
-    an ordinary finalization failure, which is what the 'branch_mismatch' key is
-    for.
+    The refusal itself was only half the fix. agent_executor.py's handler logged
+    it and fell through -- reaching record_execution_outcome(outcome='success')
+    and returning normally, so orchestrator_integration.py advanced the issue to
+    review against a branch holding NONE of the agent's work, and released the
+    pipeline lock as a success (#149 WI-4 review).
+
+    Two things must therefore hold for a branch_mismatch: the failsafe commit is
+    skipped (it is an ambient-HEAD `git add -A` + push, i.e. exactly the thing
+    the refusal declined to do), and the run does not reach the success path.
     """
 
     @pytest.mark.asyncio
     async def test_branch_mismatch_skips_the_failsafe_commit(self):
-        failsafe = await _run_finalization({
+        harness = await _run_finalization({
             'success': False,
             'branch_mismatch': True,
+            'expected_branch': 'feature/issue-5-epic',
+            'current_branch': 'scratch',
             'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
         })
-        failsafe.assert_not_called()
+        harness['failsafe'].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_branch_mismatch_never_records_a_successful_execution(self):
+        """THE critical regression: a refusal reported as success auto-advances
+        the issue with the agent's work uncommitted on disk."""
+        harness = await _run_finalization({
+            'success': False,
+            'branch_mismatch': True,
+            'expected_branch': 'feature/issue-5-epic',
+            'current_branch': 'scratch',
+            'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
+        })
+
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+
+        outcomes = [
+            call.kwargs.get('outcome')
+            for call in harness['tracker'].record_execution_outcome.call_args_list
+        ]
+        assert 'success' not in outcomes
+
+    @pytest.mark.asyncio
+    async def test_branch_mismatch_retains_the_pipeline_lock_and_explains_itself(self):
+        """Same escalation the push-rejection path already does: mark_failed()
+        so the board lock is durably retained, plus an issue comment -- a log
+        line in the orchestrator container is not an operator signal."""
+        harness = await _run_finalization({
+            'success': False,
+            'branch_mismatch': True,
+            'expected_branch': 'feature/issue-5-epic',
+            'current_branch': 'scratch',
+            'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
+        })
+
+        harness['prm'].mark_failed.assert_called_once()
+        assert harness['prm'].mark_failed.call_args.kwargs['issue_number'] == 7
+
+        harness['github'].post_comment.assert_awaited_once()
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Wrong Branch' in body
+        assert 'feature/issue-5-epic' in body
+        assert 'scratch' in body
+
+    @pytest.mark.asyncio
+    async def test_branch_mismatch_quarantines_the_epic_worktree(self):
+        """The refusal is otherwise one-shot: the NEXT dispatch is a fresh
+        PipelineRun whose resolve_workspace() re-reads the drifted branch and
+        persists it as its own expectation, at which point the guard compares
+        'scratch' against 'scratch', passes, and commits both issues' work onto
+        it -- #143, one dispatch later."""
+        harness = await _run_finalization({
+            'success': False,
+            'branch_mismatch': True,
+            'expected_branch': 'feature/issue-5-epic',
+            'current_branch': 'scratch',
+            'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
+        })
+
+        harness['workspace_manager'].quarantine_epic_worktree.assert_called_once()
+        kwargs = harness['workspace_manager'].quarantine_epic_worktree.call_args.kwargs
+        assert kwargs['epic_id'] == '5'
+        assert kwargs['expected_branch'] == 'feature/issue-5-epic'
+        assert kwargs['actual_branch'] == 'scratch'
 
     @pytest.mark.asyncio
     async def test_an_ordinary_finalization_failure_still_runs_the_failsafe(self):
         """The pre-existing behavior for every other failure must be
-        untouched -- the skip is scoped to the wrong-branch case."""
-        failsafe = await _run_finalization({
+        untouched -- the skip and the escalation are scoped to the branch
+        verdicts."""
+        harness = await _run_finalization({
             'success': False,
             'error': 'PR creation failed',
         })
-        failsafe.assert_called_once()
+        harness['failsafe'].assert_called_once()
+        assert harness['exception'] is None
+        harness['prm'].mark_failed.assert_not_called()
 
 
-async def _run_finalization(finalize_result):
+class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
+    """
+    An unreadable branch is much commoner than a genuine wrong branch (a
+    transient index.lock, a timed-out read) and used to be RECOVERED: the
+    exception reached agent_executor.py's generic handler, which ran the
+    failsafe and committed the work. Collapsing it into the mismatch verdict
+    would have silently converted those runs into ones that commit nothing.
+
+    The failsafe now verifies the branch itself, so letting it try is safe: it
+    either confirms the branch and saves the work, or refuses -- and only then
+    is there nothing left but to block the pipeline.
+    """
+
+    _UNVERIFIABLE = {
+        'success': False,
+        'branch_unverifiable': True,
+        'expected_branch': 'feature/issue-5-epic',
+        'error': 'Cannot verify the branch: index.lock exists',
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_failsafe_still_runs_and_the_run_continues_when_it_succeeds(self):
+        harness = await _run_finalization(dict(self._UNVERIFIABLE), failsafe_result=True)
+
+        harness['failsafe'].assert_called_once()
+        assert harness['exception'] is None
+        harness['prm'].mark_failed.assert_not_called()
+        harness['workspace_manager'].quarantine_epic_worktree.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_pipeline_is_blocked_when_the_failsafe_cannot_confirm_either(self):
+        harness = await _run_finalization(dict(self._UNVERIFIABLE), failsafe_result=False)
+
+        harness['failsafe'].assert_called_once()
+        from agents.non_retryable import NonRetryableAgentError
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Branch Unverifiable' in body
+
+
+async def _run_finalization(finalize_result, failsafe_result=True):
     """
     Drive execute_agent() through a real IssuesWorkspaceContext to the
     finalization block, with the agent run and the underlying
-    FeatureBranchManager stubbed out, and return the _failsafe_commit_check
-    mock. Mirrors tests/unit/test_workspace_contexts.py's harness.
+    FeatureBranchManager stubbed out. Mirrors tests/unit/test_workspace_contexts.py's
+    harness.
+
+    Returns a dict of the mocks the assertions above read, plus the exception
+    execute_agent() raised (None when it returned normally) -- the escalation
+    paths deliberately raise, so the harness cannot simply let it propagate.
     """
     from services.agent_executor import AgentExecutor
 
     async def fake_resolve_workspace(pipeline_run, github, workspace_type):
         pipeline_run.branch_name = 'feature/issue-5-epic'
         pipeline_run.project_dir = '/workspace/.orchestrator/worktrees/test-project/5'
+        pipeline_run.epic_id = '5'
         return pipeline_run
 
     mock_prm = MagicMock()
     mock_prm.get_pipeline_run.return_value = MagicMock(id='run-1')
     mock_prm.resolve_workspace = AsyncMock(side_effect=fake_resolve_workspace)
+    mock_prm.mark_failed.return_value = True
+
+    mock_github = MagicMock()
+    mock_github.post_comment = AsyncMock()
+
+    mock_workspace_manager = MagicMock()
+    mock_tracker = MagicMock()
 
     with patch('services.agent_executor.get_observability_manager'), \
          patch('services.agent_executor.PipelineFactory'), \
@@ -319,9 +490,13 @@ async def _run_finalization(finalize_result):
     with patch('services.feature_branch_manager.feature_branch_manager') as mock_fbm, \
          patch('services.agent_executor.config_manager') as mock_config, \
          patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm), \
+         patch('services.github_integration.GitHubIntegration', return_value=mock_github), \
+         patch('services.project_workspace.workspace_manager', mock_workspace_manager), \
+         patch('services.work_execution_state.work_execution_tracker', mock_tracker), \
          patch.object(executor.factory, 'create_agent') as mock_create_agent, \
          patch.object(executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
-         patch.object(executor, '_failsafe_commit_check', new_callable=AsyncMock) as mock_failsafe:
+         patch.object(executor, '_failsafe_commit_check', new_callable=AsyncMock,
+                      return_value=failsafe_result) as mock_failsafe:
 
         mock_fbm.finalize_feature_branch_work = AsyncMock(return_value=finalize_result)
 
@@ -336,18 +511,31 @@ async def _run_finalization(finalize_result):
         mock_agent.agent_config = {}
         mock_create_agent.return_value = mock_agent
 
-        await executor.execute_agent(
-            agent_name='test_agent',
-            project_name='test-project',
-            task_context={
-                'issue_number': 7,
-                'issue_title': 'Test feature',
-                'workspace_type': 'issues',
-                'pipeline_run_id': 'run-1',
-            },
-        )
+        raised = None
+        try:
+            await executor.execute_agent(
+                agent_name='test_agent',
+                project_name='test-project',
+                task_context={
+                    'issue_number': 7,
+                    'issue_title': 'Test feature',
+                    'workspace_type': 'issues',
+                    'pipeline_run_id': 'run-1',
+                    'board': 'dev_workflow',
+                },
+            )
+        except Exception as e:
+            raised = e
 
         # The harness must actually have reached the finalization block --
-        # otherwise both assertions below would pass vacuously.
+        # otherwise every assertion above would pass vacuously.
         mock_fbm.finalize_feature_branch_work.assert_called_once()
-        return mock_failsafe
+
+        return {
+            'failsafe': mock_failsafe,
+            'exception': raised,
+            'prm': mock_prm,
+            'github': mock_github,
+            'workspace_manager': mock_workspace_manager,
+            'tracker': mock_tracker,
+        }

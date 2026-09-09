@@ -343,7 +343,13 @@ class AutoCommitService:
         here, adopting whatever branch git reported as its push target. It now
         takes the same caller-supplied expected_branch off the same
         pipeline_run.branch_name and refuses on the same terms -- see
-        _verify_finalize_branch() (#149 WI-4 review).
+        _verify_finalize_branch() (#149 WI-4 review). The third path, and the one
+        that was actually the weakest of them, is agent_executor.py's
+        _failsafe_commit_check(): an unguarded `git add -A` + `git commit
+        --no-verify` + push of ambient HEAD, reached on every skip_workspace_prep
+        dispatch (all of pipeline/repair_cycle.py's inner agent calls). It now
+        reads the same expectation off task_context['branch_name'] and refuses on
+        the same terms -- see _verify_failsafe_branch() there.
 
         is_shared_dir still decides fatality for the FALLBACK expectation
         (pre_lock_branch, used when no expected_branch is supplied): there it

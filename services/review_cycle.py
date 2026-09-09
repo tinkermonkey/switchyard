@@ -1642,7 +1642,7 @@ class ReviewCycleExecutor:
 
                     if makes_code_changes:
                         _commit_dir, _commit_branch = await self._resolve_workspace_for_cycle(cycle_state)
-                        await auto_commit_service.commit_agent_changes(
+                        _commit_result = await auto_commit_service.commit_agent_changes(
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
@@ -1651,6 +1651,22 @@ class ReviewCycleExecutor:
                             custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}",
                             expected_branch=_commit_branch,
                         )
+
+                        # The return used to be discarded outright, so a FAILED
+                        # commit -- including the branch-target refusal added by
+                        # #149 WI-4 -- left no trace at all here. Same verdict the
+                        # sibling site in _run_revision_iteration() reaches: the
+                        # cycle deliberately continues (the reviewer reads the
+                        # maker's GitHub comment, not the branch), but an
+                        # uncommitted revision must not pass silently.
+                        from services.auto_commit import CommitResult
+                        if _commit_result is CommitResult.FAILED:
+                            logger.error(
+                                f"Auto-commit FAILED for iteration "
+                                f"{cycle_state.current_iteration} -- the maker's changes "
+                                f"are still uncommitted (cause logged above by "
+                                f"commit_agent_changes())"
+                            )
 
                 # Get maker output
                 maker_output = await self._get_latest_agent_comment(
@@ -2568,7 +2584,7 @@ class ReviewCycleExecutor:
                     )
                     if getattr(_agent_config, 'makes_code_changes', False):
                         _lint_pd, _lint_branch = await self._resolve_workspace_for_cycle(cycle_state)
-                        await auto_commit_service.commit_agent_changes(
+                        _lint_commit_result = await auto_commit_service.commit_agent_changes(
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"lint_fix_iter_{iteration}",
@@ -2577,6 +2593,18 @@ class ReviewCycleExecutor:
                             custom_message=f"Fix mechanical lint violations (iteration {iteration})\n\nIssue #{cycle_state.issue_number}",
                             expected_branch=_lint_branch,
                         )
+
+                        # See the sibling site above: the discarded return meant a
+                        # FAILED commit (branch-target refusal included) was
+                        # invisible here.
+                        from services.auto_commit import CommitResult
+                        if _lint_commit_result is CommitResult.FAILED:
+                            logger.error(
+                                f"Auto-commit FAILED for lint fixes on iteration "
+                                f"{iteration} -- the maker's lint fixes are still "
+                                f"uncommitted (cause logged above by "
+                                f"commit_agent_changes())"
+                            )
 
                     # Record maker's lint-fix output for audit trail (fix #6)
                     maker_lint_comment = await self._get_latest_agent_comment(

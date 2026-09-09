@@ -502,7 +502,11 @@ class PipelineRunManager:
                 deliberately does not attempt to auto-recover from; see that
                 method's own docstring for why. Unlike a transient `worktree add`
                 failure, this one is not expected to self-resolve on a plain
-                retry -- it needs manual inspection first.
+                retry -- it needs manual inspection first. The same applies to the
+                third RuntimeError source added by #149's WI-4 review: the epic's
+                worktree carries a branch-quarantine marker left by a previous
+                dispatch's wrong-branch refusal, and must not be resolved again
+                until a human has cleared it.
 
         This method deliberately does not swallow any of these exceptions itself --
         a caller wiring this into real dispatch must let them reach whatever failure
@@ -556,6 +560,34 @@ class PipelineRunManager:
         # ever needs distinct handling.
         epic_id = await feature_branch_manager.resolve_epic_id(
             github_integration, pipeline_run.issue_number, project=pipeline_run.project
+            )
+
+        # A previous dispatch's wrong-branch refusal quarantines the epic's
+        # worktree (feature_branch_manager._verify_finalize_branch() ->
+        # agent_executor.py's branch_mismatch handler). Refuse here, BEFORE the
+        # _current_worktree_branch() re-derivation below gets a chance to read the
+        # drifted branch and persist it as this run's expectation: the refusal is
+        # per-dispatch, but the drift is on disk, and a fresh PipelineRun sails
+        # straight past the idempotency guard above and past
+        # get_or_create_epic_worktree()'s cache-hit path (neither touches git), so
+        # this is the one place a later run would otherwise normalize the drift
+        # and commit two issues' work onto it (#149 WI-4 review, #143's outcome
+        # deferred by one dispatch).
+        quarantine = workspace_manager.get_epic_worktree_quarantine(
+            pipeline_run.project, epic_id
+        )
+        if quarantine:
+            marker = workspace_manager._epic_worktree_quarantine_path(
+                pipeline_run.project, epic_id
+            )
+            raise RuntimeError(
+                f"Epic worktree for {pipeline_run.project} epic #{epic_id} is "
+                f"quarantined after a wrong-branch refusal (expected "
+                f"{quarantine.get('expected_branch')!r}, found "
+                f"{quarantine.get('actual_branch')!r}): {quarantine.get('reason')}. "
+                "An agent's uncommitted work may still be sitting in that worktree -- "
+                "inspect it, preserve or discard the changes, restore the epic's "
+                f"branch, then remove {marker} to re-enable dispatch for this epic."
             )
 
         # resolve_epic_branch_name() and get_or_create_epic_worktree() are both

@@ -10,6 +10,7 @@ Manages hierarchical branch workflows where:
 
 import os
 import yaml
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -1370,14 +1371,23 @@ git push --force-with-lease
         would either fail or silently reinterpret them against the wrong
         baseline. The work stays on disk for the caller's failure path.
 
-        A branch git cannot report at all is refused on the same terms --
-        get_current_branch() raises there, and letting that propagate would
-        reach agent_executor.py's generic finalization handler as an unexplained
-        exception rather than as this method's own documented refusal.
+        A branch git cannot report at all is a DIFFERENT verdict, and gets its
+        own key ('branch_unverifiable' rather than 'branch_mismatch'). Found in
+        the WI-4 review: get_current_branch() runs with check=True, so a
+        transient `.git/index.lock` left by a killed agent container -- or a 10s
+        timeout on a large tree -- raises here exactly like a genuine wrong
+        branch does, and that case used to propagate into agent_executor.py's
+        generic handler, which ran the failsafe commit and SAVED the work.
+        Collapsing it into the mismatch verdict (which deliberately suppresses
+        that failsafe) would silently turn the commoner of the two failures into
+        a run that commits nothing. The read is retried once before the verdict
+        is reached at all, since it is cheap and the dominant cause is transient.
 
         Returns:
             None to proceed with the finalization, or the failure dict
-            finalize_feature_branch_work() should return as-is.
+            finalize_feature_branch_work() should return as-is -- carrying
+            'branch_mismatch' for a confirmed wrong branch, or
+            'branch_unverifiable' when the branch could not be read.
         """
         if not expected_branch:
             # No resolved workspace to verify against (standalone/test callers,
@@ -1385,16 +1395,38 @@ git push --force-with-lease
             # "git is the source of truth" behavior below stands.
             return None
 
-        try:
-            current_branch = await self.get_current_branch(project_dir)
-        except Exception as e:
+        current_branch = None
+        read_error = None
+        for attempt in (1, 2):
+            try:
+                current_branch = await self.get_current_branch(project_dir)
+                read_error = None
+                break
+            except Exception as e:
+                read_error = e
+                if attempt == 1:
+                    logger.warning(
+                        f"Could not read the current branch in {project_dir} while "
+                        f"finalizing issue #{issue_number} ({project}): {e}. Retrying "
+                        "once -- the dominant cause is a transient index.lock or a "
+                        "read that timed out, not a genuinely broken repository."
+                    )
+                    await asyncio.sleep(1)
+
+        if read_error is not None:
             error_msg = (
                 f"Cannot verify the branch in {project_dir} before finalizing issue "
-                f"#{issue_number} ({project}): {e}. Refusing to stage or commit "
-                "against an unknown branch; the changes are left uncommitted on disk."
+                f"#{issue_number} ({project}): {read_error}. Refusing to stage or "
+                "commit against an unknown branch; the changes are left uncommitted "
+                "on disk."
             )
             logger.error(error_msg)
-            return {"success": False, "error": error_msg, "branch_mismatch": True}
+            return {
+                "success": False,
+                "error": error_msg,
+                "branch_unverifiable": True,
+                "expected_branch": expected_branch,
+            }
 
         if current_branch and current_branch == expected_branch:
             return None
@@ -1409,7 +1441,16 @@ git push --force-with-lease
             "changes are left uncommitted on disk."
         )
         logger.error(error_msg)
-        return {"success": False, "error": error_msg, "branch_mismatch": True}
+        return {
+            "success": False,
+            "error": error_msg,
+            "branch_mismatch": True,
+            # Carried out so the caller's escalation can quarantine the worktree
+            # by the branches themselves rather than re-parsing them out of the
+            # message (#149 WI-4 review).
+            "expected_branch": expected_branch,
+            "current_branch": current_branch,
+        }
 
     async def finalize_feature_branch_work(
         self,
@@ -1446,8 +1487,14 @@ git push --force-with-lease
         Returns: dict with pr_url, all_complete, etc. On an expected_branch
             mismatch, {'success': False, 'branch_mismatch': True, ...} with
             NOTHING staged, committed or pushed -- agent_executor.py reads that
-            key to skip its own failsafe commit, which would otherwise land the
-            same work on the same wrong branch.
+            key to skip its own failsafe commit (which would otherwise land the
+            same work on the same wrong branch) and to fail the run outright
+            rather than let it be recorded as a success. When the branch could
+            not be READ at all the key is 'branch_unverifiable' instead, which
+            agent_executor.py treats differently: it still runs its (now
+            branch-verifying) failsafe, because that path can succeed where this
+            one could not, and only blocks the pipeline if the failsafe cannot
+            confirm the branch either.
         """
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely
