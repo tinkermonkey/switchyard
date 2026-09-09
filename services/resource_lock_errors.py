@@ -55,7 +55,14 @@ against a failure budget, therefore has to be able to recognise it:
     work_execution_state.count_consecutive_lock_contentions() and escalated
     (visibly, without retaining any lock) by project_monitor's
     MAX_CONSECUTIVE_LOCK_CONTENTIONS, so a lock nobody is releasing surfaces to
-    an operator instead of looping silently. That counter is also why
+    an operator instead of looping silently. That check runs from
+    project_monitor._check_sustained_lock_contention(), called at the top of
+    trigger_agent_for_status() before any column-type or lock-state branching --
+    it has to, because every teardown path listed above releases the board lock
+    (so the issue does not hold it on the next poll) and because review,
+    conversational and PR-review columns are not pipeline trigger columns at
+    all. Wired anywhere narrower, the counter climbs and nothing ever fires.
+    That counter is also why
     count_consecutive_failures() skips 'lock_contention' entries rather than
     ending its run on them: an interleaved contention must not erase the real
     failure history that MAX_CONSECUTIVE_DISPATCH_FAILURES depends on.

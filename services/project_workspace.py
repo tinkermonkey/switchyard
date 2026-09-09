@@ -4,7 +4,7 @@ import shutil
 import threading
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from config.manager import config_manager
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,9 @@ class SetupStatus(Enum):
     Deliberately NOT given a __bool__: an earlier revision of this type defined
     one that was truthy only for NEEDED, which made `if status:` re-collapse
     UNKNOWN and NOT_NEEDED into the same answer at the only two places the value
-    is ever read (main.py's setup-queuing loop and initialize_all_projects()'s own
-    log line). A three-state type whose only public behavior is two-state does not
+    is ever read (resolve_setup_queue() below, which decides main.py's startup
+    setup-queuing, and initialize_all_projects()'s own log line). A three-state
+    type whose only public behavior is two-state does not
     encapsulate the invariant it was created to express, and it made the unsafe
     reading the ergonomic one -- any future call site would silently reproduce the
     conflation with nothing to catch it. Both call sites now name the member they
@@ -57,8 +58,8 @@ class SetupStatus(Enum):
 
     What UNKNOWN does today, stated plainly: it queues no dev_environment_setup
     task, which is the same end state the old bare False produced. That is the
-    deliberate answer, not an unfinished one -- main.py's preceding
-    verify_and_update_status() loop is an independent, positive check on the
+    deliberate answer, not an unfinished one -- resolve_setup_queue()'s
+    verify_and_update_status() call is an independent, positive check on the
     project's Docker image, and a verifiably missing image upgrades UNKNOWN to
     NEEDED there regardless of whether the checkout could be inspected. So the
     only projects UNKNOWN leaves alone are ones whose image is present. What
@@ -70,6 +71,50 @@ class SetupStatus(Enum):
     NEEDED = "needed"          # confirmed: newly cloned, or Dockerfile.agent missing
     NOT_NEEDED = "not_needed"  # confirmed: existing checkout that already has Dockerfile.agent
     UNKNOWN = "unknown"        # never determined: initialization did not complete
+
+
+def resolve_setup_queue(
+    statuses: Dict[str, 'SetupStatus'],
+    image_verified: Callable[[str], bool],
+) -> List[str]:
+    """
+    Which projects get a dev_environment_setup task queued at startup, given
+    initialize_all_projects()'s per-project SetupStatus and an independent check
+    on whether that project's agent Docker image actually exists.
+
+    The two rules, which are the whole reason SetupStatus exists (#148):
+
+      * A verifiably missing Docker image upgrades UNKNOWN to NEEDED. That check
+        is a positive observation about the image, entirely independent of whether
+        the checkout could be inspected this startup, so it stands on its own.
+      * NEEDED is tested by MEMBER, never by truthiness. SetupStatus deliberately
+        defines no __bool__ (see its docstring), so enum members are all truthy and
+        a `if needs_setup:` here would queue a HIGH-priority setup task for EVERY
+        configured project on every startup — each one acquiring dev_container_build
+        and rebuilding Dockerfile.agent. That is the failure this function exists
+        to hold still and be tested against; inline in main.py's startup loop it
+        was reachable by no test at all.
+
+    `image_verified` is passed in rather than imported so the caller keeps
+    ownership of the dev-container state side effect (it also updates status), and
+    so this stays a pure decision. It is called once per project, in `statuses`
+    order.
+
+    Returns:
+        The project names to queue, in `statuses` order.
+    """
+    to_queue: List[str] = []
+
+    for project_name, status in statuses.items():
+        if not image_verified(project_name):
+            # Image was marked verified but doesn't exist - mark for setup.
+            logger.info(f"Project {project_name} needs dev environment setup (Docker image missing)")
+            status = SetupStatus.NEEDED
+
+        if status is SetupStatus.NEEDED:
+            to_queue.append(project_name)
+
+    return to_queue
 
 
 class ProjectWorkspaceManager:

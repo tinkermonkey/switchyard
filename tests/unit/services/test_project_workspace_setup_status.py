@@ -21,7 +21,11 @@ import logging
 import pytest
 from unittest.mock import MagicMock, patch
 
-from services.project_workspace import ProjectWorkspaceManager, SetupStatus
+from services.project_workspace import (
+    ProjectWorkspaceManager,
+    SetupStatus,
+    resolve_setup_queue,
+)
 from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
 
 
@@ -70,11 +74,93 @@ class TestSetupStatusEnum:
         assert '__bool__' not in SetupStatus.__dict__
         # Enum members are truthy by default, so a call site that still tested
         # truthiness would now queue setup for every project — loudly wrong rather
-        # than silently wrong, and caught by the call-site tests below.
+        # than silently wrong, and caught by TestResolveSetupQueue below (which
+        # drives the only reader of these values, so a reverted `if needs_setup:`
+        # fails a test instead of quietly rebuilding every project's image on
+        # every startup).
         assert bool(SetupStatus.UNKNOWN) is True
 
     def test_members_are_distinct(self):
         assert len({SetupStatus.NEEDED, SetupStatus.NOT_NEEDED, SetupStatus.UNKNOWN}) == 3
+
+
+class TestResolveSetupQueue:
+    """
+    The startup call site itself: which projects actually get a HIGH-priority
+    dev_environment_setup task queued. This lived inline in main.py's startup
+    coroutine, reachable by no test — so neither the `is SetupStatus.NEEDED`
+    member test nor the UNKNOWN→NEEDED upgrade on a missing Docker image had any
+    coverage, and the enum's deliberate truthiness made reverting the former to
+    the idiomatic `if needs_setup:` both legal and invisible.
+    """
+
+    @staticmethod
+    def _image(*present):
+        """verify_and_update_status() stub: True only for the named projects."""
+        present = set(present)
+        return lambda project_name: project_name in present
+
+    def test_confirmed_not_needed_with_a_present_image_queues_nothing(self):
+        assert resolve_setup_queue(
+            {'alpha': SetupStatus.NOT_NEEDED}, self._image('alpha')
+        ) == []
+
+    def test_unknown_with_a_present_image_queues_nothing(self):
+        """UNKNOWN is not an assertion that setup is needed — and with the image
+        verifiably present there is no independent reason to rebuild it."""
+        assert resolve_setup_queue(
+            {'alpha': SetupStatus.UNKNOWN}, self._image('alpha')
+        ) == []
+
+    def test_unknown_with_a_missing_image_is_upgraded_to_needed(self):
+        """The independent, positive observation about the Docker image stands on
+        its own: a verifiably missing image needs setup regardless of whether the
+        checkout could be inspected this startup."""
+        assert resolve_setup_queue(
+            {'alpha': SetupStatus.UNKNOWN}, self._image()
+        ) == ['alpha']
+
+    def test_not_needed_with_a_missing_image_is_also_upgraded(self):
+        assert resolve_setup_queue(
+            {'alpha': SetupStatus.NOT_NEEDED}, self._image()
+        ) == ['alpha']
+
+    def test_needed_always_queues(self):
+        assert resolve_setup_queue(
+            {'alpha': SetupStatus.NEEDED}, self._image('alpha')
+        ) == ['alpha']
+
+    def test_truthiness_would_queue_every_project_so_the_member_test_is_load_bearing(self):
+        """
+        The regression this guards: `if needs_setup:` reads as fine and is legal
+        (enum members are truthy), and would queue a HIGH-priority setup task for
+        every configured project on every startup — each acquiring
+        dev_container_build and rebuilding Dockerfile.agent.
+        """
+        statuses = {
+            'alpha': SetupStatus.NEEDED,
+            'beta': SetupStatus.NOT_NEEDED,
+            'gamma': SetupStatus.UNKNOWN,
+        }
+        # Every image present, so nothing is upgraded — only 'alpha' is a
+        # confirmed NEEDED. Truthiness would return all three.
+        assert resolve_setup_queue(
+            statuses, self._image('alpha', 'beta', 'gamma')
+        ) == ['alpha']
+
+    def test_the_image_check_runs_once_per_project(self):
+        """It updates dev-container state as a side effect, so it must not be
+        skipped for a NEEDED project nor called twice for any project."""
+        seen = []
+
+        def image_verified(project_name):
+            seen.append(project_name)
+            return True
+
+        resolve_setup_queue(
+            {'alpha': SetupStatus.NEEDED, 'beta': SetupStatus.UNKNOWN}, image_verified
+        )
+        assert seen == ['alpha', 'beta']
 
 
 class TestConfirmedOutcomes:

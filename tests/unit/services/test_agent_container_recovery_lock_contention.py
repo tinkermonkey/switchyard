@@ -47,11 +47,15 @@ def _recovery():
     return recovery
 
 
-def _process(result):
+def _process(result, commit=None):
     """
     Drive _process_completed_repair_cycle() with `result`, and return the
-    (run_manager, github, work_execution_tracker) mocks so the caller can inspect
-    which teardown decision was taken.
+    (run_manager, github, work_execution_tracker, progression) mocks so the
+    caller can inspect which teardown decision was taken.
+
+    `commit` is the auto_commit_service.commit_agent_changes stub (an async
+    callable, or an exception instance to raise). Left as None when the result
+    never reaches the commit at all.
     """
     recovery = _recovery()
 
@@ -65,6 +69,23 @@ def _process(result):
     github.post_agent_output = AsyncMock()
 
     tracker = MagicMock()
+    progression = MagicMock()
+
+    if isinstance(commit, BaseException):
+        raised = commit
+
+        async def commit_agent_changes(**kwargs):
+            raise raised
+    elif commit is not None:
+        returned = commit
+
+        async def commit_agent_changes(**kwargs):
+            return returned
+    else:
+        commit_agent_changes = AsyncMock(return_value=False)
+
+    auto_commit_service = MagicMock()
+    auto_commit_service.commit_agent_changes = commit_agent_changes
 
     with patch('pathlib.Path.exists', return_value=True), \
          patch('builtins.open', mock_open(read_data=json.dumps(CONTEXT))), \
@@ -73,6 +94,10 @@ def _process(result):
          patch('config.manager.ConfigManager', return_value=MagicMock()), \
          patch('services.github_integration.GitHubIntegration', return_value=github), \
          patch('services.work_execution_state.work_execution_tracker', tracker), \
+         patch('services.auto_commit.auto_commit_service', auto_commit_service), \
+         patch('services.project_workspace.workspace_manager', MagicMock()), \
+         patch('services.pipeline_progression.PipelineProgression', return_value=progression), \
+         patch('task_queue.task_manager.TaskQueue', return_value=MagicMock()), \
          patch('services.agent_container_recovery.subprocess'):
 
         recovery._process_completed_repair_cycle(
@@ -83,7 +108,7 @@ def _process(result):
             result=result,
         )
 
-    return run_manager, github, tracker
+    return run_manager, github, tracker, progression
 
 
 def _recorded_outcomes(tracker):
@@ -101,20 +126,20 @@ class TestLockContentionResult:
     }
 
     def test_mark_failed_is_not_called(self):
-        run_manager, _, _ = _process(dict(self.RESULT))
+        run_manager, _, _, _ = _process(dict(self.RESULT))
         run_manager.mark_failed.assert_not_called()
 
     def test_run_is_released_without_retaining_the_lock(self):
-        run_manager, _, _ = _process(dict(self.RESULT))
+        run_manager, _, _, _ = _process(dict(self.RESULT))
         run_manager.end_pipeline_run.assert_called_once()
         assert run_manager.end_pipeline_run.call_args.kwargs['retain_lock'] is False
 
     def test_no_failure_summary_comment_is_posted(self):
-        _, github, _ = _process(dict(self.RESULT))
+        _, github, _, _ = _process(dict(self.RESULT))
         github.post_agent_output.assert_not_called()
 
     def test_outcome_is_recorded_as_lock_contention(self):
-        _, _, tracker = _process(dict(self.RESULT))
+        _, _, tracker, _ = _process(dict(self.RESULT))
         assert _recorded_outcomes(tracker) == ['lock_contention']
 
 
@@ -124,17 +149,17 @@ class TestOrdinaryFailureResultIsUnchanged:
     RESULT = {'overall_success': False, 'error': 'integration tests still failing'}
 
     def test_mark_failed_is_still_called(self):
-        run_manager, _, _ = _process(dict(self.RESULT))
+        run_manager, _, _, _ = _process(dict(self.RESULT))
         run_manager.mark_failed.assert_called_once()
         assert run_manager.mark_failed.call_args.kwargs['reason'] == "Repair cycle failed"
 
     def test_failure_summary_comment_is_still_posted(self):
-        _, github, _ = _process(dict(self.RESULT))
+        _, github, _, _ = _process(dict(self.RESULT))
         github.post_agent_output.assert_called_once()
         assert "Repair Cycle Failed" in github.post_agent_output.call_args.args[1]
 
     def test_lock_contention_outcome_is_not_recorded(self):
-        _, _, tracker = _process(dict(self.RESULT))
+        _, _, tracker, _ = _process(dict(self.RESULT))
         assert 'lock_contention' not in _recorded_outcomes(tracker)
 
 
@@ -144,8 +169,95 @@ class TestFrozenResultIsUnchanged:
     RESULT = {'overall_success': False, 'frozen': True, 'error': 'token limit'}
 
     def test_frozen_still_leaves_the_run_active_for_the_watchdog(self):
-        run_manager, github, tracker = _process(dict(self.RESULT))
+        run_manager, github, tracker, _ = _process(dict(self.RESULT))
         run_manager.mark_failed.assert_not_called()
         run_manager.end_pipeline_run.assert_not_called()
         github.post_agent_output.assert_not_called()
         assert _recorded_outcomes(tracker) == ['frozen']
+
+
+class TestCommitLockContention:
+    """
+    The SECOND, independent contention source on this path, and the whole reason
+    services/auto_commit.py was changed to re-raise instead of returning False:
+    the recovered cycle passed, but its auto-commit lost the checkout lock, so
+    the fix is still uncommitted in the workspace.
+
+    False from commit_agent_changes() is indistinguishable from "nothing to
+    commit", and this path escalates `overall_success and not commit_success` all
+    the way to mark_failed("Repair cycle passed but its fix was not committed") —
+    which durably retains the board's pipeline lock pending scripts/release_lock.py.
+    Reaching that over pure contention is precisely what #148 exists to prevent.
+    """
+
+    RESULT = {'overall_success': True}
+
+    @staticmethod
+    def _timeout():
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+        return ProjectCheckoutLockTimeoutError(
+            "Could not acquire 'project_checkout' lock for project 'test-project' within 10900.0s"
+        )
+
+    def test_mark_failed_is_not_called(self):
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=self._timeout())
+        run_manager.mark_failed.assert_not_called()
+
+    def test_run_is_released_without_retaining_the_lock(self):
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=self._timeout())
+        run_manager.end_pipeline_run.assert_called_once()
+        assert run_manager.end_pipeline_run.call_args.kwargs['retain_lock'] is False
+
+    def test_outcome_is_recorded_as_lock_contention(self):
+        _, _, tracker, _ = _process(dict(self.RESULT), commit=self._timeout())
+        assert _recorded_outcomes(tracker) == ['lock_contention']
+
+    def test_the_issue_is_not_auto_advanced_on_an_uncommitted_fix(self):
+        """Advancing here hands the next stage — and the PR reviewed downstream —
+        a branch with no fix on it."""
+        _, _, _, progression = _process(dict(self.RESULT), commit=self._timeout())
+        progression.move_issue_to_column.assert_not_called()
+
+    def test_a_wrapped_lock_timeout_is_recognised_too(self):
+        cause = self._timeout()
+        try:
+            raise Exception("Auto-commit failed") from cause
+        except Exception as wrapped:
+            run_manager, _, tracker, _ = _process(dict(self.RESULT), commit=wrapped)
+        run_manager.mark_failed.assert_not_called()
+        assert _recorded_outcomes(tracker) == ['lock_contention']
+
+
+class TestCommitReturningFalseIsUnchanged:
+    """
+    Control: the contention handling above must be specific to the lock timeout.
+    A commit that genuinely found nothing to commit still means the cycle claimed
+    success without landing a fix, and that must still be escalated.
+    """
+
+    RESULT = {'overall_success': True}
+
+    def test_mark_failed_still_fires_for_an_uncommitted_fix(self):
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=False)
+        run_manager.mark_failed.assert_called_once()
+        assert run_manager.mark_failed.call_args.kwargs['reason'] == (
+            "Repair cycle passed but its fix was not committed"
+        )
+
+    def test_no_lock_contention_outcome_is_recorded(self):
+        _, _, tracker, _ = _process(dict(self.RESULT), commit=False)
+        assert 'lock_contention' not in _recorded_outcomes(tracker)
+
+
+class TestSuccessfulCommitIsUnchanged:
+    """Control: a green cycle whose fix did land still ends as a success."""
+
+    RESULT = {'overall_success': True}
+
+    def test_the_run_ends_successfully_and_nothing_is_marked_failed(self):
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=True)
+        run_manager.mark_failed.assert_not_called()
+        run_manager.end_pipeline_run.assert_called_once()
+        assert run_manager.end_pipeline_run.call_args.kwargs['reason'] == (
+            "Repair cycle completed successfully"
+        )

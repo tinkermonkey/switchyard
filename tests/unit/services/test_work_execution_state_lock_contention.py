@@ -111,3 +111,50 @@ class TestShouldExecuteWorkAfterContention:
             )
         assert should_execute is True
         assert 'lock_contention' in reason
+
+
+class TestGetLastExecutionForColumn:
+    """
+    The column-scoped lookup project_monitor's sustained-contention check needs
+    (#148): the agent that records an outcome for a column is frequently NOT that
+    column's configured agent — a review column's maker dispatch records under the
+    maker's own name, PR review under the synthetic 'pr_review_stage' wrapper — so
+    the agent-keyed get_last_execution() finds nothing on exactly the paths the
+    escalation exists for.
+    """
+
+    @staticmethod
+    def _lookup(history, column=COLUMN):
+        tracker = WorkExecutionStateTracker()
+        with patch.object(
+            tracker, 'load_state', return_value={'execution_history': history}
+        ):
+            return tracker.get_last_execution_for_column(PROJECT, ISSUE, column)
+
+    def test_finds_an_entry_recorded_by_a_different_agent(self):
+        found = self._lookup([
+            {'column': COLUMN, 'agent': 'senior_software_engineer',
+             'outcome': 'lock_contention'},
+        ])
+        assert found['agent'] == 'senior_software_engineer'
+        assert found['outcome'] == 'lock_contention'
+
+    def test_returns_the_most_recent_entry_in_the_column(self):
+        found = self._lookup([
+            {'column': COLUMN, 'agent': AGENT, 'outcome': 'failure'},
+            {'column': COLUMN, 'agent': 'senior_software_engineer', 'outcome': 'success'},
+        ])
+        assert found['outcome'] == 'success'
+        assert found['agent'] == 'senior_software_engineer'
+
+    def test_ignores_other_columns(self):
+        found = self._lookup([
+            {'column': COLUMN, 'agent': AGENT, 'outcome': 'lock_contention'},
+            {'column': 'Backlog', 'agent': 'business_analyst', 'outcome': 'success'},
+        ])
+        assert found['column'] == COLUMN
+
+    def test_returns_none_when_the_column_has_no_history(self):
+        assert self._lookup([
+            {'column': 'Backlog', 'agent': 'business_analyst', 'outcome': 'success'},
+        ]) is None

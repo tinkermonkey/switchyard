@@ -24,7 +24,11 @@ if not os.path.isdir('/app'):
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from services.project_monitor import ProjectMonitor, MAX_CONSECUTIVE_LOCK_CONTENTIONS
+from services.project_monitor import (
+    ProjectMonitor,
+    MAX_CONSECUTIVE_LOCK_CONTENTIONS,
+    classify_contention_dispatch,
+)
 
 PROJECT = 'test-project'
 BOARD = 'Development'
@@ -109,3 +113,181 @@ class TestEscalateSustainedLockContention:
         github = _github()
         github.post_comment.side_effect = RuntimeError("GitHub is down")
         _escalate(monitor, github)  # must not raise
+
+
+class TestClassifyContentionDispatch:
+    """
+    The count/threshold decision behind the escalation, extracted to module level
+    because the two ways it silently disappears are both one-identifier edits.
+    """
+
+    @staticmethod
+    def _tracker(count):
+        tracker = MagicMock()
+        tracker.count_consecutive_lock_contentions.return_value = count
+        # count_consecutive_failures() SKIPS 'lock_contention' entries by design,
+        # so it returns 0 for a pure-contention history. If the classifier ever
+        # calls it instead, the threshold is never reached and the escalation is
+        # silently dead — this stub makes that swap fail loudly here.
+        tracker.count_consecutive_failures.return_value = 0
+        return tracker
+
+    def _classify(self, tracker):
+        return classify_contention_dispatch(
+            tracker,
+            project_name=PROJECT,
+            issue_number=ISSUE,
+            column='Code Review',
+            agent='code_reviewer',
+        )
+
+    def test_below_the_threshold_does_not_escalate(self):
+        count, should_escalate = self._classify(
+            self._tracker(MAX_CONSECUTIVE_LOCK_CONTENTIONS - 1)
+        )
+        assert count == MAX_CONSECUTIVE_LOCK_CONTENTIONS - 1
+        assert should_escalate is False
+
+    def test_at_the_threshold_escalates(self):
+        count, should_escalate = self._classify(
+            self._tracker(MAX_CONSECUTIVE_LOCK_CONTENTIONS)
+        )
+        assert count == MAX_CONSECUTIVE_LOCK_CONTENTIONS
+        assert should_escalate is True
+
+    def test_above_the_threshold_keeps_escalating(self):
+        _, should_escalate = self._classify(
+            self._tracker(MAX_CONSECUTIVE_LOCK_CONTENTIONS + 5)
+        )
+        assert should_escalate is True
+
+    def test_it_counts_contentions_not_failures(self):
+        tracker = self._tracker(MAX_CONSECUTIVE_LOCK_CONTENTIONS)
+        self._classify(tracker)
+        tracker.count_consecutive_lock_contentions.assert_called_once()
+        tracker.count_consecutive_failures.assert_not_called()
+
+    def test_a_tracker_failure_degrades_to_no_escalation(self):
+        """This runs on the dispatch path of an issue that is about to be
+        dispatched either way — it must never become the exception that stops it."""
+        tracker = MagicMock()
+        tracker.count_consecutive_lock_contentions.side_effect = OSError("state volume full")
+        assert self._classify(tracker) == (0, False)
+
+
+class TestEscalationIsWiredIntoDispatch:
+    """
+    The wiring, not just the valve (#148). Every teardown path this work item
+    added ends the run with retain_lock=False, so on the next poll the issue does
+    NOT hold the board lock — and review, conversational and PR-review columns are
+    not pipeline trigger columns at all. The check therefore has to run before any
+    column-type or lock-state branching, or the counter climbs forever with
+    nothing but per-occurrence INFO lines to show for it.
+    """
+
+    @staticmethod
+    def _monitor_with_history(outcome, count, agent='senior_software_engineer'):
+        monitor = _monitor()
+        monitor._escalate_sustained_lock_contention = MagicMock()
+        tracker = MagicMock()
+        tracker.get_last_execution_for_column.return_value = {
+            'outcome': outcome,
+            'agent': agent,
+            'error': "Could not acquire 'project_checkout' lock within 10900.0s",
+        }
+        tracker.count_consecutive_lock_contentions.return_value = count
+        tracker.count_consecutive_failures.return_value = 0
+        return monitor, tracker
+
+    @staticmethod
+    def _check(monitor, tracker, status='Code Review'):
+        with patch('services.work_execution_state.work_execution_tracker', tracker):
+            monitor._check_sustained_lock_contention(
+                project_name=PROJECT,
+                board_name=BOARD,
+                repository='test-repo',
+                issue_number=ISSUE,
+                status=status,
+            )
+
+    def test_a_non_trigger_review_column_escalates(self):
+        """'Code Review' is not in pipeline_trigger_columns — the branch this
+        check used to live in was unreachable for it."""
+        monitor, tracker = self._monitor_with_history(
+            'lock_contention', MAX_CONSECUTIVE_LOCK_CONTENTIONS
+        )
+        self._check(monitor, tracker)
+        monitor._escalate_sustained_lock_contention.assert_called_once()
+        kwargs = monitor._escalate_sustained_lock_contention.call_args.kwargs
+        assert kwargs['contention_count'] == MAX_CONSECUTIVE_LOCK_CONTENTIONS
+        assert kwargs['status'] == 'Code Review'
+        assert 'project_checkout' in kwargs['last_error']
+
+    def test_below_the_threshold_only_logs(self):
+        monitor, tracker = self._monitor_with_history(
+            'lock_contention', MAX_CONSECUTIVE_LOCK_CONTENTIONS - 1
+        )
+        self._check(monitor, tracker)
+        monitor._escalate_sustained_lock_contention.assert_not_called()
+
+    def test_a_failure_history_never_reaches_the_contention_path(self):
+        monitor, tracker = self._monitor_with_history(
+            'failure', MAX_CONSECUTIVE_LOCK_CONTENTIONS
+        )
+        self._check(monitor, tracker)
+        monitor._escalate_sustained_lock_contention.assert_not_called()
+        tracker.count_consecutive_lock_contentions.assert_not_called()
+
+    def test_no_prior_execution_is_a_no_op(self):
+        monitor = _monitor()
+        monitor._escalate_sustained_lock_contention = MagicMock()
+        tracker = MagicMock()
+        tracker.get_last_execution_for_column.return_value = None
+        self._check(monitor, tracker)
+        monitor._escalate_sustained_lock_contention.assert_not_called()
+
+    def test_it_never_retains_a_lock_or_marks_a_run_failed(self):
+        monitor, tracker = self._monitor_with_history(
+            'lock_contention', MAX_CONSECUTIVE_LOCK_CONTENTIONS
+        )
+        self._check(monitor, tracker)
+        monitor.pipeline_run_manager.mark_failed.assert_not_called()
+        monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+
+    def test_a_state_read_failure_does_not_stop_the_dispatch(self):
+        monitor = _monitor()
+        monitor._escalate_sustained_lock_contention = MagicMock()
+        tracker = MagicMock()
+        tracker.get_last_execution_for_column.side_effect = OSError("state volume full")
+        self._check(monitor, tracker)  # must not raise
+        monitor._escalate_sustained_lock_contention.assert_not_called()
+
+    def test_a_maker_agent_entry_in_a_review_column_is_found(self):
+        """The lookup is by COLUMN, not by the column's configured agent: a review
+        column's maker dispatch records under the maker's own name, and PR review
+        under the synthetic 'pr_review_stage' wrapper. An agent-keyed lookup finds
+        neither — which is most of what this escalation exists for."""
+        monitor, tracker = self._monitor_with_history(
+            'lock_contention', MAX_CONSECUTIVE_LOCK_CONTENTIONS,
+            agent='senior_software_engineer',
+        )
+        self._check(monitor, tracker, status='Code Review')
+        tracker.get_last_execution_for_column.assert_called_once()
+        assert 'agent' not in tracker.get_last_execution_for_column.call_args.kwargs
+        # The count itself stays agent-scoped, against whoever actually recorded it.
+        assert tracker.count_consecutive_lock_contentions.call_args.kwargs['agent'] == (
+            'senior_software_engineer'
+        )
+        assert monitor._escalate_sustained_lock_contention.call_args.kwargs['agent'] == (
+            'senior_software_engineer'
+        )
+
+    def test_a_pr_review_stage_entry_is_found_too(self):
+        monitor, tracker = self._monitor_with_history(
+            'lock_contention', MAX_CONSECUTIVE_LOCK_CONTENTIONS, agent='pr_review_stage',
+        )
+        self._check(monitor, tracker, status='In Review')
+        monitor._escalate_sustained_lock_contention.assert_called_once()
+        assert monitor._escalate_sustained_lock_contention.call_args.kwargs['agent'] == (
+            'pr_review_stage'
+        )

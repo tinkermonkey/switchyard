@@ -457,6 +457,34 @@ class WorkExecutionStateTracker:
 
         return column_executions[-1] if column_executions else None
 
+    def get_last_execution_for_column(
+        self,
+        project_name: str,
+        issue_number: int,
+        column: str
+    ) -> Optional[Dict]:
+        """Get the last execution record for a column, whichever agent recorded it.
+
+        The agent-scoped get_last_execution() above is right when the caller knows
+        which agent it is asking about. project_monitor's sustained-contention check
+        (#148) does not: the agent that records an outcome for a column is often NOT
+        that column's configured agent -- a review column's maker dispatch records
+        under the maker's own name, and PR review records under the synthetic
+        'pr_review_stage' wrapper. Keyed on the column's configured agent, those
+        contention entries are invisible, which is most of what the escalation is
+        for. Returns the whole record, so the caller can read `agent` off it and
+        stay agent-scoped from there (count_consecutive_lock_contentions() below
+        deliberately counts a run for one agent, not a mixture).
+        """
+        state = self.load_state(project_name, issue_number)
+
+        column_executions = [
+            e for e in state['execution_history']
+            if e['column'] == column
+        ]
+
+        return column_executions[-1] if column_executions else None
+
     def get_resumable_frozen_session(
         self,
         project_name: str,
