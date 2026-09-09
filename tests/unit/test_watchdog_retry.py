@@ -29,6 +29,16 @@ with tempfile.TemporaryDirectory() as _tmpdir:
 from config.manager import ProjectConfig
 
 
+# detect_and_retry_empty_successful_executions() only examines a record that sits
+# between its two time gates: newer than _WATCHDOG_MAX_RECORD_AGE_HOURS (the age
+# gate that keeps a 4700-file sweep off GitHub) and older than PROTECTION 5's
+# 5-minute recency window. A hard-coded 2025-01-01 fixture is outside both, so
+# every fixture below that expects the sweep to reach its protections has to be
+# dated relative to now.
+_EXAMINABLE_COMPLETED_AT = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+_EXAMINABLE_TIMESTAMP = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()
+
+
 class TestEmptyOutputDetection:
     """Test detection of successful executions with no GitHub output"""
 
@@ -55,8 +65,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -95,8 +105,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -136,8 +146,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -184,8 +194,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -240,8 +250,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -290,8 +300,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -343,8 +353,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -450,7 +460,7 @@ class TestRaceConditionProtections:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT
                 }
             ]
         }
@@ -739,10 +749,15 @@ class TestGitHubOutputVerification:
             'programming error' in record.message for record in caplog.records
         ), caplog.text
 
-    def test_has_github_output_missing_completed_at_fails_closed(self, tracker):
+    def test_has_github_output_with_no_timestamp_at_all_fails_closed(self, tracker):
         """"Was there a comment AFTER completion?" has no answer without a
-        completion time, so it is unverifiable, not verified-empty."""
-        execution = {'agent': 'test-agent'}  # no completed_at
+        timestamp, so it is unverifiable, not verified-empty.
+
+        Note the record must carry NEITHER completed_at NOR timestamp: a record
+        with only the start timestamp is the normal on-disk shape and is
+        answerable (see _execution_anchor_time). Gating on completed_at alone is
+        what made this return True for every record in production."""
+        execution = {'agent': 'test-agent'}  # no completed_at, no timestamp
 
         with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
@@ -836,8 +851,8 @@ class TestProjectConfigCacheDoesNotPoisonOnFailure:
                         'agent': 'test-agent',
                         'column': 'In Progress',
                         'outcome': 'success',
-                        'completed_at': '2025-01-01T12:00:00Z',
-                        'timestamp': '2025-01-01T11:00:00Z',
+                        'completed_at': _EXAMINABLE_COMPLETED_AT,
+                        'timestamp': _EXAMINABLE_TIMESTAMP,
                     }
                 ],
             }
@@ -902,8 +917,8 @@ def _successful_execution_state(issue_number, board_name=None):
         'agent': 'test-agent',
         'column': 'In Progress',
         'outcome': 'success',
-        'completed_at': '2025-01-01T12:00:00Z',
-        'timestamp': '2025-01-01T11:00:00Z'
+        'completed_at': _EXAMINABLE_COMPLETED_AT,
+        'timestamp': _EXAMINABLE_TIMESTAMP
     }
     if board_name:
         execution['board_name'] = board_name
@@ -1374,6 +1389,21 @@ class TestRecordExecutionStartBoardName:
     def tracker(self, temp_state_dir):
         return WorkExecutionStateTracker(state_dir=temp_state_dir)
 
+    @staticmethod
+    def _age_out_of_the_recency_window(tracker, issue_number):
+        """Backdate the record past PROTECTION 5's 5-minute window.
+
+        record_execution_outcome() now stamps completed_at with the real clock
+        (#150), so a record written a millisecond ago is by definition "too
+        recent" and the sweep defers it. These tests are about board scoping, not
+        about the clock.
+        """
+        state = tracker.load_state('test-project', issue_number)
+        stamped = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        state['execution_history'][-1]['timestamp'] = stamped
+        state['execution_history'][-1]['completed_at'] = stamped
+        tracker.save_state('test-project', issue_number, state)
+
     def test_board_name_is_persisted_on_the_execution_record(self, tracker):
         tracker.record_execution_start(
             issue_number=123,
@@ -1414,6 +1444,8 @@ class TestRecordExecutionStartBoardName:
         assert last_exec['outcome'] == 'success'
         assert last_exec['board_name'] == 'SDLC Execution'
 
+        self._age_out_of_the_recency_window(tracker, 123)
+
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
         retried_count = TestProtection2BoardScoping._run(tracker, mock_lock_manager)
@@ -1442,6 +1474,8 @@ class TestRecordExecutionStartBoardName:
         last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
         assert last_exec['trigger_source'] == 'unknown'
         assert 'board_name' not in last_exec
+
+        self._age_out_of_the_recency_window(tracker, 123)
 
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
@@ -1522,8 +1556,8 @@ class TestSweepReachesItsProtectionsForReal:
             'column': 'In Progress',
             'board_name': 'SDLC Execution',
             'outcome': 'success',
-            'completed_at': '2025-01-01T12:00:00Z',
-            'timestamp': '2025-01-01T11:00:00Z',
+            'completed_at': _EXAMINABLE_COMPLETED_AT,
+            'timestamp': _EXAMINABLE_TIMESTAMP,
         }
         record.update(overrides)
         return record
@@ -1601,9 +1635,10 @@ class TestSweepReachesItsProtectionsForReal:
         count, gh_client = self._run_sweep(tracker, comments=[])
 
         assert count == 1
-        gh_client.rest.assert_called_once_with(
-            'GET', 'repos/test-org/test-repo/issues/123/comments'
-        )
+        (method, endpoint), _ = gh_client.rest.call_args
+        assert method == 'GET'
+        assert endpoint.startswith('repos/test-org/test-repo/issues/123/comments?')
+        assert 'since=' in endpoint
 
         with open(state_file) as f:
             updated = yaml.safe_load(f)
@@ -1620,9 +1655,10 @@ class TestSweepReachesItsProtectionsForReal:
         that had posted its comment perfectly well."""
         state_file = self._write_state(tracker, [self._success_record()])
 
+        posted_at = (datetime.now(timezone.utc) - timedelta(minutes=29)).isoformat()
         count, _ = self._run_sweep(
             tracker,
-            comments=[{'created_at': '2025-01-01T12:05:00Z', 'body': 'Agent output'}],
+            comments=[{'created_at': posted_at, 'body': 'Agent output'}],
         )
 
         assert count == 0
@@ -1656,3 +1692,444 @@ class TestSweepReachesItsProtectionsForReal:
         with open(state_file) as f:
             updated = yaml.safe_load(f)
         assert updated['execution_history'][-1]['outcome'] == 'success'
+
+
+class TestCompletedAtIsActuallyRecorded:
+    """completed_at has to exist on real records, not just on fixtures (#150).
+
+    Both watchdog gates that ask "did anything happen after this execution
+    finished?" -- PROTECTION 5's recency window and _has_github_output() -- key
+    off completed_at, and nothing in production ever wrote it: 0 of the 4721
+    state files on the live orchestrator carried the field. Every sweep-level
+    test in this file fabricated it, so the drift between fixture shape and
+    on-disk shape was invisible. These tests use the real writers.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    def test_the_normal_path_stamps_completed_at(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='manual_move', project_name='test-project',
+            board_name='SDLC Execution',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['outcome'] == 'success'
+        assert 'completed_at' in last_exec, (
+            "record_execution_outcome() must stamp completed_at -- without it "
+            "_has_github_output() returns 'cannot verify' for every record ever "
+            "written and the whole sweep is a no-op"
+        )
+        # Parseable by the same helper the watchdog uses, and after the start.
+        completed = datetime.fromisoformat(last_exec['completed_at'])
+        started = datetime.fromisoformat(last_exec['timestamp'])
+        assert completed >= started
+
+    def test_the_crash_recovery_record_carries_completed_at(self, tracker):
+        """The synthesised record (no matching in_progress entry) is the one path
+        that appends rather than mutating, so it needs its own stamp."""
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['trigger_source'] == 'unknown'
+        assert last_exec['completed_at'] == last_exec['timestamp']
+
+    def test_apply_redis_result_carries_the_blobs_completed_at(self, tracker):
+        """The Redis recovery path finalises a record too, so it must leave the
+        same anchor behind -- otherwise every recovered execution is one the
+        watchdog can never verify."""
+        execution = {
+            'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'in_progress',
+            'timestamp': '2025-01-01T11:00:00+00:00',
+        }
+
+        applied = tracker._apply_redis_result(
+            execution,
+            {'exit_code': 0, 'completed_at': '2025-01-01T12:00:00+00:00'},
+            'agent_result:test-project:123:task-1', 'test-project', 123,
+            'test-agent', 'In Progress', MagicMock(),
+        )
+
+        assert applied is True
+        assert execution['outcome'] == 'success'
+        assert execution['completed_at'] == '2025-01-01T12:00:00+00:00'
+
+    def test_apply_redis_result_falls_back_when_the_blob_has_no_completed_at(self, tracker):
+        execution = {
+            'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'in_progress',
+            'timestamp': '2025-01-01T11:00:00+00:00',
+        }
+
+        tracker._apply_redis_result(
+            execution, {'exit_code': 1, 'output': 'boom'},
+            'agent_result:test-project:123:task-1', 'test-project', 123,
+            'test-agent', 'In Progress', MagicMock(),
+        )
+
+        assert execution['outcome'] == 'failure'
+        # A real timestamp, not a missing key -- the whole point of the fallback.
+        datetime.fromisoformat(execution['completed_at'])
+
+
+class TestSweepOnProductionShapedRecords:
+    """The sweep against records shaped exactly like the ones on disk.
+
+    Everything else in this file patches _has_github_output() to a constant and
+    feeds it a 'completed_at' no real record has. That is what let the gate ship
+    returning True unconditionally for production data -- the sweep reached its
+    last gate for the first time (PROTECTION 1's flock wedge having been fixed)
+    and that gate declined every single record. These tests use the REAL gate and
+    the REAL field set record_execution_start()/record_execution_outcome() write.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _legacy_record(**overrides):
+        """A record with the exact field set state/execution_history/*.yaml holds:
+        no completed_at, no watchdog_* keys, start timestamp only."""
+        record = {
+            'column': 'In Progress',
+            'agent': 'test-agent',
+            'timestamp': (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+            'outcome': 'success',
+            'trigger_source': 'pipeline_progression',
+            'board_name': 'SDLC Execution',
+        }
+        record.update(overrides)
+        return record
+
+    @staticmethod
+    def _write_state(tracker, history):
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': history,
+                },
+                f,
+            )
+        return state_file
+
+    @staticmethod
+    def _paging_gh_client(comments):
+        """A gh client that reproduces the real endpoint's paging defaults.
+
+        GitHubAPIClient.rest() shells out to `gh api <path>` with no --paginate
+        and no per_page, and GitHub's list-issue-comments endpoint defaults to
+        per_page=30 sorted created/asc. So a caller asking for the bare path gets
+        the OLDEST 30 comments -- which on a long-lived issue is 30 comments from
+        months before the execution it is asking about.
+        """
+        import urllib.parse
+
+        def rest(method, endpoint, *args, **kwargs):
+            params = dict(urllib.parse.parse_qsl(endpoint.partition('?')[2]))
+            page = comments
+            if params.get('since'):
+                since_dt = datetime.fromisoformat(params['since'].replace('Z', '+00:00'))
+                page = [
+                    c for c in page
+                    if datetime.fromisoformat(c['created_at'].replace('Z', '+00:00')) >= since_dt
+                ]
+            return True, page[:int(params.get('per_page', 30))]
+
+        client = MagicMock()
+        client.rest.side_effect = rest
+        return client
+
+    def _run_sweep(self, tracker, gh_client):
+        """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed."""
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[pipeline_cfg],
+            pipeline_routing={},
+        )
+
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        with patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch(
+                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                 return_value=lock_manager
+             ), \
+             patch(
+                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                 return_value=queue_manager
+             ), \
+             patch.object(
+                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+             ), \
+             patch.object(tracker, '_check_redis_repair_cycle_tracking', return_value=False), \
+             patch('services.review_cycle.review_cycle_executor') as mock_rc, \
+             patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_rc._cycle_key.return_value = 'test-project:123'
+            mock_rc.active_cycles = {}
+            mock_hfl._loop_key.return_value = 'test-project:123'
+            mock_hfl.active_loops = {}
+
+            return tracker.detect_and_retry_empty_successful_executions()
+
+    def test_a_record_with_no_completed_at_is_still_swept(self, tracker):
+        """The headline regression: with the real gate and a real-shaped record,
+        the sweep must reach the retry marking. It used to bail at
+        _has_github_output(), which read completed_at, found None, and returned
+        True ("cannot verify") for every record on disk, on every pass, forever."""
+        state_file = self._write_state(tracker, [self._legacy_record()])
+
+        count = self._run_sweep(tracker, self._paging_gh_client([]))
+
+        assert count == 1, (
+            "the sweep declined a record shaped exactly like the 4721 on disk -- "
+            "_has_github_output() has no anchor to compare against"
+        )
+        with open(state_file) as f:
+            last_exec = yaml.safe_load(f)['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_start_timestamp_inside_the_recency_window_defers(self, tracker):
+        """PROTECTION 5's 5-minute window gated on completed_at alone, so it never
+        fired for any record on disk. With the start timestamp as its fallback
+        anchor, an execution that started 30 seconds ago defers."""
+        state_file = self._write_state(tracker, [
+            self._legacy_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+            )
+        ])
+        gh_client = self._paging_gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_comment_beyond_the_first_page_still_counts_as_output(self, tracker):
+        """The truncation regression: an issue with 178 comments whose agent
+        posted #179 successfully. Asking for the bare endpoint returns comments
+        1-30 -- all months old -- and the gate answers a confident "no output",
+        rewriting a finished execution to 'failure' and redispatching a container
+        onto an issue that already has its comment."""
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=30)
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        comments = [
+            {'created_at': (old + timedelta(minutes=i)).isoformat(), 'body': 'chatter'}
+            for i in range(178)
+        ]
+        comments.append({
+            'created_at': (anchor + timedelta(seconds=5)).isoformat(),
+            'body': 'Agent output',
+        })
+
+        state_file = self._write_state(
+            tracker, [self._legacy_record(timestamp=anchor.isoformat())]
+        )
+        gh_client = self._paging_gh_client(comments)
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0, (
+            "the gate only saw the oldest page of comments and declared the "
+            "execution output-less"
+        )
+        endpoint = gh_client.rest.call_args[0][1]
+        assert 'since=' in endpoint and 'per_page=100' in endpoint
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_record_older_than_the_age_gate_costs_nothing(self, tracker):
+        """PROTECTION 0. 4570 of the 4721 live state files end in 'success' and
+        97% of them are months old; before this gate every one of them reached
+        PROTECTION 4's GitHub query on every 15-minute sweep."""
+        state_file = self._write_state(tracker, [
+            self._legacy_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+            )
+        ])
+        gh_client = self._paging_gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_the_age_gate_cutoff_is_configurable(self, tracker):
+        """An operator investigating a long-stuck issue can widen the window
+        without a code change."""
+        self._write_state(tracker, [
+            self._legacy_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+            )
+        ])
+
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RECORD_AGE_HOURS': '2400'}):
+            count = self._run_sweep(tracker, self._paging_gh_client([]))
+
+        assert count == 1
+
+
+class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
+    """_should_retry_failed_execution() used to issue its GraphQL query before
+    any cheap check could reject the record (#150). The sweep calls it once per
+    'success' state file, so on the live orchestrator that was up to 4570
+    queries per 15-minute sweep -- ~18k/hour against GitHub's 5000/hour budget,
+    which would starve board polling and comment posting for the rest of the
+    hour. The Redis-local "is there an active pipeline run?" check rejects
+    almost all of them, so it has to come first.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    def test_no_active_pipeline_run_costs_no_github_query(self, tracker):
+        github_client = MagicMock()
+        run_manager = MagicMock()
+        run_manager.get_active_pipeline_run.return_value = None
+
+        with patch('services.github_api_client.get_github_client', return_value=github_client), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager):
+            should_retry, reason = tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', {}
+            )
+
+        assert should_retry is False
+        assert reason == 'no_active_pipeline_run'
+        github_client.graphql.assert_not_called()
+
+    def test_a_passed_in_project_config_is_not_re_read_from_disk(self, tracker):
+        """get_project_config() re-reads and re-parses the project's YAML on every
+        call, and the sweep already caches it per project."""
+        project_config = ProjectConfig(
+            name='test-project', description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={}, pipelines=[], pipeline_routing={},
+        )
+        github_client = MagicMock()
+        github_client.graphql.return_value = (True, {
+            'repository': {'issue': {'state': 'OPEN', 'projectItems': {'nodes': []}}}
+        })
+        run_manager = MagicMock()
+        run_manager.get_active_pipeline_run.return_value = MagicMock(board='SDLC Execution')
+
+        with patch('services.github_api_client.get_github_client', return_value=github_client), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch('config.manager.config_manager') as mock_config_manager:
+            tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', {},
+                project_config=project_config,
+            )
+
+        mock_config_manager.get_project_config.assert_not_called()
+
+
+class TestReentrantLockErrorReachesTheCaller:
+    """A re-entrant acquire must surface, not become 'no execution history'.
+
+    load_state()/save_state() wrap their locked body in a broad
+    `except Exception` that logs and returns _empty_state(). That turns
+    ReentrantFileLockError -- a programming error the guard raises specifically
+    so it shows up as a traceback -- into execution_history: [], which
+    has_active_execution() reads as "nothing is running". The caller then
+    dispatches: a double execution of a live issue, strictly worse than the
+    deadlock the guard replaced, which at least failed safe.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    @staticmethod
+    def _write_live_state(tracker):
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': [
+                        {
+                            'agent': 'test-agent',
+                            'column': 'In Progress',
+                            'outcome': 'in_progress',
+                            'trigger_source': 'manual_move',
+                            'task_id': 'task-1',
+                            'timestamp': datetime.now(timezone.utc).isoformat(),
+                        }
+                    ],
+                },
+                f,
+            )
+        return state_file
+
+    def test_load_state_lets_it_surface(self, tracker):
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.load_state('test-project', 123)
+
+    def test_has_active_execution_raises_rather_than_answering_false(self, tracker):
+        """The consequence that actually matters: the answer would have been
+        False for an issue with a live in_progress record."""
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.has_active_execution('test-project', 123)
+
+    def test_save_state_lets_it_surface_rather_than_dropping_the_write(self, tracker):
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.save_state(
+                    'test-project', 123,
+                    {'project_name': 'test-project', 'issue_number': 123,
+                     'execution_history': []},
+                )

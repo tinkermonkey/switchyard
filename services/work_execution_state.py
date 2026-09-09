@@ -24,6 +24,43 @@ logger = logging.getLogger(__name__)
 # before being consumed and the probe is now a permanent blocker — clear it.
 _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp after 60s means the Redis task was lost
 
+# How far back detect_and_retry_empty_successful_executions() will look (#150).
+# The sweep globs EVERY state file ever written, every 15 minutes -- 4700+ of them
+# on the live orchestrator, ~97% months old and terminal -- and each one that gets
+# past the cheap checks costs lock reads, queue reads and a GitHub query. Until
+# PROTECTION 1's re-entrant flock was fixed the sweep wedged on the first 'success'
+# record it found, so none of that cost was ever paid and none of it was visible.
+# Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
+_WATCHDOG_MAX_RECORD_AGE_HOURS = 24
+
+
+def _execution_anchor_time(execution: dict) -> Optional[str]:
+    """The "after what?" timestamp for an execution record.
+
+    record_execution_outcome() stamps completed_at on every record it finalises
+    (#150), but nothing did before that, so every record already on disk has only
+    the start time record_execution_start() wrote. Falling back to it is safe in
+    both places this is used: PROTECTION 5's recency window only widens, and
+    _has_github_output() counts a comment posted mid-execution as output, which
+    defers rather than redispatching. Returns None when the record carries
+    neither, which callers must treat as unverifiable.
+    """
+    return execution.get('completed_at') or execution.get('timestamp')
+
+
+def _parse_iso_timestamp(value: str) -> datetime:
+    """Parse a recorded ISO timestamp as an aware UTC datetime.
+
+    Records written by this module are always UTC-aware, but a few older ones
+    (and anything hand-edited) are naive; comparing one of those against an aware
+    datetime raises TypeError, which the watchdog's handlers turn into a silent
+    "cannot verify". Assume UTC rather than letting that happen.
+    """
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
 
 @dataclass
 class ExecutionRecord:
@@ -97,9 +134,9 @@ class WorkExecutionStateTracker:
         if not state_file.exists():
             return self._empty_state(project_name, issue_number)
 
-        try:
-            from utils.file_lock import file_lock
+        from utils.file_lock import file_lock, ReentrantFileLockError
 
+        try:
             # Use file lock when reading to prevent reading partial writes
             lock_file = state_file.with_suffix(state_file.suffix + '.lock')
             with file_lock(lock_file):
@@ -141,6 +178,14 @@ class WorkExecutionStateTracker:
                     return state
             # File doesn't exist inside lock, return default
             return self._empty_state(project_name, issue_number)
+        except ReentrantFileLockError:
+            # A caller that already holds this issue's lock, i.e. a programming
+            # error -- the exact shape PROTECTION 1 had until #150. Swallowing it
+            # here hands that caller execution_history: [], which
+            # has_active_execution() reads as "nothing is running" and dispatches
+            # on: a double execution of a live issue, strictly worse than the
+            # deadlock the guard replaced. Let it surface as a traceback.
+            raise
         except Exception as e:
             logger.error(f"Failed to load state for {project_name}/#{issue_number}: {e}")
             return self._empty_state(project_name, issue_number)
@@ -178,7 +223,7 @@ class WorkExecutionStateTracker:
 
     def save_state(self, project_name: str, issue_number: int, state: Dict):
         """Save execution state for an issue with thread-safe file locking"""
-        from utils.file_lock import safe_yaml_write
+        from utils.file_lock import safe_yaml_write, ReentrantFileLockError
 
         state_file = self.get_state_file(project_name, issue_number)
 
@@ -189,6 +234,12 @@ class WorkExecutionStateTracker:
                     yaml.dump(state, f, default_flow_style=False, sort_keys=False)
 
             logger.debug(f"Saved execution state for {project_name}/#{issue_number}")
+        except ReentrantFileLockError:
+            # See load_state()'s matching handler. A re-entrant save is a caller
+            # bug, and logging it here would silently DROP the write -- the
+            # execution outcome or probe cleanup this call was persisting is
+            # simply lost, with the in-memory dict still claiming it was saved.
+            raise
         except Exception as e:
             logger.error(f"Failed to save state for {project_name}/#{issue_number}: {e}")
 
@@ -318,7 +369,16 @@ class WorkExecutionStateTracker:
 
                 execution['outcome'] = outcome
                 if not found_primary:
-                    # Most recent in_progress: the real execution entry
+                    # Most recent in_progress: the real execution entry.
+                    #
+                    # completed_at is written HERE and nowhere else on the normal
+                    # path (#150). Both watchdog gates that ask "did anything
+                    # happen after this execution finished?" -- PROTECTION 5's
+                    # recency window and _has_github_output() -- key off it, and
+                    # until now nothing in production ever wrote it: 0 of the 4721
+                    # state files on the live orchestrator carry the field, so both
+                    # gates silently degraded to "cannot verify" on every record.
+                    execution['completed_at'] = datetime.now(timezone.utc).isoformat()
                     if error:
                         execution['error'] = error
                     if claude_session_id:
@@ -368,12 +428,17 @@ class WorkExecutionStateTracker:
 
         # No board_name and no trigger_source: this record is synthesised from
         # what the caller knows now, not from the lost dispatch. See the docstring.
+        # timestamp and completed_at are the same instant for the same reason --
+        # the real start time went with the lost dispatch, and a record with no
+        # completed_at is one the watchdog cannot verify at all.
+        now_iso = datetime.now(timezone.utc).isoformat()
         execution = {
             'column': column,
             'agent': agent,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'timestamp': now_iso,
             'outcome': outcome,
-            'trigger_source': 'unknown'
+            'trigger_source': 'unknown',
+            'completed_at': now_iso
         }
 
         if error:
@@ -1299,16 +1364,17 @@ class WorkExecutionStateTracker:
         issue_number: int,
         agent: str,
         column: str,
-        execution: dict
+        execution: dict,
+        project_config=None
     ) -> tuple:
         """
         Determine if a failed execution should be retried by watchdog.
 
         Performs comprehensive eligibility checks:
         - Retry limit not exceeded
+        - Pipeline run still active
         - Issue still in same active column
         - Column still requires agent
-        - Pipeline run still active
         - Issue still open
         - Circuit breakers not open
 
@@ -1318,6 +1384,11 @@ class WorkExecutionStateTracker:
             agent: Agent name
             column: Column name
             execution: Execution record dict
+            project_config: Already-loaded ProjectConfig, when the caller has one.
+                get_project_config() re-reads and re-parses the project's YAML from
+                disk on every call, and the sweep already caches it per project --
+                passing it through stops this method re-reading the same file once
+                per state file. Omitted (None) means fetch it here, as before.
 
         Returns:
             (should_retry, reason) tuple
@@ -1331,12 +1402,37 @@ class WorkExecutionStateTracker:
         if retry_count >= max_retries:
             return False, f"max_retries_exceeded (count={retry_count}, max={max_retries})"
 
-        # Check 2 & 3 & 5: Issue state and column (combined GitHub query)
+        # Check 2: Pipeline run active.
+        #
+        # Deliberately ahead of the GitHub query below (#150), which used to run
+        # first and unconditionally. This check is a Redis hash lookup and it is
+        # the one that rejects the overwhelming majority of records -- an issue
+        # with no active pipeline run is not retryable no matter what GitHub says.
+        # Asking GitHub first meant one GraphQL query for EVERY 'success' record
+        # the sweep examined; on the live orchestrator that is 4570 records every
+        # 15 minutes, ~18k queries an hour against a 5000/hour budget. That cost
+        # was invisible only because the sweep wedged at PROTECTION 1 and never
+        # got here.
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+
+            pipeline_run_mgr = get_pipeline_run_manager()
+            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+
+            if not active_run:
+                return False, "no_active_pipeline_run"
+
+        except Exception as e:
+            logger.error(f"Error checking pipeline run: {e}")
+            return False, f"error_checking_pipeline_run: {str(e)}"
+
+        # Check 3 & 5: Issue state and column (combined GitHub query)
         try:
             from config.manager import config_manager
             from services.github_api_client import get_github_client
 
-            project_config = config_manager.get_project_config(project_name)
+            if project_config is None:
+                project_config = config_manager.get_project_config(project_name)
             if not project_config:
                 return False, "project_config_not_found"
 
@@ -1393,21 +1489,7 @@ class WorkExecutionStateTracker:
             logger.error(f"Error checking issue state: {e}")
             return False, f"error_checking_issue_state: {str(e)}"
 
-        # Check 3: Pipeline run active (moved before workflow check to get board name)
-        try:
-            from services.pipeline_run import get_pipeline_run_manager
-
-            pipeline_run_mgr = get_pipeline_run_manager()
-            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
-
-            if not active_run:
-                return False, "no_active_pipeline_run"
-
-        except Exception as e:
-            logger.error(f"Error checking pipeline run: {e}")
-            return False, f"error_checking_pipeline_run: {str(e)}"
-
-        # Check 4: Column requires agent
+        # Check 4: Column requires agent (uses active_run.board from Check 2)
         try:
             workflow_template = config_manager.get_project_workflow(project_name, active_run.board)
             if not workflow_template:
@@ -1489,6 +1571,8 @@ class WorkExecutionStateTracker:
 
         This watchdog runs as a scheduled task and uses comprehensive race condition
         protections to prevent duplicate work launches:
+        0. Age gate - records older than _WATCHDOG_MAX_RECORD_AGE_HOURS are skipped
+           before any I/O is spent on them
         1. has_active_execution() - Checks ALL 4 types of active work
         2. Pipeline lock verification
         3. Queue status check
@@ -1513,6 +1597,10 @@ class WorkExecutionStateTracker:
 
         retried_count = 0
         state_files = list(self.state_dir.glob("*.yaml"))
+
+        max_record_age_hours = float(
+            os.environ.get('WATCHDOG_MAX_RECORD_AGE_HOURS', _WATCHDOG_MAX_RECORD_AGE_HOURS)
+        )
 
         logger.info(f"Watchdog: Checking {len(state_files)} execution state files for empty outputs")
 
@@ -1579,6 +1667,45 @@ class WorkExecutionStateTracker:
                     if not project_name or not issue_number:
                         logger.warning(f"Malformed state file {state_file}: missing project or issue")
                         continue
+
+                    # PROTECTION 0: Age gate -- see _WATCHDOG_MAX_RECORD_AGE_HOURS.
+                    #
+                    # Placed ahead of every other protection because it is the only
+                    # one that costs nothing: PROTECTION 2 and 3 read lock and queue
+                    # state per configured board, and PROTECTION 4 issues a GitHub
+                    # GraphQL query. On the live orchestrator 4570 of 4721 state
+                    # files end in 'success', so an ungated sweep every 15 minutes
+                    # is ~18k GraphQL queries an hour against a 5k/hour budget --
+                    # the watchdog would exhaust the budget for the whole
+                    # orchestrator in the first minutes of every hour. A record this
+                    # old is not something a retry can un-stick anyway; nothing is
+                    # waiting on it.
+                    #
+                    # A record with no parseable timestamp is NOT skipped: this gate
+                    # exists to bound cost, and silently dropping records it cannot
+                    # date would be the same class of quiet no-op #150 is undoing.
+                    age_anchor = _execution_anchor_time(last_exec)
+                    if age_anchor and max_record_age_hours > 0:
+                        try:
+                            age_hours = (
+                                datetime.now(timezone.utc) - _parse_iso_timestamp(age_anchor)
+                            ).total_seconds() / 3600
+                            if age_hours > max_record_age_hours:
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"last execution is {age_hours:.1f}h old "
+                                    f"(cutoff {max_record_age_hours}h)"
+                                )
+                                continue
+                        except (ValueError, TypeError, AttributeError) as e:
+                            # An unquoted timestamp in a hand-edited file parses as
+                            # a datetime, not a str, and anything else parses as
+                            # whatever it looks like -- none of which this gate
+                            # needs to be fatal about.
+                            logger.debug(
+                                f"Watchdog: Could not date {project_name}/#{issue_number} "
+                                f"({age_anchor!r}) -- age gate skipped: {e}"
+                            )
 
                     # PROTECTION 1: Check for active execution (ANY type of work)
                     #
@@ -1868,8 +1995,12 @@ class WorkExecutionStateTracker:
                         logger.warning(f"Watchdog: Missing agent or column for {project_name}/#{issue_number}")
                         continue
 
+                    # project_config is the sweep's per-project cached copy (may be
+                    # None if the lookup above failed, in which case the callee
+                    # fetches it itself) -- see the cache comment above PROTECTION 2.
                     should_retry, reason = self._should_retry_failed_execution(
-                        project_name, issue_number, agent, column, last_exec
+                        project_name, issue_number, agent, column, last_exec,
+                        project_config=project_config
                     )
 
                     if not should_retry:
@@ -1881,18 +2012,26 @@ class WorkExecutionStateTracker:
                     # PROTECTION 5: Verify no recent execution started
                     # Check if execution completed within last 5 minutes
                     # (could be starting but not yet marked as in_progress)
-                    if last_exec.get('completed_at'):
+                    #
+                    # Anchored on completed_at OR the record's start timestamp
+                    # (#150): this gated on completed_at alone, which nothing wrote
+                    # until record_execution_outcome() started stamping it above, so
+                    # the whole block was skipped for every record on disk and this
+                    # window was never enforced for any issue. Newly load-bearing,
+                    # too -- on main the sweep wedged at PROTECTION 1 and never
+                    # reached here.
+                    recency_anchor = _execution_anchor_time(last_exec)
+                    if recency_anchor:
                         try:
-                            completed_at_str = last_exec['completed_at'].replace('Z', '+00:00')
-                            completed_at = datetime.fromisoformat(completed_at_str)
-                            if datetime.now(completed_at.tzinfo) - completed_at < timedelta(minutes=5):
+                            anchor_dt = _parse_iso_timestamp(recency_anchor)
+                            if datetime.now(timezone.utc) - anchor_dt < timedelta(minutes=5):
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                    f"execution too recent ({completed_at})"
+                                    f"execution too recent ({anchor_dt})"
                                 )
                                 continue
                         except Exception as e:
-                            logger.debug(f"Could not parse completed_at timestamp: {e}")
+                            logger.debug(f"Could not parse execution timestamp: {e}")
 
                     # Check if GitHub output exists (fails closed - see the method's
                     # docstring: True also means "could not verify", which defers
@@ -1970,7 +2109,7 @@ class WorkExecutionStateTracker:
             True if GitHub output exists (or could not be verified), False if the
             execution demonstrably produced none
         """
-        from datetime import datetime
+        from urllib.parse import quote
 
         try:
             from services.github_api_client import get_github_client
@@ -1983,20 +2122,27 @@ class WorkExecutionStateTracker:
             project_config = config_manager.get_project_config(project_name)
 
             agent = execution.get('agent')
-            completed_at = execution.get('completed_at')
+            # completed_at when the record has one, else the start timestamp
+            # (#150): gating on completed_at alone made this return True for every
+            # record in production, because nothing wrote the field -- so the sweep
+            # bailed at this gate on every issue, on every pass, forever, which is
+            # the same permanent no-op #150 set out to remove, just one gate later.
+            # See _execution_anchor_time() for why the start time is a safe
+            # substitute here.
+            completed_at = _execution_anchor_time(execution)
 
             if not agent or not completed_at:
-                # "After what?" has no answer without completed_at, so there is no
-                # comparison to make -- unverifiable, not verified-empty.
+                # "After what?" has no answer without a timestamp of any kind, so
+                # there is no comparison to make -- unverifiable, not verified-empty.
                 logger.warning(
-                    f"Watchdog: Missing agent or completed_at for {project_name}/#{issue_number} "
-                    f"-- cannot verify GitHub output, leaving the record alone"
+                    f"Watchdog: Missing agent or execution timestamp for "
+                    f"{project_name}/#{issue_number} -- cannot verify GitHub output, "
+                    f"leaving the record alone"
                 )
                 return True
 
             # Parse completion timestamp
-            completed_at_str = completed_at.replace('Z', '+00:00')
-            completed_dt = datetime.fromisoformat(completed_at_str)
+            completed_dt = _parse_iso_timestamp(completed_at)
 
             # Check for comments after completion time.
             #
@@ -2009,7 +2155,25 @@ class WorkExecutionStateTracker:
             # above has always used the correct form.
             org = project_config.github['org']
             repo = project_config.github['repo']
-            endpoint = f'repos/{org}/{repo}/issues/{issue_number}/comments'
+
+            # Ask GitHub only for the window that matters (#150). rest() shells out
+            # to `gh api` with no --paginate and no per_page, and the endpoint
+            # defaults to per_page=30 sorted created/asc -- so the bare path returns
+            # the OLDEST 30 comments. On a managed-repo issue with 178 comments
+            # (context-studio has several) every one of them predates the execution,
+            # the loop below finds nothing after completed_dt, and this returns a
+            # confident False: the one wrong answer that redispatches a real agent
+            # container onto an issue whose comment is already posted. `since` is
+            # server-side and inclusive, and truncating it to whole seconds only
+            # widens the window, so the created_at > completed_dt loop still filters
+            # exactly. One page of 100 is far more than a post-completion window
+            # ever holds, and it costs the same single call --paginate would have
+            # turned into six.
+            since_param = completed_dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            endpoint = (
+                f'repos/{org}/{repo}/issues/{issue_number}/comments'
+                f'?since={quote(since_param)}&per_page=100'
+            )
 
             success, comments = gh.rest('GET', endpoint)
 
@@ -2023,7 +2187,7 @@ class WorkExecutionStateTracker:
             # Check if any comment was created after completion
             for comment in comments:
                 try:
-                    created_at = datetime.fromisoformat(comment['created_at'].replace('Z', '+00:00'))
+                    created_at = _parse_iso_timestamp(comment['created_at'])
                     if created_at > completed_dt:
                         # Found a comment after execution - assume it's the output
                         logger.debug(
@@ -2204,6 +2368,16 @@ class WorkExecutionStateTracker:
                 f"cannot determine outcome — skipping recovery"
             )
             return False
+
+        # The Redis blob carries the container's own completion time
+        # (docker_runner._persist_agent_result). Copy it onto the record so this
+        # recovery path leaves the same completed_at anchor the normal
+        # record_execution_outcome() path writes (#150) -- without it a recovered
+        # record is one the watchdog can never verify. Falls back to now for a
+        # blob written before the wrapper started stamping the field.
+        execution['completed_at'] = (
+            result_data.get('completed_at') or datetime.now(timezone.utc).isoformat()
+        )
 
         if exit_code == 0:
             execution['outcome'] = 'success'
