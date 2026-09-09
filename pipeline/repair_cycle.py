@@ -1349,15 +1349,6 @@ class RepairCycleStage(PipelineStage):
                     )
                     raise
 
-                # NonRetryableAgentError: same class of defect this handler had for
-                # lock timeouts. docker_runner raises it for container exit codes
-                # 137/143 (OOM kill / SIGTERM), where "retrying will not help" —
-                # re-running just re-allocates the same memory to be killed again.
-                from agents.non_retryable import NonRetryableAgentError
-                if isinstance(e, NonRetryableAgentError):
-                    logger.warning(f"Test execution hit a non-retryable failure — not retrying: {e}")
-                    raise
-
                 # Other execution failure (timeout, container failure, etc.)
                 logger.error(f"Test execution failed (attempt {attempt + 1}/{max_retries + 1}): {e}", exc_info=True)
                 

@@ -23,6 +23,7 @@ if not os.path.isdir('/app'):
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 from services.agent_container_recovery import AgentContainerRecovery
+from services.auto_commit import CommitResult
 
 PROJECT = 'test-project'
 ISSUE = 5150
@@ -82,7 +83,7 @@ def _process(result, commit=None):
         async def commit_agent_changes(**kwargs):
             return returned
     else:
-        commit_agent_changes = AsyncMock(return_value=False)
+        commit_agent_changes = AsyncMock(return_value=CommitResult.FAILED)
 
     auto_commit_service = MagicMock()
     auto_commit_service.commit_agent_changes = commit_agent_changes
@@ -119,6 +120,10 @@ def _recorded_outcomes(tracker):
 
 
 class TestLockContentionResult:
+    """Container-level contention: nothing ran and nothing is dirty, so this one
+    releases the board lock — and must suppress the cancellation signal, or the
+    release is not actually a retry point (#148 C1)."""
+
     RESULT = {
         'overall_success': False,
         'lock_contention': True,
@@ -133,6 +138,14 @@ class TestLockContentionResult:
         run_manager, _, _, _ = _process(dict(self.RESULT))
         run_manager.end_pipeline_run.assert_called_once()
         assert run_manager.end_pipeline_run.call_args.kwargs['retain_lock'] is False
+
+    def test_the_cancellation_signal_is_suppressed_so_the_next_poll_can_retry(self):
+        """#148 C1: end_pipeline_run sets a 1-hour cancellation signal for every
+        reason but 'feedback_loop_ended', and every automatic recovery path skips
+        a cancelled issue — so without this the 'next poll retries' promise is
+        false for up to an hour."""
+        run_manager, _, _, _ = _process(dict(self.RESULT))
+        assert run_manager.end_pipeline_run.call_args.kwargs['suppress_cancellation'] is True
 
     def test_no_failure_summary_comment_is_posted(self):
         _, github, _, _ = _process(dict(self.RESULT))
@@ -178,16 +191,19 @@ class TestFrozenResultIsUnchanged:
 
 class TestCommitLockContention:
     """
-    The SECOND, independent contention source on this path, and the whole reason
-    services/auto_commit.py was changed to re-raise instead of returning False:
-    the recovered cycle passed, but its auto-commit lost the checkout lock, so
-    the fix is still uncommitted in the workspace.
+    The SECOND, independent contention source on this path — and the one
+    contention outcome anywhere in #148 that RETAINS the board lock rather than
+    releasing it (#148 C2).
 
-    False from commit_agent_changes() is indistinguishable from "nothing to
-    commit", and this path escalates `overall_success and not commit_success` all
-    the way to mark_failed("Repair cycle passed but its fix was not committed") —
-    which durably retains the board's pipeline lock pending scripts/release_lock.py.
-    Reaching that over pure contention is precisely what #148 exists to prevent.
+    services/auto_commit.py only takes the project_checkout lock when the
+    directory is the SHARED base clone (is_base_clone_dir(); epic worktrees are
+    not gated by it at all), so a timeout on it proves the recovered cycle's fix
+    is sitting uncommitted in a directory the next dispatched issue will
+    `git checkout` into with no stash and no reset. Releasing therefore either
+    carries this fix onto another issue's branch or breaks that issue's dispatch.
+    Every other contention outcome means "nothing ran, nothing is dirty"; this
+    one does not, so it goes through mark_failed() — which, unlike
+    end_pipeline_run(retain_lock=True), actually sets retained_reason.
     """
 
     RESULT = {'overall_success': True}
@@ -199,14 +215,14 @@ class TestCommitLockContention:
             "Could not acquire 'project_checkout' lock for project 'test-project' within 10900.0s"
         )
 
-    def test_mark_failed_is_not_called(self):
+    def test_the_board_lock_is_retained_because_the_shared_clone_is_dirty(self):
         run_manager, _, _, _ = _process(dict(self.RESULT), commit=self._timeout())
-        run_manager.mark_failed.assert_not_called()
+        run_manager.mark_failed.assert_called_once()
+        assert 'uncommitted' in run_manager.mark_failed.call_args.kwargs['reason']
 
-    def test_run_is_released_without_retaining_the_lock(self):
+    def test_the_run_is_not_released(self):
         run_manager, _, _, _ = _process(dict(self.RESULT), commit=self._timeout())
-        run_manager.end_pipeline_run.assert_called_once()
-        assert run_manager.end_pipeline_run.call_args.kwargs['retain_lock'] is False
+        run_manager.end_pipeline_run.assert_not_called()
 
     def test_outcome_is_recorded_as_lock_contention(self):
         _, _, tracker, _ = _process(dict(self.RESULT), commit=self._timeout())
@@ -224,28 +240,29 @@ class TestCommitLockContention:
             raise Exception("Auto-commit failed") from cause
         except Exception as wrapped:
             run_manager, _, tracker, _ = _process(dict(self.RESULT), commit=wrapped)
-        run_manager.mark_failed.assert_not_called()
+        run_manager.mark_failed.assert_called_once()
         assert _recorded_outcomes(tracker) == ['lock_contention']
 
 
-class TestCommitReturningFalseIsUnchanged:
+class TestCommitFailureIsUnchanged:
     """
     Control: the contention handling above must be specific to the lock timeout.
-    A commit that genuinely found nothing to commit still means the cycle claimed
-    success without landing a fix, and that must still be escalated.
+    A commit that genuinely FAILED still means the cycle claimed success without
+    landing a fix, and that must still be escalated — this is the branch the live
+    path was missing entirely until #148 I1.
     """
 
     RESULT = {'overall_success': True}
 
     def test_mark_failed_still_fires_for_an_uncommitted_fix(self):
-        run_manager, _, _, _ = _process(dict(self.RESULT), commit=False)
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=CommitResult.FAILED)
         run_manager.mark_failed.assert_called_once()
         assert run_manager.mark_failed.call_args.kwargs['reason'] == (
             "Repair cycle passed but its fix was not committed"
         )
 
     def test_no_lock_contention_outcome_is_recorded(self):
-        _, _, tracker, _ = _process(dict(self.RESULT), commit=False)
+        _, _, tracker, _ = _process(dict(self.RESULT), commit=CommitResult.FAILED)
         assert 'lock_contention' not in _recorded_outcomes(tracker)
 
 
@@ -255,9 +272,18 @@ class TestSuccessfulCommitIsUnchanged:
     RESULT = {'overall_success': True}
 
     def test_the_run_ends_successfully_and_nothing_is_marked_failed(self):
-        run_manager, _, _, _ = _process(dict(self.RESULT), commit=True)
+        run_manager, _, _, _ = _process(dict(self.RESULT), commit=CommitResult.COMMITTED)
         run_manager.mark_failed.assert_not_called()
         run_manager.end_pipeline_run.assert_called_once()
         assert run_manager.end_pipeline_run.call_args.kwargs['reason'] == (
             "Repair cycle completed successfully"
         )
+
+    def test_nothing_to_commit_is_still_treated_as_a_landed_run(self):
+        """#148 I1 preserved CommitResult's truthiness precisely so this
+        pre-existing behavior is unchanged: an empty diff is not a failure."""
+        run_manager, _, _, _ = _process(
+            dict(self.RESULT), commit=CommitResult.NOTHING_TO_COMMIT
+        )
+        run_manager.mark_failed.assert_not_called()
+        run_manager.end_pipeline_run.assert_called_once()

@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from services.auto_commit import AutoCommitService
+from services.auto_commit import AutoCommitService, CommitResult
 from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
 
 
@@ -39,7 +39,7 @@ async def _lock_that_succeeds(project, issue_number=None, **kwargs):
     yield
 
 
-async def _commit_with(lock_cm, commit_and_push_result=True):
+async def _commit_with(lock_cm, commit_and_push_result=CommitResult.COMMITTED):
     service = AutoCommitService()
 
     with patch.object(Path, 'exists', return_value=True), \
@@ -68,8 +68,10 @@ class TestLockTimeoutPropagates:
 
     @pytest.mark.asyncio
     async def test_ordinary_error_still_returns_false(self):
-        """Control: every other failure mode keeps the documented False contract,
-        because callers depend on it to mean 'nothing landed, carry on'."""
+        """Control: every other failure mode is CommitResult.FAILED — falsy, so
+        every pre-existing truthiness-based caller behaves exactly as before, and
+        now nameable, so the callers that must distinguish it from an empty diff
+        can (#148 I1)."""
         service = AutoCommitService()
 
         with patch.object(Path, 'exists', return_value=True), \
@@ -88,8 +90,8 @@ class TestLockTimeoutPropagates:
                 issue_number=1,
             )
 
-        assert result is False
+        assert result is CommitResult.FAILED
 
     @pytest.mark.asyncio
-    async def test_successful_locked_commit_still_returns_true(self):
-        assert await _commit_with(_lock_that_succeeds) is True
+    async def test_successful_locked_commit_still_returns_a_non_failure(self):
+        assert await _commit_with(_lock_that_succeeds) is CommitResult.COMMITTED

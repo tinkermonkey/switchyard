@@ -134,6 +134,10 @@ class TestLockTimeoutReleasesInsteadOfRetaining:
         run_manager.end_pipeline_run.assert_called_once()
         kwargs = run_manager.end_pipeline_run.call_args.kwargs
         assert kwargs['retain_lock'] is False
+        # #148 C1: without this the release is not a retry point at all -- the
+        # cancellation signal hides the issue from BOTH failsafe scenarios for an
+        # hour, and Scenario 2 purges its queue row on the way past.
+        assert kwargs['suppress_cancellation'] is True
         assert kwargs['project'] == PROJECT
         assert kwargs['board'] == BOARD
         assert kwargs['issue_number'] == ISSUE

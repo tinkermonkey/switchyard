@@ -1801,8 +1801,17 @@ class AgentContainerRecovery:
                 from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
                 thread.join(timeout=_CHECKOUT_LOCK_TIMEOUT + 60)
 
-                if commit_success[0]:
+                from services.auto_commit import CommitResult
+                if commit_success[0] is CommitResult.COMMITTED:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                elif commit_success[0] is CommitResult.NOTHING_TO_COMMIT:
+                    # Truthy, so this still auto-advances below exactly as before
+                    # (#148 I1 preserved the bool contract deliberately) -- but it is
+                    # no longer logged as "Successfully committed", which it never was.
+                    logger.info(
+                        f"Auto-commit for repair cycle issue #{issue_number}: nothing to "
+                        "commit (working tree clean)"
+                    )
                 elif commit_lock_contention[0]:
                     # Already logged with its specific lock in commit_thread(); named
                     # separately here so the generic "no changes to commit" line below
@@ -1831,10 +1840,10 @@ class AgentContainerRecovery:
                         "reflected in this recovery pass"
                     )
                 else:
-                    logger.warning(
-                        f"Auto-commit for repair cycle issue #{issue_number} did not succeed "
-                        "(no changes to commit, or a failure already logged above by "
-                        "commit_agent_changes() itself)"
+                    logger.error(
+                        f"Auto-commit for repair cycle issue #{issue_number} FAILED "
+                        f"({commit_success[0]!r}) -- the specific cause was logged above "
+                        "by commit_agent_changes() itself; the fix is still uncommitted"
                     )
             except Exception as e:
                 logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
@@ -1941,15 +1950,68 @@ class AgentContainerRecovery:
                         )
                     except Exception as state_err:
                         logger.error(f"Failed to record frozen outcome: {state_err}")
-                elif is_lock_contention or commit_lock_contention[0]:
-                    # Contention, not a failure (#148). Unlike frozen there is no
-                    # watchdog resume path for it, so the run has to be ended
-                    # (retain_lock=False) for the next board poll to re-dispatch —
-                    # and it must NOT go through mark_failed(), which durably retains
-                    # this board's lock (blocking every sibling issue on it until an
-                    # operator runs scripts/release_lock.py) over a lock that was
-                    # working exactly as designed. Mirrors the live path's contention
+                elif commit_lock_contention[0]:
+                    # The commit's OWN contention is the one case that must not release
+                    # this board's lock (#148 C2). auto_commit only takes the
+                    # project_checkout lock when the directory is the SHARED base clone
+                    # (is_base_clone_dir(); epic worktrees are not gated by it), so a
+                    # timeout on it proves this is the shared checkout — and the repair
+                    # cycle's fix is sitting in it uncommitted. Releasing hands that
+                    # dirty clone to the next issue the failsafe pulls in, whose prep
+                    # does a plain `git checkout` (no stash, no reset): git either
+                    # carries this fix onto that issue's branch or the checkout
+                    # conflicts. Retain instead, via mark_failed() so retained_reason is
+                    # actually set (a bare end_pipeline_run(retain_lock=True) never sets
+                    # it and the lock is reclaimable as stale). Mirrors the live path's
                     # branch in project_monitor._monitor_repair_cycle_container.
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        agent_name = context.get('agent_name', 'senior_software_engineer')
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=column,
+                            agent=agent_name,
+                            outcome='lock_contention',
+                            project_name=project,
+                            error=result.get('error')
+                        )
+                    except Exception as state_err:
+                        logger.error(f"Failed to record lock_contention outcome: {state_err}")
+
+                    marked_ok = pipeline_run_manager.mark_failed(
+                        project=project,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason=(
+                            "Repair cycle passed but its auto-commit lost the project "
+                            "checkout lock; the fix is uncommitted on disk in the shared "
+                            f"project checkout ({context.get('project_dir')})"
+                        ),
+                    )
+                    if marked_ok:
+                        logger.error(
+                            f"RETAINED the pipeline lock for {project}/#{issue_number}: a "
+                            f"recovered repair cycle's fix is uncommitted in the shared "
+                            f"project checkout. No other issue will be dispatched into it "
+                            f"until an operator releases the lock."
+                        )
+                    else:
+                        logger.critical(
+                            f"Pipeline lock for {project}/#{issue_number} could NOT be "
+                            f"durably marked failed while an uncommitted repair-cycle fix "
+                            f"sits in the shared project checkout — another issue may be "
+                            f"dispatched into that dirty checkout."
+                        )
+                elif is_lock_contention:
+                    # Container-level contention: nothing ran and nothing is dirty, so
+                    # this one DOES release. Unlike frozen there is no watchdog resume
+                    # path for it, so the run has to be ended (retain_lock=False) for the
+                    # next board poll to re-dispatch — and it must NOT go through
+                    # mark_failed(), which durably retains this board's lock (blocking
+                    # every sibling issue on it until an operator runs
+                    # scripts/release_lock.py) over a lock that was working exactly as
+                    # designed. Mirrors the live path's contention branch in
+                    # project_monitor._monitor_repair_cycle_container.
                     try:
                         from services.work_execution_state import work_execution_tracker
                         agent_name = context.get('agent_name', 'senior_software_engineer')
@@ -1970,6 +2032,9 @@ class AgentContainerRecovery:
                         issue_number=issue_number,
                         reason="Repair cycle blocked by a project resource-lock timeout",
                         retain_lock=False,
+                        # The release is only a retry point if the issue stays
+                        # visible to the next poll — see #148 C1.
+                        suppress_cancellation=True,
                     )
                     logger.info(
                         f"Released pipeline run for {project}/#{issue_number} after a "
@@ -2011,8 +2076,10 @@ class AgentContainerRecovery:
                     if marked_ok:
                         logger.error(
                             f"Repair cycle for {project}/#{issue_number} passed but "
-                            "its fix was not committed (see the 'No changes to "
-                            "commit' warning above) -- marked the pipeline run "
+                            "its fix was not committed (auto-commit returned "
+                            "CommitResult.FAILED, or its thread never produced a "
+                            "result -- see the specific reason logged above) -- "
+                            "marked the pipeline run "
                             "failed and the lock retained (awaiting manual "
                             "intervention) rather than silently ending the run as "
                             "if the fix had landed."

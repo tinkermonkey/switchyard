@@ -1302,7 +1302,8 @@ class PipelineRunManager:
         reason: Optional[str] = None,
         retain_lock: Optional[bool] = None,
         outcome: Optional[str] = None,
-        board: Optional[str] = None
+        board: Optional[str] = None,
+        suppress_cancellation: bool = False
     ) -> bool:
         """
         End an active pipeline run
@@ -1319,6 +1320,30 @@ class PipelineRunManager:
                 so a board-scoped-only run (e.g. an orphaned "phantom" run created
                 by get_or_create_pipeline_run() and never reused) can still be
                 found and ended. Omit to preserve prior legacy-key-only behavior.
+            suppress_cancellation: Do NOT set the (project, issue_number)
+                cancellation signal while ending this run. Default False keeps
+                every pre-existing caller's behavior byte-identical.
+
+                For a teardown that releases the lock so the NEXT poll retries
+                this same issue, setting the signal is actively wrong: it has a
+                1-hour TTL (services/cancellation.py _TTL_SECONDS) and every
+                automatic re-dispatch path consults it —
+                _find_stalled_issues_for_pipeline() skips a cancelled issue
+                outright, _check_and_process_waiting_issues_failsafe() skips it
+                after acquiring the lock (and, for a queue row, PURGES it from
+                the queue because `is_stalled = 'column' in next_issue` is False
+                for rows that store 'initial_column'), and process_board_changes()
+                only dispatches on a status change the issue never made. So
+                "released for the next poll" silently became "invisible for up to
+                an hour" — the exact hole pipeline_watchdog.py already documents
+                for its own case. Every resource-lock-contention teardown (#148)
+                passes True here for that reason.
+
+                Deliberately an explicit parameter rather than another magic
+                reason string: the reason strings on those teardowns carry the
+                specific lock detail an operator needs, so overloading them to
+                also encode "don't cancel" would either lose that detail or make
+                suppression depend on a substring match.
 
         Returns:
             True if run was ended, False if no active run found
@@ -1344,15 +1369,17 @@ class PipelineRunManager:
         # Skip for feedback_loop_ended — that reason indicates a conversational loop
         # exiting normally (e.g., stop requested, backlog). Setting the signal here
         # would race against the next column's loop starting and cancel it immediately.
-        # Deliberately reason-string-based rather than a caller-supplied override
-        # flag: every current failure path (mark_failed()'s callers) durably
-        # retains the lock, which blocks any "next loop" this signal could
-        # spuriously race against — so a failure path never has a legitimate
-        # reason to suppress it, and no such flag currently has any real caller
-        # (round 5 briefly added one for a case this reasoning shows didn't
-        # need it; round 6 removed it rather than carry unused API forward).
+        #
+        # Also skip when the caller passes suppress_cancellation=True. The earlier
+        # reasoning for keeping this reason-string-only ("every failure path durably
+        # retains the lock, so nothing it could blind is ever re-dispatched anyway")
+        # stopped holding the moment #148 introduced teardowns that RELEASE the lock
+        # precisely so the next poll retries the same issue: for those, the signal
+        # blinds every automatic recovery path for its full 1-hour TTL and, on the
+        # review-cycle/queue path, gets the queue row purged outright. See the
+        # suppress_cancellation arg docs above.
         _effective_reason = reason or "completed"
-        if _effective_reason != "feedback_loop_ended":
+        if _effective_reason != "feedback_loop_ended" and not suppress_cancellation:
             try:
                 from services.cancellation import get_cancellation_signal
                 get_cancellation_signal().cancel(

@@ -27,7 +27,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from services.worker_pool import TaskWorker
 from services.cancellation import CancellationError
 from agents.non_retryable import NonRetryableAgentError
-from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
 from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
 
@@ -98,20 +97,6 @@ class TestLockTimeoutIsNotRetried:
         wrapper.__cause__ = inner
 
         _, mock_process = await _run_worker_with_error(wrapper)
-
-        assert mock_process.call_count == 1
-
-
-class TestRateLimitIsNotRetried:
-    """Same family, same reasoning: agent_executor has already tripped the
-    Claude Code breaker and recorded 'frozen' for automatic resume, so retrying
-    here only re-dispatches into the now-open breaker."""
-
-    @pytest.mark.asyncio
-    async def test_rate_limit_is_attempted_exactly_once(self):
-        _, mock_process = await _run_worker_with_error(
-            ClaudeCodeRateLimitError("token limit reached")
-        )
 
         assert mock_process.call_count == 1
 

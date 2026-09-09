@@ -6,10 +6,61 @@ Automatically commits code changes made by agents to feature branches.
 
 import subprocess
 import logging
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
+
+
+class CommitResult(Enum):
+    """
+    Outcome of commit_agent_changes() -- three genuinely different states that a
+    bare bool collapsed into two.
+
+    Found in review (#148 I1): the live repair-cycle path in
+    services/project_monitor.py logged a False return as "No changes to commit"
+    and then auto-advanced the issue, while its restart-recovery twin in
+    services/agent_container_recovery.py treats the same falsy value as
+    mark_failed("Repair cycle passed but its fix was not committed"). The stated
+    reason for not gating the live path was that False is indistinguishable from
+    "nothing to commit" -- so this enum removes the ambiguity at the source
+    instead of asking each caller to guess.
+
+    Note for anyone reading the old comments this replaces: "nothing to commit"
+    was never actually a False return. _commit_and_push() returns True for it
+    (it still pushes any unpushed commits on the branch and falls through to
+    `return True`), so every historical False was already a genuine failure --
+    no project_dir, a non-existent directory, a main/master refusal, a failed
+    `git commit`, or a non-lock exception. The bug was that nothing said so.
+
+    * COMMITTED -- a real commit was created (and pushed, best-effort).
+    * NOTHING_TO_COMMIT -- the working tree was clean. Not a failure: the agent
+      legitimately changed nothing, or a previous attempt already committed.
+      Any unpushed commits on the branch were still pushed.
+    * FAILED -- the commit did not happen and the reason is a fault. Whatever
+      the agent wrote (if anything) is still uncommitted on disk.
+
+    A resource-lock timeout is deliberately NOT a member: it is raised, not
+    returned, so callers route it to their own contention path (#148, see
+    commit_agent_changes()'s Raises section and services/resource_lock_errors.py).
+
+    __bool__ deliberately does NOT follow TouchResult/ResetResult's "only the
+    one success value is truthy" rule, because here there are two non-failure
+    values and the pre-existing bool contract already made both truthy. Keeping
+    that contract is what lets this change be a pure refinement: every existing
+    truthiness-based caller and assertion (`if commit_success`,
+    `overall_success and not commit_success[0]`) keeps its exact original
+    meaning, and only the callers that need the three-way distinction are
+    updated to test identity against a member.
+    """
+
+    COMMITTED = "committed"
+    NOTHING_TO_COMMIT = "nothing_to_commit"
+    FAILED = "failed"
+
+    def __bool__(self) -> bool:
+        return self is not CommitResult.FAILED
 
 
 class AutoCommitService:
@@ -23,7 +74,7 @@ class AutoCommitService:
         project_dir: Union[str, Path],
         issue_number: Optional[int] = None,
         custom_message: Optional[str] = None,
-    ) -> bool:
+    ) -> CommitResult:
         """
         Commit changes made by an agent
 
@@ -44,37 +95,41 @@ class AutoCommitService:
             custom_message: Custom commit message (optional)
 
         Returns:
-            True if commit was successful, False otherwise.
+            A CommitResult (see its docstring): COMMITTED, NOTHING_TO_COMMIT or
+            FAILED. Truthiness is unchanged from the previous bool contract --
+            only FAILED is falsy -- so existing `if commit_success:` callers
+            behave identically; callers that must distinguish "the fix never
+            landed" from "there was nothing to land" compare against the member.
 
         Raises:
             ProjectCheckoutLockTimeoutError / DevContainerBuildLockTimeoutError:
-                the ONE failure mode that is not folded into a False return
-                (#148). False is indistinguishable from "nothing to commit" at
-                every caller, and a lock timeout means the commit never ran
-                while the agent's work IS on disk uncommitted -- reporting that
-                as "no changes" loses it. Callers route this to their own
-                lock-contention path (see services/resource_lock_errors.py).
+                the ONE outcome that is not folded into a returned CommitResult
+                (#148). It is not FAILED: nothing is wrong with this project or
+                this agent, the commit simply never ran because a different
+                holder owned the lock for its whole timeout, and the agent's
+                work IS on disk uncommitted. Callers route it to their own
+                lock-contention path (see services/resource_lock_errors.py),
+                which retries rather than reporting a fault.
         """
         if not project_dir:
             # A caller with no resolved directory (e.g. an old context.json
             # predating this field) must not reach a bare Path(None) TypeError
-            # here -- this method's documented contract is "True if commit was
-            # successful, False otherwise" for every failure mode except a
-            # resource-lock timeout (#148, see Raises above), matching its
-            # repair-cycle callers, whose threading.Thread wrapper handles only
-            # that one exception.
+            # here -- this method's documented contract is a CommitResult for
+            # every failure mode except a resource-lock timeout (#148, see Raises
+            # above), matching its repair-cycle callers, whose threading.Thread
+            # wrapper handles only that one exception.
             logger.error(
                 f"commit_agent_changes() called for {project}/#{issue_number} "
                 f"(agent={agent}) with no project_dir -- cannot determine which "
                 "directory to commit."
             )
-            return False
+            return CommitResult.FAILED
 
         project_dir = Path(project_dir)
 
         if not project_dir.exists():
             logger.error(f"Project directory does not exist: {project_dir}")
-            return False
+            return CommitResult.FAILED
 
         # Fast-fail pre-check (not main/master) BEFORE acquiring the
         # project_checkout lock below (#56 review): a project_dir stuck on
@@ -88,7 +143,7 @@ class AutoCommitService:
             logger.error(f"Project: {project}, Agent: {agent}, Issue: {issue_number}")
             logger.error(f"FeatureBranchManager should have created a branch BEFORE agent execution")
             logger.error(f"Auto-commit REFUSED to create emergency branch - this would bypass parent/sub-issue logic")
-            return False
+            return CommitResult.FAILED
 
         try:
             # project_checkout lock (#54): if project_dir is the shared base
@@ -138,7 +193,7 @@ class AutoCommitService:
                             f"while we waited. Project: {project}, Agent: {agent}, "
                             f"Issue: {issue_number}. Refusing to commit."
                         )
-                        return False
+                        return CommitResult.FAILED
                     return await self._commit_and_push(
                         project, agent, task_id, project_dir, fresh_branch, issue_number, custom_message
                     )
@@ -150,14 +205,14 @@ class AutoCommitService:
         except Exception as e:
             # Project resource-lock timeout (#148): the commit never ran because
             # another holder owned this project's base clone for the whole of that
-            # lock's timeout. Returning False here would be indistinguishable from
-            # "nothing to commit" at every caller -- and the maker's work IS on disk,
-            # uncommitted. review_cycle.py reads a False return as "no changes to
-            # commit for iteration N" and carries on, while
-            # agent_container_recovery.py escalates `overall_success and not
-            # commit_success` all the way to mark_failed("Repair cycle passed but its
-            # fix was not committed"). Re-raise so callers see the same typed
-            # exception every other dispatch path now routes to its contention path.
+            # lock's timeout, and the maker's work IS on disk, uncommitted. Even
+            # with CommitResult in place this must not be folded into a return
+            # value: FAILED would send agent_container_recovery.py (and now the
+            # live path too) to mark_failed("Repair cycle passed but its fix was
+            # not committed"), durably retaining the board lock over contention
+            # that clears itself, and NOTHING_TO_COMMIT would lose the fix
+            # outright. Re-raise so callers see the same typed exception every
+            # other dispatch path now routes to its contention path.
             from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
             if is_lock_timeout_error(e):
                 logger.warning(
@@ -168,7 +223,7 @@ class AutoCommitService:
                 raise
 
             logger.error(f"Failed to auto-commit changes for {project}: {e}")
-            return False
+            return CommitResult.FAILED
 
     async def _commit_and_push(
         self,
@@ -179,7 +234,7 @@ class AutoCommitService:
         current_branch: Optional[str],
         issue_number: Optional[int],
         custom_message: Optional[str],
-    ) -> bool:
+    ) -> CommitResult:
         """
         The actual git add/commit/push sequence, split out of
         commit_agent_changes() (#54) so its caller can wrap it in the
@@ -205,7 +260,7 @@ class AutoCommitService:
                 f"commit onto {current_branch}. Project: {project}, Agent: "
                 f"{agent}, Issue: {issue_number}."
             )
-            return False
+            return CommitResult.FAILED
 
         # Check if there are changes to commit
         has_changes = self._check_for_changes(project_dir)
@@ -224,7 +279,7 @@ class AutoCommitService:
             success = self._commit(project_dir, commit_message)
             if not success:
                 logger.error("Failed to commit changes")
-                return False
+                return CommitResult.FAILED
 
             logger.info(f"Successfully committed changes for {project} (agent: {agent})")
         else:
@@ -238,7 +293,11 @@ class AutoCommitService:
             else:
                 logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
 
-        return True
+        # NOTE: a failed push is deliberately still not a FAILED result -- that
+        # was true of the bool contract too (it only warns). The commit itself
+        # landed locally; only the push didn't. Changing that is a separate
+        # question from #148 I1, which is about the commit never happening.
+        return CommitResult.COMMITTED if has_changes else CommitResult.NOTHING_TO_COMMIT
 
     def _check_for_changes(self, project_dir: Path) -> bool:
         """Check if there are uncommitted changes"""

@@ -568,6 +568,9 @@ class HumanFeedbackLoopExecutor:
                         reason=f"Conversational feedback loop blocked by a project "
                                f"resource-lock timeout: {e}",
                         retain_lock=False,
+                        # The release is only a retry point if the issue stays
+                        # visible to the next poll — see #148 C1.
+                        suppress_cancellation=True,
                     )
                 except Exception as release_err:
                     logger.error(
@@ -1025,6 +1028,9 @@ class HumanFeedbackLoopExecutor:
                             reason="Conversational feedback loop blocked by a project "
                                    "resource-lock timeout",
                             retain_lock=False,
+                            # The release is only a retry point if the issue stays
+                            # visible to the next poll — see #148 C1.
+                            suppress_cancellation=True,
                         )
                     elif _outcome == "failed":
                         # Route genuine failures through the shared mark_failed()

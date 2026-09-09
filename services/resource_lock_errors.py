@@ -46,10 +46,26 @@ against a failure budget, therefore has to be able to recognise it:
         the live one in project_monitor._monitor_repair_cycle_container and the
         restart-recovery one in services/agent_container_recovery.py, which
         share classify_repair_cycle_outcome() so they cannot drift apart again.
+    Every one of those releases the board lock, and therefore passes
+    end_pipeline_run(suppress_cancellation=True): the run is released precisely
+    so the NEXT poll retries this issue, and the cancellation signal would hide
+    it from every path that could do that for the signal's full 1-hour TTL (and,
+    on the queue path, get its queue row purged). See end_pipeline_run's own
+    arg docs.
+
+    THE ONE EXCEPTION, which retains instead of releasing: a repair cycle whose
+    auto-commit lost the checkout lock (commit_lock_contention in both
+    repair-cycle handlers). auto_commit only takes the project_checkout lock for
+    the SHARED base clone, so that timeout proves the cycle's fix is sitting
+    uncommitted in a directory other issues get dispatched into — and their prep
+    does a plain `git checkout`, which would carry the fix onto the wrong branch
+    or fail. That one goes through mark_failed() deliberately; every other
+    contention outcome means "nothing ran, nothing is dirty".
+
     services/auto_commit.py is the one non-teardown member of the same family:
-    it re-raises rather than returning False, because its False is
-    indistinguishable from "nothing to commit" and would otherwise let the
-    maker's uncommitted work be read as absent.
+    it re-raises rather than returning a CommitResult, because neither FAILED
+    (which now durably retains a board lock) nor NOTHING_TO_COMMIT describes
+    contention, and the maker's uncommitted work must not be read as absent.
   * Contention is exempt from those budgets but not unbounded: repeated
     'lock_contention' outcomes are counted by
     work_execution_state.count_consecutive_lock_contentions() and escalated

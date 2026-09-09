@@ -915,6 +915,11 @@ class ReviewCycleExecutor:
                 reason=f"Review cycle blocked by a project resource-lock timeout: "
                        f"{describe_lock_timeout(error)}",
                 retain_lock=False,
+                # Without this the release below is a no-op for recovery: the
+                # cancellation signal makes the issue invisible to BOTH failsafe
+                # scenarios for an hour, and Scenario 2 additionally purges this
+                # issue's queue row on the way past (#148 C1).
+                suppress_cancellation=True,
             )
         except Exception as release_err:
             logger.error(
@@ -2868,10 +2873,22 @@ class ReviewCycleExecutor:
                         custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
                     )
 
-                    if commit_success:
+                    from services.auto_commit import CommitResult
+                    if commit_success is CommitResult.COMMITTED:
                         logger.info(f"Auto-committed changes for iteration {iteration}")
+                    elif commit_success is CommitResult.NOTHING_TO_COMMIT:
+                        logger.info(f"No changes to commit for iteration {iteration}")
                     else:
-                        logger.warning(f"No changes to commit for iteration {iteration}")
+                        # Previously also logged as "No changes to commit" -- the exact
+                        # conflation #148 I1 removed. A FAILED commit here means the
+                        # maker's revision is uncommitted; the cycle deliberately still
+                        # continues (the reviewer reads the maker's GitHub comment, not
+                        # the branch), but it must not be reported as an empty diff.
+                        logger.error(
+                            f"Auto-commit FAILED for iteration {iteration} -- the maker's "
+                            f"changes are still uncommitted (cause logged above by "
+                            f"commit_agent_changes())"
+                        )
 
             # Get maker's revised output from GitHub (workspace-aware)
             maker_comment = await self._get_latest_agent_comment(

@@ -72,6 +72,10 @@ class TestEndPrReviewPipelineRunOnFailure:
             issue_number=123,
             reason="PR review stage exception: ValueError",
             retain_lock=False,
+            # Not contention -- an ordinary retryable failure keeps setting the
+            # cancellation signal exactly as it always did (#148 C1 scoped the
+            # suppression to contention only).
+            suppress_cancellation=False,
         )
         # No retention was attempted — nothing to report on.
         assert result is None
@@ -99,6 +103,9 @@ class TestLockTimeoutReleasesRatherThanRetaining:
 
         mock_manager.mark_failed.assert_not_called()
         assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        # #148 C1: the release exists so the next poll retries; the cancellation
+        # signal would hide the issue from every path that could do that.
+        assert mock_manager.end_pipeline_run.call_args.kwargs["suppress_cancellation"] is True
         assert result is None
 
     def test_non_retryable_wrapping_a_lock_timeout_still_releases(self):
@@ -116,6 +123,7 @@ class TestLockTimeoutReleasesRatherThanRetaining:
 
         mock_manager.mark_failed.assert_not_called()
         assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        assert mock_manager.end_pipeline_run.call_args.kwargs["suppress_cancellation"] is True
         assert result is None
 
 

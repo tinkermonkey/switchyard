@@ -152,22 +152,6 @@ class TaskWorker:
                                     self.tasks_failed += 1
                                     break
 
-                                # ClaudeCodeRateLimitError: systemic token limit — don't retry.
-                                # agent_executor.py already tripped the Claude Code breaker and
-                                # recorded outcome='frozen' for automatic resume once tokens
-                                # reset; retrying here would only re-dispatch into the now-open
-                                # breaker and overwrite that record three more times.
-                                from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
-                                if isinstance(e, ClaudeCodeRateLimitError):
-                                    duration = time.time() - start_time
-                                    logger.warning(
-                                        f"[Worker {self.worker_id}] Task {task.id} frozen by the Claude "
-                                        f"Code token-limit breaker — not retrying: {e}"
-                                    )
-                                    self.metrics.record_task_complete(task.agent, duration, success=False)
-                                    self.tasks_failed += 1
-                                    break
-
                                 # Check if we should retry
                                 if attempt <= max_retries:
                                     logger.warning(

@@ -105,6 +105,8 @@ class TestLockTimeoutReleasesInsteadOfRetaining:
         ]
         assert release_calls, "the pipeline run must be released, not retained"
         assert release_calls[0].kwargs['issue_number'] == 900
+        # #148 C1: a release that also cancels the issue is not a retry point.
+        assert release_calls[0].kwargs['suppress_cancellation'] is True
 
     @pytest.mark.asyncio
     async def test_wrapped_lock_timeout_is_also_released(self):
@@ -184,6 +186,8 @@ class TestConversationalLoopFinallyBlock:
             if call.kwargs.get('retain_lock') is False
         ]
         assert release_calls, "the pipeline run must be released, not retained"
+        # #148 C1: a release that also cancels the issue is not a retry point.
+        assert release_calls[0].kwargs['suppress_cancellation'] is True
 
     @pytest.mark.asyncio
     async def test_ordinary_mid_loop_failure_still_marks_failed(self):
