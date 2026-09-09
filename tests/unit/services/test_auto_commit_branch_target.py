@@ -203,19 +203,27 @@ class TestExpectedBranchVerification:
             mock_push.assert_called_once_with(tmp_path, 'feature/issue-7-epic')
 
     @pytest.mark.asyncio
-    async def test_epic_worktree_mismatch_warns_but_still_commits(self, service, tmp_path, caplog):
+    async def test_epic_worktree_mismatch_is_refused_too(self, service, tmp_path):
         """
-        A mismatch is fatal only where the corruption is possible. An epic
-        worktree is shared with no other board, so its checked-out branch IS
-        this epic's own branch -- a disagreement means the expectation went
-        stale (get_or_create_epic_worktree() ignores branch_name on reuse), and
-        refusing there would strand a real fix over bookkeeping.
+        The refusal must not be scoped to the shared base clone.
+
+        It was, originally, on the reasoning that an epic worktree's checked-out
+        branch IS this epic's own branch so a disagreement could only be stale
+        bookkeeping. Found in review: that made the refusal unreachable in
+        production -- every call site that supplies an expected_branch resolves
+        an epic worktree, and the only shared-base-clone producer
+        (_resolve_workspace_for_cycle()'s git-free 'discussions' path) supplies
+        None. So #143's own outcome was still reachable straight through the
+        guard: an agent container running `git checkout -b something-else` in
+        its own worktree got its repair-cycle fix staged, committed and pushed
+        onto that other branch, with a warning as the only trace.
         """
         with _epic_worktree(), \
-             patch.object(service, '_get_current_branch', return_value='feature/issue-7-epic'), \
-             patch.object(service, '_check_for_changes', return_value=False), \
-             patch.object(service, '_push_branch', return_value=True) as mock_push, \
-             caplog.at_level(logging.WARNING, logger='services.auto_commit'):
+             patch.object(service, '_get_current_branch', return_value='feature/issue-90-other'), \
+             patch.object(service, '_check_for_changes') as mock_check, \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch') as mock_push:
 
             result = await service.commit_agent_changes(
                 project='test-project',
@@ -223,12 +231,42 @@ class TestExpectedBranchVerification:
                 task_id='task-1',
                 project_dir=tmp_path,
                 issue_number=7,
-                expected_branch='feature/issue-7-stale-name',
+                expected_branch='feature/issue-7-epic',
+            )
+
+            assert result is CommitResult.FAILED
+            mock_check.assert_not_called()
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
+            mock_push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_expectation_in_the_shared_clone_is_logged_as_an_error(self, service, tmp_path, caplog):
+        """
+        The one shape #143 stays undefended against -- a shared base clone with
+        nothing to verify against -- must be visible at normal log levels. The
+        pre-lock fallback cannot catch a checkout that won the gap before our
+        very first read, so this is a degradation, not a note.
+        """
+        with _shared_base_clone(), \
+             patch('services.project_checkout_lock.project_checkout_lock_async',
+                   side_effect=_async_noop_lock_cm), \
+             patch.object(service, '_get_current_branch',
+                          side_effect=['feature/issue-7-epic', 'feature/issue-7-epic']), \
+             patch.object(service, '_check_for_changes', return_value=False), \
+             patch.object(service, '_push_branch', return_value=True), \
+             caplog.at_level(logging.ERROR, logger='services.auto_commit'):
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='senior_software_engineer',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=7,
             )
 
             assert result is CommitResult.NOTHING_TO_COMMIT
-            mock_push.assert_called_once_with(tmp_path, 'feature/issue-7-epic')
-            assert any('branch mismatch' in r.message for r in caplog.records)
+            assert any('no expected_branch' in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_epic_worktree_does_not_re_read_the_branch(self, service, tmp_path):
@@ -342,6 +380,83 @@ class TestUnknownBranchIsRefused:
 
             assert service._get_current_branch(tmp_path) is None
             assert any('not a git repository' in r.message for r in caplog.records)
+
+    def test_get_current_branch_treats_a_detached_head_as_no_branch(self, service, tmp_path, caplog):
+        """
+        The sentinel the first pass missed: `git rev-parse --abbrev-ref HEAD`
+        prints the literal 'HEAD' with exit 0 on a detached HEAD, and that value
+        is neither None nor main/master, so it passed every guard -- the commit
+        landed on no branch and `git push -u origin HEAD` then failed with "The
+        destination you provided is not a full refname", which _commit_and_push()
+        only warns about. ProjectWorkspaceManager._current_worktree_branch()
+        already folds 'HEAD' into None; this is the same rule here.
+        """
+        completed = subprocess.CompletedProcess(
+            args=['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            returncode=0,
+            stdout='HEAD\n',
+            stderr='',
+        )
+        with patch('services.auto_commit.subprocess.run', return_value=completed), \
+             caplog.at_level(logging.ERROR, logger='services.auto_commit'):
+
+            assert service._get_current_branch(tmp_path) is None
+            assert any('DETACHED HEAD' in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_detached_head_worktree_never_reaches_git(self, service, tmp_path):
+        """End to end: the detached-HEAD worktree is refused by the same
+        fast-fail the unreadable-branch case uses, so nothing is staged,
+        committed or pushed and the caller sees FAILED rather than a COMMITTED
+        result covering a dangling commit."""
+        completed = subprocess.CompletedProcess(
+            args=['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            returncode=0,
+            stdout='HEAD\n',
+            stderr='',
+        )
+        with _epic_worktree(), \
+             patch('services.auto_commit.subprocess.run', return_value=completed), \
+             patch.object(service, '_check_for_changes') as mock_check, \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch') as mock_push:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='repair_cycle',
+                task_id='repair_cycle_7',
+                project_dir=tmp_path,
+                issue_number=7,
+                expected_branch='feature/issue-7-epic',
+            )
+
+            assert result is CommitResult.FAILED
+            mock_check.assert_not_called()
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
+            mock_push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_commit_and_push_refuses_head_as_its_structural_backstop(self, service, tmp_path):
+        """_commit_and_push()'s own guard covers 'HEAD' alongside None, so a
+        future call site that resolves its branch some other way cannot
+        reintroduce the dangling commit."""
+        with patch.object(service, '_check_for_changes') as mock_check, \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch') as mock_push:
+
+            result = await service._commit_and_push(
+                'test-project', 'repair_cycle', 'task-1',
+                tmp_path, 'HEAD', 7, None,
+            )
+
+            assert result is CommitResult.FAILED
+            mock_check.assert_not_called()
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
+            mock_push.assert_not_called()
 
     def test_get_current_branch_logs_when_output_is_empty(self, service, tmp_path, caplog):
         """Same silent-None gap, reached with a zero exit code and no output."""

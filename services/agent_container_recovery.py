@@ -1137,7 +1137,18 @@ class AgentContainerRecovery:
             # default (project_dir=None; that path's own auto-commit then has
             # nothing to resolve from and will fail loudly rather than silently
             # guessing the wrong directory).
+            # branch_name: threaded for exactly the same reason and out of the
+            # same context.json field (_save_repair_cycle_context writes
+            # pipeline_run.branch_name into it) -- it is the independently
+            # derived expectation that eventual auto-commit verifies the
+            # checked-out branch against (#143/#149). Omitting it here left this
+            # recovery path comparing the branch only against itself, while its
+            # sibling _process_completed_repair_cycle() supplied one: the same
+            # divergence between the two restart paths that #123 exists to
+            # remove. None (legacy context file) degrades to the pre-lock
+            # fallback rather than blocking the commit.
             project_dir = None
+            branch_name = None
 
             if context_file.exists():
                 try:
@@ -1148,11 +1159,12 @@ class AgentContainerRecovery:
                     effective_run_id = saved_context.get('pipeline_run_id') or run_id
                     agent_name = saved_context.get('agent_name') or agent_name
                     project_dir = saved_context.get('project_dir')
+                    branch_name = saved_context.get('branch_name')
 
                     logger.info(
                         f"Loaded reconnect context from file: board={board_name}, "
                         f"run_id={effective_run_id}, agent={agent_name}, "
-                        f"project_dir={project_dir}"
+                        f"project_dir={project_dir}, branch_name={branch_name}"
                     )
                 except Exception as e:
                     logger.warning(f"Could not load context file, falling back to heuristics: {e}")
@@ -1205,7 +1217,8 @@ class AgentContainerRecovery:
                 workflow_template=workflow_template,
                 agent_name=agent_name,
                 pipeline_run_id=effective_run_id,
-                project_dir=project_dir
+                project_dir=project_dir,
+                branch_name=branch_name
             )
 
             logger.info(f"✓ Reconnected to repair cycle container: {container_name}")

@@ -105,10 +105,13 @@ class AutoCommitService:
                 #123 removed this method's own epic_id/branch_name resolution
                 precisely because a second, divergent derivation of the
                 caller's already-decided workspace is the bug, not the fix.
-                Optional -- when omitted, the branch observed before the lock
-                wait stands in as a weaker expectation (see
-                _verify_commit_branch()), so a caller that cannot resolve one
-                is degraded rather than blocked.
+                When supplied, a checked-out branch that disagrees with it is
+                refused outright (CommitResult.FAILED, changes left on disk) --
+                in an epic worktree as well as the shared base clone, see
+                _verify_commit_branch(). Optional -- when omitted, the branch
+                observed before the lock wait stands in as a weaker
+                expectation, so a caller that cannot resolve one is degraded
+                rather than blocked.
 
         Returns:
             A CommitResult (see its docstring): COMMITTED, NOTHING_TO_COMMIT or
@@ -303,13 +306,40 @@ class AutoCommitService:
         mark_failed() with the board lock retained, not a release over dirty
         state.
 
-        A mismatch is fatal only in the shared base clone. An epic worktree is
-        not shared with any other board, so its checked-out branch IS that
-        epic's own branch and a disagreement means the expectation went stale
-        (get_or_create_epic_worktree() ignores branch_name on reuse, and
-        resolve_workspace()'s idempotency guard does not re-verify HEAD) --
-        refusing there would strand a real fix over bookkeeping. Logged as a
-        warning instead.
+        A supplied expected_branch is fatal on mismatch in BOTH directory
+        kinds. This used to be fatal only in the shared base clone, on the
+        reasoning that an epic worktree's checked-out branch IS that epic's own
+        branch, so a disagreement had to mean the expectation had gone stale.
+        Found in review: that made the refusal structurally unreachable. Every
+        production call site resolves an epic worktree (review_cycle.py's three
+        sites are gated on workspace_type == 'issues'; project_monitor.py's and
+        agent_container_recovery.py's repair-cycle sites take project_dir from
+        the same resolve_workspace() result), and the ONLY producer of a shared
+        base clone -- _resolve_workspace_for_cycle()'s git-free 'discussions'
+        branch -- returns branch_name None by construction. So the two states
+        never co-occurred: wherever an expectation existed the mismatch only
+        warned, and wherever the refusal was fatal there was no expectation to
+        compare against. #143's own scenario was still reachable straight
+        through the new guard.
+
+        The staleness the old leniency protected against is also not the real
+        risk it was taken for: resolve_workspace() re-derives the worktree's
+        ACTUAL branch (workspace_manager._current_worktree_branch()) at
+        resolution time rather than trusting its own locally-resolved name, so
+        an adopted-on-restart worktree persists the branch it is really on.
+        Nothing in the orchestrator checks a branch out inside an epic worktree
+        either -- every checkout_branch() call site is base-clone-scoped. What
+        is left as a mismatch source is the agent container's own git moving
+        HEAD, and committing there pushes this agent's work onto whatever
+        branch it moved to: #143's corruption reached through a different door.
+        Refusing leaves that work on disk for the caller's failure path, which
+        is the same trade the shared clone already makes.
+
+        is_shared_dir still decides fatality for the FALLBACK expectation
+        (pre_lock_branch, used when no expected_branch is supplied): there it
+        closes the narrower "another board checked out during our lock wait"
+        sequence, and in an unlocked worktree the fallback and commit_branch
+        are the same value by construction, so the test is vacuous anyway.
 
         Returns:
             True to proceed with the commit; False to refuse (the caller
@@ -340,12 +370,18 @@ class AutoCommitService:
             )
             return False
 
+        # `or` rather than `is not None` throughout this block, so an empty
+        # expectation is treated as no expectation by every test below rather
+        # than by only some of them.
         target_branch = expected_branch or pre_lock_branch
-        if expected_branch is None:
-            # Only worth an operator's attention where ambient state is
-            # genuinely untrustworthy; in an isolated worktree the fallback and
-            # the "real" expectation are the same value anyway.
-            log_missing = logger.warning if is_shared_dir else logger.debug
+        if not expected_branch:
+            # An expectation-less commit in the SHARED clone is the one shape
+            # #143 is undefended against -- the pre-lock fallback below cannot
+            # catch a checkout that won the gap before our first read (see this
+            # method's docstring), so it is an error, not a note. In an isolated
+            # worktree the fallback and the "real" expectation are the same
+            # value anyway, so it stays at debug.
+            log_missing = logger.error if is_shared_dir else logger.debug
             log_missing(
                 f"commit_agent_changes() got no expected_branch for {project}/"
                 f"#{issue_number} (agent={agent}) -- falling back to the branch seen "
@@ -360,19 +396,36 @@ class AutoCommitService:
                 f"{target_branch!r} (project={project}, agent={agent}, "
                 f"issue={issue_number})"
             )
+            if expected_branch:
+                # Fatal in both directory kinds -- see the docstring for why
+                # scoping this to the shared clone made it unreachable.
+                where = (
+                    "this shared base clone" if is_shared_dir
+                    else "this epic's own worktree"
+                )
+                logger.error(
+                    f"Refusing to auto-commit onto the wrong branch: {detail}. "
+                    f"Something checked out a different branch in {where}; committing "
+                    "here would push this agent's work onto an unrelated issue's "
+                    "branch (#143). The changes are left uncommitted on disk."
+                )
+                return False
             if is_shared_dir:
                 logger.error(
                     f"Refusing to auto-commit onto the wrong branch: {detail}. Another "
-                    "operation checked out its own branch in this shared base clone; "
-                    "committing here would push this agent's work onto an unrelated "
-                    "issue's branch (#143). The changes are left uncommitted on disk."
+                    "operation checked out its own branch in this shared base clone "
+                    "while we waited for the project_checkout lock; committing here "
+                    "would push this agent's work onto an unrelated issue's branch "
+                    "(#143). The changes are left uncommitted on disk."
                 )
                 return False
+            # Unreachable today: without an expectation the target IS
+            # pre_lock_branch, and an unlocked worktree's commit_branch is that
+            # same object. Kept so a future re-read on this path cannot silently
+            # become a no-op comparison.
             logger.warning(
-                f"Auto-commit branch mismatch in an isolated epic worktree: {detail}. "
-                "Proceeding anyway -- a worktree is not shared with another board, so "
-                "the checked-out branch is this epic's own and the expectation is the "
-                "value more likely to have gone stale."
+                f"Auto-commit branch mismatch in an isolated epic worktree with no "
+                f"expected_branch to verify against: {detail}. Proceeding anyway."
             )
 
         return True
@@ -406,9 +459,12 @@ class AutoCommitService:
         check makes the invariant hold structurally, not just by caller
         discipline. None is refused by the same guard for the same reason
         (#149 item 33): it used to pass straight through the `in` test as
-        "not main/master".
+        "not main/master". 'HEAD' -- what git prints for a detached HEAD --
+        is refused alongside it: _get_current_branch() now maps that to None
+        before it can ever get here, so this is the same defense-in-depth for
+        a future call site that resolves its branch some other way.
         """
-        if current_branch is None or current_branch in ['main', 'master']:
+        if current_branch is None or current_branch in ['main', 'master', 'HEAD']:
             logger.error(
                 f"WORKFLOW BUG: _commit_and_push() called with current_branch="
                 f"{current_branch!r} for {project_dir} -- refusing to stage or "
@@ -474,7 +530,7 @@ class AutoCommitService:
 
     def _get_current_branch(self, project_dir: Path) -> Optional[str]:
         """
-        Get the current branch name, or None if it cannot be determined.
+        Get the current branch name, or None if there isn't a usable one.
 
         Every None return is now logged with its cause (#149 item 33): a
         non-zero `git rev-parse` used to fall out of the `if` and return None
@@ -482,6 +538,20 @@ class AutoCommitService:
         read that None as "a perfectly good non-main branch" and proceeded.
         The callers refuse on None; this makes the reason recoverable from the
         logs instead of leaving an unexplained commit refusal.
+
+        A DETACHED HEAD is folded into that same None (later review pass on
+        #149 item 33): `git rev-parse --abbrev-ref HEAD` prints the literal
+        string 'HEAD' with exit 0 when nothing is checked out, and that value
+        is not None and not main/master, so it sailed through every guard --
+        the commit landed on no branch at all and the subsequent
+        `git push -u origin HEAD` failed with "The destination you provided is
+        not a full refname", which _commit_and_push() only warns about. The
+        result was a dangling commit inside an epic worktree that the startup
+        prune_epic_worktrees() sweep can later remove, reported to the caller
+        as COMMITTED. ProjectWorkspaceManager._current_worktree_branch()
+        already treats 'HEAD' as unusable for exactly this reason; this is the
+        same rule at this module's own git boundary, so all three None
+        refusals cover it without each growing a second sentinel test.
         """
         try:
             result = subprocess.run(
@@ -494,12 +564,21 @@ class AutoCommitService:
 
             if result.returncode == 0:
                 branch = result.stdout.strip()
-                if branch:
+                if branch and branch != 'HEAD':
                     return branch
-                logger.error(
-                    f"git rev-parse --abbrev-ref HEAD succeeded but printed nothing in "
-                    f"{project_dir} -- cannot determine the current branch."
-                )
+                if branch == 'HEAD':
+                    logger.error(
+                        f"{project_dir} is on a DETACHED HEAD (git rev-parse "
+                        "--abbrev-ref HEAD printed 'HEAD') -- there is no branch to "
+                        "commit onto or push to. An interrupted rebase/bisect, or an "
+                        "agent running `git checkout <sha>` in its own worktree, "
+                        "leaves this state."
+                    )
+                else:
+                    logger.error(
+                        f"git rev-parse --abbrev-ref HEAD succeeded but printed nothing in "
+                        f"{project_dir} -- cannot determine the current branch."
+                    )
             else:
                 logger.error(
                     f"Failed to get current branch in {project_dir}: git rev-parse "

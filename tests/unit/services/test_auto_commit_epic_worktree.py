@@ -208,13 +208,26 @@ class TestCurrentBranchReReadAfterTheLock:
         mechanic this class was written for: when the lock IS taken, the branch
         is read a second time under it and that second value -- not the object
         read before the wait -- is the one threaded into the push.
+
+        Later review pass: making both reads the same *string* satisfied the
+        push assertion from either value, so the assertion no longer detected
+        its own regression (reverting to `commit_branch = pre_lock_branch`
+        while leaving the second read in place kept call_count == 2 and kept
+        the push assertion green). The two reads are therefore equal in VALUE
+        -- which is what the new branch-target verification requires -- but
+        distinct in IDENTITY, and the push is asserted with `is`.
         """
+        class _Branch(str):
+            """Equal to the other read, distinguishable from it by identity."""
+
+        pre_lock, post_lock = _Branch('feature/issue-7'), _Branch('feature/issue-7')
+
         with patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=True), \
              patch(
                  'services.project_checkout_lock.project_checkout_lock_async',
                  side_effect=self._async_noop_lock_cm,
              ), \
-             patch.object(service, '_get_current_branch', side_effect=['feature/issue-7', 'feature/issue-7']) as mock_branch, \
+             patch.object(service, '_get_current_branch', side_effect=[pre_lock, post_lock]) as mock_branch, \
              patch.object(service, '_check_for_changes', return_value=False), \
              patch.object(service, '_push_branch', return_value=True) as mock_push:
 
@@ -231,7 +244,7 @@ class TestCurrentBranchReReadAfterTheLock:
             # Read twice: once for the pre-lock fast-fail check, once again
             # after acquiring the lock.
             assert mock_branch.call_count == 2
-            mock_push.assert_called_once_with(tmp_path, 'feature/issue-7')
+            assert mock_push.call_args[0][1] is post_lock
 
     @pytest.mark.asyncio
     async def test_branch_racing_onto_main_during_the_lock_wait_refuses_to_commit(self, service, tmp_path):
