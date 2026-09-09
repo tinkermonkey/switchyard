@@ -169,7 +169,13 @@ class HybridWorkspaceContext(WorkspaceContext):
                 # resolved and the agent actually worked in (issue #122/WI-C review
                 # finding) -- without this, finalize_feature_branch_work() defaults to
                 # the shared base clone, which has none of the agent's real changes.
-                project_dir_override=self.pipeline_run.project_dir
+                project_dir_override=self.pipeline_run.project_dir,
+                # ...and onto the SAME branch that resolution decided on, verified
+                # against what is actually checked out rather than adopted from it
+                # (#149 WI-4 review). Read from the same resolve_workspace() result
+                # as project_dir, so it is an expectation derived outside the
+                # workspace's ambient git state.
+                expected_branch=self.pipeline_run.branch_name
             )
 
             return finalize_result

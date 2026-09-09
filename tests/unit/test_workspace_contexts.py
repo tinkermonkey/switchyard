@@ -58,6 +58,8 @@ class TestIssuesWorkspaceContext:
              patch('services.agent_executor.config_manager') as mock_config, \
              patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm), \
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
+             patch.object(agent_executor, '_failsafe_commit_check', new_callable=AsyncMock,
+                          return_value=None), \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):
@@ -73,7 +75,10 @@ class TestIssuesWorkspaceContext:
             mock_agent.agent_config = {}
             mock_create_agent.return_value = mock_agent
 
-            # This should NOT raise an error
+            # This should NOT raise an error. The failsafe is pinned because the
+            # worktree path resolve_workspace() hands back does not exist on disk
+            # here, and a branch the failsafe cannot read is escalated rather than
+            # silently discarded since #149 WI-4.
             await agent_executor.execute_agent(
                 agent_name='test_agent',
                 project_name='test-project',

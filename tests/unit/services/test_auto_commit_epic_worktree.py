@@ -193,12 +193,41 @@ class TestCurrentBranchReReadAfterTheLock:
 
     @pytest.mark.asyncio
     async def test_branch_is_re_read_after_acquiring_the_lock_and_the_fresh_value_is_used(self, service, tmp_path):
+        """
+        The re-read itself, and the fact that the FRESH value (not the pre-lock
+        one) is what reaches the push.
+
+        Updated for #143/#149: this test used to feed a pre-lock 'feature/stale'
+        and a post-lock 'feature/fresh' and assert the push went to
+        'feature/fresh'. That input is now the bug, not the fix -- a fresh value
+        that differs from this commit's target is another board's branch, and
+        pushing to it is exactly the corruption #143 reports (see
+        test_refuses_when_another_board_checked_out_its_own_branch_during_the_wait
+        in test_auto_commit_branch_target.py, which asserts the new verdict for
+        that input). What still has to hold, and is asserted here, is the
+        mechanic this class was written for: when the lock IS taken, the branch
+        is read a second time under it and that second value -- not the object
+        read before the wait -- is the one threaded into the push.
+
+        Later review pass: making both reads the same *string* satisfied the
+        push assertion from either value, so the assertion no longer detected
+        its own regression (reverting to `commit_branch = pre_lock_branch`
+        while leaving the second read in place kept call_count == 2 and kept
+        the push assertion green). The two reads are therefore equal in VALUE
+        -- which is what the new branch-target verification requires -- but
+        distinct in IDENTITY, and the push is asserted with `is`.
+        """
+        class _Branch(str):
+            """Equal to the other read, distinguishable from it by identity."""
+
+        pre_lock, post_lock = _Branch('feature/issue-7'), _Branch('feature/issue-7')
+
         with patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=True), \
              patch(
                  'services.project_checkout_lock.project_checkout_lock_async',
                  side_effect=self._async_noop_lock_cm,
              ), \
-             patch.object(service, '_get_current_branch', side_effect=['feature/stale', 'feature/fresh']) as mock_branch, \
+             patch.object(service, '_get_current_branch', side_effect=[pre_lock, post_lock]) as mock_branch, \
              patch.object(service, '_check_for_changes', return_value=False), \
              patch.object(service, '_push_branch', return_value=True) as mock_push:
 
@@ -208,15 +237,14 @@ class TestCurrentBranchReReadAfterTheLock:
                 task_id='task-1',
                 project_dir=tmp_path,
                 issue_number=42,
+                expected_branch='feature/issue-7',
             )
 
             assert result is CommitResult.NOTHING_TO_COMMIT
             # Read twice: once for the pre-lock fast-fail check, once again
             # after acquiring the lock.
             assert mock_branch.call_count == 2
-            # The push must use the SECOND (post-lock, fresh) value, never
-            # the first (stale, pre-lock) one.
-            mock_push.assert_called_once_with(tmp_path, 'feature/fresh')
+            assert mock_push.call_args[0][1] is post_lock
 
     @pytest.mark.asyncio
     async def test_branch_racing_onto_main_during_the_lock_wait_refuses_to_commit(self, service, tmp_path):

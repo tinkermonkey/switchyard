@@ -6641,7 +6641,8 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
         workflow_template,
         agent_name: str,
         pipeline_run_id: Optional[str] = None,
-        project_dir: Optional[str] = None
+        project_dir: Optional[str] = None,
+        branch_name: Optional[str] = None
     ):
         """
         Monitor repair cycle container completion and handle auto-advance.
@@ -6658,6 +6659,13 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 straight through to commit_agent_changes() below rather than
                 that method re-deriving it independently via epic_id/branch_name
                 (issue #123, WI-D of #119).
+            branch_name: pipeline_run.branch_name from that SAME resolution --
+                the branch the auto-commit below is meant to land on. Threaded
+                through for exactly the reason project_dir is: it is the
+                independently derived expectation commit_agent_changes()
+                verifies the checked-out branch against (#143/#149), and
+                deriving it a second time down there is the divergence #123
+                removed.
         """
         import threading
         import subprocess
@@ -6962,6 +6970,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                                 project_dir=project_dir,
                                 issue_number=issue_number,
                                 custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                                expected_branch=branch_name,
                             )
                         )
                         
@@ -8670,7 +8679,8 @@ _Repair cycle initiated by Switchyard_
                 workflow_template=workflow_template,
                 agent_name=stage_config.default_agent,
                 pipeline_run_id=pipeline_run.id,
-                project_dir=project_dir
+                project_dir=project_dir,
+                branch_name=branch_name
             )
 
             return stage_config.default_agent

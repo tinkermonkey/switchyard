@@ -41,7 +41,14 @@ class TestReconnectThreadsProjectDir:
     """reconnect_repair_cycle_container() must extract project_dir from
     context.json and pass it through to _monitor_repair_cycle_container(), so
     the eventual auto-commit resolves the same directory the container is
-    actually mounted from."""
+    actually mounted from.
+
+    branch_name (#143/#149) is threaded for the same reason and asserted the
+    same way: it is the independently derived expectation the auto-commit
+    verifies the checked-out branch against, and omitting it silently degrades
+    that verification to comparing the branch against itself. This path was
+    missed when the parameter was added -- its sibling
+    _process_completed_repair_cycle() read the field, this one did not."""
 
     def _run(self, saved_context_json):
         recovery = _make_recovery()
@@ -88,15 +95,50 @@ class TestReconnectThreadsProjectDir:
         assert call_kwargs["project_dir"] == "/workspace/.orchestrator/worktrees/my-project/42"
         assert call_kwargs["board_name"] == "Dev"
 
+    def test_branch_name_threaded_through_from_context_file(self):
+        """The expectation half of the same resolution. Without it the
+        reconnected monitor's auto-commit runs with expected_branch=None on
+        precisely the path whose on-disk git state is most likely to have
+        drifted (a restart, an adopted worktree, an empty worktree registry)."""
+        saved_context = json.dumps({
+            "board": "Dev",
+            "pipeline_run_id": "run-abc12345",
+            "agent_name": "senior_software_engineer",
+            "project_dir": "/workspace/.orchestrator/worktrees/my-project/42",
+            "branch_name": "feature/issue-42-epic",
+        })
+
+        mock_monitor = self._run(saved_context)
+
+        call_kwargs = mock_monitor._monitor_repair_cycle_container.call_args.kwargs
+        assert call_kwargs["branch_name"] == "feature/issue-42-epic"
+
     def test_missing_context_file_falls_back_to_none_not_a_crash(self):
-        """No context.json (e.g. a container from before this field existed) must
-        not raise -- project_dir falls back to None. Heuristic board search takes
-        over ('SDLC'/'dev' in board name)."""
+        """No context.json (e.g. a container from before these fields existed)
+        must not raise -- project_dir and branch_name fall back to None.
+        Heuristic board search takes over ('SDLC'/'dev' in board name)."""
         mock_monitor = self._run(None)
 
         mock_monitor._monitor_repair_cycle_container.assert_called_once()
         call_kwargs = mock_monitor._monitor_repair_cycle_container.call_args.kwargs
         assert call_kwargs["project_dir"] is None
+        assert call_kwargs["branch_name"] is None
+
+    def test_legacy_context_file_without_branch_name_still_reconnects(self):
+        """A context.json written before branch_name existed degrades to the
+        pre-lock fallback rather than blocking the reconnect."""
+        saved_context = json.dumps({
+            "board": "Dev",
+            "pipeline_run_id": "run-abc12345",
+            "agent_name": "senior_software_engineer",
+            "project_dir": "/workspace/.orchestrator/worktrees/my-project/42",
+        })
+
+        mock_monitor = self._run(saved_context)
+
+        call_kwargs = mock_monitor._monitor_repair_cycle_container.call_args.kwargs
+        assert call_kwargs["branch_name"] is None
+        assert call_kwargs["project_dir"] == "/workspace/.orchestrator/worktrees/my-project/42"
 
 
 class TestAutoAdvanceGatedOnCommitSuccess:
@@ -124,7 +166,13 @@ class TestAutoAdvanceGatedOnCommitSuccess:
         active_run = MagicMock()
         active_run.id = "run-1234"
 
+        commit_kwargs = {}
+
         async def _fake_commit(*a, **kw):
+            return commit_returns
+
+        async def _capturing_commit(*a, **kw):
+            commit_kwargs.update(kw)
             return commit_returns
 
         with patch("pathlib.Path.exists", return_value=True), \
@@ -155,7 +203,7 @@ class TestAutoAdvanceGatedOnCommitSuccess:
             mock_prm_cls.return_value.get_active_pipeline_run.return_value = active_run
             mock_config_manager_cls.return_value.get_project_config.return_value = mock_project_config
             mock_github_cls.return_value.post_agent_output = _fake_commit  # any awaitable is fine here
-            mock_auto_commit.commit_agent_changes = _fake_commit
+            mock_auto_commit.commit_agent_changes = _capturing_commit
 
             mock_prm = mock_get_prm.return_value
             mock_prm.get_active_pipeline_run.return_value = active_run
@@ -170,10 +218,10 @@ class TestAutoAdvanceGatedOnCommitSuccess:
                 result=result,
             )
 
-            return mock_prm
+            return mock_prm, commit_kwargs
 
     def test_commit_failure_marks_pipeline_run_failed_instead_of_advancing(self):
-        mock_prm = self._run(commit_returns=False)
+        mock_prm, _ = self._run(commit_returns=False)
 
         mock_prm.mark_failed.assert_called_once_with(
             project="my-project",
@@ -184,7 +232,20 @@ class TestAutoAdvanceGatedOnCommitSuccess:
         mock_prm.end_pipeline_run.assert_not_called()
 
     def test_commit_success_advances_normally(self):
-        mock_prm = self._run(commit_returns=True)
+        mock_prm, _ = self._run(commit_returns=True)
 
         mock_prm.mark_failed.assert_not_called()
         mock_prm.end_pipeline_run.assert_called_once()
+
+    def test_the_saved_branch_name_is_the_commits_expected_branch(self):
+        """#143/#149, asserted at the call site: context.json's branch_name is
+        the independently derived expectation this recovery hands
+        commit_agent_changes(). Dropping the kwarg is silent otherwise -- the
+        commit falls back to the pre-lock snapshot, which for a worktree is the
+        branch compared only against itself."""
+        _, commit_kwargs = self._run(commit_returns=True)
+
+        assert commit_kwargs['expected_branch'] == 'feature/issue-42-epic'
+        assert commit_kwargs['project_dir'] == (
+            '/workspace/.orchestrator/worktrees/my-project/42'
+        )

@@ -45,6 +45,7 @@ ISSUE = 7373
 STATUS = 'Testing'
 RUN_ID = 'run-repair'
 CONTAINER = f'repair-cycle-{PROJECT}-{ISSUE}'
+BRANCH = 'feature/issue-42-epic'
 
 
 def _monitor():
@@ -81,22 +82,27 @@ def _run_monitor(commit):
     auto_commit_service.commit_agent_changes stubbed by `commit` (an exception
     instance to raise, or a CommitResult to return).
 
-    Returns (monitor, progression, tracker, cleanup, github) for inspection.
+    Returns (monitor, progression, tracker, cleanup, github, commit_kwargs) for
+    inspection; commit_kwargs is the argument dict commit_agent_changes was
+    actually called with (empty if it was never reached).
     """
     monitor = _monitor()
     progression = MagicMock()
     tracker = MagicMock()
     cleanup = MagicMock()
+    commit_kwargs = {}
 
     if isinstance(commit, BaseException):
         raised = commit
 
         async def commit_agent_changes(**kwargs):
+            commit_kwargs.update(kwargs)
             raise raised
     else:
         returned = commit
 
         async def commit_agent_changes(**kwargs):
+            commit_kwargs.update(kwargs)
             return returned
 
     auto_commit_service = MagicMock()
@@ -127,6 +133,7 @@ def _run_monitor(commit):
             agent_name='senior_software_engineer',
             pipeline_run_id=RUN_ID,
             project_dir=f'/workspace/{PROJECT}',
+            branch_name=BRANCH,
         )
 
     with patch('subprocess.Popen', return_value=process), \
@@ -148,7 +155,7 @@ def _run_monitor(commit):
 
         captured['target']()
 
-    return monitor, progression, tracker, cleanup, github
+    return monitor, progression, tracker, cleanup, github, commit_kwargs
 
 
 def _recorded_outcomes(tracker):
@@ -176,11 +183,11 @@ class TestAutoCommitLockContention:
     def test_the_issue_is_not_auto_advanced_with_the_fix_uncommitted(self):
         """The defect this exists for: the fix is still on disk, so advancing
         hands the next stage — and the PR reviewed downstream — no fix at all."""
-        _, progression, _, _, _ = _run_monitor(commit=_lock_timeout())
+        _, progression, _, _, _, _ = _run_monitor(commit=_lock_timeout())
         progression.move_issue_to_column.assert_not_called()
 
     def test_the_outcome_is_recorded_as_contention_not_success(self):
-        _, _, tracker, _, _ = _run_monitor(commit=_lock_timeout())
+        _, _, tracker, _, _, _ = _run_monitor(commit=_lock_timeout())
         assert _recorded_outcomes(tracker) == ['lock_contention']
 
     def test_the_board_lock_is_retained_because_the_shared_clone_is_dirty(self):
@@ -188,7 +195,7 @@ class TestAutoCommitLockContention:
         the fix is uncommitted in the shared base clone (auto_commit only takes
         the project_checkout lock for that directory), and the next issue the
         failsafe pulls in runs a plain `git checkout` into it."""
-        monitor, _, _, _, _ = _run_monitor(commit=_lock_timeout())
+        monitor, _, _, _, _, _ = _run_monitor(commit=_lock_timeout())
         monitor.pipeline_run_manager.mark_failed.assert_called_once()
         kwargs = monitor.pipeline_run_manager.mark_failed.call_args.kwargs
         assert 'uncommitted' in kwargs['reason']
@@ -198,18 +205,18 @@ class TestAutoCommitLockContention:
         clone to the next dispatched issue. mark_failed() is used rather than
         end_pipeline_run(retain_lock=True) because only mark_failed sets
         retained_reason — without it the lock is reclaimable as stale."""
-        monitor, _, _, _, _ = _run_monitor(commit=_lock_timeout())
+        monitor, _, _, _, _, _ = _run_monitor(commit=_lock_timeout())
         monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
 
     def test_the_repair_cycle_state_is_kept_for_the_retry(self):
-        _, _, _, cleanup, _ = _run_monitor(commit=_lock_timeout())
+        _, _, _, cleanup, _, _ = _run_monitor(commit=_lock_timeout())
         cleanup.assert_not_called()
 
     def test_the_success_comment_is_corrected_not_posted(self):
         """#148 I3: the summary used to be posted BEFORE the commit was even
         attempted, so GitHub showed '✅ Repair Cycle Complete' on an issue that
         then never moved again."""
-        _, _, _, _, github = _run_monitor(commit=_lock_timeout())
+        _, _, _, _, github, _ = _run_monitor(commit=_lock_timeout())
         posted = _posted(github)
         assert posted is not None
         assert 'Repair Cycle Complete' not in posted
@@ -221,17 +228,41 @@ class TestAutoCommitLockContention:
         try:
             raise Exception("Auto-commit failed") from cause
         except Exception as wrapped:
-            monitor, progression, tracker, _, _ = _run_monitor(commit=wrapped)
+            monitor, progression, tracker, _, _, _ = _run_monitor(commit=wrapped)
         progression.move_issue_to_column.assert_not_called()
         assert _recorded_outcomes(tracker) == ['lock_contention']
         monitor.pipeline_run_manager.mark_failed.assert_called_once()
+
+
+class TestTheResolvedWorkspaceIsWhatReachesTheCommit:
+    """
+    #143/#149: the live repair-cycle path must hand commit_agent_changes() the
+    branch its own resolve_workspace() picked, not leave it to be re-derived (or
+    left unset) down there.
+
+    Asserted at the CALL SITE because omitting the kwarg is otherwise silent:
+    auto_commit falls back to the pre-lock snapshot and logs, so dropping
+    `expected_branch=branch_name` reverts this path to the fallback the
+    verification's own docstring says cannot catch #143 -- with every test in
+    this file still green. This is the same guard
+    test_repair_cycle_restart_recovery_worktree.py::TestReconnectThreadsProjectDir
+    already provides for the sibling project_dir parameter.
+    """
+
+    def test_the_branch_name_parameter_becomes_the_commits_expected_branch(self):
+        *_, commit_kwargs = _run_monitor(commit=CommitResult.COMMITTED)
+        assert commit_kwargs['expected_branch'] == BRANCH
+
+    def test_the_project_dir_parameter_is_threaded_the_same_way(self):
+        *_, commit_kwargs = _run_monitor(commit=CommitResult.COMMITTED)
+        assert commit_kwargs['project_dir'] == f'/workspace/{PROJECT}'
 
 
 class TestSuccessfulCommitIsUnchanged:
     """Control: a green cycle whose commit landed still advances and completes."""
 
     def test_the_issue_advances_and_the_run_ends_successfully(self):
-        monitor, progression, tracker, cleanup, github = _run_monitor(
+        monitor, progression, tracker, cleanup, github, _ = _run_monitor(
             commit=CommitResult.COMMITTED
         )
         progression.move_issue_to_column.assert_called_once()
@@ -255,7 +286,7 @@ class TestNothingToCommitIsUnchanged:
     """
 
     def test_nothing_to_commit_still_advances_and_records_success(self):
-        monitor, progression, tracker, cleanup, github = _run_monitor(
+        monitor, progression, tracker, cleanup, github, _ = _run_monitor(
             commit=CommitResult.NOTHING_TO_COMMIT
         )
         progression.move_issue_to_column.assert_called_once()
@@ -276,15 +307,15 @@ class TestGenuineCommitFailureIsGated:
     """
 
     def test_a_failed_commit_does_not_advance(self):
-        _, progression, _, _, _ = _run_monitor(commit=CommitResult.FAILED)
+        _, progression, _, _, _, _ = _run_monitor(commit=CommitResult.FAILED)
         progression.move_issue_to_column.assert_not_called()
 
     def test_a_failed_commit_is_recorded_as_failure_not_success(self):
-        _, _, tracker, _, _ = _run_monitor(commit=CommitResult.FAILED)
+        _, _, tracker, _, _, _ = _run_monitor(commit=CommitResult.FAILED)
         assert _recorded_outcomes(tracker) == ['failure']
 
     def test_a_failed_commit_retains_the_lock_like_the_twin(self):
-        monitor, _, _, cleanup, _ = _run_monitor(commit=CommitResult.FAILED)
+        monitor, _, _, cleanup, _, _ = _run_monitor(commit=CommitResult.FAILED)
         monitor.pipeline_run_manager.mark_failed.assert_called_once()
         monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
         cleanup.assert_not_called()
@@ -292,7 +323,7 @@ class TestGenuineCommitFailureIsGated:
     def test_an_ordinary_commit_exception_is_treated_the_same(self):
         """A non-lock exception out of commit_agent_changes() means the same
         thing as CommitResult.FAILED: the fix did not land."""
-        monitor, progression, tracker, _, _ = _run_monitor(
+        monitor, progression, tracker, _, _, _ = _run_monitor(
             commit=RuntimeError("git index.lock exists")
         )
         progression.move_issue_to_column.assert_not_called()
@@ -300,7 +331,7 @@ class TestGenuineCommitFailureIsGated:
         monitor.pipeline_run_manager.mark_failed.assert_called_once()
 
     def test_the_comment_says_the_fix_did_not_land(self):
-        _, _, _, _, github = _run_monitor(commit=CommitResult.FAILED)
+        _, _, _, _, github, _ = _run_monitor(commit=CommitResult.FAILED)
         posted = _posted(github)
         assert 'Repair Cycle Complete' not in posted
         assert 'could not be committed' in posted.lower()

@@ -13,7 +13,7 @@ import time
 import json
 import asyncio
 import uuid
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any, NamedTuple, Optional
 from datetime import datetime, timezone
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import get_observability_manager
@@ -30,6 +30,33 @@ except ImportError:
         pass
     def get_claude_code_breaker():  # type: ignore[misc]
         return None
+
+
+class FailsafeBranchCheck(NamedTuple):
+    """_verify_failsafe_branch()'s verdict on whether the failsafe may commit.
+
+    commit_branch is non-None only when committing is allowed; the other two
+    fields describe a refusal.
+
+    `escalate` separates a refusal worth blocking the run over from a
+    conservative default. It is set only when this dispatch actually had a
+    branch target of its own (task_context['branch_name']) -- i.e. a resolved
+    workspace whose HEAD then disagreed with it, or could not be read at all.
+    Without a target, the main/master and detached-HEAD refusals below describe
+    the NORMAL resting state of the shared base clone, where every
+    skip_workspace_prep dispatch that never resolved a workspace runs
+    (dev_environment_setup and friends). Escalating that would block the
+    pipeline on the ordinary case rather than on drift, so it stays a refusal
+    that is logged, exactly as before.
+
+    current_branch is carried alongside the refusal so the escalation can name
+    what HEAD actually said ("Found: `fix-attempt`") instead of rendering "could
+    not be determined" for a branch it read perfectly well.
+    """
+
+    commit_branch: Optional[str]
+    escalate: bool = False
+    current_branch: Optional[str] = None
 
 
 def _release_lock_instruction(project_name: str, board_name: str, issue_number: int) -> str:
@@ -325,6 +352,18 @@ class AgentExecutor:
                     epic_branch_name = pipeline_run_for_workspace.branch_name
                     task_context['epic_id'] = epic_id
                     task_context['project_dir'] = pipeline_run_for_workspace.project_dir
+                    # ...and the branch that resolution decided on, alongside the
+                    # directory it decided on, from the same result (#149 WI-4
+                    # review). Without this the failsafe commit path -- which reads
+                    # its expectation off task_context['branch_name'] -- had NO
+                    # expectation on ordinary 'issues'/'hybrid' dispatch, so on the
+                    # branch_unverifiable fallback it could still commit onto
+                    # ambient HEAD: an unverified commit path sitting behind the
+                    # verified one. Only the resolution block sets it (the
+                    # skip_workspace_prep path this block is gated OUT of already
+                    # carries its own, stashed by the repair cycle), so nothing
+                    # upstream is overwritten.
+                    task_context['branch_name'] = epic_branch_name
             else:
                 # NOT a fallback -- see the comment above on the pipeline_run_for_workspace
                 # is None branch; the same "this dispatch will fail" outcome applies here.
@@ -964,6 +1003,70 @@ class AgentExecutor:
 
                     if finalize_result.get('success'):
                         logger.info(f"✅ Finalized workspace: {finalize_result}")
+                    elif finalize_result.get('branch_mismatch'):
+                        # finalize_feature_branch_work() refused because the
+                        # workspace is not on this dispatch's own branch (#149
+                        # WI-4 review). Two things follow from that refusal, and
+                        # the review found this handler doing neither:
+                        #
+                        # 1. The failsafe below is an unguarded `git add -A` +
+                        #    commit + push of ambient HEAD, so running it here
+                        #    would land exactly the work the refusal just
+                        #    protected on exactly the wrong branch — i.e. quietly
+                        #    undo the refusal. Skip it; the changes stay on disk.
+                        # 2. Falling through from here reached
+                        #    record_execution_outcome(outcome='success') and
+                        #    returned normally, so the issue auto-advanced to
+                        #    review with NOTHING staged, committed, pushed or
+                        #    PR'd. That is strictly worse than the PushFailedError
+                        #    case below — there the work is at least committed
+                        #    locally — yet it was the only one of the two reported
+                        #    as a success. Block the pipeline on the same terms.
+                        await self._handle_wrong_branch_refusal(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=pipeline_run_id,
+                            error_detail=finalize_result.get('error', 'Unknown'),
+                            expected_branch=(
+                                finalize_result.get('expected_branch')
+                                or task_context.get('branch_name')
+                            ),
+                            current_branch=finalize_result.get('current_branch'),
+                        )
+                    elif finalize_result.get('branch_unverifiable'):
+                        # A DIFFERENT verdict from the mismatch above: the branch
+                        # could not be read at all (a transient index.lock, a
+                        # timed-out read), not confirmed wrong. Before this key
+                        # existed that case raised out of finalization and the
+                        # failsafe committed the work, which is the outcome worth
+                        # preserving — and the failsafe now verifies the branch
+                        # itself, so it can no longer land on the wrong one. Let
+                        # it try; only if IT also cannot confirm the branch is
+                        # there nothing left but to block the pipeline.
+                        logger.error(
+                            f"❌ Workspace finalization could not verify the branch: "
+                            f"{finalize_result.get('error', 'Unknown')}\n"
+                            f"  Falling back to the (branch-verifying) failsafe commit."
+                        )
+                        # Default to a refusal, so a dispatch with no issue_number
+                        # (nothing to run the failsafe for) still blocks rather than
+                        # falling through to the success path with the branch never
+                        # confirmed.
+                        refusal = FailsafeBranchCheck(None, True, None)
+                        if 'issue_number' in task_context:
+                            refusal = await self._failsafe_commit_check(
+                                project_name=project_name,
+                                agent_name=agent_name,
+                                task_context=task_context,
+                                task_id=task_id
+                            )
+                        if refusal is not None:
+                            await self._escalate_failsafe_branch_refusal(
+                                project_name=project_name,
+                                task_context=task_context,
+                                pipeline_run_id=pipeline_run_id,
+                                refusal=refusal,
+                            )
                     else:
                         # Finalization returned failure - log details and check for uncommitted changes
                         logger.warning(
@@ -974,14 +1077,33 @@ class AgentExecutor:
 
                         # Run failsafe check to handle any uncommitted changes
                         if 'issue_number' in task_context:
-                            await self._failsafe_commit_check(
+                            refusal = await self._failsafe_commit_check(
                                 project_name=project_name,
                                 agent_name=agent_name,
                                 task_context=task_context,
                                 task_id=task_id
                             )
+                            # A branch refusal here was silent: this path ignored the
+                            # return value entirely and fell through to
+                            # record_execution_outcome(outcome='success') with the work
+                            # uncommitted on a branch that is not this dispatch's own.
+                            if refusal is not None and refusal.escalate:
+                                await self._escalate_failsafe_branch_refusal(
+                                    project_name=project_name,
+                                    task_context=task_context,
+                                    pipeline_run_id=pipeline_run_id,
+                                    refusal=refusal,
+                                )
 
                 except Exception as e:
+                    from agents.non_retryable import NonRetryableAgentError
+                    if isinstance(e, NonRetryableAgentError):
+                        # A deliberate refusal raised by the branch handling above,
+                        # not a finalization crash. Must NOT be routed into the
+                        # failsafe commit below — that is precisely what the
+                        # refusal declined to do.
+                        raise
+
                     from services.git_workflow_manager import PushFailedError
                     if isinstance(e, PushFailedError):
                         # Push was rejected — agent did real work but it cannot reach origin.
@@ -992,64 +1114,35 @@ class AgentExecutor:
                             f"❌ PUSH FAILURE for {project_name} issue #{issue_number}: {e}"
                         )
 
-                        if issue_number:
-                            board_name = task_context.get('board') or '<board_name>'
-                            marked_ok = True
-                            try:
-                                from services.pipeline_run import get_pipeline_run_manager
-                                marked_ok = get_pipeline_run_manager().mark_failed(
-                                    project=project_name,
-                                    board=board_name,
-                                    issue_number=issue_number,
-                                    reason=str(e),
-                                )
-                                if not marked_ok:
-                                    logger.critical(
-                                        f"Pipeline lock for {project_name}/#{issue_number} could NOT "
-                                        f"be durably marked failed after a push failure — this issue "
-                                        f"may be silently re-dispatched."
-                                    )
-                            except Exception as end_err:
-                                marked_ok = False
-                                logger.error(f"Failed to end pipeline run after push failure: {end_err}")
+                        branch_for_recovery = task_context.get('branch_name', '<branch>')
 
-                            lock_status_line = (
-                                f"_Pipeline lock retained — no further automated work will run on "
-                                f"this issue until the lock is released._"
-                                if marked_ok else
-                                f"_⚠️ The pipeline lock could NOT be durably marked retained (both "
-                                f"Redis and YAML writes failed) — this issue may be silently "
-                                f"re-dispatched. Please investigate immediately._"
+                        def _push_failure_comment(lock_status_line: str, board_name: str) -> str:
+                            return (
+                                f"## ❌ Push Failed — Pipeline Blocked\n\n"
+                                f"The agent completed its work and committed changes locally, "
+                                f"but the push to `origin` was rejected.\n\n"
+                                f"**Reason:** {e}\n\n"
+                                f"**To recover:**\n"
+                                f"1. Inspect the local commits: `git log origin/{branch_for_recovery}..HEAD`\n"
+                                f"2. Force-push if the changes are correct: `git push --force-with-lease`\n"
+                                f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
+                                f"4. Run `python scripts/release_lock.py --project {project_name} "
+                                f"--board \"{board_name}\" --issue {issue_number}` "
+                                f"to release the pipeline lock (moving the card alone no longer "
+                                f"re-triggers anything) once ready to continue — see below for "
+                                f"whether it is actually durably retained.\n\n"
+                                f"{lock_status_line}"
                             )
-                            try:
-                                from services.github_integration import GitHubIntegration
-                                project_config = config_manager.get_project_config(project_name)
-                                github = GitHubIntegration(
-                                    repo_owner=project_config.github['org'],
-                                    repo_name=project_config.github['repo']
-                                )
-                                await github.post_comment(
-                                    issue_number,
-                                    f"## ❌ Push Failed — Pipeline Blocked\n\n"
-                                    f"The agent completed its work and committed changes locally, "
-                                    f"but the push to `origin` was rejected.\n\n"
-                                    f"**Reason:** {e}\n\n"
-                                    f"**To recover:**\n"
-                                    f"1. Inspect the local commits: `git log origin/{task_context.get('branch_name', '<branch>')}..HEAD`\n"
-                                    f"2. Force-push if the changes are correct: `git push --force-with-lease`\n"
-                                    f"3. Or reset and let the pipeline retry: `git reset --hard origin/<branch>`\n"
-                                    f"4. Run `python scripts/release_lock.py --project {project_name} "
-                                    f"--board \"{board_name}\" --issue {issue_number}` "
-                                    f"to release the pipeline lock (moving the card alone no longer "
-                                    f"re-triggers anything) once ready to continue — see below for "
-                                    f"whether it is actually durably retained.\n\n"
-                                    f"{lock_status_line}",
-                                    pipeline_run_id=pipeline_run_id
-                                )
-                            except Exception as comment_err:
-                                logger.error(f"Failed to post push-failure comment: {comment_err}")
 
-                        from agents.non_retryable import NonRetryableAgentError
+                        await self._block_pipeline_with_comment(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=pipeline_run_id,
+                            reason=str(e),
+                            failure_label="a push failure",
+                            build_comment=_push_failure_comment,
+                        )
+
                         raise NonRetryableAgentError(str(e)) from e
 
                     logger.error(
@@ -1061,8 +1154,9 @@ class AgentExecutor:
                     # Run failsafe check even on exception to handle uncommitted changes
                     if 'issue_number' in task_context:
                         logger.info("Running failsafe commit check after finalization exception...")
+                        refusal = None
                         try:
-                            await self._failsafe_commit_check(
+                            refusal = await self._failsafe_commit_check(
                                 project_name=project_name,
                                 agent_name=agent_name,
                                 task_context=task_context,
@@ -1075,6 +1169,18 @@ class AgentExecutor:
                             logger.error(
                                 f"❌ Failsafe commit check also failed: {failsafe_error}",
                                 exc_info=True
+                            )
+
+                        # Escalated OUTSIDE the try above on purpose: the refusal
+                        # raises NonRetryableAgentError, and that except clause
+                        # catches Exception — it would have swallowed the very
+                        # escalation it is meant to surface.
+                        if refusal is not None and refusal.escalate:
+                            await self._escalate_failsafe_branch_refusal(
+                                project_name=project_name,
+                                task_context=task_context,
+                                pipeline_run_id=pipeline_run_id,
+                                refusal=refusal,
                             )
                     # Continue execution even if finalization fails
             else:
@@ -1094,12 +1200,28 @@ class AgentExecutor:
                 if execution_type == "repair_test":
                     logger.info("Skipping failsafe commit check for repair_test execution type")
                 elif 'issue_number' in task_context:
-                    await self._failsafe_commit_check(
+                    refusal = await self._failsafe_commit_check(
                         project_name=project_name,
                         agent_name=agent_name,
                         task_context=task_context,
                         task_id=task_id
                     )
+                    # THE highest-frequency ignoring call site: this branch is reached
+                    # on every skip_workspace_prep dispatch, i.e. all of
+                    # repair_cycle.py's inner agents. A repair_fix container that left
+                    # the epic worktree's HEAD on a scratch branch made
+                    # _verify_failsafe_branch() refuse, and this call discarded the
+                    # refusal — no comment, no mark_failed(), no exception — so the
+                    # repair cycle carried on believing the fix had landed and
+                    # repair_test then passed against the still-uncommitted tree
+                    # (#149 WI-4 review).
+                    if refusal is not None and refusal.escalate:
+                        await self._escalate_failsafe_branch_refusal(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=pipeline_run_id,
+                            refusal=refusal,
+                        )
                 else:
                     logger.info("No issue_number in task_context - skipping failsafe commit check")
 
@@ -1739,13 +1861,351 @@ class AgentExecutor:
         logger.warning(f"Could not find any output for {agent_name} in keys: {list(result.keys())}")
         return None, True
 
+    async def _block_pipeline_with_comment(
+        self,
+        project_name: str,
+        task_context: Dict[str, Any],
+        pipeline_run_id: Optional[str],
+        reason: str,
+        failure_label: str,
+        build_comment: Callable[[str, str], str]
+    ):
+        """
+        Durably retain this issue's pipeline lock and explain why on the issue.
+
+        Shared escalation for the finalization outcomes that must NOT be reported
+        as a success: a rejected push (the work is committed but not on origin) and
+        a wrong-branch/unverifiable-branch refusal (the work is not even committed).
+        Both end with the agent's real output stranded outside origin, and both have
+        to stop the run — execute_agent() otherwise records outcome='success' and
+        orchestrator_integration.py advances the card to review against a branch
+        that has none of the work (#149 WI-4 review).
+
+        Args:
+            reason: Recorded on the pipeline run as the failure reason.
+            failure_label: Short phrase naming the failure in the log lines
+                ("a push failure", "a wrong-branch refusal").
+            build_comment: Called with (lock_status_line, board_name) to render the
+                issue comment. Whether the lock was ACTUALLY marked failed is the
+                part of that comment that matters most, and the callers word the
+                surrounding explanation differently — so it is passed in rather
+                than appended here.
+        """
+        issue_number = task_context.get('issue_number')
+        if not issue_number:
+            logger.error(
+                f"Cannot block the pipeline for {project_name} after {failure_label}: "
+                "no issue_number in task_context."
+            )
+            return
+
+        board_name = task_context.get('board') or '<board_name>'
+        marked_ok = True
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            marked_ok = get_pipeline_run_manager().mark_failed(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number,
+                reason=reason,
+            )
+            if not marked_ok:
+                logger.critical(
+                    f"Pipeline lock for {project_name}/#{issue_number} could NOT "
+                    f"be durably marked failed after {failure_label} — this issue "
+                    f"may be silently re-dispatched."
+                )
+        except Exception as end_err:
+            marked_ok = False
+            logger.error(f"Failed to end pipeline run after {failure_label}: {end_err}")
+
+        lock_status_line = (
+            f"_Pipeline lock retained — no further automated work will run on "
+            f"this issue until the lock is released._"
+            if marked_ok else
+            f"_⚠️ The pipeline lock could NOT be durably marked retained (both "
+            f"Redis and YAML writes failed) — this issue may be silently "
+            f"re-dispatched. Please investigate immediately._"
+        )
+
+        try:
+            from services.github_integration import GitHubIntegration
+            project_config = config_manager.get_project_config(project_name)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'],
+                repo_name=project_config.github['repo']
+            )
+            await github.post_comment(
+                issue_number,
+                build_comment(lock_status_line, board_name),
+                pipeline_run_id=pipeline_run_id
+            )
+        except Exception as comment_err:
+            logger.error(f"Failed to post the {failure_label} comment: {comment_err}")
+
+    async def _escalate_failsafe_branch_refusal(
+        self,
+        project_name: str,
+        task_context: Dict[str, Any],
+        pipeline_run_id: Optional[str],
+        refusal: FailsafeBranchCheck
+    ):
+        """
+        Route a failsafe branch refusal through the same escalation the
+        finalization refusal gets, and raise so the run is not recorded as a
+        success.
+
+        _verify_failsafe_branch()'s refusal reached NONE of
+        _failsafe_commit_check()'s call sites (#149 WI-4 review): every one of them
+        discarded the return value and fell through to record_execution_outcome(
+        outcome='success') -- including the `workspace_context is None` branch,
+        which every skip_workspace_prep dispatch takes. A refusal that reports
+        success is the failure class this work item exists to remove, so the
+        failsafe's refusal has to end where finalization's does.
+
+        Only called for refusal.escalate -- see FailsafeBranchCheck for why a
+        refusal with no branch expectation behind it is logged rather than
+        escalated.
+
+        Always raises NonRetryableAgentError.
+        """
+        expected_branch = task_context.get('branch_name')
+        issue_number = task_context.get('issue_number')
+        project_dir = task_context.get('project_dir', '<worktree>')
+        # The refusal carries no branch only when HEAD could not be read at all;
+        # every other refusal read it and found it unusable or simply not ours.
+        unverifiable = refusal.current_branch is None
+
+        error_detail = (
+            f"The failsafe commit could not read the checked-out branch in "
+            f"{project_dir} (project={project_name}, issue=#{issue_number}). "
+            "Refusing to commit against an unknown branch; the changes are left "
+            "uncommitted on disk."
+            if unverifiable else
+            f"The failsafe commit refused: {project_dir} is on "
+            f"{refusal.current_branch!r} but this dispatch's target is "
+            f"{expected_branch!r} (project={project_name}, issue=#{issue_number}). "
+            "The changes are left uncommitted on disk."
+        )
+        logger.error(f"❌ {error_detail}")
+
+        await self._handle_wrong_branch_refusal(
+            project_name=project_name,
+            task_context=task_context,
+            pipeline_run_id=pipeline_run_id,
+            error_detail=error_detail,
+            expected_branch=expected_branch,
+            current_branch=refusal.current_branch,
+            unverifiable=unverifiable,
+        )
+
+    async def _handle_wrong_branch_refusal(
+        self,
+        project_name: str,
+        task_context: Dict[str, Any],
+        pipeline_run_id: Optional[str],
+        error_detail: str,
+        expected_branch: Optional[str],
+        current_branch: Optional[str],
+        unverifiable: bool = False
+    ):
+        """
+        Escalate a commit path that refused because it could not confirm the
+        workspace is on this dispatch's own branch, and raise so the run is not
+        recorded as a success. Covers both verdicts _verify_finalize_branch() can
+        return -- a confirmed wrong branch, and a branch that could not be read at
+        all -- plus the same two from _verify_failsafe_branch(), whose refusal was
+        otherwise silent at every one of its call sites (#149 WI-4 review).
+
+        Scoped deliberately to THIS run: mark_failed() retains the board's pipeline
+        lock and the agent's work is left uncommitted on disk, but nothing durable
+        is written that could block a future dispatch. The drift IS still on disk
+        afterwards and nothing repairs it, so the next dispatch for the same epic
+        can re-derive the drifted branch as its own expectation -- tracked as #163,
+        which is where a durable quarantine (or a repair) belongs once it has an
+        operator-facing way to be inspected and cleared.
+
+        Always raises NonRetryableAgentError.
+        """
+        heading = (
+            "## ❌ Branch Unverifiable — Pipeline Blocked" if unverifiable
+            else "## ❌ Wrong Branch — Pipeline Blocked"
+        )
+        summary = (
+            "The agent completed its work, but the workspace's checked-out branch "
+            "could not be read, so nothing was staged, committed, pushed, or turned "
+            "into a PR. The changes are still sitting uncommitted on disk."
+            if unverifiable else
+            "The agent completed its work, but the workspace was **not on this "
+            "issue's branch** at commit time, so nothing was staged, committed, "
+            "pushed, or turned into a PR. The changes are still sitting uncommitted "
+            "on disk."
+        )
+
+        def _wrong_branch_comment(lock_status_line: str, board_name: str) -> str:
+            steps = "\n".join([
+                f"1. Inspect the worktree at "
+                f"`{task_context.get('project_dir', '<worktree>')}` and preserve "
+                "anything worth keeping (`git status`, `git diff`).",
+                f"2. Restore the epic's branch: "
+                f"`git checkout {expected_branch or '<branch>'}`.",
+                f"3. Run `python scripts/release_lock.py --project {project_name} "
+                f"--board \"{board_name}\" --issue "
+                f"{task_context.get('issue_number')}` to release the pipeline lock "
+                "once ready to continue — see below for whether it is actually "
+                "durably retained.",
+            ])
+            return (
+                f"{heading}\n\n"
+                f"{summary}\n\n"
+                f"**Expected branch:** `{expected_branch or 'unknown'}`\n"
+                f"**Found:** `{current_branch or 'could not be determined'}`\n\n"
+                f"**Reason:** {error_detail}\n\n"
+                f"**To recover:**\n{steps}\n\n"
+                f"{lock_status_line}"
+            )
+
+        await self._block_pipeline_with_comment(
+            project_name=project_name,
+            task_context=task_context,
+            pipeline_run_id=pipeline_run_id,
+            reason=error_detail,
+            failure_label=(
+                "an unverifiable-branch refusal" if unverifiable
+                else "a wrong-branch refusal"
+            ),
+            build_comment=_wrong_branch_comment,
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        raise NonRetryableAgentError(error_detail)
+
+    def _verify_failsafe_branch(
+        self,
+        project_dir: str,
+        project_name: str,
+        issue_number: Optional[int],
+        expected_branch: Optional[str]
+    ) -> FailsafeBranchCheck:
+        """
+        Decide whether the failsafe may commit and push from project_dir, and on
+        which branch.
+
+        The failsafe used to be the weakest commit path in the orchestrator (#149
+        WI-4 review): `git add -A` + `git commit --no-verify` + a push to whatever
+        `git rev-parse --abbrev-ref HEAD` reported, with no branch check at all —
+        not even the main/master refusal that commit_agent_changes() and
+        finalize_feature_branch_work() both enforce. It is reached on the
+        workspace_context is None branch, i.e. every skip_workspace_prep dispatch:
+        pipeline/repair_cycle.py sets that for repair_fix, repair_warning and
+        repair_systemic_fix, so a repair agent that leaves HEAD on `fix-attempt`
+        (or on main, or detached) had its edits committed and pushed there — the
+        exact adopt-what-git-says behavior this change removed from the two guarded
+        paths, on the highest-frequency one. Verifying those two while leaving this
+        one unguarded would make #149's fix a half-fix: the same wrong-branch commit,
+        reached through the fallback door.
+
+        task_context['branch_name'] is the same expectation the guarded paths use,
+        and was already in scope here (it is read three lines away for the directory
+        fallback), so use it. When it is absent the None/main/master/detached-HEAD
+        refusals still apply on their own.
+
+        Returns:
+            A FailsafeBranchCheck whose commit_branch is the verified branch to
+            push to, or is None for a refusal (the caller leaves the work
+            uncommitted on disk). See FailsafeBranchCheck.escalate for which
+            refusals are worth blocking the run over.
+        """
+        import subprocess
+
+        try:
+            branch_result = subprocess.run(
+                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+        except Exception as e:
+            logger.error(
+                f"❌ FAILSAFE: could not read the current branch in {project_dir} "
+                f"({project_name}/#{issue_number}): {e} — refusing to commit against "
+                "an unknown branch. Changes left uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, bool(expected_branch))
+
+        if branch_result.returncode != 0:
+            logger.error(
+                f"❌ FAILSAFE: could not read the current branch in {project_dir} "
+                f"({project_name}/#{issue_number}): {branch_result.stderr.strip()} — "
+                "refusing to commit against an unknown branch. Changes left "
+                "uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, bool(expected_branch))
+
+        current_branch = branch_result.stdout.strip()
+
+        if not current_branch:
+            # rev-parse exited 0 but said nothing — HEAD was not read at all, so the
+            # refusal carries no branch (which is what marks it unverifiable to the
+            # escalation).
+            logger.error(
+                f"❌ FAILSAFE: `git rev-parse --abbrev-ref HEAD` reported no branch "
+                f"in {project_dir} ({project_name}/#{issue_number}) — refusing to "
+                "commit against an unknown branch. Changes left uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, bool(expected_branch))
+
+        # Whether a refusal escalates turns on one thing: whether there was an
+        # expectation to drift FROM. With one, a disagreement is real evidence that
+        # something moved HEAD in this workspace. Without one, the refusals below
+        # are a conservative default applied to a workspace nobody resolved --
+        # typically the shared base clone sitting on its default branch, which is
+        # where every skip_workspace_prep dispatch with no resolved workspace runs.
+        # Escalating THAT would block the pipeline on the ordinary case (found
+        # running the pre-existing agent_executor suites against the first cut of
+        # this change).
+        escalate = bool(expected_branch)
+        drifted = escalate and current_branch != expected_branch
+
+        if current_branch == 'HEAD':
+            # Detached HEAD. Pushing this used to send the literal string 'HEAD'
+            # to push_branch(), which fails and is logged at warning level only,
+            # leaving a dangling commit.
+            logger.error(
+                f"❌ FAILSAFE: {project_dir} is on a detached HEAD "
+                f"({project_name}/#{issue_number}) — refusing to commit. Changes "
+                "left uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, escalate, current_branch)
+
+        if current_branch in ('main', 'master'):
+            logger.error(
+                f"❌ FAILSAFE: {project_dir} is on {current_branch} "
+                f"({project_name}/#{issue_number}) — refusing to commit agent work "
+                "to the default branch. Changes left uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, escalate, current_branch)
+
+        if drifted:
+            logger.error(
+                f"❌ FAILSAFE: {project_dir} is on {current_branch!r} but this "
+                f"dispatch's target is {expected_branch!r} "
+                f"({project_name}/#{issue_number}) — refusing to commit this agent's "
+                "work onto an unrelated issue's branch (#143). Changes left "
+                "uncommitted on disk."
+            )
+            return FailsafeBranchCheck(None, True, current_branch)
+
+        return FailsafeBranchCheck(current_branch, False, current_branch)
+
     async def _failsafe_commit_check(
         self,
         project_name: str,
         agent_name: str,
         task_context: Dict[str, Any],
         task_id: str
-    ):
+    ) -> Optional[FailsafeBranchCheck]:
         """
         Failsafe: Check for uncommitted changes when workspace_context is None.
 
@@ -1754,11 +2214,24 @@ class AgentExecutor:
         - Agent makes changes but workspace finalization doesn't run
         - There's a mix of staged and unstaged changes
 
+        Verifies the branch before touching anything — see _verify_failsafe_branch()
+        for why this path, not either of the two guarded ones, was the weakest commit
+        path in the orchestrator (#149 WI-4 review).
+
         Args:
             project_name: Name of the project
             agent_name: Name of the agent that ran
             task_context: Task context containing issue info
             task_id: Task identifier
+
+        Returns:
+            _verify_failsafe_branch()'s refusal when the checked-out branch could
+            not be confirmed as this dispatch's own — in which case NOTHING was
+            staged, committed or pushed and the changes are left on disk — or None
+            when the check passed and the failsafe ran as it always has. Callers
+            must escalate a refusal whose `escalate` flag is set rather than
+            reporting the run as a success; every one of them used to discard this
+            return value entirely (#149 WI-4 review).
         """
         import subprocess
         import glob
@@ -1789,6 +2262,19 @@ class AgentExecutor:
                 ))
             issue_number = task_context.get('issue_number')
 
+            # Refuse before reading anything else: every branch below ends in a
+            # commit + push, and this used to run against whatever the container
+            # left checked out.
+            branch_check = self._verify_failsafe_branch(
+                project_dir=project_dir,
+                project_name=project_name,
+                issue_number=issue_number,
+                expected_branch=task_context.get('branch_name'),
+            )
+            if branch_check.commit_branch is None:
+                return branch_check
+            commit_branch = branch_check.commit_branch
+
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")
 
             # Get git status
@@ -1802,13 +2288,13 @@ class AgentExecutor:
 
             if status_result.returncode != 0:
                 logger.error(f"❌ FAILSAFE: git status failed: {status_result.stderr}")
-                return
+                return None
 
             status_output = status_result.stdout.strip()
 
             if not status_output:
                 logger.info("✅ FAILSAFE: No uncommitted changes found - workspace is clean")
-                return
+                return None
 
             # Parse git status output
             # Format: "XY filename" where X=staged, Y=unstaged
@@ -1865,14 +2351,16 @@ class AgentExecutor:
                 # Only staged files - safe to commit
                 logger.info("🔍 FAILSAFE: Only staged files found - proceeding with commit")
                 await self._failsafe_commit_staged(
-                    project_dir, project_name, issue_number, agent_name, task_id, staged_files
+                    project_dir, project_name, issue_number, agent_name, task_id, staged_files,
+                    commit_branch
                 )
 
             elif unstaged_files and not staged_files:
                 # Only unstaged files - stage them and commit
                 logger.info("🔍 FAILSAFE: Only unstaged files found - staging and committing")
                 await self._failsafe_stage_and_commit(
-                    project_dir, project_name, issue_number, agent_name, task_id, unstaged_files
+                    project_dir, project_name, issue_number, agent_name, task_id, unstaged_files,
+                    commit_branch
                 )
 
             elif staged_files and unstaged_files:
@@ -1886,7 +2374,7 @@ class AgentExecutor:
                 # Stage everything and commit
                 await self._failsafe_stage_and_commit(
                     project_dir, project_name, issue_number, agent_name, task_id,
-                    staged_files + unstaged_files
+                    staged_files + unstaged_files, commit_branch
                 )
 
             elif untracked_files:
@@ -1894,11 +2382,14 @@ class AgentExecutor:
                 logger.info(f"🔍 FAILSAFE: Only untracked files: {untracked_files}")
                 # Don't commit untracked files automatically - might be build artifacts
 
+            return None
+
         except Exception as e:
             from services.git_workflow_manager import PushFailedError
             if isinstance(e, PushFailedError):
                 raise  # Propagate — finalization exception handler will block the pipeline
             logger.error(f"❌ FAILSAFE: Exception during commit check: {e}", exc_info=True)
+            return None
 
     async def _failsafe_commit_staged(
         self,
@@ -1907,9 +2398,10 @@ class AgentExecutor:
         issue_number: int,
         agent_name: str,
         task_id: str,
-        staged_files: list
+        staged_files: list,
+        commit_branch: str
     ):
-        """Commit already-staged files"""
+        """Commit already-staged files onto the already-verified commit_branch."""
         import subprocess
 
         try:
@@ -1937,7 +2429,9 @@ class AgentExecutor:
                 logger.info(f"✅ FAILSAFE: Successfully committed staged changes")
 
                 # Try to push
-                await self._failsafe_push(project_dir, project_name, issue_number)
+                await self._failsafe_push(
+                    project_dir, project_name, issue_number, commit_branch
+                )
             else:
                 logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
 
@@ -1954,9 +2448,10 @@ class AgentExecutor:
         issue_number: int,
         agent_name: str,
         task_id: str,
-        all_files: list
+        all_files: list,
+        commit_branch: str
     ):
-        """Stage all changes and commit"""
+        """Stage all changes and commit onto the already-verified commit_branch."""
         import subprocess
 
         try:
@@ -2000,7 +2495,9 @@ class AgentExecutor:
                 logger.info(f"✅ FAILSAFE: Successfully committed all changes")
 
                 # Try to push
-                await self._failsafe_push(project_dir, project_name, issue_number)
+                await self._failsafe_push(
+                    project_dir, project_name, issue_number, commit_branch
+                )
             else:
                 logger.error(f"❌ FAILSAFE: Commit failed: {commit_result.stderr}")
 
@@ -2014,28 +2511,19 @@ class AgentExecutor:
         self,
         project_dir: str,
         project_name: str,
-        issue_number: int
+        issue_number: int,
+        branch_name: str
     ):
-        """Try to push committed changes. Raises PushFailedError on failure."""
-        import subprocess
+        """Try to push committed changes. Raises PushFailedError on failure.
 
+        Pushes the branch _verify_failsafe_branch() already confirmed rather than
+        re-reading `git rev-parse --abbrev-ref HEAD` here: re-reading would reopen
+        the same ambient-HEAD hole one step later (and, on a detached HEAD, push
+        the literal string 'HEAD').
+        """
         try:
             from services.git_workflow_manager import git_workflow_manager
 
-            # Get current branch
-            branch_result = subprocess.run(
-                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if branch_result.returncode != 0:
-                logger.error(f"❌ FAILSAFE: Could not determine current branch: {branch_result.stderr}")
-                return
-
-            branch_name = branch_result.stdout.strip()
             logger.info(f"🔍 FAILSAFE: Pushing to branch: {branch_name}")
 
             # Delegates to push_branch which retries transient failures and raises
