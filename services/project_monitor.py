@@ -3876,7 +3876,8 @@ class ProjectMonitor:
                     column=status,
                     agent=agent,
                     trigger_source='manual',  # Triggered from project monitor
-                    project_name=project_name
+                    project_name=project_name,
+                    board_name=board_name
                 )
 
                 # EMIT DECISION EVENT: Task queued.
@@ -7735,7 +7736,8 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 column=status,
                 agent='pr_review_stage',
                 trigger_source='manual',
-                project_name=project_name
+                project_name=project_name,
+                board_name=board_name
             )
 
             # Emit decision events
@@ -8339,7 +8341,8 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 column=status,
                 agent=stage_config.default_agent,
                 trigger_source='manual',
-                project_name=project_name
+                project_name=project_name,
+                board_name=board_name
             )
 
             # Build context for stage execution

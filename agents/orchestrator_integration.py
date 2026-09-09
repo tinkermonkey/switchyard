@@ -553,7 +553,8 @@ async def process_task_integrated(task, state_manager, logger):
                 column=column_ctx,
                 agent=task.agent,
                 trigger_source='task_queue',
-                project_name=task.project
+                project_name=task.project,
+                board_name=board_name or None
             )
             logger.info(
                 f"Recorded execution start for {task.agent} on {task.project}/#{issue_number_ctx} "

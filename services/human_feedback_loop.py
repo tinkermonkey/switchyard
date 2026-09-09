@@ -1218,7 +1218,8 @@ class HumanFeedbackLoopExecutor:
             column=column.name,
             agent=state.agent,
             trigger_source=trigger_source,
-            project_name=state.project_name
+            project_name=state.project_name,
+            board_name=state.board_name
         )
 
         logger.info(

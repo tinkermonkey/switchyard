@@ -1130,7 +1130,8 @@ class RepairCycleStage(PipelineStage):
                         column=task_context['column'],
                         agent=self.agent_name,
                         trigger_source='repair_cycle_test',
-                        project_name=project
+                        project_name=project,
+                        board_name=task_context.get('board')
                     )
 
                 # Execute agent through centralized executor with full observability
@@ -1511,7 +1512,8 @@ class RepairCycleStage(PipelineStage):
                     column=task_context['column'],
                     agent=self.agent_name,
                     trigger_source='repair_cycle_fix',
-                    project_name=project
+                    project_name=project,
+                    board_name=task_context.get('board')
                 )
 
             # Execute agent through centralized executor with full observability
@@ -1669,7 +1671,8 @@ class RepairCycleStage(PipelineStage):
                     column=task_context['column'],
                     agent=self.agent_name,
                     trigger_source='repair_cycle_warning_review',
-                    project_name=project
+                    project_name=project,
+                    board_name=task_context.get('board')
                 )
 
             # Execute agent through centralized executor with full observability

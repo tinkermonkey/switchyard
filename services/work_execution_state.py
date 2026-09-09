@@ -40,6 +40,12 @@ class ExecutionRecord:
     outcome: str  # 'success', 'failure', 'frozen', 'lock_contention', 'cancelled', 'in_progress'
     trigger_source: str  # 'manual_move', 'pipeline_progression', 'webhook'
     error: Optional[str] = None
+    # The board this execution ran on (#144). Optional because records written
+    # before this field existed don't have it, and because a couple of dispatch
+    # paths genuinely have no board in scope. Consumers must handle None -- see
+    # detect_and_retry_empty_successful_executions()'s PROTECTION 2, which falls
+    # back to checking every board of the project when it's missing.
+    board_name: Optional[str] = None
 
 
 @dataclass
@@ -72,19 +78,24 @@ class WorkExecutionStateTracker:
         """Get the state file path for an issue"""
         return self.state_dir / f"{project_name}_issue_{issue_number}.yaml"
 
+    def _empty_state(self, project_name: str, issue_number: int) -> Dict:
+        """The state an issue with nothing recorded yet gets -- also the fallback
+        every load_state() failure path returns, so they can't drift apart."""
+        return {
+            'issue_number': issue_number,
+            'project_name': project_name,
+            'execution_history': [],
+            'status_changes': [],
+            'current_status': None,
+            'last_updated': None
+        }
+
     def load_state(self, project_name: str, issue_number: int) -> Dict:
         """Load execution state for an issue"""
         state_file = self.get_state_file(project_name, issue_number)
 
         if not state_file.exists():
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
 
         try:
             from utils.file_lock import file_lock
@@ -94,30 +105,71 @@ class WorkExecutionStateTracker:
             with file_lock(lock_file):
                 if state_file.exists():  # Check again inside lock
                     with open(state_file, 'r') as f:
-                        state = yaml.safe_load(f)
-                        # Ensure all expected keys exist
-                        state.setdefault('execution_history', [])
-                        state.setdefault('status_changes', [])
-                        return state
+                        try:
+                            state = yaml.safe_load(f)
+                        except yaml.YAMLError as parse_error:
+                            # Same corrupted-state-file condition as the non-mapping
+                            # case below, just detected one step earlier -- report it
+                            # the same way rather than as an opaque load failure.
+                            self._log_corrupted_state_file(
+                                state_file, str(parse_error),
+                                owner=f"{project_name}/#{issue_number}"
+                            )
+                            return self._empty_state(project_name, issue_number)
+
+                    # A truncated or empty state file parses to None, and anything
+                    # that isn't a mapping (e.g. a stray scalar) parses to a
+                    # non-dict -- either way the setdefault() calls below raise
+                    # AttributeError/TypeError into the generic handler, which is
+                    # how a single empty file on disk produced
+                    # "'NoneType' object has no attribute 'setdefault'" at ERROR on
+                    # every load of that issue, forever, without ever naming the
+                    # file as the thing needing repair. Report it as its own
+                    # condition and fall back to the same empty state a file that
+                    # doesn't exist yet gets.
+                    if not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping",
+                            owner=f"{project_name}/#{issue_number}"
+                        )
+                        return self._empty_state(project_name, issue_number)
+
+                    # Ensure all expected keys exist
+                    state.setdefault('execution_history', [])
+                    state.setdefault('status_changes', [])
+                    return state
             # File doesn't exist inside lock, return default
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
         except Exception as e:
             logger.error(f"Failed to load state for {project_name}/#{issue_number}: {e}")
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
+
+    @staticmethod
+    def _log_corrupted_state_file(
+        state_file: Path, detail: str, owner: Optional[str] = None
+    ) -> None:
+        """
+        Report an execution state file that exists but holds nothing loadable.
+
+        Deliberately NOT repaired automatically: the file is read under a shared
+        read lock here while save_state() takes its own write lock on the same
+        lock file, and an empty file is indistinguishable from one truncated by a
+        write that is still in flight. Naming the path is what an operator needs
+        to clear it by hand; every caller falls back to empty state either way, so
+        this is a visibility fix, not a fatal condition.
+
+        Args:
+            state_file: Path to the unreadable file -- the point of this message.
+            detail: Why it isn't loadable (parse error, or what it parsed as).
+            owner: "project/#issue" when the caller already knows it; omitted by
+                callers that were about to learn it FROM the file.
+        """
+        logger.warning(
+            f"Corrupted execution state file {state_file}"
+            f"{f' for {owner}' if owner else ''}: {detail} -- treating it as having "
+            f"no recorded execution history. Delete or repair the file to clear this."
+        )
 
     def save_state(self, project_name: str, issue_number: int, state: Dict):
         """Save execution state for an issue with thread-safe file locking"""
@@ -141,7 +193,8 @@ class WorkExecutionStateTracker:
         column: str,
         agent: str,
         trigger_source: str,
-        project_name: str
+        project_name: str,
+        board_name: Optional[str] = None
     ):
         """
         Record the start of work execution.
@@ -160,6 +213,13 @@ class WorkExecutionStateTracker:
             agent: Agent name
             trigger_source: Source of the trigger (e.g., 'manual', 'pipeline_progression')
             project_name: Project name
+            board_name: Board this execution runs on (#144). Recorded so the
+                watchdog can scope its pipeline-lock check to THIS execution's
+                own board instead of every board configured for the project.
+                Every dispatch call site that has a board in scope passes it;
+                omitting it is not an error, it just leaves the watchdog with
+                the older, deliberately conservative every-board behavior for
+                this record.
         """
         state = self.load_state(project_name, issue_number)
 
@@ -171,6 +231,12 @@ class WorkExecutionStateTracker:
             'trigger_source': trigger_source
         }
 
+        # Only written when actually known -- an explicit key holding None would
+        # be indistinguishable from a board that was recorded as empty, and the
+        # consumer's fallback keys off "absent or falsy" either way.
+        if board_name:
+            execution['board_name'] = board_name
+
         state['execution_history'].append(execution)
         state['current_status'] = column
 
@@ -178,7 +244,8 @@ class WorkExecutionStateTracker:
 
         logger.info(
             f"Recorded execution start: {project_name}/#{issue_number} "
-            f"{agent} in {column} (trigger: {trigger_source})"
+            f"{agent} in {column} (trigger: {trigger_source}"
+            f"{f', board: {board_name}' if board_name else ''})"
         )
 
     def stamp_execution_task_id(self, project_name, issue_number, agent, column, task_id):
@@ -1404,6 +1471,18 @@ class WorkExecutionStateTracker:
         # project count on this periodic maintenance path).
         project_config_cache = {}
 
+        # Cache PipelineQueueManager instances across the whole sweep, keyed by
+        # (project, board) (#140 item 17): get_pipeline_queue_manager() constructs
+        # a brand-new manager -- state_dir mkdir included -- on every call, and
+        # PROTECTION 3 below calls it once per board for EVERY stuck state file it
+        # examines, so an N-file x M-board sweep built N*M throwaway managers for
+        # the same M boards. Only the manager is cached, deliberately not the
+        # queue contents: get_issue_status() re-reads the queue file under its own
+        # lock on each call, and PROTECTION 3 is a race guard -- acting on a
+        # snapshot taken at the top of a long sweep is exactly the staleness it
+        # exists to avoid.
+        queue_manager_cache = {}
+
         for state_file in state_files:
             try:
                 from utils.file_lock import file_lock
@@ -1417,7 +1496,19 @@ class WorkExecutionStateTracker:
                     with open(state_file, 'r') as f:
                         state = yaml.safe_load(f)
 
-                    if not state or not state['execution_history']:
+                    # Same corrupted-state-file condition load_state() reports --
+                    # see _log_corrupted_state_file(). Without this an empty or
+                    # non-mapping file reached state['execution_history'] below and
+                    # surfaced as a generic TypeError/KeyError from this loop's
+                    # outer handler, naming the exception rather than the file.
+                    if state is not None and not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping"
+                        )
+                        continue
+
+                    if not state or not state.get('execution_history'):
                         continue
 
                     # Get last execution
@@ -1491,16 +1582,44 @@ class WorkExecutionStateTracker:
                             project_config_cache[project_name] = project_config
                         except Exception as e:
                             project_config = None
-                            logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+                            # Warning, not debug (#140 item 31): a failure here
+                            # silently degrades BOTH PROTECTION 2 and PROTECTION 3
+                            # to no-ops for this state file, which is exactly the
+                            # kind of quiet degradation that hid two real bugs in
+                            # this code.
+                            logger.warning(
+                                f"Watchdog: Could not load project config for {project_name} "
+                                f"-- PROTECTION 2/3 degraded for this state file: {e}"
+                            )
 
                     try:
                         lock_manager = get_pipeline_lock_manager()
 
+                        # Scope the lock check to the board this stuck execution
+                        # actually ran on (#144). A lock held on some OTHER board of
+                        # the same project says nothing about whether THIS execution
+                        # is safe to retry: issue #10 stuck on a completely idle
+                        # sdlc_execution board was being skipped every sweep because
+                        # issue #20 was legitimately working on planning_design.
+                        # Records written before record_execution_start() carried a
+                        # board_name (and the few dispatch paths with no board in
+                        # scope) keep the original, deliberately conservative
+                        # every-board behavior -- with no board to scope to, "some
+                        # board of this project is busy" is the only signal there is,
+                        # and over-skipping only delays a retry to the next sweep.
+                        recorded_board = last_exec.get('board_name')
+                        if recorded_board:
+                            boards_to_check = [recorded_board]
+                        else:
+                            boards_to_check = [
+                                board for board in (
+                                    getattr(pipeline_config, 'board_name', None)
+                                    for pipeline_config in getattr(project_config, 'pipelines', None) or []
+                                ) if board
+                            ]
+
                         locked_by_another_issue = False
-                        for pipeline_config in getattr(project_config, 'pipelines', None) or []:
-                            board_name = getattr(pipeline_config, 'board_name', None)
-                            if not board_name:
-                                continue
+                        for board_name in boards_to_check:
                             holder_issue = lock_manager.get_lock_holder(project_name, board_name)
                             # CRITICAL fix (found in #58 review): this must only
                             # skip when the lock is held by a DIFFERENT issue.
@@ -1515,15 +1634,31 @@ class WorkExecutionStateTracker:
                             if holder_issue and holder_issue != issue_number:
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                    f"pipeline locked by issue #{holder_issue}"
+                                    f"board '{board_name}' locked by issue #{holder_issue}"
                                 )
                                 locked_by_another_issue = True
                                 break
 
                         if locked_by_another_issue:
                             continue
+                    except (AttributeError, TypeError) as e:
+                        # A coding bug, not a transient outage -- and precisely the
+                        # shape (.get() on a dataclass, a method that doesn't exist)
+                        # that kept this protection a silent permanent no-op until
+                        # #57/#58 (#140 item 31). Surfaced distinctly from "Redis
+                        # unreachable" below, and loudly, so the next one can't hide
+                        # the same way.
+                        logger.error(
+                            f"Watchdog: PROTECTION 2 (pipeline lock) failed for "
+                            f"{project_name}/#{issue_number} with a programming error "
+                            f"-- this protection is not working: {e}",
+                            exc_info=True
+                        )
                     except Exception as e:
-                        logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
+                        logger.warning(
+                            f"Watchdog: Could not check pipeline lock for "
+                            f"{project_name}/#{issue_number} -- PROTECTION 2 skipped: {e}"
+                        )
 
                     # PROTECTION 3: Check queue state
                     #
@@ -1545,13 +1680,23 @@ class WorkExecutionStateTracker:
                         already_queued_or_active = False
                         # Reuses project_config fetched once above PROTECTION 2 --
                         # see the comment there.
+                        #
+                        # Deliberately still checks EVERY board, unlike PROTECTION 2
+                        # above: this asks "is this issue already queued anywhere",
+                        # and an issue very often sits in a different board's queue
+                        # from the one its last execution ran on (that's what a
+                        # board-to-board handoff looks like). Narrowing this one to
+                        # the recorded board would make the watchdog mark an issue
+                        # for retry while it is legitimately queued elsewhere.
                         for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
                             board_name = getattr(pipeline_cfg, 'board_name', None)
                             if not board_name:
                                 continue
-                            queue_status = get_pipeline_queue_manager(
-                                project_name, board_name
-                            ).get_issue_status(issue_number)
+                            queue_manager = queue_manager_cache.get((project_name, board_name))
+                            if queue_manager is None:
+                                queue_manager = get_pipeline_queue_manager(project_name, board_name)
+                                queue_manager_cache[(project_name, board_name)] = queue_manager
+                            queue_status = queue_manager.get_issue_status(issue_number)
                             if queue_status in ('waiting', 'active'):
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
@@ -1562,8 +1707,23 @@ class WorkExecutionStateTracker:
 
                         if already_queued_or_active:
                             continue
+                    except (AttributeError, TypeError, ImportError) as e:
+                        # See PROTECTION 2's matching handler (#140 item 31).
+                        # ImportError is in the list here because that is literally
+                        # how this protection was dead before #57 -- an import of a
+                        # function that never existed, logged at debug and never
+                        # noticed.
+                        logger.error(
+                            f"Watchdog: PROTECTION 3 (queue status) failed for "
+                            f"{project_name}/#{issue_number} with a programming error "
+                            f"-- this protection is not working: {e}",
+                            exc_info=True
+                        )
                     except Exception as e:
-                        logger.debug(f"Watchdog: Could not check queue status: {e}")
+                        logger.warning(
+                            f"Watchdog: Could not check queue status for "
+                            f"{project_name}/#{issue_number} -- PROTECTION 3 skipped: {e}"
+                        )
 
                     # PROTECTION 4: Check execution eligibility
                     agent = last_exec.get('agent')
@@ -1942,6 +2102,18 @@ class WorkExecutionStateTracker:
                         continue
                     with open(state_file, 'r') as f:
                         state = yaml.safe_load(f)
+
+                    # Third of this module's three state-file readers -- same
+                    # corrupted-state-file condition, same report. The membership
+                    # test below happens to survive a string or a list, but not a
+                    # scalar (`'x' not in 42` raises TypeError), so this site was
+                    # unguarded too.
+                    if state is not None and not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping"
+                        )
+                        continue
 
                     if not state or 'execution_history' not in state:
                         continue

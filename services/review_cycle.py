@@ -3465,7 +3465,8 @@ class ReviewCycleExecutor:
                 column=task_context['column'],
                 agent=agent_name,
                 trigger_source='review_cycle',  # Clear audit trail
-                project_name=project_name
+                project_name=project_name,
+                board_name=task_context.get('board')
             )
         else:
             logger.warning(
