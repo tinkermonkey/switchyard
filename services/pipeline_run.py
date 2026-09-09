@@ -1493,7 +1493,10 @@ class PipelineRunManager:
                 # CRITICAL: Process next waiting issue in queue after lock release
                 # This ensures queued issues are picked up when the current issue completes
                 try:
-                    from services.pipeline_queue_manager import get_pipeline_queue_manager
+                    from services.pipeline_queue_manager import (
+                        describe_rollback_reset,
+                        get_pipeline_queue_manager,
+                    )
                     from task_queue.task_manager import Task, TaskPriority
                     import time
 
@@ -1694,31 +1697,31 @@ class PipelineRunManager:
 
                                     if activated_at is not None:
                                         try:
-                                            reset_ok = pipeline_queue.reset_issue_to_waiting(
+                                            reset_result = pipeline_queue.reset_issue_to_waiting(
                                                 next_issue['issue_number'],
                                                 expected_activated_at=activated_at,
                                             )
-                                            if not reset_ok:
-                                                # A refused compare-and-swap leaves exactly
-                                                # the state the raise path warns about, and
-                                                # only logs INFO on its way out — report it
-                                                # the same way, or the stranded entry is
-                                                # invisible to an operator.
-                                                logger.critical(
-                                                    f"Could NOT reset queue entry for issue "
-                                                    f"#{next_issue['issue_number']} back to 'waiting' "
-                                                    f"after dispatch failed — the compare-and-swap on "
-                                                    f"activated_at was refused, so the entry is still "
-                                                    f"'active' and will be excluded from all future "
-                                                    f"dispatch on {project}/{pipeline_run.board} until "
-                                                    f"the stranded-'active' sweep or a human intervenes"
-                                                )
+                                            # NOT unconditionally CRITICAL on a falsy
+                                            # result: all three falsy outcomes are
+                                            # benign, and only one of them even leaves
+                                            # the entry 'active' (and doing so is then
+                                            # the correct outcome). See ResetResult.
+                                            level, message = describe_rollback_reset(
+                                                reset_result, next_issue['issue_number'],
+                                                project, pipeline_run.board,
+                                            )
+                                            logger.log(level, message)
                                         except Exception as reset_error:
+                                            # The ONE genuinely unrecoverable case: the
+                                            # write raised, so the entry's status is
+                                            # unknown and may still be 'active' with
+                                            # nothing dispatched.
                                             logger.critical(
                                                 f"Could NOT reset queue entry for issue "
                                                 f"#{next_issue['issue_number']} back to 'waiting' after "
-                                                f"dispatch failed — it will be excluded from all future "
-                                                f"dispatch on {project}/{pipeline_run.board} until the "
+                                                f"dispatch failed — its status is now unknown and it may "
+                                                f"be excluded from all future dispatch on "
+                                                f"{project}/{pipeline_run.board} until the "
                                                 f"stranded-'active' sweep or a human intervenes: {reset_error}"
                                             )
 

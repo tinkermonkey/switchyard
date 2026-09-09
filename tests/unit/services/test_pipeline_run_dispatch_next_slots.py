@@ -17,6 +17,7 @@ import json
 import unittest
 from unittest.mock import MagicMock, Mock, patch
 
+from services.pipeline_queue_manager import ResetResult
 from services.pipeline_run import PipelineRunManager
 
 # The activated_at stamp mark_issue_active() returns and the rollback hands
@@ -290,14 +291,44 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         # release-100 is the completed issue's own release, before dispatch.
         self.assertEqual(call_order, ['release-100', 'release-200', 'reset'])
 
-    def test_refused_compare_and_swap_is_reported_at_critical(self):
-        """REGRESSION (#147): the return value was dropped on the floor. A
-        refused compare-and-swap does not raise -- it returns False and logs at
-        INFO ("it was re-activated concurrently") -- so the one outcome the
-        logger.critical text describes ("excluded from all future dispatch")
-        was the one outcome that never produced it."""
+    def test_refused_compare_and_swap_is_not_reported_at_critical(self):
+        """REGRESSION (#147 review): a falsy return used to be paged as CRITICAL
+        ("excluded from all future dispatch until a human intervenes"). A refused
+        compare-and-swap means another dispatcher legitimately re-activated the
+        issue, so leaving the entry 'active' is the CORRECT outcome -- not an
+        emergency."""
         mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
-        mock_queue.reset_issue_to_waiting.return_value = False
+        mock_queue.reset_issue_to_waiting.return_value = ResetResult.REACTIVATED
+
+        with self.assertLogs('services.pipeline_run', level='DEBUG') as logs:
+            self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
+
+        self.assertFalse(
+            [line for line in logs.output if line.startswith('CRITICAL')],
+            logs.output,
+        )
+        self.assertTrue(any('correct outcome' in line for line in logs.output))
+
+    def test_benign_not_active_reset_is_not_reported_at_critical(self):
+        """Same false page from the other direction: trigger_agent_for_status()'s
+        consecutive-failure and no-agent-column branches reset the entry
+        themselves before returning, so NOT_ACTIVE is routine."""
+        mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
+        mock_queue.reset_issue_to_waiting.return_value = ResetResult.NOT_ACTIVE
+
+        with self.assertLogs('services.pipeline_run', level='DEBUG') as logs:
+            self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
+
+        self.assertFalse(
+            [line for line in logs.output if line.startswith('CRITICAL')],
+            logs.output,
+        )
+
+    def test_reset_that_raises_is_still_reported_at_critical(self):
+        """The ONE genuinely unrecoverable case still pages: the write raised, so
+        the entry's status is unknown and may still be 'active'."""
+        mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
+        mock_queue.reset_issue_to_waiting.side_effect = RuntimeError("queue file unwritable")
 
         with self.assertLogs('services.pipeline_run', level='CRITICAL') as logs:
             self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)

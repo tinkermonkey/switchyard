@@ -10,6 +10,7 @@ import pytest
 import asyncio
 from unittest.mock import Mock, MagicMock, patch, AsyncMock, call
 from datetime import datetime
+from services.pipeline_queue_manager import ResetResult
 from services.project_monitor import ProjectMonitor
 from config.manager import ConfigManager
 
@@ -595,17 +596,18 @@ class TestReviewCycleCompletionQueueDispatch:
                         )
                         assert call_order == ['release-123', 'release-456', 'reset']
 
-    async def test_refused_compare_and_swap_is_reported_at_critical(
+    async def test_refused_compare_and_swap_is_not_reported_at_critical(
         self,
         project_monitor,
         mock_config_manager,
         caplog
     ):
-        """REGRESSION (#147): the return value was dropped on the floor. A
-        refused compare-and-swap does not raise -- it returns False and logs at
-        INFO ("it was re-activated concurrently") -- so the one outcome the
-        logger.critical text describes ("excluded from all future dispatch")
-        was the one outcome that never produced it."""
+        """REGRESSION (#147 review): a falsy return used to be paged as CRITICAL
+        ("still 'active' and will be excluded from all future dispatch until a
+        human intervenes"). A refused compare-and-swap means another dispatcher
+        legitimately re-activated the issue, so leaving the entry 'active' is
+        the CORRECT outcome, not an emergency -- and the other two falsy cases
+        (NOT_ACTIVE / NOT_FOUND) are not even about an entry left active."""
         project_config = mock_config_manager.get_project_config("test_project")
         workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
         review_column = workflow_template.columns[1]  # "Code Review"
@@ -642,14 +644,16 @@ class TestReviewCycleCompletionQueueDispatch:
                             mock_queue_mgr.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
                             # The entry was re-activated concurrently: the reset
                             # refuses and the entry stays 'active'.
-                            mock_queue_mgr.reset_issue_to_waiting.return_value = False
+                            mock_queue_mgr.reset_issue_to_waiting.return_value = (
+                                ResetResult.REACTIVATED
+                            )
                             mock_get_queue_mgr.return_value = mock_queue_mgr
 
                             mock_run_mgr = Mock()
                             mock_run_mgr.ensure_pipeline_run_for_task.return_value = 'run-456'
                             mock_get_run_mgr.return_value = mock_run_mgr
 
-                            with caplog.at_level('CRITICAL'):
+                            with caplog.at_level('DEBUG'):
                                 project_monitor._start_review_cycle_for_issue(
                                     project_name="test_project",
                                     board_name="SDLC Execution",
@@ -664,8 +668,14 @@ class TestReviewCycleCompletionQueueDispatch:
 
                                 await asyncio.sleep(0.5)
 
+                        assert not [
+                            r for r in caplog.records if r.levelname == 'CRITICAL'
+                        ], [
+                            r.getMessage() for r in caplog.records
+                            if r.levelname == 'CRITICAL'
+                        ]
                         assert any(
-                            record.levelname == 'CRITICAL' and '456' in record.getMessage()
+                            'correct outcome' in record.getMessage()
                             for record in caplog.records
                         )
 

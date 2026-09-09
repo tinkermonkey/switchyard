@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 # already happened.
 MAX_CONSECUTIVE_DISPATCH_FAILURES = 3
 
+# How long a pending (enqueued, not yet picked up) task may suppress a dispatch
+# rollback for its issue. Past this, the task is treated as orphaned rather than
+# imminent. Sized well above the queue's normal pickup latency but far below
+# "forever": an unbounded suppression here is exactly #147's end state (lock held,
+# nothing running, and _reset_stranded_active_issues() skips the lock holder by
+# design, so nothing recovers it). See _has_pending_task_for_issue().
+PENDING_TASK_SUPPRESSION_SECS = 900  # 15 minutes
+
 # Grace period before trusting a pipeline run's "active" ES flag requires proof
 # of a real container. Covers the normal, fast create-run -> launch-container
 # race without waiting for PipelineWatchdog's 30-minute zombie sweep to notice
@@ -3625,8 +3633,18 @@ class ProjectMonitor:
                     project_name=project_name
                 )
 
+                # EMIT DECISION EVENT: Task queued.
+                #
+                # OUTSIDE the try below on purpose (#147 review). This is an
+                # observability write (Elasticsearch); it does not affect whether
+                # the task actually dispatches. Inside, an ES/observability outage
+                # would record outcome='failure' for this issue/column/agent, which
+                # feeds count_consecutive_failures() — three such polls and
+                # MAX_CONSECUTIVE_DISPATCH_FAILURES fires, mark_failed() retains the
+                # board lock, and the board needs human recovery, all caused purely
+                # by a monitoring outage with the dispatch path perfectly healthy.
+                # Best-effort here instead: log and carry on to the enqueue.
                 try:
-                    # EMIT DECISION EVENT: Task queued
                     self.decision_events.emit_task_queued(
                         agent=agent,
                         project=project_name,
@@ -3636,7 +3654,14 @@ class ProjectMonitor:
                         reason=f"Agent '{agent}' assigned to issue #{issue_number} in status '{status}'",
                         pipeline_run_id=pipeline_run.id
                     )
+                except Exception as emit_error:
+                    logger.warning(
+                        f"Could not emit the task-queued decision event for {agent} on "
+                        f"issue #{issue_number} — continuing with the enqueue, which is "
+                        f"unaffected: {emit_error}"
+                    )
 
+                try:
                     # Enqueue task LAST so workers find in_progress state
                     self.task_queue.enqueue(task)
                 except Exception:
@@ -3761,6 +3786,10 @@ class ProjectMonitor:
         See PipelineQueueManager.reset_issue_to_waiting() for why holding the lock
         across the reset is the more dangerous of the two orderings.
 
+        The release is NOT unconditional: trigger_agent_for_status() can have
+        deliberately RETAINED this lock (mark_failed) on the way to returning None,
+        and that retention must survive the rollback. See the release block below.
+
         Args:
             activated_at: The token mark_issue_active() returned, or None if the
                 caller never marked this entry (the FAILSAFE's stalled-issue path)
@@ -3811,18 +3840,43 @@ class ProjectMonitor:
                 )
                 return False
 
-            # has_active_execution() covers work that has STARTED. It does not
-            # cover a task that is enqueued but not yet picked up, which is
-            # exactly why trigger_agent_for_status() returns None on its
-            # "Task already exists for {agent} on issue #N - skipping duplicate"
-            # branch. Rolling back there would release the board lock and hand
-            # the entry back to the queue while a task for it is still sitting
-            # in Redis waiting to run.
-            if self._has_pending_task_for_issue(project_name, board_name, issue_number):
+            # has_active_execution() covers work that has STARTED, and every
+            # enqueue site calls record_execution_start() BEFORE enqueuing, so it
+            # already covers "enqueued but not yet picked up" for almost every
+            # pending task. The narrow gap it does NOT cover is a pipeline_progression
+            # probe whose in_progress record has aged past _STALE_ENQUEUE_PROBE_SECS
+            # with no task_id stamp: has_active_execution() clears that probe as
+            # stale while the Redis task may still be pending. That gap, plus
+            # trigger_agent_for_status()'s "Task already exists for {agent} on
+            # issue #N - skipping duplicate" branch, is what this check is for.
+            #
+            # BOUNDED on purpose (#147 review): an unbounded, agent-agnostic "any
+            # pending task for #N" check reproduces the exact end state #147 fixes.
+            # One ORPHANED pending task for #N — one no worker will ever run —
+            # would suppress this rollback forever, the lock would never be
+            # released, and _reset_stranded_active_issues() skips the lock holder
+            # by design, so nothing recovers it. Matching the agent (exactly as the
+            # duplicate-task branch does) and ignoring tasks older than the
+            # suppression window keeps the guard useful without making it a trap.
+            expected_agent = None
+            try:
+                expected_agent = self._get_agent_for_status(
+                    project_name, board_name, current_column
+                )
+            except Exception as agent_lookup_error:
+                logger.debug(
+                    f"Could not resolve the expected agent for #{issue_number} in "
+                    f"'{current_column}' — checking pending tasks across all agents: "
+                    f"{agent_lookup_error}"
+                )
+
+            if self._has_pending_task_for_issue(
+                project_name, board_name, issue_number, agent=expected_agent
+            ):
                 logger.debug(
                     f"Next queued issue #{issue_number} did not dispatch a new agent "
-                    f"but already has a pending task — leaving the lock and queue "
-                    f"entry alone"
+                    f"but already has a recent pending task — leaving the lock and "
+                    f"queue entry alone"
                 )
                 return False
 
@@ -3833,54 +3887,149 @@ class ProjectMonitor:
             )
 
         if lock_manager is not None:
+            # NOT an unconditional release, despite what this helper's docstring
+            # used to say. trigger_agent_for_status() can DELIBERATELY retain this
+            # lock between the call above and here: its
+            # MAX_CONSECUTIVE_DISPATCH_FAILURES branch calls
+            # PipelineRunManager.mark_failed(), which durably marks the lock
+            # retained-due-to-failure precisely so siblings on this board stay
+            # blocked until a human resolves it, and then returns None — landing
+            # us right here. Releasing would silently undo that.
+            #
+            # release_lock() already refuses a retained lock without force=True,
+            # so this never actually broke; but the rollback's correctness must
+            # not rest on a guard it never mentions, and an operator reading
+            # "Rolled back lock" / "Failed to rollback lock" in the log has no
+            # way to tell a deliberate retention from a real failure. Check it
+            # explicitly and say which one happened.
+            retained_lock = None
             try:
-                lock_manager.release_lock(project_name, board_name, issue_number)
-                logger.info(f"Rolled back lock for issue #{issue_number}")
-            except Exception as rollback_error:
-                logger.error(f"Failed to rollback lock: {rollback_error}")
+                existing_lock, reads_healthy = lock_manager.get_lock_fail_closed(
+                    project_name, board_name
+                )
+                if reads_healthy and existing_lock and existing_lock.retained_reason:
+                    retained_lock = existing_lock
+            except Exception as lock_read_error:
+                # Fall through to release_lock(), which repeats this check itself
+                # and fails closed on an unreadable lock.
+                logger.warning(
+                    f"Could not read lock state for {project_name}/{board_name} before "
+                    f"rolling back issue #{issue_number} — deferring to release_lock()'s "
+                    f"own retained/fail-closed guard: {lock_read_error}"
+                )
 
+            if retained_lock is not None:
+                logger.warning(
+                    f"NOT releasing the pipeline lock for {project_name}/{board_name} "
+                    f"while rolling back issue #{issue_number}: it is retained due to a "
+                    f"failed run on issue #{retained_lock.locked_by_issue} "
+                    f"({retained_lock.retained_reason}). The retention is deliberate — "
+                    f"siblings on this board stay blocked until a human resolves it via "
+                    f"scripts/release_lock.py"
+                )
+            else:
+                try:
+                    lock_manager.release_lock(project_name, board_name, issue_number)
+                    logger.info(f"Rolled back lock for issue #{issue_number}")
+                except Exception as rollback_error:
+                    logger.error(f"Failed to rollback lock: {rollback_error}")
+
+        # The queue entry is reset even when the lock was left retained above: the
+        # retention can belong to a DIFFERENT issue (release_lock's retained guard
+        # is deliberately not holder-scoped), and if it belongs to this one, the
+        # mark_failed path already reset the entry, so this is a benign no-op that
+        # reports itself as NOT_ACTIVE.
         if activated_at is not None:
+            from services.pipeline_queue_manager import describe_rollback_reset
             try:
-                reset_ok = pipeline_queue.reset_issue_to_waiting(
+                reset_result = pipeline_queue.reset_issue_to_waiting(
                     issue_number, expected_activated_at=activated_at
                 )
-                if not reset_ok:
-                    logger.critical(
-                        f"Could NOT reset queue entry for issue #{issue_number} back to "
-                        f"'waiting' after dispatch failed — the compare-and-swap on "
-                        f"activated_at was refused, so the entry is still 'active' and "
-                        f"will be excluded from all future dispatch on "
-                        f"{project_name}/{board_name} until the stranded-'active' sweep "
-                        f"or a human intervenes"
-                    )
+                # NOT unconditionally CRITICAL on a falsy result. All three falsy
+                # outcomes are benign and REACHED ROUTINELY here — see ResetResult,
+                # and note that trigger_agent_for_status()'s consecutive-failure and
+                # no-agent-column branches both reset the entry themselves before
+                # returning None, so NOT_ACTIVE is the *expected* outcome on those
+                # two paths, not an emergency.
+                level, message = describe_rollback_reset(
+                    reset_result, issue_number, project_name, board_name
+                )
+                logger.log(level, message)
             except Exception as reset_error:
+                # The ONE genuinely unrecoverable case: the write raised, so the
+                # entry's status is unknown and may still be 'active'.
                 logger.critical(
                     f"Could NOT reset queue entry for issue #{issue_number} back to "
-                    f"'waiting' after dispatch failed — it will be excluded from all "
-                    f"future dispatch on {project_name}/{board_name} until the "
-                    f"stranded-'active' sweep or a human intervenes: {reset_error}"
+                    f"'waiting' after dispatch failed — its status is now unknown and "
+                    f"it may be excluded from all future dispatch on "
+                    f"{project_name}/{board_name} until the stranded-'active' sweep or "
+                    f"a human intervenes: {reset_error}"
                 )
 
         return False
 
     def _has_pending_task_for_issue(
-        self, project_name: str, board_name: str, issue_number: int
+        self, project_name: str, board_name: str, issue_number: int,
+        agent: Optional[str] = None,
+        max_age_seconds: int = PENDING_TASK_SUPPRESSION_SECS,
     ) -> bool:
         """
-        Whether a task for this issue is already queued but not yet started.
+        Whether a RECENT task for this issue is already queued but not yet started.
 
-        Fails closed: if the queue can't be read, the answer is "assume yes",
-        because the only caller uses this to decide whether it is safe to undo
-        a lock acquisition, and undoing one on top of live work is the more
-        expensive mistake.
+        Deliberately bounded in two ways (#147 review), because the only caller
+        uses a True here to SUPPRESS a rollback, and a suppression that can never
+        expire recreates the very bug #147 fixes — a lock held forever with
+        nothing running, which _reset_stranded_active_issues() cannot recover
+        because it skips the lock holder by design:
+
+        * ``agent`` — when given, only a pending task for THAT agent counts,
+          mirroring trigger_agent_for_status()'s duplicate-task branch exactly
+          (it compares ``existing_task.agent == agent``). A pending task for some
+          other agent is not why this dispatch declined, so it must not suppress
+          the rollback.
+        * ``max_age_seconds`` — a task that has sat in Redis longer than this is
+          treated as orphaned rather than "about to run". A task queued this long
+          ago and still not picked up will not be picked up; letting it veto the
+          rollback strands the board permanently.
+
+        Fails closed on a read error: if the queue can't be read at all the answer
+        is "assume yes", since undoing a lock acquisition on top of live work is
+        the more expensive mistake. That failure is transient by nature (the next
+        exit or poll retries), unlike an orphaned task, which is not.
         """
         try:
-            for pending_task in self.task_queue.get_pending_tasks():
+            now = datetime.now(timezone.utc)
+            for pending_task in self.task_queue.get_pending_tasks(agent=agent):
                 task_context = pending_task.context or {}
-                if (task_context.get('issue_number') == issue_number and
+                if not (task_context.get('issue_number') == issue_number and
                         task_context.get('project') == project_name and
                         task_context.get('board') == board_name):
-                    return True
+                    continue
+
+                age_seconds = None
+                try:
+                    created_at = datetime.fromisoformat(
+                        str(pending_task.created_at).replace('Z', '+00:00')
+                    )
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    age_seconds = (now - created_at).total_seconds()
+                except Exception:
+                    # Unparseable timestamp: treat as recent rather than orphaned,
+                    # so a formatting change can never silently disable the guard.
+                    age_seconds = None
+
+                if age_seconds is not None and age_seconds > max_age_seconds:
+                    logger.warning(
+                        f"Ignoring pending task {pending_task.id} for issue "
+                        f"#{issue_number} when deciding whether to roll back: it has "
+                        f"been queued for {age_seconds:.0f}s (> {max_age_seconds}s) and "
+                        f"is treated as orphaned. Letting it suppress the rollback would "
+                        f"hold {project_name}/{board_name}'s lock indefinitely"
+                    )
+                    continue
+
+                return True
             return False
         except Exception as pending_error:
             logger.warning(
@@ -5798,35 +5947,38 @@ _Review cycle initiated by Switchyard_
                                                     )
 
                                                 if activated_at is not None:
+                                                    from services.pipeline_queue_manager import (
+                                                        describe_rollback_reset,
+                                                    )
                                                     try:
-                                                        reset_ok = pipeline_queue.reset_issue_to_waiting(
+                                                        reset_result = pipeline_queue.reset_issue_to_waiting(
                                                             next_issue['issue_number'],
                                                             expected_activated_at=activated_at,
                                                         )
-                                                        if not reset_ok:
-                                                            # A refused compare-and-swap leaves
-                                                            # exactly the state the raise path
-                                                            # warns about, and only logs INFO on
-                                                            # its way out — report it the same
-                                                            # way, or the stranded entry is
-                                                            # invisible to an operator.
-                                                            logger.critical(
-                                                                f"Could NOT reset queue entry for issue "
-                                                                f"#{next_issue['issue_number']} back to "
-                                                                f"'waiting' after dispatch failed — the "
-                                                                f"compare-and-swap on activated_at was "
-                                                                f"refused, so the entry is still 'active' "
-                                                                f"and will be excluded from all future "
-                                                                f"dispatch on {project_name}/{board_name} "
-                                                                f"until a human intervenes"
-                                                            )
+                                                        # NOT unconditionally CRITICAL on a
+                                                        # falsy result: all three falsy
+                                                        # outcomes are benign, and only one
+                                                        # of them even leaves the entry
+                                                        # 'active' (and doing so is then the
+                                                        # correct outcome). See ResetResult.
+                                                        level, message = describe_rollback_reset(
+                                                            reset_result,
+                                                            next_issue['issue_number'],
+                                                            project_name, board_name,
+                                                        )
+                                                        logger.log(level, message)
                                                     except Exception as reset_error:
+                                                        # The ONE genuinely unrecoverable
+                                                        # case: the write raised, so the
+                                                        # entry's status is unknown and may
+                                                        # still be 'active'.
                                                         logger.critical(
                                                             f"Could NOT reset queue entry for issue "
                                                             f"#{next_issue['issue_number']} back to 'waiting' "
-                                                            f"after dispatch failed — it will be excluded from "
-                                                            f"all future dispatch on {project_name}/{board_name} "
-                                                            f"until a human intervenes: {reset_error}"
+                                                            f"after dispatch failed — its status is now unknown "
+                                                            f"and it may be excluded from all future dispatch on "
+                                                            f"{project_name}/{board_name} until a human "
+                                                            f"intervenes: {reset_error}"
                                                         )
 
                                             logger.error(f"Error dispatching agent for next issue: {dispatch_error}")

@@ -20,7 +20,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from services.pipeline_queue_manager import PipelineQueueManager
+from services.pipeline_queue_manager import (
+    PipelineQueueManager,
+    ResetResult,
+    describe_rollback_reset,
+)
 
 
 @pytest.fixture
@@ -221,7 +225,7 @@ class TestResetIssueToWaitingCompareAndSwap:
 
         assert queue_manager.reset_issue_to_waiting(
             901, expected_activated_at=entry['activated_at']
-        ) is True
+        ) is ResetResult.RESET
         assert queue_manager.get_issue_status(901) == 'waiting'
 
     def test_refuses_when_activated_at_changed(self, queue_manager):
@@ -232,9 +236,13 @@ class TestResetIssueToWaitingCompareAndSwap:
         queue_manager.save_queue([_active_issue(902)])
         queue_manager.mark_issue_active(902)  # concurrent dispatcher re-activates
 
-        assert queue_manager.reset_issue_to_waiting(
+        # REACTIVATED, specifically -- not the same thing as "there was nothing
+        # active to reset", which is what NOT_ACTIVE/NOT_FOUND mean (#147 review).
+        result = queue_manager.reset_issue_to_waiting(
             902, expected_activated_at=stale_activated_at
-        ) is False
+        )
+        assert result is ResetResult.REACTIVATED
+        assert not result
         assert queue_manager.get_issue_status(902) == 'active'
 
     def test_unconditional_reset_still_works_without_the_token(self, queue_manager):
@@ -243,7 +251,7 @@ class TestResetIssueToWaitingCompareAndSwap:
         failure branches) must be unaffected."""
         queue_manager.save_queue([_active_issue(903)])
 
-        assert queue_manager.reset_issue_to_waiting(903) is True
+        assert queue_manager.reset_issue_to_waiting(903) is ResetResult.RESET
         assert queue_manager.get_issue_status(903) == 'waiting'
 
     def test_mark_issue_active_returns_the_token_it_stamped(self, queue_manager):
@@ -264,7 +272,7 @@ class TestResetIssueToWaitingCompareAndSwap:
         assert token is not None
         assert queue_manager.reset_issue_to_waiting(
             904, expected_activated_at=token
-        ) is True
+        ) is ResetResult.RESET
         assert queue_manager.get_issue_status(904) == 'waiting'
 
     def test_mark_issue_active_returns_none_for_an_issue_not_in_queue(self, queue_manager):
@@ -298,7 +306,7 @@ class TestResetIssueToWaitingCompareAndSwap:
         assert re_marked == token
         assert queue_manager.reset_issue_to_waiting(
             906, expected_activated_at=token
-        ) is True
+        ) is ResetResult.RESET
         assert queue_manager.get_issue_status(906) == 'waiting'
 
     def test_a_genuinely_new_activation_still_stamps_afresh(self, queue_manager):
@@ -324,5 +332,81 @@ class TestResetIssueToWaitingCompareAndSwap:
         assert fresh_token != stale_token
         assert queue_manager.reset_issue_to_waiting(
             907, expected_activated_at=stale_token
-        ) is False
+        ) is ResetResult.REACTIVATED
         assert queue_manager.get_issue_status(907) == 'active'
+
+
+class TestResetResultDistinguishesBenignOutcomes:
+    """REGRESSION (#147 review): reset_issue_to_waiting() returned a bare bool,
+    so its THREE distinct falsy outcomes were indistinguishable — and every
+    dispatch-rollback call site logged the same CRITICAL page for all of them:
+    "the entry is still 'active' and will be excluded from all future dispatch
+    until a human intervenes".
+
+    That text is wrong for two of the three (the entry is NOT active), and for
+    the third (REACTIVATED) leaving the entry 'active' is the CORRECT outcome —
+    per reset_issue_to_waiting()'s own contract, a refused compare-and-swap
+    means another dispatcher legitimately owns that activation. None of the
+    three needs a human. Mirrors TouchResult in pipeline_lock_manager.py."""
+
+    def test_not_active_when_entry_is_already_waiting(self, queue_manager):
+        """The single most common false page in production: several paths reset
+        the entry themselves before returning None into a rollback (see
+        trigger_agent_for_status()'s consecutive-dispatch-failure and
+        no-agent-column branches), so the rollback's own CAS reset then runs
+        against an entry that is already 'waiting'."""
+        queue_manager.save_queue([{
+            'issue_number': 910,
+            'status': 'waiting',
+            'position_in_column': 0,
+        }])
+
+        result = queue_manager.reset_issue_to_waiting(
+            910, expected_activated_at='2026-01-01T00:00:00+00:00'
+        )
+        assert result is ResetResult.NOT_ACTIVE
+        assert not result
+
+    def test_not_found_when_there_is_no_queue_entry(self, queue_manager):
+        queue_manager.save_queue([])
+
+        result = queue_manager.reset_issue_to_waiting(
+            911, expected_activated_at='2026-01-01T00:00:00+00:00'
+        )
+        assert result is ResetResult.NOT_FOUND
+        assert not result
+
+    def test_only_reset_is_truthy(self):
+        """__bool__ keeps every pre-existing truthiness caller correct —
+        scheduled_tasks.py's `if queue_manager.reset_issue_to_waiting(...)`
+        counter, most importantly."""
+        assert bool(ResetResult.RESET) is True
+        assert bool(ResetResult.NOT_ACTIVE) is False
+        assert bool(ResetResult.NOT_FOUND) is False
+        assert bool(ResetResult.REACTIVATED) is False
+
+    def test_no_benign_outcome_is_reported_at_critical(self):
+        """The whole point: a rollback must not page a human for a healthy
+        state. Only an EXCEPTION out of reset_issue_to_waiting() is CRITICAL,
+        and that is handled at the call sites, not here."""
+        import logging
+
+        for result in ResetResult:
+            level, message = describe_rollback_reset(result, 42, 'proj', 'board')
+            assert level < logging.WARNING, (result, level, message)
+            assert message
+
+    def test_reactivated_message_says_the_entry_is_correctly_left_active(self):
+        _level, message = describe_rollback_reset(
+            ResetResult.REACTIVATED, 42, 'proj', 'board'
+        )
+        assert 'correct outcome' in message
+        # And explicitly NOT the old text, which claimed a human was needed.
+        assert 'human intervenes' not in message
+
+    def test_not_active_message_does_not_claim_the_entry_is_active(self):
+        _level, message = describe_rollback_reset(
+            ResetResult.NOT_ACTIVE, 42, 'proj', 'board'
+        )
+        assert "no longer 'active'" in message
+        assert 'human intervenes' not in message

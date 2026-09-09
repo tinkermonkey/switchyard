@@ -18,10 +18,25 @@ from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from datetime import datetime
 import time
 from services.pipeline_lock_manager import get_pipeline_lock_manager
-from services.pipeline_queue_manager import get_pipeline_queue_manager
+from services.pipeline_queue_manager import (
+    describe_rollback_reset,
+    get_pipeline_queue_manager,
+)
 from services.pipeline_run import get_pipeline_run_manager
 
 logger = logging.getLogger(__name__)
+
+
+class _DispatchDeferred(Exception):
+    """
+    A next-issue dispatch that was deliberately NOT attempted, as opposed to one
+    that was attempted and failed.
+
+    Raised inside _release_lock_and_process_next()'s per-slot dispatch attempt so
+    the acquisition (pipeline lock + 'active' queue entry) is unwound by exactly
+    the same rollback an outright failure gets, without reporting an expected,
+    routine deferral at ERROR. See the dormancy note at the raise site (#158).
+    """
 
 
 class PipelineProgression:
@@ -533,38 +548,52 @@ class PipelineProgression:
                         pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
                         workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
 
-                        # SAFETY: resolve the column from GitHub, not from the
-                        # queue entry. This used to read next_issue.get('column')
-                        # — a key PipelineQueueManager NEVER writes (entries carry
-                        # 'initial_column' from enqueue_issue(), or no column field
-                        # at all from sync_queue_with_github()/
-                        # force_sync_with_github()), so current_column was always
-                        # None, no workflow column ever matched, and this site
-                        # could never dispatch anything. Both sibling dispatch
-                        # sites already re-resolve from GitHub for the same reason
-                        # the cached column would be wrong anyway: the user may
-                        # have moved the issue since it was queued
-                        # (PipelineRunManager._resolve_issue_column_from_github(),
-                        # ProjectMonitor.get_issue_column_sync()). The
-                        # (column, reads_ok) variant is used so a failed board
-                        # query is never reported as "not on the board".
-                        current_column, column_reads_ok = (
-                            pipeline_run_manager._resolve_issue_column_from_github(
-                                project_config, pipeline_config, next_issue['issue_number']
-                            )
-                        )
+                        # DORMANT BY DESIGN — this site does NOT dispatch (#158).
+                        #
+                        # The column is read from the queue entry, which NEVER
+                        # carries one: enqueue_issue() writes 'initial_column',
+                        # and sync_queue_with_github() / force_sync_with_github()
+                        # write no column field at all. current_column is
+                        # therefore always None and every candidate takes the
+                        # deferral below. ProjectMonitor's FAILSAFE depends on the
+                        # same fact — it uses `'column' in next_issue` to tell a
+                        # stalled candidate from a queue row.
+                        #
+                        # Resolving the column from GitHub instead (attempted
+                        # during #147) would make this site dispatch for the FIRST
+                        # time, and the body below has NONE of
+                        # ProjectMonitor.trigger_agent_for_status()'s column-type
+                        # routing: no conversational, review, repair_cycle or
+                        # pr_review handling, and none of its duplicate-task /
+                        # active-execution / cancellation guards. It does a flat
+                        # `agent = col.agent` and enqueues a plain one-shot Task.
+                        # On a board whose trigger column is 'conversational'
+                        # (Planning & Design) that starts no feedback loop AND
+                        # leaves the board's exclusive lock held by a
+                        # conversational issue — which by design never holds it —
+                        # blocking every other issue on that board. Activating
+                        # this dispatcher safely needs routing through
+                        # trigger_agent_for_status(), as both sibling sites do,
+                        # and its own review: #158.
+                        #
+                        # The deferral is NOT a silent drop. The rollback below
+                        # releases the lock and resets the entry to 'waiting',
+                        # which is precisely the "waiting issue + unlocked
+                        # pipeline" state ProjectMonitor's FAILSAFE picks up and
+                        # dispatches through trigger_agent_for_status(), WITH
+                        # routing. (On main nothing was unwound: the lock stayed
+                        # held and the entry stayed 'active' with nothing
+                        # dispatched — the #142/#147 strand this rollback exists
+                        # to prevent.)
+                        current_column = next_issue.get('column')
 
                         if not current_column:
-                            if not column_reads_ok:
-                                raise Exception(
-                                    f"Could not read board '{board_name}' to resolve the column "
-                                    f"for issue #{next_issue['issue_number']} — dispatch deferred "
-                                    f"(the queue entry and lock are rolled back, so the next "
-                                    f"exit or poll retries)"
-                                )
-                            raise Exception(
-                                f"Issue #{next_issue['issue_number']} not found on board "
-                                f"'{board_name}' — cannot determine which agent to dispatch"
+                            raise _DispatchDeferred(
+                                f"Not dispatching queued issue #{next_issue['issue_number']} "
+                                f"from {project_name}/{board_name}'s exit path: this site "
+                                f"cannot route by column type (#158). Rolling the acquisition "
+                                f"back so the monitor's FAILSAFE dispatches it through "
+                                f"trigger_agent_for_status() instead"
                             )
 
                         agent = None
@@ -656,9 +685,16 @@ class PipelineProgression:
                         # CRITICAL: undo BOTH halves of the acquisition -- the lock
                         # (or the board deadlocks) and the queue entry (or the issue
                         # is silently lost from future dispatch).
+                        #
+                        # A _DispatchDeferred is the EXPECTED path here while this
+                        # site stays dormant (#158): the rollback is identical, but
+                        # a routine deferral is not an error and must not be
+                        # reported as one, or the real failures below drown in it.
+                        deferred = isinstance(dispatch_error, _DispatchDeferred)
+                        log_dispatch_failure = logger.info if deferred else logger.error
                         if not dispatched:
-                            logger.error(
-                                f"Dispatch failed for next queued issue "
+                            log_dispatch_failure(
+                                f"Dispatch not completed for next queued issue "
                                 f"#{next_issue['issue_number']}, rolling back lock "
                                 f"acquisition and queue status to prevent deadlock"
                             )
@@ -690,39 +726,39 @@ class PipelineProgression:
 
                             if activated_at is not None:
                                 try:
-                                    reset_ok = pipeline_queue.reset_issue_to_waiting(
+                                    reset_result = pipeline_queue.reset_issue_to_waiting(
                                         next_issue['issue_number'],
                                         expected_activated_at=activated_at,
                                     )
-                                    if not reset_ok:
-                                        # A refused compare-and-swap leaves exactly the
-                                        # state the raise path warns about, and only logs
-                                        # INFO on its way out - report it the same way, or
-                                        # the stranded entry is invisible to an operator.
-                                        logger.critical(
-                                            f"Could NOT reset queue entry for issue "
-                                            f"#{next_issue['issue_number']} back to 'waiting' after "
-                                            f"dispatch failed - the compare-and-swap on activated_at "
-                                            f"was refused, so the entry is still 'active' and will be "
-                                            f"excluded from all future dispatch on "
-                                            f"{project_name}/{board_name} until the stranded-'active' "
-                                            f"sweep or a human intervenes"
-                                        )
+                                    # NOT unconditionally CRITICAL on a falsy result:
+                                    # all three falsy outcomes are benign, and only one
+                                    # of them even leaves an entry 'active' (and doing
+                                    # so is then the correct outcome). See ResetResult.
+                                    level, message = describe_rollback_reset(
+                                        reset_result, next_issue['issue_number'],
+                                        project_name, board_name,
+                                    )
+                                    logger.log(level, message)
                                 except Exception as reset_error:
+                                    # The ONE genuinely unrecoverable case: the write
+                                    # raised, so the entry's status is unknown and may
+                                    # still be 'active' with nothing dispatched.
                                     logger.critical(
                                         f"Could NOT reset queue entry for issue "
                                         f"#{next_issue['issue_number']} back to 'waiting' after "
-                                        f"dispatch failed - it will be excluded from all future "
-                                        f"dispatch on {project_name}/{board_name} until the "
-                                        f"stranded-'active' sweep or a human intervenes: {reset_error}"
+                                        f"dispatch failed - its status is now unknown and it may "
+                                        f"be excluded from all future dispatch on "
+                                        f"{project_name}/{board_name} until the stranded-'active' "
+                                        f"sweep or a human intervenes: {reset_error}"
                                     )
 
-                        logger.error(
+                        log_dispatch_failure(
                             f"Error dispatching agent for next issue "
                             f"#{next_issue['issue_number']}: {dispatch_error}"
                         )
-                        import traceback
-                        logger.error(traceback.format_exc())
+                        if not deferred:
+                            import traceback
+                            logger.error(traceback.format_exc())
                 else:
                     logger.error(f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}")
 

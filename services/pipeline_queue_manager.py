@@ -54,11 +54,102 @@ import yaml
 import logging
 import fcntl
 import contextlib
+from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+class ResetResult(Enum):
+    """
+    Outcome of reset_issue_to_waiting() -- four genuinely different states that
+    a bare bool collapsed into one.
+
+    Found in review (#147): the dispatch-rollback call sites logged CRITICAL
+    ("the entry is still 'active' and will be excluded from all future dispatch
+    until a human intervenes") on ANY falsy return, but only ONE of the three
+    falsy cases is even about an entry left 'active', and none of them is
+    unrecoverable:
+
+    * NOT_ACTIVE -- the entry exists and is NOT 'active'. Overwhelmingly this
+      means somebody already reset it: trigger_agent_for_status()'s
+      consecutive-dispatch-failure branch and its no-agent-column branch both
+      call reset_issue_to_waiting() with no token and then return None, landing
+      the caller in exactly this rollback with an entry that is already
+      'waiting'. Nothing is stranded; nothing needs a human.
+    * NOT_FOUND -- no entry at all, e.g. the issue was removed from the queue
+      because it left the trigger column. Nothing to undo.
+    * REACTIVATED -- the compare-and-swap refused because a competing dispatcher
+      stamped a fresh activated_at. Per reset_issue_to_waiting()'s own contract
+      that means somebody else legitimately owns this activation, and leaving
+      the entry 'active' is the CORRECT outcome, not a fault.
+
+    Only an exception out of reset_issue_to_waiting() leaves the entry's state
+    genuinely unknown, and that is the one case worth paging on.
+
+    __bool__ is defined so every existing truthiness-based caller/assertion
+    (`if queue_manager.reset_issue_to_waiting(...)`, assertTrue/assertFalse)
+    keeps its original meaning: only RESET is truthy. Mirrors TouchResult in
+    services/pipeline_lock_manager.py, introduced for the same reason.
+    """
+
+    RESET = "reset"                  # was 'active', now 'waiting'
+    NOT_ACTIVE = "not_active"        # entry found but not 'active' -- nothing to undo
+    NOT_FOUND = "not_found"          # no entry in the queue -- nothing to undo
+    REACTIVATED = "reactivated"      # CAS refused: another dispatcher owns this activation
+
+    def __bool__(self) -> bool:
+        return self is ResetResult.RESET
+
+
+def describe_rollback_reset(
+    result: 'ResetResult', issue_number: int, project: str, board: str
+) -> tuple:
+    """
+    Render a dispatch-rollback reset outcome as (log_level, message).
+
+    Shared by the four dispatch-rollback sites so they report identically and,
+    more importantly, accurately -- see ResetResult's docstring for why a falsy
+    result is not a CRITICAL condition. Returns a logging level constant and the
+    message to log; a RESET result returns (logging.DEBUG, ...) since
+    reset_issue_to_waiting() already logs the successful reset itself.
+    """
+    where = f"{project}/{board}"
+    if result is ResetResult.RESET:
+        return (
+            logging.DEBUG,
+            f"Rolled back queue entry for issue #{issue_number} to 'waiting' on {where}",
+        )
+    if result is ResetResult.REACTIVATED:
+        return (
+            logging.INFO,
+            f"Not rolling back the queue entry for issue #{issue_number} on {where}: "
+            f"the compare-and-swap on activated_at was refused, so another dispatcher "
+            f"has since re-activated it. Leaving it 'active' is the correct outcome — "
+            f"that dispatcher owns the entry now",
+        )
+    if result is ResetResult.NOT_ACTIVE:
+        return (
+            logging.INFO,
+            f"No rollback needed for issue #{issue_number} on {where}: its queue entry "
+            f"is no longer 'active' (an earlier reset on this same path, e.g. "
+            f"trigger_agent_for_status()'s consecutive-failure or no-agent-column "
+            f"branch, already returned it to the queue)",
+        )
+    if result is ResetResult.NOT_FOUND:
+        return (
+            logging.INFO,
+            f"No rollback needed for issue #{issue_number} on {where}: it has no queue "
+            f"entry (it was removed from the queue, e.g. after leaving the trigger "
+            f"column)",
+        )
+    return (
+        logging.WARNING,
+        f"Unrecognized reset outcome {result!r} rolling back issue #{issue_number} "
+        f"on {where}",
+    )
 
 
 class PipelineQueueManager:
@@ -668,7 +759,7 @@ class PipelineQueueManager:
 
     def reset_issue_to_waiting(
         self, issue_number: int, expected_activated_at: Optional[str] = None
-    ):
+    ) -> ResetResult:
         """
         Reset an issue from active back to waiting status.
 
@@ -697,8 +788,12 @@ class PipelineQueueManager:
                 a None token means nothing was stamped, so skip the reset.
 
         Returns:
-            True if the entry was reset, False if it wasn't 'active', wasn't
-            found, or the compare-and-swap refused.
+            A ResetResult. Only ResetResult.RESET is truthy, so callers written
+            against the old bool are unaffected; callers that need to tell
+            "somebody else owns this activation" (REACTIVATED) from "there was
+            nothing active to undo" (NOT_ACTIVE / NOT_FOUND) can now do so
+            instead of reporting all three as the same emergency. See
+            ResetResult's docstring — none of the three is unrecoverable.
         """
         with self._queue_lock():
             queue = self.load_queue()
@@ -714,7 +809,7 @@ class PipelineQueueManager:
                                 f"{issue.get('activated_at')} != expected "
                                 f"{expected_activated_at})"
                             )
-                            return False
+                            return ResetResult.REACTIVATED
 
                         issue['status'] = 'waiting'
 
@@ -727,15 +822,15 @@ class PipelineQueueManager:
                             f"Reset issue #{issue_number} from active to waiting in queue "
                             f"(recovering from stale lock)"
                         )
-                        return True
+                        return ResetResult.RESET
                     else:
                         logger.debug(
                             f"Issue #{issue_number} has status {issue['status']}, no reset needed"
                         )
-                        return False
+                        return ResetResult.NOT_ACTIVE
 
             logger.debug(f"Issue #{issue_number} not found in queue, no reset performed")
-            return False
+            return ResetResult.NOT_FOUND
 
     def get_issue_status(self, issue_number: int) -> Optional[str]:
         """

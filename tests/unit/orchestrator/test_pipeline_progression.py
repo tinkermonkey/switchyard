@@ -15,7 +15,39 @@ from tests.unit.orchestrator.conftest import create_test_issue
 
 # The activated_at stamp mark_issue_active() returns and the rollback hands
 # back to reset_issue_to_waiting() as its compare-and-swap token.
+from services.pipeline_queue_manager import ResetResult
+
 ACTIVATED_AT = '2026-01-01T00:00:00+00:00'
+
+
+def _queue_row(issue_number, position=0, column=None, shape='enqueue'):
+    """A queue row exactly as get_next_n_waiting_issues() returns it.
+
+    `shape='enqueue'` mirrors enqueue_issue() ('initial_column'); `shape='sync'`
+    mirrors sync_queue_with_github()/force_sync_with_github() (no column field
+    of any kind). Neither ever carries a 'column' key -- that is what keeps
+    _release_lock_and_process_next()'s dispatch body dormant, and
+    TestDispatcherIsDormant below pins it.
+
+    `column` injects one anyway. Tests pass it ONLY to get past the dormancy
+    guard and exercise the per-slot rollback in the dispatch body, so that code
+    stays covered for whoever activates this site under #158. It is not a shape
+    production ever produces.
+    """
+    row = {
+        'issue_number': issue_number,
+        'position_in_column': position,
+        'status': 'waiting',
+    }
+    if shape == 'enqueue':
+        row['initial_column'] = 'Development'
+    else:
+        row['added_at'] = '2026-01-01T00:00:00+00:00'
+        row['last_position_check'] = '2026-01-01T00:00:00+00:00'
+        row['title'] = f'Issue #{issue_number}'
+    if column is not None:
+        row['column'] = column
+    return row
 
 
 class TestPipelineProgression:
@@ -565,12 +597,17 @@ class TestReleaseLockAndProcessNext:
         mock_lock_manager.release_lock.assert_not_called()
         mock_run_manager.end_pipeline_run.assert_called_once()
 
-    def test_dispatches_single_next_queued_issue_at_capacity_one(self):
-        """Byte-identical-at-capacity-1 check: with exactly one waiting
-        issue queued, _release_lock_and_process_next must release the lock,
-        query get_next_n_waiting_issues(1), acquire the lock for the
-        returned issue, mark it active, and enqueue a task for it - the
-        same sequence get_next_waiting_issue() drove before #57."""
+    def test_processes_single_next_queued_issue_at_capacity_one(self):
+        """Byte-identical-at-capacity-1 check: with exactly one waiting issue
+        queued, _release_lock_and_process_next must release the exiting issue's
+        lock, query get_next_n_waiting_issues(1), acquire the lock for the
+        returned issue and mark it active - the same sequence
+        get_next_waiting_issue() drove before #57.
+
+        It then does NOT dispatch (see TestDispatcherIsDormant / #158) and
+        cleanly unwinds both halves of that acquisition, leaving the board
+        unlocked and the entry 'waiting' for the monitor FAILSAFE to dispatch
+        with column-type routing."""
         our_lock = Mock()
         our_lock.locked_by_issue = 100
 
@@ -581,17 +618,11 @@ class TestReleaseLockAndProcessNext:
 
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = True
-        mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
-        ]
+        mock_queue.mark_issue_active.return_value = ACTIVATED_AT
+        mock_queue.get_next_n_waiting_issues.return_value = [_queue_row(200)]
 
         mock_run_manager = Mock()
         mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
-        # The column is resolved from GitHub, not from the queue entry -- queue
-        # entries never carry one (see _mocks() in the rollback suite below).
-        # (column, reads_healthy) so a failed board read is never mistaken for
-        # "the issue isn't on the board".
-        mock_run_manager._resolve_issue_column_from_github.return_value = ('Development', True)
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -626,19 +657,22 @@ class TestReleaseLockAndProcessNext:
 
             progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
 
-        mock_lock_manager.release_lock.assert_called_once_with('test-project', 'dev', 100)
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 100)
         mock_queue.get_next_n_waiting_issues.assert_called_once_with(1)
         mock_lock_manager.try_acquire_lock.assert_called_once_with(
             project='test-project', board='dev', issue_number=200
         )
         mock_queue.mark_issue_active.assert_called_once_with(200)
-        mock_tracker.record_execution_start.assert_called_once()
-        mock_task_queue.enqueue.assert_called_once()
-        dispatched_task = mock_task_queue.enqueue.call_args[0][0]
-        assert dispatched_task.context['issue_number'] == 200
-        assert dispatched_task.context['trigger'] == 'pipeline_progression'
-        # Nothing failed, so nothing is rolled back.
-        mock_queue.reset_issue_to_waiting.assert_not_called()
+
+        # Dormant: nothing enqueued, no execution probe written.
+        mock_tracker.record_execution_start.assert_not_called()
+        mock_task_queue.enqueue.assert_not_called()
+
+        # ...and the acquisition fully unwound, rather than stranded as on main.
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
 
 
 class TestReleaseLockAndProcessNextDispatchRollback:
@@ -649,8 +683,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
     status=='waiting', so that issue was silently excluded from every future
     dispatch, forever, with no automated recovery."""
 
-    def _mocks(self, agent='senior_software_engineer', github_column='Development',
-               column_reads_ok=True):
+    def _mocks(self, agent='senior_software_engineer'):
         our_lock = Mock()
         our_lock.locked_by_issue = 100
 
@@ -665,9 +698,6 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         mock_queue.mark_issue_active.return_value = ACTIVATED_AT
 
         mock_run_manager = Mock()
-        mock_run_manager._resolve_issue_column_from_github.return_value = (
-            github_column, column_reads_ok
-        )
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -714,7 +744,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
         # ensure_pipeline_run_for_task() returning None is one of the real
         # failure modes this block raises on.
@@ -740,7 +770,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
 
         mock_task_queue = Mock()
@@ -773,7 +803,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks(agent=None)
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
 
         mock_task_queue = Mock()
@@ -795,8 +825,8 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'},
-            {'issue_number': 300, 'position_in_column': 1, 'status': 'waiting', 'initial_column': 'Development'},
+            _queue_row(200, position=0, column='Development'),
+            _queue_row(300, position=1, column='Development'),
         ]
         # First candidate fails, second succeeds.
         mock_run_manager.ensure_pipeline_run_for_task.side_effect = [None, 'run-300']
@@ -816,56 +846,15 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         dispatched_task = mock_task_queue.enqueue.call_args[0][0]
         assert dispatched_task.context['issue_number'] == 300
 
-    def test_dispatches_production_shaped_queue_entry_with_no_column_key(self):
-        """REGRESSION: queue entries have NO 'column' key. enqueue_issue()
-        writes 'initial_column'; sync_queue_with_github()/
-        force_sync_with_github() write no column field at all. Reading
-        next_issue.get('column') therefore yielded None on every real
-        invocation, no workflow column ever matched, and this site took the
-        no-agent branch 100% of the time -- so it could never dispatch
-        anything. The column must come from GitHub, like both sibling sites."""
+    def test_rolls_back_when_github_column_is_injected_but_has_no_agent(self):
+        """Control for the injected-'column' rows the rest of this suite uses:
+        the dispatch body's own no-agent branch must roll back, not log and
+        leave the lock held."""
         (mock_lock_manager, mock_queue, mock_run_manager,
-         workflow_template, project_config) = self._mocks()
-
-        # Exactly what force_sync_with_github() produces: no column of any kind.
-        mock_queue.get_next_n_waiting_issues.return_value = [
-            {
-                'issue_number': 200,
-                'position_in_column': 0,
-                'status': 'waiting',
-                'added_at': '2026-01-01T00:00:00+00:00',
-                'last_position_check': '2026-01-01T00:00:00+00:00',
-                'title': 'Next issue',
-            }
-        ]
-        mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
-
-        mock_task_queue = Mock()
-        self._run(mock_lock_manager, mock_queue, mock_run_manager,
-                  workflow_template, project_config, mock_task_queue)
-
-        mock_run_manager._resolve_issue_column_from_github.assert_called_once()
-        assert mock_run_manager._resolve_issue_column_from_github.call_args[0][2] == 200
-
-        mock_task_queue.enqueue.assert_called_once()
-        dispatched_task = mock_task_queue.enqueue.call_args[0][0]
-        assert dispatched_task.context['issue_number'] == 200
-        assert dispatched_task.context['column'] == 'Development'
-        assert dispatched_task.agent == 'senior_software_engineer'
-
-        # Nothing failed, so nothing is rolled back.
-        mock_queue.reset_issue_to_waiting.assert_not_called()
-        mock_lock_manager.release_lock.assert_called_once_with('test-project', 'dev', 100)
-
-    def test_rolls_back_when_column_cannot_be_resolved_from_github(self):
-        """A GitHub read that can't place the issue on the board must roll
-        back both halves rather than dispatch against a stale cached column."""
-        (mock_lock_manager, mock_queue, mock_run_manager,
-         workflow_template, project_config) = self._mocks(github_column=None)
+         workflow_template, project_config) = self._mocks(agent='null')
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
-             'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
 
         mock_task_queue = Mock()
@@ -873,33 +862,90 @@ class TestReleaseLockAndProcessNextDispatchRollback:
                   workflow_template, project_config, mock_task_queue)
 
         mock_task_queue.enqueue.assert_not_called()
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
         mock_queue.reset_issue_to_waiting.assert_called_once_with(
             200, expected_activated_at=ACTIVATED_AT
         )
-        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
 
-    def test_refused_compare_and_swap_is_reported_at_critical(self, caplog):
-        """REGRESSION (#147): the return value was dropped on the floor. A
-        refused compare-and-swap does not raise — it returns False and logs at
-        INFO ("it was re-activated concurrently") — so the one outcome the
-        logger.critical text describes ("excluded from all future dispatch")
-        was the one outcome that never produced it."""
+    def test_never_consults_github_for_the_column(self):
+        """#158: this site must NOT resolve the column from GitHub. Doing so is
+        what would activate the dispatcher -- and it has no column-type routing,
+        so it would enqueue a plain one-shot Task for a conversational/review/
+        repair_cycle/pr_review column AND leave the board lock held by an issue
+        that must never hold it."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [_queue_row(200)]
+
+        self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                  workflow_template, project_config, Mock())
+
+        mock_run_manager._resolve_issue_column_from_github.assert_not_called()
+        mock_run_manager._get_issue_column_from_github.assert_not_called()
+
+    def test_refused_compare_and_swap_is_not_reported_at_critical(self, caplog):
+        """REGRESSION (#147 review): this used to log CRITICAL ("still 'active'
+        and will be excluded from all future dispatch until a human intervenes")
+        on ANY falsy return. A refused compare-and-swap means another dispatcher
+        legitimately re-activated the issue, and leaving it 'active' is the
+        CORRECT outcome -- paging a human for it is a false alarm."""
         (mock_lock_manager, mock_queue, mock_run_manager,
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
         mock_run_manager.ensure_pipeline_run_for_task.return_value = None
-        mock_queue.reset_issue_to_waiting.return_value = False
+        mock_queue.reset_issue_to_waiting.return_value = ResetResult.REACTIVATED
+
+        with caplog.at_level('DEBUG'):
+            self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                      workflow_template, project_config, Mock())
+
+        assert not [r for r in caplog.records if r.levelname == 'CRITICAL']
+        assert any(
+            'correct outcome' in r.getMessage() for r in caplog.records
+        )
+
+    def test_benign_not_active_reset_is_not_reported_at_critical(self, caplog):
+        """The other half of the same false page: several paths reset the entry
+        themselves before landing in a rollback, so NOT_ACTIVE is a routine,
+        healthy outcome."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            _queue_row(200, column='Development')
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = None
+        mock_queue.reset_issue_to_waiting.return_value = ResetResult.NOT_ACTIVE
+
+        with caplog.at_level('DEBUG'):
+            self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                      workflow_template, project_config, Mock())
+
+        assert not [r for r in caplog.records if r.levelname == 'CRITICAL']
+
+    def test_reset_that_raises_is_still_reported_at_critical(self, caplog):
+        """...but a reset that RAISES leaves the entry's status genuinely
+        unknown, and that one still pages."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            _queue_row(200, column='Development')
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = None
+        mock_queue.reset_issue_to_waiting.side_effect = RuntimeError("queue file unwritable")
 
         with caplog.at_level('CRITICAL'):
             self._run(mock_lock_manager, mock_queue, mock_run_manager,
                       workflow_template, project_config, Mock())
 
         assert any(
-            record.levelname == 'CRITICAL' and '200' in record.getMessage()
-            for record in caplog.records
+            r.levelname == 'CRITICAL' and '200' in r.getMessage()
+            for r in caplog.records
         )
 
     def test_rollback_releases_the_lock_before_the_compare_and_swap_reset(self):
@@ -915,8 +961,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
-             'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
         mock_run_manager.ensure_pipeline_run_for_task.return_value = None
 
@@ -943,8 +988,7 @@ class TestReleaseLockAndProcessNextDispatchRollback:
          workflow_template, project_config) = self._mocks()
 
         mock_queue.get_next_n_waiting_issues.return_value = [
-            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting',
-             'initial_column': 'Development'}
+            _queue_row(200, column='Development')
         ]
         mock_run_manager.ensure_pipeline_run_for_task.return_value = None
         mock_queue.reset_issue_to_waiting.side_effect = RuntimeError("queue file unwritable")
@@ -955,3 +999,136 @@ class TestReleaseLockAndProcessNextDispatchRollback:
 
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
 
+
+
+class TestDispatcherIsDormant:
+    """PIN (#158): _release_lock_and_process_next()'s dispatch body must NOT
+    dispatch, and this must stay a deliberate choice rather than an accident.
+
+    It is dormant because it reads the column off the queue entry, and
+    PipelineQueueManager never writes a 'column' key: enqueue_issue() writes
+    'initial_column', sync_queue_with_github()/force_sync_with_github() write no
+    column field at all. (ProjectMonitor's FAILSAFE relies on the same fact --
+    it uses `'column' in next_issue` to tell a stalled candidate from a queue
+    row.)
+
+    Making it dispatch is NOT a cosmetic cleanup. The body has none of
+    ProjectMonitor.trigger_agent_for_status()'s column-type routing: no
+    conversational, review, repair_cycle or pr_review handling, and none of its
+    duplicate-task/active-execution/cancellation guards. On the Planning &
+    Design board, whose trigger column is 'conversational', it would enqueue a
+    plain one-shot Task instead of starting a feedback loop AND leave the
+    board's exclusive lock held by a conversational issue -- which by design
+    never holds it -- blocking every other issue on that board.
+
+    Unlike main, the acquisition is not stranded: the deferral runs the same
+    rollback a failure gets, leaving "waiting entry + unlocked board", which is
+    exactly what the monitor's FAILSAFE picks up and dispatches WITH routing."""
+
+    def _run_with(self, rows):
+        our_lock = Mock()
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = True
+        mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        mock_queue = Mock()
+        mock_queue.is_issue_in_queue.return_value = True
+        mock_queue.mark_issue_active.return_value = ACTIVATED_AT
+        mock_queue.get_next_n_waiting_issues.return_value = rows
+
+        mock_run_manager = Mock()
+
+        # A conversational trigger column -- the exact configuration that makes
+        # activating this site harmful.
+        conv_column = Mock()
+        conv_column.name = 'Requirements'
+        conv_column.agent = 'business_analyst'
+        conv_column.type = 'conversational'
+        workflow_template = Mock()
+        workflow_template.columns = [conv_column]
+
+        pipeline_config = Mock()
+        pipeline_config.board_name = 'dev'
+        pipeline_config.name = 'planning'
+        pipeline_config.workflow = 'planning_workflow'
+
+        project_config = Mock()
+        project_config.pipelines = [pipeline_config]
+        project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+
+        mock_task_queue = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('services.pipeline_progression.config_manager') as mock_config_manager, \
+             patch('services.work_execution_state.work_execution_tracker') as mock_tracker, \
+             patch('monitoring.observability.get_observability_manager'):
+
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_config_manager.get_workflow_template.return_value = workflow_template
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(mock_task_queue)
+            progression._get_issue_details = Mock(return_value={'title': 'Next issue'})
+
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        return mock_lock_manager, mock_queue, mock_task_queue, mock_tracker
+
+    @pytest.mark.parametrize('shape', ['enqueue', 'sync'])
+    def test_does_not_dispatch_for_production_shaped_queue_rows(self, shape):
+        """Both real row shapes -- enqueue_issue()'s and the sync paths' --
+        must leave this site dispatching nothing."""
+        rows = [_queue_row(200, shape=shape)]
+        assert 'column' not in rows[0], "the fixture must not fabricate a column"
+
+        (mock_lock_manager, mock_queue,
+         mock_task_queue, mock_tracker) = self._run_with(rows)
+
+        mock_task_queue.enqueue.assert_not_called()
+        mock_tracker.record_execution_start.assert_not_called()
+
+    def test_unwinds_both_halves_of_the_acquisition_it_took(self):
+        """main leaves the lock held and the entry 'active' with nothing
+        dispatched -- the #142/#147 strand, which the stranded-'active' sweep
+        cannot recover because it skips the lock holder by design."""
+        rows = [_queue_row(200)]
+
+        (mock_lock_manager, mock_queue,
+         mock_task_queue, _tracker) = self._run_with(rows)
+
+        mock_queue.mark_issue_active.assert_called_once_with(200)
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
+
+    def test_deferral_is_not_logged_as_an_error(self, caplog):
+        """The deferral is the expected path on every exit-column progression.
+        Reporting it at ERROR (let alone CRITICAL) would bury the real dispatch
+        failures this rollback exists to surface."""
+        with caplog.at_level('DEBUG'):
+            self._run_with([_queue_row(200)])
+
+        assert not [
+            r for r in caplog.records
+            if r.levelname in ('ERROR', 'CRITICAL')
+        ], [r.getMessage() for r in caplog.records if r.levelname in ('ERROR', 'CRITICAL')]
+
+    def test_every_slot_defers_independently(self):
+        """The per-slot try/except must still be per-iteration: one candidate
+        deferring must not abort the loop for the rest."""
+        rows = [_queue_row(200, position=0), _queue_row(300, position=1)]
+
+        (mock_lock_manager, mock_queue,
+         mock_task_queue, _tracker) = self._run_with(rows)
+
+        assert mock_queue.mark_issue_active.call_count == 2
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
+        mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 300)
+        assert mock_queue.reset_issue_to_waiting.call_count == 2
+        mock_task_queue.enqueue.assert_not_called()
