@@ -1641,7 +1641,29 @@ class PipelineRunManager:
                                         logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
                                     except Exception as rollback_error:
                                         logger.error(f"Failed to rollback lock: {rollback_error}")
-                                
+
+                                    # MUST also undo the mark_issue_active() above, or
+                                    # get_next_n_waiting_issues() never selects this issue
+                                    # again (it filters strictly on status=='waiting') —
+                                    # the lock is freed but the queue entry stays 'active'
+                                    # forever, silently dropping the issue from every
+                                    # future dispatch with no automated recovery (#142).
+                                    # Deliberately NOT gated on the release above having
+                                    # succeeded: if the lock is retained due to an
+                                    # unrelated failure, try_acquire_lock() refuses this
+                                    # issue anyway, so leaving the entry 'active' only
+                                    # guarantees permanent loss without buying anything.
+                                    try:
+                                        pipeline_queue.reset_issue_to_waiting(next_issue['issue_number'])
+                                    except Exception as reset_error:
+                                        logger.critical(
+                                            f"Could NOT reset queue entry for issue "
+                                            f"#{next_issue['issue_number']} back to 'waiting' after "
+                                            f"dispatch failed — it will be excluded from all future "
+                                            f"dispatch on {project}/{pipeline_run.board} until a human "
+                                            f"intervenes: {reset_error}"
+                                        )
+
                                 logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                 import traceback
                                 logger.error(traceback.format_exc())

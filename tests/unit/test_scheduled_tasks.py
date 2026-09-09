@@ -937,6 +937,202 @@ class TestReapOrphanedTestContainers:
         assert rm_calls == []
 
 
+class TestResetStrandedActiveIssues:
+    """Issue #142 defense in depth: a queue entry left at status='active' by a
+    leaked dispatch rollback is excluded from all future dispatch forever
+    (get_next_n_waiting_issues() selects strictly on status=='waiting') and has
+    no other automated recovery. force_sync_with_github() does NOT cover it —
+    it only drops entries that have left the trigger column.
+
+    The sweep fails CLOSED: it only resets an entry when it can positively
+    establish that nothing is running it."""
+
+    def _queue_manager(self, active_entries):
+        queue_manager = MagicMock()
+        queue_manager.get_queue_summary.return_value = {
+            'active_issues': active_entries,
+            'waiting_issues': [],
+        }
+        queue_manager.reset_issue_to_waiting.return_value = True
+        return queue_manager
+
+    def _entry(self, issue_number, age_minutes=60):
+        activated = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+        return {
+            'issue_number': issue_number,
+            'status': 'active',
+            'activated_at': activated.isoformat(),
+        }
+
+    def _lock(self, locked_by_issue):
+        lock = MagicMock()
+        lock.lock_status = 'locked'
+        lock.locked_by_issue = locked_by_issue
+        return lock
+
+    def _sweep(self, scheduled_tasks_service, queue_manager, lock=None, active_run=None):
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock.return_value = lock
+
+        mock_run_manager = MagicMock()
+        mock_run_manager.get_active_pipeline_run.return_value = active_run
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager), \
+             patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=mock_run_manager):
+            return scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+    def test_resets_stranded_entry_with_no_lock_and_no_run(self, scheduled_tasks_service):
+        """REGRESSION (#142): the leaked-rollback state — 'active', past the
+        grace period, no lock holder, no active pipeline run."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        reset_count = self._sweep(scheduled_tasks_service, queue_manager)
+
+        assert reset_count == 1
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(200)
+
+    def test_skips_entry_that_holds_the_pipeline_lock(self, scheduled_tasks_service):
+        """The normal case: the active issue is the one actually executing."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager, lock=self._lock(200)
+        )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_entry_with_an_active_pipeline_run(self, scheduled_tasks_service):
+        """Conversational issues are marked active WITHOUT ever taking the
+        lock — the active-run check is what stops the sweep from resetting one
+        out from under a running agent."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager, active_run=MagicMock()
+        )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_entry_inside_the_grace_period(self, scheduled_tasks_service):
+        """A dispatch in flight (marked active seconds ago, task not yet
+        enqueued) must never be reset."""
+        queue_manager = self._queue_manager([self._entry(200, age_minutes=1)])
+
+        reset_count = self._sweep(scheduled_tasks_service, queue_manager)
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_entry_without_activated_at(self, scheduled_tasks_service):
+        """No timestamp to age against — fail closed rather than guess."""
+        queue_manager = self._queue_manager([
+            {'issue_number': 200, 'status': 'active'}
+        ])
+
+        reset_count = self._sweep(scheduled_tasks_service, queue_manager)
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_everything_when_lock_state_is_unreadable(self, scheduled_tasks_service):
+        """Can't establish ground truth -> reset nothing, rather than risk
+        re-dispatching an issue that is genuinely running."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock.side_effect = RuntimeError("redis down")
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager), \
+             patch('services.pipeline_run.get_pipeline_run_manager'):
+            reset_count = scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_skips_entry_when_run_lookup_errors(self, scheduled_tasks_service):
+        """Same fail-closed rule, per entry."""
+        queue_manager = self._queue_manager([self._entry(200)])
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock.return_value = None
+        mock_run_manager = MagicMock()
+        mock_run_manager.get_active_pipeline_run.side_effect = RuntimeError("redis down")
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager), \
+             patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=mock_run_manager):
+            reset_count = scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_sweeps_siblings_of_the_lock_holder(self, scheduled_tasks_service):
+        """A board can carry more than one 'active' entry (nothing at the
+        queue-manager level prevents it) — the lock holder is kept, the
+        stranded sibling is reset."""
+        queue_manager = self._queue_manager([self._entry(200), self._entry(300)])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager, lock=self._lock(200)
+        )
+
+        assert reset_count == 1
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(300)
+
+    def test_no_active_entries_short_circuits(self, scheduled_tasks_service):
+        """Common case: nothing active, no lock or run lookups performed."""
+        queue_manager = self._queue_manager([])
+
+        mock_lock_manager = MagicMock()
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=mock_lock_manager):
+            reset_count = scheduled_tasks_service._reset_stranded_active_issues(
+                queue_manager, 'test-project', 'dev'
+            )
+
+        assert reset_count == 0
+        mock_lock_manager.get_lock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_runs_the_sweep_after_force_sync(self, scheduled_tasks_service):
+        """Wiring check: the sweep is driven by the existing 10-minute queue
+        reconciliation job, and runs AFTER force_sync_with_github() so entries
+        the sync already dropped aren't considered."""
+        pipeline = MagicMock()
+        pipeline.board_name = 'dev'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline]
+
+        call_order = []
+        queue_manager = MagicMock()
+        queue_manager.force_sync_with_github.side_effect = lambda: call_order.append('sync')
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.pipeline_queue_manager.PipelineQueueManager',
+                   return_value=queue_manager), \
+             patch.object(scheduled_tasks_service, '_reset_stranded_active_issues',
+                          side_effect=lambda *a, **kw: call_order.append('sweep') or 0) as mock_sweep:
+            mock_config.list_visible_projects.return_value = ['test-project']
+            mock_config.get_project_config.return_value = project_config
+
+            await scheduled_tasks_service._reconcile_queue_state()
+
+        assert call_order == ['sync', 'sweep']
+        mock_sweep.assert_called_once_with(queue_manager, 'test-project', 'dev')
+
+
 class TestGlobalInstance:
     """Test global singleton instance"""
 

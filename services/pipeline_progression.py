@@ -502,93 +502,152 @@ class PipelineProgression:
                 
                 if acquired:
                     pipeline_queue.mark_issue_active(next_issue['issue_number'])
-                    
-                    # Get current column for next issue
-                    current_column = next_issue.get('column')
-                    
-                    # Get agent for this column
-                    project_config = config_manager.get_project_config(project_name)
-                    pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
-                    workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
-                    
-                    agent = None
-                    for col in workflow_template.columns:
-                        if col.name == current_column:
-                            agent = col.agent
-                            break
-                            
-                    if agent and agent != 'null':
-                        # Fetch issue details
-                        issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
 
-                        # Get or create pipeline run for next issue.
-                        # get_pipeline_run_manager is already imported at module
-                        # level above — a redundant local import here previously
-                        # shadowed it for this ENTIRE function (Python's scoping
-                        # rules make a name local to the whole function body the
-                        # moment it's assigned/imported anywhere inside it, even
-                        # conditionally), which made the earlier
-                        # `pipeline_run_manager = get_pipeline_run_manager()`
-                        # call at the top of this method raise UnboundLocalError
-                        # every single time — silently swallowed by this
-                        # method's own outer except, so lock release, queue
-                        # cleanup, and next-issue dispatch never actually ran
-                        # via this path. Pre-existing (2026-01-14, unrelated to
-                        # this PR), found while adding regression coverage for
-                        # a different fix to this same method.
-                        pipeline_run_manager = get_pipeline_run_manager()
-                        pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
-                            project=project_name,
-                            board=board_name,
-                            issue_number=next_issue['issue_number'],
-                            issue_data=issue_data  # Already fetched on line 397
-                        )
+                    # SAFETY: every step from here to the enqueue can raise
+                    # (config lookup, GitHub issue fetch, pipeline-run creation,
+                    # enqueue itself). Each slot's dispatch attempt needs its OWN
+                    # try/except: the method-level handler below only logs, which
+                    # left the lock held AND the queue entry stuck at 'active'
+                    # forever -- and get_next_n_waiting_issues() filters strictly
+                    # on status=='waiting', so that issue was silently excluded
+                    # from every future dispatch with no automated recovery
+                    # (#142). Mirrors the rollback in the sibling dispatch site,
+                    # PipelineRunManager.end_pipeline_run().
+                    dispatched = False
+                    try:
+                        # Get current column for next issue
+                        current_column = next_issue.get('column')
 
-                        if not pipeline_run_id:
-                            raise Exception(
-                                f"Failed to create/retrieve pipeline run for issue #{next_issue['issue_number']}"
+                        # Get agent for this column
+                        project_config = config_manager.get_project_config(project_name)
+                        pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
+                        workflow_template = config_manager.get_workflow_template(pipeline_config.workflow)
+
+                        agent = None
+                        for col in workflow_template.columns:
+                            if col.name == current_column:
+                                agent = col.agent
+                                break
+
+                        if agent and agent != 'null':
+                            # Fetch issue details
+                            issue_data = self._get_issue_details(repository, next_issue['issue_number'], project_config.github['org'])
+
+                            # Get or create pipeline run for next issue.
+                            # get_pipeline_run_manager is already imported at module
+                            # level above — a redundant local import here previously
+                            # shadowed it for this ENTIRE function (Python's scoping
+                            # rules make a name local to the whole function body the
+                            # moment it's assigned/imported anywhere inside it, even
+                            # conditionally), which made the earlier
+                            # `pipeline_run_manager = get_pipeline_run_manager()`
+                            # call at the top of this method raise UnboundLocalError
+                            # every single time — silently swallowed by this
+                            # method's own outer except, so lock release, queue
+                            # cleanup, and next-issue dispatch never actually ran
+                            # via this path. Pre-existing (2026-01-14, unrelated to
+                            # this PR), found while adding regression coverage for
+                            # a different fix to this same method.
+                            pipeline_run_manager = get_pipeline_run_manager()
+                            pipeline_run_id = pipeline_run_manager.ensure_pipeline_run_for_task(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=next_issue['issue_number'],
+                                issue_data=issue_data  # Already fetched on line 397
                             )
 
-                        # Create task
-                        task_context = {
-                            'project': project_name,
-                            'board': board_name,
-                            'pipeline': pipeline_config.name,
-                            'repository': repository,
-                            'issue_number': next_issue['issue_number'],
-                            'issue': issue_data,
-                            'column': current_column,
-                            'trigger': 'pipeline_progression', # Triggered by previous issue exiting
-                            'pipeline_run_id': pipeline_run_id,  # ADD THIS
-                            'timestamp': datetime.now().isoformat()
-                        }
+                            if not pipeline_run_id:
+                                raise Exception(
+                                    f"Failed to create/retrieve pipeline run for issue #{next_issue['issue_number']}"
+                                )
 
-                        task = Task(
-                            id=str(uuid.uuid4()),
-                            agent=agent,
-                            project=project_name,
-                            priority=TaskPriority.MEDIUM,
-                            context=task_context,
-                            created_at=datetime.now().isoformat()
+                            # Create task
+                            task_context = {
+                                'project': project_name,
+                                'board': board_name,
+                                'pipeline': pipeline_config.name,
+                                'repository': repository,
+                                'issue_number': next_issue['issue_number'],
+                                'issue': issue_data,
+                                'column': current_column,
+                                'trigger': 'pipeline_progression', # Triggered by previous issue exiting
+                                'pipeline_run_id': pipeline_run_id,  # ADD THIS
+                                'timestamp': datetime.now().isoformat()
+                            }
+
+                            task = Task(
+                                id=str(uuid.uuid4()),
+                                agent=agent,
+                                project=project_name,
+                                priority=TaskPriority.MEDIUM,
+                                context=task_context,
+                                created_at=datetime.now().isoformat()
+                            )
+
+                            # Record execution start FIRST
+                            # CRITICAL: Must happen before enqueue to prevent race condition
+                            from services.work_execution_state import work_execution_tracker
+                            work_execution_tracker.record_execution_start(
+                                issue_number=next_issue['issue_number'],
+                                column=current_column,
+                                agent=agent,
+                                trigger_source='pipeline_progression',
+                                project_name=project_name
+                            )
+
+                            # Enqueue task LAST so workers find in_progress state
+                            self.task_queue.enqueue(task)
+                            dispatched = True
+
+                            logger.info(f"Triggered agent {agent} for next waiting issue #{next_issue['issue_number']}")
+                        else:
+                            # Rolled back rather than logged-and-left: holding the
+                            # lock and the 'active' queue entry for an issue nothing
+                            # will ever dispatch is a permanent board deadlock.
+                            raise Exception(
+                                f"Next queued issue #{next_issue['issue_number']} is in column "
+                                f"'{current_column}' which has no agent"
+                            )
+                    except Exception as dispatch_error:
+                        # CRITICAL: undo BOTH halves of the acquisition -- the lock
+                        # (or the board deadlocks) and the queue entry (or the issue
+                        # is silently lost from future dispatch).
+                        if not dispatched:
+                            logger.error(
+                                f"Dispatch failed for next queued issue "
+                                f"#{next_issue['issue_number']}, rolling back lock "
+                                f"acquisition and queue status to prevent deadlock"
+                            )
+                            try:
+                                lock_manager.release_lock(
+                                    project_name, board_name, next_issue['issue_number']
+                                )
+                                logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
+                            except Exception as rollback_error:
+                                logger.error(f"Failed to rollback lock: {rollback_error}")
+
+                            # Deliberately NOT gated on the release above having
+                            # succeeded: if the lock is retained due to an unrelated
+                            # failure, try_acquire_lock() refuses this issue anyway,
+                            # so leaving the entry 'active' only guarantees permanent
+                            # loss without buying anything.
+                            try:
+                                pipeline_queue.reset_issue_to_waiting(next_issue['issue_number'])
+                            except Exception as reset_error:
+                                logger.critical(
+                                    f"Could NOT reset queue entry for issue "
+                                    f"#{next_issue['issue_number']} back to 'waiting' after "
+                                    f"dispatch failed - it will be excluded from all future "
+                                    f"dispatch on {project_name}/{board_name} until a human "
+                                    f"intervenes: {reset_error}"
+                                )
+
+                        logger.error(
+                            f"Error dispatching agent for next issue "
+                            f"#{next_issue['issue_number']}: {dispatch_error}"
                         )
-
-                        # Record execution start FIRST
-                        # CRITICAL: Must happen before enqueue to prevent race condition
-                        from services.work_execution_state import work_execution_tracker
-                        work_execution_tracker.record_execution_start(
-                            issue_number=next_issue['issue_number'],
-                            column=current_column,
-                            agent=agent,
-                            trigger_source='pipeline_progression',
-                            project_name=project_name
-                        )
-
-                        # Enqueue task LAST so workers find in_progress state
-                        self.task_queue.enqueue(task)
-                        
-                        logger.info(f"Triggered agent {agent} for next waiting issue #{next_issue['issue_number']}")
-                    else:
-                        logger.warning(f"Next issue #{next_issue['issue_number']} is in column '{current_column}' which has no agent")
+                        import traceback
+                        logger.error(traceback.format_exc())
                 else:
                     logger.error(f"Failed to acquire lock for next issue #{next_issue['issue_number']}: {reason}")
 

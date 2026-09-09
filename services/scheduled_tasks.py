@@ -17,6 +17,15 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
+# Minimum age of a queue entry's `activated_at` before the stranded-'active'
+# sweep will consider resetting it (issue #142). Every dispatch call site marks
+# an issue active immediately after acquiring the lock and enqueues within
+# seconds, so anything still lock-less and run-less this long afterwards is a
+# genuine leak, not a dispatch in flight. Generous on purpose: a false positive
+# here re-dispatches work that is actually running, which is far worse than
+# leaving a stranded entry for one more 10-minute sweep.
+STRANDED_ACTIVE_GRACE_MINUTES = 15
+
 
 class ScheduledTasksService:
     """Manages periodic background tasks for the orchestrator"""
@@ -607,6 +616,14 @@ class ScheduledTasksService:
 
         This runs every 10 minutes to ensure queues don't drift from GitHub reality.
         Uses force_sync_with_github which always overwrites local state.
+
+        Also sweeps for queue entries stranded at status='active' with nothing
+        actually executing them (issue #142) — force_sync_with_github() does not
+        cover that case: it only removes entries that have left the trigger
+        column, so a stranded 'active' entry for an issue still sitting in the
+        column survives every sync untouched and is excluded from dispatch
+        forever (get_next_n_waiting_issues() filters strictly on
+        status=='waiting').
         """
         logger.info("Starting queue state reconciliation with GitHub")
 
@@ -621,6 +638,7 @@ class ScheduledTasksService:
 
             reconciled_count = 0
             error_count = 0
+            stranded_reset_count = 0
 
             for project_name in project_names:
                 try:
@@ -646,6 +664,13 @@ class ScheduledTasksService:
                             # Force sync with GitHub
                             queue_manager.force_sync_with_github()
 
+                            # Defense in depth for the dispatch-rollback gap
+                            # (#142): runs AFTER the force sync so entries the
+                            # sync already dropped aren't considered at all.
+                            stranded_reset_count += self._reset_stranded_active_issues(
+                                queue_manager, project_name, board_name
+                            )
+
                             reconciled_count += 1
 
                         except Exception as e:
@@ -660,11 +685,131 @@ class ScheduledTasksService:
 
             logger.info(
                 f"Queue state reconciliation complete: "
-                f"{reconciled_count} queues synced, {error_count} errors"
+                f"{reconciled_count} queues synced, "
+                f"{stranded_reset_count} stranded 'active' entries reset, "
+                f"{error_count} errors"
             )
 
         except Exception as e:
             logger.error(f"Error in queue state reconciliation: {e}", exc_info=True)
+
+    def _reset_stranded_active_issues(
+        self, queue_manager, project_name: str, board_name: str
+    ) -> int:
+        """
+        Reset queue entries stuck at status='active' with nothing executing them.
+
+        A dispatch call site marks an issue active immediately after acquiring
+        the pipeline lock and enqueues a task moments later. If anything in
+        between raises and the rollback itself also fails (or the process dies
+        between the two), the entry stays 'active' forever — and since
+        get_next_n_waiting_issues() selects strictly on status=='waiting', that
+        issue is silently excluded from every future dispatch. There is no other
+        automated recovery for this state, unlike the lock side's staleness/TTL
+        recovery, so it needs a sweep of its own (#142).
+
+        Fails CLOSED at every step: an entry is only reset when this method can
+        positively establish that nothing is running it. Anything it can't
+        determine — no `activated_at` to age against, an unreadable lock, an
+        errored pipeline-run lookup — leaves the entry alone.
+
+        An entry is reset only when ALL of:
+          - it is older than STRANDED_ACTIVE_GRACE_MINUTES (not a dispatch in flight)
+          - it does not hold this (project, board)'s pipeline lock
+          - it has no active PipelineRun (this is what keeps conversational
+            issues, which are marked active WITHOUT ever taking the lock, from
+            being reset out from under a running agent)
+
+        Returns:
+            Number of entries reset to 'waiting'.
+        """
+        try:
+            summary = queue_manager.get_queue_summary()
+            active_entries = summary.get('active_issues') or []
+            if not active_entries:
+                return 0
+
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            from services.pipeline_run import get_pipeline_run_manager
+
+            lock = get_pipeline_lock_manager().get_lock(project_name, board_name)
+            lock_holder = (
+                lock.locked_by_issue
+                if lock and lock.lock_status == 'locked'
+                else None
+            )
+            run_manager = get_pipeline_run_manager()
+        except Exception as e:
+            # Can't establish ground truth — reset nothing rather than risk
+            # re-dispatching an issue that is genuinely running.
+            logger.error(
+                f"Could not evaluate stranded 'active' queue entries for "
+                f"{project_name}/{board_name}: {e}"
+            )
+            return 0
+
+        now = datetime.now(timezone.utc)
+        reset_count = 0
+
+        for entry in active_entries:
+            issue_number = entry.get('issue_number')
+
+            if issue_number is None or issue_number == lock_holder:
+                continue
+
+            activated_at = entry.get('activated_at')
+            if not activated_at:
+                logger.debug(
+                    f"Queue entry for #{issue_number} on {project_name}/{board_name} is "
+                    f"'active' with no activated_at timestamp — cannot age it, skipping"
+                )
+                continue
+
+            try:
+                activated = datetime.fromisoformat(activated_at)
+                if activated.tzinfo is None:
+                    activated = activated.replace(tzinfo=timezone.utc)
+                age_minutes = (now - activated).total_seconds() / 60
+            except Exception as e:
+                logger.warning(
+                    f"Unparseable activated_at '{activated_at}' for #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
+            if age_minutes < STRANDED_ACTIVE_GRACE_MINUTES:
+                continue
+
+            try:
+                active_run = run_manager.get_active_pipeline_run(
+                    project_name, issue_number, board=board_name
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not check for an active pipeline run for #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
+            if active_run:
+                continue
+
+            try:
+                if queue_manager.reset_issue_to_waiting(issue_number):
+                    reset_count += 1
+                    logger.warning(
+                        f"Reset stranded queue entry for issue #{issue_number} on "
+                        f"{project_name}/{board_name} from 'active' back to 'waiting' — "
+                        f"active for {age_minutes:.0f}m with no pipeline lock and no "
+                        f"active pipeline run (dispatch rollback almost certainly leaked)"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to reset stranded queue entry for issue #{issue_number} on "
+                    f"{project_name}/{board_name}: {e}"
+                )
+
+        return reset_count
 
     async def _sweep_orphaned_parents(self):
         """
