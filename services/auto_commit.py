@@ -335,6 +335,16 @@ class AutoCommitService:
         Refusing leaves that work on disk for the caller's failure path, which
         is the same trade the shared clone already makes.
 
+        This is not the only commit path in the orchestrator, and the invariant
+        is only worth as much as the weakest one: FeatureBranchManager
+        .finalize_feature_branch_work() is the equivalent step for ordinary
+        'issues'/'hybrid' dispatch (the higher-volume path -- this method covers
+        the review-cycle and repair-cycle ones), and it used to do the opposite
+        here, adopting whatever branch git reported as its push target. It now
+        takes the same caller-supplied expected_branch off the same
+        pipeline_run.branch_name and refuses on the same terms -- see
+        _verify_finalize_branch() (#149 WI-4 review).
+
         is_shared_dir still decides fatality for the FALLBACK expectation
         (pre_lock_branch, used when no expected_branch is supplied): there it
         closes the narrower "another board checked out during our lock wait"
@@ -475,6 +485,22 @@ class AutoCommitService:
 
         # Check if there are changes to commit
         has_changes = self._check_for_changes(project_dir)
+        if has_changes is None:
+            # #149 item 33 at the module's last unguarded git boundary: git
+            # could not say whether the tree is dirty, and the old bool
+            # contract answered "clean" -- which skipped the commit, returned
+            # the truthy NOTHING_TO_COMMIT, and let both repair-cycle callers
+            # advance the issue with the fix still sitting on disk. Refusing
+            # keeps the work where it is and routes them to their existing
+            # mark_failed/retain-lock paths instead.
+            logger.error(
+                f"Auto-commit could not determine whether {project_dir} has "
+                f"uncommitted changes (project={project}, agent={agent}, "
+                f"issue={issue_number}) -- refusing to report a clean tree. See "
+                "the _check_for_changes() error logged above for the specific "
+                "git failure. Any changes are left uncommitted on disk."
+            )
+            return CommitResult.FAILED
 
         if has_changes:
             # Stage all changes
@@ -510,8 +536,27 @@ class AutoCommitService:
         # question from #148 I1, which is about the commit never happening.
         return CommitResult.COMMITTED if has_changes else CommitResult.NOTHING_TO_COMMIT
 
-    def _check_for_changes(self, project_dir: Path) -> bool:
-        """Check if there are uncommitted changes"""
+    def _check_for_changes(self, project_dir: Path) -> Optional[bool]:
+        """
+        Whether there are uncommitted changes, or None if git could not say.
+
+        The None is _get_current_branch()'s sibling (#149 item 33), at the last
+        unguarded git boundary left in this module. This used to ignore
+        result.returncode entirely and return bool(result.stdout.strip()), with
+        the `except` arm returning False -- so a `git status` that exited 128 on
+        an `.git/index.lock` left behind by a killed agent container, or that
+        exceeded the timeout on a large tree the agent had just rewritten, read
+        as "clean tree". _commit_and_push() then skipped the commit, pushed
+        nothing new and returned NOTHING_TO_COMMIT, which is truthy, so
+        project_monitor.py's and agent_container_recovery.py's repair-cycle
+        paths logged "No changes to commit" and advanced the issue to PR review
+        on a branch with no fix on it -- the exact tests-passed-but-fix-never-
+        committed outcome CommitResult exists to make impossible. The
+        non-zero-returncode variant said nothing at all.
+
+        Both failure arms are now None, distinguishable from a genuinely clean
+        tree, and the caller turns it into CommitResult.FAILED.
+        """
         try:
             result = subprocess.run(
                 ['git', 'status', '--porcelain'],
@@ -521,12 +566,19 @@ class AutoCommitService:
                 timeout=10
             )
 
+            if result.returncode != 0:
+                logger.error(
+                    f"Failed to check for changes in {project_dir}: git status "
+                    f"exited {result.returncode}: {result.stderr.strip()}"
+                )
+                return None
+
             # If output is empty, no changes
             return bool(result.stdout.strip())
 
         except Exception as e:
-            logger.error(f"Failed to check for changes: {e}")
-            return False
+            logger.error(f"Failed to check for changes in {project_dir}: {e}")
+            return None
 
     def _get_current_branch(self, project_dir: Path) -> Optional[str]:
         """

@@ -964,6 +964,22 @@ class AgentExecutor:
 
                     if finalize_result.get('success'):
                         logger.info(f"✅ Finalized workspace: {finalize_result}")
+                    elif finalize_result.get('branch_mismatch'):
+                        # finalize_feature_branch_work() refused because the
+                        # workspace is not on this dispatch's own branch (#149
+                        # WI-4 review). The failsafe below is an unguarded
+                        # `git add -A` + commit + push of ambient HEAD, so
+                        # running it here would land exactly the work the
+                        # refusal just protected on exactly the wrong branch —
+                        # i.e. quietly undo the refusal. Leave the changes on
+                        # disk instead; the branch has to be sorted out before
+                        # anything can be committed from this directory.
+                        logger.error(
+                            f"❌ Workspace finalization refused a wrong-branch commit: "
+                            f"{finalize_result.get('error', 'Unknown')}\n"
+                            f"  Skipping the failsafe commit — it would commit onto the "
+                            f"same wrong branch. Changes left uncommitted on disk."
+                        )
                     else:
                         # Finalization returned failure - log details and check for uncommitted changes
                         logger.warning(

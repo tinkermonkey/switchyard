@@ -145,6 +145,7 @@ class TestIssuesWorkspaceContext:
         mock_gh = MagicMock()
         mock_pipeline_run = MagicMock()
         mock_pipeline_run.project_dir = '/workspace/.orchestrator/worktrees/test-project/42'
+        mock_pipeline_run.branch_name = 'feature/issue-42-epic'
         context = IssuesWorkspaceContext(
             project='test-project',
             issue_number=123,
@@ -168,13 +169,16 @@ class TestIssuesWorkspaceContext:
             )
 
             # Verify finalization was called against the resolved epic worktree,
-            # not the shared base clone.
+            # not the shared base clone -- and onto that same resolution's
+            # branch, which finalize_feature_branch_work() verifies rather than
+            # adopting whatever git reports (#149 WI-4 review).
             mock_fbm.finalize_feature_branch_work.assert_called_once_with(
                 project='test-project',
                 issue_number=123,
                 commit_message='Test commit',
                 github_integration=mock_gh,
-                project_dir_override='/workspace/.orchestrator/worktrees/test-project/42'
+                project_dir_override='/workspace/.orchestrator/worktrees/test-project/42',
+                expected_branch='feature/issue-42-epic'
             )
 
             # Verify result

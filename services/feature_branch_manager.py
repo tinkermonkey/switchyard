@@ -1337,13 +1337,88 @@ git push --force-with-lease
         await github_integration.post_comment(parent_issue, message, pipeline_run_id=pipeline_run_id)
         logger.warning(f"Escalated stale branch for parent #{parent_issue}: {commits_behind} commits behind")
 
+    async def _verify_finalize_branch(
+        self,
+        project: str,
+        issue_number: int,
+        project_dir: str,
+        expected_branch: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Decide whether what is checked out in project_dir is genuinely THIS
+        finalization's own target.
+
+        #149 WI-4 review: auto_commit.py's _verify_commit_branch() closed this
+        for the review-cycle and repair-cycle paths, but finalize_feature_branch_work()
+        -- the higher-volume commit/push path for ordinary 'issues'/'hybrid'
+        dispatch -- did the opposite a few hundred lines away: it read the
+        checked-out branch, and on a disagreement with the tracked feature
+        branch logged a warning and adopted the checked-out name as the push
+        target ("git is the source of truth"). Handed the identical on-disk
+        state the two paths returned opposite verdicts.
+
+        The live mismatch source is the same one _verify_commit_branch()'s
+        docstring names: the agent container's own git moving HEAD inside the
+        bind-mounted worktree. Epic E's worktree is on feature/issue-E, sub-issue
+        #A's container runs `git switch -c scratch`, and the adopt-what-git-says
+        rule then staged, committed and pushed #A's entire feature onto scratch
+        and opened a PR against it.
+
+        Refuses rather than checking expected_branch out, for
+        _verify_commit_branch()'s reason: the tree holds the agent's uncommitted
+        changes on top of whatever baseline the container left, so a checkout
+        would either fail or silently reinterpret them against the wrong
+        baseline. The work stays on disk for the caller's failure path.
+
+        A branch git cannot report at all is refused on the same terms --
+        get_current_branch() raises there, and letting that propagate would
+        reach agent_executor.py's generic finalization handler as an unexplained
+        exception rather than as this method's own documented refusal.
+
+        Returns:
+            None to proceed with the finalization, or the failure dict
+            finalize_feature_branch_work() should return as-is.
+        """
+        if not expected_branch:
+            # No resolved workspace to verify against (standalone/test callers,
+            # see finalize_feature_branch_work()'s note) -- the pre-existing
+            # "git is the source of truth" behavior below stands.
+            return None
+
+        try:
+            current_branch = await self.get_current_branch(project_dir)
+        except Exception as e:
+            error_msg = (
+                f"Cannot verify the branch in {project_dir} before finalizing issue "
+                f"#{issue_number} ({project}): {e}. Refusing to stage or commit "
+                "against an unknown branch; the changes are left uncommitted on disk."
+            )
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg, "branch_mismatch": True}
+
+        if current_branch and current_branch == expected_branch:
+            return None
+
+        error_msg = (
+            f"Refusing to finalize onto the wrong branch: {project_dir} is on "
+            f"{current_branch!r} but this dispatch's target is {expected_branch!r} "
+            f"(project={project}, issue=#{issue_number}). Something -- almost "
+            "certainly the agent container's own git -- checked out a different "
+            "branch in this workspace; committing here would push this agent's work "
+            "onto an unrelated issue's branch and open a PR against it (#143). The "
+            "changes are left uncommitted on disk."
+        )
+        logger.error(error_msg)
+        return {"success": False, "error": error_msg, "branch_mismatch": True}
+
     async def finalize_feature_branch_work(
         self,
         project: str,
         issue_number: int,
         commit_message: str,
         github_integration,
-        project_dir_override: Optional[str] = None
+        project_dir_override: Optional[str] = None,
+        expected_branch: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Commit changes, push, update state, check completion
@@ -1356,8 +1431,23 @@ git push --force-with-lease
                 MUST be passed, or this method silently commits/pushes from the
                 wrong directory: none of the agent's real changes, and possibly on
                 whatever branch the base clone happens to be on at the time).
+            expected_branch: The branch this finalization is meant to land on,
+                read from the SAME already-resolved source the caller reads
+                project_dir_override from -- pipeline_run.branch_name, which
+                resolve_workspace() derives from the epic/issue context and
+                get_or_create_epic_worktree() checks the worktree out to. See
+                _verify_finalize_branch(); this is the ordinary-dispatch half of
+                the guarantee auto_commit.py's commit_agent_changes() makes for
+                the review-cycle and repair-cycle paths (#143, #149 WI-4 review).
+                Optional -- the standalone/test callers noted below have no
+                resolved workspace to read one from, and keep the pre-existing
+                "git is the source of truth" behavior.
 
-        Returns: dict with pr_url, all_complete, etc.
+        Returns: dict with pr_url, all_complete, etc. On an expected_branch
+            mismatch, {'success': False, 'branch_mismatch': True, ...} with
+            NOTHING staged, committed or pushed -- agent_executor.py reads that
+            key to skip its own failsafe commit, which would otherwise land the
+            same work on the same wrong branch.
         """
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely
@@ -1370,6 +1460,18 @@ git push --force-with-lease
         # being unset before calling this method at all -- the silent fallback
         # here is deliberately kept for this method's other, legitimate callers.
         project_dir = project_dir_override or os.path.join(self.workspace_root, project)
+
+        # Verify the branch BEFORE the prompt-file cleanup, the staging and the
+        # PR work below -- both the standalone and the tracked path stage and
+        # push whatever is checked out, so this has to sit ahead of the fork.
+        mismatch = await self._verify_finalize_branch(
+            project=project,
+            issue_number=issue_number,
+            project_dir=project_dir,
+            expected_branch=expected_branch,
+        )
+        if mismatch:
+            return mismatch
 
         feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
 
@@ -1426,6 +1528,13 @@ git push --force-with-lease
         # Step 2: Trust git - use whatever branch we're currently on
         # The feature_branch object now comes from git queries, so it should match
         # But if there's any mismatch, git wins
+        #
+        # This is only a reconciliation with the TRACKED branch name, not a
+        # branch-target check: whether what git says is this dispatch's own
+        # target was already settled by _verify_finalize_branch() above, which
+        # refused outright rather than adopting the checked-out name when an
+        # expected_branch disagreed (#149 WI-4 review). With one supplied and
+        # matched, current_branch IS expected_branch here.
         if current_branch != feature_branch.branch_name:
             logger.warning(
                 f"Current branch '{current_branch}' doesn't match feature branch '{feature_branch.branch_name}'. "

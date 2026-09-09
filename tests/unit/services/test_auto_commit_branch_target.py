@@ -529,3 +529,107 @@ class TestSingleCommitAndPushCallSite:
                 'test-project', 'senior_software_engineer', 'task-1', tmp_path,
                 'feature/issue-7-epic', 7, 'msg',
             )
+
+
+class TestUndeterminableWorkingTreeIsRefused:
+    """
+    #149 WI-4 review finding B: _check_for_changes() -- the last unguarded git
+    boundary in this module -- ignored result.returncode entirely and returned
+    bool(result.stdout.strip()), with the `except` arm returning False. Both
+    wrong-but-plausible defaults reached _commit_and_push() as has_changes=False,
+    which skipped the commit and returned the TRUTHY NOTHING_TO_COMMIT, so
+    project_monitor.py's and agent_container_recovery.py's repair-cycle paths
+    logged "No changes to commit" and advanced the issue to PR review on a
+    branch with no fix on it.
+    """
+
+    def test_check_for_changes_returns_none_when_git_status_fails(self, service, tmp_path, caplog):
+        """The variant that used to log nothing at all: a leftover
+        .git/index.lock from the killed agent container."""
+        completed = subprocess.CompletedProcess(
+            args=['git', 'status', '--porcelain'],
+            returncode=128,
+            stdout='',
+            stderr="fatal: Unable to create '/w/.git/index.lock': File exists.\n",
+        )
+        with patch('services.auto_commit.subprocess.run', return_value=completed), \
+             caplog.at_level(logging.ERROR, logger='services.auto_commit'):
+
+            assert service._check_for_changes(tmp_path) is None
+            assert any('index.lock' in r.message for r in caplog.records)
+
+    def test_check_for_changes_returns_none_when_git_status_times_out(self, service, tmp_path, caplog):
+        """The `except` arm -- e.g. the hard-coded timeout=10 exceeded on a
+        large tree the agent had just rewritten. It logged, but still answered
+        "clean"."""
+        with patch('services.auto_commit.subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(cmd='git status', timeout=10)), \
+             caplog.at_level(logging.ERROR, logger='services.auto_commit'):
+
+            assert service._check_for_changes(tmp_path) is None
+            assert any('Failed to check for changes' in r.message for r in caplog.records)
+
+    def test_check_for_changes_still_reports_a_genuinely_clean_tree(self, service, tmp_path):
+        """The guard must not swallow the real "nothing to commit" state --
+        that one is not a failure and must stay distinguishable from None."""
+        completed = subprocess.CompletedProcess(
+            args=['git', 'status', '--porcelain'], returncode=0, stdout='', stderr='',
+        )
+        with patch('services.auto_commit.subprocess.run', return_value=completed):
+            assert service._check_for_changes(tmp_path) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_working_tree_fails_rather_than_advancing_the_issue(self, service, tmp_path):
+        """
+        THE regression. A repair cycle for #7 passed and left its fix
+        uncommitted; the branch reads fine (both guards pass) but `git status`
+        does not. Reporting NOTHING_TO_COMMIT here is truthy, and both
+        repair-cycle callers advance the issue on it -- so the only safe answer
+        is FAILED, with the fix left on disk.
+        """
+        with _epic_worktree(), \
+             patch.object(service, '_get_current_branch', return_value='feature/issue-7-epic'), \
+             patch.object(service, '_check_for_changes', return_value=None), \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch') as mock_push:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='repair_cycle',
+                task_id='repair_cycle_7',
+                project_dir=tmp_path,
+                issue_number=7,
+                expected_branch='feature/issue-7-epic',
+            )
+
+            assert result is CommitResult.FAILED
+            assert result is not CommitResult.NOTHING_TO_COMMIT
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
+            mock_push.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_clean_tree_still_pushes_and_reports_nothing_to_commit(self, service, tmp_path):
+        """The unchanged half of the contract: a clean tree is not a fault, and
+        any unpushed commits on the branch are still pushed."""
+        with _epic_worktree(), \
+             patch.object(service, '_get_current_branch', return_value='feature/issue-7-epic'), \
+             patch.object(service, '_check_for_changes', return_value=False), \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch', return_value=True) as mock_push:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='repair_cycle',
+                task_id='repair_cycle_7',
+                project_dir=tmp_path,
+                issue_number=7,
+                expected_branch='feature/issue-7-epic',
+            )
+
+            assert result is CommitResult.NOTHING_TO_COMMIT
+            mock_stage.assert_not_called()
+            mock_commit.assert_not_called()
+            mock_push.assert_called_once_with(tmp_path, 'feature/issue-7-epic')
