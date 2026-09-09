@@ -714,10 +714,47 @@ class WorkExecutionStateTracker:
         - Project Monitor and Repair Cycle containers
         - Pipeline Orchestrator and Project Monitor
         - Any concurrent work trigger sources
+
+        Callers that ALREADY hold this issue's state-file lock must call
+        has_active_execution_for_state() instead -- see its docstring.
+        """
+        state = self.load_state(project_name, issue_number)
+        return self.has_active_execution_for_state(state, project_name, issue_number)
+
+    def has_active_execution_for_state(
+        self,
+        state: Dict,
+        project_name: str,
+        issue_number: int,
+        persist_probe_cleanup: bool = True
+    ) -> bool:
+        """
+        has_active_execution()'s body, operating on an ALREADY-LOADED state dict
+        instead of reading the state file itself.
+
+        Exists because fcntl.flock() locks are per open-file-description, not per
+        process or per thread: a caller holding <issue>.yaml.lock that then called
+        has_active_execution() re-entered load_state(), which opens the SAME lock
+        path on a fresh fd and blocks forever on its own lock. That is exactly what
+        detect_and_retry_empty_successful_executions()'s PROTECTION 1 did -- it took
+        the state file's lock for the whole per-file body and then called
+        has_active_execution() -- wedging the sweep's scheduler thread on the first
+        'success' record it found and leaving every later protection, including
+        #144's board scoping, permanently unreachable.
+
+        Args:
+            state: state dict the caller already read (under its own lock)
+            persist_probe_cleanup: whether a cleared stale pre-enqueue probe may be
+                written back via save_state(). Callers holding the state file's lock
+                MUST pass False -- save_state() takes that same lock and would
+                deadlock the same way. The mutation still happens on the passed-in
+                dict, so a caller that writes `state` back itself persists it; if
+                nobody does, the next unlocked has_active_execution() call re-derives
+                and persists it, since the decision is a pure function of the probe's
+                age.
         """
         # Check 1: Regular agent execution in execution_history
-        state = self.load_state(project_name, issue_number)
-        for execution in state['execution_history']:
+        for execution in state.get('execution_history', []):
             if execution.get('outcome') == 'in_progress':
                 # Detect stale pre-enqueue probes written by pipeline_progression.
                 #
@@ -758,7 +795,8 @@ class WorkExecutionStateTracker:
                                 f'with no task_id stamp; Redis task was swept '
                                 f'from queue before being consumed'
                             )
-                            self.save_state(project_name, issue_number, state)
+                            if persist_probe_cleanup:
+                                self.save_state(project_name, issue_number, state)
                             continue  # not blocking
                     except Exception as e:
                         logger.warning(
@@ -1543,7 +1581,21 @@ class WorkExecutionStateTracker:
                         continue
 
                     # PROTECTION 1: Check for active execution (ANY type of work)
-                    if self.has_active_execution(project_name, issue_number):
+                    #
+                    # Uses the already-loaded `state` rather than has_active_execution()
+                    # (#150): this loop holds `state_file`'s flock for the whole body,
+                    # and has_active_execution() re-reads the file through load_state(),
+                    # which opens the SAME lock path on a fresh fd. flock locks are per
+                    # open-file-description, so that second acquire blocked forever --
+                    # in the same thread, with no timeout. Every line below this one,
+                    # #144's board scoping included, was therefore unreachable, and the
+                    # wedged thread never released this issue's lock either, so all
+                    # later record_execution_start()/record_execution_outcome() calls
+                    # for it blocked too. persist_probe_cleanup=False for the same
+                    # reason: save_state() takes this lock as well.
+                    if self.has_active_execution_for_state(
+                        state, project_name, issue_number, persist_probe_cleanup=False
+                    ):
                         logger.debug(
                             f"Watchdog: Skipping {project_name}/#{issue_number}: work already in progress"
                         )
@@ -1842,11 +1894,13 @@ class WorkExecutionStateTracker:
                         except Exception as e:
                             logger.debug(f"Could not parse completed_at timestamp: {e}")
 
-                    # Check if GitHub output exists
+                    # Check if GitHub output exists (fails closed - see the method's
+                    # docstring: True also means "could not verify", which defers
+                    # rather than redispatching)
                     if self._has_github_output(project_name, issue_number, last_exec):
                         logger.debug(
-                            f"Watchdog: {project_name}/#{issue_number} has GitHub output, "
-                            f"execution is truly successful"
+                            f"Watchdog: {project_name}/#{issue_number} has GitHub output "
+                            f"(or it could not be verified) - leaving the record alone"
                         )
                         continue
 
@@ -1898,13 +1952,23 @@ class WorkExecutionStateTracker:
         """
         Check if execution resulted in GitHub output (comment/discussion post).
 
+        This is the LAST gate before an execution is rewritten to 'failure' and
+        redispatched, so every "can't verify" path deliberately fails CLOSED
+        (reports output, i.e. leaves the record alone) rather than open (#150). The
+        two directions are not symmetric: a wrong "no output" answer redispatches a
+        real agent container onto an issue that already has its comment, while a
+        wrong "has output" answer only defers -- the record stays 'success', no
+        retry budget is consumed, and the next sweep re-examines it. That is the
+        same posture PROTECTION 2's fail-closed lock read takes.
+
         Args:
             project_name: Project name
             issue_number: Issue number
             execution: Execution record dict
 
         Returns:
-            True if GitHub output exists, False otherwise
+            True if GitHub output exists (or could not be verified), False if the
+            execution demonstrably produced none
         """
         from datetime import datetime
 
@@ -1913,33 +1977,48 @@ class WorkExecutionStateTracker:
             from config.manager import config_manager
 
             gh = get_github_client()
+            # get_project_config() raises rather than returning None for an unknown
+            # project, so there is no falsy-config case to test for here -- and a
+            # ProjectConfig dataclass instance is always truthy anyway.
             project_config = config_manager.get_project_config(project_name)
-
-            if not project_config:
-                logger.warning(f"No project config for {project_name}")
-                return False  # Can't verify, assume no output
 
             agent = execution.get('agent')
             completed_at = execution.get('completed_at')
 
             if not agent or not completed_at:
-                logger.debug("Missing agent or completed_at in execution record")
-                return False
+                # "After what?" has no answer without completed_at, so there is no
+                # comparison to make -- unverifiable, not verified-empty.
+                logger.warning(
+                    f"Watchdog: Missing agent or completed_at for {project_name}/#{issue_number} "
+                    f"-- cannot verify GitHub output, leaving the record alone"
+                )
+                return True
 
             # Parse completion timestamp
             completed_at_str = completed_at.replace('Z', '+00:00')
             completed_dt = datetime.fromisoformat(completed_at_str)
 
-            # Check for comments after completion time
-            org = project_config['github']['org']
-            repo = project_config['github']['repo']
+            # Check for comments after completion time.
+            #
+            # Attribute access, not subscription (#150): ProjectConfig is a plain
+            # dataclass with no __getitem__, so project_config['github'] raised
+            # TypeError on EVERY call, was swallowed by the broad handler below and
+            # returned False -- making this gate unconditionally "no output" for
+            # every project. Same defect class as the .get()-on-a-dataclass bugs
+            # #57/#58 fixed in PROTECTION 2/3; _should_retry_failed_execution()
+            # above has always used the correct form.
+            org = project_config.github['org']
+            repo = project_config.github['repo']
             endpoint = f'repos/{org}/{repo}/issues/{issue_number}/comments'
 
             success, comments = gh.rest('GET', endpoint)
 
             if not success:
-                logger.warning(f"Failed to fetch comments for {project_name}/#{issue_number}")
-                return False  # Can't verify, assume no output to be safe
+                logger.warning(
+                    f"Watchdog: Failed to fetch comments for {project_name}/#{issue_number} "
+                    f"-- cannot verify GitHub output, leaving the record alone"
+                )
+                return True  # Can't verify - defer rather than redispatch blind
 
             # Check if any comment was created after completion
             for comment in comments:
@@ -1959,9 +2038,25 @@ class WorkExecutionStateTracker:
             logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {completed_dt}")
             return False
 
+        except (AttributeError, TypeError, KeyError) as e:
+            # A coding bug, not a transient outage -- and the exact shape (dataclass
+            # vs dict mixup) that made this gate a permanent "no output" until #150.
+            # Surfaced at ERROR with a traceback and distinctly from the transient
+            # case below, the same way PROTECTION 2/3's handlers were narrowed, so
+            # the next one can't hide as another quiet return value.
+            logger.error(
+                f"Watchdog: GitHub output check failed for {project_name}/#{issue_number} "
+                f"with a programming error -- this gate is not working, leaving the "
+                f"record alone: {e}",
+                exc_info=True
+            )
+            return True
         except Exception as e:
-            logger.error(f"Error checking GitHub output for {project_name}/#{issue_number}: {e}")
-            return False  # Can't verify, mark as no output to be safe
+            logger.warning(
+                f"Watchdog: Error checking GitHub output for {project_name}/#{issue_number} "
+                f"-- cannot verify, leaving the record alone: {e}"
+            )
+            return True  # Can't verify - defer rather than redispatch blind
 
     def _try_recover_result_from_redis(self, project_name, issue_number, agent, column, execution):
         """

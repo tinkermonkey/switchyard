@@ -3620,6 +3620,50 @@ class ProjectMonitor:
                                     # Just return and let the container complete normally
                                     return None
 
+                                # No container, but the dispatch may simply not have got
+                                # to launching one yet: project_checkout /
+                                # dev_container_build waits sit BETWEEN
+                                # record_execution_start()/get_or_create_pipeline_run()
+                                # and docker_runner.run_agent_in_container(), so nothing
+                                # carries the issue's Docker label for the probe above to
+                                # find while a coroutine is parked in one. That is the
+                                # same blind spot services/pipeline_watchdog.py's zombie
+                                # sweep now exempts (#140 item 9); this reaper reaches the
+                                # identical conclusion from the identical evidence, just
+                                # on a 60-second fuse instead of a 30-minute one, so it
+                                # needs the identical exemption (#150). Without it this
+                                # branch ends the run and releases the board lock while
+                                # the original coroutine is still waiting; the record then
+                                # flips to 'failure' on the next poll, the issue is
+                                # redispatched, and when the first coroutine finally gets
+                                # the lock both launch a container for the same issue
+                                # against the same shared base clone.
+                                #
+                                # _ResourceLockActivity.is_expired() bounds this
+                                # exemption, so a genuinely hung hold still gets reaped.
+                                try:
+                                    from services.project_checkout_lock import (
+                                        describe_active_resource_lock_activity,
+                                    )
+                                    lock_activity = describe_active_resource_lock_activity(
+                                        project_name, issue_number
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Could not check resource lock activity for issue "
+                                        f"#{issue_number}: {e}"
+                                    )
+                                    return None  # Fail-safe: don't reap a run we can't verify
+
+                                if lock_activity:
+                                    logger.info(
+                                        f"Pipeline run {current_active_run.id} for issue #{issue_number} "
+                                        f"has no container because its dispatch is inside a project "
+                                        f"resource lock ({lock_activity}) - keeping the run active and "
+                                        f"the lock held instead of treating it as a failed launch."
+                                    )
+                                    return None
+
                                 # Marked active but no container found after the grace period -
                                 # the launch silently never happened. Coordinate with the zombie
                                 # watchdog (and any other cleanup mechanism) so only one of them

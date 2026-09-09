@@ -19,11 +19,14 @@ from unittest.mock import MagicMock, patch, mock_open
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+import threading
 
 # Mock ORCHESTRATOR_ROOT before importing work_execution_state to avoid /app permission errors
 with tempfile.TemporaryDirectory() as _tmpdir:
     with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
         from services.work_execution_state import WorkExecutionStateTracker
+
+from config.manager import ProjectConfig
 
 
 class TestEmptyOutputDetection:
@@ -610,12 +613,31 @@ class TestRetryEligibility:
 
 
 class TestGitHubOutputVerification:
-    """Test GitHub output verification"""
+    """Test GitHub output verification.
+
+    These tests build a REAL ProjectConfig rather than a dict (#150). The dict
+    stand-in they used before is what let _has_github_output() ship a
+    project_config['github']['org'] subscript against a dataclass with no
+    __getitem__: production raised TypeError on every single call, the broad
+    handler swallowed it, and the gate answered "no output" unconditionally --
+    with a green test suite the whole time.
+    """
 
     @pytest.fixture
     def tracker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             return WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    @staticmethod
+    def _project_config():
+        return ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[],
+            pipeline_routing={},
+        )
 
     def test_has_github_output_comment_found(self, tracker):
         """Test detects GitHub comment after execution"""
@@ -636,9 +658,7 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
@@ -663,16 +683,21 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
                 assert has_output is False
 
     def test_has_github_output_api_failure(self, tracker):
-        """Test assumes no output when API fails (safe default)"""
+        """An unverifiable answer must fail CLOSED (#150).
+
+        This is the last gate before an execution is rewritten to 'failure' and
+        an agent is redispatched, and the two wrong answers are not symmetric: a
+        spurious "no output" launches a container onto an issue that already has
+        its comment, while a spurious "has output" only defers -- the record
+        stays 'success', no retry budget is spent, and the next sweep looks
+        again. It used to return False here."""
         execution = {
             'agent': 'test-agent',
             'completed_at': '2025-01-01T12:00:00Z'
@@ -683,14 +708,47 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
-                # Assumes no output to be safe (triggers retry)
-                assert has_output is False
+                assert has_output is True
+
+    def test_has_github_output_programming_error_fails_closed_and_logs_loudly(
+        self, tracker, caplog
+    ):
+        """A dataclass/dict mixup -- the exact defect that made this gate a
+        permanent "no output" -- must surface at ERROR with a traceback rather
+        than becoming another quiet return value, and must not redispatch."""
+        execution = {
+            'agent': 'test-agent',
+            'completed_at': '2025-01-01T12:00:00Z'
+        }
+
+        broken_config = object()  # no .github at all
+
+        with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = broken_config
+
+                with caplog.at_level(logging.ERROR, logger='services.work_execution_state'):
+                    has_output = tracker._has_github_output('test-project', 123, execution)
+
+        assert has_output is True
+        assert any(
+            'programming error' in record.message for record in caplog.records
+        ), caplog.text
+
+    def test_has_github_output_missing_completed_at_fails_closed(self, tracker):
+        """"Was there a comment AFTER completion?" has no answer without a
+        completion time, so it is unverifiable, not verified-empty."""
+        execution = {'agent': 'test-agent'}  # no completed_at
+
+        with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = self._project_config()
+
+                assert tracker._has_github_output('test-project', 123, execution) is True
 
 
 class TestWatchdogIncrementsRetryCount:
@@ -1408,3 +1466,193 @@ class TestRecordExecutionStartBoardName:
 
         state = tracker.load_state('test-project', 124)
         assert 'board_name' not in state['execution_history'][-1]
+
+
+class TestSweepReachesItsProtectionsForReal:
+    """End-to-end reachability of detect_and_retry_empty_successful_executions().
+
+    Every other test in this file replaces has_active_execution() and
+    _has_github_output() with constants. That is fine for unit-testing the
+    protections between them, but it is also how 599 lines of green tests were
+    written over a sweep that had never completed a single pass in production
+    (#150): PROTECTION 1 called has_active_execution(), which re-read the state
+    file through load_state(), which re-acquired the state file's own flock on a
+    fresh fd -- and blocked forever, in the same thread, with no timeout. Nothing
+    after it ran, including #144's board scoping.
+
+    These tests use the REAL protections, the REAL file locking and a real temp
+    state dir, and run the sweep on a worker thread with a hard join timeout so a
+    re-entrancy regression fails the test instead of hanging the suite.
+    """
+
+    SWEEP_TIMEOUT_SECONDS = 20
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _write_state(tracker, history):
+        # get_state_file(), not a hand-spelled name: the deadlock only reproduces
+        # when the sweep's lock path and load_state()'s lock path are the same
+        # file, which is exactly what production always has and what a
+        # "test_project_issue_123.yaml" stand-in for project "test-project"
+        # quietly does not.
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': history,
+                },
+                f,
+            )
+        return state_file
+
+    @staticmethod
+    def _success_record(**overrides):
+        record = {
+            'agent': 'test-agent',
+            'column': 'In Progress',
+            'board_name': 'SDLC Execution',
+            'outcome': 'success',
+            'completed_at': '2025-01-01T12:00:00Z',
+            'timestamp': '2025-01-01T11:00:00Z',
+        }
+        record.update(overrides)
+        return record
+
+    def _run_sweep(self, tracker, comments):
+        """Run the sweep with only the leaves mocked, on a bounded thread."""
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[pipeline_cfg],
+            pipeline_routing={},
+        )
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, comments)
+
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        result = {}
+
+        def sweep():
+            result['count'] = tracker.detect_and_retry_empty_successful_executions()
+
+        with patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch(
+                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                 return_value=lock_manager
+             ), \
+             patch(
+                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                 return_value=queue_manager
+             ), \
+             patch.object(
+                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+             ), \
+             patch.object(
+                 tracker, '_check_redis_repair_cycle_tracking', return_value=False
+             ), \
+             patch('services.review_cycle.review_cycle_executor') as mock_rc, \
+             patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_rc._cycle_key.return_value = 'test-project:123'
+            mock_rc.active_cycles = {}
+            mock_hfl._loop_key.return_value = 'test-project:123'
+            mock_hfl.active_loops = {}
+
+            worker = threading.Thread(target=sweep, daemon=True)
+            worker.start()
+            worker.join(timeout=self.SWEEP_TIMEOUT_SECONDS)
+
+        assert not worker.is_alive(), (
+            f"detect_and_retry_empty_successful_executions() did not finish within "
+            f"{self.SWEEP_TIMEOUT_SECONDS}s -- it is blocked, almost certainly on a "
+            f"re-entrant acquire of a state file's own lock"
+        )
+        return result.get('count'), gh_client
+
+    def test_the_sweep_completes_and_marks_an_output_less_execution(
+        self, tracker, temp_state_dir
+    ):
+        """The reachability test: with nothing stubbed out between the state file
+        and GitHub, the sweep runs to completion and actually rewrites the
+        record."""
+        state_file = self._write_state(tracker, [self._success_record()])
+
+        count, gh_client = self._run_sweep(tracker, comments=[])
+
+        assert count == 1
+        gh_client.rest.assert_called_once_with(
+            'GET', 'repos/test-org/test-repo/issues/123/comments'
+        )
+
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        last_exec = updated['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_real_github_comment_after_completion_spares_the_execution(
+        self, tracker, temp_state_dir
+    ):
+        """The real _has_github_output() must be able to answer "yes". It could
+        not before #150 -- the ProjectConfig subscript raised TypeError on every
+        call, so this gate said "no output" for every project and every agent
+        that had posted its comment perfectly well."""
+        state_file = self._write_state(tracker, [self._success_record()])
+
+        count, _ = self._run_sweep(
+            tracker,
+            comments=[{'created_at': '2025-01-01T12:05:00Z', 'body': 'Agent output'}],
+        )
+
+        assert count == 0
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        assert updated['execution_history'][-1]['outcome'] == 'success'
+
+    def test_the_real_protection_1_still_blocks_on_in_progress_work(
+        self, tracker, temp_state_dir
+    ):
+        """PROTECTION 1 has to keep working, not merely stop hanging: a live
+        in_progress record for the same issue must skip the file."""
+        state_file = self._write_state(
+            tracker,
+            [
+                {
+                    'agent': 'other-agent',
+                    'column': 'Code Review',
+                    'outcome': 'in_progress',
+                    'trigger_source': 'manual',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+                self._success_record(),
+            ],
+        )
+
+        count, gh_client = self._run_sweep(tracker, comments=[])
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        assert updated['execution_history'][-1]['outcome'] == 'success'
