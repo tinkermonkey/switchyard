@@ -121,16 +121,53 @@ _add_epic_worktree() (a hot path called straight from the event-loop thread)
 both get a working heartbeat from this module with no further analysis of
 whether their bodies yield.
 
-The corollary rule for everything else in this module's async paths: any
-synchronous lock I/O that runs while the caller is still able to be
-cancelled is offloaded with loop.run_in_executor() + asyncio.shield() and a
-done-callback that cleans up an orphaned success -- the pattern
-services/docker_socket_access_gate.py established for the same hazard (see
-_acquire_resource_off_loop below). Sync I/O in an exit path that MUST NOT be
-abandoned (releasing the lock, joining the heartbeat thread) stays
-synchronous instead: it is bounded by PipelineLockManager's own Redis socket
-timeouts, and every await is cancellable, so offloading it would let a
-cancellation skip the release entirely and leak the lock.
+That property only holds if the heartbeat is also STARTED without waiting on
+the event loop. Found in review of this same change: offloading the acquire
+(see _acquire_and_start_heartbeat_off_loop below) introduced a suspension
+point between "the worker thread acquired the lock" and "the coroutine is
+rescheduled and starts the heartbeat" -- and a loop blocked by some OTHER
+task's guarded body (the very thing this design accepts as normal) can hold
+that gap open for hours, past the 7200s Redis TTL, on a lock that is already
+held and not yet being refreshed. So acquisition and heartbeat start happen
+in the SAME executor callable, and the context manager below adopts the
+already-running thread rather than starting its own.
+
+The corollary rule for everything else in this module's async paths: no
+synchronous lock I/O runs on the event-loop thread. Three shapes implement
+that, and which one applies depends on what a cancellation delivered mid-call
+would cost:
+
+  (a) Cancellable acquisition I/O -- loop.run_in_executor() +
+      asyncio.shield() + a done-callback that releases an orphaned success
+      (_acquire_and_start_heartbeat_off_loop, the pattern
+      services/docker_socket_access_gate.py established for the same
+      hazard). Offloading is what lets a cancellation interleave with the
+      attempt at all, and a concurrent.futures worker already running cannot
+      be interrupted, so the callback is what keeps a post-cancellation
+      success from wedging the lock with nobody left to release it.
+
+  (b) An exit-path wait that must complete -- loop.run_in_executor() +
+      asyncio.shield() with a SYNCHRONOUS fallback both on cancellation and
+      on executor shutdown (_join_heartbeat_thread_async). A done-callback
+      can't rescue this one, because the release that must not overtake the
+      join runs immediately after it returns; instead, whenever the awaited
+      form can't be relied on, the join is finished here and now on the
+      calling thread. Thread.join() needs no event loop, so it still
+      completes while a cancellation is unwinding or the loop is tearing
+      down.
+
+  (c) The final release -- left inline on the loop, the one genuine
+      exception. Not because "every await is cancellable" (shape (b)
+      disproves that as a blanket argument) but because there is no
+      orphan-cleanup path for a SKIPPED release: nothing else in the process
+      knows this holder_id, so a release that never happens leaks the lock
+      until TTL/staleness recovery (7200s-14400s). It is bounded by
+      PipelineLockManager's own Redis socket timeouts.
+
+_default_facade_off_loop() is a plain asyncio.to_thread() with neither
+shield nor done-callback, and needs neither: constructing a
+ProjectResourceLockManager has no lock side effect to orphan -- it only
+connects/pings Redis -- so an abandoned construction leaks nothing.
 """
 
 import asyncio
@@ -143,7 +180,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional, Tuple
 
-from services.project_resource_lock_manager import ProjectResourceLockManager
+from services.project_resource_lock_manager import ProjectResourceLockManager, TouchResult
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +325,12 @@ HEARTBEAT_INTERVAL_SECONDS = 1800.0
 # about to lapse under a still-live holder, so an operator had no signal
 # distinguishing the two. Half the TTL leaves at least one more heartbeat
 # interval of margin after the escalation fires.
+#
+# Found in a later review round (#146 WI-1): "a failed refresh" here means
+# TouchResult.REFRESH_FAILED, not an exception. touch_lock() catches every
+# store failure internally and returns rather than raising, so an escalation
+# hung only off `except Exception` around touch_resource() could never fire
+# for the sustained-outage case it was written for -- see _heartbeat_worker.
 REDIS_LOCK_TTL_SECONDS = 7200.0
 HEARTBEAT_FAILURE_ESCALATION_SECONDS = REDIS_LOCK_TTL_SECONDS / 2.0
 
@@ -314,34 +357,60 @@ def _heartbeat_worker(
     heartbeating lock as abandoned and hand it to a different caller.
     touch_resource() (PipelineLockManager.touch_lock()) resets both.
 
-    If a heartbeat ever reports the lock is NOT held by this holder_id
-    anymore (touch_resource() returns False), this is logged as an ERROR --
-    it means the lock was lost (e.g. a heartbeat delayed past the Redis TTL
-    under scheduling starvation let a competing caller acquire it first) and
-    the guarded operation is very likely now racing that competing caller.
-    This cannot safely cancel/interrupt the guarded body from here (that
-    would need real task cancellation wired through every caller), so it can
-    only surface the condition loudly rather than silently continue as if
-    nothing happened.
+    Each tick's touch_resource() lands in exactly one of three states, which
+    this deliberately does NOT collapse together (see TouchResult, added in
+    #146 WI-1 review for precisely this):
 
-    A refresh that raises (a Redis blip, say) is logged and retried at the
-    next interval rather than propagated -- but a RUN of them escalates from
-    WARNING to ERROR once it has lasted HEARTBEAT_FAILURE_ESCALATION_SECONDS,
-    at which point the lock's TTL really is at risk of lapsing under a
-    still-live holder.
+      - TouchResult.NOT_HELD -- CONFIRMED not held by this holder_id anymore.
+        Logged as an ERROR: the lock was lost (e.g. a heartbeat delayed past
+        the Redis TTL under scheduling starvation let a competing caller
+        acquire it first) and the guarded operation is very likely now racing
+        that competing caller. This cannot safely cancel/interrupt the
+        guarded body from here (that would need real task cancellation wired
+        through every caller), so it can only surface the condition loudly
+        rather than silently continue as if nothing happened.
+
+      - TouchResult.REFRESH_FAILED, or a raised exception -- the stores
+        themselves failed, so liveness was NOT extended but nothing is known
+        to have taken the lock. Logged and retried at the next interval
+        rather than propagated; a RUN of them escalates from WARNING to ERROR
+        once it has lasted HEARTBEAT_FAILURE_ESCALATION_SECONDS, at which
+        point the lock's TTL really is at risk of lapsing under a still-live
+        holder. Before the tri-state return this arrived as a plain False,
+        indistinguishable from the case above -- so a sustained Redis outage
+        logged an ERROR claiming the lock had been LOST to another holder
+        (directly contradicting the ERROR touch_lock() itself logs one line
+        earlier) on every tick, while the escalation written for that exact
+        outage sat unreachable behind `except Exception`.
+
+      - TouchResult.REFRESHED -- resets the failure run and its clock.
     """
     consecutive_failures = 0
     last_success_at = time.monotonic()
     while not stop_event.wait(heartbeat_interval_seconds):
         try:
-            still_held = facade.touch_resource(project, resource_name, holder_id)
+            result = facade.touch_resource(project, resource_name, holder_id)
         except Exception as e:
             consecutive_failures += 1
             _log_heartbeat_failure(
                 resource_name, project, consecutive_failures, time.monotonic() - last_success_at, str(e)
             )
             continue
-        if not still_held:
+        if result is TouchResult.REFRESH_FAILED:
+            consecutive_failures += 1
+            _log_heartbeat_failure(
+                resource_name,
+                project,
+                consecutive_failures,
+                time.monotonic() - last_success_at,
+                "the lock's durable stores could not confirm or extend this holder's liveness",
+            )
+            continue
+        # `not result` rather than an is-NOT_HELD check: TouchResult.__bool__
+        # makes only REFRESHED truthy, and a facade that still returns a
+        # plain bool (test doubles, and any future implementation of this
+        # duck-typed facade) must keep meaning "lost" by False.
+        if not result:
             consecutive_failures += 1
             logger.error(
                 f"'{resource_name}' lock heartbeat for project {project!r} found "
@@ -425,18 +494,31 @@ async def _join_heartbeat_thread_async(heartbeat_thread: threading.Thread) -> No
     that same leak through a different door: a bare await re-raises
     CancelledError the instant the enclosing task is cancelled, abandoning
     the in-flight call exactly as a too-short timeout would. Unlike
-    _acquire_resource_off_loop()'s orphan cleanup, a done-callback can't fix
-    this one -- the release that must not overtake the join runs synchronously
-    in the CALLER's finally, immediately after this returns -- so on
-    cancellation the join is finished here and now, on this thread. That is a
+    _acquire_and_start_heartbeat_off_loop()'s orphan cleanup, a done-callback
+    can't fix this one -- the release that must not overtake the join runs
+    synchronously in the CALLER's finally, immediately after this returns --
+    so on cancellation the join is finished here and now, on this thread. That is a
     plain Thread.join(), which needs no event loop, so it completes even while
     the cancellation is unwinding.
+
+    The submission itself is INSIDE the try, not above it -- found in review:
+    BaseEventLoop.run_in_executor() raises its RuntimeErrors synchronously at
+    call time (_check_closed()'s "Event loop is closed",
+    _check_default_executor()'s "Executor shutdown has been called", and
+    ThreadPoolExecutor.submit()'s "cannot schedule new futures after
+    shutdown"), never through the awaited future. With the call above the
+    try, the shutdown fallback below could never fire for the one scenario it
+    names: asyncio.run()'s own teardown calls shutdown_default_executor(), so
+    any hold still unwinding after that point skipped the join entirely AND
+    replaced the guarded body's real exception with a RuntimeError about
+    asyncio internals.
     """
     loop = asyncio.get_running_loop()
-    join_future = loop.run_in_executor(None, heartbeat_thread.join)
     try:
-        # shield(), matching _acquire_resource_off_loop()'s reasoning: a
-        # cancellation delivered here must not tear down the join itself.
+        join_future = loop.run_in_executor(None, heartbeat_thread.join)
+        # shield(), matching _acquire_and_start_heartbeat_off_loop()'s
+        # reasoning: a cancellation delivered here must not tear down the
+        # join itself.
         await asyncio.shield(join_future)
     except asyncio.CancelledError:
         heartbeat_thread.join()
@@ -454,6 +536,7 @@ async def _held_with_heartbeat_async(
     project: str,
     holder_id: int,
     heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+    heartbeat: Optional[Tuple[threading.Event, threading.Thread]] = None,
 ):
     """
     Wraps an already-acquired lock's held duration with a background
@@ -467,8 +550,17 @@ async def _held_with_heartbeat_async(
     (which both real callers do -- see this module's docstring, "Why the
     heartbeat runs on an OS thread, never an asyncio task"). Identical to
     _held_with_heartbeat_sync() apart from how the thread is joined on exit.
+
+    `heartbeat` adopts a thread the ACQUIRING worker thread already started
+    (_acquire_and_start_heartbeat_off_loop) instead of starting one here.
+    Production callers always pass it: starting the thread here would put an
+    event-loop scheduling delay between the acquire succeeding and the first
+    refresh being possible, and a loop blocked by another task's guarded body
+    can stretch that gap past the Redis TTL on an already-held lock -- see
+    the module docstring. Omitting it (tests that exercise the held-duration
+    behavior directly) starts the thread here instead.
     """
-    stop_event, heartbeat_thread = _start_heartbeat_thread(
+    stop_event, heartbeat_thread = heartbeat if heartbeat is not None else _start_heartbeat_thread(
         facade, resource_name, project, holder_id, heartbeat_interval_seconds
     )
     try:
@@ -519,16 +611,63 @@ async def _default_facade_off_loop() -> ProjectResourceLockManager:
     return await asyncio.to_thread(ProjectResourceLockManager)
 
 
-async def _acquire_resource_off_loop(
+def _acquire_and_start_heartbeat(
     facade: ProjectResourceLockManager,
     resource_name: str,
     project: str,
     holder_id: int,
     issue_number: Optional[int],
-) -> Tuple[bool, str]:
+    heartbeat_interval_seconds: float,
+) -> Tuple[bool, str, Optional[Tuple[threading.Event, threading.Thread]]]:
     """
-    Run one acquire_resource() attempt in a worker thread instead of on the
-    event loop (#140 item 6).
+    One acquire_resource() attempt plus, on success, the heartbeat thread for
+    the hold it just won -- deliberately in ONE callable so that both happen
+    on the same worker thread with no event-loop scheduling in between.
+
+    Found in review of #146 WI-1: with the heartbeat started by the awaiting
+    coroutine instead, a lock could sit acquired-but-unheartbeated for as long
+    as the event loop stayed blocked (another task's guarded body -- the case
+    this whole module is designed around -- blocks it for the agent's entire
+    runtime, up to 10800s), letting the 7200s Redis TTL lapse under a hold
+    that was already granted. See the module docstring.
+
+    Returns (can_execute, reason, heartbeat), where heartbeat is the
+    (stop_event, thread) pair to adopt when can_execute is True and None
+    otherwise.
+    """
+    can_execute, reason = facade.acquire_resource(project, resource_name, holder_id)
+    if not can_execute:
+        return can_execute, reason, None
+    try:
+        heartbeat = _start_heartbeat_thread(
+            facade, resource_name, project, holder_id, heartbeat_interval_seconds
+        )
+    except BaseException:
+        # The lock IS held by the time we get here, but the awaiting
+        # coroutine will only ever see the exception -- so nobody downstream
+        # knows to release it. Release before propagating rather than leaving
+        # a holder nothing will ever clean up.
+        logger.error(
+            f"'{resource_name}' lock for project {project!r} ({_attribution(issue_number)}) "
+            "was acquired but its heartbeat thread could not be started -- releasing "
+            "immediately rather than holding it with no liveness refresh"
+        )
+        _release_and_warn(facade, resource_name, project, holder_id, issue_number)
+        raise
+    return can_execute, reason, heartbeat
+
+
+async def _acquire_and_start_heartbeat_off_loop(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    issue_number: Optional[int],
+    heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> Tuple[bool, str, Optional[Tuple[threading.Event, threading.Thread]]]:
+    """
+    Run one _acquire_and_start_heartbeat() attempt in a worker thread instead
+    of on the event loop (#140 item 6).
 
     acquire_resource() is synchronous I/O -- a Redis transaction plus a YAML
     file read/write on the fallback path -- and the async context managers
@@ -550,7 +689,16 @@ async def _acquire_resource_off_loop(
     """
     loop = asyncio.get_running_loop()
     attempt = loop.run_in_executor(
-        None, functools.partial(facade.acquire_resource, project, resource_name, holder_id)
+        None,
+        functools.partial(
+            _acquire_and_start_heartbeat,
+            facade,
+            resource_name,
+            project,
+            holder_id,
+            issue_number,
+            heartbeat_interval_seconds,
+        ),
     )
     try:
         return await asyncio.shield(attempt)
@@ -571,16 +719,18 @@ def _release_if_orphan_acquired(
     issue_number: Optional[int],
     attempt,
 ) -> None:
-    """Done-callback for an acquire_resource() future whose awaiting coroutine
-    was cancelled -- see _acquire_resource_off_loop(). If the orphaned attempt
-    went on to actually acquire the lock, nothing else will ever release it,
-    so this does. Runs synchronously on the event loop thread (asyncio's own
-    done-callback contract) -- a brief, one-off cost only on this rare
-    cancellation path."""
+    """Done-callback for an acquisition future whose awaiting coroutine was
+    cancelled -- see _acquire_and_start_heartbeat_off_loop(). If the orphaned
+    attempt went on to actually acquire the lock, nothing else will ever stop
+    its heartbeat or release it, so this does both (heartbeat first, so a
+    refresh in flight can't re-establish the lock after the release). Runs
+    synchronously on the event loop thread (asyncio's own done-callback
+    contract) -- a brief, one-off cost only on this rare cancellation
+    path."""
     try:
         if attempt.cancelled():
             return
-        can_execute, _ = attempt.result()
+        can_execute, _, heartbeat = attempt.result()
         if can_execute:
             logger.warning(
                 f"'{resource_name}' lock acquisition for project {project!r} "
@@ -589,6 +739,10 @@ def _release_if_orphan_acquired(
                 "holder immediately instead of leaving it for TTL/staleness recovery "
                 "to eventually reclaim."
             )
+            if heartbeat is not None:
+                stop_event, heartbeat_thread = heartbeat
+                stop_event.set()
+                heartbeat_thread.join()
             _release_and_warn(facade, resource_name, project, holder_id, issue_number)
     except Exception as cleanup_exc:
         logger.warning(
@@ -610,11 +764,12 @@ async def project_checkout_lock_async(
     directory for the duration of the `with` block.
 
     Polls ProjectResourceLockManager.acquire_resource() -- a single
-    non-blocking attempt, run in a worker thread (see
-    _acquire_resource_off_loop) -- with asyncio.sleep() between attempts, so
-    the poll genuinely never blocks the event loop, until acquired or
-    timeout_seconds elapses. Releases in a finally block so an exception
-    raised inside the `with` body still frees the lock.
+    non-blocking attempt, run in a worker thread that also starts this hold's
+    heartbeat the moment the attempt succeeds (see
+    _acquire_and_start_heartbeat_off_loop) -- with asyncio.sleep() between
+    attempts, so the poll genuinely never blocks the event loop, until
+    acquired or timeout_seconds elapses. Releases in a finally block so an
+    exception raised inside the `with` body still frees the lock.
 
     Args:
         project: Project name.
@@ -638,7 +793,7 @@ async def project_checkout_lock_async(
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
     while True:
-        can_execute, reason = await _acquire_resource_off_loop(
+        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
             facade, RESOURCE_NAME, project, holder_id, issue_number
         )
         if can_execute:
@@ -649,14 +804,18 @@ async def project_checkout_lock_async(
         await asyncio.sleep(poll_interval_seconds)
 
     try:
-        async with _held_with_heartbeat_async(facade, RESOURCE_NAME, project, holder_id):
+        async with _held_with_heartbeat_async(
+            facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
+        ):
             yield
     finally:
-        # Deliberately synchronous, not offloaded: every await is cancellable,
-        # so an `await asyncio.to_thread(...)` here would let a cancellation
-        # delivered during unwinding skip the release entirely and leak the
-        # lock until TTL/staleness recovery. Bounded by PipelineLockManager's
-        # own Redis socket timeouts -- see this module's docstring.
+        # Deliberately synchronous, not offloaded -- shape (c) in this
+        # module's docstring. NOT because awaits are cancellable in general
+        # (_join_heartbeat_thread_async offloads an exit path safely with
+        # shield + a synchronous fallback), but because a SKIPPED release has
+        # no orphan-cleanup path: nothing else in the process knows this
+        # holder_id, so it would leak until TTL/staleness recovery. Bounded by
+        # PipelineLockManager's own Redis socket timeouts.
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 

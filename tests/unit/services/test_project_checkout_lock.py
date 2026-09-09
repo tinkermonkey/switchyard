@@ -47,11 +47,13 @@ import shutil
 
 import pytest
 
-from services.pipeline_lock_manager import PipelineLockManager
+import services.project_checkout_lock as project_checkout_lock
+from services.pipeline_lock_manager import PipelineLockManager, TouchResult
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_checkout_lock import (
     project_checkout_lock_async,
     project_checkout_lock_sync,
+    _acquire_and_start_heartbeat_off_loop,
     _default_facade_off_loop,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
@@ -721,6 +723,84 @@ class TestAsyncHeartbeatJoinSurvivesCancellation:
 
         # The loop kept scheduling other work for the whole ~0.2s join.
         assert len(ticks) >= 5
+        # ...and the join actually waited: returning while the thread is still
+        # running is the leak this helper exists to close.
+        assert not heartbeat_thread.is_alive()
+
+    async def test_the_normal_path_join_is_unbounded(self):
+        """
+        The invariant itself, asserted directly so no bound can slip back in:
+        the whole reason this helper exists is that a bounded join (the
+        original implementation used timeout=5) can return while a heartbeat's
+        touch_resource() is still in flight, letting the caller's release be
+        overtaken and the lock re-established under an abandoned holder id.
+        A behavioral test can only ever catch a bound shorter than its own
+        patience -- reintroducing `join(5.0)` passes every other case here.
+        """
+        release_worker = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=lambda: release_worker.wait(timeout=5.0), daemon=True
+        )
+        heartbeat_thread.start()
+        probe = MagicMock(wraps=heartbeat_thread)
+
+        threading.Timer(0.1, release_worker.set).start()
+        await _join_heartbeat_thread_async(probe)
+
+        probe.join.assert_called_once_with()  # no timeout argument, positional or keyword
+        assert not heartbeat_thread.is_alive()
+
+
+@pytest.mark.asyncio
+class TestAsyncHeartbeatJoinSurvivesExecutorShutdown:
+    """
+    Regression found reviewing WI-1 (#146): the `except RuntimeError` fallback
+    in _join_heartbeat_thread_async() was dead code, because
+    BaseEventLoop.run_in_executor() raises its RuntimeErrors SYNCHRONOUSLY at
+    call time (_check_closed()'s "Event loop is closed",
+    _check_default_executor()'s "Executor shutdown has been called",
+    ThreadPoolExecutor.submit()'s "cannot schedule new futures after
+    shutdown") and the submission sat above the try.
+
+    asyncio.run()'s own teardown calls shutdown_default_executor(), so a hold
+    still unwinding at that point hit exactly this: the join was skipped (the
+    caller's release could then be overtaken by an in-flight touch_resource(),
+    re-establishing the lock under an abandoned holder id) AND the guarded
+    body's real exception was replaced by a RuntimeError about asyncio
+    internals.
+    """
+
+    async def test_the_join_still_happens_once_the_default_executor_is_shut_down(self):
+        release_worker = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=lambda: release_worker.wait(timeout=5.0), daemon=True
+        )
+        heartbeat_thread.start()
+
+        loop = asyncio.get_running_loop()
+        await loop.shutdown_default_executor()
+
+        threading.Timer(0.1, release_worker.set).start()
+        await _join_heartbeat_thread_async(heartbeat_thread)  # must not raise
+
+        assert not heartbeat_thread.is_alive()
+
+    async def test_the_guarded_bodys_own_exception_is_not_replaced_by_an_executor_error(self):
+        facade = MagicMock()
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+
+        class _SentinelError(Exception):
+            pass
+
+        loop = asyncio.get_running_loop()
+        with pytest.raises(_SentinelError):
+            async with _held_with_heartbeat_async(
+                facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=60.0
+            ):
+                await loop.shutdown_default_executor()
+                raise _SentinelError("the body's real failure")
+
+        assert "lock-heartbeat-proj_checkout-proj" not in [t.name for t in threading.enumerate()]
 
 
 class TestHeartbeatFailureEscalation(unittest.TestCase):
@@ -777,6 +857,122 @@ class TestHeartbeatFailureEscalation(unittest.TestCase):
         # No escalation, despite the run outlasting the (patched) threshold --
         # the clock restarts from the successful refresh, not from the hold.
         self.assertNotIn(logging.ERROR, [r.levelno for r in captured.records])
+
+
+class TestHeartbeatDistinguishesLostFromUnrefreshed(unittest.TestCase):
+    """
+    Regression found reviewing WI-1 (#146): the escalation above was
+    unreachable for the failure mode it was written for. It hung off
+    `except Exception` around touch_resource(), but touch_lock() catches
+    every store failure internally (Redis errors around hset/expire,
+    _read_redis_lock_only/_read_yaml_lock_only, _save_lock_to_yaml) and
+    RETURNS instead of raising -- so a sustained Redis+YAML outage, the exact
+    case the escalation targets, produced no escalation at all.
+
+    Worse, the same bare-False return also meant "another holder now owns
+    this lock", so every tick of that outage logged an ERROR asserting the
+    lock had been LOST and the guarded operation was racing a competing
+    holder -- directly contradicting the ERROR touch_lock() itself logs one
+    line earlier ("this is NOT confirmed loss to another holder either").
+
+    touch_lock()/touch_resource() now return a tri-state TouchResult, and the
+    heartbeat routes REFRESH_FAILED through the failure accounting while
+    keeping the "lock lost" ERROR for a confirmed NOT_HELD.
+    """
+
+    def test_a_sustained_refresh_failure_escalates_without_claiming_the_lock_was_lost(self):
+        facade = MagicMock()
+        facade.touch_resource.return_value = TouchResult.REFRESH_FAILED
+
+        with patch('services.project_checkout_lock.HEARTBEAT_FAILURE_ESCALATION_SECONDS', 0.05):
+            with self.assertLogs('services.project_checkout_lock', level='WARNING') as captured:
+                with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+                    time.sleep(0.25)
+
+        levels = [r.levelno for r in captured.records]
+        messages = [r.getMessage() for r in captured.records]
+        self.assertEqual(levels[0], logging.WARNING, "the first blip must not cry wolf")
+        self.assertIn(logging.ERROR, levels, "a sustained store outage must escalate")
+        self.assertTrue(
+            all("NO LONGER held" not in m for m in messages),
+            "a store outage is not proof the lock was lost to a competing holder",
+        )
+        self.assertTrue(any("could not confirm or extend" in m for m in messages))
+
+    def test_a_confirmed_loss_still_logs_the_lock_lost_error(self):
+        facade = MagicMock()
+        facade.touch_resource.return_value = TouchResult.NOT_HELD
+
+        with self.assertLogs('services.project_checkout_lock', level='ERROR') as captured:
+            with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+                time.sleep(0.05)
+
+        self.assertTrue(any("NO LONGER held" in r.getMessage() for r in captured.records))
+
+    def test_a_facade_still_returning_a_plain_bool_keeps_its_original_meaning(self):
+        """TouchResult only has to be understood by this module; the facade is
+        duck-typed (tests inject MagicMocks, and PipelineLockManager is not
+        the only conceivable backing store). A plain False must still mean
+        'lost', not be silently mistaken for a successful refresh."""
+        facade = MagicMock()
+        facade.touch_resource.return_value = False
+
+        with self.assertLogs('services.project_checkout_lock', level='ERROR') as captured:
+            with _held_with_heartbeat_sync(facade, "proj_checkout", "proj", holder_id=-42, heartbeat_interval_seconds=0.02):
+                time.sleep(0.05)
+
+        self.assertTrue(any("NO LONGER held" in r.getMessage() for r in captured.records))
+
+
+class TestRealFacadeReportsStoreFailuresAsRefreshFailed(unittest.TestCase):
+    """
+    The half of the regression above a mock can't prove: against the REAL
+    PipelineLockManager/ProjectResourceLockManager, a dual-store failure must
+    surface as TouchResult.REFRESH_FAILED -- not as an exception (which is
+    what the old `except Exception` escalation assumed) and not as NOT_HELD
+    (which is what the old bare-False return collapsed it into).
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        # YAML-only (redis_client=None), matching
+        # test_project_resource_lock_manager.py::TestTouchResource: the whole
+        # point here is what the REAL store layer returns, so the on-disk copy
+        # is the one that has to be made to fail.
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_an_unreadable_store_returns_refresh_failed_rather_than_raising(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, -42)
+        # Corrupt the only configured store's file: with no Redis to fall back
+        # on, lock state is now genuinely unknown.
+        self.lock_manager._get_state_file(
+            "proj", f"__resource__{RESOURCE_NAME}"
+        ).write_text("not: valid: yaml: [")
+
+        result = self.facade.touch_resource("proj", RESOURCE_NAME, -42)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertFalse(bool(result))
+
+    def test_a_healthy_refresh_returns_refreshed(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, -42)
+
+        result = self.facade.touch_resource("proj", RESOURCE_NAME, -42)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        self.assertTrue(bool(result))
+
+    def test_a_lock_held_by_someone_else_returns_not_held(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, -42)
+
+        result = self.facade.touch_resource("proj", RESOURCE_NAME, -43)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(bool(result))
 
 
 @pytest.mark.asyncio
@@ -867,6 +1063,191 @@ class TestAsyncAcquireRunsOffTheEventLoop:
 
         facade.release_resource.assert_called_once()
         assert facade.release_resource.call_args.args[:2] == ("proj", RESOURCE_NAME)
+
+    async def test_an_orphaned_success_has_its_heartbeat_stopped_before_the_release(self):
+        """The orphaned attempt now also STARTS a heartbeat (see
+        TestAcquireAndHeartbeatStartAreAtomic), so the cleanup callback has to
+        stop and join it first -- a refresh still in flight when the phantom
+        holder is released would re-establish the lock right back under it."""
+        attempt_started = threading.Event()
+        release_attempt = threading.Event()
+        order = []
+
+        def _slow_acquire(*args):
+            attempt_started.set()
+            release_attempt.wait(timeout=5.0)
+            return (True, "acquired")
+
+        facade = MagicMock()
+        facade.acquire_resource.side_effect = _slow_acquire
+        facade.touch_resource.side_effect = lambda *a: (order.append("touched"), TouchResult.REFRESHED)[1]
+        facade.release_resource.side_effect = lambda *a: (order.append("released"), True)[1]
+
+        async def _holder():
+            async with project_checkout_lock_async("proj", 42, facade=facade):
+                pass  # pragma: no cover -- never reached; cancelled mid-acquire
+
+        task = asyncio.create_task(_holder())
+        await asyncio.to_thread(attempt_started.wait, 5.0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        release_attempt.set()  # the orphaned attempt now succeeds
+        for _ in range(200):
+            if facade.release_resource.called:
+                break
+            await asyncio.sleep(0.02)
+
+        facade.release_resource.assert_called_once()
+        assert order[-1] == "released", "a heartbeat refresh must not outlive the release"
+        assert f"lock-heartbeat-{RESOURCE_NAME}-proj" not in [t.name for t in threading.enumerate()]
+
+
+@pytest.mark.asyncio
+class TestAcquireAndHeartbeatStartAreAtomic:
+    """
+    Regression found reviewing WI-1 (#146): offloading the acquire introduced a
+    suspension point between "the worker thread won the lock" and "the awaiting
+    coroutine is rescheduled and starts the heartbeat". A single-threaded loop
+    blocked by some OTHER task's guarded body -- the case this whole module is
+    designed around, and one that lasts the agent's entire runtime (agents.yaml
+    allows up to 10800s) -- holds that gap open on a lock that is ALREADY held
+    and not yet being refreshed, letting PipelineLockManager's fixed 7200s
+    Redis lock TTL lapse under it. Past that point a second caller's acquire
+    reads the expired key back as an empty dict and is granted the same
+    resource: the exact double-acquisition this lock exists to close.
+
+    So the acquire and the heartbeat start happen in ONE executor callable, and
+    the held-duration context manager adopts that already-running thread.
+    """
+
+    async def test_the_heartbeat_is_already_running_when_the_acquire_await_returns(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+
+        can_execute, _, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+            facade, RESOURCE_NAME, "proj", -42, None, heartbeat_interval_seconds=60.0
+        )
+
+        assert can_execute
+        assert heartbeat is not None, "the hold was granted with no heartbeat attached"
+        stop_event, heartbeat_thread = heartbeat
+        try:
+            assert heartbeat_thread.is_alive()
+        finally:
+            stop_event.set()
+            heartbeat_thread.join()
+
+    async def test_the_heartbeat_thread_is_started_by_the_acquiring_worker_thread(self):
+        loop_thread_id = threading.get_ident()
+        acquired_from = []
+        started_from = []
+        real_start = project_checkout_lock._start_heartbeat_thread
+
+        def _probe_start(*args, **kwargs):
+            started_from.append(threading.get_ident())
+            return real_start(*args, **kwargs)
+
+        facade = MagicMock()
+        facade.acquire_resource.side_effect = lambda *a: (
+            acquired_from.append(threading.get_ident()), (True, "acquired")
+        )[1]
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+
+        with patch('services.project_checkout_lock._start_heartbeat_thread', _probe_start):
+            async with project_checkout_lock_async("proj", facade=facade):
+                pass
+
+        assert started_from, "no heartbeat thread was ever started"
+        assert started_from[0] != loop_thread_id
+        assert started_from[0] == acquired_from[0], (
+            "the heartbeat must start on the same worker thread that won the lock, "
+            "with no event-loop scheduling in between"
+        )
+
+    async def test_a_failed_acquisition_starts_no_heartbeat(self):
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (False, "held by someone else")
+
+        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+            facade, RESOURCE_NAME, "proj", -42, None, heartbeat_interval_seconds=60.0
+        )
+
+        assert not can_execute
+        assert reason == "held by someone else"
+        assert heartbeat is None
+        facade.touch_resource.assert_not_called()
+
+    async def test_a_heartbeat_that_cannot_be_started_releases_the_lock_it_just_won(self):
+        """The lock IS held once acquire_resource() returns, but the awaiting
+        coroutine only ever sees the exception -- so nothing downstream knows
+        to release it."""
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.release_resource.return_value = True
+
+        with patch(
+            'services.project_checkout_lock._start_heartbeat_thread',
+            side_effect=RuntimeError("can't start new thread"),
+        ):
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                await _acquire_and_start_heartbeat_off_loop(
+                    facade, RESOURCE_NAME, "proj", -42, 42, heartbeat_interval_seconds=60.0
+                )
+
+        facade.release_resource.assert_called_once_with("proj", RESOURCE_NAME, -42)
+
+
+@pytest.mark.asyncio
+class TestReleaseNeverOvertakesAnInFlightHeartbeat:
+    """
+    The composed ordering guarantee, end to end through
+    project_checkout_lock_async() rather than through the join helper alone:
+    an in-flight touch_resource() that completed AFTER release_resource()
+    would re-establish the lock under a holder_id nobody will ever release
+    again, leaking it until TTL/staleness recovery (7200s-14400s).
+    """
+
+    async def test_release_resource_is_called_only_after_the_in_flight_touch_returns(self):
+        order = []
+        touch_entered = threading.Event()
+        let_touch_finish = threading.Event()
+        touch_calls = []
+
+        def _touch(*args):
+            touch_calls.append(1)
+            if len(touch_calls) == 1:
+                touch_entered.set()
+                let_touch_finish.wait(timeout=5.0)
+                order.append("touch_returned")
+            return TouchResult.REFRESHED
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.side_effect = _touch
+        facade.release_resource.side_effect = lambda *a: (order.append("released"), True)[1]
+
+        real_start = project_checkout_lock._start_heartbeat_thread
+
+        def _fast_start(facade_, resource_name, project, holder_id, _interval):
+            # The production interval is 1800s; nothing else about the hold
+            # changes, so this is the one knob the composed path doesn't expose.
+            return real_start(facade_, resource_name, project, holder_id, 0.02)
+
+        with patch('services.project_checkout_lock._start_heartbeat_thread', _fast_start):
+            async def _hold():
+                async with project_checkout_lock_async("proj", facade=facade):
+                    await asyncio.to_thread(touch_entered.wait, 5.0)
+
+            task = asyncio.create_task(_hold())
+            await asyncio.to_thread(touch_entered.wait, 5.0)
+            threading.Timer(0.2, let_touch_finish.set).start()
+            await task
+
+        assert order == ["touch_returned", "released"]
 
 
 @pytest.mark.asyncio

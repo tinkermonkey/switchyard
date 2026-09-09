@@ -57,7 +57,16 @@ not wired into any call site by this issue -- that is a follow-up (#54).
 import logging
 from typing import Optional, Tuple
 
-from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, get_pipeline_lock_manager
+# TouchResult is imported (and re-exported) so callers of this facade --
+# services/project_checkout_lock.py's heartbeat -- can interpret
+# touch_resource()'s tri-state return without reaching past the facade into
+# PipelineLockManager directly.
+from services.pipeline_lock_manager import (
+    PipelineLockManager,
+    PipelineLock,
+    TouchResult,
+    get_pipeline_lock_manager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +227,7 @@ class ProjectResourceLockManager:
         """
         return self._lock_manager.get_lock(project, self._resource_board(resource_name))
 
-    def touch_resource(self, project: str, resource_name: str, issue_number: int) -> bool:
+    def touch_resource(self, project: str, resource_name: str, issue_number: int) -> TouchResult:
         """
         Refresh an already-held resource lock's liveness markers (TTL AND
         acquired-at timestamp) without changing its holder.
@@ -231,9 +240,13 @@ class ProjectResourceLockManager:
         staleness heuristic while it's still genuinely alive.
 
         Returns:
-            True if the lock was found (held by issue_number) and refreshed,
-            False if not currently held by issue_number, or if both stores
-            failed to write.
+            The TouchResult touch_lock() produced, passed through unchanged:
+            REFRESHED (held by issue_number and liveness extended), NOT_HELD
+            (confirmed not held by issue_number), or REFRESH_FAILED (the
+            stores themselves failed, so liveness was NOT extended and the
+            state may be unknown). Only REFRESHED is truthy, so this stays
+            drop-in compatible with the bool return this method used to have
+            -- see TouchResult for why the distinction was needed.
         """
         return self._lock_manager.touch_lock(
             project, self._resource_board(resource_name), issue_number

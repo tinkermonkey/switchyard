@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
-from services.pipeline_lock_manager import PipelineLockManager, PipelineLock
+from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, TouchResult
 
 class TestPipelineLockManager(unittest.TestCase):
     def setUp(self):
@@ -143,24 +143,30 @@ class TestTouchLock(unittest.TestCase):
 
         result = self.manager.touch_lock("proj", "board", 123)
 
+        self.assertIs(result, TouchResult.REFRESHED)
         self.assertTrue(result)
         refreshed = self.manager.get_lock("proj", "board")
         self.assertGreater(refreshed.lock_acquired_at, original.lock_acquired_at)
         self.assertEqual(refreshed.locked_by_issue, 123)
 
-    def test_returns_false_and_does_not_touch_a_lock_held_by_a_different_issue(self):
+    def test_returns_not_held_and_does_not_touch_a_lock_held_by_a_different_issue(self):
         self.manager._create_lock("proj", "board", 123)
         original = self.manager.get_lock("proj", "board")
 
         result = self.manager.touch_lock("proj", "board", 456)
 
+        # NOT_HELD, not REFRESH_FAILED: this is a CONFIRMED loss, which
+        # project_checkout_lock.py's heartbeat escalates very differently from
+        # "the stores are down" -- see TouchResult.
+        self.assertIs(result, TouchResult.NOT_HELD)
         self.assertFalse(result)
         unchanged = self.manager.get_lock("proj", "board")
         self.assertEqual(unchanged.lock_acquired_at, original.lock_acquired_at)
         self.assertEqual(unchanged.locked_by_issue, 123)
 
-    def test_returns_false_when_no_lock_exists_at_all(self):
+    def test_returns_not_held_when_no_lock_exists_at_all(self):
         result = self.manager.touch_lock("proj", "board", 123)
+        self.assertIs(result, TouchResult.NOT_HELD)
         self.assertFalse(result)
 
     def test_preserves_retained_reason_if_somehow_set(self):
@@ -196,7 +202,7 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir)
 
-    def test_returns_false_when_both_reads_fail_without_a_healthy_read_ever_happening(self):
+    def test_returns_refresh_failed_when_both_reads_fail_without_a_healthy_read_ever_happening(self):
         # Redis read raises.
         self.mock_redis.hgetall.side_effect = Exception("redis down")
         # YAML read also fails: corrupt the state file directly.
@@ -205,6 +211,24 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
 
         result = self.manager.touch_lock("proj", "board", 123)
 
+        # REFRESH_FAILED, distinct from NOT_HELD: unknown state is not proof
+        # the lock was lost. Found in WI-1 (#146) review -- collapsing the two
+        # into one False made project_checkout_lock.py's heartbeat log an
+        # alarming "the lock was LOST, you may be racing another holder" ERROR
+        # on every tick of a storage outage, and left its sustained-failure
+        # escalation unreachable.
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertFalse(result)
+
+    def test_returns_refresh_failed_when_both_refresh_writes_fail(self):
+        self.mock_redis.hgetall.return_value = {}  # healthy read, "not locked in Redis"
+        self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.hset.side_effect = Exception("redis down")
+
+        with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
         self.assertFalse(result)
 
     def test_still_works_normally_once_reads_are_healthy_again(self):
@@ -216,6 +240,7 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
 
         result = self.manager.touch_lock("proj", "board", 123)
 
+        self.assertIs(result, TouchResult.REFRESHED)
         self.assertTrue(result)
 
 

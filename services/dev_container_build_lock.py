@@ -160,7 +160,7 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 from services.project_checkout_lock import (
-    _acquire_resource_off_loop,
+    _acquire_and_start_heartbeat_off_loop,
     _default_facade_off_loop,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
@@ -228,11 +228,13 @@ async def dev_container_build_lock_async(
     build/state resource for the duration of the `with` block.
 
     Polls ProjectResourceLockManager.acquire_resource() -- a single
-    non-blocking attempt, run in a worker thread (see
-    project_checkout_lock._acquire_resource_off_loop) -- with asyncio.sleep()
-    between attempts, so the poll genuinely never blocks the event loop, until
-    acquired or timeout_seconds elapses. Releases in a finally block so an
-    exception raised inside the `with` body still frees the lock.
+    non-blocking attempt, run in a worker thread that also starts this hold's
+    heartbeat the moment the attempt succeeds (see
+    project_checkout_lock._acquire_and_start_heartbeat_off_loop) -- with
+    asyncio.sleep() between attempts, so the poll genuinely never blocks the
+    event loop, until acquired or timeout_seconds elapses. Releases in a
+    finally block so an exception raised inside the `with` body still frees
+    the lock.
 
     See this module's docstring for exactly what this lock is (and is not)
     held around, and why dev_container_state.set_status() itself is
@@ -257,7 +259,7 @@ async def dev_container_build_lock_async(
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
     while True:
-        can_execute, reason = await _acquire_resource_off_loop(
+        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
             facade, RESOURCE_NAME, project, holder_id, issue_number
         )
         if can_execute:
@@ -268,7 +270,9 @@ async def dev_container_build_lock_async(
         await asyncio.sleep(poll_interval_seconds)
 
     try:
-        async with _held_with_heartbeat_async(facade, RESOURCE_NAME, project, holder_id):
+        async with _held_with_heartbeat_async(
+            facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
+        ):
             yield
     finally:
         # Deliberately synchronous, not offloaded -- see the same finally in

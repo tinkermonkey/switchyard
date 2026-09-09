@@ -12,12 +12,44 @@ import redis
 import logging
 import os
 import threading
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
+
+
+class TouchResult(Enum):
+    """
+    Outcome of touch_lock() -- three genuinely different states that a bare
+    bool collapsed into one.
+
+    Found in review (#146 WI-1): touch_lock() catches every store failure
+    internally (Redis errors around hset/expire, _read_redis_lock_only/
+    _read_yaml_lock_only, _save_lock_to_yaml) and converts each of them into
+    a False return, so its only caller --
+    services/project_checkout_lock.py's heartbeat -- could not tell "another
+    holder now owns this lock" from "the stores are down and this holder's
+    liveness was NOT extended". It treated both as the former, logging a
+    specific and alarming "the lock was LOST, you may be racing a different
+    holder" ERROR every tick of a Redis outage (directly contradicting the
+    ERROR touch_lock itself logs immediately before it), while the sustained-
+    failure escalation written for exactly that outage sat unreachable
+    behind an `except Exception` that store failures never reach.
+
+    __bool__ is defined so every existing truthiness-based caller/assertion
+    (`if not still_held`, assertTrue/assertFalse) keeps its original meaning:
+    only REFRESHED is truthy.
+    """
+
+    REFRESHED = "refreshed"       # confirmed held by this holder, liveness extended
+    NOT_HELD = "not_held"         # confirmed NOT held by this holder (lost, or never held)
+    REFRESH_FAILED = "refresh_failed"  # state unknown / not written -- liveness NOT extended
+
+    def __bool__(self) -> bool:
+        return self is TouchResult.REFRESHED
 
 
 @dataclass
@@ -554,7 +586,7 @@ class PipelineLockManager:
         )
         return True
 
-    def touch_lock(self, project: str, board: str, issue_number: int) -> bool:
+    def touch_lock(self, project: str, board: str, issue_number: int) -> TouchResult:
         """
         Refresh an ALREADY-HELD lock's liveness markers -- both the Redis TTL
         AND lock_acquired_at -- without changing its holder.
@@ -579,10 +611,19 @@ class PipelineLockManager:
         itself, which is what needs the atomic transaction).
 
         Returns:
-            True if the lock was found (held by issue_number) and refreshed
-            in at least one durable store, False if it isn't currently held
-            by issue_number at all (including "no lock exists"), if both
-            reads failed (state genuinely unknown), or if both writes failed.
+            TouchResult.REFRESHED if the lock was found (held by
+            issue_number) and refreshed in at least one durable store;
+            TouchResult.NOT_HELD if it is confirmed NOT currently held by
+            issue_number (including "no lock exists"); TouchResult.
+            REFRESH_FAILED if liveness could not be extended because the
+            stores themselves failed (both reads failed, so the state is
+            genuinely unknown, or both writes failed). Only REFRESHED is
+            truthy (see TouchResult), so callers written against the
+            original bool return keep their original meaning while callers
+            that need to distinguish "lost to another holder" from "the
+            stores are down" now can -- see project_checkout_lock.py's
+            _heartbeat_worker(), which logs and escalates the two very
+            differently.
 
         Note (found in PR #138 review, /pr-review-toolkit:review-pr): reads via
         get_lock_fail_closed(), not the plain get_lock() this method used
@@ -590,11 +631,11 @@ class PipelineLockManager:
         and YAML reads raised" into the same None, so a transient dual-store
         outage would be indistinguishable from "lock genuinely lost to
         another holder" to this method's caller. project_checkout_lock.py's
-        heartbeat treats a False return as proof of the latter and logs a
-        specific, alarming "lock lost to a competing holder" ERROR -- which
-        would have been a false alarm for a momentary storage hiccup. Reads
-        being unhealthy is logged distinctly below rather than folded into
-        the same False the "genuinely not held" case returns.
+        heartbeat logs the latter as a specific, alarming "lock lost to a
+        competing holder" ERROR -- which would have been a false alarm for a
+        momentary storage hiccup. Reads being unhealthy is logged distinctly
+        below AND returned distinctly (REFRESH_FAILED, not NOT_HELD) rather
+        than folded into the "genuinely not held" case.
         """
         lock, reads_healthy = self.get_lock_fail_closed(project, board)
         if not reads_healthy:
@@ -605,9 +646,9 @@ class PipelineLockManager:
                 f"loss to another holder either; refusing to refresh liveness "
                 f"rather than silently reporting a false 'lock lost' condition"
             )
-            return False
+            return TouchResult.REFRESH_FAILED
         if not lock or lock.locked_by_issue != issue_number:
-            return False
+            return TouchResult.NOT_HELD
 
         refreshed = PipelineLock(
             project=project,
@@ -644,9 +685,9 @@ class PipelineLockManager:
                 f"{project}/{board} issue #{issue_number} -- liveness was NOT "
                 f"extended, this lock may be stolen by the staleness heuristic"
             )
-            return False
+            return TouchResult.REFRESH_FAILED
 
-        return True
+        return TouchResult.REFRESHED
 
     def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
         """

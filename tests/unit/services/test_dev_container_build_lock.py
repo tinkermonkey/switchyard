@@ -385,11 +385,15 @@ class TestReusesProjectCheckoutLockHolderIdMinting(unittest.TestCase):
     def test_shared_off_loop_helpers_are_reused(self):
         """WI-1 (#146): the event-loop fixes for the async path -- an OS-thread
         heartbeat that fires even when the guarded body never yields (#141),
-        and an acquire_resource() poll tick that runs off the loop (#140 item
-        6) -- live in project_checkout_lock.py and are imported here, so this
-        module's async lock gets them too."""
+        and an acquire_resource() poll tick that runs off the loop and starts
+        that heartbeat on the same worker thread (#140 item 6) -- live in
+        project_checkout_lock.py and are imported here, so this module's async
+        lock gets them too."""
         import services.dev_container_build_lock as dcbl
-        self.assertIs(dcbl._acquire_resource_off_loop, project_checkout_lock._acquire_resource_off_loop)
+        self.assertIs(
+            dcbl._acquire_and_start_heartbeat_off_loop,
+            project_checkout_lock._acquire_and_start_heartbeat_off_loop,
+        )
         self.assertIs(dcbl._default_facade_off_loop, project_checkout_lock._default_facade_off_loop)
         self.assertIs(dcbl._held_with_heartbeat_async, project_checkout_lock._held_with_heartbeat_async)
 
