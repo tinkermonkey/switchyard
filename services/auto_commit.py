@@ -44,15 +44,25 @@ class AutoCommitService:
             custom_message: Custom commit message (optional)
 
         Returns:
-            True if commit was successful, False otherwise
+            True if commit was successful, False otherwise.
+
+        Raises:
+            ProjectCheckoutLockTimeoutError / DevContainerBuildLockTimeoutError:
+                the ONE failure mode that is not folded into a False return
+                (#148). False is indistinguishable from "nothing to commit" at
+                every caller, and a lock timeout means the commit never ran
+                while the agent's work IS on disk uncommitted -- reporting that
+                as "no changes" loses it. Callers route this to their own
+                lock-contention path (see services/resource_lock_errors.py).
         """
         if not project_dir:
             # A caller with no resolved directory (e.g. an old context.json
             # predating this field) must not reach a bare Path(None) TypeError
             # here -- this method's documented contract is "True if commit was
-            # successful, False otherwise" for every failure mode, matching its
-            # repair-cycle callers, which run it inside a bare threading.Thread
-            # with no exception handling of their own.
+            # successful, False otherwise" for every failure mode except a
+            # resource-lock timeout (#148, see Raises above), matching its
+            # repair-cycle callers, whose threading.Thread wrapper handles only
+            # that one exception.
             logger.error(
                 f"commit_agent_changes() called for {project}/#{issue_number} "
                 f"(agent={agent}) with no project_dir -- cannot determine which "
@@ -138,6 +148,25 @@ class AutoCommitService:
             )
 
         except Exception as e:
+            # Project resource-lock timeout (#148): the commit never ran because
+            # another holder owned this project's base clone for the whole of that
+            # lock's timeout. Returning False here would be indistinguishable from
+            # "nothing to commit" at every caller -- and the maker's work IS on disk,
+            # uncommitted. review_cycle.py reads a False return as "no changes to
+            # commit for iteration N" and carries on, while
+            # agent_container_recovery.py escalates `overall_success and not
+            # commit_success` all the way to mark_failed("Repair cycle passed but its
+            # fix was not committed"). Re-raise so callers see the same typed
+            # exception every other dispatch path now routes to its contention path.
+            from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+            if is_lock_timeout_error(e):
+                logger.warning(
+                    f"Auto-commit for {project} (agent {agent}, issue {issue_number}) could "
+                    f"not acquire the project_checkout lock -- propagating rather than "
+                    f"reporting 'nothing to commit': {describe_lock_timeout(e)}"
+                )
+                raise
+
             logger.error(f"Failed to auto-commit changes for {project}: {e}")
             return False
 

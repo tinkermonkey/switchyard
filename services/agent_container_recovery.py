@@ -1572,18 +1572,35 @@ class AgentContainerRecovery:
         # Get success status
         overall_success = result.get('overall_success', False)
 
+        # Classify the recovered result through the SAME single authority the live
+        # (non-restart-recovery) path uses — project_monitor.classify_repair_cycle_
+        # outcome(). exit_code=None because the container is long gone by the time
+        # this runs; the result dict's own flags are all that survives an orchestrator
+        # restart, and repair_cycle_runner.py persists it to Redis before exiting for
+        # exactly that reason. Sharing the classifier is what stops this path drifting
+        # from the live one again: it honoured 'frozen' but silently ignored
+        # 'lock_contention', so contention fell through to mark_failed() (#148).
+        #
         # Frozen: paused by the Claude Code token-limit circuit breaker mid-run, not
-        # a genuine test/infra failure. repair_cycle_runner.py sets 'frozen': True in
-        # the Redis result for this case (see its exit code 5). Handled distinctly
-        # below — no misleading failure comment, no lock retained for manual
-        # intervention — mirroring project_monitor.py's _monitor_repair_cycle_container,
-        # which handles the same signal for the live (non-restart-recovery) path.
-        is_frozen = bool(result.get('frozen'))
+        # a genuine test/infra failure. Lock contention: another holder owned this
+        # project's checkout (or dev-container build slot) for the whole of that lock's
+        # timeout, so no agent in the cycle ever ran. Both are handled distinctly below
+        # — no misleading failure comment, no lock retained for manual intervention.
+        from services.project_monitor import classify_repair_cycle_outcome
+        repair_outcome = classify_repair_cycle_outcome(None, result, overall_success)
+        is_frozen = repair_outcome == 'frozen'
+        is_lock_contention = repair_outcome == 'lock_contention'
         if is_frozen:
             logger.warning(
                 f"Repair cycle for {project}/#{issue_number} (recovered after restart) "
                 f"was paused by the Claude Code circuit breaker. Not treating as a "
                 f"failure — will auto-resume once tokens reset."
+            )
+        if is_lock_contention:
+            logger.warning(
+                f"Repair cycle for {project}/#{issue_number} (recovered after restart) "
+                f"could not acquire a project resource lock. Not treating as a failure — "
+                f"the next board poll re-dispatches it."
             )
 
         # Load project config to get org
@@ -1642,7 +1659,9 @@ class AgentContainerRecovery:
         # this isn't a failure requiring attention, it's a temporary pause that
         # resumes automatically, so the failure-shaped summary above would be
         # actively misleading (matches the silent-pause behavior of the live path).
-        if not comment_already_posted and not is_frozen:
+        # Same for lock contention: the cycle never ran, so a "Repair Cycle Failed"
+        # summary would be reporting a failure that never happened (#148).
+        if not comment_already_posted and not is_frozen and not is_lock_contention:
             # Run async code in a new thread to avoid event loop conflicts
             # (threading imported at the top of this method -- also needed
             # unconditionally by the auto-commit section below, whether or not
@@ -1676,6 +1695,13 @@ class AgentContainerRecovery:
         # always has a real value to gate on, even if something raises before the
         # commit thread itself ever runs (e.g. the auto_commit_service import).
         commit_success = [False]
+        # Set when the commit itself couldn't run because a project resource lock was
+        # held for its whole timeout (#148). Distinguishes "the fix was never committed
+        # because contention blocked the attempt" — which must NOT reach the
+        # mark_failed("passed but its fix was not committed") branch below — from the
+        # genuine case that branch exists for. commit_agent_changes() re-raises rather
+        # than returning False precisely so this is distinguishable at all.
+        commit_lock_contention = [False]
         if overall_success:
             try:
                 logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
@@ -1735,9 +1761,28 @@ class AgentContainerRecovery:
                         )
                     )
 
-                # Run in separate thread
+                # Run in separate thread. The lock-timeout capture has to happen HERE,
+                # inside the thread: do_commit() now propagates that exception, and one
+                # raised in a thread never reaches the enclosing try/except below.
                 def commit_thread():
-                    commit_success[0] = do_commit()
+                    try:
+                        commit_success[0] = do_commit()
+                    except Exception as commit_err:
+                        from services.resource_lock_errors import (
+                            is_lock_timeout_error, describe_lock_timeout,
+                        )
+                        if is_lock_timeout_error(commit_err):
+                            commit_lock_contention[0] = True
+                            logger.warning(
+                                f"Auto-commit for recovered repair cycle on issue "
+                                f"#{issue_number} could not acquire a project resource "
+                                f"lock: {describe_lock_timeout(commit_err)}"
+                            )
+                        else:
+                            logger.error(
+                                f"Auto-commit for recovered repair cycle on issue "
+                                f"#{issue_number} raised: {commit_err}", exc_info=True
+                            )
 
                 thread = threading.Thread(target=commit_thread)
                 thread.start()
@@ -1758,6 +1803,16 @@ class AgentContainerRecovery:
 
                 if commit_success[0]:
                     logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                elif commit_lock_contention[0]:
+                    # Already logged with its specific lock in commit_thread(); named
+                    # separately here so the generic "no changes to commit" line below
+                    # can't be read as this outcome -- the fix IS still in the workspace
+                    # and the run is released for the next poll rather than marked failed.
+                    logger.warning(
+                        f"Auto-commit for repair cycle issue #{issue_number} was blocked by a "
+                        "project resource-lock timeout -- the fix is still uncommitted in the "
+                        "workspace; releasing the run so the next board poll retries"
+                    )
                 elif thread.is_alive():
                     # #57 review: the join itself timed out (thread still
                     # running) -- distinct from "commit_agent_changes()
@@ -1886,6 +1941,41 @@ class AgentContainerRecovery:
                         )
                     except Exception as state_err:
                         logger.error(f"Failed to record frozen outcome: {state_err}")
+                elif is_lock_contention or commit_lock_contention[0]:
+                    # Contention, not a failure (#148). Unlike frozen there is no
+                    # watchdog resume path for it, so the run has to be ended
+                    # (retain_lock=False) for the next board poll to re-dispatch —
+                    # and it must NOT go through mark_failed(), which durably retains
+                    # this board's lock (blocking every sibling issue on it until an
+                    # operator runs scripts/release_lock.py) over a lock that was
+                    # working exactly as designed. Mirrors the live path's contention
+                    # branch in project_monitor._monitor_repair_cycle_container.
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        agent_name = context.get('agent_name', 'senior_software_engineer')
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=column,
+                            agent=agent_name,
+                            outcome='lock_contention',
+                            project_name=project,
+                            error=result.get('error')
+                        )
+                    except Exception as state_err:
+                        logger.error(f"Failed to record lock_contention outcome: {state_err}")
+
+                    pipeline_run_manager.end_pipeline_run(
+                        project=project,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason="Repair cycle blocked by a project resource-lock timeout",
+                        retain_lock=False,
+                    )
+                    logger.info(
+                        f"Released pipeline run for {project}/#{issue_number} after a "
+                        f"recovered repair-cycle lock contention — next poll retries. "
+                        f"No lock retained, no failure comment posted."
+                    )
                 elif overall_success and commit_success[0]:
                     # Proceed to end the run normally — matches the live-run success path.
                     ended = pipeline_run_manager.end_pipeline_run(

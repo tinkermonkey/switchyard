@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 # already happened.
 MAX_CONSECUTIVE_DISPATCH_FAILURES = 3
 
+# Consecutive 'lock_contention' dispatches (#148) for the same issue/column/agent
+# before the contention itself is escalated to an operator. Deliberately NOT a
+# mark_failed() budget like MAX_CONSECUTIVE_DISPATCH_FAILURES above — retaining the
+# board's lock is the exact outcome the contention exemption exists to prevent, and
+# the condition genuinely does resolve itself the moment the other holder finishes.
+# What it buys is visibility: at ~3h per project_checkout timeout, three rounds is
+# most of a day of a worker slot waiting on a lock nobody is releasing (an
+# orchestrator-side coroutine wedged mid-hold keeps refreshing the lock's TTL from
+# its heartbeat thread for the life of the process), which is well past the point a
+# human should have been told.
+MAX_CONSECUTIVE_LOCK_CONTENTIONS = 3
+
 # How long a pending (enqueued, not yet picked up) task may suppress a dispatch
 # rollback for its issue. Past this, the task is treated as orphaned rather than
 # imminent. Sized well above the queue's normal pickup latency but far below
@@ -463,6 +475,76 @@ def _register_repair_cycle_container(
     except Exception as e:
         logger.error(f"Failed to register repair cycle container in Redis: {e}")
         return False
+
+
+# pipeline/repair_cycle_runner.py's dedicated exit codes for the two outcomes that
+# are NOT repair-cycle failures (see its run() docstring). Named here rather than
+# written as bare integers at the comparison sites so the runner->monitor contract
+# is greppable from both ends: a new code inserted on one side without the other
+# silently demotes contention to a generic exit-2 failure, which retains this
+# board's lock. tests/unit/test_repair_cycle_outcome_contract.py pins the pair.
+REPAIR_CYCLE_EXIT_FROZEN = 5
+REPAIR_CYCLE_EXIT_LOCK_CONTENTION = 6
+
+
+def classify_repair_cycle_outcome(
+    exit_code: Optional[int],
+    repair_result: Optional[Dict[str, Any]],
+    overall_success: bool,
+) -> str:
+    """
+    The single authority on what a finished repair-cycle container's result means:
+    'success', 'frozen', 'lock_contention' or 'failure'.
+
+    Both non-failure outcomes are signalled twice — a dedicated exit code from
+    pipeline/repair_cycle_runner.py, and a flag in the result dict it persists to
+    Redis before exiting — because either can be the only one that survives
+    (a container killed after writing its result has no usable exit code; a result
+    that never reached Redis leaves only the exit code). Checked before success so
+    a partially-successful result can't mask the pause/contention that ended the run.
+
+    Extracted as a module-level function, and shared with
+    services/agent_container_recovery.py's restart-recovery consumer of the same
+    result dict (which passes exit_code=None — the container is long gone by then),
+    for the same two reasons _end_pr_review_pipeline_run_on_failure() above was:
+    the live consumer is a closure inside a background-thread monitor that is
+    impractical to drive from a test, and a second hand-written copy of this
+    classification is exactly how the restart-recovery path came to honour 'frozen'
+    but not 'lock_contention' (#148).
+    """
+    if (exit_code == REPAIR_CYCLE_EXIT_FROZEN) or bool(repair_result and repair_result.get('frozen')):
+        return 'frozen'
+    if (exit_code == REPAIR_CYCLE_EXIT_LOCK_CONTENTION) or bool(
+        repair_result and repair_result.get('lock_contention')
+    ):
+        return 'lock_contention'
+    return 'success' if overall_success else 'failure'
+
+
+def _pr_review_failure_report(exception: Exception) -> Tuple[str, bool]:
+    """
+    How a PRReviewStage exception should be reported: the outcome to record for
+    the synthetic 'pr_review_stage' wrapper agent, and whether to post the
+    "PR Review Failed" comment on the issue.
+
+    A project resource-lock timeout (#148) is contention, not a review failure —
+    pr_review_stage.py's phase handlers abandon the review on the first one so it
+    propagates here with its type intact, and nothing was ever attempted. Reporting
+    it as 'failed' puts a bogus failure in the execution history and pastes the raw
+    lock-timeout text onto the issue as operator-facing noise. Same suppression the
+    repair-cycle handler applies for its own contention signal, and the same reason
+    agent_executor.py gives for not emitting agent_completed(success=False) here.
+
+    Extracted as a module-level function for the same reason
+    _end_pr_review_pipeline_run_on_failure() above was — see its docstring.
+
+    Returns:
+        (outcome, post_failure_comment)
+    """
+    from services.resource_lock_errors import is_lock_timeout_error
+    if is_lock_timeout_error(exception):
+        return 'lock_contention', False
+    return 'failed', True
 
 
 def _end_pr_review_pipeline_run_on_failure(
@@ -2770,12 +2852,44 @@ class ProjectMonitor:
                                     f"Issue #{issue_number} retrying after {consecutive_failures} "
                                     f"prior failure(s) for {current_column_agent} in '{status}'"
                                 )
+                        elif last_execution and last_execution.get('outcome') == 'lock_contention':
+                            # Never ran — a project resource lock was held for the whole of
+                            # its timeout (#148). This poll IS the retry, and it deliberately
+                            # does not accumulate toward MAX_CONSECUTIVE_DISPATCH_FAILURES
+                            # above: mark_failed() would durably retain this board's lock over
+                            # a lock working exactly as designed. But re-dispatching forever
+                            # with nothing but a log line is its own silent failure, so a
+                            # sustained run of contention is escalated for visibility — the
+                            # dispatch still proceeds, because it is still the only thing that
+                            # can resolve on its own.
+                            contention_count = work_execution_tracker.count_consecutive_lock_contentions(
+                                project_name=project_name,
+                                issue_number=issue_number,
+                                column=status,
+                                agent=current_column_agent,
+                            )
+                            if contention_count >= MAX_CONSECUTIVE_LOCK_CONTENTIONS:
+                                self._escalate_sustained_lock_contention(
+                                    project_name=project_name,
+                                    board_name=board_name,
+                                    repository=repository,
+                                    issue_number=issue_number,
+                                    status=status,
+                                    agent=current_column_agent,
+                                    contention_count=contention_count,
+                                    last_error=last_execution.get('error'),
+                                )
+                            else:
+                                logger.info(
+                                    f"Issue #{issue_number} retrying after {contention_count} "
+                                    f"project resource-lock contention(s) for "
+                                    f"{current_column_agent} in '{status}'"
+                                )
+                            pipeline_queue.mark_issue_active(
+                                issue_number, preserve_activated_at=already_activated_at
+                            )
                         else:
                             # Issue is queued but never executed - should execute current stage.
-                            # A previous outcome of 'lock_contention' (#148) lands here on
-                            # purpose: the dispatch never ran because a project resource lock
-                            # was held, so this poll IS its retry, and it deliberately does not
-                            # accumulate toward MAX_CONSECUTIVE_DISPATCH_FAILURES above.
                             logger.info(
                                 f"Issue #{issue_number} holds pipeline lock but no active execution "
                                 f"and no completed execution for {current_column_agent}. "
@@ -4128,6 +4242,113 @@ class ProjectMonitor:
                     f"Failed to post failure comment for issue #{issue_number} after "
                     f"retry: {comment_err}"
                 )
+
+    def _escalate_sustained_lock_contention(
+        self,
+        project_name: str,
+        board_name: str,
+        repository: str,
+        issue_number: int,
+        status: str,
+        agent: str,
+        contention_count: int,
+        last_error: Optional[str] = None,
+    ):
+        """
+        Make a sustained run of project resource-lock contention visible to an
+        operator (#148), without doing anything that blocks the board.
+
+        Deliberately NOT the mark_failed() treatment MAX_CONSECUTIVE_DISPATCH_
+        FAILURES gets: durably retaining this board's lock is precisely what the
+        contention exemption exists to prevent, and unlike a broken agent this
+        condition really does clear itself when the other holder finishes. The
+        dispatch proceeds either way; this only ensures that "waiting on a lock
+        nobody is releasing" stops being indistinguishable, from the outside, from
+        "working normally but slowly".
+
+        The GitHub comment is posted at most once per (issue, column, agent) day —
+        the poll loop revisits this every 30 seconds, so an ungated comment would
+        bury the issue thread. Redis-gated because that's what the poll loop
+        already depends on; with no Redis the log line and the decision event are
+        still emitted and the comment is simply skipped rather than spammed.
+        """
+        import asyncio
+        from services.github_integration import GitHubIntegration
+
+        logger.error(
+            f"Issue #{issue_number} has now lost {contention_count} consecutive dispatches "
+            f"for {agent} in '{status}' to a project resource-lock timeout on "
+            f"{project_name} — no agent has run. The lock is being held for its full "
+            f"timeout by something that is not finishing; check for a wedged holder "
+            f"(the last timeout reported: {last_error or 'no detail recorded'}). Still "
+            f"re-dispatching: the pipeline lock is NOT retained and no run is marked "
+            f"failed, because contention is not this issue's fault."
+        )
+
+        try:
+            self.decision_events.emit_error_decision(
+                error_type="sustained_lock_contention",
+                error_message=(
+                    f"{contention_count} consecutive lock-contention dispatches for "
+                    f"{agent} in '{status}': {last_error or 'no detail recorded'}"
+                ),
+                context={
+                    'issue_number': issue_number,
+                    'project': project_name,
+                    'board': board_name,
+                    'column': status,
+                    'agent': agent,
+                    'consecutive_lock_contentions': contention_count,
+                },
+                recovery_action="Re-dispatching; no lock retained, no run marked failed",
+                success=False,
+                project=project_name,
+            )
+        except Exception as emit_err:
+            logger.warning(f"Failed to emit sustained lock contention event: {emit_err}")
+
+        notified_key = (
+            f"lock_contention:notified:{project_name}:{board_name}:{issue_number}:{status}:{agent}"
+        )
+        try:
+            redis_client = self.task_queue.redis_client
+            if not redis_client:
+                return
+            if not redis_client.set(notified_key, "1", nx=True, ex=86400):
+                return
+        except Exception as redis_err:
+            logger.warning(
+                f"Could not gate the sustained-lock-contention comment for issue "
+                f"#{issue_number} — skipping it rather than posting on every poll: {redis_err}"
+            )
+            return
+
+        comment = (
+            f"## ⏳ Blocked by a project resource lock\n\n"
+            f"The last **{contention_count}** dispatches of `{agent}` for this issue in "
+            f"**{status}** each waited out a project resource lock without ever running "
+            f"an agent.\n\n"
+            f"```\n{last_error or 'No lock detail was recorded with the last attempt.'}\n```\n\n"
+            f"This is contention, not a failure — the pipeline lock has **not** been "
+            f"retained and this issue is still being re-dispatched, so no action is "
+            f"needed if another long-running job on `{project_name}` is simply holding "
+            f"the checkout. If nothing is legitimately holding it, look for a wedged "
+            f"holder: the lock's TTL is refreshed by its holder's heartbeat thread for "
+            f"as long as that process lives.\n\n"
+            f"---\n_Sustained lock contention - Switchyard_"
+        )
+
+        try:
+            project_config = self.config_manager.get_project_config(project_name)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'], repo_name=repository
+            )
+            asyncio.run(github.post_comment(issue_number, comment))
+        except Exception as comment_err:
+            logger.error(
+                f"Failed to post sustained-lock-contention comment for issue "
+                f"#{issue_number}: {comment_err}"
+            )
 
     def _release_pipeline_lock_and_process_next(
         self,
@@ -5550,6 +5771,9 @@ class ProjectMonitor:
             def run_cycle_in_thread():
                 """Run the review cycle in a background thread"""
                 exception_occurred = False  # True only for a genuine crash, not CancellationError
+                # Blocked by a project resource-lock timeout (#148) — the run has already
+                # been released by the executor, but the queue entry still needs resetting.
+                lock_contention_occurred = False
                 error_summary = None
                 try:
                     # Create new event loop for this thread
@@ -5669,8 +5893,26 @@ _Review cycle initiated by Switchyard_
                 except Exception as e:
                     # CancellationError: deliberate stop — log as info, don't emit error events
                     from services.cancellation import CancellationError
+                    from services.resource_lock_errors import (
+                        is_lock_timeout_error, describe_lock_timeout,
+                    )
                     if isinstance(e, CancellationError):
                         logger.info(f"Review cycle cancelled for issue #{issue_number}")
+                    elif is_lock_timeout_error(e):
+                        # Project resource-lock timeout (#148): contention, not a crash.
+                        # ReviewCycleExecutor._release_run_for_lock_contention() has
+                        # already ended this run with retain_lock=False and deliberately
+                        # kept the cycle state; re-raising it here is only how it reaches
+                        # this thread boundary. exception_occurred stays False so the
+                        # finally block's mark_failed() — which durably retains this
+                        # board's lock pending scripts/release_lock.py — is not reached
+                        # for a lock that was working exactly as designed.
+                        lock_contention_occurred = True
+                        logger.warning(
+                            f"Review cycle for issue #{issue_number} was blocked by a project "
+                            f"resource-lock timeout — the pipeline run was released, the next "
+                            f"board poll retries: {describe_lock_timeout(e)}"
+                        )
                     else:
                         exception_occurred = True
                         error_summary = str(e)
@@ -6044,6 +6286,22 @@ _Review cycle initiated by Switchyard_
                                 project_name, board_name, repository, issue_number,
                                 fail_reason, marked_successfully=marked_ok,
                             )
+                        elif lock_contention_occurred:
+                            # Contention, not a crash (#148): no mark_failed(), no failure
+                            # comment. The executor already ended the run with
+                            # retain_lock=False; the one thing still owed is the same queue
+                            # reset the crash branch above does, because nothing else moves
+                            # a 'active' entry back to 'waiting' and
+                            # get_next_waiting_issue() filters strictly on 'waiting'.
+                            from services.pipeline_queue_manager import get_pipeline_queue_manager
+                            queue_mgr = get_pipeline_queue_manager(project_name, board_name)
+                            queue_mgr.reset_issue_to_waiting(issue_number)
+                            logger.warning(
+                                f"Pipeline run released for issue #{issue_number} after a "
+                                f"review-cycle project resource-lock timeout (was in "
+                                f"'{status}') — queue entry reset to 'waiting', the next "
+                                f"poll re-dispatches. No lock retained, no failure recorded."
+                            )
                         else:
                             logger.debug(
                                 f"Keeping pipeline lock for issue #{issue_number} "
@@ -6342,36 +6600,35 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     repair_result.get('overall_success', False) if repair_result else False
                 )
 
+                # Classify once, here, and derive every downstream gate from that one
+                # answer — see classify_repair_cycle_outcome() for the exit-code/result-
+                # flag contract and why it lives at module level.
+                #
                 # Frozen: paused by the Claude Code token-limit circuit breaker mid-run,
-                # not a genuine test/infra failure. Exit code 5 is repair_cycle_runner.py's
-                # dedicated signal for this (see its Exit Codes docstring);
-                # repair_result['frozen'] is a belt-and-suspenders check in case the exit
-                # code didn't make it through cleanly. Handled distinctly below: no
+                # not a genuine test/infra failure. Handled distinctly below: no
                 # misleading failure comment, no lock retained for manual intervention —
                 # pipeline_watchdog's existing frozen-resume path (which watches for
                 # work_execution_tracker outcome='frozen') picks this back up
                 # automatically once the breaker closes.
-                is_frozen = (exit_code == 5) or bool(repair_result and repair_result.get('frozen'))
+                #
+                # Lock contention: the cycle never got to run because another holder
+                # owned this project's checkout (or dev-container build slot) for the
+                # whole of that lock's timeout. Handled like frozen below — no misleading
+                # failure comment, no lock retained for manual intervention — except that
+                # the pipeline run IS released, because nothing watches for lock
+                # contention the way pipeline_watchdog watches for frozen: the next board
+                # poll is the retry point (#148).
+                repair_outcome = classify_repair_cycle_outcome(
+                    exit_code, repair_result, overall_success
+                )
+                is_frozen = repair_outcome == 'frozen'
+                is_lock_contention = repair_outcome == 'lock_contention'
                 if is_frozen:
                     logger.warning(
                         f"Repair cycle for {project_name}/#{issue_number} was paused by the "
                         f"Claude Code circuit breaker (exit_code={exit_code}). Not treating as "
                         f"a failure — will auto-resume once tokens reset."
                     )
-
-                # Lock contention: the cycle never got to run because another holder
-                # owned this project's checkout (or dev-container build slot) for the
-                # whole of that lock's timeout. Exit code 6 is repair_cycle_runner.py's
-                # dedicated signal (see its Exit Codes docstring), with the result-dict
-                # flag as the same belt-and-suspenders fallback used for frozen.
-                # Handled like frozen below — no misleading failure comment, no lock
-                # retained for manual intervention — except that the pipeline run IS
-                # released, because nothing watches for lock contention the way
-                # pipeline_watchdog watches for frozen: the next board poll is the
-                # retry point (#148).
-                is_lock_contention = (exit_code == 6) or bool(
-                    repair_result and repair_result.get('lock_contention')
-                )
                 if is_lock_contention:
                     logger.warning(
                         f"Repair cycle for {project_name}/#{issue_number} could not acquire a "
@@ -6597,15 +6854,16 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # agent_name is now passed as a parameter to this function
                     # No need to extract from repair_result
 
-                    if is_frozen:
-                        outcome = 'frozen'
-                    elif is_lock_contention:
-                        # Deliberately not 'failure': count_consecutive_failures() would
-                        # otherwise turn repeated contention into a durably-retained
-                        # board lock via MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
-                        outcome = 'lock_contention'
-                    else:
-                        outcome = 'success' if overall_success else 'failure'
+                    # Same single authority the gates above were derived from, re-evaluated
+                    # here because this finally block also runs when the try never reached
+                    # that point (its inputs are all initialised before the try). Note
+                    # 'lock_contention' is deliberately not 'failure':
+                    # count_consecutive_failures() would otherwise turn repeated contention
+                    # into a durably-retained board lock via
+                    # MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
+                    outcome = classify_repair_cycle_outcome(
+                        exit_code, repair_result, overall_success
+                    )
 
                     # If we never got an exit code, container failed during launch
                     if exit_code is None:
@@ -7100,12 +7358,18 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 except Exception as e:
                     logger.error(f"PR review stage failed for issue #{issue_number}: {e}", exc_info=True)
 
-                    # Record failure — must match the 'pr_review_stage' outer wrapper name
+                    # A lock timeout is contention, not a failure of this stage — see
+                    # _pr_review_failure_report(). _end_pr_review_pipeline_run_on_failure()
+                    # below already releases (rather than retains) the run for it; this is
+                    # the matching treatment for the two operator-facing reports.
+                    pr_review_outcome, post_failure_comment = _pr_review_failure_report(e)
+
+                    # Record the outcome — must match the 'pr_review_stage' outer wrapper name
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
                         agent='pr_review_stage',
-                        outcome='failed',
+                        outcome=pr_review_outcome,
                         project_name=project_name,
                         error=str(e)
                     )
@@ -7122,29 +7386,38 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     except Exception as end_err:
                         logger.warning(f"Failed to end pipeline run after PR review failure: {end_err}")
 
-                    # Post failure comment to GitHub
-                    try:
-                        from services.github_integration import GitHubIntegration
-                        github = GitHubIntegration(
-                            repo_owner=project_config.github['org'],
-                            repo_name=project_config.github['repo']
+                    # Post failure comment to GitHub — never for pure lock contention:
+                    # nothing was attempted, so the comment would just paste the raw
+                    # lock-timeout text onto the issue as operator-facing noise.
+                    if not post_failure_comment:
+                        logger.warning(
+                            f"PR review for issue #{issue_number} was blocked by a project "
+                            f"resource-lock timeout — recorded as contention, no failure "
+                            f"comment posted, the next board poll retries."
                         )
-                        error_comment = (
-                            f"## PR Review Failed\n\n"
-                            f"The PR review stage encountered an error:\n\n"
-                            f"```\n{str(e)}\n```\n\n"
-                            f"---\n_PR review stage error - Switchyard_"
-                        )
-                        loop2 = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop2)
+                    else:
                         try:
-                            loop2.run_until_complete(
-                                github.post_comment(issue_number, error_comment, pipeline_run_id=pipeline_run.id)
+                            from services.github_integration import GitHubIntegration
+                            github = GitHubIntegration(
+                                repo_owner=project_config.github['org'],
+                                repo_name=project_config.github['repo']
                             )
-                        finally:
-                            loop2.close()
-                    except Exception as comment_error:
-                        logger.warning(f"Failed to post PR review failure comment: {comment_error}")
+                            error_comment = (
+                                f"## PR Review Failed\n\n"
+                                f"The PR review stage encountered an error:\n\n"
+                                f"```\n{str(e)}\n```\n\n"
+                                f"---\n_PR review stage error - Switchyard_"
+                            )
+                            loop2 = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop2)
+                            try:
+                                loop2.run_until_complete(
+                                    github.post_comment(issue_number, error_comment, pipeline_run_id=pipeline_run.id)
+                                )
+                            finally:
+                                loop2.close()
+                        except Exception as comment_error:
+                            logger.warning(f"Failed to post PR review failure comment: {comment_error}")
                 finally:
                     loop.close()
 

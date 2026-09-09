@@ -36,6 +36,11 @@ Exit Codes:
     5: Frozen - paused by the Claude Code token-limit circuit breaker; not a
        genuine failure. project_monitor's container-completion handler resumes
        this automatically (via the checkpoint) once the breaker closes.
+    6: Lock contention - blocked by a project resource-lock timeout; not a
+       genuine failure either, and nothing ran. project_monitor's
+       classify_repair_cycle_outcome() reads this code (and the matching
+       'lock_contention' flag in the Redis result) and releases the pipeline run
+       so the next board poll re-dispatches (#148).
 """
 
 import argparse

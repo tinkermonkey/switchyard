@@ -499,11 +499,22 @@ class WorkExecutionStateTracker:
         """Count trailing consecutive 'failure' outcomes for this column/agent —
         same filter idiom as get_last_execution().
 
-        Only 'failure' counts, and any other outcome ends the run. That is what
-        keeps a 'lock_contention' dispatch (#148) — where the agent never ran
-        because another holder owned a project resource lock — from accumulating
-        toward project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES, which would
-        durably retain the whole board's pipeline lock over pure contention.
+        Only 'failure' increments, so a 'lock_contention' dispatch (#148) — where
+        the agent never ran because another holder owned a project resource lock —
+        never accumulates toward project_monitor's
+        MAX_CONSECUTIVE_DISPATCH_FAILURES, which would durably retain the whole
+        board's pipeline lock over pure contention.
+
+        But 'lock_contention' is SKIPPED rather than treated as the end of the run.
+        Ending the run on it would let contention erase real failure history: on a
+        busy shared base clone, a genuinely broken agent that loses the lock race
+        every third dispatch produces failure, failure, lock_contention, failure,
+        failure, ... — a trailing count that never reaches 3, so the budget never
+        fires and the broken agent is re-dispatched forever. Contention is
+        transparent to this count in both directions: it neither accumulates
+        toward the budget nor resets it. Every other outcome still ends the run —
+        a success, a frozen pause or a cancellation genuinely does mean the
+        preceding failures are no longer consecutive.
         """
         state = self.load_state(project_name, issue_number)
         column_executions = [
@@ -512,7 +523,50 @@ class WorkExecutionStateTracker:
         ]
         count = 0
         for execution in reversed(column_executions):
-            if execution.get('outcome') == 'failure':
+            outcome = execution.get('outcome')
+            if outcome == 'failure':
+                count += 1
+            elif outcome == 'lock_contention':
+                continue
+            else:
+                break
+        return count
+
+    def count_consecutive_lock_contentions(
+        self,
+        project_name: str,
+        issue_number: int,
+        column: str,
+        agent: str
+    ) -> int:
+        """Count trailing consecutive 'lock_contention' outcomes for this
+        column/agent — the contention counterpart of
+        count_consecutive_failures(), same filter idiom.
+
+        Exists so repeated contention is bounded and visible rather than silent
+        (#148). 'lock_contention' is deliberately excluded from the dispatch
+        failure budget, and should_execute_work() re-dispatches after it, so
+        without a counter of its own a permanently-held project resource lock
+        (e.g. an orchestrator-side coroutine wedged while its heartbeat thread
+        keeps refreshing the lock's TTL) produces an unbounded wait/re-dispatch
+        loop with nothing but a per-occurrence log line to show for it.
+        project_monitor escalates on this count; it deliberately does NOT
+        mark_failed(), which would reintroduce exactly the durable board-lock
+        retention the contention exemption exists to prevent.
+
+        Unlike count_consecutive_failures() above this one ends its run on ANY
+        other outcome, 'failure' included: a real dispatch that got far enough to
+        fail is proof the lock was obtainable in between, so the contention was
+        not continuous.
+        """
+        state = self.load_state(project_name, issue_number)
+        column_executions = [
+            e for e in state['execution_history']
+            if e['column'] == column and e['agent'] == agent
+        ]
+        count = 0
+        for execution in reversed(column_executions):
+            if execution.get('outcome') == 'lock_contention':
                 count += 1
             else:
                 break

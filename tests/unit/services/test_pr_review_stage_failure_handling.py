@@ -117,3 +117,38 @@ class TestLockTimeoutReleasesRatherThanRetaining:
         mock_manager.mark_failed.assert_not_called()
         assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
         assert result is None
+
+
+class TestPrReviewFailureReport:
+    """
+    #148: the run releases the lock for contention, but the two operator-facing
+    reports the same handler produces — the 'pr_review_stage' execution-history
+    record and the "PR Review Failed" issue comment — were still failure-shaped,
+    so pure contention left a bogus 'failed' entry in the history and pasted the
+    raw lock-timeout text onto the issue.
+    """
+
+    def test_lock_timeout_is_reported_as_contention_without_a_comment(self):
+        from services.project_monitor import _pr_review_failure_report
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        outcome, post_comment = _pr_review_failure_report(
+            ProjectCheckoutLockTimeoutError("could not acquire lock within 10900.0s")
+        )
+
+        assert outcome == 'lock_contention'
+        assert post_comment is False
+
+    def test_wrapped_lock_timeout_is_recognised(self):
+        from services.project_monitor import _pr_review_failure_report
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        wrapper = NonRetryableAgentError("All review phases failed for #123")
+        wrapper.__cause__ = ProjectCheckoutLockTimeoutError("busy")
+
+        assert _pr_review_failure_report(wrapper) == ('lock_contention', False)
+
+    def test_ordinary_failure_is_still_reported_as_failed_with_a_comment(self):
+        from services.project_monitor import _pr_review_failure_report
+
+        assert _pr_review_failure_report(ValueError("boom")) == ('failed', True)

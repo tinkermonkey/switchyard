@@ -32,10 +32,33 @@ against a failure budget, therefore has to be able to recognise it:
     rather than 'failure' so work_execution_state.count_consecutive_failures()
     never reaches project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES, and the
     teardown paths that would otherwise call PipelineRunManager.mark_failed()
-    (services/human_feedback_loop.py, the PR-review and repair-cycle handlers
-    in services/project_monitor.py) release the run instead, because
-    mark_failed() durably retains the BOARD's lock until a human runs
-    scripts/release_lock.py.
+    release the run instead, because mark_failed() durably retains the BOARD's
+    lock until a human runs scripts/release_lock.py. Those teardown paths, in
+    full -- if you add another, it belongs on this list:
+      - services/human_feedback_loop.py (initial dispatch + loop finally),
+      - services/review_cycle.py's two start_review_cycle() handlers, via
+        _release_run_for_lock_contention() -- the maker-checker executor behind
+        every review column of the sdlc_execution pipeline, and so the widest
+        of them,
+      - the PR-review handler in services/project_monitor.py
+        (_end_pr_review_pipeline_run_on_failure + _pr_review_failure_report),
+      - the repair-cycle handlers for BOTH consumers of the runner's result:
+        the live one in project_monitor._monitor_repair_cycle_container and the
+        restart-recovery one in services/agent_container_recovery.py, which
+        share classify_repair_cycle_outcome() so they cannot drift apart again.
+    services/auto_commit.py is the one non-teardown member of the same family:
+    it re-raises rather than returning False, because its False is
+    indistinguishable from "nothing to commit" and would otherwise let the
+    maker's uncommitted work be read as absent.
+  * Contention is exempt from those budgets but not unbounded: repeated
+    'lock_contention' outcomes are counted by
+    work_execution_state.count_consecutive_lock_contentions() and escalated
+    (visibly, without retaining any lock) by project_monitor's
+    MAX_CONSECUTIVE_LOCK_CONTENTIONS, so a lock nobody is releasing surfaces to
+    an operator instead of looping silently. That counter is also why
+    count_consecutive_failures() skips 'lock_contention' entries rather than
+    ending its run on them: an interleaved contention must not erase the real
+    failure history that MAX_CONSECUTIVE_DISPATCH_FAILURES depends on.
 
 Both those call sites already special-case ClaudeCodeRateLimitError for
 exactly the same reason ("systemic condition, not this stage's fault"); this
