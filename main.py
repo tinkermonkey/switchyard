@@ -199,6 +199,19 @@ async def main():
     # Initialize GitHub project manager with new configuration system
     github_project_manager = GitHubProjectManager(config_manager, github_state_manager)
 
+    # Warm the process-wide PipelineLockManager singleton off the event loop
+    # (#140 item 7), BEFORE anything concurrent can reach it. Its
+    # double-checked-locking guard is held across a full PipelineLockManager()
+    # construction, including a Redis connect + .ping() with
+    # socket_connect_timeout=5 -- so a caller that loses that race blocks for
+    # up to 5s, and the event-loop thread is a caller (every
+    # ProjectResourceLockManager() default-construction reaches it). Doing the
+    # one-time construction here, on a worker thread while the loop has nothing
+    # else to run, means every later caller hits the already-initialized fast
+    # path and never touches the guard at all.
+    from services.pipeline_lock_manager import get_pipeline_lock_manager as _warm_pipeline_lock_manager
+    await asyncio.to_thread(_warm_pipeline_lock_manager)
+
     # Initialize all project workspaces on startup
     #
     # Run off the event loop (#54 follow-up): initialize_all_projects() ->

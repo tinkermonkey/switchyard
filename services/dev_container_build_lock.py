@@ -160,6 +160,8 @@ from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
 from services.project_checkout_lock import (
+    _acquire_resource_off_loop,
+    _default_facade_off_loop,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
     _log_busy,
@@ -226,10 +228,11 @@ async def dev_container_build_lock_async(
     build/state resource for the duration of the `with` block.
 
     Polls ProjectResourceLockManager.acquire_resource() -- a single
-    non-blocking attempt -- with asyncio.sleep() between attempts (never
-    blocks the event loop) until acquired or timeout_seconds elapses.
-    Releases in a finally block so an exception raised inside the `with` body
-    still frees the lock.
+    non-blocking attempt, run in a worker thread (see
+    project_checkout_lock._acquire_resource_off_loop) -- with asyncio.sleep()
+    between attempts, so the poll genuinely never blocks the event loop, until
+    acquired or timeout_seconds elapses. Releases in a finally block so an
+    exception raised inside the `with` body still frees the lock.
 
     See this module's docstring for exactly what this lock is (and is not)
     held around, and why dev_container_state.set_status() itself is
@@ -250,11 +253,13 @@ async def dev_container_build_lock_async(
     Raises:
         DevContainerBuildLockTimeoutError: not acquired within timeout_seconds.
     """
-    facade = facade if facade is not None else ProjectResourceLockManager()
+    facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
     while True:
-        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
+        can_execute, reason = await _acquire_resource_off_loop(
+            facade, RESOURCE_NAME, project, holder_id, issue_number
+        )
         if can_execute:
             break
         if time.monotonic() >= deadline:
@@ -266,6 +271,8 @@ async def dev_container_build_lock_async(
         async with _held_with_heartbeat_async(facade, RESOURCE_NAME, project, holder_id):
             yield
     finally:
+        # Deliberately synchronous, not offloaded -- see the same finally in
+        # project_checkout_lock_async() for why.
         _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 

@@ -37,6 +37,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 import tempfile
 import shutil
 
@@ -380,6 +381,57 @@ class TestReusesProjectCheckoutLockHolderIdMinting(unittest.TestCase):
     def test_same_function_object_is_reused(self):
         import services.dev_container_build_lock as dcbl
         self.assertIs(dcbl._mint_unique_holder_id, project_checkout_lock._mint_unique_holder_id)
+
+    def test_shared_off_loop_helpers_are_reused(self):
+        """WI-1 (#146): the event-loop fixes for the async path -- an OS-thread
+        heartbeat that fires even when the guarded body never yields (#141),
+        and an acquire_resource() poll tick that runs off the loop (#140 item
+        6) -- live in project_checkout_lock.py and are imported here, so this
+        module's async lock gets them too."""
+        import services.dev_container_build_lock as dcbl
+        self.assertIs(dcbl._acquire_resource_off_loop, project_checkout_lock._acquire_resource_off_loop)
+        self.assertIs(dcbl._default_facade_off_loop, project_checkout_lock._default_facade_off_loop)
+        self.assertIs(dcbl._held_with_heartbeat_async, project_checkout_lock._held_with_heartbeat_async)
+
+
+@pytest.mark.asyncio
+class TestAsyncPathSharesTheEventLoopFixes:
+    """
+    WI-1 (#146): behavioral spot-checks that this module's async lock really
+    gets the shared event-loop fixes at runtime, not just by import identity
+    (see TestReusesProjectCheckoutLockHolderIdMinting for that). Their full
+    behavior is covered in test_project_checkout_lock.py.
+    """
+
+    async def test_acquire_resource_is_called_off_the_event_loop_thread(self):
+        loop_thread_id = threading.get_ident()
+        calling_threads = []
+
+        facade = MagicMock()
+        facade.acquire_resource.side_effect = lambda *args: (
+            calling_threads.append(threading.get_ident()), (True, "acquired")
+        )[1]
+
+        async with dev_container_build_lock_async("proj", facade=facade):
+            pass
+
+        assert calling_threads, "acquire_resource() was never called"
+        assert all(tid != loop_thread_id for tid in calling_threads)
+
+    async def test_heartbeat_fires_while_the_guarded_body_blocks_the_event_loop(self):
+        """The local-execution path this lock wraps
+        (claude/claude_integration.py's _run_claude_code_locally()) blocks the
+        event loop for the subprocess's whole runtime -- see #141."""
+        touched = threading.Event()
+        facade = MagicMock()
+        facade.touch_resource.side_effect = lambda *args: (touched.set(), True)[1]
+
+        async with project_checkout_lock._held_with_heartbeat_async(
+            facade, RESOURCE_NAME, "proj", holder_id=-9, heartbeat_interval_seconds=0.02
+        ):
+            fired_during_the_block = touched.wait(timeout=5.0)  # no `await` here, deliberately
+
+        assert fired_during_the_block
 
 
 if __name__ == '__main__':
