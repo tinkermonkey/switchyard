@@ -12,7 +12,10 @@ A pipeline run is considered a zombie if:
 4. Nothing in this process is still legitimately working on the issue without a
    container: no active review cycle, no active human feedback loop, and no
    in-flight project_checkout / dev_container_build resource lock wait or hold
-   (those run up to ~3h and are invisible to the container probe in 3)
+   (those run up to ~3h and are invisible to the container probe in 3). A lock
+   wait/hold that outlives its own budget stops counting -- see
+   project_checkout_lock's activity registry -- so a hung guarded operation is
+   still reapable rather than exempt forever.
 
 Runs periodically as a background task to ensure automatic recovery.
 """
@@ -313,12 +316,17 @@ class PipelineWatchdog:
                         })
                     continue
 
-                # NOTE: We intentionally do NOT skip cleanup just because the lock is held.
-                # The lock alone is not proof of life — a crashed container leaves the lock
-                # held with nobody to release it. The review cycle and feedback loop checks
-                # below (plus the 30-minute age threshold) cover every legitimate
-                # non-containerized state. If none of those fire, the lock is stale and
-                # _cleanup_zombie_run will release it.
+                # NOTE: We intentionally do NOT skip cleanup just because the run's
+                # BOARD lock is held. That lock alone is not proof of life — a crashed
+                # container leaves it held with nobody to release it. Distinct from the
+                # PROJECT RESOURCE lock registry checked above, which IS proof of life:
+                # that registry is process-local and frame-scoped, so an entry means a
+                # coroutine in this very process is still inside the lock's context
+                # manager (and it stops vouching once the entry outlives its budget).
+                # The resource-lock check above, plus the review cycle and feedback loop
+                # checks below (plus the 30-minute age threshold), cover every legitimate
+                # non-containerized state. If none of those fire, the board lock is stale
+                # and _cleanup_zombie_run will release it.
 
                 # Never clean up a run that has an active human feedback loop.
                 # Feedback-listening phases legitimately have no Docker container running —
@@ -354,7 +362,8 @@ class PipelineWatchdog:
                     logger.warning(f"Could not check review cycle state for issue #{issue_number}: {e}")
                     continue  # Fail-safe: don't kill a run we can't verify
 
-                # No container, old enough, no active review cycle or feedback loop = ZOMBIE
+                # No container, old enough, no in-flight project resource lock, no
+                # active review cycle or feedback loop = ZOMBIE
                 # Coordination guard: prevent double-processing with other cleanup mechanisms
                 try:
                     from services.cleanup_guard import try_claim_cleanup

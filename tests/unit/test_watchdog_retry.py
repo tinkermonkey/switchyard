@@ -225,7 +225,7 @@ class TestEmptyOutputDetection:
         protection a permanent no-op (the same bug class already fixed for
         PROTECTION 3's dead get_pipeline_queue() import). Now uses the real
         ProjectPipeline.board_name attribute and
-        PipelineLockManager.get_lock_holder() -- a pipeline board genuinely
+        PipelineLockManager.get_lock_holder_fail_closed() -- a pipeline board genuinely
         locked by a different issue must skip marking this execution for
         retry rather than racing the in-progress run."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
@@ -252,7 +252,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a different issue
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (999, True)  # locked by a different issue
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -267,17 +267,17 @@ class TestEmptyOutputDetection:
                                 retried_count = tracker.detect_and_retry_empty_successful_executions()
 
         assert retried_count == 0
-        mock_lock_manager.get_lock_holder.assert_called_once_with('test-project', 'SDLC Execution')
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'SDLC Execution')
 
         with open(state_file) as f:
             updated_state = yaml.safe_load(f)
         assert updated_state['execution_history'][-1]['outcome'] == 'success'
 
     def test_proceeds_when_pipeline_lock_is_free(self, tracker, temp_state_dir):
-        """Control case: get_lock_holder() returns None (board unlocked) --
-        the watchdog must proceed exactly as before this fix, and must not
-        raise despite the real ProjectPipeline/PipelineLockManager objects
-        now actually being called."""
+        """Control case: get_lock_holder_fail_closed() reports no holder on a
+        healthy read (board unlocked) -- the watchdog must proceed exactly as
+        before this fix, and must not raise despite the real
+        ProjectPipeline/PipelineLockManager objects now actually being called."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
         state_data = {
             'project_name': 'test-project',
@@ -302,7 +302,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -328,8 +328,9 @@ class TestEmptyOutputDetection:
         still holds its own lock right after finishing a stage (locks
         release only at specific exit columns, not after every stage), that
         version would have skipped almost every retry check, not just ones
-        actually racing a different issue's in-progress work. get_lock_holder()
-        returning this SAME issue_number must proceed exactly as if unlocked."""
+        actually racing a different issue's in-progress work.
+        get_lock_holder_fail_closed() returning this SAME issue_number must
+        proceed exactly as if unlocked."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
         state_data = {
             'project_name': 'test-project',
@@ -354,7 +355,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 123  # this SAME issue holds it
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (123, True)  # this SAME issue holds it
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -791,7 +792,7 @@ class TestProjectConfigCacheDoesNotPoisonOnFailure:
         real_project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a DIFFERENT issue
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (999, True)  # locked by a DIFFERENT issue
 
         # First call (for whichever state file is processed first) raises;
         # every subsequent call succeeds.
@@ -899,12 +900,13 @@ class TestProtection2BoardScoping:
 
         def _holder(project_name, board_name):
             # Only the planning board is busy, and by an unrelated issue.
-            return 999 if board_name == 'Planning Design' else None
+            return (999, True) if board_name == 'Planning Design' else (None, True)
 
-        mock_lock_manager.get_lock_holder.side_effect = _holder
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = _holder
         return mock_lock_manager
 
-    def _run(self, tracker, mock_lock_manager):
+    @staticmethod
+    def _run(tracker, mock_lock_manager):
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
                 with patch.object(tracker, '_has_github_output', return_value=False):
@@ -928,7 +930,7 @@ class TestProtection2BoardScoping:
 
         assert retried_count == 1
         # Scoped: only the execution's own board was consulted at all.
-        mock_lock_manager.get_lock_holder.assert_called_once_with('test-project', 'SDLC Execution')
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'SDLC Execution')
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'failure'
 
@@ -941,7 +943,48 @@ class TestProtection2BoardScoping:
         retried_count = self._run(tracker, mock_lock_manager)
 
         assert retried_count == 0
-        mock_lock_manager.get_lock_holder.assert_called_once_with('test-project', 'Planning Design')
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'Planning Design')
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_board_that_is_no_longer_configured_falls_back_to_every_board(
+        self, tracker, temp_state_dir
+    ):
+        """A recorded board that no longer resolves (a board rename, or the
+        'system' pseudo-board some task contexts carry) must NOT be trusted:
+        get_lock_holder on an unknown board name is not an error, both stores
+        simply have no entry, so scoping to it would make PROTECTION 2 a
+        guaranteed no-op -- strictly weaker than the every-board behavior it
+        replaced, not more conservative than it."""
+        state_file = _write_state(temp_state_dir, 123, board_name='Renamed Away')
+        mock_lock_manager = self._lock_manager_with_planning_locked()
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
+        # Fell back to the configured boards rather than the recorded one.
+        checked = {
+            call.args[1]
+            for call in mock_lock_manager.get_lock_holder_fail_closed.call_args_list
+        }
+        assert 'Renamed Away' not in checked
+        assert 'Planning Design' in checked
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_an_unverifiable_lock_read_assumes_locked(self, tracker, temp_state_dir):
+        """#150: get_lock_holder() drops the health flag both stores return, and
+        those stores swallow their own exceptions -- so Redis down plus an
+        unreadable YAML lock file used to surface here as "no holder", identical
+        to an idle board, and the execution was marked for retry onto a board
+        another issue was actively holding."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, False)
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
 
@@ -991,7 +1034,7 @@ class TestQueueManagerCachedPerSweep:
         factory = MagicMock(return_value=mock_queue_manager)
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -1064,27 +1107,34 @@ class TestProtectionFailureVisibility:
     def test_protection_2_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
         _write_state(temp_state_dir, 123)
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.side_effect = AttributeError(
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = AttributeError(
             "'ProjectConfig' object has no attribute 'get'"
         )
 
         with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            self._run_with_lock_manager(tracker, mock_lock_manager)
+            retried_count = self._run_with_lock_manager(tracker, mock_lock_manager)
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any('PROTECTION 2' in r.getMessage() for r in errors), \
             "a coding bug in PROTECTION 2 must be logged at ERROR, not debug"
+        # ...and the sweep FALLS THROUGH rather than skipping the issue. See the
+        # handler's comment: a permanent coding bug must not silently freeze the
+        # un-sticking watchdog, and the redispatch this invites still contends on
+        # the board's pipeline lock at project_monitor.
+        assert retried_count == 1
 
     def test_protection_2_transient_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
         _write_state(temp_state_dir, 123)
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.side_effect = ConnectionError("Redis unreachable")
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = ConnectionError("Redis unreachable")
 
         with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            self._run_with_lock_manager(tracker, mock_lock_manager)
+            retried_count = self._run_with_lock_manager(tracker, mock_lock_manager)
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any('PROTECTION 2 skipped' in r.getMessage() for r in warnings)
+        # Same fall-through posture as the programming-error case above.
+        assert retried_count == 1
         # A transient outage is NOT a coding bug -- it must not be logged as one.
         assert not [
             r for r in caplog.records
@@ -1094,30 +1144,36 @@ class TestProtectionFailureVisibility:
     def test_protection_3_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
         _write_state(temp_state_dir, 123)
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
         mock_queue_manager = MagicMock()
         mock_queue_manager.get_issue_status.side_effect = TypeError(
             "'NoneType' object is not subscriptable"
         )
 
         with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            self._run_with_lock_manager(tracker, mock_lock_manager, mock_queue_manager)
+            retried_count = self._run_with_lock_manager(
+                tracker, mock_lock_manager, mock_queue_manager
+            )
 
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any('PROTECTION 3' in r.getMessage() for r in errors)
+        assert retried_count == 1
 
     def test_protection_3_transient_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
         _write_state(temp_state_dir, 123)
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
         mock_queue_manager = MagicMock()
         mock_queue_manager.get_issue_status.side_effect = TimeoutError("queue lock timeout")
 
         with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            self._run_with_lock_manager(tracker, mock_lock_manager, mock_queue_manager)
+            retried_count = self._run_with_lock_manager(
+                tracker, mock_lock_manager, mock_queue_manager
+            )
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any('PROTECTION 3 skipped' in r.getMessage() for r in warnings)
+        assert retried_count == 1
 
     def test_project_config_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
         """A config read that fails degrades BOTH protections to no-ops for that
@@ -1216,7 +1272,7 @@ class TestCorruptedStateFile:
         project_config = MagicMock()
         project_config.pipelines = [pipeline_cfg]
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
         mock_queue_manager = MagicMock()
         mock_queue_manager.get_issue_status.return_value = None
 
@@ -1272,6 +1328,72 @@ class TestRecordExecutionStartBoardName:
 
         state = tracker.load_state('test-project', 123)
         assert state['execution_history'][-1]['board_name'] == 'SDLC Execution'
+
+    def test_board_name_survives_record_execution_outcome_and_scopes_the_sweep(
+        self, tracker, temp_state_dir
+    ):
+        """The two halves of #144's fix only meet through
+        record_execution_outcome() mutating the in_progress entry in place. If
+        that ever stopped carrying board_name through, both sides would still
+        pass their own tests while the fix quietly stopped applying."""
+        tracker.record_execution_start(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            trigger_source='manual',
+            project_name='test-project',
+            board_name='SDLC Execution'
+        )
+        tracker.record_execution_outcome(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            outcome='success',
+            project_name='test-project'
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['outcome'] == 'success'
+        assert last_exec['board_name'] == 'SDLC Execution'
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        retried_count = TestProtection2BoardScoping._run(tracker, mock_lock_manager)
+
+        assert retried_count == 1
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with(
+            'test-project', 'SDLC Execution'
+        )
+
+    def test_the_crash_recovery_record_has_no_board_and_gets_the_fallback(
+        self, tracker, temp_state_dir
+    ):
+        """record_execution_outcome() with no matching in_progress entry -- the
+        documented orchestrator restart/crash case -- appends a record synthesised
+        from what the caller knows now, which includes no board. That record gets
+        PROTECTION 2's every-board fallback, deliberately rather than
+        accidentally."""
+        tracker.record_execution_outcome(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            outcome='success',
+            project_name='test-project'
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['trigger_source'] == 'unknown'
+        assert 'board_name' not in last_exec
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        TestProtection2BoardScoping._run(tracker, mock_lock_manager)
+
+        checked = [
+            call.args[1]
+            for call in mock_lock_manager.get_lock_holder_fail_closed.call_args_list
+        ]
+        assert checked == ['Planning Design', 'SDLC Execution']
 
     def test_board_name_is_omitted_rather_than_written_as_none(self, tracker):
         """An explicit None would be indistinguishable from a board recorded as

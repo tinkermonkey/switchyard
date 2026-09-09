@@ -152,12 +152,17 @@ class WorkExecutionStateTracker:
         """
         Report an execution state file that exists but holds nothing loadable.
 
-        Deliberately NOT repaired automatically: the file is read under a shared
-        read lock here while save_state() takes its own write lock on the same
-        lock file, and an empty file is indistinguishable from one truncated by a
-        write that is still in flight. Naming the path is what an operator needs
-        to clear it by hand; every caller falls back to empty state either way, so
-        this is a visibility fix, not a fatal condition.
+        Deliberately NOT repaired automatically. Readers and writers here are
+        strictly serialised -- utils.file_lock.file_lock() is always LOCK_EX, and
+        every reader in this module takes it on the same `<state>.yaml.lock` path
+        save_state() writes under -- so a zero-byte file is never a write caught
+        in flight. It means one of two things this code cannot tell apart:
+        save_state() truncates in place (open(..., 'w')) and the process was
+        killed between the truncate and the yaml.dump, or something outside this
+        module wrote the file. Deleting it would silently discard execution
+        history an operator may want to inspect in either case, so naming the path
+        is what they get; every caller falls back to empty state anyway, which
+        makes this a visibility fix, not a fatal condition.
 
         Args:
             state_file: Path to the unreadable file -- the point of this message.
@@ -289,6 +294,15 @@ class WorkExecutionStateTracker:
         already established a Claude Code session — see docker_runner.py's
         _rate_limit_signal capture. Used by the active-resume step to decide
         whether a captured session is worth --resume-ing.
+
+        board_name (#144) is deliberately NOT a parameter here: the normal path
+        mutates the in_progress entry record_execution_start() already wrote, so
+        the board it recorded is carried through to the 'success'/'failure'
+        record the watchdog inspects. Only the crash-recovery path below
+        (no matching in_progress entry) appends a fresh record, and it has no
+        board to record for the same reason it has no trigger_source -- nothing
+        in scope knows what the lost execution was dispatched onto. Those records
+        get PROTECTION 2's every-board fallback; see the comment there.
         """
         state = self.load_state(project_name, issue_number)
 
@@ -352,6 +366,8 @@ class WorkExecutionStateTracker:
             f"This should only happen after orchestrator restart/crash."
         )
 
+        # No board_name and no trigger_source: this record is synthesised from
+        # what the caller knows now, not from the lost dispatch. See the docstring.
         execution = {
             'column': column,
             'agent': agent,
@@ -1601,26 +1617,76 @@ class WorkExecutionStateTracker:
                         # is safe to retry: issue #10 stuck on a completely idle
                         # sdlc_execution board was being skipped every sweep because
                         # issue #20 was legitimately working on planning_design.
-                        # Records written before record_execution_start() carried a
-                        # board_name (and the few dispatch paths with no board in
-                        # scope) keep the original, deliberately conservative
-                        # every-board behavior -- with no board to scope to, "some
-                        # board of this project is busy" is the only signal there is,
-                        # and over-skipping only delays a retry to the next sweep.
+                        #
+                        # Two cases fall back to the original every-board behavior,
+                        # and both are deliberate:
+                        #   - no board recorded at all (every record written before
+                        #     record_execution_start() started carrying board_name,
+                        #     plus the crash-recovery record record_execution_outcome()
+                        #     synthesises when it finds no matching in_progress
+                        #     entry, plus the dispatch paths with no board in scope);
+                        #   - a board recorded that is no longer one of this
+                        #     project's configured boards (a board rename, or the
+                        #     'system' pseudo-board some task contexts carry).
+                        # The second case MUST NOT be trusted as-is: get_lock_holder
+                        # on an unknown board name is not an error, both stores
+                        # simply have no entry and it returns None, which would turn
+                        # this protection into a guaranteed no-op -- strictly weaker
+                        # than the pre-#144 behavior it replaced, rather than more
+                        # conservative than it.
+                        #
+                        # The fallback is genuinely conservative, not free: a board
+                        # lock is held for the life of a pipeline run (up to
+                        # LOCK_TTL_SECONDS, 2h), so a record without a usable board
+                        # reproduces #144 -- skipped every sweep while ANY other
+                        # board of the project stays busy -- for as long as that lock
+                        # lives, not just until the next sweep. That is accepted
+                        # because it only defers: no retry budget is consumed, the
+                        # record stays 'success' and is re-examined on every sweep,
+                        # and the issue is picked up as soon as the other board frees
+                        # up. Everything already on disk before this change lands is
+                        # in exactly that state.
+                        configured_boards = [
+                            board for board in (
+                                getattr(pipeline_config, 'board_name', None)
+                                for pipeline_config in getattr(project_config, 'pipelines', None) or []
+                            ) if board
+                        ]
                         recorded_board = last_exec.get('board_name')
-                        if recorded_board:
+                        if recorded_board and recorded_board in configured_boards:
                             boards_to_check = [recorded_board]
                         else:
-                            boards_to_check = [
-                                board for board in (
-                                    getattr(pipeline_config, 'board_name', None)
-                                    for pipeline_config in getattr(project_config, 'pipelines', None) or []
-                                ) if board
-                            ]
+                            if recorded_board:
+                                logger.warning(
+                                    f"Watchdog: {project_name}/#{issue_number} recorded board "
+                                    f"'{recorded_board}', which is not one of this project's "
+                                    f"configured boards ({configured_boards}) -- falling back to "
+                                    f"checking every board rather than trusting a name no lock "
+                                    f"is ever keyed on"
+                                )
+                            boards_to_check = configured_boards
 
                         locked_by_another_issue = False
                         for board_name in boards_to_check:
-                            holder_issue = lock_manager.get_lock_holder(project_name, board_name)
+                            # Fail-closed read (#150): get_lock_holder() goes through
+                            # get_lock(), which drops the health flag both stores
+                            # return, and those stores swallow their own exceptions --
+                            # so Redis down + an unreadable YAML lock file surfaced
+                            # here as "no holder", i.e. exactly the same answer as an
+                            # idle board, and this protection cheerfully marked the
+                            # execution for retry onto a board another issue was
+                            # actively holding.
+                            holder_issue, reads_healthy = lock_manager.get_lock_holder_fail_closed(
+                                project_name, board_name
+                            )
+                            if not reads_healthy:
+                                logger.warning(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: lock state "
+                                    f"for board '{board_name}' could not be read from either store "
+                                    f"-- assuming locked rather than deciding on unverified data"
+                                )
+                                locked_by_another_issue = True
+                                break
                             # CRITICAL fix (found in #58 review): this must only
                             # skip when the lock is held by a DIFFERENT issue.
                             # The original version fired for ANY holder,
@@ -1645,13 +1711,29 @@ class WorkExecutionStateTracker:
                         # A coding bug, not a transient outage -- and precisely the
                         # shape (.get() on a dataclass, a method that doesn't exist)
                         # that kept this protection a silent permanent no-op until
-                        # #57/#58 (#140 item 31). Surfaced distinctly from "Redis
-                        # unreachable" below, and loudly, so the next one can't hide
-                        # the same way.
+                        # #57/#58 (#140 item 31). Surfaced distinctly from the
+                        # transient case below, and loudly, so the next one can't
+                        # hide the same way.
+                        #
+                        # Both handlers fall THROUGH to PROTECTION 3 rather than
+                        # skipping this issue -- the opposite posture to
+                        # services/pipeline_watchdog.py, which bails out on a check
+                        # it can't verify, and deliberately so. That watchdog ends
+                        # the run and releases its board lock, so acting on a bad
+                        # answer there produces a genuinely concurrent second
+                        # container; this sweep only rewrites a state record, and the
+                        # redispatch it invites still goes through project_monitor,
+                        # which takes the board's pipeline lock and consults the
+                        # queue itself. Failing closed here would instead let one
+                        # permanent coding bug silently freeze the un-sticking
+                        # watchdog for every issue, which is the failure mode #57/#58
+                        # already cost us twice. The narrower "lock state is
+                        # unreadable" case above IS failed closed, because there the
+                        # check itself worked and told us it doesn't know.
                         logger.error(
                             f"Watchdog: PROTECTION 2 (pipeline lock) failed for "
                             f"{project_name}/#{issue_number} with a programming error "
-                            f"-- this protection is not working: {e}",
+                            f"-- this protection is not working, continuing without it: {e}",
                             exc_info=True
                         )
                     except Exception as e:
@@ -1708,15 +1790,16 @@ class WorkExecutionStateTracker:
                         if already_queued_or_active:
                             continue
                     except (AttributeError, TypeError, ImportError) as e:
-                        # See PROTECTION 2's matching handler (#140 item 31).
-                        # ImportError is in the list here because that is literally
-                        # how this protection was dead before #57 -- an import of a
-                        # function that never existed, logged at debug and never
-                        # noticed.
+                        # See PROTECTION 2's matching handler (#140 item 31) --
+                        # including why both of these log and fall through rather
+                        # than skipping the issue. ImportError is in the list here
+                        # because that is literally how this protection was dead
+                        # before #57 -- an import of a function that never existed,
+                        # logged at debug and never noticed.
                         logger.error(
                             f"Watchdog: PROTECTION 3 (queue status) failed for "
                             f"{project_name}/#{issue_number} with a programming error "
-                            f"-- this protection is not working: {e}",
+                            f"-- this protection is not working, continuing without it: {e}",
                             exc_info=True
                         )
                     except Exception as e:

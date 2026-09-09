@@ -265,7 +265,15 @@ async def dev_container_build_lock_async(
     # comment. Matters at least as much for this lock as for project_checkout:
     # the operation it guards is an image build, which runs no container
     # labelled for the issue for the watchdog's probe to find.
-    with _tracked_resource_activity(RESOURCE_NAME, project, issue_number) as activity:
+    #
+    # The hold is budgeted (HELD_ACTIVITY_MAX_SECONDS), not unconditional: the
+    # body guarded here is claude_integration._run_claude_code_locally(), whose
+    # subprocess readline() loop has no timeout of any kind, so a Claude CLI that
+    # stalls with no output would otherwise keep this issue's pipeline run
+    # exempt from zombie cleanup until the orchestrator process restarts.
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
         while True:
             can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
                 facade, RESOURCE_NAME, project, holder_id, issue_number
@@ -314,7 +322,9 @@ def dev_container_build_lock_sync(
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
-    with _tracked_resource_activity(RESOURCE_NAME, project, issue_number) as activity:
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
         while True:
             can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
             if can_execute:
