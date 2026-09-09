@@ -10,7 +10,7 @@ import logging
 import redis
 import json
 import uuid
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
@@ -1493,7 +1493,10 @@ class PipelineRunManager:
                 # CRITICAL: Process next waiting issue in queue after lock release
                 # This ensures queued issues are picked up when the current issue completes
                 try:
-                    from services.pipeline_queue_manager import get_pipeline_queue_manager
+                    from services.pipeline_queue_manager import (
+                        describe_rollback_reset,
+                        get_pipeline_queue_manager,
+                    )
                     from task_queue.task_manager import Task, TaskPriority
                     import time
 
@@ -1520,19 +1523,31 @@ class PipelineRunManager:
                         )
                         
                         if acquired:
-                            # CRITICAL: Mark issue active IMMEDIATELY after lock acquisition
-                            # This prevents monitoring loop from seeing "issue has lock" and creating duplicate task
-                            # The monitoring loop checks if issue holds lock (line 1507 in project_monitor.py)
-                            # If yes, it assumes work is resuming and proceeds to create task
-                            # We must mark active BEFORE that check can happen
-                            pipeline_queue.mark_issue_active(next_issue['issue_number'])
-                            logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
-                            
                             # CRITICAL: Actually dispatch the agent by creating a task
                             # Not sufficient to just acquire lock - need to enqueue task
                             # SAFETY: Track task_created for rollback if creation fails
                             task_created = False
+                            # CAS token from mark_issue_active(), None until it has
+                            # actually stamped one — the rollback below skips the
+                            # reset while it is None, so a mark that never landed
+                            # can't be "undone" onto someone else's activation.
+                            activated_at = None
                             try:
+                                # CRITICAL: Mark issue active IMMEDIATELY after lock acquisition
+                                # This prevents monitoring loop from seeing "issue has lock" and creating duplicate task
+                                # The monitoring loop checks if issue holds lock (line 1507 in project_monitor.py)
+                                # If yes, it assumes work is resuming and proceeds to create task
+                                # We must mark active BEFORE that check can happen.
+                                # INSIDE the try (not above it): mark_issue_active()
+                                # takes an fcntl lock and rewrites the queue YAML, so it
+                                # raises on ENOSPC / a read-only or full state/ volume /
+                                # a permissions change. Outside, that raise skipped the
+                                # whole rollback and left the lock held with nothing
+                                # dispatched — the exact deadlock this block exists to
+                                # prevent, one statement above the guard.
+                                activated_at = pipeline_queue.mark_issue_active(next_issue['issue_number'])
+                                logger.info(f"Successfully acquired lock for issue #{next_issue['issue_number']}")
+
                                 from config.manager import ConfigManager
                                 config_manager = ConfigManager()
                                 project_config = config_manager.get_project_config(project)
@@ -1542,12 +1557,23 @@ class PipelineRunManager:
                                 # SAFETY: Re-fetch issue from GitHub to verify it hasn't moved columns
                                 # The queue cache might be stale if user moved the issue
                                 # FIX: Use GraphQL query instead of gh issue view --json projectItems
-                                # because projectItems can be stale/empty due to GitHub eventual consistency
-                                actual_column = self._get_issue_column_from_github(
+                                # because projectItems can be stale/empty due to GitHub eventual consistency.
+                                # The (column, reads_ok) variant is used so a board query
+                                # that failed outright isn't reported as "issue not on the
+                                # board" — an operator reading the log otherwise can't tell
+                                # a rate limit from a genuinely removed card.
+                                actual_column, column_reads_ok = self._resolve_issue_column_from_github(
                                     project_config, pipeline_config, next_issue['issue_number']
                                 )
 
                                 if not actual_column:
+                                    if not column_reads_ok:
+                                        raise Exception(
+                                            f"Could not read board '{pipeline_run.board}' to resolve the "
+                                            f"column for issue #{next_issue['issue_number']} — dispatch "
+                                            f"deferred (the queue entry and lock are rolled back, so the "
+                                            f"next poll retries)"
+                                        )
                                     raise Exception(f"Issue #{next_issue['issue_number']} not found on board '{pipeline_run.board}'")
                                 
                                 # Get agent for ACTUAL current column (not cached column)
@@ -1636,12 +1662,69 @@ class PipelineRunManager:
                                         f"Task creation failed for issue #{next_issue['issue_number']}, "
                                         f"rolling back lock acquisition to prevent deadlock"
                                     )
+                                    # MUST also undo the mark_issue_active() above, or
+                                    # get_next_n_waiting_issues() never selects this issue
+                                    # again (it filters strictly on status=='waiting') —
+                                    # the lock is freed but the queue entry stays 'active'
+                                    # forever, silently dropping the issue from every
+                                    # future dispatch with no automated recovery (#142).
+                                    #
+                                    # ORDER: release the lock FIRST, then reset the entry
+                                    # under a compare-and-swap on the activated_at this
+                                    # dispatch stamped. Holding the lock across the reset
+                                    # is NOT safe — try_acquire_lock() returns True /
+                                    # "already_holds_lock" for the current holder, and
+                                    # ProjectMonitor.trigger_agent_for_status() dispatches
+                                    # on that branch, so a competing poll can genuinely
+                                    # start this issue while we still hold its lock, and
+                                    # the unconditional release below would then free the
+                                    # lock out from under a running agent. Releasing first
+                                    # leaves the symmetric window ("lock free, entry still
+                                    # 'active'"), which the CAS closes instead: a
+                                    # re-activation stamps a fresh activated_at, the reset
+                                    # refuses, and the running issue is correctly left
+                                    # 'active'.
+                                    #
+                                    # Released unconditionally, and before the reset:
+                                    # holding the lock on top of a lost queue entry
+                                    # deadlocks the whole board rather than just this
+                                    # issue.
                                     try:
                                         lock_manager.release_lock(project, pipeline_run.board, next_issue['issue_number'])
                                         logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
                                     except Exception as rollback_error:
                                         logger.error(f"Failed to rollback lock: {rollback_error}")
-                                
+
+                                    if activated_at is not None:
+                                        try:
+                                            reset_result = pipeline_queue.reset_issue_to_waiting(
+                                                next_issue['issue_number'],
+                                                expected_activated_at=activated_at,
+                                            )
+                                            # NOT unconditionally CRITICAL on a falsy
+                                            # result: all three falsy outcomes are
+                                            # benign, and only one of them even leaves
+                                            # the entry 'active' (and doing so is then
+                                            # the correct outcome). See ResetResult.
+                                            level, message = describe_rollback_reset(
+                                                reset_result, next_issue['issue_number'],
+                                                project, pipeline_run.board,
+                                            )
+                                            logger.log(level, message)
+                                        except Exception as reset_error:
+                                            # The ONE genuinely unrecoverable case: the
+                                            # write raised, so the entry's status is
+                                            # unknown and may still be 'active' with
+                                            # nothing dispatched.
+                                            logger.critical(
+                                                f"Could NOT reset queue entry for issue "
+                                                f"#{next_issue['issue_number']} back to 'waiting' after "
+                                                f"dispatch failed — its status is now unknown and it may "
+                                                f"be excluded from all future dispatch on "
+                                                f"{project}/{pipeline_run.board} until the "
+                                                f"stranded-'active' sweep or a human intervenes: {reset_error}"
+                                            )
+
                                 logger.error(f"Error dispatching agent for next issue: {dispatch_error}")
                                 import traceback
                                 logger.error(traceback.format_exc())
@@ -1990,10 +2073,27 @@ class PipelineRunManager:
                     
                     # Get current column for this issue from GitHub Projects v2
                     # We need to query the project board to see what column the issue is in
-                    current_column = self._get_issue_column_from_github(
+                    current_column, column_reads_ok = self._resolve_issue_column_from_github(
                         project_config, pipeline_config, issue_number
                     )
-                    
+
+                    if not column_reads_ok:
+                        # The board could not be read (auth, rate limit, network,
+                        # missing state). Ending the run here would force-end EVERY
+                        # active run for the project — their agents still running —
+                        # off a transient failure, and ProjectMonitor then reads the
+                        # missing run as stale execution state and cleans it up,
+                        # opening the door to re-dispatch on top of live work. Leave
+                        # the run alone; the next sweep re-asks.
+                        logger.error(
+                            f"Could not read the board to resolve the column for issue "
+                            f"#{issue_number} — leaving run {pipeline_run_id} active for "
+                            f"the next cleanup pass rather than ending it on an unanswered "
+                            f"query"
+                        )
+                        kept_active_count += 1
+                        continue
+
                     if not current_column:
                         logger.warning(
                             f"Could not determine column for issue #{issue_number}, "
@@ -2002,7 +2102,7 @@ class PipelineRunManager:
                         self._end_run_in_elasticsearch(run, "Issue not found on board", original_index)
                         ended_count += 1
                         continue
-                    
+
                     # Check if this column has an agent assigned
                     column_config = next(
                         (c for c in workflow_template.columns if c.name == current_column),
@@ -2090,141 +2190,101 @@ class PipelineRunManager:
     # A pipeline run is active if and only if the issue is in a column with an agent
     # and NOT in an exit column. This is simple, deterministic, and testable.
     
-    def _get_issue_column_from_github(self, project_config, pipeline_config, issue_number: int) -> Optional[str]:
+    def _resolve_issue_column_from_github(
+        self, project_config, pipeline_config, issue_number: int
+    ) -> Tuple[Optional[str], bool]:
         """
-        Query GitHub Projects v2 to get the current column for an issue
-        
+        Query GitHub Projects v2 for an issue's current column, distinguishing
+        "not on the board" from "couldn't ask".
+
+        Goes through github_owner_utils.execute_board_query_cached(), which
+        walks items.pageInfo.hasNextPage/endCursor to the end of the board
+        (GitHub issue #96). The hand-rolled `gh api graphql` query this used to
+        build did items(first: 100) with no follow-up, so on any board with
+        more than 100 items every issue past the 100th resolved to None — the
+        caller then read that as "not on the board" and, at the dispatch call
+        sites, rolled the issue straight back to 'waiting' on every attempt.
+        Boards accumulate items in Done/Staged indefinitely, so 100 is reached
+        by ordinary use, not by a pathological case.
+
         Args:
             project_config: Project configuration
             pipeline_config: Pipeline configuration
             issue_number: Issue number to look up
-            
+
         Returns:
-            Column name if found, None otherwise
+            (column_name, reads_healthy).
+              (name, True)  - found, this is its column
+              (None, True)  - the board was read successfully and the issue is
+                              genuinely not on it (or carries no Status value)
+              (None, False) - the board could not be read (auth, rate limit,
+                              network, missing state); nothing can be concluded
+                              about where the issue is
         """
         try:
-            import subprocess
-            import json
-            
-            # Extract project number from board name (e.g., "Development Pipeline" -> number from GitHub)
-            # We need to query the organization's projects to find the right one
             org = project_config.github.get('org')
-            repo = project_config.github.get('repo')
             board_name = pipeline_config.board_name
-            
+
             # Get project number from state manager
             from config.state_manager import state_manager
             github_state = state_manager.load_project_state(project_config.name)
-            
+
             if not github_state or not github_state.boards:
                 logger.warning(f"No GitHub state for project {project_config.name}")
-                return None
-            
+                return None, False
+
             # github_state.boards is a dict, not a list
             board_state = github_state.boards.get(board_name)
             if not board_state or not board_state.project_number:
                 logger.warning(f"No project number for board {board_name}")
-                return None
-            
-            project_number = board_state.project_number
-            
-            # Query GitHub Projects v2 API for this specific issue
-            from services.github_owner_utils import get_owner_type
-            
-            owner_type = get_owner_type(org)
-            if owner_type is None:
-                logger.error(f"Cannot query project items - unable to determine owner type for '{org}'")
-                return None
-            
-            # Build the correct query based on owner type
-            if owner_type == 'user':
-                query = f'''{{
-                    user(login: "{org}") {{
-                        projectV2(number: {project_number}) {{
-                            items(first: 100) {{
-                                nodes {{
-                                    content {{
-                                        ... on Issue {{
-                                            number
-                                        }}
-                                    }}
-                                    fieldValues(first: 10) {{
-                                        nodes {{
-                                            ... on ProjectV2ItemFieldSingleSelectValue {{
-                                                name
-                                                field {{
-                                                    ... on ProjectV2SingleSelectField {{
-                                                        name
-                                                    }}
-                                                }}
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
-                }}'''
-            else:  # organization
-                query = f'''{{
-                    organization(login: "{org}") {{
-                        projectV2(number: {project_number}) {{
-                            items(first: 100) {{
-                                nodes {{
-                                    content {{
-                                        ... on Issue {{
-                                            number
-                                        }}
-                                    }}
-                                    fieldValues(first: 10) {{
-                                        nodes {{
-                                            ... on ProjectV2ItemFieldSingleSelectValue {{
-                                                name
-                                                field {{
-                                                    ... on ProjectV2SingleSelectField {{
-                                                        name
-                                                    }}
-                                                }}
-                                            }}
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }}
-                }}'''
-            
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
+                return None, False
+
+            from services.github_owner_utils import (
+                execute_board_query_cached,
+                _unwrap_board_envelope,
             )
-            
-            data = json.loads(result.stdout)
-            
-            # Get project data from the correct path based on owner type
-            owner_key = 'user' if owner_type == 'user' else 'organization'
-            project_data = data['data'][owner_key]['projectV2']
-            
-            # Find the item matching our issue number
-            for node in project_data['items']['nodes']:
-                content = node.get('content')
+
+            data = execute_board_query_cached(org, board_state.project_number)
+            if not data:
+                logger.warning(
+                    f"Board query for {org}/project#{board_state.project_number} failed - "
+                    f"cannot resolve the column for issue #{issue_number}"
+                )
+                return None, False
+
+            project_data = _unwrap_board_envelope(data)
+            if not isinstance(project_data, dict):
+                logger.warning(
+                    f"Unexpected board query response shape for "
+                    f"{org}/project#{board_state.project_number} - cannot resolve the "
+                    f"column for issue #{issue_number}"
+                )
+                return None, False
+
+            nodes = ((project_data.get('items') or {}).get('nodes')) or []
+
+            for node in nodes:
+                content = node.get('content') if isinstance(node, dict) else None
                 if content and content.get('number') == issue_number:
-                    # Found the issue, extract status field
-                    for field_value in node['fieldValues']['nodes']:
-                        if field_value and field_value.get('field', {}).get('name') == 'Status':
+                    field_values = (node.get('fieldValues') or {}).get('nodes') or []
+                    for field_value in field_values:
+                        if field_value and (field_value.get('field') or {}).get('name') == 'Status':
                             column_name = field_value.get('name')
                             logger.debug(f"Found issue #{issue_number} in column '{column_name}'")
-                            return column_name
-            
+                            return column_name, True
+                    # On the board but with no Status value set yet.
+                    logger.debug(
+                        f"Issue #{issue_number} is on board {board_name} but has no "
+                        f"Status field value"
+                    )
+                    return None, True
+
             logger.debug(f"Issue #{issue_number} not found on board {board_name}")
-            return None
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"GraphQL query failed: {e}")
-            return None
+            return None, True
+
         except Exception as e:
             logger.error(f"Error querying issue column: {e}")
-            return None
+            return None, False
     
     def _end_run_in_elasticsearch(self, run_data: Dict[str, Any], reason: str, index: Optional[str] = None, outcome: Optional[str] = None):
         """

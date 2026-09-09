@@ -10,6 +10,7 @@ import pytest
 import asyncio
 from unittest.mock import Mock, MagicMock, patch, AsyncMock, call
 from datetime import datetime
+from services.pipeline_queue_manager import ResetResult
 from services.project_monitor import ProjectMonitor
 from config.manager import ConfigManager
 
@@ -501,6 +502,182 @@ class TestReviewCycleCompletionQueueDispatch:
                             project="test_project", board="SDLC Execution", issue_number=123
                         )
                         project_monitor.task_queue.enqueue.assert_not_called()
+
+
+    async def test_rolls_back_lock_and_queue_when_dispatch_fails(
+        self,
+        project_monitor,
+        mock_config_manager
+    ):
+        """REGRESSION (#142): this third dispatch call site rolled back ONLY
+        the lock, leaving the queue entry at status='active'.
+        get_next_n_waiting_issues() selects strictly on status=='waiting', so
+        the issue was silently excluded from every future dispatch, forever --
+        and the stranded-'active' sweep in scheduled_tasks cannot recover THIS
+        site, because ensure_pipeline_run_for_task() has already created an
+        active PipelineRun by the time the enqueue can fail and the sweep skips
+        any entry that has one.
+
+        The lock is released FIRST and the reset then runs under the
+        mark_issue_active() compare-and-swap token (#147): holding the lock
+        across the reset does not exclude a competing dispatcher, because
+        try_acquire_lock() returns True/"already_holds_lock" for the current
+        holder and trigger_agent_for_status() dispatches on that branch -- the
+        unconditional release would then free the lock out from under a real
+        agent."""
+        project_config = mock_config_manager.get_project_config("test_project")
+        workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
+        review_column = workflow_template.columns[1]  # "Code Review"
+
+        project_monitor.get_issue_column_sync = Mock(return_value='Development')
+        # A Redis blip on the enqueue is the most plausible real trigger.
+        project_monitor.task_queue.enqueue = Mock(side_effect=RuntimeError("redis down"))
+
+        call_order = []
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+            mock_lock_mgr = Mock()
+            mock_lock_mgr.try_acquire_lock.return_value = (True, "lock_acquired")
+            mock_lock_mgr.release_lock.side_effect = (
+                lambda *a, **kw: call_order.append(f'release-{a[2]}') or True
+            )
+            mock_get_lock_mgr.return_value = mock_lock_mgr
+
+            with patch('services.review_cycle.review_cycle_executor') as mock_review_executor:
+                async def mock_start_review_cycle(*args, **kwargs):
+                    return "Done", True
+
+                mock_review_executor.start_review_cycle = AsyncMock(side_effect=mock_start_review_cycle)
+
+                with patch('services.github_integration.GitHubIntegration') as mock_github_cls:
+                    mock_github = Mock()
+                    mock_github.post_agent_output = AsyncMock()
+                    mock_github_cls.return_value = mock_github
+
+                    with patch('config.state_manager.state_manager') as mock_state_mgr:
+                        mock_state_mgr.get_discussion_for_issue.return_value = None
+
+                        with patch('services.pipeline_queue_manager.get_pipeline_queue_manager') as mock_get_queue_mgr, \
+                             patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_run_mgr:
+                            mock_queue_mgr = Mock()
+                            mock_queue_mgr.get_next_n_waiting_issues.return_value = [
+                                {'issue_number': 456, 'position_in_column': 0}
+                            ]
+                            mock_queue_mgr.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
+                            mock_queue_mgr.reset_issue_to_waiting.side_effect = (
+                                lambda *a, **kw: call_order.append('reset') or True
+                            )
+                            mock_get_queue_mgr.return_value = mock_queue_mgr
+
+                            mock_run_mgr = Mock()
+                            mock_run_mgr.ensure_pipeline_run_for_task.return_value = 'run-456'
+                            mock_get_run_mgr.return_value = mock_run_mgr
+
+                            project_monitor._start_review_cycle_for_issue(
+                                project_name="test_project",
+                                board_name="SDLC Execution",
+                                issue_number=123,
+                                status="Done",
+                                repository="test-repo",
+                                project_config=project_config,
+                                pipeline_config=project_config.pipelines[0],
+                                workflow_template=workflow_template,
+                                column=review_column
+                            )
+
+                            await asyncio.sleep(0.5)
+
+                        mock_queue_mgr.mark_issue_active.assert_called_once_with(456)
+                        # BOTH halves rolled back: lock first, then the entry
+                        # under the compare-and-swap token mark_issue_active()
+                        # returned.
+                        mock_queue_mgr.reset_issue_to_waiting.assert_called_once_with(
+                            456, expected_activated_at='2026-01-01T00:00:00+00:00'
+                        )
+                        assert call_order == ['release-123', 'release-456', 'reset']
+
+    async def test_refused_compare_and_swap_is_not_reported_at_critical(
+        self,
+        project_monitor,
+        mock_config_manager,
+        caplog
+    ):
+        """REGRESSION (#147 review): a falsy return used to be paged as CRITICAL
+        ("still 'active' and will be excluded from all future dispatch until a
+        human intervenes"). A refused compare-and-swap means another dispatcher
+        legitimately re-activated the issue, so leaving the entry 'active' is
+        the CORRECT outcome, not an emergency -- and the other two falsy cases
+        (NOT_ACTIVE / NOT_FOUND) are not even about an entry left active."""
+        project_config = mock_config_manager.get_project_config("test_project")
+        workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
+        review_column = workflow_template.columns[1]  # "Code Review"
+
+        project_monitor.get_issue_column_sync = Mock(return_value='Development')
+        project_monitor.task_queue.enqueue = Mock(side_effect=RuntimeError("redis down"))
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+            mock_lock_mgr = Mock()
+            mock_lock_mgr.try_acquire_lock.return_value = (True, "lock_acquired")
+            mock_lock_mgr.release_lock.return_value = True
+            mock_get_lock_mgr.return_value = mock_lock_mgr
+
+            with patch('services.review_cycle.review_cycle_executor') as mock_review_executor:
+                async def mock_start_review_cycle(*args, **kwargs):
+                    return "Done", True
+
+                mock_review_executor.start_review_cycle = AsyncMock(side_effect=mock_start_review_cycle)
+
+                with patch('services.github_integration.GitHubIntegration') as mock_github_cls:
+                    mock_github = Mock()
+                    mock_github.post_agent_output = AsyncMock()
+                    mock_github_cls.return_value = mock_github
+
+                    with patch('config.state_manager.state_manager') as mock_state_mgr:
+                        mock_state_mgr.get_discussion_for_issue.return_value = None
+
+                        with patch('services.pipeline_queue_manager.get_pipeline_queue_manager') as mock_get_queue_mgr, \
+                             patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_run_mgr:
+                            mock_queue_mgr = Mock()
+                            mock_queue_mgr.get_next_n_waiting_issues.return_value = [
+                                {'issue_number': 456, 'position_in_column': 0}
+                            ]
+                            mock_queue_mgr.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
+                            # The entry was re-activated concurrently: the reset
+                            # refuses and the entry stays 'active'.
+                            mock_queue_mgr.reset_issue_to_waiting.return_value = (
+                                ResetResult.REACTIVATED
+                            )
+                            mock_get_queue_mgr.return_value = mock_queue_mgr
+
+                            mock_run_mgr = Mock()
+                            mock_run_mgr.ensure_pipeline_run_for_task.return_value = 'run-456'
+                            mock_get_run_mgr.return_value = mock_run_mgr
+
+                            with caplog.at_level('DEBUG'):
+                                project_monitor._start_review_cycle_for_issue(
+                                    project_name="test_project",
+                                    board_name="SDLC Execution",
+                                    issue_number=123,
+                                    status="Done",
+                                    repository="test-repo",
+                                    project_config=project_config,
+                                    pipeline_config=project_config.pipelines[0],
+                                    workflow_template=workflow_template,
+                                    column=review_column
+                                )
+
+                                await asyncio.sleep(0.5)
+
+                        assert not [
+                            r for r in caplog.records if r.levelname == 'CRITICAL'
+                        ], [
+                            r.getMessage() for r in caplog.records
+                            if r.levelname == 'CRITICAL'
+                        ]
+                        assert any(
+                            'correct outcome' in record.getMessage()
+                            for record in caplog.records
+                        )
 
 
 if __name__ == '__main__':

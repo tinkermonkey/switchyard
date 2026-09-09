@@ -17,6 +17,15 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
+# Minimum age of a queue entry's `activated_at` before the stranded-'active'
+# sweep will consider resetting it (issue #142). Every dispatch call site marks
+# an issue active immediately after acquiring the lock and enqueues within
+# seconds, so anything still lock-less and run-less this long afterwards is a
+# genuine leak, not a dispatch in flight. Generous on purpose: a false positive
+# here re-dispatches work that is actually running, which is far worse than
+# leaving a stranded entry for one more 10-minute sweep.
+STRANDED_ACTIVE_GRACE_MINUTES = 15
+
 
 class ScheduledTasksService:
     """Manages periodic background tasks for the orchestrator"""
@@ -607,6 +616,14 @@ class ScheduledTasksService:
 
         This runs every 10 minutes to ensure queues don't drift from GitHub reality.
         Uses force_sync_with_github which always overwrites local state.
+
+        Also sweeps for queue entries stranded at status='active' with nothing
+        actually executing them (issue #142) — force_sync_with_github() does not
+        cover that case: it only removes entries that have left the trigger
+        column, so a stranded 'active' entry for an issue still sitting in the
+        column survives every sync untouched and is excluded from dispatch
+        forever (get_next_n_waiting_issues() filters strictly on
+        status=='waiting').
         """
         logger.info("Starting queue state reconciliation with GitHub")
 
@@ -621,6 +638,7 @@ class ScheduledTasksService:
 
             reconciled_count = 0
             error_count = 0
+            stranded_reset_count = 0
 
             for project_name in project_names:
                 try:
@@ -646,6 +664,13 @@ class ScheduledTasksService:
                             # Force sync with GitHub
                             queue_manager.force_sync_with_github()
 
+                            # Defense in depth for the dispatch-rollback gap
+                            # (#142): runs AFTER the force sync so entries the
+                            # sync already dropped aren't considered at all.
+                            stranded_reset_count += self._reset_stranded_active_issues(
+                                queue_manager, project_name, board_name
+                            )
+
                             reconciled_count += 1
 
                         except Exception as e:
@@ -660,11 +685,251 @@ class ScheduledTasksService:
 
             logger.info(
                 f"Queue state reconciliation complete: "
-                f"{reconciled_count} queues synced, {error_count} errors"
+                f"{reconciled_count} queues synced, "
+                f"{stranded_reset_count} stranded 'active' entries reset, "
+                f"{error_count} errors"
             )
 
         except Exception as e:
             logger.error(f"Error in queue state reconciliation: {e}", exc_info=True)
+
+    def _has_durable_conversational_signal(
+        self, project_name: str, issue_number: int
+    ) -> bool:
+        """
+        True if Redis still holds a liveness signal for a conversational loop on
+        this issue — or if Redis could not be asked at all.
+
+        The two keys are the ones ProjectMonitor's FAILSAFE already treats as the
+        authority on "is this conversational loop alive"
+        (orchestrator:feedback_loop:heartbeat:* is re-set on every 30s poll with
+        a 5m TTL; orchestrator:conversational_loop:* is the distributed
+        start_feedback_loop lock). Unlike
+        HumanFeedbackLoopExecutor.active_loops, they survive an orchestrator
+        restart, which is exactly the case that makes a live conversation look
+        dead to every in-process probe.
+
+        Fails CLOSED: an unreachable Redis returns True, leaving the entry alone.
+        Resetting a live conversational entry re-queues it for dispatch while a
+        human is mid-thread, which is a far worse outcome than deferring the
+        sweep for one issue to the next 10-minute run.
+        """
+        try:
+            import redis as _redis_mod
+            client = _redis_mod.Redis(host='redis', port=6379, decode_responses=True)
+            heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+            loop_lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
+            if client.exists(heartbeat_key) or client.exists(loop_lock_key):
+                logger.debug(
+                    f"Issue #{issue_number} in {project_name} still has a conversational "
+                    f"loop signal in Redis — not a stranded queue entry"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(
+                f"Could not read conversational loop liveness keys for #{issue_number} "
+                f"in {project_name} — treating the entry as live and skipping the "
+                f"stranded check: {e}"
+            )
+            return True
+
+    def _reset_stranded_active_issues(
+        self, queue_manager, project_name: str, board_name: str
+    ) -> int:
+        """
+        Reset queue entries stuck at status='active' with nothing executing them.
+
+        A dispatch call site marks an issue active immediately after acquiring
+        the pipeline lock and enqueues a task moments later. If anything in
+        between raises and the rollback itself also fails (or the process dies
+        between the two), the entry stays 'active' forever — and since
+        get_next_n_waiting_issues() selects strictly on status=='waiting', that
+        issue is silently excluded from every future dispatch. There is no other
+        automated recovery for this state, unlike the lock side's staleness/TTL
+        recovery, so it needs a sweep of its own (#142).
+
+        Fails CLOSED at every step: an entry is only reset when this method can
+        positively establish that nothing is running it. Anything it can't
+        determine — no `activated_at` to age against, a lock whose state could
+        not be read, a pipeline-run lookup that errored, a work-execution check
+        that errored — leaves the entry alone.
+
+        Note that "fails closed" here has to be built deliberately, because the
+        underlying probes do NOT fail closed on their own:
+          - get_lock() swallows store read failures into a plain None
+            (_read_redis_lock_only/_read_yaml_lock_only return (None, False) and
+            get_lock() discards the flag), making "unreadable" indistinguishable
+            from "unlocked". get_lock_fail_closed() is used instead, exactly as
+            try_acquire_lock does, and an unhealthy read aborts the whole board.
+          - get_active_pipeline_run() returns None for BOTH "no run" and
+            "couldn't tell": its Elasticsearch fallback logs at debug and falls
+            through to None, and self.es is None outright when the client could
+            not be constructed. A run whose Redis key has aged out (routine for
+            long conversational loops) plus any ES trouble therefore reads as
+            "nothing running". So it is not trusted alone.
+
+        An entry is reset only when ALL of:
+          - it is older than STRANDED_ACTIVE_GRACE_MINUTES (not a dispatch in flight)
+          - this (project, board)'s lock state was readable, and the entry does
+            not hold that lock
+          - work_execution_tracker.has_active_execution() says nothing is running
+            for it — the canonical liveness predicate, covering regular agent
+            executions, review cycles, repair-cycle containers and conversational
+            feedback loops.
+          - no durable conversational-liveness signal exists for it in Redis.
+            This, NOT has_active_execution(), is the guard that matters for
+            conversational issues — which are marked active WITHOUT ever taking
+            the lock, so the lock check can never protect them either. All three
+            of has_active_execution()'s non-history checks read in-process dicts,
+            and HumanFeedbackLoopExecutor.initialize() clears active_loops
+            unconditionally on every restart; human_feedback_loop only records an
+            execution per agent TURN, so an idle loop waiting on a human has no
+            in_progress entry. After a routine restart a live, listening
+            conversation therefore reads as completely dead to every in-process
+            probe. The heartbeat/lock keys ProjectMonitor's FAILSAFE already
+            treats as conversational liveness truth survive it, so they are
+            consulted here too — and a Redis read that raises fails closed.
+          - it has no active PipelineRun
+          - its `activated_at` has not changed since it was sampled (the reset is
+            a compare-and-swap): the liveness checks above are slow enough — a
+            YAML file-lock acquisition plus, possibly, an ES round trip — that a
+            concurrent dispatcher can legitimately re-activate the issue in
+            between, and flipping THAT activation to 'waiting' would make a
+            running issue a selectable dispatch candidate.
+
+        Returns:
+            Number of entries reset to 'waiting'.
+        """
+        try:
+            summary = queue_manager.get_queue_summary()
+            active_entries = summary.get('active_issues') or []
+            if not active_entries:
+                return 0
+
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            from services.pipeline_run import get_pipeline_run_manager
+            from services.work_execution_state import work_execution_tracker
+
+            lock, reads_healthy = get_pipeline_lock_manager().get_lock_fail_closed(
+                project_name, board_name
+            )
+            if not reads_healthy:
+                logger.error(
+                    f"Could not determine pipeline lock state for "
+                    f"{project_name}/{board_name} (both Redis and YAML reads failed) — "
+                    f"skipping the stranded 'active' sweep for this board rather than "
+                    f"risk resetting an issue that genuinely holds the lock"
+                )
+                return 0
+
+            lock_holder = (
+                lock.locked_by_issue
+                if lock and lock.lock_status == 'locked'
+                else None
+            )
+            run_manager = get_pipeline_run_manager()
+        except Exception as e:
+            # Can't establish ground truth — reset nothing rather than risk
+            # re-dispatching an issue that is genuinely running.
+            logger.error(
+                f"Could not evaluate stranded 'active' queue entries for "
+                f"{project_name}/{board_name}: {e}"
+            )
+            return 0
+
+        now = datetime.now(timezone.utc)
+        reset_count = 0
+
+        for entry in active_entries:
+            issue_number = entry.get('issue_number')
+
+            if issue_number is None or issue_number == lock_holder:
+                continue
+
+            activated_at = entry.get('activated_at')
+            if not activated_at:
+                logger.debug(
+                    f"Queue entry for #{issue_number} on {project_name}/{board_name} is "
+                    f"'active' with no activated_at timestamp — cannot age it, skipping"
+                )
+                continue
+
+            try:
+                activated = datetime.fromisoformat(activated_at)
+                if activated.tzinfo is None:
+                    activated = activated.replace(tzinfo=timezone.utc)
+                age_minutes = (now - activated).total_seconds() / 60
+            except Exception as e:
+                logger.warning(
+                    f"Unparseable activated_at '{activated_at}' for #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
+            if age_minutes < STRANDED_ACTIVE_GRACE_MINUTES:
+                continue
+
+            # Positive liveness check, and the ONLY one that protects
+            # conversational issues: they are marked active without ever taking
+            # the pipeline lock, and the run lookup below returns None both for
+            # "no run" and for "couldn't tell" (see this method's docstring).
+            # has_active_execution() covers regular executions, review cycles,
+            # repair-cycle containers and feedback loops, and fails closed
+            # internally when its own sub-checks degrade.
+            try:
+                if work_execution_tracker.has_active_execution(project_name, issue_number):
+                    continue
+            except Exception as e:
+                logger.warning(
+                    f"Could not check for active work on #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
+            # The durable half of the conversational liveness check — see this
+            # method's docstring for why the in-process probes above cannot
+            # carry it on their own.
+            if self._has_durable_conversational_signal(project_name, issue_number):
+                continue
+
+            try:
+                active_run = run_manager.get_active_pipeline_run(
+                    project_name, issue_number, board=board_name
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Could not check for an active pipeline run for #{issue_number} on "
+                    f"{project_name}/{board_name}, skipping stranded check: {e}"
+                )
+                continue
+
+            if active_run:
+                continue
+
+            try:
+                # Compare-and-swap on the activation this entry was aged
+                # against: the checks above take long enough (file lock, ES
+                # round trip) for a concurrent dispatcher to have re-activated
+                # the issue since get_queue_summary() sampled it.
+                if queue_manager.reset_issue_to_waiting(
+                    issue_number, expected_activated_at=activated_at
+                ):
+                    reset_count += 1
+                    logger.warning(
+                        f"Reset stranded queue entry for issue #{issue_number} on "
+                        f"{project_name}/{board_name} from 'active' back to 'waiting' — "
+                        f"active for {age_minutes:.0f}m with no pipeline lock, no active "
+                        f"work execution, no conversational loop signal in Redis and no "
+                        f"active pipeline run (dispatch rollback almost certainly leaked)"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Failed to reset stranded queue entry for issue #{issue_number} on "
+                    f"{project_name}/{board_name}: {e}"
+                )
+
+        return reset_count
 
     async def _sweep_orphaned_parents(self):
         """

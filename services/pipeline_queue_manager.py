@@ -54,11 +54,102 @@ import yaml
 import logging
 import fcntl
 import contextlib
+from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+class ResetResult(Enum):
+    """
+    Outcome of reset_issue_to_waiting() -- four genuinely different states that
+    a bare bool collapsed into one.
+
+    Found in review (#147): the dispatch-rollback call sites logged CRITICAL
+    ("the entry is still 'active' and will be excluded from all future dispatch
+    until a human intervenes") on ANY falsy return, but only ONE of the three
+    falsy cases is even about an entry left 'active', and none of them is
+    unrecoverable:
+
+    * NOT_ACTIVE -- the entry exists and is NOT 'active'. Overwhelmingly this
+      means somebody already reset it: trigger_agent_for_status()'s
+      consecutive-dispatch-failure branch and its no-agent-column branch both
+      call reset_issue_to_waiting() with no token and then return None, landing
+      the caller in exactly this rollback with an entry that is already
+      'waiting'. Nothing is stranded; nothing needs a human.
+    * NOT_FOUND -- no entry at all, e.g. the issue was removed from the queue
+      because it left the trigger column. Nothing to undo.
+    * REACTIVATED -- the compare-and-swap refused because a competing dispatcher
+      stamped a fresh activated_at. Per reset_issue_to_waiting()'s own contract
+      that means somebody else legitimately owns this activation, and leaving
+      the entry 'active' is the CORRECT outcome, not a fault.
+
+    Only an exception out of reset_issue_to_waiting() leaves the entry's state
+    genuinely unknown, and that is the one case worth paging on.
+
+    __bool__ is defined so every existing truthiness-based caller/assertion
+    (`if queue_manager.reset_issue_to_waiting(...)`, assertTrue/assertFalse)
+    keeps its original meaning: only RESET is truthy. Mirrors TouchResult in
+    services/pipeline_lock_manager.py, introduced for the same reason.
+    """
+
+    RESET = "reset"                  # was 'active', now 'waiting'
+    NOT_ACTIVE = "not_active"        # entry found but not 'active' -- nothing to undo
+    NOT_FOUND = "not_found"          # no entry in the queue -- nothing to undo
+    REACTIVATED = "reactivated"      # CAS refused: another dispatcher owns this activation
+
+    def __bool__(self) -> bool:
+        return self is ResetResult.RESET
+
+
+def describe_rollback_reset(
+    result: 'ResetResult', issue_number: int, project: str, board: str
+) -> tuple:
+    """
+    Render a dispatch-rollback reset outcome as (log_level, message).
+
+    Shared by the four dispatch-rollback sites so they report identically and,
+    more importantly, accurately -- see ResetResult's docstring for why a falsy
+    result is not a CRITICAL condition. Returns a logging level constant and the
+    message to log; a RESET result returns (logging.DEBUG, ...) since
+    reset_issue_to_waiting() already logs the successful reset itself.
+    """
+    where = f"{project}/{board}"
+    if result is ResetResult.RESET:
+        return (
+            logging.DEBUG,
+            f"Rolled back queue entry for issue #{issue_number} to 'waiting' on {where}",
+        )
+    if result is ResetResult.REACTIVATED:
+        return (
+            logging.INFO,
+            f"Not rolling back the queue entry for issue #{issue_number} on {where}: "
+            f"the compare-and-swap on activated_at was refused, so another dispatcher "
+            f"has since re-activated it. Leaving it 'active' is the correct outcome — "
+            f"that dispatcher owns the entry now",
+        )
+    if result is ResetResult.NOT_ACTIVE:
+        return (
+            logging.INFO,
+            f"No rollback needed for issue #{issue_number} on {where}: its queue entry "
+            f"is no longer 'active' (an earlier reset on this same path, e.g. "
+            f"trigger_agent_for_status()'s consecutive-failure or no-agent-column "
+            f"branch, already returned it to the queue)",
+        )
+    if result is ResetResult.NOT_FOUND:
+        return (
+            logging.INFO,
+            f"No rollback needed for issue #{issue_number} on {where}: it has no queue "
+            f"entry (it was removed from the queue, e.g. after leaving the trigger "
+            f"column)",
+        )
+    return (
+        logging.WARNING,
+        f"Unrecognized reset outcome {result!r} rolling back issue #{issue_number} "
+        f"on {where}",
+    )
 
 
 class PipelineQueueManager:
@@ -401,20 +492,67 @@ class PipelineQueueManager:
                 f"(position: {position}, status: waiting)"
             )
 
-    def mark_issue_active(self, issue_number: int):
-        """Mark issue as active (currently executing)"""
+    def mark_issue_active(
+        self,
+        issue_number: int,
+        preserve_activated_at: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Mark issue as active (currently executing).
+
+        Args:
+            preserve_activated_at: A token a caller already holds for THIS
+                activation. When the entry is still 'active' carrying exactly
+                that token, the stamp is left alone and the same token is
+                returned, so re-marking inside one dispatch does not invalidate
+                the caller's rollback token.
+
+                This matters because a single dispatch marks the entry active
+                more than once: the call sites that acquire the lock and mark
+                the entry themselves then call
+                ProjectMonitor.trigger_agent_for_status(), which marks it
+                active AGAIN on every branch that reaches dispatch. Without
+                this, the second stamp made the caller's token stale before it
+                could ever be used, so the rollback's compare-and-swap refused
+                every time and the entry stayed 'active' forever — the exact
+                silent-loss state the rollback exists to prevent (#147).
+
+                A genuinely NEW activation (the entry was reset to 'waiting' and
+                re-dispatched, or a different dispatcher re-activated it) does
+                not match the token, so it still gets a fresh stamp and the
+                compare-and-swap still refuses a stale rollback.
+
+        Returns:
+            The `activated_at` timestamp on the entry, to be passed back as
+            reset_issue_to_waiting(expected_activated_at=...) if this activation
+            later has to be rolled back — the compare-and-swap that stops a
+            rollback from flipping a DIFFERENT, genuinely-running activation
+            back to 'waiting'. None when the issue isn't in the queue at all
+            (nothing was stamped, so there is nothing to undo).
+        """
         with self._queue_lock():
             queue = self.load_queue()
 
+            activated_at = None
             for issue in queue:
                 if issue['issue_number'] == issue_number:
+                    same_activation = (
+                        preserve_activated_at is not None
+                        and issue.get('status') == 'active'
+                        and issue.get('activated_at') == preserve_activated_at
+                    )
+                    activated_at = (
+                        preserve_activated_at if same_activation
+                        else datetime.now(timezone.utc).isoformat()
+                    )
                     issue['status'] = 'active'
-                    issue['activated_at'] = datetime.now(timezone.utc).isoformat()
+                    issue['activated_at'] = activated_at
                     break
 
             self.save_queue(queue)
 
             logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
+            return activated_at
 
     def sync_queue_with_github(
         self,
@@ -619,7 +757,9 @@ class PipelineQueueManager:
                 f"({removed_count} removed, {added_count} added, {updated_count} updated)"
             )
 
-    def reset_issue_to_waiting(self, issue_number: int):
+    def reset_issue_to_waiting(
+        self, issue_number: int, expected_activated_at: Optional[str] = None
+    ) -> ResetResult:
         """
         Reset an issue from active back to waiting status.
 
@@ -627,6 +767,33 @@ class PipelineQueueManager:
 
         Args:
             issue_number: Issue number to reset
+            expected_activated_at: Optional compare-and-swap token. When given,
+                the reset is applied ONLY if the entry's current `activated_at`
+                still matches — i.e. this is the same activation the caller
+                observed. mark_issue_active() always stamps a fresh
+                `activated_at`, so a mismatch means a concurrent dispatcher
+                re-activated the issue between the caller's read and this write,
+                and resetting would flip a genuinely-running issue back to
+                'waiting'. Callers that sample queue state and then perform slow
+                liveness checks (see ScheduledTasksService._reset_stranded_active_issues)
+                MUST pass this.
+
+                So MUST the dispatch call sites rolling back their own
+                mark_issue_active(): they release the pipeline lock BEFORE
+                resetting (holding it across the reset is not safe either —
+                try_acquire_lock() returns True/"already_holds_lock" for the
+                current holder, and ProjectMonitor.trigger_agent_for_status()
+                re-dispatches on that branch), which opens exactly the window
+                this token closes. Pass the value mark_issue_active() returned;
+                a None token means nothing was stamped, so skip the reset.
+
+        Returns:
+            A ResetResult. Only ResetResult.RESET is truthy, so callers written
+            against the old bool are unaffected; callers that need to tell
+            "somebody else owns this activation" (REACTIVATED) from "there was
+            nothing active to undo" (NOT_ACTIVE / NOT_FOUND) can now do so
+            instead of reporting all three as the same emergency. See
+            ResetResult's docstring — none of the three is unrecoverable.
         """
         with self._queue_lock():
             queue = self.load_queue()
@@ -634,6 +801,16 @@ class PipelineQueueManager:
             for issue in queue:
                 if issue['issue_number'] == issue_number:
                     if issue['status'] == 'active':
+                        if (expected_activated_at is not None
+                                and issue.get('activated_at') != expected_activated_at):
+                            logger.info(
+                                f"Not resetting issue #{issue_number} to waiting: it was "
+                                f"re-activated concurrently (activated_at "
+                                f"{issue.get('activated_at')} != expected "
+                                f"{expected_activated_at})"
+                            )
+                            return ResetResult.REACTIVATED
+
                         issue['status'] = 'waiting'
 
                         # Clear activation timestamp
@@ -645,15 +822,15 @@ class PipelineQueueManager:
                             f"Reset issue #{issue_number} from active to waiting in queue "
                             f"(recovering from stale lock)"
                         )
-                        return True
+                        return ResetResult.RESET
                     else:
                         logger.debug(
                             f"Issue #{issue_number} has status {issue['status']}, no reset needed"
                         )
-                        return False
+                        return ResetResult.NOT_ACTIVE
 
             logger.debug(f"Issue #{issue_number} not found in queue, no reset performed")
-            return False
+            return ResetResult.NOT_FOUND
 
     def get_issue_status(self, issue_number: int) -> Optional[str]:
         """

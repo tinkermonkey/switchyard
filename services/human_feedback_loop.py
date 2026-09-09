@@ -83,12 +83,23 @@ class HumanFeedbackLoopExecutor:
 
     def _update_loop_heartbeat(self, project_name: str, issue_number: int) -> None:
         """
-        Update heartbeat timestamp for active feedback loop.
+        Update heartbeat timestamp for active feedback loop, and renew the
+        distributed conversational-loop lock alongside it.
 
         Used for monitoring loop health and detecting stuck loops.
         Heartbeat is stored in Redis with a 5-minute TTL (10x poll interval for safety margin).
+
+        The lock key is set once in _start_feedback_loop() with ex=1800 and was
+        never renewed, so on any conversation that waits more than 30 minutes for
+        a human it silently lapsed while the loop was still running — leaving
+        _start_feedback_loop() free to start a SECOND loop on the same issue after
+        a restart, and removing one of the two durable liveness signals the
+        FAILSAFE and the stranded-'active' sweep read (#147). Renewed here rather
+        than on its own timer so the two keys can only ever go stale together,
+        when the loop itself has actually stopped polling.
         """
         heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+        lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
 
         try:
             import redis
@@ -98,6 +109,9 @@ class HumanFeedbackLoopExecutor:
                 300,  # 5 minute TTL (10x poll interval for safety margin)
                 datetime.utcnow().isoformat()
             )
+            # expire() only renews an existing key — it will not resurrect a lock
+            # a legitimate cleanup_loop()/teardown already deleted.
+            redis_client.expire(lock_key, 1800)
         except Exception as e:
             # Don't fail the loop if heartbeat update fails - it's just for monitoring
             logger.warning(f"Failed to update feedback loop heartbeat for {project_name}#{issue_number}: {e}")

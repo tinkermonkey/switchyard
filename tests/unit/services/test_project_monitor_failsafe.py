@@ -58,6 +58,10 @@ class TestQueueProcessingFailsafe:
     def project_monitor(self, mock_config_manager):
         """Create ProjectMonitor instance with mocked dependencies"""
         task_queue = Mock()
+        # _trigger_next_issue_with_rollback() consults the pending queue before
+        # undoing anything (a task enqueued but not yet started is work in flight
+        # that has_active_execution() can't see). Default: nothing pending.
+        task_queue.get_pending_tasks.return_value = []
         monitor = ProjectMonitor(task_queue, mock_config_manager)
 
         # Mock trigger_agent_for_status to avoid actual agent triggering
@@ -127,14 +131,20 @@ class TestQueueProcessingFailsafe:
         # Verify: Issue was marked as active
         mock_queue_manager.mark_issue_active.assert_called_once_with(155)
 
-        # Verify: Agent was triggered
+        # Verify: Agent was triggered. raise_on_error=True is what lets the
+        # FAILSAFE tell "the dispatch blew up" from "it declined" and roll back
+        # the lock + queue entry it just took (#147) -- without it every internal
+        # failure came back as an indistinguishable None and the acquisition
+        # leaked.
         project_monitor.trigger_agent_for_status.assert_called_once_with(
             'test_project',
             'SDLC Execution',
             155,
             'Development',
             'test-org/test-repo',
-            lock_already_acquired=True
+            lock_already_acquired=True,
+            raise_on_error=True,
+            already_activated_at=mock_queue_manager.mark_issue_active.return_value
         )
 
     def test_failsafe_skips_when_pipeline_locked(
@@ -363,6 +373,7 @@ class TestQueueProcessingFailsafe:
 
         # Create monitor
         task_queue = Mock()
+        task_queue.get_pending_tasks.return_value = []
         monitor = ProjectMonitor(task_queue, mock_config_manager)
         monitor.trigger_agent_for_status = Mock()
         monitor.get_issue_column_sync = Mock(return_value='Development')
@@ -419,3 +430,88 @@ class TestQueueProcessingFailsafe:
 
         # Verify: Agent was triggered (we have the lock)
         project_monitor.trigger_agent_for_status.assert_called_once()
+
+    # --- Issue #147: dispatch-failure rollback ----------------------------
+    # The FAILSAFE acquires the lock and marks the queue entry 'active', then
+    # calls trigger_agent_for_status() and ignores the result. That method ends
+    # in a bare `except Exception: logger.error(...); return None`, so before
+    # #147 a Redis blip on the enqueue left the lock held with the entry stuck
+    # at 'active' -- and the stranded-'active' sweep skips the lock holder by
+    # design, so nothing recovered it.
+
+    def _waiting_issue_failsafe_mocks(self, mock_lock_manager, mock_queue_manager):
+        mock_lock_manager.get_lock.return_value = None
+        mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
+        mock_lock_manager.release_lock.return_value = True
+        mock_queue_manager.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
+        mock_queue_manager.get_next_waiting_issue.return_value = {
+            'issue_number': 155,
+            'status': 'waiting',
+            'title': 'Test Issue',
+        }
+
+    def _run_failsafe(self, project_monitor, mock_lock_manager, mock_queue_manager,
+                      has_active_execution=False):
+        mock_tracker = Mock()
+        mock_tracker.has_active_execution.return_value = has_active_execution
+
+        # is_cancelled() must be explicitly False - a bare Mock() is truthy and
+        # would send the FAILSAFE down its "skipping cancelled issue" branch
+        # before it ever reaches the dispatch under test.
+        mock_cancellation = Mock()
+        mock_cancellation.is_cancelled.return_value = False
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_queue_manager.get_pipeline_queue_manager', return_value=mock_queue_manager), \
+             patch('services.work_execution_state.work_execution_tracker', mock_tracker), \
+             patch('services.cancellation.get_cancellation_signal', return_value=mock_cancellation):
+            project_monitor._check_and_process_waiting_issues_failsafe()
+
+    def test_failsafe_rolls_back_when_dispatch_raises(
+        self, project_monitor, mock_lock_manager, mock_queue_manager
+    ):
+        """REGRESSION (#147): a dispatch that blows up must give back BOTH the
+        lock and the queue entry, or the board deadlocks with the issue
+        excluded from every future dispatch."""
+        self._waiting_issue_failsafe_mocks(mock_lock_manager, mock_queue_manager)
+        project_monitor.trigger_agent_for_status = Mock(side_effect=RuntimeError("redis down"))
+
+        self._run_failsafe(project_monitor, mock_lock_manager, mock_queue_manager)
+
+        mock_lock_manager.release_lock.assert_any_call('test_project', 'SDLC Execution', 155)
+        mock_queue_manager.reset_issue_to_waiting.assert_called_once_with(
+            155, expected_activated_at='2026-01-01T00:00:00+00:00'
+        )
+
+    def test_failsafe_releases_lock_when_mark_issue_active_raises(
+        self, project_monitor, mock_lock_manager, mock_queue_manager
+    ):
+        """A queue YAML write failure between acquiring the lock and dispatching
+        left the lock held with nothing running. Nothing was stamped, so there
+        is no reset to make -- only the release."""
+        self._waiting_issue_failsafe_mocks(mock_lock_manager, mock_queue_manager)
+        mock_queue_manager.mark_issue_active.side_effect = OSError(
+            "[Errno 28] No space left on device"
+        )
+
+        self._run_failsafe(project_monitor, mock_lock_manager, mock_queue_manager)
+
+        mock_lock_manager.release_lock.assert_any_call('test_project', 'SDLC Execution', 155)
+        mock_queue_manager.reset_issue_to_waiting.assert_not_called()
+        project_monitor.trigger_agent_for_status.assert_not_called()
+
+    def test_failsafe_does_not_roll_back_when_work_is_already_running(
+        self, project_monitor, mock_lock_manager, mock_queue_manager
+    ):
+        """trigger_agent_for_status() also returns None for legitimate reasons.
+        The positive liveness check keeps those from being torn down."""
+        self._waiting_issue_failsafe_mocks(mock_lock_manager, mock_queue_manager)
+        project_monitor.trigger_agent_for_status = Mock(return_value=None)
+
+        self._run_failsafe(project_monitor, mock_lock_manager, mock_queue_manager,
+                           has_active_execution=True)
+
+        # The dispatch really was attempted (guards against a vacuous pass).
+        project_monitor.trigger_agent_for_status.assert_called_once()
+        mock_queue_manager.reset_issue_to_waiting.assert_not_called()
+        mock_lock_manager.release_lock.assert_not_called()
