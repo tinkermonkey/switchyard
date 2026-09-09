@@ -13,8 +13,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-def _committed_failsafe(branch='feature/issue-42-shared'):
-    """The failsafe verdict for "the fallback commit saved the work".
+def _no_branch_refusal():
+    """_failsafe_commit_check()'s "the branch checked out fine" return.
 
     These tests run against real paths under /workspace, so an unstubbed
     _failsafe_commit_check() reads whatever branch happens to be checked out
@@ -23,8 +23,7 @@ def _committed_failsafe(branch='feature/issue-42-shared'):
     silently discarded since #149 WI-4. What these tests are about is workspace
     resolution, so pin the failsafe.
     """
-    from services.agent_executor import FailsafeOutcome, FailsafeResult
-    return FailsafeResult(FailsafeOutcome.COMMITTED, branch)
+    return None
 
 
 @pytest.fixture
@@ -250,7 +249,7 @@ class TestAgentExecutorWorkspaceIntegration:
             # /workspace/test-project, whose branch disagrees with 'feature/test',
             # and that IS escalated since #149 WI-4).
             agent_executor._failsafe_commit_check = AsyncMock(
-                return_value=_committed_failsafe('feature/test')
+                return_value=_no_branch_refusal()
             )
             mock_factory.create.return_value = mock_workspace
 
@@ -613,7 +612,7 @@ class TestExecuteAgentEpicResolution:
              patch.object(agent_executor.obs, 'emit_agent_completed'), \
              patch.object(agent_executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
              patch.object(agent_executor, '_failsafe_commit_check', new_callable=AsyncMock,
-                          return_value=_committed_failsafe()), \
+                          return_value=_no_branch_refusal()), \
              patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
              patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm), \
              patch('services.feature_branch_manager.feature_branch_manager.resolve_epic_id',

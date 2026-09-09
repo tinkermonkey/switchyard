@@ -1445,9 +1445,9 @@ git push --force-with-lease
             "success": False,
             "error": error_msg,
             "branch_mismatch": True,
-            # Carried out so the caller's escalation can quarantine the worktree
-            # by the branches themselves rather than re-parsing them out of the
-            # message (#149 WI-4 review).
+            # Carried out so the caller's escalation can name the two branches
+            # itself rather than re-parsing them out of the message
+            # (#149 WI-4 review).
             "expected_branch": expected_branch,
             "current_branch": current_branch,
         }

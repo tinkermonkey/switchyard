@@ -10,11 +10,11 @@ if not os.path.isdir('/app'):
 from unittest.mock import AsyncMock, patch, MagicMock
 from datetime import datetime
 
-from services.agent_executor import AgentExecutor, FailsafeOutcome, FailsafeResult
+from services.agent_executor import AgentExecutor
 
 
-def _committed_failsafe(branch='feature/issue-51-login-form-ui'):
-    """The failsafe verdict for "the fallback commit saved the work".
+def _no_branch_refusal():
+    """_failsafe_commit_check()'s "the branch checked out fine" return.
 
     These tests run against the container's real /workspace/test-project, which
     sits on its default branch -- so an unstubbed _failsafe_commit_check() reads a
@@ -22,7 +22,7 @@ def _committed_failsafe(branch='feature/issue-51-login-form-ui'):
     disagreement is escalated rather than silently discarded. What each test here
     is actually about is the finalization/preparation path, so pin the failsafe.
     """
-    return FailsafeResult(FailsafeOutcome.COMMITTED, branch)
+    return None
 
 
 @pytest.fixture
@@ -279,7 +279,7 @@ class TestFeatureBranchFinalization:
              patch.object(agent_executor.factory, 'create_agent') as mock_create_agent, \
              patch.object(agent_executor, '_post_agent_output_to_github') as mock_post, \
              patch.object(agent_executor, '_failsafe_commit_check', new_callable=AsyncMock,
-                          return_value=_committed_failsafe()), \
+                          return_value=_no_branch_refusal()), \
              patch.object(agent_executor.obs, 'emit_task_received'), \
              patch.object(agent_executor.obs, 'emit_agent_initialized'), \
              patch.object(agent_executor.obs, 'emit_agent_completed'):

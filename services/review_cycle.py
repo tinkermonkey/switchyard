@@ -1655,7 +1655,7 @@ class ReviewCycleExecutor:
                         # The return used to be discarded outright, so a FAILED
                         # commit -- including the branch-target refusal added by
                         # #149 WI-4 -- left no trace at all here. Same verdict the
-                        # sibling site in _run_revision_iteration() reaches: the
+                        # sibling site in _execute_review_loop() reaches: the
                         # cycle deliberately continues (the reviewer reads the
                         # maker's GitHub comment, not the branch), but an
                         # uncommitted revision must not pass silently.

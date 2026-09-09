@@ -526,132 +526,6 @@ class ProjectWorkspaceManager:
             )
         return self.workspace_root / '.orchestrator' / 'worktrees' / project_name / epic_id_str
 
-    @staticmethod
-    def _quarantine_marker_for(worktree_path: Path) -> Path:
-        """The branch-quarantine marker that belongs to worktree_path.
-
-        One definition shared by _epic_worktree_quarantine_path() (which addresses
-        it by project/epic) and prune_epic_worktrees() (which only has the on-disk
-        worktree path to go on) -- the same treatment
-        _is_corrupted_non_empty_worktree() got for the same reason.
-        """
-        return worktree_path.parent / f"{worktree_path.name}.branch-quarantine.json"
-
-    def _epic_worktree_quarantine_path(self, project_name: str, epic_id: str) -> Path:
-        """Marker path for a quarantined epic worktree -- a SIBLING of the worktree
-        directory, deliberately never a file inside it.
-
-        Inside the worktree the marker would be swept up by the very `git add -A`
-        the quarantine exists to stop, and committed onto the drifted branch.
-        prune_epic_worktrees() skips non-directories under the staging root, so a
-        sibling file also survives the startup sweep it has to outlive -- and that
-        sweep skips the WORKTREE beside it too, or the marker would outlive the
-        drift it describes (see prune_epic_worktrees()).
-        """
-        return self._quarantine_marker_for(self._epic_worktree_path(project_name, epic_id))
-
-    def quarantine_epic_worktree(
-        self,
-        project_name: str,
-        epic_id: str,
-        expected_branch: Optional[str],
-        actual_branch: Optional[str],
-        reason: str,
-    ) -> bool:
-        """Durably mark an epic's worktree unusable after a wrong-branch refusal.
-
-        A refusal only leaves the drift on disk; it does not repair it, and nothing
-        else does either. The NEXT dispatch for the same epic is a fresh PipelineRun,
-        so PipelineRunManager.resolve_workspace()'s idempotency guard does not apply,
-        get_or_create_epic_worktree() takes its cache-hit path and returns the same
-        directory without touching git, and _current_worktree_branch() then reads the
-        drifted branch and PERSISTS it as that run's expectation. The next
-        finalization verifies the drifted branch against itself, passes, and commits
-        both issues' work onto it -- #143's outcome, deferred by exactly one dispatch.
-        This marker is what resolve_workspace() reads to refuse instead (#149 WI-4
-        review).
-
-        Best-effort: returns False rather than raising when the marker cannot be
-        written, so a quarantine failure can never mask the refusal that triggered it.
-        """
-        import json
-        from datetime import datetime, timezone
-
-        try:
-            marker = self._epic_worktree_quarantine_path(project_name, epic_id)
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(json.dumps({
-                'project': project_name,
-                'epic_id': str(epic_id),
-                'expected_branch': expected_branch,
-                'actual_branch': actual_branch,
-                'reason': reason,
-                'quarantined_at': datetime.now(timezone.utc).isoformat(),
-            }, indent=2))
-            logger.error(
-                f"Quarantined epic worktree for {project_name} epic #{epic_id} "
-                f"(expected {expected_branch!r}, found {actual_branch!r}). No further "
-                f"dispatch will resolve this worktree until {marker} is removed."
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                f"Failed to write the branch-quarantine marker for {project_name} "
-                f"epic #{epic_id}: {e} -- the wrong-branch refusal still stands for "
-                "this dispatch, but the NEXT one may adopt the drifted branch."
-            )
-            return False
-
-    def get_epic_worktree_quarantine(
-        self, project_name: str, epic_id: str
-    ) -> Optional[Dict]:
-        """Read an epic worktree's quarantine marker, or None when it is not quarantined.
-
-        Fails CLOSED on a marker that exists but cannot be read: its mere presence is
-        the whole signal ("a wrong-branch refusal happened in this worktree"), and
-        returning None for it would resume exactly the adoption it exists to block.
-        """
-        import json
-
-        try:
-            marker = self._epic_worktree_quarantine_path(project_name, epic_id)
-            if not marker.is_file():
-                return None
-            return json.loads(marker.read_text())
-        except Exception as e:
-            logger.warning(
-                f"Epic worktree quarantine marker for {project_name} epic #{epic_id} "
-                f"could not be read ({e}) -- treating the worktree as quarantined."
-            )
-            return {
-                'project': project_name,
-                'epic_id': str(epic_id),
-                'reason': f'quarantine marker present but unreadable: {e}',
-            }
-
-    def clear_epic_worktree_quarantine(self, project_name: str, epic_id: str) -> bool:
-        """Remove an epic worktree's quarantine marker (True if one was removed).
-
-        The operator-facing half of quarantine_epic_worktree(): dispatch stays
-        refused until the drifted worktree has been inspected and this is called
-        (or the marker file simply deleted).
-        """
-        try:
-            marker = self._epic_worktree_quarantine_path(project_name, epic_id)
-            if not marker.is_file():
-                return False
-            marker.unlink()
-            logger.info(
-                f"Cleared branch quarantine for {project_name} epic #{epic_id} ({marker})"
-            )
-            return True
-        except Exception as e:
-            logger.error(
-                f"Failed to clear the branch-quarantine marker for {project_name} "
-                f"epic #{epic_id}: {e}"
-            )
-            return False
-
     def get_or_create_epic_worktree(
         self,
         project_name: str,
@@ -1553,9 +1427,7 @@ class ProjectWorkspaceManager:
         is explicitly skipped rather than force-removed -- _push_local_commits_
         if_any() is a no-op with no .git to run git commands against, so the
         "cheap, no real loss" assumption this paragraph otherwise relies on
-        does not hold for it. A FOURTH, for the same reason (#149 WI-4 review):
-        a worktree quarantined by a wrong-branch refusal, whose uncommitted
-        contents that refusal deliberately preserved for a human to inspect.
+        does not hold for it.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
@@ -1660,43 +1532,6 @@ class ProjectWorkspaceManager:
                             "it may hold real uncommitted work. Needs manual inspection, "
                             f"then `git worktree remove --force {worktree_path}` (or "
                             "`git worktree prune`) run against the base clone."
-                        )
-                        continue
-
-                    # A FOURTH case, found in the #149 WI-4 review: a worktree a
-                    # wrong-branch refusal quarantined. The marker is deliberately a
-                    # sibling file so it survives this sweep -- but removing the
-                    # worktree it names is worse than removing neither. The refusal
-                    # left the agent's uncommitted work on disk ON PURPOSE and told
-                    # the operator, in an issue comment, to go inspect it and restore
-                    # the branch; _push_local_commits_if_any() below is a no-op for
-                    # uncommitted changes, so this sweep would destroy exactly the
-                    # evidence the quarantine exists to preserve. The marker would
-                    # then outlive the drift, and resolve_workspace() would keep
-                    # refusing every issue under that epic (three dispatches later,
-                    # project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES calls
-                    # mark_failed() and the whole board's lock is retained) over a
-                    # stale marker with nothing left to explain it. Skip it, for the
-                    # same reason and on the same terms as the corrupted case above.
-                    quarantine_marker = self._quarantine_marker_for(worktree_path)
-                    try:
-                        is_quarantined = quarantine_marker.is_file()
-                    except OSError as e:
-                        # Fail closed, as get_epic_worktree_quarantine() does: the
-                        # marker's mere presence is the whole signal, and a read that
-                        # raised is not evidence of absence.
-                        logger.warning(
-                            f"Could not determine whether {worktree_path} is quarantined "
-                            f"({e}) -- skipping its prune."
-                        )
-                        is_quarantined = True
-                    if is_quarantined:
-                        logger.warning(
-                            f"Skipping prune of {worktree_path} -- quarantined by a "
-                            f"wrong-branch refusal ({quarantine_marker}). It holds "
-                            "uncommitted work the refusal deliberately preserved. "
-                            "Inspect it, restore the branch, then delete the marker to "
-                            "re-enable dispatch for this epic."
                         )
                         continue
 

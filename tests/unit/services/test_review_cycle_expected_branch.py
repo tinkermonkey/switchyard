@@ -181,7 +181,7 @@ class TestAFailedCommitIsNotSwallowedHere:
     left no trace at all. The cycle deliberately still continues (the reviewer
     reads the maker's GitHub comment, not the branch), but an uncommitted
     revision must not pass silently, matching the sibling site in
-    _run_revision_iteration() that already logged it.
+    _execute_review_loop() that already logged it.
     """
 
     @pytest.mark.asyncio
