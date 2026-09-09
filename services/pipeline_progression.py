@@ -690,10 +690,24 @@ class PipelineProgression:
 
                             if activated_at is not None:
                                 try:
-                                    pipeline_queue.reset_issue_to_waiting(
+                                    reset_ok = pipeline_queue.reset_issue_to_waiting(
                                         next_issue['issue_number'],
                                         expected_activated_at=activated_at,
                                     )
+                                    if not reset_ok:
+                                        # A refused compare-and-swap leaves exactly the
+                                        # state the raise path warns about, and only logs
+                                        # INFO on its way out - report it the same way, or
+                                        # the stranded entry is invisible to an operator.
+                                        logger.critical(
+                                            f"Could NOT reset queue entry for issue "
+                                            f"#{next_issue['issue_number']} back to 'waiting' after "
+                                            f"dispatch failed - the compare-and-swap on activated_at "
+                                            f"was refused, so the entry is still 'active' and will be "
+                                            f"excluded from all future dispatch on "
+                                            f"{project_name}/{board_name} until the stranded-'active' "
+                                            f"sweep or a human intervenes"
+                                        )
                                 except Exception as reset_error:
                                     logger.critical(
                                         f"Could NOT reset queue entry for issue "

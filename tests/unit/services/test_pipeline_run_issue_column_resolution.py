@@ -148,20 +148,6 @@ class TestResolveIssueColumnFromGitHub(unittest.TestCase):
         self.assertEqual(column, 'Development')
         self.assertTrue(reads_ok)
 
-    def test_thin_wrapper_still_returns_a_bare_column(self):
-        """_get_issue_column_from_github() keeps its old single-value contract
-        for the callers that don't need to tell the two None cases apart."""
-        state_manager = Mock()
-        state_manager.load_project_state.return_value = self.github_state
-        with patch('config.state_manager.state_manager', state_manager), \
-             patch('services.github_owner_utils.execute_board_query_cached',
-                   return_value=_board_envelope([400])):
-            column = self.manager._get_issue_column_from_github(
-                self.project_config, self.pipeline_config, 400
-            )
-
-        self.assertEqual(column, 'Development')
-
 
 if __name__ == '__main__':
     unittest.main()

@@ -192,8 +192,8 @@ class TestPipelineRunCleanupLogic:
             # Mock GitHub API to return "Done" as current column
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
-                return_value='Done'
+                '_resolve_issue_column_from_github',
+                return_value=('Done', True)
             ):
                 # Execute cleanup
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup()
@@ -229,8 +229,8 @@ class TestPipelineRunCleanupLogic:
             # Mock GitHub API to return "Backlog" as current column
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
-                return_value='Backlog'
+                '_resolve_issue_column_from_github',
+                return_value=('Backlog', True)
             ):
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup()
         
@@ -265,8 +265,8 @@ class TestPipelineRunCleanupLogic:
             # Mock GitHub API to return "Development" as current column
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
-                return_value='Development'
+                '_resolve_issue_column_from_github',
+                return_value=('Development', True)
             ):
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup()
         
@@ -299,8 +299,8 @@ class TestPipelineRunCleanupLogic:
             # Mock GitHub API to return None (issue not on board)
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
-                return_value=None
+                '_resolve_issue_column_from_github',
+                return_value=(None, True)
             ):
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup()
         
@@ -308,7 +308,48 @@ class TestPipelineRunCleanupLogic:
         assert len(mock_elasticsearch.indexed_docs) == 1
         ended_run = mock_elasticsearch.indexed_docs[0]['body']
         assert ended_run['status'] == 'completed'
-    
+
+    def test_unreadable_board_keeps_run_active(
+        self,
+        pipeline_run_manager,
+        mock_elasticsearch,
+        mock_project_config,
+        mock_workflow_template
+    ):
+        """A board query that couldn't be answered is NOT 'issue not on board'.
+
+        Rate limits, an open owner-type circuit breaker or a token refresh make
+        the board unreadable for every run in the sweep at once. Ending them all
+        would kill live runs whose agents are still working and let ProjectMonitor
+        re-dispatch on top of them (#147).
+        """
+        mock_elasticsearch.search_results = [{
+            'id': 'run-222',
+            'issue_number': 76,
+            'issue_title': 'Live Issue, Unreadable Board',
+            'issue_url': 'https://github.com/test-org/test-repo/issues/76',
+            'project': 'test-project',
+            'board': 'Development Board',
+            'started_at': '2025-12-10T07:00:00Z',
+            'status': 'active'
+        }]
+
+        with patch('config.manager.config_manager') as mock_config:
+            mock_config.get_project_config.return_value = mock_project_config
+            mock_config.get_workflow_template.return_value = mock_workflow_template
+
+            # Board query failed - nothing can be concluded about the column
+            with patch.object(
+                pipeline_run_manager,
+                '_resolve_issue_column_from_github',
+                return_value=(None, False)
+            ):
+                pipeline_run_manager.cleanup_stale_active_runs_on_startup()
+
+        # Verify: Run left untouched for the next pass
+        assert mock_elasticsearch.indexed_docs == []
+
+
     def test_retriggered_issue_skipped_from_cleanup(
         self,
         pipeline_run_manager,
@@ -338,8 +379,8 @@ class TestPipelineRunCleanupLogic:
             # Even though it might be in Backlog, it should be skipped
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
-                return_value='Backlog'
+                '_resolve_issue_column_from_github',
+                return_value=('Backlog', True)
             ):
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup(
                     retriggered_issues=retriggered_issues
@@ -396,7 +437,7 @@ class TestPipelineRunCleanupLogic:
                 20: 'Development', # Has agent - should keep
                 30: 'Backlog'      # No agent - should end
             }
-            return column_map.get(issue_number)
+            return column_map.get(issue_number), True
         
         with patch('config.manager.config_manager') as mock_config:
             mock_config.get_project_config.return_value = mock_project_config
@@ -404,7 +445,7 @@ class TestPipelineRunCleanupLogic:
             
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
+                '_resolve_issue_column_from_github',
                 side_effect=mock_get_column
             ):
                 pipeline_run_manager.cleanup_stale_active_runs_on_startup()
@@ -490,7 +531,7 @@ class TestPipelineRunCleanupEdgeCases:
             # Simulate GitHub API error
             with patch.object(
                 pipeline_run_manager,
-                '_get_issue_column_from_github',
+                '_resolve_issue_column_from_github',
                 side_effect=Exception("GitHub API error")
             ):
                 # Should handle error and keep run active (safe default)

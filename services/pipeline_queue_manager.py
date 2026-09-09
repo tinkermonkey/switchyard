@@ -401,17 +401,43 @@ class PipelineQueueManager:
                 f"(position: {position}, status: waiting)"
             )
 
-    def mark_issue_active(self, issue_number: int) -> Optional[str]:
+    def mark_issue_active(
+        self,
+        issue_number: int,
+        preserve_activated_at: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Mark issue as active (currently executing).
 
+        Args:
+            preserve_activated_at: A token a caller already holds for THIS
+                activation. When the entry is still 'active' carrying exactly
+                that token, the stamp is left alone and the same token is
+                returned, so re-marking inside one dispatch does not invalidate
+                the caller's rollback token.
+
+                This matters because a single dispatch marks the entry active
+                more than once: the call sites that acquire the lock and mark
+                the entry themselves then call
+                ProjectMonitor.trigger_agent_for_status(), which marks it
+                active AGAIN on every branch that reaches dispatch. Without
+                this, the second stamp made the caller's token stale before it
+                could ever be used, so the rollback's compare-and-swap refused
+                every time and the entry stayed 'active' forever — the exact
+                silent-loss state the rollback exists to prevent (#147).
+
+                A genuinely NEW activation (the entry was reset to 'waiting' and
+                re-dispatched, or a different dispatcher re-activated it) does
+                not match the token, so it still gets a fresh stamp and the
+                compare-and-swap still refuses a stale rollback.
+
         Returns:
-            The `activated_at` timestamp stamped on the entry, to be passed
-            back as reset_issue_to_waiting(expected_activated_at=...) if this
-            activation later has to be rolled back — the compare-and-swap that
-            stops a rollback from flipping a DIFFERENT, genuinely-running
-            activation back to 'waiting'. None when the issue isn't in the
-            queue at all (nothing was stamped, so there is nothing to undo).
+            The `activated_at` timestamp on the entry, to be passed back as
+            reset_issue_to_waiting(expected_activated_at=...) if this activation
+            later has to be rolled back — the compare-and-swap that stops a
+            rollback from flipping a DIFFERENT, genuinely-running activation
+            back to 'waiting'. None when the issue isn't in the queue at all
+            (nothing was stamped, so there is nothing to undo).
         """
         with self._queue_lock():
             queue = self.load_queue()
@@ -419,7 +445,15 @@ class PipelineQueueManager:
             activated_at = None
             for issue in queue:
                 if issue['issue_number'] == issue_number:
-                    activated_at = datetime.now(timezone.utc).isoformat()
+                    same_activation = (
+                        preserve_activated_at is not None
+                        and issue.get('status') == 'active'
+                        and issue.get('activated_at') == preserve_activated_at
+                    )
+                    activated_at = (
+                        preserve_activated_at if same_activation
+                        else datetime.now(timezone.utc).isoformat()
+                    )
                     issue['status'] = 'active'
                     issue['activated_at'] = activated_at
                     break

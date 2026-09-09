@@ -878,6 +878,30 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         )
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
 
+    def test_refused_compare_and_swap_is_reported_at_critical(self, caplog):
+        """REGRESSION (#147): the return value was dropped on the floor. A
+        refused compare-and-swap does not raise — it returns False and logs at
+        INFO ("it was re-activated concurrently") — so the one outcome the
+        logger.critical text describes ("excluded from all future dispatch")
+        was the one outcome that never produced it."""
+        (mock_lock_manager, mock_queue, mock_run_manager,
+         workflow_template, project_config) = self._mocks()
+
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0, 'status': 'waiting', 'initial_column': 'Development'}
+        ]
+        mock_run_manager.ensure_pipeline_run_for_task.return_value = None
+        mock_queue.reset_issue_to_waiting.return_value = False
+
+        with caplog.at_level('CRITICAL'):
+            self._run(mock_lock_manager, mock_queue, mock_run_manager,
+                      workflow_template, project_config, Mock())
+
+        assert any(
+            record.levelname == 'CRITICAL' and '200' in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_rollback_releases_the_lock_before_the_compare_and_swap_reset(self):
         """ORDER REGRESSION (#147): the reset must NOT run while the lock is
         still held. try_acquire_lock() returns True/"already_holds_lock" for the

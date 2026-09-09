@@ -1694,10 +1694,25 @@ class PipelineRunManager:
 
                                     if activated_at is not None:
                                         try:
-                                            pipeline_queue.reset_issue_to_waiting(
+                                            reset_ok = pipeline_queue.reset_issue_to_waiting(
                                                 next_issue['issue_number'],
                                                 expected_activated_at=activated_at,
                                             )
+                                            if not reset_ok:
+                                                # A refused compare-and-swap leaves exactly
+                                                # the state the raise path warns about, and
+                                                # only logs INFO on its way out — report it
+                                                # the same way, or the stranded entry is
+                                                # invisible to an operator.
+                                                logger.critical(
+                                                    f"Could NOT reset queue entry for issue "
+                                                    f"#{next_issue['issue_number']} back to 'waiting' "
+                                                    f"after dispatch failed — the compare-and-swap on "
+                                                    f"activated_at was refused, so the entry is still "
+                                                    f"'active' and will be excluded from all future "
+                                                    f"dispatch on {project}/{pipeline_run.board} until "
+                                                    f"the stranded-'active' sweep or a human intervenes"
+                                                )
                                         except Exception as reset_error:
                                             logger.critical(
                                                 f"Could NOT reset queue entry for issue "
@@ -2055,10 +2070,27 @@ class PipelineRunManager:
                     
                     # Get current column for this issue from GitHub Projects v2
                     # We need to query the project board to see what column the issue is in
-                    current_column = self._get_issue_column_from_github(
+                    current_column, column_reads_ok = self._resolve_issue_column_from_github(
                         project_config, pipeline_config, issue_number
                     )
-                    
+
+                    if not column_reads_ok:
+                        # The board could not be read (auth, rate limit, network,
+                        # missing state). Ending the run here would force-end EVERY
+                        # active run for the project — their agents still running —
+                        # off a transient failure, and ProjectMonitor then reads the
+                        # missing run as stale execution state and cleans it up,
+                        # opening the door to re-dispatch on top of live work. Leave
+                        # the run alone; the next sweep re-asks.
+                        logger.error(
+                            f"Could not read the board to resolve the column for issue "
+                            f"#{issue_number} — leaving run {pipeline_run_id} active for "
+                            f"the next cleanup pass rather than ending it on an unanswered "
+                            f"query"
+                        )
+                        kept_active_count += 1
+                        continue
+
                     if not current_column:
                         logger.warning(
                             f"Could not determine column for issue #{issue_number}, "
@@ -2067,7 +2099,7 @@ class PipelineRunManager:
                         self._end_run_in_elasticsearch(run, "Issue not found on board", original_index)
                         ended_count += 1
                         continue
-                    
+
                     # Check if this column has an agent assigned
                     column_config = next(
                         (c for c in workflow_template.columns if c.name == current_column),
@@ -2155,29 +2187,6 @@ class PipelineRunManager:
     # A pipeline run is active if and only if the issue is in a column with an agent
     # and NOT in an exit column. This is simple, deterministic, and testable.
     
-    def _get_issue_column_from_github(self, project_config, pipeline_config, issue_number: int) -> Optional[str]:
-        """
-        Query GitHub Projects v2 to get the current column for an issue
-
-        Thin wrapper over _resolve_issue_column_from_github() that collapses
-        "the board query failed" and "the issue genuinely isn't on the board"
-        back into a single None. Dispatch call sites, which have to tell those
-        two apart to log something an operator can act on, should call
-        _resolve_issue_column_from_github() directly instead.
-
-        Args:
-            project_config: Project configuration
-            pipeline_config: Pipeline configuration
-            issue_number: Issue number to look up
-
-        Returns:
-            Column name if found, None otherwise
-        """
-        column, _reads_ok = self._resolve_issue_column_from_github(
-            project_config, pipeline_config, issue_number
-        )
-        return column
-
     def _resolve_issue_column_from_github(
         self, project_config, pipeline_config, issue_number: int
     ) -> Tuple[Optional[str], bool]:

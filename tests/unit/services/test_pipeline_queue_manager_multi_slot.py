@@ -274,3 +274,55 @@ class TestResetIssueToWaitingCompareAndSwap:
         queue_manager.save_queue([])
 
         assert queue_manager.mark_issue_active(905) is None
+
+    def test_re_marking_within_one_dispatch_preserves_the_callers_token(
+        self, queue_manager
+    ):
+        """REGRESSION (#147): a single dispatch marks the entry active more than
+        once -- the call site marks it, then trigger_agent_for_status() marks it
+        again on every branch that reaches dispatch. The second stamp used to
+        invalidate the caller's rollback token before it could ever be used, so
+        the compare-and-swap refused on EVERY dispatch and the entry stayed
+        'active', excluded from all future selection."""
+        queue_manager.save_queue([{
+            'issue_number': 906,
+            'status': 'waiting',
+            'position_in_column': 0,
+        }])
+
+        token = queue_manager.mark_issue_active(906)
+        re_marked = queue_manager.mark_issue_active(
+            906, preserve_activated_at=token
+        )
+
+        assert re_marked == token
+        assert queue_manager.reset_issue_to_waiting(
+            906, expected_activated_at=token
+        ) is True
+        assert queue_manager.get_issue_status(906) == 'waiting'
+
+    def test_a_genuinely_new_activation_still_stamps_afresh(self, queue_manager):
+        """The token only survives while it IS the current activation. Once the
+        entry has been reset and re-dispatched, a stale rollback must still be
+        refused -- otherwise it would flip a genuinely-running issue back to
+        'waiting'."""
+        queue_manager.save_queue([{
+            'issue_number': 907,
+            'status': 'waiting',
+            'position_in_column': 0,
+        }])
+
+        stale_token = queue_manager.mark_issue_active(907)
+        queue_manager.reset_issue_to_waiting(907, expected_activated_at=stale_token)
+
+        # A new dispatch picks it up and offers the token it holds - which is
+        # not this activation's.
+        fresh_token = queue_manager.mark_issue_active(
+            907, preserve_activated_at=stale_token
+        )
+
+        assert fresh_token != stale_token
+        assert queue_manager.reset_issue_to_waiting(
+            907, expected_activated_at=stale_token
+        ) is False
+        assert queue_manager.get_issue_status(907) == 'active'

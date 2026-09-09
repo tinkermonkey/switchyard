@@ -290,6 +290,20 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         # release-100 is the completed issue's own release, before dispatch.
         self.assertEqual(call_order, ['release-100', 'release-200', 'reset'])
 
+    def test_refused_compare_and_swap_is_reported_at_critical(self):
+        """REGRESSION (#147): the return value was dropped on the floor. A
+        refused compare-and-swap does not raise -- it returns False and logs at
+        INFO ("it was re-activated concurrently") -- so the one outcome the
+        logger.critical text describes ("excluded from all future dispatch")
+        was the one outcome that never produced it."""
+        mock_lock_manager, mock_queue = self._dispatch_rollback_mocks()
+        mock_queue.reset_issue_to_waiting.return_value = False
+
+        with self.assertLogs('services.pipeline_run', level='CRITICAL') as logs:
+            self._end_run_with_failing_dispatch(mock_lock_manager, mock_queue)
+
+        self.assertTrue(any('200' in message for message in logs.output))
+
     def test_rollback_still_releases_lock_when_queue_reset_raises(self):
         """A failing reset loses one issue; a retained lock deadlocks the whole
         board. The release runs first and unconditionally so the second can never

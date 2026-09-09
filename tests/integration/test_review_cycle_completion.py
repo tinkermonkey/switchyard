@@ -595,6 +595,80 @@ class TestReviewCycleCompletionQueueDispatch:
                         )
                         assert call_order == ['release-123', 'release-456', 'reset']
 
+    async def test_refused_compare_and_swap_is_reported_at_critical(
+        self,
+        project_monitor,
+        mock_config_manager,
+        caplog
+    ):
+        """REGRESSION (#147): the return value was dropped on the floor. A
+        refused compare-and-swap does not raise -- it returns False and logs at
+        INFO ("it was re-activated concurrently") -- so the one outcome the
+        logger.critical text describes ("excluded from all future dispatch")
+        was the one outcome that never produced it."""
+        project_config = mock_config_manager.get_project_config("test_project")
+        workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
+        review_column = workflow_template.columns[1]  # "Code Review"
+
+        project_monitor.get_issue_column_sync = Mock(return_value='Development')
+        project_monitor.task_queue.enqueue = Mock(side_effect=RuntimeError("redis down"))
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+            mock_lock_mgr = Mock()
+            mock_lock_mgr.try_acquire_lock.return_value = (True, "lock_acquired")
+            mock_lock_mgr.release_lock.return_value = True
+            mock_get_lock_mgr.return_value = mock_lock_mgr
+
+            with patch('services.review_cycle.review_cycle_executor') as mock_review_executor:
+                async def mock_start_review_cycle(*args, **kwargs):
+                    return "Done", True
+
+                mock_review_executor.start_review_cycle = AsyncMock(side_effect=mock_start_review_cycle)
+
+                with patch('services.github_integration.GitHubIntegration') as mock_github_cls:
+                    mock_github = Mock()
+                    mock_github.post_agent_output = AsyncMock()
+                    mock_github_cls.return_value = mock_github
+
+                    with patch('config.state_manager.state_manager') as mock_state_mgr:
+                        mock_state_mgr.get_discussion_for_issue.return_value = None
+
+                        with patch('services.pipeline_queue_manager.get_pipeline_queue_manager') as mock_get_queue_mgr, \
+                             patch('services.pipeline_run.get_pipeline_run_manager') as mock_get_run_mgr:
+                            mock_queue_mgr = Mock()
+                            mock_queue_mgr.get_next_n_waiting_issues.return_value = [
+                                {'issue_number': 456, 'position_in_column': 0}
+                            ]
+                            mock_queue_mgr.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
+                            # The entry was re-activated concurrently: the reset
+                            # refuses and the entry stays 'active'.
+                            mock_queue_mgr.reset_issue_to_waiting.return_value = False
+                            mock_get_queue_mgr.return_value = mock_queue_mgr
+
+                            mock_run_mgr = Mock()
+                            mock_run_mgr.ensure_pipeline_run_for_task.return_value = 'run-456'
+                            mock_get_run_mgr.return_value = mock_run_mgr
+
+                            with caplog.at_level('CRITICAL'):
+                                project_monitor._start_review_cycle_for_issue(
+                                    project_name="test_project",
+                                    board_name="SDLC Execution",
+                                    issue_number=123,
+                                    status="Done",
+                                    repository="test-repo",
+                                    project_config=project_config,
+                                    pipeline_config=project_config.pipelines[0],
+                                    workflow_template=workflow_template,
+                                    column=review_column
+                                )
+
+                                await asyncio.sleep(0.5)
+
+                        assert any(
+                            record.levelname == 'CRITICAL' and '456' in record.getMessage()
+                            for record in caplog.records
+                        )
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

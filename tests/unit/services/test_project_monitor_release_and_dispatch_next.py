@@ -32,6 +32,10 @@ def mock_config_manager():
 @pytest.fixture
 def project_monitor(mock_config_manager):
     task_queue = Mock()
+    # _trigger_next_issue_with_rollback() consults the pending queue before
+    # undoing anything (a task enqueued but not yet started is work in flight
+    # that has_active_execution() can't see). Default: nothing pending.
+    task_queue.get_pending_tasks.return_value = []
     monitor = ProjectMonitor(task_queue, mock_config_manager)
 
     monitor.get_issue_column_sync = Mock(return_value='Development')
@@ -103,11 +107,15 @@ class TestReleasePipelineLockAndProcessNext:
             project='test-project', board='SDLC Execution', issue_number=200
         )
 
-        # Next issue marked active and agent triggered for it
+        # Next issue marked active and agent triggered for it. The activation
+        # token goes WITH the dispatch: trigger_agent_for_status() re-marks the
+        # entry active internally, and without the token that second stamp
+        # invalidates the caller's rollback CAS before it can ever be used (#147).
         mock_queue.mark_issue_active.assert_called_once_with(200)
         project_monitor.trigger_agent_for_status.assert_called_once_with(
             'test-project', 'SDLC Execution', 200, 'Development', 'test-repo',
-            lock_already_acquired=False, raise_on_error=True
+            lock_already_acquired=False, raise_on_error=True,
+            already_activated_at=mock_queue.mark_issue_active.return_value
         )
 
         # Nothing failed, so nothing is rolled back.

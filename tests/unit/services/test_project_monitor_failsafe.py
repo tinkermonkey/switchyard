@@ -58,6 +58,10 @@ class TestQueueProcessingFailsafe:
     def project_monitor(self, mock_config_manager):
         """Create ProjectMonitor instance with mocked dependencies"""
         task_queue = Mock()
+        # _trigger_next_issue_with_rollback() consults the pending queue before
+        # undoing anything (a task enqueued but not yet started is work in flight
+        # that has_active_execution() can't see). Default: nothing pending.
+        task_queue.get_pending_tasks.return_value = []
         monitor = ProjectMonitor(task_queue, mock_config_manager)
 
         # Mock trigger_agent_for_status to avoid actual agent triggering
@@ -139,7 +143,8 @@ class TestQueueProcessingFailsafe:
             'Development',
             'test-org/test-repo',
             lock_already_acquired=True,
-            raise_on_error=True
+            raise_on_error=True,
+            already_activated_at=mock_queue_manager.mark_issue_active.return_value
         )
 
     def test_failsafe_skips_when_pipeline_locked(
@@ -368,6 +373,7 @@ class TestQueueProcessingFailsafe:
 
         # Create monitor
         task_queue = Mock()
+        task_queue.get_pending_tasks.return_value = []
         monitor = ProjectMonitor(task_queue, mock_config_manager)
         monitor.trigger_agent_for_status = Mock()
         monitor.get_issue_column_sync = Mock(return_value='Development')
