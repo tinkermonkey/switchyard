@@ -863,6 +863,70 @@ class ReviewCycleExecutor:
 
         logger.info("Finished resuming active cycles")
 
+    def _release_run_for_lock_contention(
+        self,
+        cycle_state: 'ReviewCycleState',
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        error: Exception,
+    ) -> None:
+        """
+        Teardown for a project resource-lock timeout out of the review loop (#148).
+
+        Deliberately does none of the three things the failure handlers wrapped
+        around this one do:
+
+          * no mark_failed() — it durably retains the BOARD's pipeline lock (see
+            PipelineRunManager.mark_failed), blocking every sibling issue on that
+            board until an operator runs scripts/release_lock.py, over a lock that
+            was working exactly as designed and clears itself the moment the other
+            holder finishes;
+          * no _remove_cycle_state() — _execute_agent_directly() never got to run
+            an agent, so the accumulated maker/review outputs and the iteration
+            counter are all still valid; discarding them restarts the review from
+            iteration 0 and throws away real work;
+          * no "Review Cycle Error" comment — nothing failed and there is nothing
+            for a human to review.
+
+        The run IS ended (retain_lock=False) so the next board poll re-acquires the
+        lock and resumes this same cycle. Same treatment, and the same retry point,
+        as services/human_feedback_loop.py's initial-dispatch handler and the
+        PR-review / repair-cycle handlers in services/project_monitor.py.
+        """
+        from services.resource_lock_errors import describe_lock_timeout
+
+        logger.warning(
+            f"Review cycle for #{issue_number} could not acquire a project resource "
+            f"lock — releasing the pipeline run for the next poll instead of marking "
+            f"it failed, and keeping the cycle state so the accumulated iterations "
+            f"survive: {describe_lock_timeout(error)}"
+        )
+
+        if not getattr(cycle_state, 'pipeline_run_id', None):
+            return
+
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            get_pipeline_run_manager().end_pipeline_run(
+                project=project_name,
+                board=board_name,
+                issue_number=issue_number,
+                reason=f"Review cycle blocked by a project resource-lock timeout: "
+                       f"{describe_lock_timeout(error)}",
+                retain_lock=False,
+                # Without this the release below is a no-op for recovery: the
+                # cancellation signal makes the issue invisible to BOTH failsafe
+                # scenarios for an hour, and Scenario 2 additionally purges this
+                # issue's queue row on the way past (#148 C1).
+                suppress_cancellation=True,
+            )
+        except Exception as release_err:
+            logger.error(
+                f"Failed to release pipeline run for {project_name}/#{issue_number} "
+                f"after review-cycle lock contention: {release_err}"
+            )
+
     async def start_review_cycle(
         self,
         issue_number: int,
@@ -1099,6 +1163,24 @@ class ReviewCycleExecutor:
                         return next_column, True
 
                     except Exception as e:
+                        # Project resource-lock timeout (#148): contention, not a review
+                        # cycle failure. _execute_agent_directly() -> AgentExecutor.
+                        # execute_agent() now re-raises these with their type intact, so
+                        # the maker/reviewer dispatch never ran. Everything below —
+                        # mark_failed(), _remove_cycle_state(), the error comment — is
+                        # the wrong response to that; see
+                        # _release_run_for_lock_contention() for why each one is.
+                        from services.resource_lock_errors import is_lock_timeout_error
+                        if is_lock_timeout_error(e):
+                            self._release_run_for_lock_contention(
+                                cycle_state=cycle_state,
+                                project_name=project_name,
+                                board_name=board_name,
+                                issue_number=issue_number,
+                                error=e,
+                            )
+                            raise
+
                         logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
 
                         # EMIT ERROR EVENT for UI visibility
@@ -1328,6 +1410,21 @@ class ReviewCycleExecutor:
                 if key in self.active_cycles:
                     self._remove_cycle_state(self.active_cycles[key])
                     del self.active_cycles[key]
+                raise
+
+            # Project resource-lock timeout (#148): contention, not a failure of this
+            # cycle — the same treatment the reuse-existing-cycle handler above gives
+            # it. Reached on the fresh-start path too, because _execute_review_loop()'s
+            # very first _execute_agent_directly() is what waits on the lock.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(e):
+                self._release_run_for_lock_contention(
+                    cycle_state=cycle_state,
+                    project_name=project_name,
+                    board_name=board_name,
+                    issue_number=issue_number,
+                    error=e,
+                )
                 raise
 
             logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
@@ -2776,10 +2873,22 @@ class ReviewCycleExecutor:
                         custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
                     )
 
-                    if commit_success:
+                    from services.auto_commit import CommitResult
+                    if commit_success is CommitResult.COMMITTED:
                         logger.info(f"Auto-committed changes for iteration {iteration}")
+                    elif commit_success is CommitResult.NOTHING_TO_COMMIT:
+                        logger.info(f"No changes to commit for iteration {iteration}")
                     else:
-                        logger.warning(f"No changes to commit for iteration {iteration}")
+                        # Previously also logged as "No changes to commit" -- the exact
+                        # conflation #148 I1 removed. A FAILED commit here means the
+                        # maker's revision is uncommitted; the cycle deliberately still
+                        # continues (the reviewer reads the maker's GitHub comment, not
+                        # the branch), but it must not be reported as an empty diff.
+                        logger.error(
+                            f"Auto-commit FAILED for iteration {iteration} -- the maker's "
+                            f"changes are still uncommitted (cause logged above by "
+                            f"commit_agent_changes())"
+                        )
 
             # Get maker's revised output from GitHub (workspace-aware)
             maker_comment = await self._get_latest_agent_comment(

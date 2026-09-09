@@ -538,6 +538,47 @@ class HumanFeedbackLoopExecutor:
 
         except Exception as e:
             logger.error(f"Conversational loop failed for issue #{issue_number}: {e}")
+
+            # Project resource-lock timeout: contention, not a failure of this loop
+            # (#148). The initial _execute_agent() never ran -- another holder owned
+            # the project's checkout for the whole of that lock's timeout -- so
+            # mark_failed()'s durable lock retention would permanently block this
+            # (planning) board, and every sibling issue on it, until an operator runs
+            # scripts/release_lock.py. Release instead, which is the same treatment
+            # project_monitor._end_pr_review_pipeline_run_on_failure() gives the PR
+            # review path: the next board poll is the retry point.
+            #
+            # _conversational_loop()'s finally block makes the same call when the
+            # timeout happened mid-loop; both are needed because either can be the
+            # only one that runs, and the second is a harmless no-op (end_pipeline_
+            # run() returns False when there is no active run left to end).
+            from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+            if is_lock_timeout_error(e):
+                logger.warning(
+                    f"Conversational feedback loop for #{issue_number} could not acquire a "
+                    f"project resource lock -- releasing the pipeline run for the next poll "
+                    f"instead of marking it failed: {describe_lock_timeout(e)}"
+                )
+                try:
+                    from services.pipeline_run import get_pipeline_run_manager
+                    get_pipeline_run_manager().end_pipeline_run(
+                        project=project_name,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason=f"Conversational feedback loop blocked by a project "
+                               f"resource-lock timeout: {e}",
+                        retain_lock=False,
+                        # The release is only a retry point if the issue stays
+                        # visible to the next poll — see #148 C1.
+                        suppress_cancellation=True,
+                    )
+                except Exception as release_err:
+                    logger.error(
+                        f"Failed to release pipeline run for {project_name}#{issue_number} "
+                        f"after feedback-loop lock contention: {release_err}"
+                    )
+                raise
+
             # Route through the shared mark_failed() entry point -- the same one
             # _conversational_loop()'s own finally block below already uses for a
             # failure mid-loop. Without this, a failure here (the INITIAL
@@ -941,6 +982,17 @@ class HumanFeedbackLoopExecutor:
 
                 except Exception as e:
                     logger.warning(f"Could not check current column for issue #{state.issue_number}: {e}")
+        except BaseException as loop_exc:
+            # Sole purpose: let the finally block below tell a project resource-lock
+            # timeout (#148) apart from a genuine failure. That block has no other
+            # access to the exception (this try deliberately has no other except
+            # clause -- see its own comment), and it would otherwise route pure
+            # contention through mark_failed(), durably retaining this board's lock
+            # until a human runs scripts/release_lock.py. Re-raised unchanged.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(loop_exc):
+                _exit_reason = "lock_contention"
+            raise
         finally:
             self._stop_events.pop(stop_key, None)
             self._stop_reasons.pop(stop_key, None)
@@ -959,7 +1011,28 @@ class HumanFeedbackLoopExecutor:
                 try:
                     from services.pipeline_run import get_pipeline_run_manager
                     pipeline_run_manager = get_pipeline_run_manager()
-                    if _outcome == "failed":
+                    if _exit_reason == "lock_contention":
+                        # Contention, not a failure: the agent never ran, so release
+                        # the run (retain_lock=False) and let the next board poll be
+                        # the retry point. mark_failed() here would block this whole
+                        # board over a lock working exactly as designed (#148).
+                        logger.warning(
+                            f"Feedback loop for #{state.issue_number} exited on a project "
+                            f"resource-lock timeout — releasing the pipeline run for the "
+                            f"next poll instead of marking it failed."
+                        )
+                        pipeline_run_manager.end_pipeline_run(
+                            project=state.project_name,
+                            board=state.board_name,
+                            issue_number=state.issue_number,
+                            reason="Conversational feedback loop blocked by a project "
+                                   "resource-lock timeout",
+                            retain_lock=False,
+                            # The release is only a retry point if the issue stays
+                            # visible to the next poll — see #148 C1.
+                            suppress_cancellation=True,
+                        )
+                    elif _outcome == "failed":
                         # Route genuine failures through the shared mark_failed()
                         # entry point rather than a bare end_pipeline_run(outcome=
                         # "failed") — previously unmigrated. Before this PR, an

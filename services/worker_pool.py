@@ -126,6 +126,32 @@ class TaskWorker:
                                     self.tasks_failed += 1
                                     break
 
+                                # Resource-lock timeout: contention, not an agent failure —
+                                # don't retry. project_checkout_lock/dev_container_build_lock
+                                # already polled for the whole of their (deliberately
+                                # generous: ~3h / ~1h) timeout before raising, so every retry
+                                # here just re-runs that same wait — one contention event
+                                # becomes ~12h at max_retries=3 with a worker slot pinned
+                                # throughout — while the only thing that can change the
+                                # outcome is a different holder finishing. This loop is a peer
+                                # of agent_executor.py's inner retry loop and has to carry the
+                                # same exemption (see agents/non_retryable.py's docstring,
+                                # which names both); the natural retry point is the next
+                                # board poll/dispatch (#148).
+                                from services.resource_lock_errors import (
+                                    is_lock_timeout_error, describe_lock_timeout
+                                )
+                                if is_lock_timeout_error(e):
+                                    duration = time.time() - start_time
+                                    logger.warning(
+                                        f"[Worker {self.worker_id}] Task {task.id} could not acquire "
+                                        f"a project resource lock — not retrying (contention, not an "
+                                        f"agent failure): {describe_lock_timeout(e)}"
+                                    )
+                                    self.metrics.record_task_complete(task.agent, duration, success=False)
+                                    self.tasks_failed += 1
+                                    break
+
                                 # Check if we should retry
                                 if attempt <= max_retries:
                                     logger.warning(

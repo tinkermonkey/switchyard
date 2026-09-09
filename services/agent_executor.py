@@ -846,6 +846,31 @@ class AgentExecutor:
                         logger.warning(f"Agent {agent_name} hit non-retryable error: {e}")
                         raise
 
+                    # Resource-lock timeout: contention, not an agent failure — never retry.
+                    # project_checkout_lock/dev_container_build_lock already polled for the
+                    # whole of their (deliberately generous: ~3h / ~1h) timeout before
+                    # raising, so retrying here just re-runs that same wait — turning one
+                    # contention event into ~9h at the default retries=2 — while the only
+                    # thing that can actually change the outcome is a different holder
+                    # finishing. The natural retry point is the next board poll/dispatch,
+                    # exactly as project_checkout_lock.py's "Blocking vs failing" section
+                    # describes — and the outer handler below records this as
+                    # 'lock_contention' rather than 'failure' precisely so that poll keeps
+                    # happening instead of tripping MAX_CONSECUTIVE_DISPATCH_FAILURES.
+                    # This is not the only retry loop on the dispatch path:
+                    # services/worker_pool.py's carries the identical exemption, and so do
+                    # pipeline/repair_cycle.py's handlers. services/circuit_breaker.py
+                    # separately exempts these from this agent+project breaker's failure
+                    # count (#148).
+                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    if is_lock_timeout_error(e):
+                        logger.warning(
+                            f"Agent {agent_name} could not acquire a project resource lock — "
+                            f"not retrying (contention, not an agent failure): "
+                            f"{describe_lock_timeout(e)}"
+                        )
+                        raise
+
                     # ClaudeCodeRateLimitError: systemic token limit — trip breaker if not open, never retry
                     if isinstance(e, ClaudeCodeRateLimitError):
                         claude_breaker = get_claude_code_breaker()
@@ -1111,7 +1136,7 @@ class AgentExecutor:
                     if execution.get('outcome') == 'in_progress':
                         # Found our current execution — it hasn't been recorded yet
                         break
-                    if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen']:
+                    if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen', 'lock_contention']:
                         # Terminal outcome already recorded for this execution
                         already_recorded = True
                         logger.debug(
@@ -1171,7 +1196,60 @@ class AgentExecutor:
                 "Claude Code circuit breaker is OPEN" in error_message
             )
 
-            if is_claude_breaker_failure:
+            # Resource-lock timeout: the guarded execution never ran, so this is not
+            # an agent failure and must not be recorded as one (#148). Recording
+            # 'failure' here would feed work_execution_tracker.count_consecutive_
+            # failures(), and project_monitor.py's MAX_CONSECUTIVE_DISPATCH_FAILURES
+            # check turns three of those into mark_failed() — which durably retains
+            # the BOARD's pipeline lock, blocking every sibling issue until a human
+            # runs scripts/release_lock.py. That is a strictly wider blast radius
+            # than the per-agent circuit breaker this exception is already exempt
+            # from (services/circuit_breaker.py), reached by pure contention. The
+            # dedicated 'lock_contention' outcome is the exact analogue of the
+            # 'frozen' outcome the ClaudeCodeRateLimitError branch below records for
+            # the same reason: not counted as a failure, still re-dispatchable by the
+            # next board poll (services/work_execution_state.py's should_execute_work).
+            from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+            is_lock_contention = is_lock_timeout_error(e)
+
+            if is_lock_contention:
+                logger.warning(
+                    f"Agent {agent_name} could not acquire a project resource lock after "
+                    f"{duration_ms:.0f}ms — recording as contention, not an agent failure. "
+                    f"The next board poll re-dispatches: {describe_lock_timeout(e)}"
+                )
+
+                # No emit_agent_completed(success=False): that writes an AGENT_FAILED
+                # event and degrades this agent's measured success rate for something
+                # it never got to attempt. Mirrors the frozen branch below.
+                if 'issue_number' in task_context:
+                    from services.work_execution_state import work_execution_tracker
+                    column = task_context.get('column', 'unknown')
+
+                    work_execution_tracker.record_execution_outcome(
+                        issue_number=task_context['issue_number'],
+                        column=column,
+                        agent=agent_name,
+                        outcome='lock_contention',
+                        project_name=project_name,
+                        error=error_message
+                    )
+                else:
+                    logger.warning(
+                        f"Cannot record lock_contention outcome for {agent_name}: "
+                        f"missing issue_number in task_context"
+                    )
+
+                # Deliberately NOT resetting dev container state for
+                # dev_environment_setup here (the branch below does that for real
+                # failures): a DevContainerBuildLockTimeoutError means the build slot
+                # was never acquired, so nothing was built and nothing is broken.
+                # Flipping the project to UNVERIFIED would block every agent with
+                # requires_dev_container on that project. Leaving it IN_PROGRESS is
+                # correct and is already covered by validate_task_can_run()'s
+                # STALE_IN_PROGRESS_MINUTES fallback.
+
+            elif is_claude_breaker_failure:
                 # This is a systemic issue (token limits), not an agent failure
                 # Don't emit agent_failed - emit a paused/frozen event instead
                 logger.warning(
@@ -1243,7 +1321,7 @@ class AgentExecutor:
                             continue
                         if execution.get('outcome') == 'in_progress':
                             break
-                        if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen']:
+                        if execution.get('outcome') in ['success', 'failure', 'cancelled', 'frozen', 'lock_contention']:
                             already_recorded = True
                             logger.debug(
                                 f"Execution outcome already recorded by docker_runner for "

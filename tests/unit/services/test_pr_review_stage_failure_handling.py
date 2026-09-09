@@ -72,6 +72,91 @@ class TestEndPrReviewPipelineRunOnFailure:
             issue_number=123,
             reason="PR review stage exception: ValueError",
             retain_lock=False,
+            # Not contention -- an ordinary retryable failure keeps setting the
+            # cancellation signal exactly as it always did (#148 C1 scoped the
+            # suppression to contention only).
+            suppress_cancellation=False,
         )
         # No retention was attempted — nothing to report on.
         assert result is None
+
+
+class TestLockTimeoutReleasesRatherThanRetaining:
+    """
+    #148: a project resource-lock timeout is contention, not a review failure —
+    the stage abandons the review on the first one (pr_review_stage.py's phase
+    handlers) precisely so it lands here, and this function must release so the
+    next board poll retries. A lock timeout arriving wrapped in something
+    non-retryable must still release, which is why the check is explicit rather
+    than left to the isinstance() fall-through.
+    """
+
+    def test_lock_timeout_releases(self):
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        mock_manager = MagicMock()
+
+        result = _end_pr_review_pipeline_run_on_failure(
+            mock_manager, "proj", "board", 123,
+            ProjectCheckoutLockTimeoutError("could not acquire lock within 10900.0s"),
+        )
+
+        mock_manager.mark_failed.assert_not_called()
+        assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        # #148 C1: the release exists so the next poll retries; the cancellation
+        # signal would hide the issue from every path that could do that.
+        assert mock_manager.end_pipeline_run.call_args.kwargs["suppress_cancellation"] is True
+        assert result is None
+
+    def test_non_retryable_wrapping_a_lock_timeout_still_releases(self):
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        inner = ProjectCheckoutLockTimeoutError("busy")
+        wrapper = NonRetryableAgentError("All review phases failed for #123")
+        wrapper.__cause__ = inner
+
+        mock_manager = MagicMock()
+
+        result = _end_pr_review_pipeline_run_on_failure(
+            mock_manager, "proj", "board", 123, wrapper,
+        )
+
+        mock_manager.mark_failed.assert_not_called()
+        assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        assert mock_manager.end_pipeline_run.call_args.kwargs["suppress_cancellation"] is True
+        assert result is None
+
+
+class TestPrReviewFailureReport:
+    """
+    #148: the run releases the lock for contention, but the two operator-facing
+    reports the same handler produces — the 'pr_review_stage' execution-history
+    record and the "PR Review Failed" issue comment — were still failure-shaped,
+    so pure contention left a bogus 'failed' entry in the history and pasted the
+    raw lock-timeout text onto the issue.
+    """
+
+    def test_lock_timeout_is_reported_as_contention_without_a_comment(self):
+        from services.project_monitor import _pr_review_failure_report
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        outcome, post_comment = _pr_review_failure_report(
+            ProjectCheckoutLockTimeoutError("could not acquire lock within 10900.0s")
+        )
+
+        assert outcome == 'lock_contention'
+        assert post_comment is False
+
+    def test_wrapped_lock_timeout_is_recognised(self):
+        from services.project_monitor import _pr_review_failure_report
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        wrapper = NonRetryableAgentError("All review phases failed for #123")
+        wrapper.__cause__ = ProjectCheckoutLockTimeoutError("busy")
+
+        assert _pr_review_failure_report(wrapper) == ('lock_contention', False)
+
+    def test_ordinary_failure_is_still_reported_as_failed_with_a_comment(self):
+        from services.project_monitor import _pr_review_failure_report
+
+        assert _pr_review_failure_report(ValueError("boom")) == ('failed', True)

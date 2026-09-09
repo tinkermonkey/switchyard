@@ -520,44 +520,48 @@ async def main():
     # Verify Docker images for all projects marked as verified
     # This handles cases where Docker context changed or images were lost
     logger.info("Verifying Docker images for verified projects")
-    for project_name in projects_needing_setup.keys():
-        image_verified = dev_container_state.verify_and_update_status(project_name)
-        if not image_verified:
-            # Image was marked verified but doesn't exist - mark for setup
-            logger.info(f"Project {project_name} needs dev environment setup (Docker image missing)")
-            projects_needing_setup[project_name] = True
+    from services.project_workspace import resolve_setup_queue
+
+    # Both rules — a verifiably missing Docker image upgrades UNKNOWN to NEEDED,
+    # and NEEDED is tested by member rather than truthiness — live in
+    # resolve_setup_queue() so they are covered by tests rather than by this
+    # untestable startup loop. verify_and_update_status() is passed in because it
+    # also updates dev-container state; resolve_setup_queue() calls it once per
+    # project. See its docstring for what a truthiness test would cost here.
+    projects_to_set_up = resolve_setup_queue(
+        projects_needing_setup, dev_container_state.verify_and_update_status
+    )
 
     # Queue dev_environment_setup tasks for projects that need it
     from task_queue.task_manager import Task, TaskPriority
 
-    for project_name, needs_setup in projects_needing_setup.items():
-        if needs_setup:
-            logger.info(f"Queuing dev_environment_setup task for {project_name}")
+    for project_name in projects_to_set_up:
+        logger.info(f"Queuing dev_environment_setup task for {project_name}")
 
-            task = Task(
-                id=str(uuid.uuid4()),
-                agent="dev_environment_setup",
-                project=project_name,
-                priority=TaskPriority.HIGH,  # High priority for initial setup
-                context={
-                    'issue': {
-                        'title': f'Development environment setup for {project_name}',
-                        'body': 'Automated setup of development environment, Dockerfile.agent generation, and validation',
-                        'number': 0  # No GitHub issue for automated setup
-                    },
-                    'issue_number': 0,
-                    'board': 'system',  # System-initiated task
-                    'project': project_name,
-                    'repository': project_name,
-                    'automated_setup': True,  # Flag to indicate this is automated setup
-                    'skip_workspace_prep': True,  # System task — no feature branch needed
-                    'use_docker': False  # Run locally in orchestrator environment to access Docker for building project images
+        task = Task(
+            id=str(uuid.uuid4()),
+            agent="dev_environment_setup",
+            project=project_name,
+            priority=TaskPriority.HIGH,  # High priority for initial setup
+            context={
+                'issue': {
+                    'title': f'Development environment setup for {project_name}',
+                    'body': 'Automated setup of development environment, Dockerfile.agent generation, and validation',
+                    'number': 0  # No GitHub issue for automated setup
                 },
-                created_at=utc_isoformat()
-            )
+                'issue_number': 0,
+                'board': 'system',  # System-initiated task
+                'project': project_name,
+                'repository': project_name,
+                'automated_setup': True,  # Flag to indicate this is automated setup
+                'skip_workspace_prep': True,  # System task — no feature branch needed
+                'use_docker': False  # Run locally in orchestrator environment to access Docker for building project images
+            },
+            created_at=utc_isoformat()
+        )
 
-            task_queue.enqueue(task)
-            logger.info(f"Queued dev_environment_setup task: {task.id}")
+        task_queue.enqueue(task)
+        logger.info(f"Queued dev_environment_setup task: {task.id}")
 
     # Reconcile all visible (non-hidden) projects on startup
     # Hidden projects (like test-project) are excluded from normal operations

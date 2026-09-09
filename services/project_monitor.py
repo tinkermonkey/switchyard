@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 # already happened.
 MAX_CONSECUTIVE_DISPATCH_FAILURES = 3
 
+# Consecutive 'lock_contention' dispatches (#148) for the same issue/column/agent
+# before the contention itself is escalated to an operator. Deliberately NOT a
+# mark_failed() budget like MAX_CONSECUTIVE_DISPATCH_FAILURES above — retaining the
+# board's lock is the exact outcome the contention exemption exists to prevent, and
+# the condition genuinely does resolve itself the moment the other holder finishes.
+# What it buys is visibility: at ~3h per project_checkout timeout, three rounds is
+# most of a day of a worker slot waiting on a lock nobody is releasing (an
+# orchestrator-side coroutine wedged mid-hold keeps refreshing the lock's TTL from
+# its heartbeat thread for the life of the process), which is well past the point a
+# human should have been told.
+MAX_CONSECUTIVE_LOCK_CONTENTIONS = 3
+
 # How long a pending (enqueued, not yet picked up) task may suppress a dispatch
 # rollback for its issue. Past this, the task is treated as orphaned rather than
 # imminent. Sized well above the queue's normal pickup latency but far below
@@ -465,6 +477,179 @@ def _register_repair_cycle_container(
         return False
 
 
+# pipeline/repair_cycle_runner.py's dedicated exit codes for the two outcomes that
+# are NOT repair-cycle failures (see its run() docstring). Named here rather than
+# written as bare integers at the comparison sites so the runner->monitor contract
+# is greppable from both ends: a new code inserted on one side without the other
+# silently demotes contention to a generic exit-2 failure, which retains this
+# board's lock. tests/unit/test_repair_cycle_outcome_contract.py pins the pair.
+REPAIR_CYCLE_EXIT_FROZEN = 5
+REPAIR_CYCLE_EXIT_LOCK_CONTENTION = 6
+
+
+def classify_repair_cycle_outcome(
+    exit_code: Optional[int],
+    repair_result: Optional[Dict[str, Any]],
+    overall_success: bool,
+) -> str:
+    """
+    The single authority on what a finished repair-cycle container's result means:
+    'success', 'frozen', 'lock_contention' or 'failure'.
+
+    Both non-failure outcomes are signalled twice — a dedicated exit code from
+    pipeline/repair_cycle_runner.py, and a flag in the result dict it persists to
+    Redis before exiting — because either can be the only one that survives
+    (a container killed after writing its result has no usable exit code; a result
+    that never reached Redis leaves only the exit code). Checked before success so
+    a partially-successful result can't mask the pause/contention that ended the run.
+
+    Extracted as a module-level function, and shared with
+    services/agent_container_recovery.py's restart-recovery consumer of the same
+    result dict (which passes exit_code=None — the container is long gone by then),
+    for the same two reasons _end_pr_review_pipeline_run_on_failure() above was:
+    the live consumer is a closure inside a background-thread monitor that is
+    impractical to drive from a test, and a second hand-written copy of this
+    classification is exactly how the restart-recovery path came to honour 'frozen'
+    but not 'lock_contention' (#148).
+    """
+    if (exit_code == REPAIR_CYCLE_EXIT_FROZEN) or bool(repair_result and repair_result.get('frozen')):
+        return 'frozen'
+    if (exit_code == REPAIR_CYCLE_EXIT_LOCK_CONTENTION) or bool(
+        repair_result and repair_result.get('lock_contention')
+    ):
+        return 'lock_contention'
+    return 'success' if overall_success else 'failure'
+
+
+def classify_review_cycle_thread_exception(exception: BaseException) -> str:
+    """
+    What an exception out of the review-cycle thread body means: 'cancelled',
+    'lock_contention' or 'crash'.
+
+    Only 'crash' may reach the mark_failed() teardown, which durably retains the
+    BOARD's pipeline lock pending scripts/release_lock.py. A CancellationError is a
+    deliberate stop, and a project resource-lock timeout (#148) is contention —
+    ReviewCycleExecutor._release_run_for_lock_contention() has already ended that
+    run with retain_lock=False and kept the cycle state; the exception only
+    propagates this far because that is how it reaches the thread boundary.
+
+    Extracted to module level with review_cycle_thread_teardown() below for the
+    same reason _end_pr_review_pipeline_run_on_failure() and
+    classify_repair_cycle_outcome() were: the live code is a closure inside a
+    daemon thread that is impractical to drive from a test, and these two
+    decisions are exactly the ones whose silent misclassification strands an issue.
+    """
+    from services.cancellation import CancellationError
+    from services.resource_lock_errors import is_lock_timeout_error
+
+    if isinstance(exception, CancellationError):
+        return 'cancelled'
+    if is_lock_timeout_error(exception):
+        return 'lock_contention'
+    return 'crash'
+
+
+def review_cycle_thread_teardown(
+    is_exit_column: bool,
+    exception_occurred: bool,
+    lock_contention_occurred: bool,
+) -> str:
+    """
+    Which teardown the review-cycle thread owes on its way out: 'exit' (release
+    the lock and dispatch the next queued issue), 'crash' (mark_failed + reset the
+    queue entry + failure comment), 'contention' (reset the queue entry ONLY), or
+    'keep' (an intermediate column mid-pipeline — hold the lock for the next stage).
+
+    'contention' is not a lighter 'crash': mark_failed() would durably retain this
+    board's lock over a lock working exactly as designed, and there is nothing for
+    a human to review. But it is not 'keep' either — the executor already released
+    the run, and the queue entry is still 'active'. reset_issue_to_waiting() is the
+    one thing still owed, because nothing else moves an 'active' entry back to
+    'waiting' and get_next_waiting_issue() filters strictly on 'waiting'. Drop it
+    and the issue is silently excluded from every future dispatch on this board,
+    with no failure recorded and no comment posted — the exact quiet failure #148
+    was written against, and the reason this decision is tested rather than inlined.
+    """
+    if is_exit_column:
+        return 'exit'
+    if exception_occurred:
+        return 'crash'
+    if lock_contention_occurred:
+        return 'contention'
+    return 'keep'
+
+
+def classify_contention_dispatch(
+    tracker,
+    project_name: str,
+    issue_number: int,
+    column: str,
+    agent: str,
+) -> Tuple[int, bool]:
+    """
+    How many consecutive project resource-lock contentions this issue's
+    column+agent has lost in a row, and whether that run has reached the point
+    where an operator has to be told (#148).
+
+    Deliberately uses count_consecutive_lock_contentions(), NOT the adjacent,
+    near-identical count_consecutive_failures() on the same tracker: the latter
+    SKIPS 'lock_contention' entries by design (so an interleaved contention can't
+    erase the real failure history MAX_CONSECUTIVE_DISPATCH_FAILURES depends on),
+    and therefore returns 0 for a pure-contention history — silently disabling the
+    escalation forever. Extracted to module level, and asserted on directly by
+    tests, precisely because the two are one identifier apart and the swap is
+    invisible at runtime.
+
+    Never raises: this runs on the dispatch path of an issue that is about to be
+    dispatched either way, so a tracker/state-read failure must degrade to "no
+    escalation" rather than becoming the exception that stops the dispatch.
+
+    Returns:
+        (consecutive_lock_contentions, should_escalate)
+    """
+    try:
+        count = tracker.count_consecutive_lock_contentions(
+            project_name=project_name,
+            issue_number=issue_number,
+            column=column,
+            agent=agent,
+        )
+    except Exception as count_err:
+        logger.warning(
+            f"Could not count consecutive lock contentions for {project_name}/"
+            f"#{issue_number} in '{column}': {count_err}"
+        )
+        return 0, False
+
+    return count, count >= MAX_CONSECUTIVE_LOCK_CONTENTIONS
+
+
+def _pr_review_failure_report(exception: Exception) -> Tuple[str, bool]:
+    """
+    How a PRReviewStage exception should be reported: the outcome to record for
+    the synthetic 'pr_review_stage' wrapper agent, and whether to post the
+    "PR Review Failed" comment on the issue.
+
+    A project resource-lock timeout (#148) is contention, not a review failure —
+    pr_review_stage.py's phase handlers abandon the review on the first one so it
+    propagates here with its type intact, and nothing was ever attempted. Reporting
+    it as 'failed' puts a bogus failure in the execution history and pastes the raw
+    lock-timeout text onto the issue as operator-facing noise. Same suppression the
+    repair-cycle handler applies for its own contention signal, and the same reason
+    agent_executor.py gives for not emitting agent_completed(success=False) here.
+
+    Extracted as a module-level function for the same reason
+    _end_pr_review_pipeline_run_on_failure() above was — see its docstring.
+
+    Returns:
+        (outcome, post_failure_comment)
+    """
+    from services.resource_lock_errors import is_lock_timeout_error
+    if is_lock_timeout_error(exception):
+        return 'lock_contention', False
+    return 'failed', True
+
+
 def _end_pr_review_pipeline_run_on_failure(
     pipeline_run_manager,
     project_name: str,
@@ -499,8 +684,16 @@ def _end_pr_review_pipeline_run_on_failure(
         None — when the release branch was taken instead; retention wasn't
             attempted, so there's nothing to report on.
     """
+    # A project resource-lock timeout is contention, not a review failure: the
+    # stage abandons the review on the first one (see pr_review_stage.py's phase
+    # handlers) precisely so this lands on the release branch and the next board
+    # poll retries. Checked explicitly rather than left to fall through the
+    # isinstance() below, because it must keep releasing even if a lock timeout
+    # ever arrives wrapped in something non-retryable (#148).
+    from services.resource_lock_errors import is_lock_timeout_error
     from agents.non_retryable import NonRetryableAgentError
-    if isinstance(exception, NonRetryableAgentError):
+    _is_contention = is_lock_timeout_error(exception)
+    if isinstance(exception, NonRetryableAgentError) and not _is_contention:
         marked_ok = pipeline_run_manager.mark_failed(
             project=project_name,
             board=board_name,
@@ -520,7 +713,13 @@ def _end_pr_review_pipeline_run_on_failure(
             board=board_name,
             issue_number=issue_number,
             reason=f"PR review stage exception: {type(exception).__name__}",
-            retain_lock=False
+            retain_lock=False,
+            # Contention only: the release above exists so the NEXT poll retries
+            # this same issue, and the cancellation signal would hide it from
+            # every path that could do that for an hour (#148 C1). Ordinary
+            # (non-contention) failures keep setting the signal exactly as before
+            # — nothing about their teardown changed here.
+            suppress_cancellation=_is_contention,
         )
         return None
 
@@ -2543,6 +2742,31 @@ class ProjectMonitor:
                     )
                     return None
 
+            # Universal sustained-contention valve — deliberately here, alongside the
+            # retained-lock gate above and for the same reason: it has to cover EVERY
+            # column type and every dispatch path. The check used to live inside the
+            # is_trigger_column block below, in the arm reached only when the issue
+            # ALREADY HOLDS the board's pipeline lock, which made it unreachable for
+            # exactly the paths #148 added: every one of them ends the run with
+            # retain_lock=False, so on the next poll the issue no longer holds the lock
+            # and control goes down the try_acquire_lock arm instead. Review columns
+            # (the maker-checker executor, the widest contention path of all),
+            # conversational columns and PR review are not trigger columns at all and
+            # never entered that block. The counter climbed and nothing ever fired.
+            #
+            # Escalation is pure visibility — no lock retained, no run marked failed —
+            # so running it before the queue-order and lock-acquisition gates below is
+            # safe: it reports on the issue's own recorded history, not on whether this
+            # particular poll is the one that gets to dispatch.
+            if agent and agent != 'null':
+                self._check_sustained_lock_contention(
+                    project_name=project_name,
+                    board_name=board_name,
+                    repository=repository,
+                    issue_number=issue_number,
+                    status=status,
+                )
+
             # NEW: Pipeline lock and queue management
             # Check if this column triggers pipeline execution (requires exclusive lock)
             is_trigger_column = False
@@ -2763,8 +2987,30 @@ class ProjectMonitor:
                                     f"Issue #{issue_number} retrying after {consecutive_failures} "
                                     f"prior failure(s) for {current_column_agent} in '{status}'"
                                 )
+                        elif last_execution and last_execution.get('outcome') == 'lock_contention':
+                            # Never ran — a project resource lock was held for the whole of
+                            # its timeout (#148). This poll IS the retry, and it deliberately
+                            # does not accumulate toward MAX_CONSECUTIVE_DISPATCH_FAILURES
+                            # above: mark_failed() would durably retain this board's lock over
+                            # a lock working exactly as designed. But re-dispatching forever
+                            # with nothing but a log line is its own silent failure, so a
+                            # sustained run of contention is escalated for visibility — the
+                            # dispatch still proceeds, because it is still the only thing that
+                            # can resolve on its own. The counting/escalation itself is NOT
+                            # done here — _check_sustained_lock_contention() at the top of
+                            # this method already ran it for every column and every dispatch
+                            # path, including the ones that no longer hold the lock by the
+                            # time they get here.
+                            logger.info(
+                                f"Issue #{issue_number} re-dispatching after a project "
+                                f"resource-lock contention for {current_column_agent} "
+                                f"in '{status}'"
+                            )
+                            pipeline_queue.mark_issue_active(
+                                issue_number, preserve_activated_at=already_activated_at
+                            )
                         else:
-                            # Issue is queued but never executed - should execute current stage
+                            # Issue is queued but never executed - should execute current stage.
                             logger.info(
                                 f"Issue #{issue_number} holds pipeline lock but no active execution "
                                 f"and no completed execution for {current_column_agent}. "
@@ -4117,6 +4363,188 @@ class ProjectMonitor:
                     f"Failed to post failure comment for issue #{issue_number} after "
                     f"retry: {comment_err}"
                 )
+
+    def _check_sustained_lock_contention(
+        self,
+        project_name: str,
+        board_name: str,
+        repository: str,
+        issue_number: int,
+        status: str,
+    ) -> None:
+        """
+        The wiring behind MAX_CONSECUTIVE_LOCK_CONTENTIONS: if this issue's last
+        recorded execution in this column was a project resource-lock timeout,
+        count the run of them and escalate once it is long enough (#148).
+
+        Called from trigger_agent_for_status() before any column-type branching, so
+        every dispatch path is covered — review columns, conversational columns and
+        PR review are not pipeline trigger columns, and every teardown path #148
+        added releases the board lock, which between them excluded this check
+        entirely when it lived down inside the trigger-column/already-holds-lock arm.
+
+        Deliberately looks up the last execution by COLUMN, not by the column's
+        configured agent: the agent that records the outcome is frequently not that
+        one — a review column's maker dispatch records under the maker's own name,
+        PR review under the synthetic 'pr_review_stage' wrapper — so an agent-keyed
+        lookup would see nothing on exactly the paths this is for. The count is then
+        taken agent-scoped, against whichever agent actually recorded that entry.
+
+        Escalation is visibility only: it never retains a lock and never marks a run
+        failed, and this method never raises, so the dispatch it precedes is
+        unaffected either way.
+        """
+        try:
+            from services.work_execution_state import work_execution_tracker
+
+            last_execution = work_execution_tracker.get_last_execution_for_column(
+                project_name=project_name,
+                issue_number=issue_number,
+                column=status,
+            )
+            if not last_execution or last_execution.get('outcome') != 'lock_contention':
+                return
+
+            agent = last_execution.get('agent')
+            if not agent:
+                return
+
+            contention_count, should_escalate = classify_contention_dispatch(
+                work_execution_tracker,
+                project_name=project_name,
+                issue_number=issue_number,
+                column=status,
+                agent=agent,
+            )
+            if not should_escalate:
+                logger.info(
+                    f"Issue #{issue_number} retrying after {contention_count} "
+                    f"project resource-lock contention(s) for {agent} in '{status}'"
+                )
+                return
+
+            self._escalate_sustained_lock_contention(
+                project_name=project_name,
+                board_name=board_name,
+                repository=repository,
+                issue_number=issue_number,
+                status=status,
+                agent=agent,
+                contention_count=contention_count,
+                last_error=last_execution.get('error'),
+            )
+        except Exception as check_err:
+            logger.warning(
+                f"Could not evaluate sustained lock contention for {project_name}/"
+                f"#{issue_number} in '{status}': {check_err}"
+            )
+
+    def _escalate_sustained_lock_contention(
+        self,
+        project_name: str,
+        board_name: str,
+        repository: str,
+        issue_number: int,
+        status: str,
+        agent: str,
+        contention_count: int,
+        last_error: Optional[str] = None,
+    ):
+        """
+        Make a sustained run of project resource-lock contention visible to an
+        operator (#148), without doing anything that blocks the board.
+
+        Deliberately NOT the mark_failed() treatment MAX_CONSECUTIVE_DISPATCH_
+        FAILURES gets: durably retaining this board's lock is precisely what the
+        contention exemption exists to prevent, and unlike a broken agent this
+        condition really does clear itself when the other holder finishes. The
+        dispatch proceeds either way; this only ensures that "waiting on a lock
+        nobody is releasing" stops being indistinguishable, from the outside, from
+        "working normally but slowly".
+
+        The GitHub comment is posted at most once per (issue, column, agent) day —
+        the poll loop revisits this every 30 seconds, so an ungated comment would
+        bury the issue thread. Redis-gated because that's what the poll loop
+        already depends on; with no Redis the log line and the decision event are
+        still emitted and the comment is simply skipped rather than spammed.
+        """
+        import asyncio
+        from services.github_integration import GitHubIntegration
+
+        logger.error(
+            f"Issue #{issue_number} has now lost {contention_count} consecutive dispatches "
+            f"for {agent} in '{status}' to a project resource-lock timeout on "
+            f"{project_name} — no agent has run. The lock is being held for its full "
+            f"timeout by something that is not finishing; check for a wedged holder "
+            f"(the last timeout reported: {last_error or 'no detail recorded'}). Still "
+            f"re-dispatching: the pipeline lock is NOT retained and no run is marked "
+            f"failed, because contention is not this issue's fault."
+        )
+
+        try:
+            self.decision_events.emit_error_decision(
+                error_type="sustained_lock_contention",
+                error_message=(
+                    f"{contention_count} consecutive lock-contention dispatches for "
+                    f"{agent} in '{status}': {last_error or 'no detail recorded'}"
+                ),
+                context={
+                    'issue_number': issue_number,
+                    'project': project_name,
+                    'board': board_name,
+                    'column': status,
+                    'agent': agent,
+                    'consecutive_lock_contentions': contention_count,
+                },
+                recovery_action="Re-dispatching; no lock retained, no run marked failed",
+                success=False,
+                project=project_name,
+            )
+        except Exception as emit_err:
+            logger.warning(f"Failed to emit sustained lock contention event: {emit_err}")
+
+        notified_key = (
+            f"lock_contention:notified:{project_name}:{board_name}:{issue_number}:{status}:{agent}"
+        )
+        try:
+            redis_client = self.task_queue.redis_client
+            if not redis_client:
+                return
+            if not redis_client.set(notified_key, "1", nx=True, ex=86400):
+                return
+        except Exception as redis_err:
+            logger.warning(
+                f"Could not gate the sustained-lock-contention comment for issue "
+                f"#{issue_number} — skipping it rather than posting on every poll: {redis_err}"
+            )
+            return
+
+        comment = (
+            f"## ⏳ Blocked by a project resource lock\n\n"
+            f"The last **{contention_count}** dispatches of `{agent}` for this issue in "
+            f"**{status}** each waited out a project resource lock without ever running "
+            f"an agent.\n\n"
+            f"```\n{last_error or 'No lock detail was recorded with the last attempt.'}\n```\n\n"
+            f"This is contention, not a failure — the pipeline lock has **not** been "
+            f"retained and this issue is still being re-dispatched, so no action is "
+            f"needed if another long-running job on `{project_name}` is simply holding "
+            f"the checkout. If nothing is legitimately holding it, look for a wedged "
+            f"holder: the lock's TTL is refreshed by its holder's heartbeat thread for "
+            f"as long as that process lives.\n\n"
+            f"---\n_Sustained lock contention - Switchyard_"
+        )
+
+        try:
+            project_config = self.config_manager.get_project_config(project_name)
+            github = GitHubIntegration(
+                repo_owner=project_config.github['org'], repo_name=repository
+            )
+            asyncio.run(github.post_comment(issue_number, comment))
+        except Exception as comment_err:
+            logger.error(
+                f"Failed to post sustained-lock-contention comment for issue "
+                f"#{issue_number}: {comment_err}"
+            )
 
     def _release_pipeline_lock_and_process_next(
         self,
@@ -5539,6 +5967,9 @@ class ProjectMonitor:
             def run_cycle_in_thread():
                 """Run the review cycle in a background thread"""
                 exception_occurred = False  # True only for a genuine crash, not CancellationError
+                # Blocked by a project resource-lock timeout (#148) — the run has already
+                # been released by the executor, but the queue entry still needs resetting.
+                lock_contention_occurred = False
                 error_summary = None
                 try:
                     # Create new event loop for this thread
@@ -5657,9 +6088,25 @@ _Review cycle initiated by Switchyard_
 
                 except Exception as e:
                     # CancellationError: deliberate stop — log as info, don't emit error events
-                    from services.cancellation import CancellationError
-                    if isinstance(e, CancellationError):
+                    from services.resource_lock_errors import describe_lock_timeout
+                    thread_verdict = classify_review_cycle_thread_exception(e)
+                    if thread_verdict == 'cancelled':
                         logger.info(f"Review cycle cancelled for issue #{issue_number}")
+                    elif thread_verdict == 'lock_contention':
+                        # Project resource-lock timeout (#148): contention, not a crash.
+                        # ReviewCycleExecutor._release_run_for_lock_contention() has
+                        # already ended this run with retain_lock=False and deliberately
+                        # kept the cycle state; re-raising it here is only how it reaches
+                        # this thread boundary. exception_occurred stays False so the
+                        # finally block's mark_failed() — which durably retains this
+                        # board's lock pending scripts/release_lock.py — is not reached
+                        # for a lock that was working exactly as designed.
+                        lock_contention_occurred = True
+                        logger.warning(
+                            f"Review cycle for issue #{issue_number} was blocked by a project "
+                            f"resource-lock timeout — the pipeline run was released, the next "
+                            f"board poll retries: {describe_lock_timeout(e)}"
+                        )
                     else:
                         exception_occurred = True
                         error_summary = str(e)
@@ -5732,7 +6179,16 @@ _Review cycle initiated by Switchyard_
                         if workflow_template_obj and hasattr(workflow_template_obj, 'pipeline_exit_columns'):
                             is_exit_column = status in workflow_template_obj.pipeline_exit_columns
 
-                        if is_exit_column:
+                        # One authority for which of the four teardowns this thread owes
+                        # — see review_cycle_thread_teardown() for why 'contention' is
+                        # neither 'crash' nor 'keep'.
+                        teardown = review_cycle_thread_teardown(
+                            is_exit_column=is_exit_column,
+                            exception_occurred=exception_occurred,
+                            lock_contention_occurred=lock_contention_occurred,
+                        )
+
+                        if teardown == 'exit':
                             lock_mgr.release_lock(project_name, board_name, issue_number)
                             logger.info(
                                 f"Released pipeline lock for issue #{issue_number} "
@@ -5993,7 +6449,7 @@ _Review cycle initiated by Switchyard_
                                 logger.error(f"Error processing next queued issue for {project_name}/{board_name}: {queue_error}")
                                 import traceback
                                 logger.error(traceback.format_exc())
-                        elif exception_occurred:
+                        elif teardown == 'crash':
                             # Crashed mid-pipeline (not at an exit column). NOT the "process
                             # next queued issue" block above (which also purges/reassigns
                             # queue state — wrong here since review-type columns like
@@ -6032,6 +6488,22 @@ _Review cycle initiated by Switchyard_
                             self._post_pipeline_failure_comment(
                                 project_name, board_name, repository, issue_number,
                                 fail_reason, marked_successfully=marked_ok,
+                            )
+                        elif teardown == 'contention':
+                            # Contention, not a crash (#148): no mark_failed(), no failure
+                            # comment. The executor already ended the run with
+                            # retain_lock=False; the one thing still owed is the same queue
+                            # reset the crash branch above does, because nothing else moves
+                            # a 'active' entry back to 'waiting' and
+                            # get_next_waiting_issue() filters strictly on 'waiting'.
+                            from services.pipeline_queue_manager import get_pipeline_queue_manager
+                            queue_mgr = get_pipeline_queue_manager(project_name, board_name)
+                            queue_mgr.reset_issue_to_waiting(issue_number)
+                            logger.warning(
+                                f"Pipeline run released for issue #{issue_number} after a "
+                                f"review-cycle project resource-lock timeout (was in "
+                                f"'{status}') — queue entry reset to 'waiting', the next "
+                                f"poll re-dispatches. No lock retained, no failure recorded."
                             )
                         else:
                             logger.debug(
@@ -6195,6 +6667,22 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             exit_code = None
             overall_success = False
             is_frozen = False  # Paused by Claude Code token-limit breaker, not a real failure
+            is_lock_contention = False  # Blocked by a project resource-lock timeout, not a real failure
+            # Second, independent contention source: the cycle itself ran green but
+            # its auto-commit could not acquire the checkout lock, so the fix is
+            # still sitting uncommitted on disk. Tracked separately from
+            # is_lock_contention (which reflects the container's own outcome) because
+            # only this one has to suppress the auto-advance below. Mirrors
+            # agent_container_recovery._process_completed_repair_cycle's
+            # commit_lock_contention (#148).
+            commit_lock_contention = False
+            # Third, distinct commit outcome (#148 I1): the cycle ran green but the
+            # auto-commit came back CommitResult.FAILED — a real fault, not contention
+            # and not an empty diff. Kept separate from commit_lock_contention because
+            # the two want opposite teardowns: contention leaves a dirty SHARED clone
+            # and retries; a genuine commit failure is the "passed but its fix was not
+            # committed" case agent_container_recovery.py already mark_failed()s.
+            commit_failed = False
             repair_result = None
             error_message = None
             pipeline_run_ended = False
@@ -6330,21 +6818,40 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     repair_result.get('overall_success', False) if repair_result else False
                 )
 
+                # Classify once, here, and derive every downstream gate from that one
+                # answer — see classify_repair_cycle_outcome() for the exit-code/result-
+                # flag contract and why it lives at module level.
+                #
                 # Frozen: paused by the Claude Code token-limit circuit breaker mid-run,
-                # not a genuine test/infra failure. Exit code 5 is repair_cycle_runner.py's
-                # dedicated signal for this (see its Exit Codes docstring);
-                # repair_result['frozen'] is a belt-and-suspenders check in case the exit
-                # code didn't make it through cleanly. Handled distinctly below: no
+                # not a genuine test/infra failure. Handled distinctly below: no
                 # misleading failure comment, no lock retained for manual intervention —
                 # pipeline_watchdog's existing frozen-resume path (which watches for
                 # work_execution_tracker outcome='frozen') picks this back up
                 # automatically once the breaker closes.
-                is_frozen = (exit_code == 5) or bool(repair_result and repair_result.get('frozen'))
+                #
+                # Lock contention: the cycle never got to run because another holder
+                # owned this project's checkout (or dev-container build slot) for the
+                # whole of that lock's timeout. Handled like frozen below — no misleading
+                # failure comment, no lock retained for manual intervention — except that
+                # the pipeline run IS released, because nothing watches for lock
+                # contention the way pipeline_watchdog watches for frozen: the next board
+                # poll is the retry point (#148).
+                repair_outcome = classify_repair_cycle_outcome(
+                    exit_code, repair_result, overall_success
+                )
+                is_frozen = repair_outcome == 'frozen'
+                is_lock_contention = repair_outcome == 'lock_contention'
                 if is_frozen:
                     logger.warning(
                         f"Repair cycle for {project_name}/#{issue_number} was paused by the "
                         f"Claude Code circuit breaker (exit_code={exit_code}). Not treating as "
                         f"a failure — will auto-resume once tokens reset."
+                    )
+                if is_lock_contention:
+                    logger.warning(
+                        f"Repair cycle for {project_name}/#{issue_number} could not acquire a "
+                        f"project resource lock (exit_code={exit_code}). Not treating as a "
+                        f"failure — the next board poll re-dispatches it."
                     )
 
                 # Emit container completed event
@@ -6427,13 +6934,17 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 # a temporary pause that resumes automatically — posting the failure-shaped
                 # summary above would be actively misleading (matches the silent-pause
                 # behavior of the non-repair-cycle paths, e.g. requirements_verifier).
-                if not is_frozen:
-                    loop.run_until_complete(
-                        github.post_agent_output(
-                            comment_context,
-                            "\n".join(summary_lines)
-                        )
-                    )
+                # Same for lock contention: nothing ran, so there is nothing to report.
+                #
+                # DEFERRED until after the auto-commit below (#148 I3). This used to post
+                # here, before the commit was even attempted, so a commit that then lost
+                # the checkout lock (or failed outright) left GitHub showing "✅ Repair
+                # Cycle Complete" on an issue that never moves again — and the
+                # sustained-contention escalation that would eventually explain it needs
+                # 3 consecutive occurrences AND Redis, so the common single-event case is
+                # success-then-silence. commit_lock_contention / commit_failed are not
+                # known yet at this point; they are, immediately below the commit.
+                should_post_summary = not is_frozen and not is_lock_contention
 
                 # NOTE: Execution outcome is recorded in finally block to ensure it happens even on error
                 
@@ -6454,16 +6965,148 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             )
                         )
                         
-                        if commit_success:
+                        from services.auto_commit import CommitResult
+                        if commit_success is CommitResult.COMMITTED:
                             logger.info(f"Successfully committed repair cycle changes for issue #{issue_number}")
+                        elif commit_success is CommitResult.NOTHING_TO_COMMIT:
+                            logger.info(f"No changes to commit for repair cycle on issue #{issue_number}")
                         else:
-                            logger.warning(f"No changes to commit for repair cycle on issue #{issue_number}")
+                            # CommitResult.FAILED — a genuine fault (no/absent
+                            # project_dir, a main/master refusal, a failed `git
+                            # commit`, a non-lock exception). Gated here rather
+                            # than logged-and-ignored (#148 I1): this path used to
+                            # log every falsy return as "No changes to commit" and
+                            # then auto-advance, so the tests-passed-but-fix-never-
+                            # committed bug — the one its restart-recovery twin in
+                            # agent_container_recovery.py already calls
+                            # mark_failed("Repair cycle passed but its fix was not
+                            # committed") for — stayed fully open here for every
+                            # commit failure that wasn't a lock timeout. The
+                            # "False could mean nothing to commit" objection that
+                            # kept it ungated is what CommitResult removes.
+                            commit_failed = True
+                            error_message = (
+                                "Repair cycle passed but its fix was not committed "
+                                "(auto-commit reported a failure; see the auto_commit "
+                                "log lines above for the specific cause)"
+                            )
+                            logger.error(
+                                f"Auto-commit for repair cycle on issue #{issue_number} FAILED "
+                                f"— the fix is still uncommitted in the workspace, so the issue "
+                                f"is NOT advanced."
+                            )
                     except Exception as e:
-                        logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
-                        # Don't fail the repair cycle if commit fails - changes are still in workspace
-                
+                        # A resource-lock timeout is NOT "the commit failed, carry on"
+                        # (#148): commit_agent_changes() re-raises it rather than
+                        # returning a CommitResult precisely so this is distinguishable
+                        # from both NOTHING_TO_COMMIT and FAILED. The cycle's fix is
+                        # still uncommitted in the workspace, so advancing the issue here
+                        # would hand the next stage — and the PR that gets reviewed
+                        # downstream — a branch with no fix on it.
+                        from services.resource_lock_errors import (
+                            is_lock_timeout_error, describe_lock_timeout,
+                        )
+                        if is_lock_timeout_error(e):
+                            commit_lock_contention = True
+                            # Carries the actual lock detail into the retention reason and
+                            # the recorded outcome's `error`, which is what
+                            # _escalate_sustained_lock_contention() reports to an operator.
+                            error_message = (
+                                f"Repair cycle auto-commit blocked by a project resource "
+                                f"lock: {describe_lock_timeout(e)}"
+                            )
+                            logger.error(
+                                f"Auto-commit for repair cycle on issue #{issue_number} could "
+                                f"not acquire a project resource lock: "
+                                f"{describe_lock_timeout(e)} — the fix is still uncommitted in "
+                                f"{project_dir}, so the issue is NOT advanced and this board's "
+                                f"lock is RETAINED (see the teardown branch below)."
+                            )
+                        else:
+                            commit_failed = True
+                            error_message = (
+                                f"Repair cycle passed but its fix was not committed: "
+                                f"auto-commit raised {type(e).__name__}: {str(e)[:200]}"
+                            )
+                            logger.error(f"Failed to auto-commit repair cycle changes: {e}", exc_info=True)
+
+                # Post the deferred repair-cycle summary now that the commit outcome
+                # IS known (#148 I3). Three cases:
+                #   * clean run -> the summary built above, unchanged;
+                #   * commit contention / commit failure -> a comment that says the
+                #     cycle passed but its fix did not land and the issue is NOT
+                #     advancing, because posting the unqualified "✅ Repair Cycle
+                #     Complete" and then never moving the issue is the silent outcome
+                #     this whole change exists to remove. The sustained-contention
+                #     escalation is not a substitute: it needs 3 consecutive
+                #     occurrences AND Redis, so the single-event case reached an
+                #     operator as success-then-silence;
+                #   * frozen / container-level contention -> still nothing, as before.
+                if should_post_summary:
+                    if commit_lock_contention or commit_failed:
+                        if commit_lock_contention:
+                            _headline = (
+                                "## ⚠️ Repair Cycle Passed — But Its Fix Is Not Committed"
+                            )
+                            _detail = (
+                                "The test-fix-validate cycle completed successfully, but the "
+                                "automatic commit could not acquire this project's checkout "
+                                "lock before the lock's own timeout expired, so the fix is "
+                                "still sitting **uncommitted** in the shared project checkout."
+                            )
+                            _action = (
+                                "This board's pipeline lock has been **retained** so no other "
+                                "issue is dispatched into that checkout while it is dirty. "
+                                "Find and clear whatever is holding the project checkout lock, "
+                                "then release this board's lock "
+                                "(`python scripts/release_lock.py`) to resume."
+                            )
+                        else:
+                            _headline = (
+                                "## ❌ Repair Cycle Passed — But Its Fix Could Not Be Committed"
+                            )
+                            _detail = (
+                                "The test-fix-validate cycle completed successfully, but the "
+                                "automatic commit failed, so the fix is still **uncommitted** "
+                                "in the project checkout. Advancing would have handed the next "
+                                "stage — and the PR reviewed downstream — a branch with no fix "
+                                "on it."
+                            )
+                            _action = (
+                                "This board's pipeline lock has been **retained**. Inspect the "
+                                "orchestrator logs for the auto-commit failure, resolve it, then "
+                                "release the lock (`python scripts/release_lock.py`) to resume."
+                            )
+                        summary_lines = [
+                            _headline,
+                            "",
+                            f"**Container**: `{container_name}`\n",
+                            f"**Exit Code**: {exit_code}\n",
+                            "",
+                            _detail,
+                            "",
+                            f"**Detail**: {error_message or 'no detail recorded'}",
+                            "",
+                            _action,
+                            "",
+                            "---",
+                            "_Repair cycle executed by Switchyard (containerized)_",
+                        ]
+                    try:
+                        loop.run_until_complete(
+                            github.post_agent_output(
+                                comment_context,
+                                "\n".join(summary_lines)
+                            )
+                        )
+                    except Exception as post_err:
+                        logger.error(
+                            f"Failed to post repair-cycle summary for #{issue_number}: {post_err}",
+                            exc_info=True,
+                        )
+
                 # Auto-advance if successful (AFTER commit to ensure code is pushed before moving to next stage)
-                if overall_success:
+                if overall_success and not commit_lock_contention and not commit_failed:
                     current_index = next(
                         (i for i, col in enumerate(workflow_template.columns) if col.name == status),
                         None
@@ -6494,8 +7137,12 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             # (since repair cycle itself succeeded)
                             # Ideally we should have a "Move Failed" state or alert.
 
-                # End pipeline run on success
-                if overall_success and pipeline_run_id:
+                # End pipeline run on success. Not reached when the auto-commit above
+                # lost the checkout lock or failed: the finally block RETAINS that run's
+                # lock instead (#148 C2/I1), so the shared checkout the fix is sitting
+                # uncommitted in is not handed to another issue, rather than the run
+                # being recorded as a completed success whose fix never landed.
+                if overall_success and not commit_lock_contention and not commit_failed and pipeline_run_id:
                     try:
                         ended = self.pipeline_run_manager.end_pipeline_run(
                             project=project_name,
@@ -6525,8 +7172,11 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     except Exception as e:
                         logger.error(f"Failed to end pipeline run {pipeline_run_id}: {e}", exc_info=True)
 
-                # Cleanup repair cycle state (only on success)
-                if overall_success:
+                # Cleanup repair cycle state (only on success). Kept when the commit
+                # lost the lock (the next poll's re-dispatch resumes from it) and when
+                # it failed outright (an operator releasing the retained lock resumes
+                # from it).
+                if overall_success and not commit_lock_contention and not commit_failed:
                     _cleanup_repair_cycle_state(project_name, issue_number, pipeline_run_id)
                 
                 # Cleanup container
@@ -6564,7 +7214,30 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # agent_name is now passed as a parameter to this function
                     # No need to extract from repair_result
 
-                    outcome = 'frozen' if is_frozen else ('success' if overall_success else 'failure')
+                    # Same single authority the gates above were derived from, re-evaluated
+                    # here because this finally block also runs when the try never reached
+                    # that point (its inputs are all initialised before the try). Note
+                    # 'lock_contention' is deliberately not 'failure':
+                    # count_consecutive_failures() would otherwise turn repeated contention
+                    # into a durably-retained board lock via
+                    # MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
+                    outcome = classify_repair_cycle_outcome(
+                        exit_code, repair_result, overall_success
+                    )
+                    # The commit's own contention isn't visible to
+                    # classify_repair_cycle_outcome() — it reads the exit code and the
+                    # runner's result dict, and this contention happened after both.
+                    # Folded in here so the release branch below, the recorded outcome
+                    # and count_consecutive_lock_contentions() all see the one answer.
+                    if commit_lock_contention:
+                        outcome = 'lock_contention'
+                    # Likewise for a genuine commit failure: the container exited 0 and
+                    # the runner reported success, so classify_repair_cycle_outcome()
+                    # says 'success' — but the fix never landed, and recording that as a
+                    # success is exactly how "the PR reviewed downstream contained no
+                    # fix" looked identical to a clean run (#148 I1).
+                    elif commit_failed:
+                        outcome = 'failure'
 
                     # If we never got an exit code, container failed during launch
                     if exit_code is None:
@@ -6598,6 +7271,104 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             f"retained, no failure comment posted."
                         )
 
+                    # An UNCOMMITTED FIX ON DISK is the one contention outcome that must
+                    # NOT release this board's lock (#148 C2). commit_lock_contention can
+                    # only ever be reached with project_dir == the SHARED base clone:
+                    # auto_commit only takes the project_checkout lock when
+                    # workspace_manager.is_base_clone_dir(project, project_dir) is true
+                    # (epic worktrees are not gated by it at all), so a timeout on that
+                    # lock is proof this is the shared directory — and the repair cycle's
+                    # fix is sitting in it, uncommitted.
+                    #
+                    # Releasing the board lock here hands that dirty shared clone to the
+                    # next issue the failsafe pulls in. Its prep does a plain
+                    # `git checkout <its-branch>` (ProjectWorkspaceManager.ensure_branch —
+                    # no stash, no reset), so either git carries THIS issue's fix onto
+                    # that issue's branch, or the checkout conflicts and its dispatch
+                    # fails. If the fix is carried away, this issue's own retry then finds
+                    # a clean tree, commits nothing, and auto-advances with no fix — the
+                    # very bug this change exists to eliminate, reached by another route.
+                    #
+                    # So this takes the is_frozen treatment one step further: not merely
+                    # "don't release" but mark_failed(), which durably sets the lock's
+                    # retained_reason. A plain end_pipeline_run(retain_lock=True) is NOT
+                    # equivalent — it never sets retained_reason, so the stale-lock
+                    # reclamation path can hand the dirty clone away anyway — and unlike
+                    # frozen there is no watchdog resume path that would notice. The board
+                    # stops until an operator clears the wedged checkout-lock holder and
+                    # runs scripts/release_lock.py, which is the correct trade against
+                    # silently corrupting another issue's branch. commit_failed gets the
+                    # same treatment for the same reason, and matches what
+                    # agent_container_recovery.py's twin already does for it (#148 I1).
+                    if (commit_lock_contention or commit_failed) and not pipeline_run_ended:
+                        _retain_reason = (
+                            f"Repair cycle passed but its fix was not committed and is "
+                            f"uncommitted on disk in {project_dir}: "
+                            f"{error_message or 'Unknown error'}"
+                        )
+                        try:
+                            marked_ok = self.pipeline_run_manager.mark_failed(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=issue_number,
+                                reason=_retain_reason,
+                            )
+                            pipeline_run_ended = True
+                            if marked_ok:
+                                logger.error(
+                                    f"RETAINED the pipeline lock for {project_name}/"
+                                    f"#{issue_number}: the repair cycle's fix is uncommitted "
+                                    f"in {project_dir}. No other issue will be dispatched "
+                                    f"into that checkout until an operator releases it."
+                                )
+                            else:
+                                logger.critical(
+                                    f"Pipeline lock for {project_name}/#{issue_number} could "
+                                    f"NOT be durably marked failed while an uncommitted "
+                                    f"repair-cycle fix sits in {project_dir} — another issue "
+                                    f"may be dispatched into that dirty checkout."
+                                )
+                        except Exception as retain_err:
+                            logger.critical(
+                                f"Failed to retain the pipeline lock for {project_name}/"
+                                f"#{issue_number} with an uncommitted repair-cycle fix in "
+                                f"{project_dir}: {retain_err}"
+                            )
+
+                    # Container-level lock contention: nothing ran, nothing is dirty, so
+                    # release the run instead of retaining it. Unlike frozen there is no
+                    # watchdog resume path for contention, so the run has to be ended
+                    # (retain_lock=False) for the next board poll to re-dispatch — and it
+                    # must NOT go through mark_failed(), which would durably block this
+                    # board and every sibling issue on it over a lock that was working
+                    # exactly as designed (#148).
+                    elif is_lock_contention and not pipeline_run_ended:
+                        try:
+                            self.pipeline_run_manager.end_pipeline_run(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=issue_number,
+                                reason=f"Repair cycle blocked by a project resource-lock timeout: "
+                                       f"{error_message or 'Unknown error'}",
+                                retain_lock=False,
+                                # Without this the release is not actually a retry point:
+                                # the cancellation signal hides the issue from
+                                # _find_stalled_issues_for_pipeline() for its full 1-hour
+                                # TTL, and this issue sits in a mid-pipeline column that
+                                # nothing else re-dispatches (#148 C1).
+                                suppress_cancellation=True,
+                            )
+                            pipeline_run_ended = True
+                            logger.info(
+                                f"Released pipeline run for {project_name}/#{issue_number} after "
+                                f"repair-cycle lock contention — next poll retries."
+                            )
+                        except Exception as release_err:
+                            logger.error(
+                                f"Failed to release pipeline run for {project_name}/#{issue_number} "
+                                f"after repair-cycle lock contention: {release_err}"
+                            )
+
                     # End pipeline run if genuinely failed (success and frozen cases are
                     # handled elsewhere). Only end if not already ended (e.g., in timeout
                     # handler). Uses the same shared mark_failed() entry point as the
@@ -6608,7 +7379,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # instead of relying on its own independently-written equivalent,
                     # which had drifted out of sync with the shared implementation.
                     repair_mark_failed_ok = True
-                    if not overall_success and not is_frozen and not pipeline_run_ended:
+                    if not overall_success and not is_frozen and not is_lock_contention and not pipeline_run_ended:
                         repair_mark_failed_ok = self.pipeline_run_manager.mark_failed(
                             project=project_name,
                             board=board_name,
@@ -6629,7 +7400,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # in Testing and blocks the pipeline until a human intervenes. Frozen runs
                     # are excluded: they're not a failure, and pipeline_watchdog's frozen-resume
                     # path (triggered by the outcome='frozen' recorded above) handles them.
-                    if not overall_success and not is_frozen:
+                    if not overall_success and not is_frozen and not is_lock_contention:
                         if container_log_excerpt:
                             logger.error(
                                 f"Container {container_name} logs (last 100 lines, exit "
@@ -7032,12 +7803,18 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 except Exception as e:
                     logger.error(f"PR review stage failed for issue #{issue_number}: {e}", exc_info=True)
 
-                    # Record failure — must match the 'pr_review_stage' outer wrapper name
+                    # A lock timeout is contention, not a failure of this stage — see
+                    # _pr_review_failure_report(). _end_pr_review_pipeline_run_on_failure()
+                    # below already releases (rather than retains) the run for it; this is
+                    # the matching treatment for the two operator-facing reports.
+                    pr_review_outcome, post_failure_comment = _pr_review_failure_report(e)
+
+                    # Record the outcome — must match the 'pr_review_stage' outer wrapper name
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
                         agent='pr_review_stage',
-                        outcome='failed',
+                        outcome=pr_review_outcome,
                         project_name=project_name,
                         error=str(e)
                     )
@@ -7054,29 +7831,38 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     except Exception as end_err:
                         logger.warning(f"Failed to end pipeline run after PR review failure: {end_err}")
 
-                    # Post failure comment to GitHub
-                    try:
-                        from services.github_integration import GitHubIntegration
-                        github = GitHubIntegration(
-                            repo_owner=project_config.github['org'],
-                            repo_name=project_config.github['repo']
+                    # Post failure comment to GitHub — never for pure lock contention:
+                    # nothing was attempted, so the comment would just paste the raw
+                    # lock-timeout text onto the issue as operator-facing noise.
+                    if not post_failure_comment:
+                        logger.warning(
+                            f"PR review for issue #{issue_number} was blocked by a project "
+                            f"resource-lock timeout — recorded as contention, no failure "
+                            f"comment posted, the next board poll retries."
                         )
-                        error_comment = (
-                            f"## PR Review Failed\n\n"
-                            f"The PR review stage encountered an error:\n\n"
-                            f"```\n{str(e)}\n```\n\n"
-                            f"---\n_PR review stage error - Switchyard_"
-                        )
-                        loop2 = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop2)
+                    else:
                         try:
-                            loop2.run_until_complete(
-                                github.post_comment(issue_number, error_comment, pipeline_run_id=pipeline_run.id)
+                            from services.github_integration import GitHubIntegration
+                            github = GitHubIntegration(
+                                repo_owner=project_config.github['org'],
+                                repo_name=project_config.github['repo']
                             )
-                        finally:
-                            loop2.close()
-                    except Exception as comment_error:
-                        logger.warning(f"Failed to post PR review failure comment: {comment_error}")
+                            error_comment = (
+                                f"## PR Review Failed\n\n"
+                                f"The PR review stage encountered an error:\n\n"
+                                f"```\n{str(e)}\n```\n\n"
+                                f"---\n_PR review stage error - Switchyard_"
+                            )
+                            loop2 = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop2)
+                            try:
+                                loop2.run_until_complete(
+                                    github.post_comment(issue_number, error_comment, pipeline_run_id=pipeline_run.id)
+                                )
+                            finally:
+                                loop2.close()
+                        except Exception as comment_error:
+                            logger.warning(f"Failed to post PR review failure comment: {comment_error}")
                 finally:
                     loop.close()
 

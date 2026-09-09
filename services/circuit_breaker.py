@@ -185,6 +185,22 @@ class CircuitBreaker:
                     f"not counting against this circuit's failure_count"
                 )
                 raise
+
+            # Same reasoning for a project resource-lock timeout (#148): the guarded
+            # stage never ran at all — another holder owned the project's base clone
+            # (or its dev-container build slot) for the whole of that lock's timeout.
+            # Counting contention here would let three unlucky-but-correct waits open
+            # this agent+project circuit and block ALL further dispatch of that agent
+            # for recovery_timeout, on top of the contention that caused it. Deferred
+            # import (like the one above) keeps this low-level module free of a
+            # module-load dependency on the Redis-backed lock stack.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(e):
+                logger.info(
+                    f"Circuit '{self.name}' saw a project resource-lock timeout — "
+                    f"not counting against this circuit's failure_count"
+                )
+                raise
             self._on_failure()
             raise
         except Exception as e:

@@ -102,4 +102,12 @@ class CodeReviewerAgent(PipelineStage):
             # agent failure") that only work if the original exception type survives.
             raise
         except Exception as exc:
+            # Resource-lock timeouts survive too — same rule, spelled the same way as
+            # agents/base_maker_agent.py so all three wrappers read identically (#148).
+            # services/resource_lock_errors.py can still recognise these through the
+            # `from exc` chain, but relying on that alone leaves the invariant resting
+            # on a two-word suffix nothing at this call site explains.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(exc):
+                raise
             raise Exception(f"Code review failed: {exc}") from exc

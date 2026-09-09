@@ -19,7 +19,7 @@ import pytest
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
-from services.auto_commit import AutoCommitService
+from services.auto_commit import AutoCommitService, CommitResult
 
 
 @pytest.fixture
@@ -50,7 +50,7 @@ class TestCommitAgentChangesProjectDir:
 
             mock_branch.assert_called_once_with(tmp_path)
             mock_changes.assert_called_once_with(tmp_path)
-            assert result is True  # no changes -> nothing to commit, but not a failure
+            assert result is CommitResult.NOTHING_TO_COMMIT
 
     @pytest.mark.asyncio
     async def test_accepts_project_dir_as_string(self, service, tmp_path):
@@ -69,7 +69,7 @@ class TestCommitAgentChangesProjectDir:
             )
 
             assert mock_branch.call_args[0][0] == tmp_path
-            assert result is True
+            assert result is CommitResult.NOTHING_TO_COMMIT
 
     @pytest.mark.asyncio
     async def test_missing_project_dir_returns_false_not_raise(self, service):
@@ -83,7 +83,7 @@ class TestCommitAgentChangesProjectDir:
             issue_number=42,
         )
 
-        assert result is False
+        assert result is CommitResult.FAILED
 
     @pytest.mark.asyncio
     async def test_nonexistent_project_dir_returns_false_not_raise(self, service, tmp_path):
@@ -101,7 +101,7 @@ class TestCommitAgentChangesProjectDir:
             issue_number=42,
         )
 
-        assert result is False
+        assert result is CommitResult.FAILED
 
 
 class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
@@ -128,7 +128,7 @@ class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
                 issue_number=42,
             )
 
-            assert result is False
+            assert result is CommitResult.FAILED
             mock_branch.assert_called_once_with(tmp_path)
             # The fast-fail must happen before the lock decision is even
             # consulted -- is_base_clone_dir()/the lock context manager
@@ -149,7 +149,7 @@ class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
                 issue_number=42,
             )
 
-            assert result is False
+            assert result is CommitResult.FAILED
             mock_lock.assert_not_called()
 
     @pytest.mark.asyncio
@@ -168,7 +168,7 @@ class TestWorkflowBugBranchCheckFailsFastBeforeTheLock:
                 issue_number=42,
             )
 
-            assert result is True
+            assert result is CommitResult.NOTHING_TO_COMMIT
             mock_branch.assert_called_once_with(tmp_path)
 
 
@@ -210,7 +210,7 @@ class TestCurrentBranchReReadAfterTheLock:
                 issue_number=42,
             )
 
-            assert result is True
+            assert result is CommitResult.NOTHING_TO_COMMIT
             # Read twice: once for the pre-lock fast-fail check, once again
             # after acquiring the lock.
             assert mock_branch.call_count == 2
@@ -248,7 +248,7 @@ class TestCurrentBranchReReadAfterTheLock:
                 issue_number=42,
             )
 
-            assert result is False
+            assert result is CommitResult.FAILED
             assert mock_branch.call_count == 2
             # Must refuse before ever touching git -- no staging, no commit.
             mock_check.assert_not_called()
