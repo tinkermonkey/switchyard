@@ -1758,6 +1758,16 @@ class AgentContainerRecovery:
                             project_dir=repair_cycle_project_dir,
                             issue_number=issue_number,
                             custom_message=f"Complete repair cycle for issue #{issue_number}\n\nAutomated test-fix-validate cycle completed successfully.\nAll tests passing.",
+                            # The branch resolve_workspace() picked for this run,
+                            # persisted into context.json alongside project_dir by
+                            # _save_repair_cycle_context() -- the independently
+                            # derived expectation commit_agent_changes() verifies
+                            # the checked-out branch against (#143/#149). Read from
+                            # the same context.json field the worktree
+                            # re-registration above uses; None on a legacy context
+                            # file, which degrades to the pre-lock fallback rather
+                            # than blocking the commit.
+                            expected_branch=branch_name_for_recovery,
                         )
                     )
 

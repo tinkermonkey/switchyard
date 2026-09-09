@@ -241,9 +241,30 @@ class ReviewCycleExecutor:
 
     async def _resolve_project_dir_for_cycle(self, cycle_state: 'ReviewCycleState') -> 'Path':
         """
+        The directory half of _resolve_workspace_for_cycle() -- see that method for
+        the full rationale. Kept as the entry point for this file's many
+        directory-only call sites (diff-building, lint, HEAD snapshots), which have
+        no use for the branch name.
+        """
+        project_dir, _branch_name = await self._resolve_workspace_for_cycle(cycle_state)
+        return project_dir
+
+    async def _resolve_workspace_for_cycle(
+        self, cycle_state: 'ReviewCycleState'
+    ) -> Tuple['Path', Optional[str]]:
+        """
         Resolve the directory this file's own git operations (diff-building for the
         reviewer's context, mechanical lint, pre-flight context fetch, HEAD
-        snapshots, and branch checkout) must read from and write to.
+        snapshots, and branch checkout) must read from and write to, together with
+        the branch that workspace is meant to be on.
+
+        The branch is returned alongside the directory (rather than left for a
+        consumer to read back off the checkout) so the auto-commit call sites below
+        can pass it as commit_agent_changes()'s expected_branch: both values come
+        from the SAME resolve_workspace() result, which is the whole point --
+        verifying a checkout against an expectation re-derived somewhere else is
+        the divergence #123 removed, and verifying it against the checkout itself
+        is what #143 found to be no verification at all.
 
         For 'issues'/'hybrid' workspace types this MUST be the SAME epic worktree
         the maker agent's own dispatch (_execute_agent_directly() ->
@@ -268,6 +289,11 @@ class ReviewCycleExecutor:
         for it) and stays on the shared base clone, matching this file's
         pre-existing behavior for that type.
 
+        Returns:
+            (project_dir, branch_name). branch_name is None for workspace types
+            resolve_workspace() doesn't handle ('discussions'), never for
+            'issues'/'hybrid' on a successful resolution.
+
         Raises:
             RuntimeError: cycle_state.pipeline_run_id is unset, or no PipelineRun
                 exists for it -- both indicate a construction bug upstream (the
@@ -283,7 +309,12 @@ class ReviewCycleExecutor:
         from services.project_workspace import workspace_manager
 
         if cycle_state.workspace_type not in ('issues', 'hybrid'):
-            return workspace_manager.get_project_dir(cycle_state.project_name)
+            # 'discussions' is git-free -- resolve_workspace() is a no-op for it,
+            # so there is no resolved branch to return. An auto-commit reaching
+            # here (only the lint-fix call site is not explicitly gated on
+            # 'issues') degrades to commit_agent_changes()'s pre-lock fallback
+            # expectation rather than being blocked.
+            return workspace_manager.get_project_dir(cycle_state.project_name), None
 
         if not cycle_state.pipeline_run_id:
             raise RuntimeError(
@@ -313,7 +344,7 @@ class ReviewCycleExecutor:
                 f"run {pipeline_run.id} ({cycle_state.project_name}/"
                 f"#{cycle_state.issue_number})."
             )
-        return Path(pipeline_run.project_dir)
+        return Path(pipeline_run.project_dir), pipeline_run.branch_name
 
     def _ensure_context_writer(
         self,
@@ -1610,13 +1641,15 @@ class ReviewCycleExecutor:
                     makes_code_changes = getattr(agent_config, 'makes_code_changes', False)
 
                     if makes_code_changes:
+                        _commit_dir, _commit_branch = await self._resolve_workspace_for_cycle(cycle_state)
                         await auto_commit_service.commit_agent_changes(
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"review_cycle_iter_{cycle_state.current_iteration}",
-                            project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
+                            project_dir=_commit_dir,
                             issue_number=cycle_state.issue_number,
-                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}"
+                            custom_message=f"Address code review feedback (iteration {cycle_state.current_iteration})\n\nIssue #{cycle_state.issue_number}",
+                            expected_branch=_commit_branch,
                         )
 
                 # Get maker output
@@ -2534,13 +2567,15 @@ class ReviewCycleExecutor:
                         cycle_state.project_name, cycle_state.maker_agent
                     )
                     if getattr(_agent_config, 'makes_code_changes', False):
+                        _lint_pd, _lint_branch = await self._resolve_workspace_for_cycle(cycle_state)
                         await auto_commit_service.commit_agent_changes(
                             project=cycle_state.project_name,
                             agent=cycle_state.maker_agent,
                             task_id=f"lint_fix_iter_{iteration}",
-                            project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
+                            project_dir=_lint_pd,
                             issue_number=cycle_state.issue_number,
                             custom_message=f"Fix mechanical lint violations (iteration {iteration})\n\nIssue #{cycle_state.issue_number}",
+                            expected_branch=_lint_branch,
                         )
 
                     # Record maker's lint-fix output for audit trail (fix #6)
@@ -2864,13 +2899,15 @@ class ReviewCycleExecutor:
 
                 if makes_code_changes:
                     logger.info(f"Agent {cycle_state.maker_agent} makes code changes, attempting auto-commit")
+                    _commit_dir, _commit_branch = await self._resolve_workspace_for_cycle(cycle_state)
                     commit_success = await auto_commit_service.commit_agent_changes(
                         project=cycle_state.project_name,
                         agent=cycle_state.maker_agent,
                         task_id=f"review_cycle_iter_{iteration}",
-                        project_dir=await self._resolve_project_dir_for_cycle(cycle_state),
+                        project_dir=_commit_dir,
                         issue_number=cycle_state.issue_number,
-                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}"
+                        custom_message=f"Address code review feedback (iteration {iteration})\n\nIssue #{cycle_state.issue_number}",
+                        expected_branch=_commit_branch,
                     )
 
                     from services.auto_commit import CommitResult
