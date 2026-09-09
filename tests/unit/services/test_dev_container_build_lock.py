@@ -37,13 +37,13 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import tempfile
 import shutil
 
 import pytest
 
-from services.pipeline_lock_manager import PipelineLockManager
+from services.pipeline_lock_manager import PipelineLockManager, TouchResult
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services import project_checkout_lock
 from services.dev_container_build_lock import (
@@ -423,19 +423,86 @@ class TestAsyncPathSharesTheEventLoopFixes:
         assert all(tid != loop_thread_id for tid in calling_threads)
 
     async def test_heartbeat_fires_while_the_guarded_body_blocks_the_event_loop(self):
-        """The local-execution path this lock wraps
+        """
+        The local-execution path this lock wraps
         (claude/claude_integration.py's _run_claude_code_locally()) blocks the
-        event loop for the subprocess's whole runtime -- see #141."""
-        touched = threading.Event()
-        facade = MagicMock()
-        facade.touch_resource.side_effect = lambda *args: (touched.set(), True)[1]
+        event loop for the subprocess's whole runtime -- see #141.
 
-        async with project_checkout_lock._held_with_heartbeat_async(
-            facade, RESOURCE_NAME, "proj", holder_id=-9, heartbeat_interval_seconds=0.02
-        ):
-            fired_during_the_block = touched.wait(timeout=5.0)  # no `await` here, deliberately
+        Drives dev_container_build_lock_async() itself rather than the shared
+        _held_with_heartbeat_async() helper: found in a later WI-1 (#146)
+        review round that going through the helper directly re-tested code
+        already covered in test_project_checkout_lock.py and proved nothing
+        about THIS module's wiring -- dropping `heartbeat=heartbeat` from the
+        call site below (which would leak one never-stopped heartbeat thread
+        per build, and silently reopen the acquire-then-heartbeat gap
+        _acquire_and_start_heartbeat() exists to close) left the whole file
+        green.
+        """
+        touched = threading.Event()
+        touch_args = []
+        acquired_holder_ids = []
+        thread_name = f"lock-heartbeat-{RESOURCE_NAME}-proj"
+
+        facade = MagicMock()
+        facade.acquire_resource.side_effect = lambda project, resource, holder_id: (
+            acquired_holder_ids.append(holder_id), (True, "acquired")
+        )[1]
+        facade.touch_resource.side_effect = lambda *args: (
+            touch_args.append(args), touched.set(), TouchResult.REFRESHED
+        )[2]
+
+        real_start = project_checkout_lock._start_heartbeat_thread
+
+        def _fast_start(facade_, resource_name, project, holder_id, _interval):
+            # The production interval is 1800s; nothing else about the hold
+            # changes, so this is the one knob the composed path doesn't expose.
+            return real_start(facade_, resource_name, project, holder_id, 0.02)
+
+        with patch('services.project_checkout_lock._start_heartbeat_thread', _fast_start):
+            async with dev_container_build_lock_async("proj", facade=facade):
+                fired_during_the_block = touched.wait(timeout=5.0)  # no `await` here, deliberately
+                # Exactly one: the thread the acquiring worker started and
+                # this hold adopted, not that one plus a second started here.
+                live = [t for t in threading.enumerate() if t.name == thread_name and t.is_alive()]
+                assert len(live) == 1, f"expected exactly one adopted heartbeat thread, got {len(live)}"
 
         assert fired_during_the_block
+        assert touch_args, "touch_resource() was never called"
+        # Pins the adoption to the acquire's own holder id -- the id a
+        # self-started thread would share, which is why the counts above
+        # carry the rest of the weight.
+        assert all(args == ("proj", RESOURCE_NAME, acquired_holder_ids[0]) for args in touch_args)
+        assert not [t for t in threading.enumerate() if t.name == thread_name and t.is_alive()], (
+            "the hold's heartbeat thread outlived the with block"
+        )
+
+    async def test_the_lock_is_still_released_after_the_default_executor_is_shut_down(self):
+        """
+        Mirror of test_project_checkout_lock.py's test of the same name: the
+        final _release_and_warn() in dev_container_build_lock_async()'s
+        finally must stay SYNCHRONOUS on the loop. Offloading it makes it
+        raise RuntimeError out of _check_default_executor() once
+        asyncio.run()'s teardown has shut the default executor down --
+        skipping the release entirely (the build lock then stays `locked`
+        under a holder id nothing in the next process knows, until
+        TTL/staleness recovery) and replacing the guarded body's real
+        exception with one about asyncio internals.
+        """
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+        facade.release_resource.return_value = True
+
+        class _SentinelError(Exception):
+            pass
+
+        loop = asyncio.get_running_loop()
+        with pytest.raises(_SentinelError):
+            async with dev_container_build_lock_async("proj", facade=facade):
+                await loop.shutdown_default_executor()
+                raise _SentinelError("the body's real failure")
+
+        facade.release_resource.assert_called_once()
 
 
 if __name__ == '__main__':

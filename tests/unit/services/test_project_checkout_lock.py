@@ -802,6 +802,38 @@ class TestAsyncHeartbeatJoinSurvivesExecutorShutdown:
 
         assert "lock-heartbeat-proj_checkout-proj" not in [t.name for t in threading.enumerate()]
 
+    async def test_the_lock_is_still_released_after_the_default_executor_is_shut_down(self):
+        """
+        Shape (c) in this module's docstring, defended rather than only
+        argued: the final _release_and_warn() in
+        project_checkout_lock_async()'s finally must stay SYNCHRONOUS on the
+        loop. Offloading it (the obvious "why is this one still inline?"
+        cleanup) makes it raise RuntimeError out of
+        _check_default_executor() once asyncio.run()'s teardown has shut the
+        default executor down -- skipping the release entirely, so the lock
+        stays `locked` under a synthetic holder id nothing in the next
+        process knows, until TTL/staleness recovery (7200s-14400s) -- and
+        replacing the guarded body's real exception with one about asyncio
+        internals.
+        """
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+        facade.release_resource.return_value = True
+
+        class _SentinelError(Exception):
+            pass
+
+        loop = asyncio.get_running_loop()
+        # The pytest.raises half is as load-bearing as the release assertion:
+        # it is what catches the exception-replacement half of the same bug.
+        with pytest.raises(_SentinelError):
+            async with project_checkout_lock_async("proj", facade=facade):
+                await loop.shutdown_default_executor()
+                raise _SentinelError("the body's real failure")
+
+        facade.release_resource.assert_called_once()
+
 
 class TestHeartbeatFailureEscalation(unittest.TestCase):
     """
@@ -973,6 +1005,77 @@ class TestRealFacadeReportsStoreFailuresAsRefreshFailed(unittest.TestCase):
 
         self.assertIs(result, TouchResult.NOT_HELD)
         self.assertFalse(bool(result))
+
+
+class _WriteFailingFakeRedis(ThreadSafeFakeRedis):
+    """Reads keep answering while writes start failing -- the ordinary Redis
+    states where exactly that happens (OOM under maxmemory-policy noeviction,
+    MISCONF after a failed BGSAVE, READONLY after a failover). `writes_fail`
+    is flipped mid-hold so the acquire itself still succeeds normally."""
+
+    def __init__(self):
+        super().__init__()
+        self.writes_fail = False
+
+    def hset(self, key, mapping):
+        if self.writes_fail:
+            raise RuntimeError("OOM command not allowed when used memory > 'maxmemory'")
+        return super().hset(key, mapping)
+
+
+class TestRedisWriteOnlyOutageIsNotReportedAsAHealthyRefresh(unittest.TestCase):
+    """
+    Regression found in a later WI-1 (#146) review round: touch_lock() OR-ed
+    its two write legs, so a Redis-writes-fail/reads-succeed outage returned
+    REFRESHED on the strength of the YAML write alone.
+
+    Only the Redis key has a TTL (fixed 7200s), and extending it is the
+    entire reason HEARTBEAT_INTERVAL_SECONDS exists -- the YAML copy never
+    expires, and try_acquire_lock()'s Redis transaction reads a lapsed key
+    back as an empty dict, which is falsy, so it hands the resource to a
+    second caller without ever consulting that still-valid YAML copy. Under
+    the old return, every tick of such an outage reset the heartbeat's
+    failure run, so the sustained-failure escalation written for exactly
+    this could never fire while the TTL ran down under a live holder.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.redis = _WriteFailingFakeRedis()
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.redis)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_a_redis_write_failure_is_refresh_failed_even_though_yaml_succeeded(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, -42)
+        self.redis.writes_fail = True
+
+        result = self.facade.touch_resource("proj", RESOURCE_NAME, -42)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertFalse(bool(result))
+
+    def test_a_sustained_redis_write_outage_escalates_instead_of_looking_healthy(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, -42)
+        self.redis.writes_fail = True
+
+        with patch('services.project_checkout_lock.HEARTBEAT_FAILURE_ESCALATION_SECONDS', 0.05):
+            with self.assertLogs('services.project_checkout_lock', level='WARNING') as captured:
+                with _held_with_heartbeat_sync(
+                    self.facade, RESOURCE_NAME, "proj", holder_id=-42, heartbeat_interval_seconds=0.02
+                ):
+                    time.sleep(0.25)
+
+        levels = [r.levelno for r in captured.records]
+        messages = [r.getMessage() for r in captured.records]
+        self.assertEqual(levels[0], logging.WARNING, "the first blip must not cry wolf")
+        self.assertIn(logging.ERROR, levels, "a sustained Redis write outage must escalate")
+        self.assertTrue(
+            all("NO LONGER held" not in m for m in messages),
+            "a write outage is not proof the lock was lost to a competing holder",
+        )
 
 
 @pytest.mark.asyncio

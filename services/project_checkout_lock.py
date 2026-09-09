@@ -381,7 +381,12 @@ def _heartbeat_worker(
         logged an ERROR claiming the lock had been LOST to another holder
         (directly contradicting the ERROR touch_lock() itself logs one line
         earlier) on every tick, while the escalation written for that exact
-        outage sat unreachable behind `except Exception`.
+        outage sat unreachable behind `except Exception`. A later round found
+        the same escalation still unreachable for the Redis-writes-fail/
+        reads-succeed outage (OOM, MISCONF, READONLY), because touch_lock()
+        OR-ed its two write legs and reported a YAML-only write as a full
+        refresh -- see its write path for why only the Redis leg extends
+        anything that actually expires.
 
       - TouchResult.REFRESHED -- resets the failure run and its clock.
     """

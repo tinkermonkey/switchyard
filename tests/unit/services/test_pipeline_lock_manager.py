@@ -231,6 +231,54 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
         self.assertIs(result, TouchResult.REFRESH_FAILED)
         self.assertFalse(result)
 
+    def test_returns_refresh_failed_when_only_the_redis_refresh_write_fails(self):
+        """
+        CRITICAL regression (found in a later #146 WI-1 review round): a
+        Redis-writes-fail/reads-succeed outage (OOM under noeviction, MISCONF
+        after a failed BGSAVE, READONLY after a failover) used to return
+        REFRESHED because the YAML leg succeeded. Only the Redis key has a
+        TTL, so nothing was actually extended -- and the heartbeat's success
+        branch then reset its failure run every tick, making the
+        sustained-failure escalation unreachable for the one outage it was
+        written for.
+        """
+        self.mock_redis.hgetall.return_value = {}  # healthy read, "not locked in Redis"
+        self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.hset.side_effect = Exception("OOM command not allowed")
+
+        # YAML write deliberately left working -- that's the whole point.
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertFalse(result)
+
+    def test_returns_refresh_failed_when_only_the_redis_expire_fails(self):
+        """Same hazard through the other Redis call: hset can land while
+        EXPIRE fails, which leaves the key's original TTL still running
+        down."""
+        self.mock_redis.hgetall.return_value = {}
+        self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.expire.side_effect = Exception("READONLY You can't write against a read only replica")
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertFalse(result)
+
+    def test_returns_refreshed_with_no_redis_client_when_the_yaml_write_succeeds(self):
+        """The Redis-leg requirement is conditional on a client being
+        configured -- a YAML-only manager has no expiring copy to extend, so
+        a successful YAML write is a genuine full refresh there."""
+        # Nulled after construction rather than passed as None: the
+        # constructor builds a real client when none is supplied.
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 123)
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        self.assertTrue(result)
+
     def test_still_works_normally_once_reads_are_healthy_again(self):
         """Not a general regression test of the happy path (see TestTouchLock
         above) -- specifically confirms the fail-closed branch doesn't

@@ -612,12 +612,14 @@ class PipelineLockManager:
 
         Returns:
             TouchResult.REFRESHED if the lock was found (held by
-            issue_number) and refreshed in at least one durable store;
-            TouchResult.NOT_HELD if it is confirmed NOT currently held by
-            issue_number (including "no lock exists"); TouchResult.
+            issue_number) and its liveness genuinely extended -- which means
+            the Redis write landed whenever a Redis client is configured,
+            since Redis holds the only expiring copy (see the write path
+            below); TouchResult.NOT_HELD if it is confirmed NOT currently held
+            by issue_number (including "no lock exists"); TouchResult.
             REFRESH_FAILED if liveness could not be extended because the
             stores themselves failed (both reads failed, so the state is
-            genuinely unknown, or both writes failed). Only REFRESHED is
+            genuinely unknown, or the writes that matter failed). Only REFRESHED is
             truthy (see TouchResult), so callers written against the
             original bool return keep their original meaning while callers
             that need to distinguish "lost to another holder" from "the
@@ -684,6 +686,30 @@ class PipelineLockManager:
                 f"touch_lock: BOTH Redis and YAML refresh writes failed for "
                 f"{project}/{board} issue #{issue_number} -- liveness was NOT "
                 f"extended, this lock may be stolen by the staleness heuristic"
+            )
+            return TouchResult.REFRESH_FAILED
+
+        # A Redis write failure is REFRESH_FAILED even when the YAML write
+        # succeeded -- found in a later review round (#146 WI-1). The two
+        # stores are NOT interchangeable for this method's purpose: only the
+        # Redis lock key has a TTL (fixed 7200s), and extending it is the
+        # entire reason the heartbeat that calls this exists (see
+        # project_checkout_lock.HEARTBEAT_INTERVAL_SECONDS). The YAML copy
+        # never expires, so refreshing it alone buys nothing against that
+        # clock -- and try_acquire_lock()'s Redis transaction reads an expired
+        # key back as an empty dict, which is falsy, so it grants the lock to
+        # a second caller without ever consulting the still-valid YAML copy.
+        # OR-ing the two legs reported that outage (Redis writes failing while
+        # its reads still succeed: OOM under noeviction, MISCONF after a failed
+        # BGSAVE, READONLY after a failover) as a full success, which reset the
+        # heartbeat's failure run every tick and left the sustained-failure
+        # escalation written for exactly that case unreachable.
+        if self.redis_client and not redis_ok:
+            logger.error(
+                f"touch_lock: Redis refresh write failed for {project}/{board} "
+                f"issue #{issue_number} -- the 7200s lock-key TTL was NOT extended "
+                f"(only the TTL-less YAML copy was), so this hold is still on the "
+                f"clock and may be acquired by a second caller when the key lapses"
             )
             return TouchResult.REFRESH_FAILED
 
