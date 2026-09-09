@@ -4,6 +4,7 @@ from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
 from services.cancellation import CancellationError
 from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
+from agents.non_retryable import NonRetryableAgentError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -99,10 +100,19 @@ class DocumentationEditorAgent(PipelineStage):
             logger.info("Documentation review completed, output length: %d", len(markdown_output))
             return context
 
-        except (CancellationError, ClaudeCodeRateLimitError):
+        except (CancellationError, ClaudeCodeRateLimitError, NonRetryableAgentError):
             # Never re-wrap: agent_executor.py's retry loop does isinstance() checks
             # on these ("never retry cancellations", "systemic token limit, not an
-            # agent failure") that only work if the original exception type survives.
+            # agent failure", "permanent failure — container OOM-killed or manually
+            # terminated") that only work if the original exception type survives.
             raise
         except Exception as exc:
+            # Resource-lock timeouts survive too — same rule, spelled the same way as
+            # agents/base_maker_agent.py so all three wrappers read identically (#148).
+            # services/resource_lock_errors.py can still recognise these through the
+            # `from exc` chain, but relying on that alone leaves the invariant resting
+            # on a two-word suffix nothing at this call site explains.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(exc):
+                raise
             raise Exception(f"Documentation review failed: {exc}") from exc

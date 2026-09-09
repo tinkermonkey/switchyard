@@ -31,7 +31,13 @@ class ExecutionRecord:
     column: str
     agent: str
     timestamp: str
-    outcome: str  # 'success', 'failure', 'frozen', 'cancelled', 'in_progress'
+    # 'lock_contention' (#148): the dispatch never ran because a project resource
+    # lock (project_checkout / dev_container_build) was held for the whole of its
+    # timeout. Deliberately NOT 'failure' — count_consecutive_failures() counts
+    # only 'failure', and project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES turns
+    # three of those into a durably-retained board lock. Same role 'frozen' plays
+    # for a Claude Code token-limit rejection.
+    outcome: str  # 'success', 'failure', 'frozen', 'lock_contention', 'cancelled', 'in_progress'
     trigger_source: str  # 'manual_move', 'pipeline_progression', 'webhook'
     error: Optional[str] = None
 
@@ -377,8 +383,11 @@ class WorkExecutionStateTracker:
                 )
                 return True, "manual_rework_detected"
 
-        # Case 3: Previous execution failed, was frozen, cancelled, or abandoned
-        if last_execution['outcome'] in ['failure', 'frozen', 'cancelled', 'abandoned']:
+        # Case 3: Previous execution failed, was frozen, blocked by lock contention,
+        # cancelled, or abandoned. 'lock_contention' belongs here for the same reason
+        # 'frozen' does: the agent never ran, so the next poll is the retry point
+        # (#148) — it just doesn't count toward count_consecutive_failures().
+        if last_execution['outcome'] in ['failure', 'frozen', 'lock_contention', 'cancelled', 'abandoned']:
             logger.debug(
                 f"Should execute {agent} on {project_name}/#{issue_number}: "
                 f"retry_after_{last_execution['outcome']}"
@@ -488,7 +497,14 @@ class WorkExecutionStateTracker:
         agent: str
     ) -> int:
         """Count trailing consecutive 'failure' outcomes for this column/agent —
-        same filter idiom as get_last_execution()."""
+        same filter idiom as get_last_execution().
+
+        Only 'failure' counts, and any other outcome ends the run. That is what
+        keeps a 'lock_contention' dispatch (#148) — where the agent never ran
+        because another holder owned a project resource lock — from accumulating
+        toward project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES, which would
+        durably retain the whole board's pipeline lock over pure contention.
+        """
         state = self.load_state(project_name, issue_number)
         column_executions = [
             e for e in state['execution_history']

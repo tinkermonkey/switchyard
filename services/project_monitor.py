@@ -499,8 +499,15 @@ def _end_pr_review_pipeline_run_on_failure(
         None — when the release branch was taken instead; retention wasn't
             attempted, so there's nothing to report on.
     """
+    # A project resource-lock timeout is contention, not a review failure: the
+    # stage abandons the review on the first one (see pr_review_stage.py's phase
+    # handlers) precisely so this lands on the release branch and the next board
+    # poll retries. Checked explicitly rather than left to fall through the
+    # isinstance() below, because it must keep releasing even if a lock timeout
+    # ever arrives wrapped in something non-retryable (#148).
+    from services.resource_lock_errors import is_lock_timeout_error
     from agents.non_retryable import NonRetryableAgentError
-    if isinstance(exception, NonRetryableAgentError):
+    if isinstance(exception, NonRetryableAgentError) and not is_lock_timeout_error(exception):
         marked_ok = pipeline_run_manager.mark_failed(
             project=project_name,
             board=board_name,
@@ -2764,7 +2771,11 @@ class ProjectMonitor:
                                     f"prior failure(s) for {current_column_agent} in '{status}'"
                                 )
                         else:
-                            # Issue is queued but never executed - should execute current stage
+                            # Issue is queued but never executed - should execute current stage.
+                            # A previous outcome of 'lock_contention' (#148) lands here on
+                            # purpose: the dispatch never ran because a project resource lock
+                            # was held, so this poll IS its retry, and it deliberately does not
+                            # accumulate toward MAX_CONSECUTIVE_DISPATCH_FAILURES above.
                             logger.info(
                                 f"Issue #{issue_number} holds pipeline lock but no active execution "
                                 f"and no completed execution for {current_column_agent}. "
@@ -6195,6 +6206,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             exit_code = None
             overall_success = False
             is_frozen = False  # Paused by Claude Code token-limit breaker, not a real failure
+            is_lock_contention = False  # Blocked by a project resource-lock timeout, not a real failure
             repair_result = None
             error_message = None
             pipeline_run_ended = False
@@ -6347,6 +6359,26 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"a failure — will auto-resume once tokens reset."
                     )
 
+                # Lock contention: the cycle never got to run because another holder
+                # owned this project's checkout (or dev-container build slot) for the
+                # whole of that lock's timeout. Exit code 6 is repair_cycle_runner.py's
+                # dedicated signal (see its Exit Codes docstring), with the result-dict
+                # flag as the same belt-and-suspenders fallback used for frozen.
+                # Handled like frozen below — no misleading failure comment, no lock
+                # retained for manual intervention — except that the pipeline run IS
+                # released, because nothing watches for lock contention the way
+                # pipeline_watchdog watches for frozen: the next board poll is the
+                # retry point (#148).
+                is_lock_contention = (exit_code == 6) or bool(
+                    repair_result and repair_result.get('lock_contention')
+                )
+                if is_lock_contention:
+                    logger.warning(
+                        f"Repair cycle for {project_name}/#{issue_number} could not acquire a "
+                        f"project resource lock (exit_code={exit_code}). Not treating as a "
+                        f"failure — the next board poll re-dispatches it."
+                    )
+
                 # Emit container completed event
                 try:
                     from monitoring.observability import get_observability_manager
@@ -6427,7 +6459,8 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 # a temporary pause that resumes automatically — posting the failure-shaped
                 # summary above would be actively misleading (matches the silent-pause
                 # behavior of the non-repair-cycle paths, e.g. requirements_verifier).
-                if not is_frozen:
+                # Same for lock contention: nothing ran, so there is nothing to report.
+                if not is_frozen and not is_lock_contention:
                     loop.run_until_complete(
                         github.post_agent_output(
                             comment_context,
@@ -6564,7 +6597,15 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # agent_name is now passed as a parameter to this function
                     # No need to extract from repair_result
 
-                    outcome = 'frozen' if is_frozen else ('success' if overall_success else 'failure')
+                    if is_frozen:
+                        outcome = 'frozen'
+                    elif is_lock_contention:
+                        # Deliberately not 'failure': count_consecutive_failures() would
+                        # otherwise turn repeated contention into a durably-retained
+                        # board lock via MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
+                        outcome = 'lock_contention'
+                    else:
+                        outcome = 'success' if overall_success else 'failure'
 
                     # If we never got an exit code, container failed during launch
                     if exit_code is None:
@@ -6598,6 +6639,33 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                             f"retained, no failure comment posted."
                         )
 
+                    # Lock contention: release the run instead of retaining it. Unlike
+                    # frozen there is no watchdog resume path for contention, so the run
+                    # has to be ended (retain_lock=False) for the next board poll to
+                    # re-dispatch — and it must NOT go through mark_failed(), which would
+                    # durably block this board and every sibling issue on it over a lock
+                    # that was working exactly as designed (#148).
+                    if is_lock_contention and not pipeline_run_ended:
+                        try:
+                            self.pipeline_run_manager.end_pipeline_run(
+                                project=project_name,
+                                board=board_name,
+                                issue_number=issue_number,
+                                reason=f"Repair cycle blocked by a project resource-lock timeout: "
+                                       f"{error_message or 'Unknown error'}",
+                                retain_lock=False,
+                            )
+                            pipeline_run_ended = True
+                            logger.info(
+                                f"Released pipeline run for {project_name}/#{issue_number} after "
+                                f"repair-cycle lock contention — next poll retries."
+                            )
+                        except Exception as release_err:
+                            logger.error(
+                                f"Failed to release pipeline run for {project_name}/#{issue_number} "
+                                f"after repair-cycle lock contention: {release_err}"
+                            )
+
                     # End pipeline run if genuinely failed (success and frozen cases are
                     # handled elsewhere). Only end if not already ended (e.g., in timeout
                     # handler). Uses the same shared mark_failed() entry point as the
@@ -6608,7 +6676,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # instead of relying on its own independently-written equivalent,
                     # which had drifted out of sync with the shared implementation.
                     repair_mark_failed_ok = True
-                    if not overall_success and not is_frozen and not pipeline_run_ended:
+                    if not overall_success and not is_frozen and not is_lock_contention and not pipeline_run_ended:
                         repair_mark_failed_ok = self.pipeline_run_manager.mark_failed(
                             project=project_name,
                             board=board_name,
@@ -6629,7 +6697,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     # in Testing and blocks the pipeline until a human intervenes. Frozen runs
                     # are excluded: they're not a failure, and pipeline_watchdog's frozen-resume
                     # path (triggered by the outcome='frozen' recorded above) handles them.
-                    if not overall_success and not is_frozen:
+                    if not overall_success and not is_frozen and not is_lock_contention:
                         if container_log_excerpt:
                             logger.error(
                                 f"Container {container_name} logs (last 100 lines, exit "

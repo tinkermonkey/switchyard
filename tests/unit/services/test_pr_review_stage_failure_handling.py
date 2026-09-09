@@ -75,3 +75,45 @@ class TestEndPrReviewPipelineRunOnFailure:
         )
         # No retention was attempted — nothing to report on.
         assert result is None
+
+
+class TestLockTimeoutReleasesRatherThanRetaining:
+    """
+    #148: a project resource-lock timeout is contention, not a review failure —
+    the stage abandons the review on the first one (pr_review_stage.py's phase
+    handlers) precisely so it lands here, and this function must release so the
+    next board poll retries. A lock timeout arriving wrapped in something
+    non-retryable must still release, which is why the check is explicit rather
+    than left to the isinstance() fall-through.
+    """
+
+    def test_lock_timeout_releases(self):
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        mock_manager = MagicMock()
+
+        result = _end_pr_review_pipeline_run_on_failure(
+            mock_manager, "proj", "board", 123,
+            ProjectCheckoutLockTimeoutError("could not acquire lock within 10900.0s"),
+        )
+
+        mock_manager.mark_failed.assert_not_called()
+        assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        assert result is None
+
+    def test_non_retryable_wrapping_a_lock_timeout_still_releases(self):
+        from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
+
+        inner = ProjectCheckoutLockTimeoutError("busy")
+        wrapper = NonRetryableAgentError("All review phases failed for #123")
+        wrapper.__cause__ = inner
+
+        mock_manager = MagicMock()
+
+        result = _end_pr_review_pipeline_run_on_failure(
+            mock_manager, "proj", "board", 123, wrapper,
+        )
+
+        mock_manager.mark_failed.assert_not_called()
+        assert mock_manager.end_pipeline_run.call_args.kwargs["retain_lock"] is False
+        assert result is None

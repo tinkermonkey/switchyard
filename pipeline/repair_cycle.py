@@ -1332,6 +1332,32 @@ class RepairCycleStage(PipelineStage):
                     )
 
             except Exception as e:
+                # Resource-lock timeout: contention, not a test or infra failure (#148).
+                # The guarded run never happened, and claude_integration already polled
+                # the lock for the whole of its (~3h / ~1h) timeout, so retrying here
+                # re-runs that same wait — three attempts is the ~9h compounding #148
+                # exists to eliminate. Worse, exhausting the retries below fabricates a
+                # RepairTestResult with an "__infrastructure__" failure, which the cycle
+                # then dispatches fix agents against — each blocking on the same lock.
+                # Propagate to repair_cycle_runner.execute_repair_cycle() instead, the
+                # same treatment the ClaudeCodeRateLimitError clause above gives.
+                from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                if is_lock_timeout_error(e):
+                    logger.warning(
+                        f"Test execution could not acquire a project resource lock — "
+                        f"not retrying: {describe_lock_timeout(e)}"
+                    )
+                    raise
+
+                # NonRetryableAgentError: same class of defect this handler had for
+                # lock timeouts. docker_runner raises it for container exit codes
+                # 137/143 (OOM kill / SIGTERM), where "retrying will not help" —
+                # re-running just re-allocates the same memory to be killed again.
+                from agents.non_retryable import NonRetryableAgentError
+                if isinstance(e, NonRetryableAgentError):
+                    logger.warning(f"Test execution hit a non-retryable failure — not retrying: {e}")
+                    raise
+
                 # Other execution failure (timeout, container failure, etc.)
                 logger.error(f"Test execution failed (attempt {attempt + 1}/{max_retries + 1}): {e}", exc_info=True)
                 
@@ -1535,6 +1561,14 @@ class RepairCycleStage(PipelineStage):
                 # repair_cycle_runner.py's execute_repair_cycle().
                 raise
             except Exception as e:
+                # Resource-lock timeout: propagate rather than logging this file as
+                # "not fixed" and moving on — every remaining file would re-acquire the
+                # same still-held lock and pay its own full timeout, and files_fixed
+                # would report the run as merely under-performing. See _run_tests().
+                from services.resource_lock_errors import is_lock_timeout_error
+                if is_lock_timeout_error(e):
+                    raise
+
                 logger.error(f"Failed to fix failures in {test_file}: {e}", exc_info=True)
                 
                 # Emit file fix failed event
@@ -1686,6 +1720,12 @@ class RepairCycleStage(PipelineStage):
                 # repair_cycle_runner.py's execute_repair_cycle().
                 raise
             except Exception as e:
+                # Resource-lock timeout: propagate — same per-file compounding as
+                # _fix_failures_by_file(). See _run_tests().
+                from services.resource_lock_errors import is_lock_timeout_error
+                if is_lock_timeout_error(e):
+                    raise
+
                 logger.error(f"Failed to review warnings in {source_file}: {e}", exc_info=True)
                 
                 # Emit warning review failed event
@@ -2171,6 +2211,13 @@ class RepairCycleStage(PipelineStage):
             # repair_cycle_runner.py's execute_repair_cycle().
             raise
         except Exception as e:
+            # Resource-lock timeout: propagate rather than returning no_issues, which
+            # asserts has_env_issues=False/has_systemic_code_issues=False for an
+            # analysis that never ran. See _run_tests().
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(e):
+                raise
+
             logger.warning(
                 f"Systemic failure analysis failed: {e}, falling back to per-file fixes",
                 exc_info=True,
@@ -2360,6 +2407,13 @@ class RepairCycleStage(PipelineStage):
                 # repair_cycle_runner.py's execute_repair_cycle().
                 raise
             except Exception as e:
+                # Resource-lock timeout: propagate. A dev_container_build timeout here
+                # means the build slot was held, not that the rebuild failed. See
+                # _run_tests().
+                from services.resource_lock_errors import is_lock_timeout_error
+                if is_lock_timeout_error(e):
+                    raise
+
                 logger.error(f"Env rebuild setup failed on attempt {attempts_made}: {e}", exc_info=True)
                 if obs:
                     obs.emit(
@@ -2747,6 +2801,13 @@ class RepairCycleStage(PipelineStage):
                 last_test_result = current_test_result
                 break
             except Exception as e:
+                # Resource-lock timeout: propagate rather than continuing to the
+                # re-run below, which would pay the same wait again for a fix that
+                # was never applied. See _run_tests().
+                from services.resource_lock_errors import is_lock_timeout_error
+                if is_lock_timeout_error(e):
+                    raise
+
                 logger.error(
                     f"Systemic fix attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES} agent "
                     f"execution failed for {project}/{task_id} "

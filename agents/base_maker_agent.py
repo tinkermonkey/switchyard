@@ -18,6 +18,7 @@ from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext
 from services.cancellation import CancellationError
 from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
+from agents.non_retryable import NonRetryableAgentError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -162,7 +163,7 @@ class MakerAgent(PipelineStage, ABC):
             ]
             return context
 
-        except (CancellationError, ClaudeCodeRateLimitError):
+        except (CancellationError, ClaudeCodeRateLimitError, NonRetryableAgentError):
             # Never re-wrap these: agent_executor.py's retry loop does isinstance()
             # checks on them ("never retry cancellations", "systemic token limit,
             # not an agent failure — don't retry, don't count against the agent's
@@ -170,6 +171,16 @@ class MakerAgent(PipelineStage, ABC):
             # survives unchanged. Wrapping in a generic Exception below erases that
             # type and silently defeats both checks (see repair_cycle.py's
             # equivalent fix for the same underlying pattern).
+            #
+            # NonRetryableAgentError for the same reason (#140 item 25):
+            # docker_runner._raise_for_failed_exit_code() raises it for container
+            # exit codes 137/143 ("deliberately terminated — user kill or OOM
+            # killer — retrying will not help"), and that raise reaches this
+            # wrapper directly (claude_integration.run_claude_code returns straight
+            # out of run_agent_in_container on the Docker branch). Erasing the type
+            # here defeats BOTH the agent_executor and worker_pool exemptions, so
+            # an OOM-killed container is re-run to be killed again — and each of
+            # those runs counts against this agent+project's circuit breaker.
             raise
         except Exception as exc:
             # Same rule, one more family (#148, from #140 item 25): run_claude_code()

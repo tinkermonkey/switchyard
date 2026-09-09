@@ -17,13 +17,25 @@ the only thing that changes the outcome is a *different* holder finishing.
 Every layer that reacts to an exception by retrying it, or by counting it
 against a failure budget, therefore has to be able to recognise it:
 
-  * services/agent_executor.py's retry loop would otherwise re-run the whole
-    acquisition with the default retries=2, turning one genuine contention
-    event into ~9h of wall clock before the pipeline finally fails.
+  * The retry loops -- services/agent_executor.py's inner one (default
+    retries=2), services/worker_pool.py's outer one (max_retries=3, the live
+    path whenever ORCHESTRATOR_WORKERS > 1), and pipeline/repair_cycle.py's own
+    -- would each otherwise re-run the whole acquisition, multiplying together:
+    one genuine contention event becomes tens of hours of wall clock, with a
+    worker slot pinned throughout, before the pipeline finally fails.
   * services/circuit_breaker.py would otherwise count each such attempt
     against that agent+project's own breaker, so pure contention could trip
     it (failure_threshold=3) and block ALL further dispatch of that agent for
     that project for recovery_timeout on top of the contention itself.
+  * The failure budgets one level up are the same hazard with a wider blast
+    radius: services/agent_executor.py records outcome='lock_contention'
+    rather than 'failure' so work_execution_state.count_consecutive_failures()
+    never reaches project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES, and the
+    teardown paths that would otherwise call PipelineRunManager.mark_failed()
+    (services/human_feedback_loop.py, the PR-review and repair-cycle handlers
+    in services/project_monitor.py) release the run instead, because
+    mark_failed() durably retains the BOARD's lock until a human runs
+    scripts/release_lock.py.
 
 Both those call sites already special-case ClaudeCodeRateLimitError for
 exactly the same reason ("systemic condition, not this stage's fault"); this

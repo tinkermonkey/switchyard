@@ -43,20 +43,33 @@ class SetupStatus(Enum):
     justify, so an immediate retry would just double every project's startup
     delay for no expected gain.
 
-    __bool__ is defined so main.py's existing `if needs_setup:` keeps its
-    original meaning: only NEEDED is truthy, so UNKNOWN queues no setup task,
-    exactly as the old False did -- the change is that it is now visible as
-    unknown rather than indistinguishable from a confirmed answer. Mirrors
-    TouchResult (services/pipeline_lock_manager.py) and ResetResult
+    Deliberately NOT given a __bool__: an earlier revision of this type defined
+    one that was truthy only for NEEDED, which made `if status:` re-collapse
+    UNKNOWN and NOT_NEEDED into the same answer at the only two places the value
+    is ever read (main.py's setup-queuing loop and initialize_all_projects()'s own
+    log line). A three-state type whose only public behavior is two-state does not
+    encapsulate the invariant it was created to express, and it made the unsafe
+    reading the ergonomic one -- any future call site would silently reproduce the
+    conflation with nothing to catch it. Both call sites now name the member they
+    mean (`is SetupStatus.NEEDED`), which is no less readable and cannot drift.
+    Mirrors TouchResult (services/pipeline_lock_manager.py) and ResetResult
     (services/pipeline_queue_manager.py), introduced for the same reason.
+
+    What UNKNOWN does today, stated plainly: it queues no dev_environment_setup
+    task, which is the same end state the old bare False produced. That is the
+    deliberate answer, not an unfinished one -- main.py's preceding
+    verify_and_update_status() loop is an independent, positive check on the
+    project's Docker image, and a verifiably missing image upgrades UNKNOWN to
+    NEEDED there regardless of whether the checkout could be inspected. So the
+    only projects UNKNOWN leaves alone are ones whose image is present. What
+    changes is that the state is now named, logged, and available to any caller
+    that wants to act on it (e.g. surfacing degraded startup on /health) instead
+    of being asserted as a confirmed "no setup needed".
     """
 
     NEEDED = "needed"          # confirmed: newly cloned, or Dockerfile.agent missing
     NOT_NEEDED = "not_needed"  # confirmed: existing checkout that already has Dockerfile.agent
     UNKNOWN = "unknown"        # never determined: initialization did not complete
-
-    def __bool__(self) -> bool:
-        return self is SetupStatus.NEEDED
 
 
 class ProjectWorkspaceManager:
@@ -108,7 +121,8 @@ class ProjectWorkspaceManager:
             or missing Dockerfile.agent), NOT_NEEDED (confirmed neither), or
             UNKNOWN (initialization never completed -- a lock timeout or an
             outright failure -- so the question was never answered). See
-            SetupStatus's docstring for why UNKNOWN exists and why it is falsy.
+            SetupStatus's docstring for why UNKNOWN exists; callers must test
+            for a specific member (`is SetupStatus.NEEDED`), never truthiness.
         """
         logger.info("Initializing all project workspaces")
 
@@ -139,7 +153,7 @@ class ProjectWorkspaceManager:
                     else SetupStatus.NOT_NEEDED
                 )
 
-                if needs_setup[project_name]:
+                if needs_setup[project_name] is SetupStatus.NEEDED:
                     logger.info(f"Project {project_name} needs dev environment setup (newly_cloned={was_cloned}, has_dockerfile={dockerfile_agent.exists()})")
 
             except Exception as e:

@@ -9,8 +9,9 @@ ProjectCheckoutLockTimeoutError if a stale lock left by a crashed prior process
 still owns it. That used to be caught alongside every genuine clone failure and
 recorded as needs_setup[project] = False — which main.py's startup
 dispatch-queuing loop reads as an assertion that the project is fine. It is
-now SetupStatus.UNKNOWN: falsy (so nothing is queued on the strength of a
-non-answer, exactly as before) but distinguishable and loudly logged.
+now SetupStatus.UNKNOWN: distinguishable and loudly logged, and read at every
+call site by member (`is SetupStatus.NEEDED`) rather than by truthiness, so
+the three states cannot silently re-collapse into two.
 
 Without the fix these tests fail: initialize_all_projects() returns bare
 booleans, so UNKNOWN is indistinguishable from a confirmed NOT_NEEDED.
@@ -59,11 +60,21 @@ def _run(manager, projects, initialize_side_effect, dockerfile_projects=()):
 
 
 class TestSetupStatusEnum:
-    def test_only_needed_is_truthy(self):
-        """main.py's `if needs_setup:` must keep its original meaning."""
-        assert bool(SetupStatus.NEEDED) is True
-        assert bool(SetupStatus.NOT_NEEDED) is False
-        assert bool(SetupStatus.UNKNOWN) is False
+    def test_defines_no_bool_so_truthiness_cannot_conflate_states(self):
+        """
+        The type must not carry a __bool__: one that was truthy only for NEEDED
+        made `if status:` give UNKNOWN and NOT_NEEDED the same answer at the only
+        places the value is read, which is exactly the conflation the enum exists
+        to remove. Callers name the member instead.
+        """
+        assert '__bool__' not in SetupStatus.__dict__
+        # Enum members are truthy by default, so a call site that still tested
+        # truthiness would now queue setup for every project — loudly wrong rather
+        # than silently wrong, and caught by the call-site tests below.
+        assert bool(SetupStatus.UNKNOWN) is True
+
+    def test_members_are_distinct(self):
+        assert len({SetupStatus.NEEDED, SetupStatus.NOT_NEEDED, SetupStatus.UNKNOWN}) == 3
 
 
 class TestConfirmedOutcomes:
@@ -93,10 +104,11 @@ class TestLockTimeoutIsUnknownNotFalse:
         )
 
         assert result == {'alpha': SetupStatus.UNKNOWN}
-        # Still falsy, so nothing is queued on the strength of a non-answer —
-        # but no longer indistinguishable from a confirmed NOT_NEEDED.
-        assert not result['alpha']
+        # Not a confirmed NOT_NEEDED, and not a NEEDED either — so main.py's
+        # `is SetupStatus.NEEDED` queues nothing on the strength of a non-answer,
+        # while the state stays distinguishable to any caller that wants it.
         assert result['alpha'] is not SetupStatus.NOT_NEEDED
+        assert result['alpha'] is not SetupStatus.NEEDED
 
     def test_unknown_is_distinguishable_from_a_confirmed_not_needed(self, manager):
         """The whole point: two projects that both queue no setup task, for two
@@ -110,7 +122,9 @@ class TestLockTimeoutIsUnknownNotFalse:
 
         assert result['alpha'] is SetupStatus.NOT_NEEDED
         assert result['beta'] is SetupStatus.UNKNOWN
-        assert not result['alpha'] and not result['beta']
+        # Both queue no setup task, for two categorically different reasons.
+        assert result['alpha'] is not SetupStatus.NEEDED
+        assert result['beta'] is not SetupStatus.NEEDED
 
     def test_genuine_initialization_failure_also_reports_unknown(self, manager):
         """A clone failure was never a confirmed 'no setup needed' either."""

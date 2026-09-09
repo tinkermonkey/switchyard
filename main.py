@@ -538,12 +538,15 @@ async def main():
     from task_queue.task_manager import Task, TaskPriority
 
     for project_name, needs_setup in projects_needing_setup.items():
-        # SetupStatus.__bool__ is truthy only for NEEDED, so an UNKNOWN project
-        # (initialization never completed) queues nothing here — the same
-        # end state the old bare False produced, but no longer by asserting a
-        # "confirmed, no setup needed" answer nobody ever determined.
-        # initialize_all_projects() has already logged which projects those are.
-        if needs_setup:
+        # Tested by member, never by truthiness (SetupStatus defines no __bool__
+        # on purpose — see its docstring): only a confirmed NEEDED queues a task.
+        # An UNKNOWN project (initialization never completed) queues nothing here,
+        # the same end state the old bare False produced, but no longer by
+        # asserting a "confirmed, no setup needed" answer nobody ever determined —
+        # and the Docker-image check just above has already upgraded it to NEEDED
+        # if its image is verifiably missing. initialize_all_projects() has already
+        # logged which projects are UNKNOWN.
+        if needs_setup is SetupStatus.NEEDED:
             logger.info(f"Queuing dev_environment_setup task for {project_name}")
 
             task = Task(

@@ -478,6 +478,24 @@ class PRReviewStage(PipelineStage):
                     }, pipeline_run_id)
 
             except Exception as e:
+                # Resource-lock timeout: abandon the whole review rather than
+                # degrading this phase to review text and moving on (#148). Every
+                # remaining phase is its own execute_agent() call that re-acquires
+                # the same project_checkout lock, so continuing pays that lock's
+                # full (~3h) timeout once per phase — and with every phase failing,
+                # phases_completed==0 raises NonRetryableAgentError below, which
+                # project_monitor routes to mark_failed() and a durably retained
+                # board lock. Propagating instead sends it to
+                # _end_pr_review_pipeline_run_on_failure()'s release branch, so the
+                # next board poll is the retry.
+                from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                if is_lock_timeout_error(e):
+                    logger.warning(
+                        f"PR review abandoned: could not acquire a project resource lock "
+                        f"— {describe_lock_timeout(e)}"
+                    )
+                    raise
+
                 logger.error(f"Phase 1 PR review failed: {e}", exc_info=True)
                 review_summary_parts.append(f"### PR Code Review\n\nFailed: {e}")
 
@@ -615,6 +633,17 @@ class PRReviewStage(PipelineStage):
                         }, pipeline_run_id)
 
                 except Exception as e:
+                    # Resource-lock timeout: abandon the review — see the Phase 1
+                    # handler above for why paying this lock's timeout once per
+                    # remaining phase is the wrong answer.
+                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    if is_lock_timeout_error(e):
+                        logger.warning(
+                            f"PR review abandoned during {check_name} verification: could not "
+                            f"acquire a project resource lock — {describe_lock_timeout(e)}"
+                        )
+                        raise
+
                     logger.error(f"{check_name} verification failed: {e}", exc_info=True)
                     review_summary_parts.append(f"### {check_name} Verification\n\nFailed: {e}")
 
@@ -698,6 +727,16 @@ class PRReviewStage(PipelineStage):
                         }, pipeline_run_id)
 
                 except Exception as e:
+                    # Resource-lock timeout: abandon the review — see the Phase 1
+                    # handler above.
+                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    if is_lock_timeout_error(e):
+                        logger.warning(
+                            f"PR review abandoned during consolidation: could not acquire a "
+                            f"project resource lock — {describe_lock_timeout(e)}"
+                        )
+                        raise
+
                     logger.error(f"Phase 4 consolidation failed: {e}", exc_info=True)
                     review_summary_parts.append(f"### Consolidation\n\nFailed: {e}")
 

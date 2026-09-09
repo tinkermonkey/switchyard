@@ -323,6 +323,21 @@ class RepairCycleRunner:
             logger.warning(f"Repair cycle paused by Claude Code circuit breaker: {e}")
             return {'overall_success': False, 'frozen': True, 'error': str(e)}
         except Exception as e:
+            # Project resource-lock timeout (#148): another holder owned this
+            # project's base clone (or its dev-container build slot) for the whole
+            # of that lock's timeout, so no agent in this cycle ever ran. Distinct
+            # from the generic branch below for the same reason ClaudeCodeRateLimit
+            # Error is: project_monitor's container-completion handler must not post
+            # a "manual intervention required" comment or durably retain the board's
+            # pipeline lock over pure contention — the next board poll is the retry.
+            from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+            if is_lock_timeout_error(e):
+                logger.warning(
+                    f"Repair cycle could not acquire a project resource lock: "
+                    f"{describe_lock_timeout(e)}"
+                )
+                return {'overall_success': False, 'lock_contention': True, 'error': str(e)}
+
             logger.error(f"Repair cycle execution failed: {e}", exc_info=True)
             return {'overall_success': False, 'error': str(e)}
 
@@ -387,7 +402,8 @@ class RepairCycleRunner:
 
         Returns:
             Exit code (0=success, 1=failure, 2=error, 3=timeout, 4=cancelled,
-            5=frozen by Claude Code circuit breaker, will auto-resume)
+            5=frozen by Claude Code circuit breaker, will auto-resume,
+            6=blocked by a project resource-lock timeout, retried on next poll)
         """
         try:
             logger.info("=" * 80)
@@ -427,6 +443,12 @@ class RepairCycleRunner:
                     f"Repair cycle paused by Claude Code circuit breaker: {result.get('error')}"
                 )
                 return 5
+            elif result.get('lock_contention'):
+                logger.warning(
+                    f"Repair cycle blocked by a project resource-lock timeout: "
+                    f"{result.get('error')}"
+                )
+                return 6
             elif result.get('error'):
                 logger.error(f"Repair cycle failed with error: {result.get('error')}")
                 return 2
