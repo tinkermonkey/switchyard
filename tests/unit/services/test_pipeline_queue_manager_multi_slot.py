@@ -238,9 +238,39 @@ class TestResetIssueToWaitingCompareAndSwap:
         assert queue_manager.get_issue_status(902) == 'active'
 
     def test_unconditional_reset_still_works_without_the_token(self, queue_manager):
-        """Rollback call sites undoing their OWN mark_issue_active() in the
-        same breath don't need the token and must be unaffected."""
+        """The token stays optional: the recovery paths that deliberately reset
+        whatever they find (trigger_agent_for_status' no-agent and dispatch-
+        failure branches) must be unaffected."""
         queue_manager.save_queue([_active_issue(903)])
 
         assert queue_manager.reset_issue_to_waiting(903) is True
         assert queue_manager.get_issue_status(903) == 'waiting'
+
+    def test_mark_issue_active_returns_the_token_it_stamped(self, queue_manager):
+        """#147: the dispatch call sites release the pipeline lock BEFORE
+        resetting (holding it across the reset does not exclude a competing
+        dispatcher -- try_acquire_lock() returns "already_holds_lock" for the
+        current holder and trigger_agent_for_status() dispatches on that
+        branch). That ordering needs the compare-and-swap, so
+        mark_issue_active() has to hand its stamp back to the caller."""
+        queue_manager.save_queue([{
+            'issue_number': 904,
+            'status': 'waiting',
+            'position_in_column': 0,
+        }])
+
+        token = queue_manager.mark_issue_active(904)
+
+        assert token is not None
+        assert queue_manager.reset_issue_to_waiting(
+            904, expected_activated_at=token
+        ) is True
+        assert queue_manager.get_issue_status(904) == 'waiting'
+
+    def test_mark_issue_active_returns_none_for_an_issue_not_in_queue(self, queue_manager):
+        """No stamp means the rollback has nothing to undo -- and must NOT
+        reset unconditionally, or it could clobber an activation it never
+        made."""
+        queue_manager.save_queue([])
+
+        assert queue_manager.mark_issue_active(905) is None

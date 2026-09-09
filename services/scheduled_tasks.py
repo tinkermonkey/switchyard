@@ -693,6 +693,47 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Error in queue state reconciliation: {e}", exc_info=True)
 
+    def _has_durable_conversational_signal(
+        self, project_name: str, issue_number: int
+    ) -> bool:
+        """
+        True if Redis still holds a liveness signal for a conversational loop on
+        this issue — or if Redis could not be asked at all.
+
+        The two keys are the ones ProjectMonitor's FAILSAFE already treats as the
+        authority on "is this conversational loop alive"
+        (orchestrator:feedback_loop:heartbeat:* is re-set on every 30s poll with
+        a 5m TTL; orchestrator:conversational_loop:* is the distributed
+        start_feedback_loop lock). Unlike
+        HumanFeedbackLoopExecutor.active_loops, they survive an orchestrator
+        restart, which is exactly the case that makes a live conversation look
+        dead to every in-process probe.
+
+        Fails CLOSED: an unreachable Redis returns True, leaving the entry alone.
+        Resetting a live conversational entry re-queues it for dispatch while a
+        human is mid-thread, which is a far worse outcome than deferring the
+        sweep for one issue to the next 10-minute run.
+        """
+        try:
+            import redis as _redis_mod
+            client = _redis_mod.Redis(host='redis', port=6379, decode_responses=True)
+            heartbeat_key = f"orchestrator:feedback_loop:heartbeat:{project_name}:{issue_number}"
+            loop_lock_key = f"orchestrator:conversational_loop:{project_name}:{issue_number}"
+            if client.exists(heartbeat_key) or client.exists(loop_lock_key):
+                logger.debug(
+                    f"Issue #{issue_number} in {project_name} still has a conversational "
+                    f"loop signal in Redis — not a stranded queue entry"
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(
+                f"Could not read conversational loop liveness keys for #{issue_number} "
+                f"in {project_name} — treating the entry as live and skipping the "
+                f"stranded check: {e}"
+            )
+            return True
+
     def _reset_stranded_active_issues(
         self, queue_manager, project_name: str, board_name: str
     ) -> int:
@@ -735,9 +776,20 @@ class ScheduledTasksService:
           - work_execution_tracker.has_active_execution() says nothing is running
             for it — the canonical liveness predicate, covering regular agent
             executions, review cycles, repair-cycle containers and conversational
-            feedback loops. This is the guard that matters for conversational
-            issues, which are marked active WITHOUT ever taking the lock, so the
-            lock check can never protect them.
+            feedback loops.
+          - no durable conversational-liveness signal exists for it in Redis.
+            This, NOT has_active_execution(), is the guard that matters for
+            conversational issues — which are marked active WITHOUT ever taking
+            the lock, so the lock check can never protect them either. All three
+            of has_active_execution()'s non-history checks read in-process dicts,
+            and HumanFeedbackLoopExecutor.initialize() clears active_loops
+            unconditionally on every restart; human_feedback_loop only records an
+            execution per agent TURN, so an idle loop waiting on a human has no
+            in_progress entry. After a routine restart a live, listening
+            conversation therefore reads as completely dead to every in-process
+            probe. The heartbeat/lock keys ProjectMonitor's FAILSAFE already
+            treats as conversational liveness truth survive it, so they are
+            consulted here too — and a Redis read that raises fails closed.
           - it has no active PipelineRun
           - its `activated_at` has not changed since it was sampled (the reset is
             a compare-and-swap): the liveness checks above are slow enough — a
@@ -835,6 +887,12 @@ class ScheduledTasksService:
                 )
                 continue
 
+            # The durable half of the conversational liveness check — see this
+            # method's docstring for why the in-process probes above cannot
+            # carry it on their own.
+            if self._has_durable_conversational_signal(project_name, issue_number):
+                continue
+
             try:
                 active_run = run_manager.get_active_pipeline_run(
                     project_name, issue_number, board=board_name
@@ -862,8 +920,8 @@ class ScheduledTasksService:
                         f"Reset stranded queue entry for issue #{issue_number} on "
                         f"{project_name}/{board_name} from 'active' back to 'waiting' — "
                         f"active for {age_minutes:.0f}m with no pipeline lock, no active "
-                        f"work execution and no active pipeline run (dispatch rollback "
-                        f"almost certainly leaked)"
+                        f"work execution, no conversational loop signal in Redis and no "
+                        f"active pipeline run (dispatch rollback almost certainly leaked)"
                     )
             except Exception as e:
                 logger.error(

@@ -13,6 +13,10 @@ from unittest.mock import Mock, patch, MagicMock
 from tests.unit.orchestrator.mocks import MockGitHubAPI
 from tests.unit.orchestrator.conftest import create_test_issue
 
+# The activated_at stamp mark_issue_active() returns and the rollback hands
+# back to reset_issue_to_waiting() as its compare-and-swap token.
+ACTIVATED_AT = '2026-01-01T00:00:00+00:00'
+
 
 class TestPipelineProgression:
     """Test automatic progression through pipeline stages"""
@@ -585,7 +589,9 @@ class TestReleaseLockAndProcessNext:
         mock_run_manager.ensure_pipeline_run_for_task.return_value = 'run-200'
         # The column is resolved from GitHub, not from the queue entry -- queue
         # entries never carry one (see _mocks() in the rollback suite below).
-        mock_run_manager._get_issue_column_from_github.return_value = 'Development'
+        # (column, reads_healthy) so a failed board read is never mistaken for
+        # "the issue isn't on the board".
+        mock_run_manager._resolve_issue_column_from_github.return_value = ('Development', True)
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -643,7 +649,8 @@ class TestReleaseLockAndProcessNextDispatchRollback:
     status=='waiting', so that issue was silently excluded from every future
     dispatch, forever, with no automated recovery."""
 
-    def _mocks(self, agent='senior_software_engineer', github_column='Development'):
+    def _mocks(self, agent='senior_software_engineer', github_column='Development',
+               column_reads_ok=True):
         our_lock = Mock()
         our_lock.locked_by_issue = 100
 
@@ -654,9 +661,13 @@ class TestReleaseLockAndProcessNextDispatchRollback:
 
         mock_queue = Mock()
         mock_queue.is_issue_in_queue.return_value = True
+        # The compare-and-swap token the rollback has to hand back.
+        mock_queue.mark_issue_active.return_value = ACTIVATED_AT
 
         mock_run_manager = Mock()
-        mock_run_manager._get_issue_column_from_github.return_value = github_column
+        mock_run_manager._resolve_issue_column_from_github.return_value = (
+            github_column, column_reads_ok
+        )
 
         dev_column = Mock()
         dev_column.name = 'Development'
@@ -718,7 +729,9 @@ class TestReleaseLockAndProcessNextDispatchRollback:
 
         # Both halves rolled back.
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
-        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
 
     def test_rolls_back_when_issue_fetch_raises(self):
         """_get_issue_details() raises RuntimeError after 3 failed attempts —
@@ -748,7 +761,9 @@ class TestReleaseLockAndProcessNextDispatchRollback:
             progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
 
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
-        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
 
     def test_rolls_back_when_next_issue_column_has_no_agent(self):
         """A queued issue sitting in an agent-less column used to be logged as
@@ -767,7 +782,9 @@ class TestReleaseLockAndProcessNextDispatchRollback:
 
         mock_task_queue.enqueue.assert_not_called()
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
-        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
 
     def test_failure_on_one_slot_does_not_abort_remaining_slots(self):
         """The try/except must be PER ITERATION, not method-level: with the
@@ -790,7 +807,9 @@ class TestReleaseLockAndProcessNextDispatchRollback:
 
         # Failed candidate fully rolled back...
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
-        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
 
         # ...and the loop still went on to dispatch the second candidate.
         mock_task_queue.enqueue.assert_called_once()
@@ -825,8 +844,8 @@ class TestReleaseLockAndProcessNextDispatchRollback:
         self._run(mock_lock_manager, mock_queue, mock_run_manager,
                   workflow_template, project_config, mock_task_queue)
 
-        mock_run_manager._get_issue_column_from_github.assert_called_once()
-        assert mock_run_manager._get_issue_column_from_github.call_args[0][2] == 200
+        mock_run_manager._resolve_issue_column_from_github.assert_called_once()
+        assert mock_run_manager._resolve_issue_column_from_github.call_args[0][2] == 200
 
         mock_task_queue.enqueue.assert_called_once()
         dispatched_task = mock_task_queue.enqueue.call_args[0][0]
@@ -854,16 +873,20 @@ class TestReleaseLockAndProcessNextDispatchRollback:
                   workflow_template, project_config, mock_task_queue)
 
         mock_task_queue.enqueue.assert_not_called()
-        mock_queue.reset_issue_to_waiting.assert_called_once_with(200)
+        mock_queue.reset_issue_to_waiting.assert_called_once_with(
+            200, expected_activated_at=ACTIVATED_AT
+        )
         mock_lock_manager.release_lock.assert_any_call('test-project', 'dev', 200)
 
-    def test_rollback_resets_queue_entry_before_releasing_the_lock(self):
-        """ORDER REGRESSION: releasing the lock first leaves a window where the
-        lock is free while the entry still reads 'active'. The 30s monitor poll
-        can acquire it, mark it active and dispatch for real in that window --
-        and the reset would then flip a genuinely-running, lock-holding issue
-        back to 'waiting', making it double-dispatchable (try_acquire_lock
-        returns True/"already_holds_lock" for the current holder)."""
+    def test_rollback_releases_the_lock_before_the_compare_and_swap_reset(self):
+        """ORDER REGRESSION (#147): the reset must NOT run while the lock is
+        still held. try_acquire_lock() returns True/"already_holds_lock" for the
+        current holder and trigger_agent_for_status() dispatches on that branch,
+        so a competing poll can genuinely start #200 in that window -- and the
+        unconditional release that follows would then free the lock out from
+        under a running agent. Releasing first opens the symmetric window ("lock
+        free, entry still 'active'"), which the activated_at compare-and-swap
+        closes instead."""
         (mock_lock_manager, mock_queue, mock_run_manager,
          workflow_template, project_config) = self._mocks()
 
@@ -886,11 +909,12 @@ class TestReleaseLockAndProcessNextDispatchRollback:
                   workflow_template, project_config, mock_task_queue)
 
         # release-100 is the exiting issue's own release, before dispatch.
-        assert call_order == ['release-100', 'reset', 'release-200']
+        assert call_order == ['release-100', 'release-200', 'reset']
 
     def test_rollback_still_releases_lock_when_queue_reset_raises(self):
-        """The reset moving first must not be able to strand the lock: a
-        failing reset loses one issue, a retained lock deadlocks the board."""
+        """A failing reset loses one issue; a retained lock deadlocks the whole
+        board. The release runs first and unconditionally so the second can
+        never happen because of the first."""
         (mock_lock_manager, mock_queue, mock_run_manager,
          workflow_template, project_config) = self._mocks()
 

@@ -970,8 +970,19 @@ class TestResetStrandedActiveIssues:
         lock.locked_by_issue = locked_by_issue
         return lock
 
+    def _redis(self, conversational_keys_exist=False, raises=False):
+        """Stand-in for the Redis holding the conversational loop's durable
+        liveness keys (the heartbeat and the distributed loop lock)."""
+        client = MagicMock()
+        if raises:
+            client.exists.side_effect = ConnectionError("redis unreachable")
+        else:
+            client.exists.return_value = 1 if conversational_keys_exist else 0
+        return client
+
     def _sweep(self, scheduled_tasks_service, queue_manager, lock=None,
-               active_run=None, reads_healthy=True, has_active_execution=False):
+               active_run=None, reads_healthy=True, has_active_execution=False,
+               redis_client=None):
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_fail_closed.return_value = (lock, reads_healthy)
 
@@ -981,11 +992,14 @@ class TestResetStrandedActiveIssues:
         mock_tracker = MagicMock()
         mock_tracker.has_active_execution.return_value = has_active_execution
 
+        redis_client = redis_client if redis_client is not None else self._redis()
+
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
                    return_value=mock_lock_manager), \
              patch('services.pipeline_run.get_pipeline_run_manager',
                    return_value=mock_run_manager), \
-             patch('services.work_execution_state.work_execution_tracker', mock_tracker):
+             patch('services.work_execution_state.work_execution_tracker', mock_tracker), \
+             patch('redis.Redis', return_value=redis_client):
             return scheduled_tasks_service._reset_stranded_active_issues(
                 queue_manager, 'test-project', 'dev'
             )
@@ -1177,6 +1191,93 @@ class TestResetStrandedActiveIssues:
         assert reset_count == 1
         queue_manager.reset_issue_to_waiting.assert_called_once_with(
             300, expected_activated_at=stranded['activated_at']
+        )
+
+    # --- Conversational entries (#147) ------------------------------------
+    # The riskiest false-positive class for this sweep, because it is the one
+    # shape where all of the original guards are legitimately satisfied by an
+    # issue that is genuinely alive:
+    #   - conversational columns are marked active WITHOUT ever taking the
+    #     pipeline lock (project_monitor's is_conversational_col branch), so
+    #     lock_holder can never protect them;
+    #   - human_feedback_loop records an execution per agent TURN, so an idle
+    #     loop waiting on a human has no in_progress entry;
+    #   - has_active_execution()'s three remaining checks all read in-process
+    #     dicts, and HumanFeedbackLoopExecutor.initialize() clears active_loops
+    #     unconditionally on every restart;
+    #   - get_active_pipeline_run() returns None for "couldn't tell" as well as
+    #     for "no run", and hdel's the mapping once the Redis key has expired.
+    # So after a routine restart a live, listening conversation reads as
+    # completely dead. The durable Redis keys are what actually distinguish it.
+
+    def test_skips_live_conversational_entry_after_a_restart(self, scheduled_tasks_service):
+        """REGRESSION (#147): #500 is listening in a conversational column, no
+        lock, activated 3h ago. The orchestrator restarted, so active_loops is
+        empty and every in-process probe reads False; the run lookup returns
+        None too. Only the conversational loop's Redis heartbeat/lock keys still
+        say it is alive — and they must be enough to leave it alone. Resetting
+        makes a live conversation a selectable dispatch candidate while a human
+        is mid-thread."""
+        entry = self._entry(500, age_minutes=180)
+        queue_manager = self._queue_manager([entry])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager,
+            lock=None, active_run=None, has_active_execution=False,
+            redis_client=self._redis(conversational_keys_exist=True),
+        )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_checks_both_conversational_liveness_keys(self, scheduled_tasks_service):
+        """The heartbeat (re-set every poll, 5m TTL) and the distributed loop
+        lock are the two keys project_monitor's FAILSAFE already treats as
+        conversational liveness truth — both are consulted here."""
+        redis_client = self._redis(conversational_keys_exist=False)
+        queue_manager = self._queue_manager([self._entry(500, age_minutes=180)])
+
+        self._sweep(scheduled_tasks_service, queue_manager, redis_client=redis_client)
+
+        checked = {call.args[0] for call in redis_client.exists.call_args_list}
+        assert 'orchestrator:feedback_loop:heartbeat:test-project:500' in checked
+        assert 'orchestrator:conversational_loop:test-project:500' in checked
+
+    def test_skips_entry_when_the_conversational_liveness_read_errors(
+        self, scheduled_tasks_service
+    ):
+        """Fails CLOSED like every other probe here: an unreachable Redis means
+        the sweep cannot establish that nothing is running, so it defers to the
+        next 10-minute run rather than resetting."""
+        queue_manager = self._queue_manager([self._entry(500, age_minutes=180)])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager,
+            redis_client=self._redis(raises=True),
+        )
+
+        assert reset_count == 0
+        queue_manager.reset_issue_to_waiting.assert_not_called()
+
+    def test_resets_lockless_entry_once_the_conversational_signals_are_gone(
+        self, scheduled_tasks_service
+    ):
+        """The other half of the decision, stated explicitly: a lock-less entry
+        whose loop left no Redis signal at all IS treated as stranded and reset.
+        A dead conversational loop's entry is otherwise excluded from dispatch
+        forever, which is the state #142/#147 exist to eliminate."""
+        entry = self._entry(500, age_minutes=180)
+        queue_manager = self._queue_manager([entry])
+
+        reset_count = self._sweep(
+            scheduled_tasks_service, queue_manager,
+            lock=None, active_run=None, has_active_execution=False,
+            redis_client=self._redis(conversational_keys_exist=False),
+        )
+
+        assert reset_count == 1
+        queue_manager.reset_issue_to_waiting.assert_called_once_with(
+            500, expected_activated_at=entry['activated_at']
         )
 
     def test_no_active_entries_short_circuits(self, scheduled_tasks_service):

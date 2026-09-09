@@ -503,9 +503,6 @@ class TestReviewCycleCompletionQueueDispatch:
                         project_monitor.task_queue.enqueue.assert_not_called()
 
 
-if __name__ == '__main__':
-    pytest.main([__file__, '-v'])
-
     async def test_rolls_back_lock_and_queue_when_dispatch_fails(
         self,
         project_monitor,
@@ -518,9 +515,15 @@ if __name__ == '__main__':
         and the stranded-'active' sweep in scheduled_tasks cannot recover THIS
         site, because ensure_pipeline_run_for_task() has already created an
         active PipelineRun by the time the enqueue can fail and the sweep skips
-        any entry that has one. The entry must be reset here, BEFORE the lock
-        is released so no competing dispatcher can observe "lock free, entry
-        still active" and double-dispatch."""
+        any entry that has one.
+
+        The lock is released FIRST and the reset then runs under the
+        mark_issue_active() compare-and-swap token (#147): holding the lock
+        across the reset does not exclude a competing dispatcher, because
+        try_acquire_lock() returns True/"already_holds_lock" for the current
+        holder and trigger_agent_for_status() dispatches on that branch -- the
+        unconditional release would then free the lock out from under a real
+        agent."""
         project_config = mock_config_manager.get_project_config("test_project")
         workflow_template = mock_config_manager.get_workflow_template("sdlc_execution_workflow")
         review_column = workflow_template.columns[1]  # "Code Review"
@@ -559,6 +562,7 @@ if __name__ == '__main__':
                             mock_queue_mgr.get_next_n_waiting_issues.return_value = [
                                 {'issue_number': 456, 'position_in_column': 0}
                             ]
+                            mock_queue_mgr.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
                             mock_queue_mgr.reset_issue_to_waiting.side_effect = (
                                 lambda *a, **kw: call_order.append('reset') or True
                             )
@@ -583,6 +587,14 @@ if __name__ == '__main__':
                             await asyncio.sleep(0.5)
 
                         mock_queue_mgr.mark_issue_active.assert_called_once_with(456)
-                        # BOTH halves rolled back, queue entry first.
-                        mock_queue_mgr.reset_issue_to_waiting.assert_called_once_with(456)
-                        assert call_order == ['release-123', 'reset', 'release-456']
+                        # BOTH halves rolled back: lock first, then the entry
+                        # under the compare-and-swap token mark_issue_active()
+                        # returned.
+                        mock_queue_mgr.reset_issue_to_waiting.assert_called_once_with(
+                            456, expected_activated_at='2026-01-01T00:00:00+00:00'
+                        )
+                        assert call_order == ['release-123', 'release-456', 'reset']
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

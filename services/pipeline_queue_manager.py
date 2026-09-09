@@ -401,20 +401,33 @@ class PipelineQueueManager:
                 f"(position: {position}, status: waiting)"
             )
 
-    def mark_issue_active(self, issue_number: int):
-        """Mark issue as active (currently executing)"""
+    def mark_issue_active(self, issue_number: int) -> Optional[str]:
+        """
+        Mark issue as active (currently executing).
+
+        Returns:
+            The `activated_at` timestamp stamped on the entry, to be passed
+            back as reset_issue_to_waiting(expected_activated_at=...) if this
+            activation later has to be rolled back — the compare-and-swap that
+            stops a rollback from flipping a DIFFERENT, genuinely-running
+            activation back to 'waiting'. None when the issue isn't in the
+            queue at all (nothing was stamped, so there is nothing to undo).
+        """
         with self._queue_lock():
             queue = self.load_queue()
 
+            activated_at = None
             for issue in queue:
                 if issue['issue_number'] == issue_number:
+                    activated_at = datetime.now(timezone.utc).isoformat()
                     issue['status'] = 'active'
-                    issue['activated_at'] = datetime.now(timezone.utc).isoformat()
+                    issue['activated_at'] = activated_at
                     break
 
             self.save_queue(queue)
 
             logger.info(f"Marked issue #{issue_number} as active in pipeline queue")
+            return activated_at
 
     def sync_queue_with_github(
         self,
@@ -638,8 +651,20 @@ class PipelineQueueManager:
                 and resetting would flip a genuinely-running issue back to
                 'waiting'. Callers that sample queue state and then perform slow
                 liveness checks (see ScheduledTasksService._reset_stranded_active_issues)
-                MUST pass this; callers rolling back their own mark_issue_active()
-                in the same breath do not need it.
+                MUST pass this.
+
+                So MUST the dispatch call sites rolling back their own
+                mark_issue_active(): they release the pipeline lock BEFORE
+                resetting (holding it across the reset is not safe either —
+                try_acquire_lock() returns True/"already_holds_lock" for the
+                current holder, and ProjectMonitor.trigger_agent_for_status()
+                re-dispatches on that branch), which opens exactly the window
+                this token closes. Pass the value mark_issue_active() returned;
+                a None token means nothing was stamped, so skip the reset.
+
+        Returns:
+            True if the entry was reset, False if it wasn't 'active', wasn't
+            found, or the compare-and-swap refused.
         """
         with self._queue_lock():
             queue = self.load_queue()

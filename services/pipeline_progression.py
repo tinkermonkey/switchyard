@@ -501,20 +501,33 @@ class PipelineProgression:
                 )
                 
                 if acquired:
-                    pipeline_queue.mark_issue_active(next_issue['issue_number'])
-
                     # SAFETY: every step from here to the enqueue can raise
-                    # (config lookup, GitHub issue fetch, pipeline-run creation,
-                    # enqueue itself). Each slot's dispatch attempt needs its OWN
-                    # try/except: the method-level handler below only logs, which
-                    # left the lock held AND the queue entry stuck at 'active'
-                    # forever -- and get_next_n_waiting_issues() filters strictly
-                    # on status=='waiting', so that issue was silently excluded
-                    # from every future dispatch with no automated recovery
-                    # (#142). Mirrors the rollback in the sibling dispatch site,
+                    # (the mark_issue_active() queue write, config lookup, GitHub
+                    # issue fetch, pipeline-run creation, enqueue itself). Each
+                    # slot's dispatch attempt needs its OWN try/except: the
+                    # method-level handler below only logs, which left the lock
+                    # held AND the queue entry stuck at 'active' forever -- and
+                    # get_next_n_waiting_issues() filters strictly on
+                    # status=='waiting', so that issue was silently excluded from
+                    # every future dispatch with no automated recovery (#142).
+                    # Mirrors the rollback in the sibling dispatch site,
                     # PipelineRunManager.end_pipeline_run().
                     dispatched = False
+                    # CAS token from mark_issue_active(); None until it has
+                    # actually stamped one, so a mark that never landed is not
+                    # "undone" onto somebody else's activation.
+                    activated_at = None
                     try:
+                        # INSIDE the try, not above it: mark_issue_active() takes
+                        # an fcntl lock and rewrites the queue YAML, so it raises
+                        # on ENOSPC / a read-only or full state/ volume / a
+                        # permissions change (state/ is a bind-mounted host
+                        # directory -- ordinary operational conditions). Outside,
+                        # that raise skipped the whole rollback below and left the
+                        # lock held with nothing dispatched: the exact deadlock
+                        # this block exists to prevent.
+                        activated_at = pipeline_queue.mark_issue_active(next_issue['issue_number'])
+
                         # Get agent for this column
                         project_config = config_manager.get_project_config(project_name)
                         pipeline_config = next(p for p in project_config.pipelines if p.board_name == board_name)
@@ -531,13 +544,24 @@ class PipelineProgression:
                         # sites already re-resolve from GitHub for the same reason
                         # the cached column would be wrong anyway: the user may
                         # have moved the issue since it was queued
-                        # (PipelineRunManager._get_issue_column_from_github(),
-                        # ProjectMonitor.get_issue_column_sync()).
-                        current_column = pipeline_run_manager._get_issue_column_from_github(
-                            project_config, pipeline_config, next_issue['issue_number']
+                        # (PipelineRunManager._resolve_issue_column_from_github(),
+                        # ProjectMonitor.get_issue_column_sync()). The
+                        # (column, reads_ok) variant is used so a failed board
+                        # query is never reported as "not on the board".
+                        current_column, column_reads_ok = (
+                            pipeline_run_manager._resolve_issue_column_from_github(
+                                project_config, pipeline_config, next_issue['issue_number']
+                            )
                         )
 
                         if not current_column:
+                            if not column_reads_ok:
+                                raise Exception(
+                                    f"Could not read board '{board_name}' to resolve the column "
+                                    f"for issue #{next_issue['issue_number']} — dispatch deferred "
+                                    f"(the queue entry and lock are rolled back, so the next "
+                                    f"exit or poll retries)"
+                                )
                             raise Exception(
                                 f"Issue #{next_issue['issue_number']} not found on board "
                                 f"'{board_name}' — cannot determine which agent to dispatch"
@@ -638,33 +662,24 @@ class PipelineProgression:
                                 f"#{next_issue['issue_number']}, rolling back lock "
                                 f"acquisition and queue status to prevent deadlock"
                             )
-                            # ORDER MATTERS: reset the queue entry BEFORE releasing
-                            # the lock. While the lock is still held no competing
-                            # dispatcher can acquire it (try_acquire_lock refuses,
-                            # and project_monitor's non-conversational path returns
-                            # before mark_issue_active), so the two pieces of state
-                            # can never be observed in the dangerous combination
-                            # "lock free, entry still 'active'". Released first, the
-                            # 30s monitor poll can slip in, re-acquire, re-activate
-                            # and dispatch #N for real -- and the reset below would
-                            # then flip a genuinely-running, lock-holding issue back
-                            # to 'waiting', making it a selectable candidate for a
-                            # SECOND dispatch (try_acquire_lock returns True /
-                            # "already_holds_lock" for the current holder).
-                            try:
-                                pipeline_queue.reset_issue_to_waiting(next_issue['issue_number'])
-                            except Exception as reset_error:
-                                logger.critical(
-                                    f"Could NOT reset queue entry for issue "
-                                    f"#{next_issue['issue_number']} back to 'waiting' after "
-                                    f"dispatch failed - it will be excluded from all future "
-                                    f"dispatch on {project_name}/{board_name} until a human "
-                                    f"intervenes: {reset_error}"
-                                )
-
-                            # Released unconditionally, even if the reset above
-                            # failed: holding the lock on top of a lost queue entry
-                            # deadlocks the whole board rather than just this issue.
+                            # ORDER: release the lock FIRST, then reset the entry
+                            # under a compare-and-swap on the activated_at this
+                            # dispatch stamped. Holding the lock across the reset is
+                            # NOT safe -- try_acquire_lock() returns True /
+                            # "already_holds_lock" for the current holder, and
+                            # ProjectMonitor.trigger_agent_for_status() dispatches on
+                            # that branch, so a competing poll can genuinely start
+                            # #N while we still hold its lock, and the unconditional
+                            # release below would then free the lock out from under a
+                            # running agent. Releasing first leaves the symmetric
+                            # window ("lock free, entry still 'active'"), which the
+                            # CAS closes instead: a re-activation stamps a fresh
+                            # activated_at, the reset refuses, and the running issue
+                            # is correctly left 'active'.
+                            #
+                            # Released unconditionally, and before the reset: holding
+                            # the lock on top of a lost queue entry deadlocks the
+                            # whole board rather than just this issue.
                             try:
                                 lock_manager.release_lock(
                                     project_name, board_name, next_issue['issue_number']
@@ -672,6 +687,21 @@ class PipelineProgression:
                                 logger.info(f"Rolled back lock for issue #{next_issue['issue_number']}")
                             except Exception as rollback_error:
                                 logger.error(f"Failed to rollback lock: {rollback_error}")
+
+                            if activated_at is not None:
+                                try:
+                                    pipeline_queue.reset_issue_to_waiting(
+                                        next_issue['issue_number'],
+                                        expected_activated_at=activated_at,
+                                    )
+                                except Exception as reset_error:
+                                    logger.critical(
+                                        f"Could NOT reset queue entry for issue "
+                                        f"#{next_issue['issue_number']} back to 'waiting' after "
+                                        f"dispatch failed - it will be excluded from all future "
+                                        f"dispatch on {project_name}/{board_name} until the "
+                                        f"stranded-'active' sweep or a human intervenes: {reset_error}"
+                                    )
 
                         logger.error(
                             f"Error dispatching agent for next issue "
