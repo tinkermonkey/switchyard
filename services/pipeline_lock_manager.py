@@ -9,6 +9,8 @@ Only ONE issue can hold the pipeline lock at a time. Other issues wait in queue.
 
 import yaml
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 import logging
 import os
 import sys
@@ -50,6 +52,30 @@ LOCK_TTL_SECONDS = 7200
 # failure instead of a thread parked forever.
 STATE_LOCK_TIMEOUT_SECONDS = 20
 
+# Socket budget for every Redis call this class makes, and -- with
+# LOCK_REDIS_RETRY below -- the whole cost of one round trip against a Redis
+# that is not answering. Named rather than left as two literals because
+# RELEASE_GUARD_RETRY_TIMEOUT_SECONDS is sized in multiples of it.
+LOCK_REDIS_SOCKET_TIMEOUT_SECONDS = 5
+
+# ONE attempt per Redis command, with no backoff (found in the #139 review
+# round). redis-py does NOT default to this: since 6.0 every client is built
+# with Retry(ExponentialWithJitterBackoff(), retries=10) unless a retry policy
+# is passed, so a command against a host that drops SYNs costs eleven
+# socket_connect_timeout waits plus backoff -- measured at ~59s per call
+# against this deployment's redis 8.1.0, not the 5s the timeouts above read as.
+# That multiplier lands squarely inside the '<state>.yaml.acquire.lock' guard,
+# whose worst-case hold is what the release budget below is derived from, and
+# it is invisible at every call site.
+#
+# Dropping the retries costs this class nothing it does not already have: every
+# Redis call here is inside a try/except whose fallback is the YAML store (see
+# _try_acquire_lock_unguarded's fall-through and get_lock()'s two-store read),
+# and every caller of try_acquire_lock() polls, so a blip that redis-py's
+# default would have papered over becomes one guarded YAML-path attempt and a
+# retry a few seconds later rather than a minute parked inside the guard.
+LOCK_REDIS_RETRY = Retry(NoBackoff(), 0)
+
 # How long release_lock() waits for the '<state>.yaml.acquire.lock' guard on
 # its FIRST attempt. Spelled out rather than left to utils.file_lock's own
 # default so the two budgets below read as one deliberate decision.
@@ -69,22 +95,40 @@ RELEASE_GUARD_TIMEOUT_SECONDS = 10
 # (services/project_checkout_lock.py's release site spells this consequence out
 # at its call to _release_and_warn). The contention is also
 # asymmetric in the wrong direction: every try_acquire_lock() takes this same
-# guard, and on its YAML-fallback path -- reached exactly when Redis is
-# unavailable -- each attempt holds it for several seconds of Redis socket
+# guard, and when Redis is unavailable -- which is when this contention
+# actually happens -- each attempt holds it for several seconds of Redis socket
 # timeouts, so two waiters polling every DEFAULT_POLL_INTERVAL_SECONDS can hold
-# it almost continuously. (Its Redis path holds the guard too, since the #139
-# review round, but only for a transaction and a small YAML write.)
+# it almost continuously. Since the #139 review round the guard covers
+# try_acquire_lock()'s Redis branch as well as its YAML fallback, so an
+# unreachable Redis is paid for inside the guard on BOTH of them.
 #
 # Sized against the longest a guard holder can now legitimately hold it. The
-# longest guarded section is try_acquire_lock()'s YAML-fallback stale-lock
-# recovery, which takes the inner '<state>.yaml.lock' four times -- its opening
-# get_lock(), the fail-closed read inside _release_lock_unguarded(), that
-# release's own delete, and _create_lock()'s write -- around four Redis round
-# trips at a 5s socket timeout each. All four of those acquisitions are bounded
-# by STATE_LOCK_TIMEOUT_SECONDS (they were not, before the WI-8 review round,
-# which is what made the 35s figure this used to cite underivable), so the
-# worst case is 4 * STATE_LOCK_TIMEOUT_SECONDS + ~20s of Redis, and this budget
-# covers it with margin.
+# longest guarded section is a try_acquire_lock() whose Redis branch fails and
+# whose YAML fallback then recovers a stale lock. That takes the inner
+# '<state>.yaml.lock' four times -- get_lock()'s read, the fail-closed read
+# inside _release_lock_unguarded(), that release's own delete, and
+# _create_lock()'s write -- and makes five Redis calls that each have to fail
+# before it can move on: the Redis branch's opening watch, get_lock()'s read,
+# the fail-closed read's, the Redis leg of the release, and _create_lock()'s
+# hset.
+#
+# Both multipliers are bounded only because something makes them so, and both
+# had to be made so deliberately:
+#
+#   - all four inner-lock acquisitions pass STATE_LOCK_TIMEOUT_SECONDS (they
+#     did not, before the WI-8 review round, which is what made the 35s figure
+#     this used to cite underivable), and
+#   - one Redis call really costs LOCK_REDIS_SOCKET_TIMEOUT_SECONDS only
+#     because LOCK_REDIS_RETRY replaces redis-py's default ten retries with
+#     one attempt -- with that default the same five calls are ~59s each and
+#     nothing below is derivable.
+#
+# So the worst case is 4 * STATE_LOCK_TIMEOUT_SECONDS + 5 *
+# LOCK_REDIS_SOCKET_TIMEOUT_SECONDS = 105s, and this budget covers it.
+# tests/unit/services/test_pipeline_lock_manager.py asserts both multipliers
+# (TestEveryInnerStateLockAcquisitionInsideTheGuardIsBounded and
+# TestOneRedisRoundTripIsBoundedByItsSocketTimeout) rather than leaving this
+# derivation as prose that can drift from the code again.
 #
 # Still BOUNDED rather than a blocking acquire, and a release that exhausts
 # even this budget is reported as ReleaseResult.SERIALIZATION_FAILED rather
@@ -361,8 +405,13 @@ class PipelineLockManager:
                     host=redis_host,
                     port=redis_port,
                     decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=5
+                    socket_connect_timeout=LOCK_REDIS_SOCKET_TIMEOUT_SECONDS,
+                    socket_timeout=LOCK_REDIS_SOCKET_TIMEOUT_SECONDS,
+                    # Without this the two timeouts above are not the cost of a
+                    # call -- see LOCK_REDIS_RETRY, and
+                    # RELEASE_GUARD_RETRY_TIMEOUT_SECONDS, which is derived
+                    # from them.
+                    retry=LOCK_REDIS_RETRY,
                 )
                 self.redis_client.ping()
                 logger.info(f"Connected to Redis at {redis_host}:{redis_port} for pipeline locks")
@@ -865,10 +914,21 @@ class PipelineLockManager:
                             # If we got here, transaction succeeded (or returned early)
                             if result in ["lock_acquired", "already_holds_lock", "stale_lock_recovered"]:
                                 # We acquired/held the lock in Redis. Now sync to YAML.
-                                # Note: There is a small window where Redis has lock but YAML doesn't.
-                                # This is acceptable as Redis is primary.
-                                self._create_lock_yaml_only(project, board, issue_number)
-                                return True, result
+                                #
+                                # The sync's result is what authorizes the
+                                # success below (#139 review round). It used to
+                                # be discarded, on a "Redis is primary" note
+                                # that the rest of this class does not agree
+                                # with: Redis is the FRESH store, YAML is the
+                                # only NON-EXPIRING one, and a grant that
+                                # exists solely in Redis is the double-grant
+                                # _get_acquire_guard_file() and
+                                # _create_lock_yaml_only() both describe.
+                                if self._create_lock_yaml_only(project, board, issue_number):
+                                    return True, result
+                                return self._refuse_unmirrored_redis_grant(
+                                    project, board, issue_number, result
+                                )
                             else:
                                 return False, result
 
@@ -900,6 +960,67 @@ class PipelineLockManager:
         # alongside the orchestrator).
         return self._try_acquire_lock_yaml_unguarded(project, board, issue_number)
 
+    def _refuse_unmirrored_redis_grant(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        result: str
+    ) -> Tuple[bool, str]:
+        """
+        Report a Redis grant whose durable YAML mirror did not land as a
+        REFUSED acquisition, and undo the Redis side of it where undoing it is
+        safe.
+
+        Reported rather than silently downgraded because every caller of
+        try_acquire_lock() polls: a refusal costs one poll cycle and is retried,
+        while the "success" this replaces put a live dispatch on a lock that
+        vanishes with its TTL.
+
+        The rollback is conditional on which grant this was:
+
+          - a NEW grant ("lock_acquired", or the defensive
+            "stale_lock_recovered") wrote the key in the transaction that just
+            ran, so deleting it restores exactly the state this call found; and
+          - "already_holds_lock" did NOT -- the key belongs to a holder that
+            was already live and is still running, and deleting it would
+            release a lock out from under it. That one is refused without a
+            rollback, so the mirror is retried on the holder's next poll.
+
+        A rollback that itself fails leaves a Redis-only key blocking this
+        (project, board) until LOCK_TTL_SECONDS. That is the fail-CLOSED side
+        of this failure -- a stalled board an operator can see and clear with
+        scripts/release_lock.py, rather than two runs on one board.
+        """
+        if result == "already_holds_lock":
+            logger.error(
+                f"try_acquire_lock: issue #{issue_number} holds the Redis lock for "
+                f"{project}/{board} but its durable YAML copy could not be written "
+                f"— refusing this acquisition rather than reporting a lock only "
+                f"Redis knows about. The Redis key is left alone: it belongs to a "
+                f"live holder."
+            )
+            return False, "lock_mirror_write_failed"
+
+        try:
+            self.redis_client.delete(self._get_lock_key(project, board))
+            logger.error(
+                f"try_acquire_lock: granted {project}/{board} to issue "
+                f"#{issue_number} in Redis but could not write the durable YAML "
+                f"copy — the Redis grant has been rolled back and the acquisition "
+                f"refused"
+            )
+        except Exception as e:
+            logger.error(
+                f"try_acquire_lock: granted {project}/{board} to issue "
+                f"#{issue_number} in Redis, could not write the durable YAML copy, "
+                f"and could not roll the Redis grant back either: {e} — the "
+                f"acquisition is refused, but that key will block this board until "
+                f"its {LOCK_TTL_SECONDS}s TTL lapses or scripts/release_lock.py "
+                f"clears it"
+            )
+        return False, "lock_mirror_write_failed"
+
     def _try_acquire_lock_yaml_unguarded(
         self,
         project: str,
@@ -916,7 +1037,13 @@ class PipelineLockManager:
 
         # Case 1: No existing lock - acquire immediately
         if not lock or lock.lock_status == 'unlocked':
-            self._create_lock(project, board, issue_number)
+            # _create_lock()'s bool is the grant, not a log line (#139 review
+            # round -- its own docstring names this caller as the one that must
+            # not treat a both-failed write as an acquisition). Same posture as
+            # _refuse_unmirrored_redis_grant(): refuse and let the caller's poll
+            # retry, rather than dispatch onto a lock that was never recorded.
+            if not self._create_lock(project, board, issue_number):
+                return False, "lock_write_failed"
             return True, "lock_acquired"
 
         # Case 2: Lock held by THIS issue - already has access
@@ -980,7 +1107,12 @@ class PipelineLockManager:
                         f"via a fresh lock creation."
                     )
                     return False, f"locked_by_issue_{lock.locked_by_issue}"
-                self._create_lock(project, board, issue_number)
+                # See Case 1 above: a write that landed nowhere is not a grant,
+                # and here the stale holder's record has already been deleted,
+                # so reporting success would put a dispatch on a board with no
+                # lock record in either store at all.
+                if not self._create_lock(project, board, issue_number):
+                    return False, "lock_write_failed"
                 return True, "stale_lock_recovered"
         except Exception as e:
             logger.warning(f"Failed to check lock age: {e}")
@@ -992,11 +1124,25 @@ class PipelineLockManager:
         )
         return False, f"locked_by_issue_{lock.locked_by_issue}"
 
-    def _create_lock_yaml_only(self, project: str, board: str, issue_number: int):
+    def _create_lock_yaml_only(self, project: str, board: str, issue_number: int) -> bool:
         """
         Sync the Redis-acquired lock to YAML (helper for Redis sync — called after
         every successful try_acquire_lock, including the "already_holds_lock" result
         which fires on every poll while an issue holds the lock).
+
+        Returns:
+            True when the durable copy of this grant is on disk, False when the
+            write did not land — a full state dir, a read-only mount, or the
+            inner '<state>.yaml.lock' still held by another process after
+            STATE_LOCK_TIMEOUT_SECONDS. Found in the #139 review round: this
+            used to swallow _save_lock_to_yaml()'s bool, so its caller reported
+            a grant whose only copy was the Redis key — invisible to
+            get_all_locks(), reported by _read_yaml_lock_only() as a HEALTHY
+            "no lock", and gone once LOCK_TTL_SECONDS lapsed, at which point
+            try_acquire_lock()'s transaction reads the absent key back as an
+            empty dict and grants the same board to a second issue. That is the
+            exact outcome _get_acquire_guard_file() exists to prevent, reached
+            through a failed write instead of through a concurrent release.
 
         If a YAML lock already exists for this (project, board) held by the same
         issue, its fields — most importantly retained_reason/retained_at — are
@@ -1012,10 +1158,9 @@ class PipelineLockManager:
         existing, _ = self._read_yaml_lock_only(project, board)
         if existing and existing.locked_by_issue == issue_number:
             if existing.lock_status == 'locked':
-                return  # nothing changed — avoid an unnecessary rewrite
+                return True  # nothing changed — avoid an unnecessary rewrite
             existing.lock_status = 'locked'
-            self._save_lock_to_yaml(existing)
-            return
+            return self._save_lock_to_yaml(existing)
 
         lock = PipelineLock(
             project=project,
@@ -1025,7 +1170,7 @@ class PipelineLockManager:
             lock_status='locked',
             owner_process=PROCESS_OWNER_ID,
         )
-        self._save_lock_to_yaml(lock)
+        return self._save_lock_to_yaml(lock)
 
     def _create_lock(self, project: str, board: str, issue_number: int) -> bool:
         """
@@ -1591,12 +1736,12 @@ class PipelineLockManager:
                     return self._release_lock_to_result(project, board, issue_number, force)
             except TimeoutError as first_timeout:
                 # Not fatal on its own -- see the docstring. The usual cause is
-                # try_acquire_lock()'s YAML-fallback path, which takes this same
-                # guard and is reached exactly when Redis is unavailable, so
-                # every attempt holds it for several seconds of socket timeouts
-                # while its waiters re-poll faster than it lets go. (Its Redis
-                # path takes the guard too, but holds it only for a transaction
-                # and a small YAML write.)
+                # a try_acquire_lock() running against an unavailable Redis:
+                # both of its branches take this same guard, and both spend
+                # LOCK_REDIS_SOCKET_TIMEOUT_SECONDS per Redis call inside it
+                # while its waiters re-poll faster than it lets go. The whole
+                # of that worst case is what
+                # RELEASE_GUARD_RETRY_TIMEOUT_SECONDS is derived from.
                 logger.warning(
                     f"release_lock: the acquire guard for {project}/{board} (issue "
                     f"#{issue_number}) was still contended after "

@@ -762,6 +762,8 @@ class TestAcquireFailureClassification(unittest.TestCase):
             "lock_state_unknown_failing_closed",
             "lock_acquire_serialization_timeout",
             "lock_acquire_serialization_unavailable",
+            "lock_mirror_write_failed",
+            "lock_write_failed",
         ):
             with self.subTest(reason=reason):
                 self.assertFalse(acquire_failure_is_contention(reason))
@@ -776,13 +778,17 @@ class TestAcquireFailureClassification(unittest.TestCase):
         import inspect
         from services.pipeline_lock_manager import PipelineLockManager as _PLM
 
-        source = inspect.getsource(_PLM.try_acquire_lock) + inspect.getsource(
-            _PLM._try_acquire_lock_yaml_unguarded
+        source = (
+            inspect.getsource(_PLM.try_acquire_lock)
+            + inspect.getsource(_PLM._try_acquire_lock_yaml_unguarded)
+            + inspect.getsource(_PLM._refuse_unmirrored_redis_grant)
         )
         for reason in (
             "lock_state_unknown_failing_closed",
             "lock_acquire_serialization_timeout",
             "lock_acquire_serialization_unavailable",
+            "lock_mirror_write_failed",
+            "lock_write_failed",
         ):
             with self.subTest(reason=reason):
                 self.assertIn(reason, source)

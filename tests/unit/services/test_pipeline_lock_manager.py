@@ -16,9 +16,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.
 import redis
 
 from services.pipeline_lock_manager import (
+    LOCK_REDIS_RETRY,
+    LOCK_REDIS_SOCKET_TIMEOUT_SECONDS,
     LockStateSerializationError,
     PipelineLockManager,
     PipelineLock,
+    RELEASE_GUARD_RETRY_TIMEOUT_SECONDS,
     ReleaseResult,
     STATE_LOCK_TIMEOUT_SECONDS,
     TouchResult,
@@ -718,9 +721,8 @@ class TestTouchAndReleaseCannotInterleave(unittest.TestCase):
 
     #139 audit: YAML-only, and only the FIRST of the two interleavings above is
     what this class proves. Its last test turns on try_acquire_lock()'s YAML
-    fallback specifically (the Redis branch never takes the guard, so there is
-    no re-entrancy to deadlock on), and the file-lock ordering the other three
-    assert on is the YAML leg's. The second, cross-leg interleaving needs a
+    fallback specifically, and the file-lock ordering the other three assert on
+    is the YAML leg's. The second, cross-leg interleaving needs a
     Redis to exist at all and is covered by
     TestTouchAndReleaseCannotInterleaveAcrossTheTwoStores below -- until #139
     it was covered by nothing, because redis_client=None here silently meant
@@ -1131,14 +1133,22 @@ class TestEveryInnerStateLockAcquisitionInsideTheGuardIsBounded(unittest.TestCas
     this asserted only on _read_yaml_lock_only() and would have passed
     unchanged with both remaining sites blocking, so it is replaced here by one
     that walks the whole guarded section.
+
+    "The whole guarded section" includes the REDIS branch (#139 review round):
+    it takes the same guard, and the _create_lock_yaml_only() that mirrors its
+    grant to disk makes two more inner-lock takes inside that hold. The
+    manager here is YAML-only, so the last test below builds its own with a
+    ThreadSafeFakeRedis and walks that branch too -- without it, a
+    _save_lock_to_yaml() regressed back to an unbounded safe_yaml_write()
+    would leave every test in this class passing while the hold on the path
+    production takes whenever Redis is up became unbounded again.
     """
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        # YAML-only (#139 audit): the acquisitions walked here are the
-        # YAML leg's inner '<state>.yaml.lock' takes inside the acquire
-        # guard, and the Redis branch of try_acquire_lock() never takes
-        # that guard at all. use_redis=False, not redis_client=None.
+        # YAML-only for the first four tests: they walk the YAML leg's inner
+        # '<state>.yaml.lock' takes inside the acquire guard. use_redis=False,
+        # not redis_client=None -- see TestConstructionSaysWhichStoresItHas.
         self.manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         self.state_file = self.manager._get_state_file("proj", "board")
         self.state_lock = str(self.state_file) + '.lock'
@@ -1219,6 +1229,48 @@ class TestEveryInnerStateLockAcquisitionInsideTheGuardIsBounded(unittest.TestCas
         self.assertEqual(reason, "stale_lock_recovered")
         self.assertGreaterEqual(
             len([p for p, _ in seen if p == self.state_lock]), 4, seen
+        )
+        self._assert_state_lock_always_bounded(seen)
+
+    def test_a_redis_acquire_never_takes_the_inner_state_lock_unbounded(self):
+        """
+        The branch production actually takes whenever Redis is up, and the one
+        the rest of this class cannot see: try_acquire_lock()'s Redis grant
+        mirrors itself to disk with _create_lock_yaml_only(), whose
+        _read_yaml_lock_only() and _save_lock_to_yaml() are two more inner-lock
+        takes inside the same guard hold.
+        """
+        fake_redis = ThreadSafeFakeRedis()
+        manager = PipelineLockManager(
+            state_dir=Path(self.test_dir), redis_client=fake_redis
+        )
+        # A stale record in BOTH stores, so the mirror has an existing lock to
+        # read and a different holder to write over -- an acquire on an empty
+        # board short-circuits both of _read_yaml_lock_only()'s takes (no file
+        # to lock) and would walk only one of the three.
+        stale = PipelineLock(
+            project="proj",
+            board="board",
+            locked_by_issue=111,
+            lock_acquired_at=(
+                datetime.now(timezone.utc) - timedelta(hours=5)
+            ).isoformat(),
+            lock_status='locked',
+        )
+        self.assertTrue(manager._save_lock_to_yaml(stale))
+        fake_redis.hset(
+            manager._get_lock_key("proj", "board"),
+            mapping=manager._lock_to_redis_mapping(stale),
+        )
+        seen = []
+
+        with self._recording_file_lock(seen):
+            success, reason = manager.try_acquire_lock("proj", "board", 222)
+
+        self.assertEqual((success, reason), (True, "lock_acquired"))
+        # The upfront fail-closed read, plus the mirror's read and its write.
+        self.assertGreaterEqual(
+            len([p for p, _ in seen if p == self.state_lock]), 3, seen
         )
         self._assert_state_lock_always_bounded(seen)
 
@@ -1522,6 +1574,194 @@ class TestConstructionSaysWhichStoresItHas(unittest.TestCase):
         self.assertTrue(degraded.use_redis)
         self.assertIsNone(deliberate.redis_client)
         self.assertIsNone(degraded.redis_client)
+
+
+class TestOneRedisRoundTripIsBoundedByItsSocketTimeout(unittest.TestCase):
+    """
+    REGRESSION (#139 review round). Every budget in this module that mentions
+    Redis is derived from "a call against a Redis that is not answering costs
+    socket_connect_timeout" -- and that was not true of the client this class
+    builds. redis-py has defaulted every client to
+    Retry(ExponentialWithJitterBackoff(), retries=10) since 6.0, so the
+    5s socket timeouts bought eleven attempts plus backoff: ~59s per call
+    against a host that drops SYNs, measured against this deployment's 8.1.0.
+
+    That multiplier lands inside the '<state>.yaml.acquire.lock' guard --
+    try_acquire_lock() takes it around BOTH branches now, and the YAML fallback
+    makes four more Redis calls after the Redis branch has already failed -- so
+    a partitioned (not refused) Redis stretched one acquire's guard hold to
+    minutes, past the RELEASE_GUARD_RETRY_TIMEOUT_SECONDS a concurrent
+    release_lock() is willing to wait. The release then returns
+    SERIALIZATION_FAILED, nothing reclaims the lock, and the board stops
+    dispatching until the 4-hour staleness heuristic.
+
+    Nothing about that is visible at a call site, and the comment sizing the
+    budget said "5s socket timeout each", so this pins the multiplier itself
+    rather than the prose.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_the_client_is_built_with_an_explicit_retry_policy(self):
+        """A client built without `retry=` silently inherits redis-py's
+        default, which is the whole defect."""
+        with patch('services.pipeline_lock_manager.redis.Redis',
+                   return_value=ThreadSafeFakeRedis()) as mock_redis:
+            PipelineLockManager(state_dir=Path(self.test_dir))
+
+        kwargs = mock_redis.call_args.kwargs
+        self.assertIs(kwargs.get('retry'), LOCK_REDIS_RETRY)
+        self.assertEqual(
+            kwargs.get('socket_connect_timeout'), LOCK_REDIS_SOCKET_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            kwargs.get('socket_timeout'), LOCK_REDIS_SOCKET_TIMEOUT_SECONDS
+        )
+
+    def test_the_policy_makes_exactly_one_attempt(self):
+        """Asserted through redis-py's own retry machinery rather than by
+        reading LOCK_REDIS_RETRY's constructor arguments back: what matters is
+        how many times the socket timeout is actually paid."""
+        attempts = []
+
+        def do():
+            attempts.append(1)
+            raise redis.exceptions.ConnectionError("no route to host")
+
+        with self.assertRaises(redis.exceptions.ConnectionError):
+            LOCK_REDIS_RETRY.call_with_retry(do, lambda _e: None)
+
+        self.assertEqual(len(attempts), 1, attempts)
+
+    def test_the_release_budget_still_covers_the_worst_case_guard_hold(self):
+        """The derivation spelled out at RELEASE_GUARD_RETRY_TIMEOUT_SECONDS,
+        as arithmetic: the longest guarded section is a failed Redis branch
+        followed by the YAML fallback's stale-lock recovery -- four bounded
+        inner-lock takes and five Redis calls that each have to fail first.
+        Changing any of the three constants without re-deriving this is what
+        made the figure it used to cite unrecoverable."""
+        worst_case_guard_hold = (
+            4 * STATE_LOCK_TIMEOUT_SECONDS + 5 * LOCK_REDIS_SOCKET_TIMEOUT_SECONDS
+        )
+
+        self.assertGreaterEqual(
+            RELEASE_GUARD_RETRY_TIMEOUT_SECONDS,
+            worst_case_guard_hold,
+            "a release now gives up before the longest legitimate guard holder "
+            "can let go, which leaks the lock until the 4-hour staleness heuristic",
+        )
+
+
+class TestAGrantIsOnlyReportedWhenItsDurableCopyLanded(unittest.TestCase):
+    """
+    The remaining hole in the both-stores-agree invariant
+    TestAcquireAndReleaseCannotInterleaveAcrossTheTwoStores establishes (#139
+    review round). The guard closed the path where a CONCURRENT RELEASE
+    unlinked the incoming holder's state file; it does nothing about the path
+    where the file was never written.
+
+    Both grant paths discarded the bool that says so:
+
+      - the Redis branch called _create_lock_yaml_only() and returned
+        (True, result) unconditionally, and that helper swallowed
+        _save_lock_to_yaml()'s False; and
+      - the YAML fallback called _create_lock() and returned
+        (True, 'lock_acquired')/(True, 'stale_lock_recovered') without looking,
+        even though _create_lock()'s own docstring names that caller as the one
+        that must not treat a both-failed write as an acquisition.
+
+    A full or read-only state dir, or another process (scripts/release_lock.py,
+    the observability server's release endpoint) holding '<state>.yaml.lock'
+    past STATE_LOCK_TIMEOUT_SECONDS, was therefore enough to dispatch a run on
+    a lock whose only copy was the TTL'd Redis key -- invisible to
+    get_all_locks(), a HEALTHY "no lock" to _read_yaml_lock_only(), and gone at
+    LOCK_TTL_SECONDS, at which point the same board is granted to a second
+    issue while the first run is still live.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.redis = ThreadSafeFakeRedis()
+        self.manager = PipelineLockManager(
+            state_dir=Path(self.test_dir), redis_client=self.redis
+        )
+        self.lock_key = self.manager._get_lock_key("proj", "board")
+        self.state_file = self.manager._get_state_file("proj", "board")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_a_redis_grant_with_no_durable_copy_is_refused_and_rolled_back(self):
+        with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual((success, reason), (False, "lock_mirror_write_failed"))
+        self.assertEqual(
+            self.redis.hgetall(self.lock_key), {},
+            "the Redis-only grant survived, so it still vanishes with its TTL "
+            "and the board is granted twice",
+        )
+        self.assertFalse(self.state_file.exists())
+
+    def test_a_live_holders_key_is_not_deleted_by_the_refusal(self):
+        """The repeat call an issue makes on every poll while it holds the
+        lock. Its mirror can fail too -- but rolling THAT back would release a
+        lock out from under a running pipeline, so it is refused in place."""
+        self.assertEqual(
+            self.manager.try_acquire_lock("proj", "board", 123), (True, "lock_acquired")
+        )
+        self.state_file.unlink()
+
+        with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 123)
+
+        self.assertEqual((success, reason), (False, "lock_mirror_write_failed"))
+        self.assertEqual(str(self.redis.hgetall(self.lock_key)['locked_by_issue']), '123')
+
+    def test_a_yaml_fallback_grant_that_was_recorded_nowhere_is_refused(self):
+        manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
+
+        with patch.object(manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual((success, reason), (False, "lock_write_failed"))
+        self.assertIsNone(manager.get_lock("proj", "board"))
+
+    def test_a_stale_lock_recovery_that_was_recorded_nowhere_is_refused(self):
+        """The worse half: the stale holder's record has already been deleted
+        by this point, so reporting success leaves a dispatched run with no
+        lock record in either store."""
+        manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
+        stale = PipelineLock(
+            project="proj",
+            board="board",
+            locked_by_issue=111,
+            lock_acquired_at=(
+                datetime.now(timezone.utc) - timedelta(hours=5)
+            ).isoformat(),
+            lock_status='locked',
+        )
+        self.assertTrue(manager._save_lock_to_yaml(stale))
+
+        with patch.object(manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = manager.try_acquire_lock("proj", "board", 222)
+
+        self.assertEqual((success, reason), (False, "lock_write_failed"))
+
+    def test_a_healthy_grant_is_still_reported_as_one(self):
+        """The check must not have inverted the ordinary path: both stores
+        agree, and the acquisition succeeds."""
+        success, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual((success, reason), (True, "lock_acquired"))
+        self.assertEqual(str(self.redis.hgetall(self.lock_key)['locked_by_issue']), '456')
+        yaml_lock, healthy = self.manager._read_yaml_lock_only("proj", "board")
+        self.assertTrue(healthy)
+        self.assertEqual(yaml_lock.locked_by_issue, 456)
 
 
 class TestRedisAcquisitionIsSerialized(unittest.TestCase):
