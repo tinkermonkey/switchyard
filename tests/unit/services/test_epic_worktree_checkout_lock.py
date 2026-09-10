@@ -120,13 +120,12 @@ class _RecordingLock:
 def _yaml_only_facade(tmp_dir: str) -> ProjectResourceLockManager:
     """A real facade over PipelineLockManager's YAML-only fallback.
 
-    redis_client is cleared explicitly after construction rather than just passed
-    as None, because None makes the constructor build a real client from
-    REDIS_HOST, which succeeds inside the orchestrator container -- the same
-    reason test_project_checkout_lock.py's own YAML-only fixture does this.
+    use_redis=False rather than redis_client=None (#139): None means "connect one
+    yourself", and the post-construction clear this used to do was a workaround
+    for a constructor bug that made it look otherwise -- the same reason
+    test_project_checkout_lock.py's own YAML-only fixture did it.
     """
-    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), redis_client=None)
-    lock_manager.redis_client = None
+    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), use_redis=False)
     return ProjectResourceLockManager(lock_manager=lock_manager)
 
 

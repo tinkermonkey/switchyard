@@ -57,76 +57,7 @@ from services.dev_container_build_lock import (
     DevContainerBuildLockTimeoutError,
     RESOURCE_NAME,
 )
-
-
-class ThreadSafeFakeRedis:
-    """Minimal in-memory stand-in for a single Redis instance's hash + atomic
-    transaction API, sufficient for PipelineLockManager's try_acquire_lock()/
-    release_lock()/get_lock(). Duplicated from test_project_checkout_lock.py
-    (see that module's docstring for the full rationale) rather than shared
-    via cross-test-module import, since tests/unit has no package __init__.py
-    making such an import reliable under pytest's collection."""
-
-    def __init__(self):
-        self._store = {}
-        self._global_lock = threading.RLock()
-
-    def ping(self):
-        return True
-
-    def hgetall(self, key):
-        with self._global_lock:
-            return dict(self._store.get(key, {}))
-
-    def hset(self, key, mapping):
-        with self._global_lock:
-            self._store.setdefault(key, {}).update(mapping)
-
-    def delete(self, key):
-        with self._global_lock:
-            self._store.pop(key, None)
-
-    def expire(self, key, seconds):
-        pass  # TTL not needed for these tests
-
-    class _Pipe:
-        def __init__(self, redis):
-            self._redis = redis
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def watch(self, key):
-            return None
-
-        def exists(self, key):
-            with self._redis._global_lock:
-                return key in self._redis._store
-
-        def multi(self):
-            return None
-
-        def hgetall(self, key):
-            return self._redis.hgetall(key)
-
-        def hset(self, key, mapping):
-            return self._redis.hset(key, mapping)
-
-        def expire(self, key, seconds):
-            return None
-
-        def delete(self, key):
-            return self._redis.delete(key)
-
-    def pipeline(self):
-        return ThreadSafeFakeRedis._Pipe(self)
-
-    def transaction(self, func, *keys, value_from_callable=False):
-        with self._global_lock:
-            return func(ThreadSafeFakeRedis._Pipe(self))
+from tests.utils.fake_redis import ThreadSafeFakeRedis
 
 
 def _make_facade(tmp_dir: str) -> ProjectResourceLockManager:
@@ -138,12 +69,11 @@ def _make_yaml_only_facade(tmp_dir: str) -> ProjectResourceLockManager:
     """
     Facade over PipelineLockManager's documented YAML-only fallback -- see
     test_project_checkout_lock.py's helper of the same name for the full
-    rationale. redis_client is cleared explicitly after construction rather
-    than just passed as None, because None makes the constructor build a real
-    client from REDIS_HOST, which succeeds inside the orchestrator container.
+    rationale. use_redis=False says that outright (#139): redis_client=None
+    means "connect one yourself", and the post-construction clear this used to
+    do was a workaround for a constructor bug that made it look otherwise.
     """
-    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), redis_client=None)
-    lock_manager.redis_client = None
+    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), use_redis=False)
     return ProjectResourceLockManager(lock_manager=lock_manager)
 
 

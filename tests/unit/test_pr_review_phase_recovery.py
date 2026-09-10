@@ -8,16 +8,22 @@ fresh — not posted to GitHub as if it were the whole stage's complete, termina
 result. See claude/docker_runner.py's _process_recovered_pr_review_phase_completion.
 """
 
-import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# Pre-mock modules that fail outside Docker (/app/state doesn't exist)
-if 'services.work_execution_state' not in sys.modules:
-    sys.modules['services.work_execution_state'] = MagicMock()
-if 'services.dev_container_state' not in sys.modules:
-    sys.modules['services.dev_container_state'] = MagicMock()
-
+# services.work_execution_state / services.dev_container_state used to be
+# pre-mocked into sys.modules here, because both build their singleton at
+# import time under a state directory derived from ORCHESTRATOR_ROOT (default
+# /app), which does not exist on a host. That assignment was module-scoped and
+# never undone, so it outlived this file: _build_docker_command() ->
+# _get_image_for_agent() imports `dev_container_state` from that same
+# sys.modules entry, got the MagicMock, and appended a MagicMock as the image
+# name -- which is what made tests/unit/test_docker_runner_worktree_mount.py's
+# ' '.join(cmd) raise "expected str instance, MagicMock found" whenever this
+# file ran first (#133; the leak was blamed on the subprocess patches below,
+# which turn out to be correctly scoped). tests/conftest.py now sets
+# ORCHESTRATOR_ROOT to a scratch directory off-container instead, so the real
+# modules import.
 from claude.docker_runner import DockerAgentRunner
 
 

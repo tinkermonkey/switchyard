@@ -1,0 +1,76 @@
+# Runs the unit suite on a bare runner and REPORTS the result. It does not
+# gate anything, on purpose (#174, #177 Phase 0).
+#
+# Why reporting and not a required check: the suite still has known failures on
+# `main` that this work item did not set out to fix -- #179 for the three that
+# fail even in isolation, and the pre-existing list in #177 Phase 4. A required
+# check that is red for reasons nobody is working on trains everyone to ignore
+# it, which is worse than having no check. Turn this into a gate when the suite
+# is genuinely green, not before.
+#
+# Why this can exist at all now: until the service fail-fast guards in
+# tests/conftest.py, this job would not have finished. `pytest tests/unit` on a
+# bare python:3.11-slim blocked against the hardcoded `redis` hostname -- ~6s of
+# CPU over 3+ minutes at 0.2% utilisation -- and pytest.ini's `timeout = 300`
+# does not bound a socket call. It now completes in ~90s. Note the guards
+# deliberately point `redis`/`elasticsearch` at loopback here; if this job ever
+# gains real `services:` containers, it must also set
+# SWITCHYARD_TEST_ALLOW_SERVICE_HOSTS=1 or they will be unreachable.
+#
+# What it does NOT cover: the ~65 test files that skip themselves when /app is
+# absent, because they import modules that genuinely only work inside the
+# orchestrator container (CLAUDE.md, "Docker-only imports"). tests/conftest.py
+# prints how many of those never ran, in the header and again in the summary,
+# so this job's output cannot be mistaken for a full pass. Covering them needs
+# the job to run inside an image built from this repo's Dockerfile, which pulls
+# from five separate networks -- costed separately in #174.
+
+name: Unit tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: pytest tests/unit (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        id: pytest
+        # Never fails the job -- see the note at the top of this file.
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/unit -p no:cacheprovider --tb=short \
+            | tee pytest-output.txt
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo '## Unit test result'
+            echo
+            echo 'Reporting only -- this job never fails the build. See'
+            echo '`.github/workflows/unit-tests.yml` for why.'
+            echo
+            echo '```'
+            tail -n 40 pytest-output.txt || echo 'no output captured'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

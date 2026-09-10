@@ -514,7 +514,10 @@ class TestClearRetainedReasonDurability(unittest.TestCase):
         """redis_satisfied must not require an unattempted write when no
         Redis client is configured at all -- only require it when Redis
         actually is configured."""
-        yaml_only_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        # use_redis=False, not redis_client=None (#139): "no Redis client
+        # configured at all" is this test's entire premise, and None means
+        # "connect one yourself".
+        yaml_only_manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         yaml_only_manager._create_lock("proj", "board", 123)
         yaml_only_manager.mark_lock_failed("proj", "board", 123, reason="agent crashed")
 

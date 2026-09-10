@@ -285,25 +285,61 @@ class PipelineLock:
 class PipelineLockManager:
     """Manages pipeline execution locks with Redis + YAML persistence"""
 
-    def __init__(self, state_dir: Path = None, redis_client=None):
+    def __init__(self, state_dir: Path = None, redis_client=None, use_redis: bool = True):
         """
         Initialize pipeline lock manager.
 
         Args:
             state_dir: Directory for YAML state persistence
-            redis_client: Optional Redis client (will create if not provided)
+            redis_client: Optional Redis client (one is created from REDIS_HOST
+                if not provided, unless use_redis is False)
+            use_redis: Whether this instance may talk to Redis at all. False is
+                the ONLY way to ask for the YAML-only fallback deliberately --
+                see below.
+
+        Raises:
+            ValueError: use_redis=False was combined with an explicit
+                redis_client. That is a contradiction, and silently honouring
+                either half of it is how this class got into trouble the first
+                time.
+
+        On use_redis (#139): until this was added there was no way to say "run
+        without Redis" -- redis_client=None is documented as, and means,
+        "connect one yourself". Callers who wanted YAML-only passed None anyway
+        and got it, but only by accident: the redundant `import os` that used to
+        sit inside the `state_dir is None` branch made `os` local to this whole
+        method (any name assigned anywhere in a function is local to all of it),
+        so a caller supplying state_dir and omitting redis_client hit an
+        UnboundLocalError on the os.environ.get() in the connect block, the
+        except swallowed it, and the instance latched into YAML-only mode with a
+        "Redis connection failed" line in the log for a connection that was
+        never attempted.
+
+        The import is hoisted (`os` is imported at module level, line 13) and
+        the intent is now expressible, because the accident was load-bearing for
+        the test suite: every lock test passing a state_dir was exercising the
+        YAML fallback while reading as though it covered the Redis WATCH/MULTI
+        path. PR #155 found a real double-grant bug in that fallback under
+        coverage that had never once run against Redis. Those call sites now say
+        which path they mean.
         """
         if state_dir is None:
-            import os
             orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
             state_dir = Path(orchestrator_root) / "state" / "pipeline_locks"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
+        if redis_client is not None and not use_redis:
+            raise ValueError(
+                "PipelineLockManager(redis_client=..., use_redis=False) is "
+                "contradictory: pass use_redis=False for YAML-only operation, or "
+                "a redis_client to use it, not both."
+            )
+
         # Initialize Redis client
         self.redis_client = redis_client
-        if self.redis_client is None:
+        if self.redis_client is None and use_redis:
             try:
                 redis_host = os.environ.get('REDIS_HOST', 'redis')
                 redis_port = int(os.environ.get('REDIS_PORT', 6379))
@@ -319,6 +355,11 @@ class PipelineLockManager:
             except Exception as e:
                 logger.warning(f"Redis connection failed for locks, using YAML only: {e}")
                 self.redis_client = None
+        elif not use_redis:
+            # Distinct from the warning above on purpose: no connection was
+            # attempted, so reporting one as failed would send an operator
+            # looking for a Redis outage that isn't happening.
+            logger.info("PipelineLockManager running YAML-only (use_redis=False)")
 
         logger.info(f"PipelineLockManager initialized with state_dir: {state_dir}")
 

@@ -68,149 +68,7 @@ from services.project_checkout_lock import (
     REDIS_LOCK_TTL_SECONDS,
     RESOURCE_NAME,
 )
-
-
-class ThreadSafeFakeRedis:
-    """Minimal in-memory stand-in for a single Redis instance's hash + atomic
-    transaction API, sufficient for PipelineLockManager's try_acquire_lock()/
-    release_lock()/get_lock() -- see module docstring for why this exists
-    instead of a MagicMock or the real redis client."""
-
-    def __init__(self):
-        self._store = {}
-        # RLock, not Lock: transaction() holds this for the whole func(pipe)
-        # call, and func (acquire_lock_tx/release_lock_tx in
-        # pipeline_lock_manager.py) calls pipe.hgetall()/.hset()/.delete(),
-        # which re-enter this same lock from the same thread -- a plain
-        # non-reentrant Lock would self-deadlock there.
-        self._global_lock = threading.RLock()
-
-    def ping(self):
-        return True
-
-    def hgetall(self, key):
-        with self._global_lock:
-            return dict(self._store.get(key, {}))
-
-    def hset(self, key, mapping):
-        with self._global_lock:
-            self._store.setdefault(key, {}).update(mapping)
-
-    def delete(self, key):
-        with self._global_lock:
-            self._store.pop(key, None)
-
-    def expire(self, key, seconds):
-        pass  # TTL not needed for these tests
-
-    class _Pipe:
-        """Stands in for both Redis.pipeline()'s context-managed object
-        (.watch()/.exists(), whose results this codebase's acquire_lock
-        currently discards -- see pipeline_lock_manager.py's own comments)
-        and the callable-transaction pipe passed to acquire_lock_tx/
-        release_lock_tx (.hgetall()/.multi()/.hset()/.expire()/.delete())."""
-
-        def __init__(self, redis):
-            self._redis = redis
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def watch(self, key):
-            return None
-
-        def exists(self, key):
-            with self._redis._global_lock:
-                return key in self._redis._store
-
-        def multi(self):
-            return None
-
-        def hgetall(self, key):
-            return self._redis.hgetall(key)
-
-        def hset(self, key, mapping):
-            return self._redis.hset(key, mapping)
-
-        def expire(self, key, seconds):
-            return None
-
-        def delete(self, key):
-            return self._redis.delete(key)
-
-    # type(self)._Pipe, not ThreadSafeFakeRedis._Pipe: resolving through the
-    # MRO is what lets TtlFakeRedis below swap in its own TTL-honouring pipe.
-    def pipeline(self):
-        return type(self)._Pipe(self)
-
-    def transaction(self, func, *keys, value_from_callable=False):
-        # The whole read-decide-write sequence runs under one process-wide
-        # lock -- see class docstring for why this is a faithful enough model
-        # of real single-Redis-instance atomicity for these tests.
-        with self._global_lock:
-            return func(type(self)._Pipe(self))
-
-
-class TtlFakeRedis(ThreadSafeFakeRedis):
-    """
-    ThreadSafeFakeRedis that actually HONOURS expire(), on a compressed clock.
-
-    Found in review of #146 WI-1: the base fake's expire() is a no-op
-    ("TTL not needed for these tests"), which makes every heartbeat test in
-    this file structurally blind to the one outcome the heartbeat exists to
-    produce. A hold that outlives PipelineLockManager's Redis lock-key TTL has
-    its Redis copy silently vanish, and try_acquire_lock()'s transaction reads
-    the missing key back as an empty dict -- so a SECOND caller is granted the
-    same lock while the first still holds it. Asserting on touch_resource call
-    counts cannot see that; only a real acquire attempt can.
-
-    The real TTL is REDIS_LOCK_TTL_SECONDS (7200s), far too long to sit
-    through in a unit test, so ANY expire() maps onto `ttl_seconds` instead
-    and the tests choose a heartbeat interval either side of it.
-    """
-
-    def __init__(self, ttl_seconds: float):
-        super().__init__()
-        self.ttl_seconds = ttl_seconds
-        # Every (key, seconds) passed to expire(), so a test can assert the
-        # TTL this codebase actually writes -- see
-        # TestHeartbeatConstantsTrackTheRealRedisTtl.
-        self.expire_calls = []
-        self._expires_at = {}
-
-    def expire(self, key, seconds):
-        with self._global_lock:
-            self.expire_calls.append((key, seconds))
-            self._expires_at[key] = time.monotonic() + self.ttl_seconds
-
-    def _drop_if_expired(self, key):
-        """Caller must hold _global_lock."""
-        expires_at = self._expires_at.get(key)
-        if expires_at is not None and time.monotonic() >= expires_at:
-            self._store.pop(key, None)
-            self._expires_at.pop(key, None)
-
-    def hgetall(self, key):
-        with self._global_lock:
-            self._drop_if_expired(key)
-            return dict(self._store.get(key, {}))
-
-    def delete(self, key):
-        with self._global_lock:
-            self._expires_at.pop(key, None)
-            self._store.pop(key, None)
-
-    class _Pipe(ThreadSafeFakeRedis._Pipe):
-        def exists(self, key):
-            with self._redis._global_lock:
-                self._redis._drop_if_expired(key)
-                return key in self._redis._store
-
-        def expire(self, key, seconds):
-            return self._redis.expire(key, seconds)
+from tests.utils.fake_redis import ThreadSafeFakeRedis, TtlFakeRedis
 
 
 # Compressed stand-in for REDIS_LOCK_TTL_SECONDS in the TTL tests below.
@@ -232,13 +90,12 @@ def _make_yaml_only_facade(tmp_dir: str) -> ProjectResourceLockManager:
 
     Every other concurrency fixture in this file injects ThreadSafeFakeRedis,
     whose transaction() serializes the whole read-modify-write -- so they only
-    ever exercise try_acquire_lock()'s ATOMIC Redis branch. redis_client is
-    cleared explicitly after construction rather than just passed as None,
-    because None makes the constructor build a real client from REDIS_HOST,
-    which succeeds inside the orchestrator container.
+    ever exercise try_acquire_lock()'s ATOMIC Redis branch. use_redis=False
+    rather than redis_client=None (#139): None means "connect one yourself",
+    and the post-construction clear this used to do was a workaround for a
+    constructor bug that made it look otherwise.
     """
-    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), redis_client=None)
-    lock_manager.redis_client = None
+    lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), use_redis=False)
     return ProjectResourceLockManager(lock_manager=lock_manager)
 
 
@@ -1344,11 +1201,12 @@ class TestRealFacadeReportsStoreFailuresAsRefreshFailed(unittest.TestCase):
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        # YAML-only (redis_client=None), matching
+        # YAML-only, matching
         # test_project_resource_lock_manager.py::TestTouchResource: the whole
         # point here is what the REAL store layer returns, so the on-disk copy
-        # is the one that has to be made to fail.
-        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        # is the one that has to be made to fail -- and it can only be the ONLY
+        # configured store if there is genuinely no Redis behind it (#139).
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
 
     def tearDown(self):
