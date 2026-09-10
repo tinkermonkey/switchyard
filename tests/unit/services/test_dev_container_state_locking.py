@@ -149,3 +149,166 @@ class TestWritersAreSerialised:
 
         assert manager.get_status("proj") == DevContainerStatus.VERIFIED
         writer.join(timeout=5)
+
+
+class TestReadDecideWriteCallersReDecideUnderTheLock:
+    """#171. Serialising _merge_state() made each WRITE atomic; it did nothing
+    for a caller that read, decided, and only then wrote -- the decision was
+    already made on a released lock by the time the write ran."""
+
+    def test_a_status_write_can_be_made_conditional_on_what_is_on_disk(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        # Somebody else moved the project on while our caller was deciding.
+        manager.set_status("proj", DevContainerStatus.IN_PROGRESS)
+
+        manager.set_status(
+            "proj",
+            DevContainerStatus.UNVERIFIED,
+            expect_status=DevContainerStatus.VERIFIED,
+        )
+
+        assert manager.get_status("proj") == DevContainerStatus.IN_PROGRESS
+
+    def test_the_conditional_write_still_lands_when_nothing_changed(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        manager.set_status(
+            "proj",
+            DevContainerStatus.UNVERIFIED,
+            expect_status=DevContainerStatus.VERIFIED,
+        )
+
+        assert manager.get_status("proj") == DevContainerStatus.UNVERIFIED
+
+    def test_an_unconditional_write_is_unaffected(self, manager):
+        """Only callers whose decision depends on an earlier read pass
+        expect_status; everything else must keep writing unconditionally."""
+        manager.set_status("proj", DevContainerStatus.IN_PROGRESS)
+        manager.set_status("proj", DevContainerStatus.BLOCKED, error_message="nope")
+
+        assert manager.get_status("proj") == DevContainerStatus.BLOCKED
+
+    def test_the_precondition_is_evaluated_inside_the_lock(self, manager, monkeypatch):
+        """THE regression. A caller-side check -- get_status(), decide,
+        set_status() -- releases the file lock between the read and the write,
+        and the competing writer lands in exactly that gap. Only a check
+        performed inside _merge_state()'s own critical section sees it.
+
+        The interleaving write here is timed to land AFTER the caller has
+        decided and called set_status(), but BEFORE _merge_state() takes the
+        lock: the window a caller-side check cannot cover, and the one this
+        check has to."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        interleaved = threading.Event()
+        original_merge = DevContainerStateManager._merge_state
+
+        def _merge_after_an_interleaving_write(self, project_name, updates, expect=None):
+            if expect is not None and not interleaved.is_set():
+                interleaved.set()
+                other = DevContainerStateManager(state_dir=self.state_dir)
+                other.set_status(project_name, DevContainerStatus.IN_PROGRESS)
+            return original_merge(self, project_name, updates, expect=expect)
+
+        monkeypatch.setattr(
+            DevContainerStateManager, '_merge_state', _merge_after_an_interleaving_write
+        )
+
+        manager.set_status(
+            "proj",
+            DevContainerStatus.UNVERIFIED,
+            expect_status=DevContainerStatus.VERIFIED,
+        )
+
+        assert interleaved.is_set(), "test setup: the competing write never ran"
+        assert manager.get_status("proj") == DevContainerStatus.IN_PROGRESS
+
+
+class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
+    """verify_and_update_status() reads VERIFIED, shells out to `docker image
+    inspect` (10s timeout), and only then writes UNVERIFIED. Its two live
+    callers are docker_runner's per-launch image resolution and main.py's
+    startup sweep -- both of which can run while the observability server, a
+    separate container, is finishing an operator-triggered rebuild (#171)."""
+
+    def test_a_rebuild_that_landed_during_the_docker_probe_is_not_reverted(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        def _rebuild_lands_during_the_probe(project_name):
+            manager.set_status(
+                "proj", DevContainerStatus.IN_PROGRESS, image_name="proj-agent:latest"
+            )
+            return False
+
+        original = DevContainerStateManager.verify_image_exists
+        try:
+            DevContainerStateManager.verify_image_exists = (
+                lambda self, project_name: _rebuild_lands_during_the_probe(project_name)
+            )
+            result = manager.verify_and_update_status("proj")
+        finally:
+            DevContainerStateManager.verify_image_exists = original
+
+        # The image this call actually looked at really was missing, so the
+        # caller is still told not to launch against it...
+        assert result is False
+        # ...but the fresher verdict on disk is left alone.
+        assert manager.get_status("proj") == DevContainerStatus.IN_PROGRESS
+
+    def test_it_still_resets_a_status_nothing_else_touched(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        original = DevContainerStateManager.verify_image_exists
+        try:
+            DevContainerStateManager.verify_image_exists = lambda self, project_name: False
+            result = manager.verify_and_update_status("proj")
+        finally:
+            DevContainerStateManager.verify_image_exists = original
+
+        assert result is False
+        assert manager.get_status("proj") == DevContainerStatus.UNVERIFIED
+
+
+class TestStatusAndTimestampComeFromOneSnapshot:
+    """#171. get_status() and get_status_updated_at() each take the file lock
+    separately, so a caller that reads both in sequence can pair a status from
+    one version of the file with a timestamp from another -- and neither
+    accessor can detect that it happened."""
+
+    def test_both_values_come_from_a_single_read(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        reads = []
+        original_read = DevContainerStateManager._read_state
+
+        def _counting_read(self, project_name):
+            reads.append(project_name)
+            return original_read(self, project_name)
+
+        try:
+            DevContainerStateManager._read_state = _counting_read
+            status, updated_at = manager.get_status_and_updated_at("proj")
+        finally:
+            DevContainerStateManager._read_state = original_read
+
+        assert reads == ["proj"]
+        assert status == DevContainerStatus.VERIFIED
+        assert updated_at is not None
+
+    def test_a_missing_file_degrades_the_same_way_the_single_accessors_do(self, manager):
+        status, updated_at = manager.get_status_and_updated_at("never-seen")
+
+        assert status == DevContainerStatus.UNVERIFIED
+        assert updated_at is None
+
+    def test_an_unparseable_timestamp_degrades_to_none_without_losing_the_status(
+        self, manager
+    ):
+        manager.set_status("proj", DevContainerStatus.BLOCKED, error_message="x")
+        manager._merge_state("proj", {'updated_at': 'not-a-timestamp'})
+
+        status, updated_at = manager.get_status_and_updated_at("proj")
+
+        assert status == DevContainerStatus.BLOCKED
+        assert updated_at is None

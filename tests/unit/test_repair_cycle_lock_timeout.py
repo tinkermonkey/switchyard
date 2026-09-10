@@ -186,3 +186,31 @@ class TestRunnerClassifiesContentionDistinctly:
 
         assert result['overall_success'] is False
         assert 'lock_contention' not in result
+
+
+@pytest.mark.asyncio
+class TestRunTestsDoesNotRetryATerminatedContainer:
+    """#160 rider 3. claude/docker_runner.py raises NonRetryableAgentError for
+    container exit codes 137/143 -- the OOM killer, or an operator's kill switch.
+    Neither changes on a second attempt: an OOM reproduces on every run of the
+    same suite, and relaunching a container an operator just killed is the
+    opposite of what they asked for. Exhausting the retries is worse than not
+    retrying, because it fabricates the same '__infrastructure__' RepairTestResult
+    the lock-timeout case above exists to prevent -- and the cycle then dispatches
+    fix agents against a container that was killed, not a broken test."""
+
+    async def test_a_terminated_container_propagates_after_one_attempt(self):
+        from agents.non_retryable import NonRetryableAgentError
+
+        stage = _stage()
+        executor = _executor_raising(
+            NonRetryableAgentError(
+                "Agent container was terminated by signal (exit_code=137): OOM"
+            )
+        )
+
+        with patch('services.agent_executor.get_agent_executor', return_value=executor):
+            with pytest.raises(NonRetryableAgentError):
+                await stage._run_tests(stage.test_configs[0], _context(), 1, 0)
+
+        assert executor.execute_agent.call_count == 1

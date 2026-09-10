@@ -126,6 +126,29 @@ class TaskWorker:
                                     self.tasks_failed += 1
                                     break
 
+                                # ClaudeCodeRateLimitError: systemic token limit — don't
+                                # retry (#160). By the time this arrives, agent_executor.py
+                                # has already tripped the Claude Code circuit breaker and
+                                # recorded outcome='frozen' for the automatic resume, so
+                                # every retry here re-dispatches straight into an open
+                                # breaker, fails again immediately, and overwrites that
+                                # 'frozen' record with a plain failure — losing the thing
+                                # that would have resumed the work when tokens reset. The
+                                # breaker's own reset is the retry point, not this loop.
+                                # Peer of agent_executor.py's inner exemption, which raises
+                                # for the same reason.
+                                from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
+                                if isinstance(e, ClaudeCodeRateLimitError):
+                                    duration = time.time() - start_time
+                                    logger.warning(
+                                        f"[Worker {self.worker_id}] Task {task.id} hit the Claude Code "
+                                        f"token limit — not retrying (the circuit breaker is open and "
+                                        f"this task is recorded for automatic resume): {e}"
+                                    )
+                                    self.metrics.record_task_complete(task.agent, duration, success=False)
+                                    self.tasks_failed += 1
+                                    break
+
                                 # Resource-lock timeout: contention, not an agent failure —
                                 # don't retry. project_checkout_lock/dev_container_build_lock
                                 # already polled for the whole of their (deliberately

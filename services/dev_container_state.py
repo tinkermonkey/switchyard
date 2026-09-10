@@ -14,7 +14,7 @@ import logging
 import subprocess
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from enum import Enum
 from datetime import datetime
 
@@ -107,12 +107,53 @@ class DevContainerStateManager:
             logger.error(f"Failed to read dev container status for {project_name}: {e}")
             return DevContainerStatus.UNVERIFIED
 
+    def get_status_and_updated_at(
+        self, project_name: str
+    ) -> Tuple[DevContainerStatus, Optional[datetime]]:
+        """
+        This project's status and the timestamp of the write that set it, read
+        from ONE snapshot of the state file.
+
+        For callers that decide on both together (#171). get_status() and
+        get_status_updated_at() each take the file lock separately, so calling
+        them in sequence can pair a status from one version of the file with a
+        timestamp from another -- and a decision built from a mismatched pair is
+        wrong in a way neither accessor can detect. Reading both off the dict
+        _read_state() already loaded is also what
+        services/dev_container_build_lock.py's docstring asks of anyone who
+        needs a second field ("read it off the dict already loaded there rather
+        than calling back into DevContainerStateManager"), which is what keeps
+        utils.file_lock's no-nesting rule true.
+
+        Returns:
+            (status, updated_at) -- status falls back to UNVERIFIED and
+            updated_at to None on an unreadable/absent file or an unparseable
+            value, exactly as the two single-field accessors do.
+        """
+        state = self._read_state(project_name)
+
+        try:
+            status = DevContainerStatus(state.get('status', 'unverified'))
+        except Exception as e:
+            logger.error(f"Failed to read dev container status for {project_name}: {e}")
+            status = DevContainerStatus.UNVERIFIED
+
+        updated_at_str = state.get('updated_at')
+        if not updated_at_str:
+            return status, None
+        try:
+            return status, datetime.fromisoformat(updated_at_str)
+        except Exception as e:
+            logger.error(f"Failed to read dev container updated_at for {project_name}: {e}")
+            return status, None
+
     def set_status(
         self,
         project_name: str,
         status: DevContainerStatus,
         image_name: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
+        expect_status: Optional[DevContainerStatus] = None,
     ):
         """
         Set the status of a project's dev container
@@ -122,6 +163,13 @@ class DevContainerStateManager:
             status: New status
             image_name: Docker image name (e.g., "context-studio-agent:latest")
             error_message: Error message if status is BLOCKED
+            expect_status: when given, the write only lands if the status ON
+                DISK is still this value when _merge_state() has the file lock.
+                Turns a read-decide-write whose decision was made outside the
+                lock into a compare-and-set (#171); see _merge_state()'s
+                `expect` argument for why the check has to happen in there
+                rather than as a get_status() call right before this one.
+                Default None keeps every existing caller's unconditional write.
         """
         updates = {
             'status': status.value,
@@ -137,7 +185,10 @@ class DevContainerStateManager:
             # Clear error message if status changed from blocked
             updates['error_message'] = None
 
-        if self._merge_state(project_name, updates):
+        expect = (
+            None if expect_status is None else {'status': expect_status.value}
+        )
+        if self._merge_state(project_name, updates, expect=expect):
             logger.info(f"Updated dev container status for {project_name}: {status.value}")
 
     def set_pending_operation(self, project_name: str, operation: str) -> None:
@@ -245,8 +296,30 @@ class DevContainerStateManager:
                 f"{project_name} (requested {state.get('pending_operation_at')}) - "
                 f"the thread that owned it never came back"
             )
-            self.clear_pending_operation(project_name)
-            cleared += 1
+            # Conditional on the marker still being the one just read (#171).
+            # This is a read-decide-write with the lock released in between:
+            # clear_pending_operation() would clear whatever is there by the
+            # time it runs, so a rebuild requested in that gap would lose its
+            # 'queued' display -- the state file being that request's ONLY
+            # feedback channel (see set_pending_operation). The ownership
+            # argument in this method's docstring makes that gap very narrow
+            # rather than impossible, and the precondition costs nothing: the
+            # value it compares is the one just read.
+            #
+            # Inlined rather than routed through clear_pending_operation(),
+            # which has to stay unconditional for the rebuild endpoint's own
+            # `finally`. Sequential, not nested: _read_state() above has already
+            # released the file lock -- see _state_lock_file() on why nothing
+            # here may nest.
+            if self._merge_state(
+                project_name,
+                {'pending_operation': None, 'pending_operation_at': None},
+                expect={
+                    'pending_operation': state['pending_operation'],
+                    'pending_operation_at': state.get('pending_operation_at'),
+                },
+            ):
+                cleared += 1
         return cleared
 
     def set_last_operation_error(self, project_name: str, message: str) -> None:
@@ -364,7 +437,9 @@ class DevContainerStateManager:
         """
         return state_file.with_suffix(state_file.suffix + '.lock')
 
-    def _merge_state(self, project_name: str, updates: Dict) -> bool:
+    def _merge_state(
+        self, project_name: str, updates: Dict, expect: Optional[Dict] = None
+    ) -> bool:
         """
         Read-modify-write the project's state file, applying `updates` and
         deleting any key whose new value is None. Every writer of this file goes
@@ -397,7 +472,22 @@ class DevContainerStateManager:
         genuinely supersedes it, so writing one retracts it here, where every
         status writer already passes.
 
-        Returns True if the file was written.
+        `expect` makes the write a COMPARE-AND-SET (#171): each of its
+        key/value pairs must still match the state ON DISK once this method
+        holds the file lock, or the write is skipped. It has to be checked in
+        here and not by the caller because that is the only place the read and
+        the write are one critical section -- a caller that reads with
+        get_status(), decides, and then calls set_status() has already released
+        the lock in between, which is exactly the window a concurrent writer
+        (the verifier's in-session write from its own OS process, an operator
+        running scripts/rebuild_project_images.py) lands in. Only callers whose
+        decision depends on a value they read earlier pass it; an unconditional
+        write must not, or it would silently become a no-op.
+
+        Returns True if the file was written. A False is either a failure (the
+        ERROR below) or a refused precondition (the INFO below); no current
+        caller distinguishes them, and set_status() uses it only to decide
+        whether to log that it wrote.
         """
         from utils.file_lock import file_lock
 
@@ -418,6 +508,21 @@ class DevContainerStateManager:
                         state = {}
                 else:
                     state = {}
+
+                if expect is not None:
+                    stale = {
+                        key: state.get(key)
+                        for key, expected in expect.items()
+                        if state.get(key) != expected
+                    }
+                    if stale:
+                        logger.info(
+                            f"Skipping dev container state write for {project_name}: "
+                            f"expected {expect}, found {stale} on disk -- something "
+                            f"else wrote a fresher value while this caller was "
+                            f"deciding, so its decision no longer applies"
+                        )
+                        return False
 
                 for key, value in updates.items():
                     if value is None:
@@ -572,6 +677,18 @@ class DevContainerStateManager:
             f"or is not a genuine agent-environment image. Resetting status to unverified."
         )
 
+        # expect_status makes this a compare-and-set (#171). The decision above
+        # rests on a status read several seconds ago -- verify_image_exists()
+        # shells out to `docker image inspect` with a 10s timeout in between --
+        # and this method's two live callers are the ones most likely to be
+        # running while something else writes: claude/docker_runner.py's image
+        # resolution on every container launch, and main.py's startup sweep
+        # (which runs while the observability server, a separate container, may
+        # be finishing an operator-triggered rebuild). Writing unconditionally
+        # would revert that rebuild's fresh VERIFIED and force a redundant one.
+        # The return value stays False either way: the image this call actually
+        # looked at was genuinely missing, and reporting otherwise would tell
+        # docker_runner to launch against it.
         self.set_status(
             project_name,
             DevContainerStatus.UNVERIFIED,
@@ -579,7 +696,8 @@ class DevContainerStateManager:
             error_message=(
                 "Image missing, or tag now points at an unrelated image (e.g. overwritten "
                 "by another docker build/compose using the same name) - rebuild required"
-            )
+            ),
+            expect_status=DevContainerStatus.VERIFIED,
         )
 
         return False

@@ -25,6 +25,19 @@ if not os.path.exists('/app/state/dev_containers'):
 from services.dev_container_state import DevContainerStatus
 
 
+def _stub_session_snapshot(mock_state, before, after, status_after):
+    """Stub the two reads the no-marker fallback makes around the session.
+
+    Since #171 the POST-session status and timestamp come from ONE snapshot
+    (get_status_and_updated_at), so a decision built from both cannot pair a
+    timestamp from before an interleaving write with the status from after it.
+    The pre-session read is still its own call, which is what the fallback
+    compares against.
+    """
+    mock_state.get_status_updated_at.return_value = before
+    mock_state.get_status_and_updated_at.return_value = (status_after, after)
+
+
 def _task_context(project="test-project"):
     return {
         "context": {
@@ -78,6 +91,13 @@ class TestVerifierStatusParsing:
             "agents.dev_environment_verifier_agent.run_claude_code",
             new=AsyncMock(return_value="I looked at the environment and it seems fine, no markers here."),
         ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
+            same_timestamp = datetime(2026, 9, 2, 11, 8, 21)
+            _stub_session_snapshot(
+                mock_state,
+                before=same_timestamp,
+                after=same_timestamp,
+                status_after=DevContainerStatus.IN_PROGRESS,
+            )
             await agent.execute(_task_context())
 
         mock_state.set_status.assert_called_once()
@@ -124,11 +144,12 @@ class TestVerifierStatusParsing:
             "agents.dev_environment_verifier_agent.run_claude_code",
             new=AsyncMock(return_value="```\n### Summary\nConfirmed resolved. Dev container state updated to VERIFIED.\n```"),
         ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
-            mock_state.get_status_updated_at.side_effect = [
-                datetime(2026, 9, 2, 11, 8, 21),   # snapshot taken before the session runs
-                datetime(2026, 9, 2, 11, 16, 57),  # stamped by the agent's own set_status() call
-            ]
-            mock_state.get_status.return_value = DevContainerStatus.VERIFIED
+            _stub_session_snapshot(
+                mock_state,
+                before=datetime(2026, 9, 2, 11, 8, 21),   # snapshot taken before the session runs
+                after=datetime(2026, 9, 2, 11, 16, 57),   # stamped by the agent's own set_status() call
+                status_after=DevContainerStatus.VERIFIED,
+            )
             result = await agent.execute(_task_context())
 
         mock_state.set_status.assert_not_called()
@@ -145,11 +166,12 @@ class TestVerifierStatusParsing:
             "agents.dev_environment_verifier_agent.run_claude_code",
             new=AsyncMock(return_value="```\n### Summary\nStill broken. Dev container state updated to BLOCKED.\n```"),
         ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
-            mock_state.get_status_updated_at.side_effect = [
-                datetime(2026, 9, 2, 11, 8, 21),
-                datetime(2026, 9, 2, 11, 16, 57),
-            ]
-            mock_state.get_status.return_value = DevContainerStatus.BLOCKED
+            _stub_session_snapshot(
+                mock_state,
+                before=datetime(2026, 9, 2, 11, 8, 21),
+                after=datetime(2026, 9, 2, 11, 16, 57),
+                status_after=DevContainerStatus.BLOCKED,
+            )
             await agent.execute(_task_context())
 
         mock_state.set_status.assert_not_called()
@@ -171,11 +193,12 @@ class TestVerifierStatusParsing:
             "agents.dev_environment_verifier_agent.run_claude_code",
             new=AsyncMock(return_value="```\n### Summary\nDev container state updated to CHANGES_NEEDED.\n```"),
         ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
-            mock_state.get_status_updated_at.side_effect = [
-                datetime(2026, 9, 2, 11, 8, 21),
-                datetime(2026, 9, 2, 11, 16, 57),
-            ]
-            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+            _stub_session_snapshot(
+                mock_state,
+                before=datetime(2026, 9, 2, 11, 8, 21),
+                after=datetime(2026, 9, 2, 11, 16, 57),
+                status_after=DevContainerStatus.CHANGES_NEEDED,
+            )
             await agent.execute(_task_context())
 
         mock_state.set_status.assert_called_once()
@@ -198,8 +221,12 @@ class TestVerifierStatusParsing:
             new=AsyncMock(return_value="I looked at the environment and it seems fine, no markers here."),
         ), patch("agents.dev_environment_verifier_agent.dev_container_state") as mock_state:
             same_timestamp = datetime(2026, 9, 2, 11, 8, 21)
-            mock_state.get_status_updated_at.side_effect = [same_timestamp, same_timestamp]
-            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            _stub_session_snapshot(
+                mock_state,
+                before=same_timestamp,
+                after=same_timestamp,
+                status_after=DevContainerStatus.IN_PROGRESS,
+            )
             await agent.execute(_task_context())
 
         mock_state.set_status.assert_called_once()

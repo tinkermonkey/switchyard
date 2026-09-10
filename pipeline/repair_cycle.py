@@ -1365,6 +1365,26 @@ class RepairCycleStage(PipelineStage):
                     )
                     raise
 
+                # A deliberately terminated test container: don't retry (#160).
+                # claude/docker_runner.py raises NonRetryableAgentError for exit
+                # 137/143 — the OOM killer, or an operator's kill switch. Neither
+                # changes on a second attempt: an OOM reproduces on every run of
+                # the same suite, and re-launching a container an operator just
+                # killed is the opposite of what they asked for. Exhausting the
+                # retries here is worse than not retrying, because it fabricates a
+                # RepairTestResult carrying an "__infrastructure__" failure that
+                # the cycle then dispatches fix agents against — a Claude-driven
+                # "fix" for a container that was killed, not for a broken test.
+                # Propagated with its type intact, the same way the lock-timeout
+                # clause above and the ClaudeCodeRateLimitError clause earlier do.
+                from agents.non_retryable import NonRetryableAgentError
+                if isinstance(e, NonRetryableAgentError):
+                    logger.warning(
+                        f"Test execution container was terminated (not a test failure) — "
+                        f"not retrying: {e}"
+                    )
+                    raise
+
                 # Other execution failure (timeout, container failure, etc.)
                 logger.error(f"Test execution failed (attempt {attempt + 1}/{max_retries + 1}): {e}", exc_info=True)
                 

@@ -38,6 +38,21 @@ def mock_logger():
     return logger
 
 
+def _snapshot_from_stubs(mock_dev_state):
+    """Keep a mocked dev_container_state's get_status_and_updated_at() (#171)
+    consistent with the per-field stubs these tests set.
+
+    validate_task_can_run() reads the status and its timestamp from ONE
+    snapshot, so a staleness decision built from both cannot straddle an
+    interleaving write. The tests still state the two separately; this derives
+    the snapshot from them rather than making every case say it twice.
+    """
+    mock_dev_state.get_status_and_updated_at.side_effect = lambda project: (
+        mock_dev_state.get_status.return_value,
+        mock_dev_state.get_status_updated_at.return_value,
+    )
+
+
 @pytest.mark.asyncio
 async def test_validation_error_message_includes_context(mock_task, mock_logger):
     """Test that validation error messages include helpful context"""
@@ -55,6 +70,7 @@ async def test_validation_error_message_includes_context(mock_task, mock_logger)
         # Mock unverified status
         from services.dev_container_state import DevContainerStatus
         mock_dev_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+        _snapshot_from_stubs(mock_dev_state)
 
         # Mock decision emitter
         mock_decision_emitter = Mock()
@@ -98,6 +114,7 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
 
         from services.dev_container_state import DevContainerStatus
         mock_dev_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+        _snapshot_from_stubs(mock_dev_state)
 
         mock_decision_emitter = Mock()
         mock_decision_emitter.emit_error_decision = Mock()
@@ -136,6 +153,7 @@ async def test_in_progress_message_is_clear(mock_task, mock_logger):
 
         from services.dev_container_state import DevContainerStatus
         mock_dev_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+        _snapshot_from_stubs(mock_dev_state)
         mock_dev_state.get_status_updated_at.return_value = datetime.now()
 
         mock_decision_emitter = Mock()
@@ -171,6 +189,7 @@ async def test_blocked_message_includes_troubleshooting(mock_task, mock_logger):
 
         from services.dev_container_state import DevContainerStatus
         mock_dev_state.get_status.return_value = DevContainerStatus.BLOCKED
+        _snapshot_from_stubs(mock_dev_state)
 
         mock_decision_emitter = Mock()
         mock_decision_emitter.emit_error_decision = Mock()
@@ -208,6 +227,7 @@ async def test_validate_task_can_run_messages():
         mock_agent_config.requires_dev_container = True
         mock_config.get_project_agent_config.return_value = mock_agent_config
         mock_dev_state.get_status.return_value = DevContainerStatus.VERIFIED
+        _snapshot_from_stubs(mock_dev_state)
 
         result = await validate_task_can_run(mock_task, mock_logger)
         assert result['can_run'] is True
@@ -272,6 +292,7 @@ async def test_validate_task_can_run_stale_in_progress_triggers_resetup():
         mock_agent_config.requires_dev_container = True
         mock_config.get_project_agent_config.return_value = mock_agent_config
         mock_dev_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+        _snapshot_from_stubs(mock_dev_state)
 
         # Just under the threshold: still a normal defer.
         mock_dev_state.get_status_updated_at.return_value = (

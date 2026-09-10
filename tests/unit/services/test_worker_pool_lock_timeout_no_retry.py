@@ -123,3 +123,24 @@ class TestOrdinaryFailuresStillRetry:
 
         assert mock_process.call_count == 4  # 1 initial + max_retries=3
         assert worker.tasks_failed == 1
+
+
+class TestRateLimitIsNotRetried:
+    """#160 rider 2. By the time a ClaudeCodeRateLimitError reaches this loop,
+    services/agent_executor.py has already tripped the Claude Code circuit
+    breaker and recorded outcome='frozen' for the automatic resume. Every retry
+    here re-dispatches straight into an open breaker, fails again immediately,
+    and overwrites that 'frozen' record with a plain failure -- losing the thing
+    that would have resumed the work when tokens reset. The breaker's own reset
+    is the retry point, not this loop."""
+
+    @pytest.mark.asyncio
+    async def test_a_rate_limit_error_is_attempted_exactly_once(self):
+        from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
+
+        worker, mock_process = await _run_worker_with_error(
+            ClaudeCodeRateLimitError("Claude Code circuit breaker is OPEN")
+        )
+
+        assert mock_process.call_count == 1
+        assert worker.tasks_failed == 1

@@ -324,6 +324,7 @@ from services.project_checkout_lock import (
     _acquire_and_start_heartbeat_off_loop,
     _attribution,
     _default_facade_off_loop,
+    acquire_failure_is_contention,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
     _mint_unique_holder_id,
@@ -556,29 +557,13 @@ def dev_container_build_lock_sync(
 #                                               a durable marker, not a holder)
 #
 # See PipelineLockManager.try_acquire_lock() for each one's own comment.
-_DEGRADED_ACQUIRE_REASONS = frozenset({
-    "lock_state_unknown_failing_closed",
-    "lock_acquire_serialization_timeout",
-    "lock_acquire_serialization_unavailable",
-    "lock_mirror_write_failed",
-    "lock_mirror_write_failed_while_held",
-    "lock_write_failed",
-})
-
-
-def acquire_failure_is_contention(reason: Optional[str]) -> bool:
-    """
-    True when a False from acquire_resource() means a live holder currently owns
-    the build window, rather than a degraded/fail-closed or retained outcome.
-
-    Only `locked_by_issue_<n>` (without the `_failed` retained suffix) is genuine
-    contention. Everything else -- including a reason this module has never seen,
-    which is deliberately NOT assumed to be a holder -- is reported as degraded so
-    the caller and the operator both see the real reason.
-    """
-    if not isinstance(reason, str) or not reason.startswith("locked_by_issue_"):
-        return False
-    return not reason.endswith("_failed")
+# acquire_failure_is_contention() moved to services/project_checkout_lock.py
+# (#169): project_checkout_lock_if_free_sync() needs the identical
+# classification for the identical reason, and the reasons it classifies come
+# from the shared ProjectResourceLockManager facade rather than from anything
+# specific to this lock. Re-exported here (it is imported at the top of this
+# module) so `from services.dev_container_build_lock import
+# acquire_failure_is_contention` keeps working.
 
 
 def _log_skipped(project: str, issue_number: Optional[int], reason: str) -> None:

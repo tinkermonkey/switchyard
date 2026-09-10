@@ -188,12 +188,23 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             # called dev_container_state.set_status(VERIFIED) itself mid-session,
             # then this fallback overwrote that back to BLOCKED because the
             # closing "### Summary" text it wrote afterward omitted the marker.
-            status_updated_after_session = dev_container_state.get_status_updated_at(project_name)
+            #
+            # Both values come from ONE snapshot of the state file (#171).
+            # get_status_updated_at() and get_status() each take the file lock
+            # separately, so reading them in sequence could pair a timestamp
+            # from before an interleaving write with the status from after it --
+            # and then honor a status this session did not produce on the
+            # strength of a timestamp change it did. This lock is already
+            # released by the time these lines run (see
+            # services/dev_container_build_lock.py's "deliberately accepted
+            # gaps"), so a single locked read is what makes the pair consistent.
+            status_after_session, status_updated_after_session = (
+                dev_container_state.get_status_and_updated_at(project_name)
+            )
             session_wrote_state = (
                 status_updated_before_session != status_updated_after_session
                 and status_updated_after_session is not None
             )
-            status_after_session = dev_container_state.get_status(project_name)
             honorable_statuses = (DevContainerStatus.VERIFIED, DevContainerStatus.BLOCKED)
             if session_wrote_state and status_after_session in honorable_statuses:
                 logger.warning(

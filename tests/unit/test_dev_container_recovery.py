@@ -8,11 +8,46 @@ when a task is blocked by dev container validation.
 
 import os
 import pytest
+from contextlib import asynccontextmanager, contextmanager
 from unittest.mock import MagicMock, Mock, AsyncMock, patch
 
 # agents module requires Docker container environment
 if not os.path.exists('/app/state/dev_containers'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
+
+
+def _status_snapshot_from_stubs(mock_state):
+    """Keep a mocked dev_container_state's get_status_and_updated_at() (#171)
+    consistent with the per-field stubs a test sets.
+
+    queue_dev_environment_setup() now reads the status and its timestamp from
+    ONE snapshot, so that a decision built from both cannot straddle an
+    interleaving write. Tests still state the two separately; this derives the
+    snapshot from them rather than making every test say it twice.
+    """
+    mock_state.get_status_and_updated_at.side_effect = lambda project: (
+        mock_state.get_status.return_value,
+        mock_state.get_status_updated_at.return_value,
+    )
+
+
+@contextmanager
+def _build_lock(acquired: bool):
+    """Stand-in for dev_container_build_lock_if_free_async (#171).
+
+    queue_dev_environment_setup() takes that lock around its check-then-mark.
+    These tests are about the guard, not the lock, and the real acquire would
+    reach Redis / the on-disk lock store; the lock's own behaviour is covered by
+    tests/unit/services/test_dev_container_build_lock.py.
+    """
+    @asynccontextmanager
+    async def _ctx(project, issue_number=None, facade=None):
+        yield acquired
+
+    with patch(
+        'services.dev_container_build_lock.dev_container_build_lock_if_free_async', _ctx
+    ):
+        yield
 
 
 @pytest.fixture
@@ -46,6 +81,14 @@ def mock_task():
 class TestQueueDevEnvironmentSetup:
     """Tests for idempotent dev environment setup queuing."""
 
+    @pytest.fixture(autouse=True)
+    def _serialized_by_default(self):
+        """queue_dev_environment_setup() runs its check-then-mark inside this
+        project's dev_container_build lock (#171). Granted by default here; the
+        tests that care about a refused acquire re-patch it themselves."""
+        with _build_lock(True):
+            yield
+
     @pytest.mark.asyncio
     async def test_skips_when_already_in_progress(self, mock_logger):
         """When status is a RECENT IN_PROGRESS, should skip queuing entirely."""
@@ -60,6 +103,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -87,6 +131,7 @@ class TestQueueDevEnvironmentSetup:
             mock_state.set_status.side_effect = lambda *a, **kw: call_order.append('set_status')
             mock_queue_instance.enqueue.side_effect = lambda *a, **kw: call_order.append('enqueue')
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -112,6 +157,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("my-project", mock_logger)
@@ -136,6 +182,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup(
@@ -162,6 +209,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("my-project", mock_logger)
@@ -184,6 +232,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("my-project", mock_logger, change_description="   ")
@@ -205,6 +254,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             # First call: UNVERIFIED -> sets IN_PROGRESS and queues
@@ -262,6 +312,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.get_pending_tasks.return_value = []
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -297,6 +348,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.get_pending_tasks.return_value = [queued]
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -334,6 +386,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.get_pending_tasks.return_value = []
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -345,7 +398,13 @@ class TestQueueDevEnvironmentSetup:
     async def test_a_stale_in_progress_is_not_requeued_while_the_build_lock_is_held(self, mock_logger):
         """A held dev_container_build lock means a build genuinely IS running,
         whoever started it -- the one signal that outlasts the staleness window
-        most often."""
+        most often.
+
+        A held lock is also exactly what refuses this function's own
+        non-blocking acquire (#171), so the run reaches probe 3 through the
+        unserialized fallback -- which is the branch that still has to make this
+        judgement, and the reason probe 3 was kept rather than replaced by the
+        acquire."""
         from datetime import datetime, timedelta
         from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
         from services.dev_container_state import DevContainerStatus
@@ -359,7 +418,8 @@ class TestQueueDevEnvironmentSetup:
         facade = MagicMock()
         facade.get_resource_lock.return_value = held
 
-        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+        with _build_lock(False), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
              patch('services.work_execution_state.work_execution_tracker', tracker), \
              patch('services.project_resource_lock_manager.ProjectResourceLockManager', return_value=facade):
@@ -372,6 +432,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.get_pending_tasks.return_value = []
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -399,6 +460,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.get_pending_tasks.side_effect = RuntimeError("redis down")
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -420,6 +482,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             await queue_dev_environment_setup("test-project", mock_logger)
@@ -439,6 +502,7 @@ class TestQueueDevEnvironmentSetup:
             mock_queue_instance.enqueue.side_effect = ConnectionError("Redis unavailable")
             MockTaskQueue.return_value = mock_queue_instance
 
+            _status_snapshot_from_stubs(mock_state)
             from agents.orchestrator_integration import queue_dev_environment_setup
 
             with pytest.raises(ConnectionError, match="Redis unavailable"):
@@ -453,6 +517,158 @@ class TestQueueDevEnvironmentSetup:
 
             # Should have logged the error
             assert any("Rolling back" in str(call) for call in mock_logger.error.call_args_list)
+
+
+# ---------------------------------------------------------------------------
+# queue_dev_environment_setup: the check-then-mark is one critical section
+# ---------------------------------------------------------------------------
+
+class TestTheDuplicateGuardIsAtomic:
+    """#171. "Mark as in-progress BEFORE queuing to prevent races" only prevents
+    them if the read that decided to mark and the mark itself are one critical
+    section. They were two, so two concurrent callers for the same project both
+    read a non-IN_PROGRESS status, both wrote IN_PROGRESS and both enqueued --
+    the duplicate hour-scale rebuild _dev_setup_in_flight_reason()'s docstring
+    describes, reached from the other direction."""
+
+    @pytest.mark.asyncio
+    async def test_the_status_is_re_read_inside_the_lock(self, mock_logger):
+        """THE regression: the interleaving write lands after this caller's own
+        caller decided it needed a setup, but before the guard reads. A guard
+        reading outside the lock cannot see it; one reading inside must."""
+        from datetime import datetime
+        from services.dev_container_state import DevContainerStatus
+
+        reads = []
+
+        def _status_at_read_time(project):
+            # First read happens inside the lock; by then another dispatch has
+            # already marked the project IN_PROGRESS.
+            reads.append(project)
+            return (DevContainerStatus.IN_PROGRESS, datetime.now())
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.side_effect = _status_at_read_time
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert reads == ["test-project"], "the guard did not re-read the status"
+        mock_state.set_status.assert_not_called()
+        mock_queue_instance.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_decision_and_the_mark_happen_inside_the_same_hold(self, mock_logger):
+        from services.dev_container_state import DevContainerStatus
+
+        events = []
+
+        @asynccontextmanager
+        async def _recording_lock(project, issue_number=None, facade=None):
+            events.append('lock_acquired')
+            try:
+                yield True
+            finally:
+                events.append('lock_released')
+
+        with patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async',
+                   _recording_lock), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.side_effect = (
+                lambda project: (events.append('status_read'),
+                                 (DevContainerStatus.UNVERIFIED, None))[1]
+            )
+            mock_state.set_status.side_effect = lambda *a, **kw: events.append('set_status')
+            mock_queue_instance = Mock()
+            mock_queue_instance.enqueue.side_effect = lambda *a, **kw: events.append('enqueue')
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert events == [
+            'lock_acquired', 'status_read', 'set_status', 'enqueue', 'lock_released'
+        ], events
+
+    @pytest.mark.asyncio
+    async def test_a_refused_acquire_falls_back_rather_than_never_queuing(self, mock_logger):
+        """A retained lock from a failed run, or a degraded lock store, refuses
+        the acquire without any build being in flight -- and probe 3 of
+        _dev_setup_in_flight_reason() deliberately does not treat either as a
+        live run. Skipping outright there would be a NEW way for a project to
+        never get a setup queued, so the fallback keeps the previous
+        (unserialized) behaviour and says so."""
+        from services.dev_container_state import DevContainerStatus
+
+        with _build_lock(False), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        mock_queue_instance.enqueue.assert_called_once()
+        assert any(
+            "WITHOUT its dev_container_build lock" in str(call)
+            for call in mock_logger.warning.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_holding_the_lock_suppresses_the_probe_that_would_find_it(self, mock_logger):
+        """_dev_setup_in_flight_reason()'s probe 3 asks whether the
+        dev_container_build lock is held. Run from inside the hold it would find
+        this call's OWN lock and report a build that is not running, turning the
+        stale-IN_PROGRESS recovery into a permanent no-op."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        held = Mock()
+        held.retained_reason = None
+        held.lock_acquired_at = '2026-01-01T00:00:00+00:00'
+
+        tracker = MagicMock()
+        tracker.load_state.return_value = {'execution_history': []}
+        facade = MagicMock()
+        facade.get_resource_lock.return_value = held
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
+             patch('services.work_execution_state.work_execution_tracker', tracker), \
+             patch('services.project_resource_lock_manager.ProjectResourceLockManager',
+                   return_value=facade):
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.IN_PROGRESS,
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1),
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.return_value = []
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        facade.get_resource_lock.assert_not_called()
+        mock_queue_instance.enqueue.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +790,7 @@ class TestChangesNeededHasAStalenessEscape:
             mock_config.get_project_agent_config.return_value = Mock(requires_dev_container=True)
             mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
             mock_state.get_status_updated_at.return_value = updated_at
+            _status_snapshot_from_stubs(mock_state)
 
             from agents.orchestrator_integration import validate_task_can_run
             return await validate_task_can_run(self._task(), mock_logger)

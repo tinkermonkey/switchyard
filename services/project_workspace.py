@@ -829,10 +829,13 @@ class ProjectWorkspaceManager:
         epic_id: str,
         issue_number: Optional[int],
         requested_seconds: Optional[float],
+        operation: str = 'get_or_create_epic_worktree',
     ) -> float:
-        """How long get_or_create_epic_worktree() may wait for a lock -- both this
+        """How long an epic-worktree operation may wait for a lock -- both this
         epic's own serializer (_epic_worktree_key_lock_held) and, on the creation
-        path, this project's project_checkout lock.
+        path, this project's project_checkout lock. `operation` names the caller
+        in the on-loop error below; cleanup_epic_worktree() shares this resolver
+        because its teardown takes exactly the same two locks (#169).
 
         One budget for both because they are one queue: a caller blocked on the
         per-key lock is blocked on the winner's project_checkout wait, so giving
@@ -877,8 +880,8 @@ class ProjectWorkspaceManager:
             pass
         else:
             logger.error(
-                f"get_or_create_epic_worktree({project_name!r}, epic #{epic_id}) reached "
-                "its creation path on the event-loop thread. Its project_checkout wait "
+                f"{operation}({project_name!r}, epic #{epic_id}) reached "
+                "its base-clone git path on the event-loop thread. Its project_checkout wait "
                 "is a time.sleep() poll loop, and the holders it would wait behind "
                 "release from coroutines on this same loop -- so waiting here freezes "
                 "the orchestrator and starves the holder. Failing immediately instead. "
@@ -1201,12 +1204,13 @@ class ProjectWorkspaceManager:
                 # definition never the base clone -- so this was the last unlocked
                 # base-clone writer on the CREATION side, free to race the startup
                 # clone/update, a base-clone-scoped container run and auto_commit's
-                # add/commit/push against that same .git. Epic-worktree TEARDOWN is
-                # still an unlocked writer of this same .git/worktrees/ --
-                # cleanup_epic_worktree() and prune_epic_worktrees() both run `git -C
-                # <base clone> worktree remove --force` with no project_checkout lock
-                # -- tracked separately in #169; do not read this block as saying
-                # base-clone coverage is now complete.
+                # add/commit/push against that same .git. The symmetric TEARDOWN
+                # writers of this same .git/worktrees/ are covered too since #169:
+                # cleanup_epic_worktree() takes this lock the same way (bounded
+                # wait, inside the same per-key serializer), and
+                # prune_epic_worktrees()'s startup sweep takes it per project with
+                # a single non-blocking attempt -- see that method's docstring for
+                # why a wait there could never succeed.
                 #
                 # Sync, not async: this is a plain sync method with sync callers. #146
                 # WI-1 made that safe for the HOLD -- the heartbeat runs on a real OS
@@ -1794,7 +1798,13 @@ class ProjectWorkspaceManager:
         except Exception as e:
             logger.warning(f"Failed to check/push local commits in {worktree_path} before removal: {e}")
 
-    def cleanup_epic_worktree(self, project_name: str, epic_id: str) -> bool:
+    def cleanup_epic_worktree(
+        self,
+        project_name: str,
+        epic_id: str,
+        issue_number: Optional[int] = None,
+        checkout_lock_timeout_seconds: Optional[float] = None,
+    ) -> bool:
         """
         Remove an epic's worktree once the whole epic is complete.
 
@@ -1807,11 +1817,38 @@ class ProjectWorkspaceManager:
         A crash before this ever runs simply leaves the worktree on disk — it's caught by
         prune_epic_worktrees() on the next orchestrator startup instead.
 
+        Args:
+            project_name: Project name.
+            epic_id: Epic identifier the worktree is staged under.
+            issue_number: log attribution for both lock waits, and the key
+                project_checkout_lock's activity registry publishes them under
+                -- see get_or_create_epic_worktree(). Never the lock's holder
+                identity.
+            checkout_lock_timeout_seconds: See get_or_create_epic_worktree();
+                resolved through the same _resolve_checkout_lock_timeout().
+
         Returns:
             True if a worktree was found and removed (or already gone), False if this
             epic had no tracked worktree to clean up.
+
+        Raises:
+            ProjectCheckoutLockTimeoutError: neither this epic's serializer nor
+                this project's project_checkout lock could be acquired within the
+                resolved budget. Propagated rather than folded into the False
+                return (#169): False already means "nothing was tracked to clean
+                up", and collapsing "could not get the lock" into it would report
+                a contention outcome as a completed no-op. Nothing was pushed,
+                removed or untracked when it raises, and it is the type
+                services/resource_lock_errors.is_lock_timeout_error() recognizes,
+                so a caller routes through the existing contention path exactly
+                as get_or_create_epic_worktree()'s own timeout does.
         """
         key = (project_name, str(epic_id))
+        lock_issue_number = self._resolve_epic_lock_issue_number(epic_id, issue_number)
+        lock_timeout_seconds = self._resolve_checkout_lock_timeout(
+            project_name, epic_id, lock_issue_number, checkout_lock_timeout_seconds,
+            operation='cleanup_epic_worktree',
+        )
         # This epic's own serializer, not the process-global map guard (code
         # review on #151/WI-6): the body below runs `git worktree remove --force`
         # (15s), a directory removal, a `worktree prune` (15s) and possibly a push
@@ -1819,7 +1856,15 @@ class ProjectWorkspaceManager:
         # other project's worktree resolution too. Same lock ordering as
         # get_or_create_epic_worktree(): per-key OUTER, map guard INNER, so a
         # cleanup and a creation for the SAME epic still cannot interleave.
-        with self._epic_worktree_key_lock(key):
+        #
+        # Budgeted rather than a bare acquire (#169), for the reason
+        # _epic_worktree_key_lock_held() gives: the winner for this epic now waits
+        # on project_checkout INSIDE this lock, so an unbudgeted acquire here
+        # would park a second caller on a plain threading.Lock for that whole
+        # wait, unpublished and unreapable.
+        with self._epic_worktree_key_lock_held(
+            key, project_name, str(epic_id), lock_issue_number, lock_timeout_seconds
+        ):
             with self._epic_worktree_lock:
                 worktree_path = self._epic_worktrees.get(key)
 
@@ -1827,31 +1872,66 @@ class ProjectWorkspaceManager:
                 logger.debug(f"No in-flight worktree tracked for {project_name} epic #{epic_id}; nothing to clean up")
                 return False
 
-            self._push_local_commits_if_any(worktree_path)
+            # project_checkout lock (#169). This is the TEARDOWN half of the gap
+            # #151/WI-6 closed on the creation side: `git worktree remove --force`
+            # and `git worktree prune` both rewrite the BASE CLONE's own
+            # .git/worktrees/ registration, and _push_local_commits_if_any()
+            # updates its remote-tracking refs -- all in the shared directory the
+            # startup clone/update, a base-clone-scoped container run and
+            # auto_commit's add/commit/push also write. Nothing gated any of it,
+            # for the same reason nothing gated _add_epic_worktree(): every other
+            # call site decides whether to lock from its FINAL resolved directory
+            # (is_base_clone_dir()), which here is the worktree being removed,
+            # never the base clone it is registered in.
+            #
+            # The hold starts BEFORE the push, not at the removal: the push is
+            # itself a base-clone write, and splitting the two would leave the
+            # window between them unguarded.
+            #
+            # Lock ordering, unchanged from the creation path: this epic's
+            # per-key lock is held here and project_checkout is taken INSIDE it,
+            # never the reverse. The map guard (_epic_worktree_lock) is
+            # deliberately not held across the wait -- see
+            # _epic_worktree_key_lock().
+            #
+            # Sync and blocking, unlike prune_epic_worktrees()'s sweep: this has
+            # no startup/event-loop caller to freeze, and
+            # _resolve_checkout_lock_timeout() clamps a stray on-loop caller to a
+            # single non-blocking attempt anyway. A timeout raises rather than
+            # proceeding unlocked, so nothing is pushed, removed or untracked
+            # when it does.
+            from services.project_checkout_lock import project_checkout_lock_sync
 
             base_repo_dir = self.workspace_root / project_name
             removed = False
-            try:
-                result = subprocess.run(
-                    ['git', '-C', str(base_repo_dir), 'worktree', 'remove', '--force', worktree_path],
-                    capture_output=True, text=True, timeout=15
-                )
-                if result.returncode == 0:
-                    removed = True
-                else:
-                    logger.warning(
-                        f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
-                        "removing directory directly"
+            with project_checkout_lock_sync(
+                project_name,
+                lock_issue_number,
+                timeout_seconds=lock_timeout_seconds,
+            ):
+                self._push_local_commits_if_any(worktree_path)
+
+                try:
+                    result = subprocess.run(
+                        ['git', '-C', str(base_repo_dir), 'worktree', 'remove', '--force', worktree_path],
+                        capture_output=True, text=True, timeout=15
                     )
-                    shutil.rmtree(worktree_path, ignore_errors=True)
-                    subprocess.run(
-                        ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
-                        capture_output=True, timeout=15
-                    )
+                    if result.returncode == 0:
+                        removed = True
+                    else:
+                        logger.warning(
+                            f"git worktree remove failed for {worktree_path}: {result.stderr.strip()}; "
+                            "removing directory directly"
+                        )
+                        shutil.rmtree(worktree_path, ignore_errors=True)
+                        subprocess.run(
+                            ['git', '-C', str(base_repo_dir), 'worktree', 'prune'],
+                            capture_output=True, timeout=15
+                        )
+                        removed = not Path(worktree_path).exists()
+                except Exception as e:
+                    logger.warning(f"Failed to clean up epic worktree {worktree_path}: {e}")
                     removed = not Path(worktree_path).exists()
-            except Exception as e:
-                logger.warning(f"Failed to clean up epic worktree {worktree_path}: {e}")
-                removed = not Path(worktree_path).exists()
 
             if removed:
                 with self._epic_worktree_lock:
@@ -1944,6 +2024,154 @@ class ProjectWorkspaceManager:
             else:
                 self._worktree_paths_in_use.pop(key, None)
 
+    def _prune_project_staging(self, project_staging: Path, running_mount_sources: set) -> None:
+        """One project's half of prune_epic_worktrees()'s sweep, run with that
+        project's project_checkout lock HELD.
+
+        Split out of the sweep loop (#169) rather than reindented in place so the
+        per-project unit -- everything that writes the base clone's .git, from the
+        per-worktree removals through the trailing `worktree prune` and the
+        staging-dir rmdir -- is one callable the lock can wrap, and one the tests
+        can drive directly. Every skip rule it applies, and why the lock does not
+        replace any of them, is documented on prune_epic_worktrees().
+
+        Best-effort like its caller: it swallows its own subprocess/OS failures and
+        must never raise (prune_epic_worktrees() runs unguarded at every startup).
+        """
+        repo_path = self.workspace_root / project_staging.name
+        try:
+            worktree_paths = list(project_staging.iterdir())
+        except OSError as e:
+            logger.warning(f"Failed to list epic worktrees under {project_staging}: {e}")
+            return
+        for worktree_path in worktree_paths:
+            if not worktree_path.is_dir():
+                continue
+            # Re-check right before acting on each worktree, not once
+            # up front (review pass 2 on #87): container recovery can
+            # still be adopting/creating worktrees concurrently on
+            # another thread while this sweep is mid-loop -- a single
+            # snapshot taken before the loop started could already be
+            # stale by the time a later iteration gets here, especially
+            # for a first-time worktree creation via the slower
+            # multi-subprocess _add_epic_worktree path.
+            #
+            # _epic_worktrees_pending is what makes that re-check mean
+            # anything for a resolution still IN FLIGHT (code review on
+            # #151/WI-6). While _epic_worktree_lock was
+            # get_or_create_epic_worktree()'s whole serializer, this
+            # acquire blocked until a concurrent adoption/creation had
+            # finished and registered itself, so _epic_worktrees alone
+            # could never miss one. It is now only a map guard -- the git
+            # work and the project_checkout wait run with it released --
+            # so _epic_worktrees is empty for a worktree another thread
+            # is actively populating, and this sweep would force-remove
+            # it. The pending map is published under this same guard
+            # BEFORE any of that work starts, so the check still sees the
+            # in-flight case, without prune ever blocking (it runs on the
+            # event-loop thread at startup; taking the per-key lock here
+            # would freeze the loop for the creation's whole ~3h budget).
+            with self._epic_worktree_lock:
+                currently_tracked = (
+                    str(worktree_path) in self._epic_worktrees.values()
+                    or str(worktree_path) in self._epic_worktrees_pending.values()
+                    or str(worktree_path) in self._worktree_paths_in_use
+                )
+            if currently_tracked:
+                logger.debug(
+                    f"Skipping prune of {worktree_path} -- currently tracked in "
+                    "_epic_worktrees (adopted or created earlier this process), "
+                    "being adopted/created right now on another thread, or "
+                    "currently being written by a git writer that marked it in use"
+                )
+                continue
+
+            # Liveness check: is this worktree's HOST path currently
+            # bind-mounted into a running container? worktree_path is
+            # container-side (rooted at self.workspace_root, i.e.
+            # /workspace in-container); running_mount_sources holds HOST
+            # paths (docker inspect's Mounts[].Source), so translate
+            # before comparing -- same /workspace/ -> host_workspace_path
+            # translation established in project_monitor.py's
+            # _launch_repair_cycle_container.
+            if running_mount_sources:
+                worktree_path_str = str(worktree_path)
+                if worktree_path_str.startswith('/workspace/'):
+                    try:
+                        from claude.docker_runner import DockerAgentRunner
+                        host_workspace_path = DockerAgentRunner._detect_host_workspace_path()
+                        host_worktree_path = (
+                            f"{host_workspace_path}/"
+                            f"{worktree_path_str[len('/workspace/'):]}"
+                        )
+                        if host_worktree_path in running_mount_sources:
+                            logger.info(
+                                f"Skipping prune of {worktree_path} -- currently "
+                                "bind-mounted into a live, running container "
+                                "(e.g. a repair-cycle container that survived "
+                                "the restart)"
+                            )
+                            continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to check container liveness for "
+                            f"{worktree_path}, proceeding with prune: {e}"
+                        )
+
+            # Code review finding on get_or_create_epic_worktree()'s own
+            # new corruption guard: this sweep was a second, unprotected
+            # path to the identical destructive operation that guard
+            # exists to prevent -- neither the tracked-check nor the
+            # liveness check above catches a worktree that's corrupted
+            # (no .git at all) but currently untracked and unmounted,
+            # and _push_local_commits_if_any() below is a no-op with no
+            # .git to run git commands against, so the safety net that
+            # normally justifies "safe to remove unconditionally, cheaply
+            # recreated on demand" for this method's whole design doesn't
+            # apply here: there is no way to tell "just the unmodified
+            # checkout, safe to lose" apart from "an agent's real,
+            # uncommitted work that never got the chance to be pushed
+            # before whatever caused the corruption interrupted it" --
+            # exactly the scenario a corrupted (not merely idle) worktree
+            # is more likely to correlate with. Skip it here too, for a
+            # human to resolve the same way get_or_create_epic_worktree()
+            # asks them to -- unless it's genuinely empty, which has
+            # nothing to lose either way.
+            if self._is_corrupted_non_empty_worktree(worktree_path):
+                logger.warning(
+                    f"Skipping prune of {worktree_path} -- has no .git at all "
+                    "(corrupted, not a recognized worktree) but is non-empty, so "
+                    "it may hold real uncommitted work. Needs manual inspection, "
+                    f"then `git worktree remove --force {worktree_path}` (or "
+                    "`git worktree prune`) run against the base clone."
+                )
+                continue
+
+            self._push_local_commits_if_any(worktree_path)
+            try:
+                subprocess.run(
+                    ['git', '-C', str(repo_path), 'worktree', 'remove', '--force', str(worktree_path)],
+                    capture_output=True, timeout=15
+                )
+            except Exception:
+                pass
+            if worktree_path.is_dir():
+                shutil.rmtree(worktree_path, ignore_errors=True)
+        # Prune any remaining stale metadata entries
+        try:
+            subprocess.run(
+                ['git', '-C', str(repo_path), 'worktree', 'prune'],
+                capture_output=True, timeout=15
+            )
+        except Exception:
+            pass
+        # Remove the now-empty staging directory for this project
+        try:
+            if project_staging.is_dir() and not any(project_staging.iterdir()):
+                project_staging.rmdir()
+        except OSError as e:
+            logger.warning(f"Failed to remove empty epic worktree staging dir {project_staging}: {e}")
+
     def prune_epic_worktrees(self) -> None:
         """Remove all staged epic worktrees and prune git metadata.
 
@@ -2007,7 +2235,55 @@ class ProjectWorkspaceManager:
         if_any() is a no-op with no .git to run git commands against, so the
         "cheap, no real loss" assumption this paragraph otherwise relies on
         does not hold for it.
+
+        The project_checkout lock, and why it is per-project and non-blocking
+        ----------------------------------------------------------------------
+        Everything this sweep does to a worktree is also a write to the BASE
+        CLONE (#169): `git worktree remove --force` and `git worktree prune`
+        rewrite its own .git/worktrees/ registration, and
+        _push_local_commits_if_any() updates its remote-tracking refs. It ran
+        ungated against the same .git that container recovery -- which main.py
+        calls immediately BEFORE this, and whose auto-commit work can still be
+        running on a background thread holding this project's project_checkout
+        lock (see mark_worktree_path_in_use()) -- writes to.
+
+        Three placements were possible, and only one of them works here:
+
+          - Per WORKTREE. Rejected: it leaves the trailing `git worktree prune`
+            and the staging-dir rmdir -- both base-clone writes -- outside every
+            hold, and pays an acquire/release per directory for no isolation
+            gain, since every worktree under one project_staging targets that
+            same project's .git anyway.
+          - Per SWEEP (one hold covering every project). Rejected: one busy
+            project would skip every other project's cleanup, and the hold would
+            span every project's git subprocesses.
+          - Per PROJECT, taken once per project_staging iteration. Chosen: it is
+            exactly the scope of the .git being written, it covers the trailing
+            prune and rmdir, and one busy project costs only that project's
+            sweep.
+
+        NON-BLOCKING (project_checkout_lock_if_free_sync), not the bounded wait
+        get_or_create_epic_worktree() and cleanup_epic_worktree() use. main.py
+        calls this directly on the event-loop thread, and
+        project_checkout_lock_sync()'s poll is a time.sleep() whose in-process
+        holders can only reach their release by being rescheduled on that same
+        loop -- so a wait here would starve the holder it is waiting for and
+        could never succeed, on the one path where stalling means a frozen
+        orchestrator rather than a slow one. A single attempt has neither
+        problem, and this sweep is best-effort by construction: a skipped
+        project's worktrees stay on disk for the next startup's sweep, or get
+        adopted and reused by get_or_create_epic_worktree() before then.
+
+        The in-flight/liveness/corruption checks below all STAY. They answer a
+        different question (is this particular worktree still someone's working
+        directory?) than the lock does (is anything else writing this base
+        clone's .git right now?), and neither substitutes for the other: the
+        thread that adopted a worktree does not hold project_checkout merely to
+        keep tracking it, and a container that survived the restart holds no
+        in-process lock at all.
         """
+        from services.project_checkout_lock import project_checkout_lock_if_free_sync
+
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
             if not staging_root.is_dir():
@@ -2027,139 +2303,21 @@ class ProjectWorkspaceManager:
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
                     continue
-                repo_path = self.workspace_root / project_staging.name
-                try:
-                    worktree_paths = list(project_staging.iterdir())
-                except OSError as e:
-                    logger.warning(f"Failed to list epic worktrees under {project_staging}: {e}")
-                    continue
-                for worktree_path in worktree_paths:
-                    if not worktree_path.is_dir():
-                        continue
-                    # Re-check right before acting on each worktree, not once
-                    # up front (review pass 2 on #87): container recovery can
-                    # still be adopting/creating worktrees concurrently on
-                    # another thread while this sweep is mid-loop -- a single
-                    # snapshot taken before the loop started could already be
-                    # stale by the time a later iteration gets here, especially
-                    # for a first-time worktree creation via the slower
-                    # multi-subprocess _add_epic_worktree path.
-                    #
-                    # _epic_worktrees_pending is what makes that re-check mean
-                    # anything for a resolution still IN FLIGHT (code review on
-                    # #151/WI-6). While _epic_worktree_lock was
-                    # get_or_create_epic_worktree()'s whole serializer, this
-                    # acquire blocked until a concurrent adoption/creation had
-                    # finished and registered itself, so _epic_worktrees alone
-                    # could never miss one. It is now only a map guard -- the git
-                    # work and the project_checkout wait run with it released --
-                    # so _epic_worktrees is empty for a worktree another thread
-                    # is actively populating, and this sweep would force-remove
-                    # it. The pending map is published under this same guard
-                    # BEFORE any of that work starts, so the check still sees the
-                    # in-flight case, without prune ever blocking (it runs on the
-                    # event-loop thread at startup; taking the per-key lock here
-                    # would freeze the loop for the creation's whole ~3h budget).
-                    with self._epic_worktree_lock:
-                        currently_tracked = (
-                            str(worktree_path) in self._epic_worktrees.values()
-                            or str(worktree_path) in self._epic_worktrees_pending.values()
-                            or str(worktree_path) in self._worktree_paths_in_use
-                        )
-                    if currently_tracked:
-                        logger.debug(
-                            f"Skipping prune of {worktree_path} -- currently tracked in "
-                            "_epic_worktrees (adopted or created earlier this process), "
-                            "being adopted/created right now on another thread, or "
-                            "currently being written by a git writer that marked it in use"
-                        )
-                        continue
-
-                    # Liveness check: is this worktree's HOST path currently
-                    # bind-mounted into a running container? worktree_path is
-                    # container-side (rooted at self.workspace_root, i.e.
-                    # /workspace in-container); running_mount_sources holds HOST
-                    # paths (docker inspect's Mounts[].Source), so translate
-                    # before comparing -- same /workspace/ -> host_workspace_path
-                    # translation established in project_monitor.py's
-                    # _launch_repair_cycle_container.
-                    if running_mount_sources:
-                        worktree_path_str = str(worktree_path)
-                        if worktree_path_str.startswith('/workspace/'):
-                            try:
-                                from claude.docker_runner import DockerAgentRunner
-                                host_workspace_path = DockerAgentRunner._detect_host_workspace_path()
-                                host_worktree_path = (
-                                    f"{host_workspace_path}/"
-                                    f"{worktree_path_str[len('/workspace/'):]}"
-                                )
-                                if host_worktree_path in running_mount_sources:
-                                    logger.info(
-                                        f"Skipping prune of {worktree_path} -- currently "
-                                        "bind-mounted into a live, running container "
-                                        "(e.g. a repair-cycle container that survived "
-                                        "the restart)"
-                                    )
-                                    continue
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to check container liveness for "
-                                    f"{worktree_path}, proceeding with prune: {e}"
-                                )
-
-                    # Code review finding on get_or_create_epic_worktree()'s own
-                    # new corruption guard: this sweep was a second, unprotected
-                    # path to the identical destructive operation that guard
-                    # exists to prevent -- neither the tracked-check nor the
-                    # liveness check above catches a worktree that's corrupted
-                    # (no .git at all) but currently untracked and unmounted,
-                    # and _push_local_commits_if_any() below is a no-op with no
-                    # .git to run git commands against, so the safety net that
-                    # normally justifies "safe to remove unconditionally, cheaply
-                    # recreated on demand" for this method's whole design doesn't
-                    # apply here: there is no way to tell "just the unmodified
-                    # checkout, safe to lose" apart from "an agent's real,
-                    # uncommitted work that never got the chance to be pushed
-                    # before whatever caused the corruption interrupted it" --
-                    # exactly the scenario a corrupted (not merely idle) worktree
-                    # is more likely to correlate with. Skip it here too, for a
-                    # human to resolve the same way get_or_create_epic_worktree()
-                    # asks them to -- unless it's genuinely empty, which has
-                    # nothing to lose either way.
-                    if self._is_corrupted_non_empty_worktree(worktree_path):
+                # project_checkout lock, taken per project and NON-BLOCKING -- see
+                # this method's docstring for why that placement and not the other
+                # two, and why a wait here could never succeed (#169).
+                with project_checkout_lock_if_free_sync(project_staging.name) as acquired:
+                    if not acquired:
                         logger.warning(
-                            f"Skipping prune of {worktree_path} -- has no .git at all "
-                            "(corrupted, not a recognized worktree) but is non-empty, so "
-                            "it may hold real uncommitted work. Needs manual inspection, "
-                            f"then `git worktree remove --force {worktree_path}` (or "
-                            "`git worktree prune`) run against the base clone."
+                            f"Skipping the epic-worktree prune sweep for "
+                            f"{project_staging.name} -- its project_checkout lock could not "
+                            f"be taken, and every removal in it rewrites that base clone's "
+                            f"own .git. Its stale worktrees stay on disk; the next startup's "
+                            f"sweep (or get_or_create_epic_worktree()'s adoption path) picks "
+                            f"them up."
                         )
                         continue
-
-                    self._push_local_commits_if_any(worktree_path)
-                    try:
-                        subprocess.run(
-                            ['git', '-C', str(repo_path), 'worktree', 'remove', '--force', str(worktree_path)],
-                            capture_output=True, timeout=15
-                        )
-                    except Exception:
-                        pass
-                    if worktree_path.is_dir():
-                        shutil.rmtree(worktree_path, ignore_errors=True)
-                # Prune any remaining stale metadata entries
-                try:
-                    subprocess.run(
-                        ['git', '-C', str(repo_path), 'worktree', 'prune'],
-                        capture_output=True, timeout=15
-                    )
-                except Exception:
-                    pass
-                # Remove the now-empty staging directory for this project
-                try:
-                    if project_staging.is_dir() and not any(project_staging.iterdir()):
-                        project_staging.rmdir()
-                except OSError as e:
-                    logger.warning(f"Failed to remove empty epic worktree staging dir {project_staging}: {e}")
+                    self._prune_project_staging(project_staging, running_mount_sources)
 
             logger.info(f"Pruned epic worktrees under {staging_root}")
         except Exception as e:
