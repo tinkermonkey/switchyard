@@ -25,6 +25,7 @@ from services.pipeline_lock_manager import (
     ReleaseResult,
     STATE_LOCK_TIMEOUT_SECONDS,
     TouchResult,
+    refusal_leaves_caller_holding_lock,
 )
 from tests.utils.fake_redis import ThreadSafeFakeRedis
 
@@ -1710,7 +1711,13 @@ class TestAGrantIsOnlyReportedWhenItsDurableCopyLanded(unittest.TestCase):
     def test_a_live_holders_key_is_not_deleted_by_the_refusal(self):
         """The repeat call an issue makes on every poll while it holds the
         lock. Its mirror can fail too -- but rolling THAT back would release a
-        lock out from under a running pipeline, so it is refused in place."""
+        lock out from under a running pipeline, so it is refused in place.
+
+        The reason is DISTINCT from the new-grant refusal (#139 review round):
+        this is the one refusal after which the caller is still the recorded
+        holder, and its teardown call sites branch on exactly that -- see
+        refusal_leaves_caller_holding_lock().
+        """
         self.assertEqual(
             self.manager.try_acquire_lock("proj", "board", 123), (True, "lock_acquired")
         )
@@ -1719,8 +1726,83 @@ class TestAGrantIsOnlyReportedWhenItsDurableCopyLanded(unittest.TestCase):
         with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
             success, reason = self.manager.try_acquire_lock("proj", "board", 123)
 
-        self.assertEqual((success, reason), (False, "lock_mirror_write_failed"))
+        self.assertEqual((success, reason), (False, "lock_mirror_write_failed_while_held"))
+        self.assertTrue(refusal_leaves_caller_holding_lock(reason))
         self.assertEqual(str(self.redis.hgetall(self.lock_key)['locked_by_issue']), '123')
+
+    def test_a_new_grants_refusal_does_not_claim_the_caller_still_holds_it(self):
+        """The other half of the same distinction: a rolled-back NEW grant
+        leaves the caller holding nothing, so a teardown call site must be
+        free to end the run and release exactly as it always did."""
+        with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            _success, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual(reason, "lock_mirror_write_failed")
+        self.assertFalse(refusal_leaves_caller_holding_lock(reason))
+        self.assertFalse(refusal_leaves_caller_holding_lock("locked_by_issue_999"))
+        self.assertFalse(refusal_leaves_caller_holding_lock("lock_write_failed"))
+        self.assertFalse(refusal_leaves_caller_holding_lock(None))
+
+    def test_the_yaml_fallback_refuses_a_grant_recorded_only_in_redis(self):
+        """The sibling path, WITH Redis configured -- the case the use_redis=False
+        cases below structurally cannot reach.
+
+        try_acquire_lock() falls into its YAML fallback whenever the Redis
+        transaction raises (a stale connection, and LOCK_REDIS_RETRY leaves
+        redis-py one attempt to notice). redis-py reconnects for the next
+        command, so _create_lock()'s own hset/expire then succeed -- and
+        _create_lock's default "recorded in at least one store" bar reported
+        that as a grant even with the non-expiring YAML copy missing. The only
+        record of it is then a key that vanishes at LOCK_TTL_SECONDS, after
+        which the same board is granted to a second issue while the first run
+        is live.
+        """
+        with patch.object(self.redis, 'transaction',
+                          side_effect=redis.ConnectionError("connection reset")), \
+             patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual((success, reason), (False, "lock_write_failed"))
+        self.assertEqual(
+            self.redis.hgetall(self.lock_key), {},
+            "the fallback's Redis-only grant survived, so it still vanishes "
+            "with its TTL and the board is granted twice",
+        )
+        self.assertFalse(self.state_file.exists())
+
+    def test_the_yaml_fallbacks_stale_recovery_refuses_a_redis_only_grant(self):
+        """Same path, its worse half: the stale holder's YAML record has
+        already been deleted by the time _create_lock() runs, so a Redis-only
+        'grant' leaves the board with no durable lock record at all."""
+        stale = PipelineLock(
+            project="proj",
+            board="board",
+            locked_by_issue=111,
+            lock_acquired_at=(
+                datetime.now(timezone.utc) - timedelta(hours=5)
+            ).isoformat(),
+            lock_status='locked',
+        )
+        self.assertTrue(self.manager._save_lock_to_yaml(stale))
+
+        with patch.object(self.redis, 'transaction',
+                          side_effect=redis.ConnectionError("connection reset")), \
+             patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 222)
+
+        self.assertEqual((success, reason), (False, "lock_write_failed"))
+        self.assertEqual(self.redis.hgetall(self.lock_key), {})
+
+    def test_the_yaml_fallback_still_grants_when_the_durable_copy_lands(self):
+        """The check must not have inverted the fallback's ordinary path."""
+        with patch.object(self.redis, 'transaction',
+                          side_effect=redis.ConnectionError("connection reset")):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertEqual((success, reason), (True, "lock_acquired"))
+        yaml_lock, healthy = self.manager._read_yaml_lock_only("proj", "board")
+        self.assertTrue(healthy)
+        self.assertEqual(yaml_lock.locked_by_issue, 456)
 
     def test_a_yaml_fallback_grant_that_was_recorded_nowhere_is_refused(self):
         manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)

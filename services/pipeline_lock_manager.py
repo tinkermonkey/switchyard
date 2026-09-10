@@ -187,6 +187,38 @@ def owner_process_role(owner_process: Optional[str]) -> Optional[str]:
     return owner_process.split('#', 1)[0] or None
 
 
+# try_acquire_lock() reasons that refuse the acquisition WITHOUT the caller
+# having stopped being the recorded holder.
+#
+# Every other False try_acquire_lock() returns means "you do not hold this
+# lock" -- contention, a retained failure, an unreadable store, a write that
+# landed nowhere -- and several call sites are written directly against that
+# reading: services/project_monitor.py's review-cycle and repair-cycle gates
+# tear the pipeline run down on a refusal, and end_pipeline_run() RELEASES the
+# lock whenever it finds the run's own issue recorded as the holder. Found in
+# the #139 review round: _refuse_unmirrored_redis_grant()'s "already_holds_lock"
+# branch deliberately leaves a live holder's Redis key alone (rolling it back
+# would release a lock out from under a running pipeline), which made that
+# reading false for the first time -- so those teardowns released the very lock
+# the refusal was written to protect. This set is what lets a caller tell the
+# two apart; see refusal_leaves_caller_holding_lock().
+LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS = frozenset({
+    "lock_mirror_write_failed_while_held",
+})
+
+
+def refusal_leaves_caller_holding_lock(reason: Optional[str]) -> bool:
+    """
+    True when a False from try_acquire_lock() carrying this reason means "this
+    refresh failed, but you are still the recorded holder" rather than "you do
+    not hold this lock".
+
+    Callers that respond to a refusal by ending the run and/or releasing the
+    lock MUST check this first -- see LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS.
+    """
+    return reason in LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS
+
+
 class TouchResult(Enum):
     """
     Outcome of touch_lock() -- three genuinely different states that a bare
@@ -987,6 +1019,11 @@ class PipelineLockManager:
             release a lock out from under it. That one is refused without a
             rollback, so the mirror is retried on the holder's next poll.
 
+        Those two also get DIFFERENT reason strings, because a refusal that
+        leaves the caller holding the lock breaks the "False means you do not
+        hold it" reading the teardown call sites were written against -- see
+        LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS.
+
         A rollback that itself fails leaves a Redis-only key blocking this
         (project, board) until LOCK_TTL_SECONDS. That is the fail-CLOSED side
         of this failure -- a stalled board an operator can see and clear with
@@ -998,28 +1035,56 @@ class PipelineLockManager:
                 f"{project}/{board} but its durable YAML copy could not be written "
                 f"— refusing this acquisition rather than reporting a lock only "
                 f"Redis knows about. The Redis key is left alone: it belongs to a "
-                f"live holder."
+                f"live holder, which is also why this refusal reports "
+                f"'lock_mirror_write_failed_while_held' — the caller must not tear "
+                f"its run down or release the lock over it."
             )
-            return False, "lock_mirror_write_failed"
+            return False, "lock_mirror_write_failed_while_held"
 
+        self._rollback_redis_grant(
+            project, board, issue_number,
+            "could not write the durable YAML copy",
+        )
+        return False, "lock_mirror_write_failed"
+
+    def _rollback_redis_grant(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        why: str
+    ) -> None:
+        """
+        Delete a Redis lock key this call itself just wrote, so a grant whose
+        durable YAML copy did not land leaves the store exactly as it found it.
+
+        ONLY safe for a NEW grant. A key that belonged to an already-live
+        holder before this call must be left alone -- deleting that one
+        releases a lock out from under a running pipeline (see
+        _refuse_unmirrored_redis_grant's "already_holds_lock" branch).
+
+        A failed rollback is logged and swallowed: the caller refuses either
+        way, and the orphaned key fails CLOSED (it blocks this board until
+        LOCK_TTL_SECONDS lapses or scripts/release_lock.py clears it) rather
+        than open.
+        """
+        if not self.redis_client:
+            return
         try:
             self.redis_client.delete(self._get_lock_key(project, board))
             logger.error(
                 f"try_acquire_lock: granted {project}/{board} to issue "
-                f"#{issue_number} in Redis but could not write the durable YAML "
-                f"copy — the Redis grant has been rolled back and the acquisition "
-                f"refused"
+                f"#{issue_number} in Redis but {why} — the Redis grant has been "
+                f"rolled back and the acquisition refused"
             )
         except Exception as e:
             logger.error(
                 f"try_acquire_lock: granted {project}/{board} to issue "
-                f"#{issue_number} in Redis, could not write the durable YAML copy, "
-                f"and could not roll the Redis grant back either: {e} — the "
-                f"acquisition is refused, but that key will block this board until "
-                f"its {LOCK_TTL_SECONDS}s TTL lapses or scripts/release_lock.py "
-                f"clears it"
+                f"#{issue_number} in Redis, {why}, and could not roll the Redis "
+                f"grant back either: {e} — the acquisition is refused, but that "
+                f"key will block this board until its {LOCK_TTL_SECONDS}s TTL "
+                f"lapses or scripts/release_lock.py clears it"
             )
-        return False, "lock_mirror_write_failed"
 
     def _try_acquire_lock_yaml_unguarded(
         self,
@@ -1038,11 +1103,17 @@ class PipelineLockManager:
         # Case 1: No existing lock - acquire immediately
         if not lock or lock.lock_status == 'unlocked':
             # _create_lock()'s bool is the grant, not a log line (#139 review
-            # round -- its own docstring names this caller as the one that must
-            # not treat a both-failed write as an acquisition). Same posture as
-            # _refuse_unmirrored_redis_grant(): refuse and let the caller's poll
-            # retry, rather than dispatch onto a lock that was never recorded.
-            if not self._create_lock(project, board, issue_number):
+            # round). require_durable_copy=True because "recorded in at least
+            # one store" is not enough for a grant: this path is reached
+            # whenever the Redis transaction raised, and redis-py reconnects
+            # before _create_lock's own hset, so the Redis leg routinely
+            # succeeds while the non-expiring YAML copy is the one that fails.
+            # Same posture as _refuse_unmirrored_redis_grant(): refuse and let
+            # the caller's poll retry, rather than dispatch onto a lock that
+            # disappears with its TTL.
+            if not self._create_lock(
+                project, board, issue_number, require_durable_copy=True
+            ):
                 return False, "lock_write_failed"
             return True, "lock_acquired"
 
@@ -1107,11 +1178,14 @@ class PipelineLockManager:
                         f"via a fresh lock creation."
                     )
                     return False, f"locked_by_issue_{lock.locked_by_issue}"
-                # See Case 1 above: a write that landed nowhere is not a grant,
-                # and here the stale holder's record has already been deleted,
-                # so reporting success would put a dispatch on a board with no
-                # lock record in either store at all.
-                if not self._create_lock(project, board, issue_number):
+                # See Case 1 above: a write whose durable copy did not land is
+                # not a grant, and here the stale holder's record has already
+                # been deleted, so reporting success would put a dispatch on a
+                # board whose only lock record is a TTL'd Redis key -- or none
+                # at all.
+                if not self._create_lock(
+                    project, board, issue_number, require_durable_copy=True
+                ):
                     return False, "lock_write_failed"
                 return True, "stale_lock_recovered"
         except Exception as e:
@@ -1172,18 +1246,47 @@ class PipelineLockManager:
         )
         return self._save_lock_to_yaml(lock)
 
-    def _create_lock(self, project: str, board: str, issue_number: int) -> bool:
+    def _create_lock(
+        self,
+        project: str,
+        board: str,
+        issue_number: int,
+        require_durable_copy: bool = False
+    ) -> bool:
         """
         Create a new lock (Legacy/Fallback method).
 
+        Args:
+            require_durable_copy: set by the callers for whom this write IS the
+                grant — try_acquire_lock()'s YAML-fallback path. See below.
+
         Returns:
-            True if the lock was recorded in at least one durable store
-            (mirrors mark_lock_failed's fail-open-across-two-stores pattern),
-            False if BOTH the Redis and YAML writes failed — a caller relying
-            on this lock actually existing (e.g. try_acquire_lock()'s YAML-
-            fallback path, which reports success to its own caller based on
-            this) must not treat a both-failed write as if the lock was
-            acquired.
+            With require_durable_copy=False (the default, used by tests and
+            other bookkeeping callers): True if the lock was recorded in at
+            least one store, mirroring mark_lock_failed's fail-open-across-
+            two-stores pattern, and False only if BOTH writes failed.
+
+            With require_durable_copy=True: True only when the NON-EXPIRING
+            YAML copy landed, and the Redis write is rolled back when it did
+            not. Found in the #139 review round: "at least one store" is the
+            right bar for a durable failure MARKER but not for a grant, and
+            the YAML-fallback path is reached whenever the Redis transaction
+            raised — a connection blip redis-py reconnects from before this
+            method's own hset/expire, so redis_ok is routinely True here. On a
+            YAML write failure that made this report a grant whose only copy
+            was the TTL'd Redis key: invisible to get_all_locks(), a HEALTHY
+            "no lock" to _read_yaml_lock_only(), and gone at LOCK_TTL_SECONDS,
+            at which point try_acquire_lock()'s transaction reads the absent
+            key back as an empty dict and grants the same board to a second
+            issue while the first run is still live. That is the exact
+            double-grant _create_lock_yaml_only()'s docstring says must not
+            happen, reached through the sibling path.
+
+            The rollback is unconditionally safe here in a way it is not in
+            _refuse_unmirrored_redis_grant(): both require_durable_copy callers
+            are NEW grants — Case 1 found no lock at all, and Case 3 has
+            already released the stale holder's record — so deleting the key
+            this method just wrote restores what the call found.
         """
         lock = PipelineLock(
             project=project,
@@ -1208,6 +1311,20 @@ class PipelineLockManager:
 
         # Write to YAML for persistence
         yaml_ok = self._save_lock_to_yaml(lock)
+
+        if require_durable_copy and not yaml_ok:
+            if redis_ok:
+                self._rollback_redis_grant(
+                    project, board, issue_number,
+                    "could not write the durable YAML copy on the fallback path",
+                )
+            logger.error(
+                f"_create_lock: the durable YAML copy of the lock for "
+                f"{project}/{board} issue #{issue_number} could not be written "
+                f"— refusing this acquisition rather than reporting a grant that "
+                f"only a TTL'd Redis key records"
+            )
+            return False
 
         if not redis_ok and not yaml_ok:
             logger.error(

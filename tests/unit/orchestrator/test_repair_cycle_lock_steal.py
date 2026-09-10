@@ -390,6 +390,62 @@ class TestLockAcquisitionGate:
         assert result == stage_config.default_agent
         launch_mock.assert_called_once()
 
+    def test_a_mirror_failure_on_a_held_lock_does_not_end_the_run(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The one refusal that leaves this issue holding the lock (#139
+        review round).
+
+        _refuse_unmirrored_redis_grant() refuses an acquisition whose durable
+        YAML mirror did not land, but deliberately leaves a LIVE holder's Redis
+        key alone — so this issue is refused while still being the recorded
+        holder. The teardown below was written against "a refusal means this
+        issue never actually holds the lock, so end_pipeline_run() will no-op
+        its lock-release logic", which end_pipeline_run() does not honor: it
+        releases whenever the current lock's locked_by_issue matches this run's
+        issue (see tests/unit/services/test_lock_refusal_leaves_holder_intact.py
+        for that half). Ending the run here therefore released the board to the
+        next queued issue while this issue's own run was live.
+        """
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
+            False, "lock_mirror_write_failed_while_held"
+        )
+        capture = {}
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            pipeline_manager_capture=capture,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        capture['manager'].end_pipeline_run.assert_not_called()
+        mock_pipeline_lock_manager_auto.release_lock.assert_not_called()
+
+    def test_an_ordinary_refusal_still_ends_the_run(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Control for the test above: every refusal that does NOT leave this
+        issue holding the lock must still clean up the run this method created,
+        or it leaks until the zombie watchdog's hourly sweep."""
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
+            False, "locked_by_issue_999"
+        )
+        capture = {}
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            pipeline_manager_capture=capture,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        capture['manager'].end_pipeline_run.assert_called_once()
+
 
 class TestCheapLockProbeSkipsExpensiveWorkWhenBusy:
     """

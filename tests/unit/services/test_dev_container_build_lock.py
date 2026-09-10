@@ -763,6 +763,7 @@ class TestAcquireFailureClassification(unittest.TestCase):
             "lock_acquire_serialization_timeout",
             "lock_acquire_serialization_unavailable",
             "lock_mirror_write_failed",
+            "lock_mirror_write_failed_while_held",
             "lock_write_failed",
         ):
             with self.subTest(reason=reason):
@@ -788,6 +789,7 @@ class TestAcquireFailureClassification(unittest.TestCase):
             "lock_acquire_serialization_timeout",
             "lock_acquire_serialization_unavailable",
             "lock_mirror_write_failed",
+            "lock_mirror_write_failed_while_held",
             "lock_write_failed",
         ):
             with self.subTest(reason=reason):
