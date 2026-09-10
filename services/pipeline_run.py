@@ -684,7 +684,8 @@ class PipelineRunManager:
         self,
         project: str,
         issue_number: int,
-        board: Optional[str] = None
+        board: Optional[str] = None,
+        restore_to_redis: bool = True
     ) -> Optional[PipelineRun]:
         """
         Get active pipeline run for an issue
@@ -706,6 +707,17 @@ class PipelineRunManager:
                 lookup for the same (project, issue_number) — producing a
                 duplicate "phantom" pipeline run instead of reusing the one
                 that already exists.
+            restore_to_redis: Whether a run found only in Elasticsearch may be
+                written back to Redis (#150). True (the default) is what every
+                live caller wants: the fallback exists to rehydrate a run whose
+                Redis blob expired, and the caller is about to act on it. Pass
+                False from periodic maintenance sweeps, which only need to know
+                whether a run is active: the restore refreshes the blob's TTL and
+                writes the issue mapping under the board-less legacy key, so a
+                crashed run whose ES doc still reads 'active' would be resurrected
+                on every pass and could then shadow a board-scoped lookup. Stale
+                mappings found in Redis are still cleaned up either way -- that is
+                removal of state known to be dead, not resurrection of it.
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -829,18 +841,25 @@ class PipelineRunManager:
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                    # Restore to Redis. feedback_listening runs get a 7-day TTL to cover
-                    # any realistic human review window; active runs get a 1-hour refresh.
-                    restore_key = self._get_redis_key(pipeline_run.id)
-                    if pipeline_run.status == 'feedback_listening':
-                        self.redis.setex(restore_key, 604800, json.dumps(pipeline_run.to_dict()))
+                    if restore_to_redis:
+                        # Restore to Redis. feedback_listening runs get a 7-day TTL to cover
+                        # any realistic human review window; active runs get a 1-hour refresh.
+                        restore_key = self._get_redis_key(pipeline_run.id)
+                        if pipeline_run.status == 'feedback_listening':
+                            self.redis.setex(restore_key, 604800, json.dumps(pipeline_run.to_dict()))
+                        else:
+                            self.redis.setex(restore_key, 3600, json.dumps(pipeline_run.to_dict()))
+                        # Restore under the board-scoped key when board was given (matches
+                        # what create_pipeline_run() writes), else the legacy key — NOT
+                        # whatever `issue_key` last held from the Redis loop above.
+                        restore_issue_key = self._get_issue_key(project, issue_number, board)
+                        self.redis.hset(self.redis_issue_mapping, restore_issue_key, pipeline_run.id)
                     else:
-                        self.redis.setex(restore_key, 3600, json.dumps(pipeline_run.to_dict()))
-                    # Restore under the board-scoped key when board was given (matches
-                    # what create_pipeline_run() writes), else the legacy key — NOT
-                    # whatever `issue_key` last held from the Redis loop above.
-                    restore_issue_key = self._get_issue_key(project, issue_number, board)
-                    self.redis.hset(self.redis_issue_mapping, restore_issue_key, pipeline_run.id)
+                        logger.debug(
+                            f"Not restoring pipeline run {pipeline_run.id} to Redis for "
+                            f"{project} issue #{issue_number} — caller asked for a "
+                            f"read-only lookup"
+                        )
 
                     return pipeline_run
             except Exception as e:

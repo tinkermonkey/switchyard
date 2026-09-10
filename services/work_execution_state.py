@@ -12,7 +12,7 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict
 
 logger = logging.getLogger(__name__)
@@ -33,19 +33,53 @@ _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp a
 # Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
 _WATCHDOG_MAX_RECORD_AGE_HOURS = 24
 
+# PROTECTION 5's recency window (#150). A record carrying completed_at knows
+# exactly when its execution ended, so five minutes past that is ample slack for
+# an in-flight redispatch to show up as in_progress.
+_WATCHDOG_RECENCY_WINDOW = timedelta(minutes=5)
+
+# A record with NO completed_at -- the 4721 already on disk -- knows only when its
+# execution BEGAN, and reusing the five-minute window there does not widen it, it
+# shifts it earlier by the execution's whole duration: the window becomes
+# [start, start+5min] instead of [end, end+5min]. Per CLAUDE.md most agent
+# timeouts are 300s and builds are 1800s, so for the typical run start+5min has
+# already elapsed before the record is even finalised and the guard can never
+# fire. Adding the longest agent timeout back keeps it conservative for legacy
+# records while still bounding the wait.
+_WATCHDOG_LEGACY_RECENCY_WINDOW = timedelta(minutes=35)
+
 
 def _execution_anchor_time(execution: dict) -> Optional[str]:
-    """The "after what?" timestamp for an execution record.
+    """The "when did this execution end?" timestamp, best effort.
 
     record_execution_outcome() stamps completed_at on every record it finalises
     (#150), but nothing did before that, so every record already on disk has only
-    the start time record_execution_start() wrote. Falling back to it is safe in
-    both places this is used: PROTECTION 5's recency window only widens, and
-    _has_github_output() counts a comment posted mid-execution as output, which
-    defers rather than redispatching. Returns None when the record carries
+    the start time record_execution_start() wrote. PROTECTION 0's age gate is the
+    only caller that wants completion and the only one the fallback is free for:
+    a start-time anchor makes a record look OLDER, i.e. more likely to be skipped
+    before any I/O is spent on it. PROTECTION 5 and _has_github_output() each
+    need something different -- see _WATCHDOG_LEGACY_RECENCY_WINDOW and
+    _execution_output_anchor_time(). Returns None when the record carries
     neither, which callers must treat as unverifiable.
     """
     return execution.get('completed_at') or execution.get('timestamp')
+
+
+def _execution_output_anchor_time(execution: dict) -> Optional[str]:
+    """The "has anything been posted since?" timestamp for an execution record.
+
+    Deliberately the inverse preference of _execution_anchor_time(): the START
+    time, with completed_at only as a fallback (#150). Both real completion paths
+    post the agent's comment to GitHub BEFORE record_execution_outcome() stamps
+    completed_at -- docker_runner.py's _complete_agent_execution posts and then
+    records, and agent_executor.py's finalisation does the same -- so completed_at
+    is strictly LATER than the created_at of the very comment that proves the
+    execution produced output. Anchoring _has_github_output() there filters that
+    comment out (server-side, via ?since=) and answers a confident "no output" for
+    every genuine success. The question the gate has to answer is "has anything
+    been posted since this execution began?", so it anchors on the beginning.
+    """
+    return execution.get('timestamp') or execution.get('completed_at')
 
 
 def _parse_iso_timestamp(value: str) -> datetime:
@@ -372,12 +406,15 @@ class WorkExecutionStateTracker:
                     # Most recent in_progress: the real execution entry.
                     #
                     # completed_at is written HERE and nowhere else on the normal
-                    # path (#150). Both watchdog gates that ask "did anything
-                    # happen after this execution finished?" -- PROTECTION 5's
-                    # recency window and _has_github_output() -- key off it, and
+                    # path (#150). PROTECTION 5's recency window is the gate that
+                    # wants it -- "how long ago did this execution end?" -- and
                     # until now nothing in production ever wrote it: 0 of the 4721
-                    # state files on the live orchestrator carry the field, so both
-                    # gates silently degraded to "cannot verify" on every record.
+                    # state files on the live orchestrator carry the field, so that
+                    # gate silently degraded to "cannot verify" on every record.
+                    # Note the stamp lands AFTER the agent's GitHub comment is
+                    # posted on both completion paths, which is why
+                    # _has_github_output() anchors on the start time instead --
+                    # see _execution_output_anchor_time().
                     execution['completed_at'] = datetime.now(timezone.utc).isoformat()
                     if error:
                         execution['error'] = error
@@ -1405,19 +1442,31 @@ class WorkExecutionStateTracker:
         # Check 2: Pipeline run active.
         #
         # Deliberately ahead of the GitHub query below (#150), which used to run
-        # first and unconditionally. This check is a Redis hash lookup and it is
-        # the one that rejects the overwhelming majority of records -- an issue
-        # with no active pipeline run is not retryable no matter what GitHub says.
-        # Asking GitHub first meant one GraphQL query for EVERY 'success' record
-        # the sweep examined; on the live orchestrator that is 4570 records every
-        # 15 minutes, ~18k queries an hour against a 5000/hour budget. That cost
-        # was invisible only because the sweep wedged at PROTECTION 1 and never
-        # got here.
+        # first and unconditionally. This is the check that rejects the
+        # overwhelming majority of records -- an issue with no active pipeline run
+        # is not retryable no matter what GitHub says -- and it costs no GitHub
+        # budget. Asking GitHub first meant one GraphQL query for EVERY 'success'
+        # record the sweep examined; on the live orchestrator that is 4570 records
+        # every 15 minutes, ~18k queries an hour against a 5000/hour budget. That
+        # cost was invisible only because the sweep wedged at PROTECTION 1 and
+        # never got here.
+        #
+        # restore_to_redis=False because this is NOT the plain Redis hash lookup it
+        # looks like: on a mapping miss -- the normal case once end_pipeline_run()
+        # has deleted the mapping -- get_active_pipeline_run() falls through to an
+        # Elasticsearch search and, on a hit, writes the run back with a fresh TTL
+        # under the board-less legacy issue key. A periodic sweep must not do that:
+        # a crashed run whose ES doc still reads 'active' would be resurrected on
+        # every pass for as long as the age gate lets the record through, and the
+        # legacy key it lands under can shadow a later board-scoped lookup. The
+        # watchdog only needs to know whether a run is active, not to repair Redis.
         try:
             from services.pipeline_run import get_pipeline_run_manager
 
             pipeline_run_mgr = get_pipeline_run_manager()
-            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+            active_run = pipeline_run_mgr.get_active_pipeline_run(
+                project_name, issue_number, restore_to_redis=False
+            )
 
             if not active_run:
                 return False, "no_active_pipeline_run"
@@ -1577,7 +1626,8 @@ class WorkExecutionStateTracker:
         2. Pipeline lock verification
         3. Queue status check
         4. Execution eligibility via _should_retry_failed_execution
-        5. 5-minute recency check
+        5. Recency check (_WATCHDOG_RECENCY_WINDOW, or the longer legacy window
+           for records with no completed_at)
 
         CRITICAL: This method only marks executions as 'failure' - it does NOT
         directly trigger work. The project_monitor picks up failed executions and
@@ -2010,21 +2060,32 @@ class WorkExecutionStateTracker:
                         continue
 
                     # PROTECTION 5: Verify no recent execution started
-                    # Check if execution completed within last 5 minutes
+                    # Check if execution completed inside the recency window
                     # (could be starting but not yet marked as in_progress)
                     #
-                    # Anchored on completed_at OR the record's start timestamp
-                    # (#150): this gated on completed_at alone, which nothing wrote
-                    # until record_execution_outcome() started stamping it above, so
-                    # the whole block was skipped for every record on disk and this
-                    # window was never enforced for any issue. Newly load-bearing,
-                    # too -- on main the sweep wedged at PROTECTION 1 and never
-                    # reached here.
-                    recency_anchor = _execution_anchor_time(last_exec)
+                    # Anchored on completed_at, falling back to the record's start
+                    # timestamp (#150): this gated on completed_at alone, which
+                    # nothing wrote until record_execution_outcome() started
+                    # stamping it above, so the whole block was skipped for every
+                    # record on disk and this window was never enforced for any
+                    # issue. Newly load-bearing, too -- on main the sweep wedged at
+                    # PROTECTION 1 and never reached here.
+                    #
+                    # The fallback is NOT equivalent to the real thing: a start
+                    # anchor moves the window earlier by the execution's duration
+                    # rather than widening it, which for any run over five minutes
+                    # means the window has already closed by the time the record is
+                    # finalised. Legacy records therefore get the longer window --
+                    # see _WATCHDOG_LEGACY_RECENCY_WINDOW.
+                    recency_anchor = last_exec.get('completed_at')
+                    recency_window = _WATCHDOG_RECENCY_WINDOW
+                    if not recency_anchor:
+                        recency_anchor = last_exec.get('timestamp')
+                        recency_window = _WATCHDOG_LEGACY_RECENCY_WINDOW
                     if recency_anchor:
                         try:
                             anchor_dt = _parse_iso_timestamp(recency_anchor)
-                            if datetime.now(timezone.utc) - anchor_dt < timedelta(minutes=5):
+                            if datetime.now(timezone.utc) - anchor_dt < recency_window:
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
                                     f"execution too recent ({anchor_dt})"
@@ -2122,16 +2183,17 @@ class WorkExecutionStateTracker:
             project_config = config_manager.get_project_config(project_name)
 
             agent = execution.get('agent')
-            # completed_at when the record has one, else the start timestamp
-            # (#150): gating on completed_at alone made this return True for every
-            # record in production, because nothing wrote the field -- so the sweep
-            # bailed at this gate on every issue, on every pass, forever, which is
-            # the same permanent no-op #150 set out to remove, just one gate later.
-            # See _execution_anchor_time() for why the start time is a safe
-            # substitute here.
-            completed_at = _execution_anchor_time(execution)
+            # The execution's START, with completed_at only as a fallback (#150).
+            # Gating on completed_at alone made this return True for every record
+            # in production, because nothing wrote the field -- so the sweep bailed
+            # at this gate on every issue, on every pass, forever. Stamping the
+            # field fixed that but inverted the gate instead: both completion paths
+            # post the agent's comment BEFORE recording the outcome, so completed_at
+            # is always later than the comment that proves the execution produced
+            # output. See _execution_output_anchor_time().
+            anchor_at = _execution_output_anchor_time(execution)
 
-            if not agent or not completed_at:
+            if not agent or not anchor_at:
                 # "After what?" has no answer without a timestamp of any kind, so
                 # there is no comparison to make -- unverifiable, not verified-empty.
                 logger.warning(
@@ -2141,10 +2203,10 @@ class WorkExecutionStateTracker:
                 )
                 return True
 
-            # Parse completion timestamp
-            completed_dt = _parse_iso_timestamp(completed_at)
+            # Parse the anchor timestamp
+            anchor_dt = _parse_iso_timestamp(anchor_at)
 
-            # Check for comments after completion time.
+            # Check for comments posted since the execution began.
             #
             # Attribute access, not subscription (#150): ProjectConfig is a plain
             # dataclass with no __getitem__, so project_config['github'] raised
@@ -2161,15 +2223,15 @@ class WorkExecutionStateTracker:
             # defaults to per_page=30 sorted created/asc -- so the bare path returns
             # the OLDEST 30 comments. On a managed-repo issue with 178 comments
             # (context-studio has several) every one of them predates the execution,
-            # the loop below finds nothing after completed_dt, and this returns a
+            # the loop below finds nothing after anchor_dt, and this returns a
             # confident False: the one wrong answer that redispatches a real agent
             # container onto an issue whose comment is already posted. `since` is
             # server-side and inclusive, and truncating it to whole seconds only
-            # widens the window, so the created_at > completed_dt loop still filters
-            # exactly. One page of 100 is far more than a post-completion window
-            # ever holds, and it costs the same single call --paginate would have
-            # turned into six.
-            since_param = completed_dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            # widens the window, so the created_at > anchor_dt loop still filters
+            # exactly. One page of 100 is far more than one execution's window ever
+            # holds, and it costs the same single call --paginate would have turned
+            # into six.
+            since_param = anchor_dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
             endpoint = (
                 f'repos/{org}/{repo}/issues/{issue_number}/comments'
                 f'?since={quote(since_param)}&per_page=100'
@@ -2184,14 +2246,14 @@ class WorkExecutionStateTracker:
                 )
                 return True  # Can't verify - defer rather than redispatch blind
 
-            # Check if any comment was created after completion
+            # Check if any comment was created after the execution began
             for comment in comments:
                 try:
                     created_at = _parse_iso_timestamp(comment['created_at'])
-                    if created_at > completed_dt:
-                        # Found a comment after execution - assume it's the output
+                    if created_at > anchor_dt:
+                        # Found a comment after execution start - assume it's the output
                         logger.debug(
-                            f"Found GitHub comment after execution completion for "
+                            f"Found GitHub comment after execution start for "
                             f"{project_name}/#{issue_number}"
                         )
                         return True
@@ -2199,7 +2261,7 @@ class WorkExecutionStateTracker:
                     logger.debug(f"Error parsing comment timestamp: {e}")
                     continue
 
-            logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {completed_dt}")
+            logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {anchor_dt}")
             return False
 
         except (AttributeError, TypeError, KeyError) as e:
@@ -2780,7 +2842,13 @@ class WorkExecutionStateTracker:
                                         obs = get_observability_manager()
                                         decision_events = DecisionEventEmitter(obs)
                                         pipeline_run_mgr = get_pipeline_run_manager()
-                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+                                        # read-only: this lookup only wants an id
+                                        # to stamp on an event, and the ES fallback
+                                        # would otherwise write a possibly-dead run
+                                        # back into Redis (#150)
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(
+                                            project_name, issue_number, restore_to_redis=False
+                                        )
 
                                         decision_events.emit_execution_state_reconciled(
                                             agent=agent,
@@ -2880,7 +2948,13 @@ class WorkExecutionStateTracker:
                                         obs = get_observability_manager()
                                         decision_events = DecisionEventEmitter(obs)
                                         pipeline_run_mgr = get_pipeline_run_manager()
-                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+                                        # read-only: this lookup only wants an id
+                                        # to stamp on an event, and the ES fallback
+                                        # would otherwise write a possibly-dead run
+                                        # back into Redis (#150)
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(
+                                            project_name, issue_number, restore_to_redis=False
+                                        )
 
                                         # Emit error decision event with blocking context
                                         decision_events.emit_error_decision(

@@ -755,8 +755,8 @@ class TestGitHubOutputVerification:
 
         Note the record must carry NEITHER completed_at NOR timestamp: a record
         with only the start timestamp is the normal on-disk shape and is
-        answerable (see _execution_anchor_time). Gating on completed_at alone is
-        what made this return True for every record in production."""
+        answerable (see _execution_output_anchor_time). Gating on completed_at
+        alone is what made this return True for every record in production."""
         execution = {'agent': 'test-agent'}  # no completed_at, no timestamp
 
         with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
@@ -1697,9 +1697,8 @@ class TestSweepReachesItsProtectionsForReal:
 class TestCompletedAtIsActuallyRecorded:
     """completed_at has to exist on real records, not just on fixtures (#150).
 
-    Both watchdog gates that ask "did anything happen after this execution
-    finished?" -- PROTECTION 5's recency window and _has_github_output() -- key
-    off completed_at, and nothing in production ever wrote it: 0 of the 4721
+    PROTECTION 5's recency window asks "how long ago did this execution end?" and
+    keys off completed_at, and nothing in production ever wrote it: 0 of the 4721
     state files on the live orchestrator carried the field. Every sweep-level
     test in this file fabricated it, so the drift between fixture shape and
     on-disk shape was invisible. These tests use the real writers.
@@ -1789,8 +1788,11 @@ class TestSweepOnProductionShapedRecords:
     feeds it a 'completed_at' no real record has. That is what let the gate ship
     returning True unconditionally for production data -- the sweep reached its
     last gate for the first time (PROTECTION 1's flock wedge having been fixed)
-    and that gate declined every single record. These tests use the REAL gate and
-    the REAL field set record_execution_start()/record_execution_outcome() write.
+    and that gate declined every single record. These tests use the REAL gate
+    against BOTH shapes that reach it: the LEGACY shape (_legacy_record) the 4721
+    files on disk have, and the shape every future record will have
+    (_production_record), written by actually calling record_execution_start()
+    and record_execution_outcome().
     """
 
     @pytest.fixture
@@ -1805,17 +1807,51 @@ class TestSweepOnProductionShapedRecords:
     @staticmethod
     def _legacy_record(**overrides):
         """A record with the exact field set state/execution_history/*.yaml holds:
-        no completed_at, no watchdog_* keys, start timestamp only."""
+        no completed_at, no watchdog_* keys, start timestamp only.
+
+        Dated well past _WATCHDOG_LEGACY_RECENCY_WINDOW: with no completed_at,
+        PROTECTION 5 has only the start time to go on and cannot tell a long run
+        that just finished from an old one, so it holds records off for the
+        longest agent timeout plus the usual five minutes."""
         record = {
             'column': 'In Progress',
             'agent': 'test-agent',
-            'timestamp': (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),
+            'timestamp': (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat(),
             'outcome': 'success',
             'trigger_source': 'pipeline_progression',
             'board_name': 'SDLC Execution',
         }
         record.update(overrides)
         return record
+
+    @staticmethod
+    def _production_record(tracker, duration_minutes=20, finished_minutes_ago=40):
+        """A record written by the REAL writers, then aged.
+
+        record_execution_start() + record_execution_outcome() is the pair every
+        production execution goes through, so what lands on disk carries the
+        exact field set -- completed_at included -- that every future record will
+        have. Only the two timestamps are then shifted, by a fixed end time and a
+        real duration; nothing about the shape is fabricated. Returns the aged
+        record.
+        """
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='pipeline_progression', project_name='test-project',
+            board_name='SDLC Execution',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+
+        state = tracker.load_state('test-project', 123)
+        last_exec = state['execution_history'][-1]
+        completed = datetime.now(timezone.utc) - timedelta(minutes=finished_minutes_ago)
+        last_exec['timestamp'] = (completed - timedelta(minutes=duration_minutes)).isoformat()
+        last_exec['completed_at'] = completed.isoformat()
+        tracker.save_state('test-project', 123, state)
+        return last_exec
 
     @staticmethod
     def _write_state(tracker, history):
@@ -1857,6 +1893,14 @@ class TestSweepOnProductionShapedRecords:
         client = MagicMock()
         client.rest.side_effect = rest
         return client
+
+    @staticmethod
+    def _since_from(endpoint):
+        """The ?since= bound the gate actually asked GitHub for."""
+        import urllib.parse
+
+        params = dict(urllib.parse.parse_qsl(endpoint.partition('?')[2]))
+        return datetime.fromisoformat(params['since'].replace('Z', '+00:00'))
 
     def _run_sweep(self, tracker, gh_client):
         """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed."""
@@ -1919,14 +1963,111 @@ class TestSweepOnProductionShapedRecords:
         assert last_exec['watchdog_retry_triggered'] is True
 
     def test_a_start_timestamp_inside_the_recency_window_defers(self, tracker):
-        """PROTECTION 5's 5-minute window gated on completed_at alone, so it never
-        fired for any record on disk. With the start timestamp as its fallback
-        anchor, an execution that started 30 seconds ago defers."""
+        """PROTECTION 5's window gated on completed_at alone, so it never fired
+        for any record on disk. With the start timestamp as its fallback anchor,
+        an execution that started 30 seconds ago defers."""
         state_file = self._write_state(tracker, [
             self._legacy_record(
                 timestamp=(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
             )
         ])
+        gh_client = self._paging_gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_long_running_legacy_record_still_defers(self, tracker):
+        """PROTECTION 5 with the START time as its anchor and the SAME five-minute
+        window is not conservative -- it shifts the window earlier by the whole
+        execution duration instead of widening it, so for any run longer than five
+        minutes the window has already closed by the time the record is finalised
+        and the guard can never fire. Per CLAUDE.md most agent timeouts are 300s
+        and builds are 1800s, so that is the normal case, not the edge one.
+
+        A 20-minute agent run with no completed_at that ended seconds ago, with a
+        redispatch already in flight but not yet marked in_progress, is exactly
+        the race PROTECTION 5 exists to prevent."""
+        state_file = self._write_state(tracker, [
+            self._legacy_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+            )
+        ])
+        gh_client = self._paging_gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0, (
+            "PROTECTION 5 let a 20-minute legacy execution through -- a fixed "
+            "five-minute window measured from the START time can never fire for "
+            "a run longer than five minutes"
+        )
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_comment_posted_before_completed_at_still_counts_as_output(self, tracker):
+        """The headline regression for the shape every future record will have.
+
+        Both real completion paths post the agent's comment to GitHub BEFORE
+        record_execution_outcome() stamps completed_at -- docker_runner.py's
+        _complete_agent_execution posts then records, agent_executor.py's
+        finalisation does the same -- so the comment that PROVES the execution
+        produced output is always a second or two OLDER than completed_at.
+        Anchoring the gate there filtered that comment out server-side (?since=)
+        and answered a confident "no output" for every genuine success, rewriting
+        it to 'failure' and redispatching the same agent into the same column."""
+        last_exec = self._production_record(tracker)
+        state_file = tracker.get_state_file('test-project', 123)
+        posted_at = (
+            datetime.fromisoformat(last_exec['completed_at']) - timedelta(seconds=2)
+        )
+        gh_client = self._paging_gh_client([
+            {'created_at': posted_at.isoformat(), 'body': 'Agent output'}
+        ])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0, (
+            "the gate anchored on completed_at, which is stamped AFTER the agent's "
+            "own comment is posted -- so every genuine success reads as 'no output'"
+        )
+        # The bounded query has to start at the execution, not at its completion,
+        # or GitHub itself drops the comment before the loop can see it.
+        since = self._since_from(gh_client.rest.call_args[0][1])
+        assert since <= posted_at
+        assert abs(
+            since - datetime.fromisoformat(last_exec['timestamp'])
+        ) < timedelta(seconds=1), (
+            f"?since= was not anchored on the execution's start ({since})"
+        )
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_production_shaped_record_with_no_comments_is_still_swept(self, tracker):
+        """The other half of the pair: anchoring on the start time must not turn
+        the gate into a permanent "has output". An execution that genuinely posted
+        nothing still gets marked for retry."""
+        self._production_record(tracker)
+        state_file = tracker.get_state_file('test-project', 123)
+        gh_client = self._paging_gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 1
+        with open(state_file) as f:
+            last_exec = yaml.safe_load(f)['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_completed_at_inside_the_recency_window_defers(self, tracker):
+        """PROTECTION 5 on the shape that has a real completion time: five minutes
+        is measured from the end of the execution, not from its start."""
+        self._production_record(tracker, duration_minutes=20, finished_minutes_ago=1)
+        state_file = tracker.get_state_file('test-project', 123)
         gh_client = self._paging_gh_client([])
 
         count = self._run_sweep(tracker, gh_client)
@@ -1942,7 +2083,7 @@ class TestSweepOnProductionShapedRecords:
         1-30 -- all months old -- and the gate answers a confident "no output",
         rewriting a finished execution to 'failure' and redispatching a container
         onto an issue that already has its comment."""
-        anchor = datetime.now(timezone.utc) - timedelta(minutes=30)
+        anchor = datetime.now(timezone.utc) - timedelta(minutes=90)
         old = datetime.now(timezone.utc) - timedelta(days=60)
         comments = [
             {'created_at': (old + timedelta(minutes=i)).isoformat(), 'body': 'chatter'}
@@ -2008,8 +2149,9 @@ class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
     'success' state file, so on the live orchestrator that was up to 4570
     queries per 15-minute sweep -- ~18k/hour against GitHub's 5000/hour budget,
     which would starve board polling and comment posting for the rest of the
-    hour. The Redis-local "is there an active pipeline run?" check rejects
-    almost all of them, so it has to come first.
+    hour. The "is there an active pipeline run?" check rejects almost all of them
+    and spends no GitHub budget, so it has to come first -- read-only, though:
+    see test_the_run_lookup_is_read_only.
     """
 
     @pytest.fixture
@@ -2031,6 +2173,28 @@ class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
         assert should_retry is False
         assert reason == 'no_active_pipeline_run'
         github_client.graphql.assert_not_called()
+
+    def test_the_run_lookup_is_read_only(self, tracker):
+        """Moving the run check ahead of the GitHub query put it on records that
+        previously never reached it -- closed issues, issues moved off the column.
+        get_active_pipeline_run() is not the plain hash lookup it looks like: on a
+        mapping miss it searches Elasticsearch and, on a hit, writes the run back
+        with a fresh TTL under the board-less legacy key. A crashed run whose ES
+        doc still reads 'active' would be resurrected by every 15-minute sweep for
+        as long as the age gate lets the record through."""
+        github_client = MagicMock()
+        run_manager = MagicMock()
+        run_manager.get_active_pipeline_run.return_value = None
+
+        with patch('services.github_api_client.get_github_client', return_value=github_client), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager):
+            tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', {}
+            )
+
+        assert run_manager.get_active_pipeline_run.call_args.kwargs.get(
+            'restore_to_redis'
+        ) is False
 
     def test_a_passed_in_project_config_is_not_re_read_from_disk(self, tracker):
         """get_project_config() re-reads and re-parses the project's YAML on every
