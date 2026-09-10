@@ -1126,6 +1126,12 @@ def get_image_build_status(project: str) -> dict:
     the request: a rebuild that is only queued has changed nothing yet, so
     treating a "verified" there as "the rebuild finished" is wrong.
 
+    "last_operation_error" is set when a requested operation could not be
+    carried out at all — most often a rebuild that waited out its whole lock
+    window and never started. It is reported separately from "status" because
+    it is not a verdict on the image: the image is still whatever it was, and
+    the rebuild simply has to be requested again.
+
     Args:
         project: Project name.
     """
@@ -1139,6 +1145,7 @@ def get_image_build_status(project: str) -> dict:
         "status": "queued" if pending else status.value,
         "image_status": status.value,
         "pending_operation": pending,
+        "last_operation_error": dev_container_state.get_last_operation_error(project),
         "image_name": image_name,
     }
 

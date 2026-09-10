@@ -75,13 +75,12 @@ class TestRebuildProjectImageLockHeldByCaller:
 
 class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
 
-    def _invoke(self, rebuild_result, lock_busy=False, if_free_granted=True, status=None):
+    def _invoke(self, rebuild_result, lock_busy=False, status=None):
         """Drive the endpoint's background worker synchronously.
 
-        `status` is what get_status() reports -- read inside the if_free lock on
-        the contention path to re-decide whether BLOCKED is still the right thing
-        to write. None leaves it a bare MagicMock, i.e. "some status that is
-        neither verified nor in_progress".
+        `status` is what get_status() reports. None leaves it a bare MagicMock;
+        the contention path no longer reads it, which is the point of several
+        tests below.
         """
         from services import observability_server
         from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
@@ -98,11 +97,6 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
             finally:
                 events.append(('lock:exit', project))
 
-        @contextlib.contextmanager
-        def _if_free_lock(project, *args, **kwargs):
-            events.append(('if_free:attempt', project))
-            yield if_free_granted
-
         state = MagicMock()
         state.set_status.side_effect = lambda project, new_status, **kw: events.append(
             ('set_status', new_status)
@@ -112,6 +106,12 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
         )
         state.clear_pending_operation.side_effect = lambda project: events.append(
             ('pending:clear', project)
+        )
+        state.set_last_operation_error.side_effect = lambda project, message: events.append(
+            ('op_error:set', message)
+        )
+        state.clear_last_operation_error.side_effect = lambda project: events.append(
+            ('op_error:clear', project)
         )
         if status is not None:
             state.get_status.return_value = status
@@ -134,7 +134,6 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
 
         with patch('scripts.rebuild_project_images.rebuild_project_image', _rebuild), \
              patch('services.dev_container_build_lock.dev_container_build_lock_sync', _lock), \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _if_free_lock), \
              patch('services.dev_container_state.dev_container_state', state), \
              patch.object(observability_server, 'threading') as mock_threading:
             mock_threading.Thread = _ImmediateThread
@@ -192,66 +191,65 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
         (mcp/server.py's get_image_build_status reads it directly). A bare log
         line left that caller reading the project's PRE-EXISTING status --
         commonly 'verified' -- and concluding the rebuild had finished."""
-        from services.dev_container_state import DevContainerStatus
-
         response, events = self._invoke(rebuild_result=True, lock_busy=True)
 
         assert response.status_code == 200
-        assert ('if_free:attempt', 'proj') in events
-        assert ('set_status', DevContainerStatus.BLOCKED) in events
+        recorded = [e for e in events if e[0] == 'op_error:set']
+        assert recorded
+        assert 'never started' in recorded[0][1]
 
-    def test_the_drop_is_recorded_under_the_lock_not_over_a_live_holder(self):
-        """That record still never lands on top of a build that is genuinely
-        running: it goes through the non-blocking variant, so a lock that is
-        still held leaves the holder's own status alone."""
+    def test_the_drop_is_recorded_without_needing_the_lock_it_could_not_get(self):
+        """#152 review: the previous version wrote the drop under a single
+        NON-BLOCKING acquire attempted milliseconds after the blocking one gave
+        up -- and dev_container_build_lock_sync raises on the same loop iteration
+        as a failed acquire, so the lock was busy microseconds earlier and is
+        overwhelmingly likely still busy. In the most likely instance of this
+        path (a setup agent holding it for its full 3600s timeout) the record was
+        therefore never written at all, and the drop stayed invisible to every
+        state-file consumer -- the exact symptom it was added to remove.
+
+        last_operation_error is not `status`, so it cannot clobber a live
+        holder's verdict and needs no lock to be honest."""
+        _, events = self._invoke(rebuild_result=True, lock_busy=True)
+
+        assert [e for e in events if e[0] == 'op_error:set']
+        assert not [e for e in events if e[0].startswith('lock:')]
+
+    @pytest.mark.parametrize('status_name', [
+        'VERIFIED', 'IN_PROGRESS', 'UNVERIFIED', 'CHANGES_NEEDED', 'BLOCKED',
+    ])
+    def test_the_drop_never_overwrites_the_status(self, status_name):
+        """#152 review: lock contention is not a verdict on the image, and there
+        is no status that can honestly express it.
+
+        BLOCKED is terminal -- validate_task_can_run gives the terminal statuses
+        no staleness escape -- so writing it over VERIFIED or IN_PROGRESS buries a
+        real verdict, and writing it over UNVERIFIED or CHANGES_NEEDED converts a
+        self-healing state (both re-queue setup on their own) into one that
+        refuses every task for the project until a human intervenes. That last
+        case is reachable purely by contention: a setup session holds the lock
+        past this endpoint's 900s wait, then fails and resets the project to
+        UNVERIFIED just as the worker gives up."""
         from services.dev_container_state import DevContainerStatus
 
         _, events = self._invoke(
-            rebuild_result=True, lock_busy=True, if_free_granted=False
+            rebuild_result=True,
+            lock_busy=True,
+            status=getattr(DevContainerStatus, status_name),
         )
 
-        assert ('if_free:attempt', 'proj') in events
-        assert ('set_status', DevContainerStatus.BLOCKED) not in events
+        assert not [e for e in events if e[0] == 'set_status']
 
-    def test_the_drop_is_not_recorded_over_a_status_that_moved_during_the_wait(self):
-        """#152 review: taking the if_free lock is not enough on its own. Between
-        the failed blocking acquire and this one the previous holder can finish
-        and release -- log formatting plus a possible Redis connect sit in
-        between -- so BLOCKED could land on top of the VERIFIED a verifier had
-        just written. BLOCKED is terminal and validate_task_can_run gives the
-        terminal statuses no staleness escape, so every task for the project
-        would be refused indefinitely over lock contention against a healthy,
-        freshly-verified image."""
+    def test_a_rebuild_that_does_start_clears_an_earlier_drop(self):
+        """The record describes a request that never ran; one that does run and
+        writes a real verdict makes it obsolete."""
         from services.dev_container_state import DevContainerStatus
 
-        _, events = self._invoke(
-            rebuild_result=True, lock_busy=True, status=DevContainerStatus.VERIFIED
+        _, events = self._invoke(rebuild_result=True)
+
+        assert events.index(('op_error:clear', 'proj')) < events.index(
+            ('set_status', DevContainerStatus.IN_PROGRESS)
         )
-
-        assert ('if_free:attempt', 'proj') in events
-        assert ('set_status', DevContainerStatus.BLOCKED) not in events
-
-    def test_the_drop_is_not_recorded_over_a_build_that_just_started(self):
-        """Same re-read, other direction: a holder that took the lock, wrote
-        IN_PROGRESS and released it back in the gap still owns the status."""
-        from services.dev_container_state import DevContainerStatus
-
-        _, events = self._invoke(
-            rebuild_result=True, lock_busy=True, status=DevContainerStatus.IN_PROGRESS
-        )
-
-        assert ('set_status', DevContainerStatus.BLOCKED) not in events
-
-    def test_the_drop_is_still_recorded_when_nothing_better_has_been_written(self):
-        """The re-read narrows the write, it does not remove it -- an UNVERIFIED
-        project whose rebuild never started must still say so."""
-        from services.dev_container_state import DevContainerStatus
-
-        _, events = self._invoke(
-            rebuild_result=True, lock_busy=True, status=DevContainerStatus.UNVERIFIED
-        )
-
-        assert ('set_status', DevContainerStatus.BLOCKED) in events
 
     def test_the_wait_is_visible_before_the_build_starts(self):
         """#152 review: IN_PROGRESS is written INSIDE the lock, so for the whole

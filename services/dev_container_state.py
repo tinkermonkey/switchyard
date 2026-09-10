@@ -34,6 +34,30 @@ logger = logging.getLogger(__name__)
 # unrelated image ends up holding the tag.
 SWITCHYARD_AGENT_ENV_LABEL = "io.switchyard.agent-environment"
 
+# How long a pending-operation marker is believed before it is treated as
+# abandoned. Bounded by what can legitimately keep one alive: the only writer is
+# /api/projects/<p>/rebuild-image, whose worker clears it the moment it takes
+# the dev_container_build lock and gives up waiting after
+# REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS (900s), plus slack for a worker thread
+# that is merely slow to be scheduled.
+#
+# Needed because that worker is a daemon thread and is therefore killed
+# outright at interpreter shutdown: a SIGTERM or a container restart during the
+# lock wait leaves the marker on disk with nobody coming back to clear it, and
+# mcp/server.py's get_image_build_status then masks the project's real image
+# state with "status": "queued" forever, telling the calling agent a rebuild is
+# waiting that will never start (#152 review).
+PENDING_OPERATION_MAX_AGE_SECONDS = 1200.0
+
+# How long any read or write of a project's state file waits for that file's own
+# lock. Bounded rather than blocking because get_status() is reachable from the
+# orchestrator's event loop (validate_task_can_run), and utils.file_lock's own
+# guidance is that such call sites must not risk an unbounded wait. The critical
+# section is one small YAML read-modify-write, so 10s of contention means
+# something is wrong rather than merely busy, and both paths fall back to the
+# same behaviour an unreadable/unwritable file already had.
+STATE_LOCK_TIMEOUT_SECONDS = 10
+
 
 class DevContainerStatus(Enum):
     """Status of a project's development container"""
@@ -76,20 +100,11 @@ class DevContainerStateManager:
         Returns:
             Current DevContainerStatus
         """
-        state_file = self.get_state_file(project_name)
-
-        if not state_file.exists():
-            return DevContainerStatus.UNVERIFIED
-
         try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f)
-
-            status_str = state.get('status', 'unverified')
+            status_str = self._read_state(project_name).get('status', 'unverified')
             return DevContainerStatus(status_str)
-
         except Exception as e:
-            logger.error(f"Failed to read dev container state for {project_name}: {e}")
+            logger.error(f"Failed to read dev container status for {project_name}: {e}")
             return DevContainerStatus.UNVERIFIED
 
     def set_status(
@@ -108,42 +123,22 @@ class DevContainerStateManager:
             image_name: Docker image name (e.g., "context-studio-agent:latest")
             error_message: Error message if status is BLOCKED
         """
-        state_file = self.get_state_file(project_name)
-
-        # Load existing state or create new
-        if state_file.exists():
-            try:
-                with open(state_file, 'r') as f:
-                    state = yaml.safe_load(f) or {}
-            except Exception as e:
-                logger.warning(f"Failed to read existing state, creating new: {e}")
-                state = {}
-        else:
-            state = {}
-
-        # Update state
-        state['status'] = status.value
-        state['updated_at'] = datetime.now().isoformat()
+        updates = {
+            'status': status.value,
+            'updated_at': datetime.now().isoformat(),
+        }
 
         if image_name:
-            state['image_name'] = image_name
+            updates['image_name'] = image_name
 
         if error_message:
-            state['error_message'] = error_message
-        elif 'error_message' in state:
+            updates['error_message'] = error_message
+        elif status != DevContainerStatus.BLOCKED:
             # Clear error message if status changed from blocked
-            if status != DevContainerStatus.BLOCKED:
-                del state['error_message']
+            updates['error_message'] = None
 
-        # Save state
-        try:
-            with open(state_file, 'w') as f:
-                yaml.dump(state, f, default_flow_style=False)
-
+        if self._merge_state(project_name, updates):
             logger.info(f"Updated dev container status for {project_name}: {status.value}")
-
-        except Exception as e:
-            logger.error(f"Failed to save dev container state for {project_name}: {e}")
 
     def set_pending_operation(self, project_name: str, operation: str) -> None:
         """
@@ -188,54 +183,213 @@ class DevContainerStateManager:
         """
         The operation requested but not yet started for this project, as
         {'operation': ..., 'requested_at': ...}, or None.
+
+        A marker older than PENDING_OPERATION_MAX_AGE_SECONDS is reported as
+        absent: see that constant for why one can be left on disk with nobody
+        coming back to clear it.
         """
-        state_file = self.get_state_file(project_name)
-
-        if not state_file.exists():
-            return None
-
-        try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.error(f"Failed to read dev container pending operation for {project_name}: {e}")
-            return None
+        state = self._read_state(project_name)
 
         operation = state.get('pending_operation')
         if not operation:
             return None
-        return {'operation': operation, 'requested_at': state.get('pending_operation_at')}
 
-    def _merge_state(self, project_name: str, updates: Dict) -> None:
+        requested_at = state.get('pending_operation_at')
+        if self._is_stale_pending_operation(requested_at):
+            # Debug, not warning: every /api/projects poll and every
+            # get_image_build_status call comes through here.
+            logger.debug(
+                f"Ignoring abandoned '{operation}' marker for {project_name} "
+                f"(requested {requested_at}, older than "
+                f"{PENDING_OPERATION_MAX_AGE_SECONDS:.0f}s)"
+            )
+            return None
+
+        return {'operation': operation, 'requested_at': requested_at}
+
+    @staticmethod
+    def _is_stale_pending_operation(requested_at: Optional[str]) -> bool:
+        """True if a marker requested at `requested_at` can no longer be live."""
+        if not requested_at:
+            # No timestamp to age against -- written by an older version, or the
+            # file was hand-edited. Treat it as stale rather than as immortal.
+            return True
+        try:
+            age = (datetime.now() - datetime.fromisoformat(requested_at)).total_seconds()
+        except Exception:
+            return True
+        return age > PENDING_OPERATION_MAX_AGE_SECONDS
+
+    def clear_stale_pending_operations(self) -> int:
         """
-        Read-modify-write the project's state file, applying `updates` and
-        deleting any key whose new value is None. Used by the pending-operation
-        markers, which must not disturb `status`/`updated_at` the way
-        set_status() does.
+        Clear every abandoned pending-operation marker on disk, returning how
+        many were removed.
+
+        Called from services/observability_server.py's start_observability_server
+        alongside the orphaned-lock recovery, for the same reason: that process
+        is the only writer of these markers and is a docker-compose singleton,
+        so any stale marker present at its startup belongs to its own dead
+        predecessor. get_pending_operation() already refuses to report one, but
+        only this removes it from the file.
         """
+        cleared = 0
+        for state_file in sorted(self.state_dir.glob('*.yaml')):
+            project_name = state_file.stem
+            state = self._read_state(project_name)
+            if not state.get('pending_operation'):
+                continue
+            if not self._is_stale_pending_operation(state.get('pending_operation_at')):
+                continue
+            logger.warning(
+                f"Clearing abandoned '{state['pending_operation']}' marker for "
+                f"{project_name} (requested {state.get('pending_operation_at')}) - "
+                f"the thread that owned it never came back"
+            )
+            self.clear_pending_operation(project_name)
+            cleared += 1
+        return cleared
+
+    def set_last_operation_error(self, project_name: str, message: str) -> None:
+        """
+        Record that a requested operation could not be carried out, WITHOUT
+        touching `status`.
+
+        The channel the rebuild endpoint uses to report a rebuild that never
+        started. It deliberately is not a status: lock contention is not a
+        verdict on the image, and there is no status value that can honestly
+        express it -- BLOCKED is terminal (validate_task_can_run gives the
+        terminal statuses no staleness escape), so writing it over a VERIFIED,
+        UNVERIFIED or CHANGES_NEEDED project turns a healthy or self-healing
+        state into one that refuses every task for that project until a human
+        intervenes (#152 review). Being a non-`status` field is also what lets
+        this be written without the dev_container_build lock: it cannot clobber
+        a live holder's verdict, so it does not need to wait for one.
+        """
+        self._merge_state(
+            project_name,
+            {
+                'last_operation_error': message,
+                'last_operation_error_at': datetime.now().isoformat(),
+            },
+        )
+
+    def clear_last_operation_error(self, project_name: str) -> None:
+        """Clear the record set by set_last_operation_error()."""
+        self._merge_state(
+            project_name, {'last_operation_error': None, 'last_operation_error_at': None}
+        )
+
+    def get_last_operation_error(self, project_name: str) -> Optional[Dict[str, str]]:
+        """
+        The last requested operation that could not be carried out, as
+        {'error': ..., 'at': ...}, or None.
+        """
+        state = self._read_state(project_name)
+
+        message = state.get('last_operation_error')
+        if not message:
+            return None
+        return {'error': message, 'at': state.get('last_operation_error_at')}
+
+    def get_state(self, project_name: str) -> Dict:
+        """
+        The project's whole state file as a dict, {} if absent or unreadable.
+
+        For callers that want several fields at once (e.g. /api/projects
+        building its dev_container payload) without re-reading the file per
+        accessor -- and without re-deriving the locked read below.
+        """
+        return self._read_state(project_name)
+
+    def _read_state(self, project_name: str) -> Dict:
+        """
+        The project's state file as a dict, {} if absent or unreadable.
+
+        Taken under the state file's own lock so a reader never sees the
+        half-written file a concurrent _merge_state() is producing -- the same
+        reason PipelineLockManager._read_yaml_lock_only holds its lock across
+        the read.
+        """
+        from utils.file_lock import file_lock
+
         state_file = self.get_state_file(project_name)
 
-        if state_file.exists():
-            try:
-                with open(state_file, 'r') as f:
-                    state = yaml.safe_load(f) or {}
-            except Exception as e:
-                logger.warning(f"Failed to read existing state, creating new: {e}")
-                state = {}
-        else:
-            state = {}
-
-        for key, value in updates.items():
-            if value is None:
-                state.pop(key, None)
-            else:
-                state[key] = value
+        if not state_file.exists():
+            return {}
 
         try:
-            with open(state_file, 'w') as f:
-                yaml.dump(state, f, default_flow_style=False)
+            with file_lock(
+                self._state_lock_file(state_file),
+                timeout=STATE_LOCK_TIMEOUT_SECONDS,
+                enforce_timeout=True,
+            ):
+                if not state_file.exists():  # Check again inside lock
+                    return {}
+                with open(state_file, 'r') as f:
+                    return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Failed to read dev container state for {project_name}: {e}")
+            return {}
+
+    @staticmethod
+    def _state_lock_file(state_file: Path) -> Path:
+        """Guard file serializing every read and write of `state_file`."""
+        return state_file.with_suffix(state_file.suffix + '.lock')
+
+    def _merge_state(self, project_name: str, updates: Dict) -> bool:
+        """
+        Read-modify-write the project's state file, applying `updates` and
+        deleting any key whose new value is None. Every writer of this file goes
+        through here -- set_status(), the pending-operation markers and the
+        last-operation-error record -- so that a write which owns only some of
+        the keys cannot carry the others backwards.
+
+        Held under the state file's own lock for the whole read-modify-write,
+        because "every writer is inside the dev_container_build lock" is not
+        true of this file and cannot be made true: the pending-operation marker
+        is deliberately set from the rebuild endpoint's REQUEST thread, before
+        the lock wait even starts, precisely so it is visible to the first poll
+        (#152 review). Without this lock that unlocked writer's blind whole-file
+        rewrite could land on top of a set_status() the other container made in
+        between and silently revert it -- a freshly VERIFIED image reading back
+        as UNVERIFIED, which refuses every task for the project. The lock is
+        cross-process (fcntl on the shared bind mount), which matters because
+        the observability server and the orchestrator are separate containers.
+
+        Returns True if the file was written.
+        """
+        from utils.file_lock import file_lock
+
+        state_file = self.get_state_file(project_name)
+
+        try:
+            with file_lock(
+                self._state_lock_file(state_file),
+                timeout=STATE_LOCK_TIMEOUT_SECONDS,
+                enforce_timeout=True,
+            ):
+                if state_file.exists():
+                    try:
+                        with open(state_file, 'r') as f:
+                            state = yaml.safe_load(f) or {}
+                    except Exception as e:
+                        logger.warning(f"Failed to read existing state, creating new: {e}")
+                        state = {}
+                else:
+                    state = {}
+
+                for key, value in updates.items():
+                    if value is None:
+                        state.pop(key, None)
+                    else:
+                        state[key] = value
+
+                with open(state_file, 'w') as f:
+                    yaml.dump(state, f, default_flow_style=False)
+                return True
         except Exception as e:
             logger.error(f"Failed to save dev container state for {project_name}: {e}")
+            return False
 
     def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
         """
@@ -249,20 +403,12 @@ class DevContainerStateManager:
             The updated_at timestamp (naive datetime, matching set_status's
             datetime.now().isoformat() format), or None if unavailable/unparseable.
         """
-        state_file = self.get_state_file(project_name)
-
-        if not state_file.exists():
+        updated_at_str = self._read_state(project_name).get('updated_at')
+        if not updated_at_str:
             return None
 
         try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f)
-
-            updated_at_str = (state or {}).get('updated_at')
-            if not updated_at_str:
-                return None
             return datetime.fromisoformat(updated_at_str)
-
         except Exception as e:
             logger.error(f"Failed to read dev container updated_at for {project_name}: {e}")
             return None
@@ -277,20 +423,7 @@ class DevContainerStateManager:
         Returns:
             Image name (e.g., "context-studio-agent:latest") or None
         """
-        state_file = self.get_state_file(project_name)
-
-        if not state_file.exists():
-            return None
-
-        try:
-            with open(state_file, 'r') as f:
-                state = yaml.safe_load(f)
-
-            return state.get('image_name')
-
-        except Exception as e:
-            logger.error(f"Failed to read dev container state for {project_name}: {e}")
-            return None
+        return self._read_state(project_name).get('image_name')
 
     def is_verified(self, project_name: str) -> bool:
         """Check if a project's dev container is verified and ready"""
