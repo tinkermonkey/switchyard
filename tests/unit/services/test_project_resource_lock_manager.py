@@ -41,6 +41,7 @@ from services.project_resource_lock_manager import (
     RESOURCE_BOARD_PREFIX,
     InvalidResourceNameError,
 )
+from tests.utils.fake_redis import ThreadSafeFakeRedis
 
 
 class TestProjectResourceLockManagerAcquireRelease(unittest.TestCase):
@@ -321,9 +322,11 @@ class TestGetAllLocksCompatibility(unittest.TestCase):
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        # redis_client=None exercises the YAML-only path directly and avoids
+        # YAML-only exercises get_all_locks()' glob path directly and avoids
         # having to hand-mock a redis `keys()`/`hgetall()` scan for this test.
-        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        # use_redis=False, not redis_client=None, which means "connect one
+        # yourself" (#139).
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
 
     def tearDown(self):
@@ -590,11 +593,15 @@ class TestProjectResourceLockManagerDefaultConstruction(unittest.TestCase):
 class TestTouchResource(unittest.TestCase):
     """touch_resource() delegates to PipelineLockManager.touch_lock() -- see
     its own tests (test_pipeline_lock_manager.py::TestTouchLock) for the full
-    liveness-refresh contract this passes through unchanged."""
+    liveness-refresh contract this passes through unchanged.
+
+    YAML-only for TestTouchLock's own reason -- lock_acquired_at read straight
+    off disk -- said with use_redis=False rather than redis_client=None, which
+    means "connect one yourself" (#139)."""
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
 
     def tearDown(self):
@@ -643,8 +650,9 @@ class TestRecoverOrphanedResourceLocks(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         # YAML-only path -- the recovery is a get_all_locks() scan plus releases,
-        # neither of which needs a hand-mocked Redis transaction.
-        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        # neither of which needs a hand-mocked Redis transaction. use_redis=False,
+        # not redis_client=None, which means "connect one yourself" (#139).
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), use_redis=False)
         self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
 
     def tearDown(self):
@@ -793,11 +801,23 @@ class TestRecoverOrphanedResourceLocks(unittest.TestCase):
 
 
 class TestAcquisitionStampsTheOwningProcess(unittest.TestCase):
-    """The stamp TestRecoverOrphanedResourceLocks' ownership decisions read."""
+    """The stamp TestRecoverOrphanedResourceLocks' ownership decisions read.
+
+    #139 audit: this one moved the other way, to the REDIS path. It had no
+    stated reason to be YAML-only -- it was YAML-only only because
+    redis_client=None accidentally meant that -- and every one of these
+    assertions is a read-back of owner_process through get_resource_lock(),
+    which in production comes from the Redis hash. That round trip goes through
+    _lock_to_redis_mapping()/_lock_from_redis_mapping(), which the YAML path
+    never touches, so the stamp TestRecoverOrphanedResourceLocks' decisions
+    depend on was never once verified against the store production reads it
+    from."""
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
-        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.lock_manager = PipelineLockManager(
+            state_dir=Path(self.test_dir), redis_client=ThreadSafeFakeRedis()
+        )
         self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
 
     def tearDown(self):
@@ -818,7 +838,16 @@ class TestAcquisitionStampsTheOwningProcess(unittest.TestCase):
         board = f"{RESOURCE_BOARD_PREFIX}dev_container_build"
         lock = self.lock_manager.get_lock("proj", board)
         lock.owner_process = "observability_server.py#abc123def456"
+        # BOTH stores, not just the YAML one: touch_lock()'s Redis leg reads
+        # and rewrites the Redis copy, so restamping only the file leaves the
+        # copy the refresh actually reads still naming this process -- the
+        # foreign holder this test is about would not exist there at all
+        # (#139 audit; this test was YAML-only by accident until then).
         self.lock_manager._save_lock_to_yaml(lock)
+        self.lock_manager.redis_client.hset(
+            self.lock_manager._get_lock_key("proj", board),
+            mapping=self.lock_manager._lock_to_redis_mapping(lock),
+        )
 
         self.facade.touch_resource("proj", "dev_container_build", -1)
 

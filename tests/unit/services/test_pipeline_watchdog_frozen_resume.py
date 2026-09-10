@@ -51,12 +51,23 @@ def watchdog():
     pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
     lock_manager = Mock()
     lock_manager.clear_retained_reason = Mock(return_value=True)
-    return PipelineWatchdog(
+    wd = PipelineWatchdog(
         es_client=Mock(),
         pipeline_run_manager=pipeline_run_manager,
         lock_manager=lock_manager,
         project_monitor=Mock(),
     )
+    # Patched, not left to the real thing: services/cleanup_guard.py builds its
+    # OWN redis.Redis(host='redis') and check_for_zombie_runs() writes
+    # `SET orchestrator:cleanup_guard:proj:<n> zombie_watchdog NX EX 300`
+    # through it. In the orchestrator container that Redis is the running
+    # deployment's, so a second run of this file within five minutes found its
+    # own leftover claim, `continue`d past cleanup, and failed tests that had
+    # passed minutes earlier -- the suite's result depending on whether it had
+    # been run before, which is the class of defect #174 exists to remove.
+    # Nothing these tests assert depends on an external store.
+    with patch("services.cleanup_guard.try_claim_cleanup", return_value=True):
+        yield wd
 
 
 def _active_run_hit(pipeline_run_id, project, issue_number, started_at):

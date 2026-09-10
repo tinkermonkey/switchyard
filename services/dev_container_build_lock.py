@@ -543,8 +543,15 @@ def dev_container_build_lock_sync(
 # does not exist.
 #
 #   - lock_state_unknown_failing_closed        (both Redis and YAML reads failed)
-#   - lock_acquire_serialization_timeout       (YAML-fallback acquire guard)
-#   - lock_acquire_serialization_unavailable   (   "        "        "        )
+#   - lock_acquire_serialization_timeout       (acquire guard contended)
+#   - lock_acquire_serialization_unavailable   (   "     "    unopenable)
+#   - lock_mirror_write_failed                 (granted in Redis, but the
+#                                               durable YAML copy did not land)
+#   - lock_mirror_write_failed_while_held      (same, on a lock this caller
+#                                               ALREADY holds -- see
+#                                               refusal_leaves_caller_holding_lock)
+#   - lock_write_failed                        (YAML fallback: the lock was not
+#                                               recorded in EITHER store)
 #   - locked_by_issue_<n>_failed               (retained after a failed run --
 #                                               a durable marker, not a holder)
 #
@@ -553,6 +560,9 @@ _DEGRADED_ACQUIRE_REASONS = frozenset({
     "lock_state_unknown_failing_closed",
     "lock_acquire_serialization_timeout",
     "lock_acquire_serialization_unavailable",
+    "lock_mirror_write_failed",
+    "lock_mirror_write_failed_while_held",
+    "lock_write_failed",
 })
 
 

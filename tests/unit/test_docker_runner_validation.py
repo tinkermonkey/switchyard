@@ -248,10 +248,14 @@ class TestSignalTerminationHandling:
     """Test that SIGKILL (137) and SIGTERM (143) raise NonRetryableAgentError."""
 
     def _get_non_retryable_class(self):
-        """Import NonRetryableAgentError without triggering agents/__init__.py."""
-        import sys
-        if 'services.dev_container_state' not in sys.modules:
-            sys.modules['services.dev_container_state'] = MagicMock()
+        """Import NonRetryableAgentError without triggering agents/__init__.py.
+
+        No longer pre-mocks services.dev_container_state into sys.modules: that
+        assignment was never undone and leaked a MagicMock into every later
+        test file in the session (#133). tests/conftest.py sets
+        ORCHESTRATOR_ROOT to a scratch directory off-container instead, so the
+        real module imports.
+        """
         from agents.non_retryable import NonRetryableAgentError
         return NonRetryableAgentError
 

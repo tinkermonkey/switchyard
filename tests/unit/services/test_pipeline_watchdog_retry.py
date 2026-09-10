@@ -49,7 +49,17 @@ def watchdog():
         lock_manager=lock_manager,
         project_monitor=project_monitor,
     )
-    return wd
+    # Patched, not left to the real thing: services/cleanup_guard.py builds its
+    # OWN redis.Redis(host='redis') and check_for_zombie_runs() writes
+    # `SET orchestrator:cleanup_guard:proj:<n> zombie_watchdog NX EX 300`
+    # through it. In the orchestrator container that Redis is the running
+    # deployment's, so a second run of this file within five minutes found its
+    # own leftover claim, `continue`d past cleanup, and failed tests that had
+    # passed minutes earlier -- the suite's result depending on whether it had
+    # been run before, which is the class of defect #174 exists to remove.
+    # Nothing these tests assert depends on an external store.
+    with patch("services.cleanup_guard.try_claim_cleanup", return_value=True):
+        yield wd
 
 
 class TestZombieRetryCount:
@@ -536,8 +546,15 @@ class TestCleanupZombieRunWithRealLockManager:
     """
 
     def _real_lock_manager(self, tmp_path):
+        # YAML-only, said with use_redis=False rather than redis_client=None
+        # (#139 audit): None means "connect one yourself", so this used to
+        # depend on a constructor bug to be YAML-only at all. Kept YAML rather
+        # than switched to a fake Redis because what these prove -- that the
+        # lock never leaves the issue across a self-heal cycle -- is a property
+        # of the lock record, not of which store holds it; the two stores'
+        # agreement is test_pipeline_lock_manager.py's subject.
         from services.pipeline_lock_manager import PipelineLockManager
-        return PipelineLockManager(state_dir=tmp_path, redis_client=None)
+        return PipelineLockManager(state_dir=tmp_path, use_redis=False)
 
     def _watchdog(self, lock_mgr, project_monitor):
         pipeline_run_manager = Mock()
@@ -874,8 +891,15 @@ class TestActivelyResumeRunWithRealLockManager:
     _cleanup_zombie_run had real-lock-manager integration coverage)."""
 
     def _real_lock_manager(self, tmp_path):
+        # YAML-only, said with use_redis=False rather than redis_client=None
+        # (#139 audit): None means "connect one yourself", so this used to
+        # depend on a constructor bug to be YAML-only at all. Kept YAML rather
+        # than switched to a fake Redis because what these prove -- that the
+        # lock never leaves the issue across a self-heal cycle -- is a property
+        # of the lock record, not of which store holds it; the two stores'
+        # agreement is test_pipeline_lock_manager.py's subject.
         from services.pipeline_lock_manager import PipelineLockManager
-        return PipelineLockManager(state_dir=tmp_path, redis_client=None)
+        return PipelineLockManager(state_dir=tmp_path, use_redis=False)
 
     def _watchdog(self, lock_mgr, project_monitor):
         pipeline_run_manager = Mock()

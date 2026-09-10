@@ -7,17 +7,14 @@ column has auto_advance_on_approval enabled.
 """
 
 import asyncio
-import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# Pre-mock modules that fail outside Docker (/app/state doesn't exist)
-if 'services.work_execution_state' not in sys.modules:
-    mock_wes = MagicMock()
-    sys.modules['services.work_execution_state'] = mock_wes
-if 'services.dev_container_state' not in sys.modules:
-    sys.modules['services.dev_container_state'] = MagicMock()
-
+# The sys.modules pre-mocking of services.work_execution_state /
+# services.dev_container_state that used to sit here leaked into every later
+# test file in the session -- see test_pr_review_phase_recovery.py's note and
+# #133. tests/conftest.py sets ORCHESTRATOR_ROOT to a scratch directory
+# off-container instead, so the real modules import.
 from claude.docker_runner import DockerAgentRunner
 
 

@@ -12,26 +12,38 @@ import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
 
 
+@pytest.fixture
+def in_memory_signal():
+    """A CancellationSignal whose Redis leg is genuinely absent.
+
+    `signal._redis = None` does NOT do this, which is what the three tests
+    below used to rely on (found in review): _get_redis() connects precisely
+    WHEN _redis is None, so every one of them built a real
+    redis.Redis(host='redis') and wrote `SETEX cancelled:proj:42 3600` through
+    it. Inside the orchestrator container that is the running deployment's
+    Redis, and the in-memory fallback these tests are named for was never
+    executed at all. Patching the accessor is the only way to reach it.
+    """
+    from services.cancellation import CancellationSignal
+
+    signal = CancellationSignal()
+    with patch.object(CancellationSignal, '_get_redis', return_value=None):
+        yield signal
+
+
 class TestCancellationSignal:
-    """Test CancellationSignal with in-memory fallback (Redis unavailable locally)."""
+    """Test CancellationSignal with in-memory fallback (Redis unavailable)."""
 
-    def test_cancel_and_is_cancelled(self):
-        from services.cancellation import CancellationSignal
-
-        signal = CancellationSignal()
-        # Force in-memory mode by ensuring Redis fails
-        signal._redis = None
+    def test_cancel_and_is_cancelled(self, in_memory_signal):
+        signal = in_memory_signal
 
         assert not signal.is_cancelled("proj", 42)
 
         signal.cancel("proj", 42, "test reason")
         assert signal.is_cancelled("proj", 42)
 
-    def test_clear_removes_signal(self):
-        from services.cancellation import CancellationSignal
-
-        signal = CancellationSignal()
-        signal._redis = None
+    def test_clear_removes_signal(self, in_memory_signal):
+        signal = in_memory_signal
 
         signal.cancel("proj", 42, "test")
         assert signal.is_cancelled("proj", 42)
@@ -39,16 +51,26 @@ class TestCancellationSignal:
         signal.clear("proj", 42)
         assert not signal.is_cancelled("proj", 42)
 
-    def test_different_issues_are_independent(self):
-        from services.cancellation import CancellationSignal
-
-        signal = CancellationSignal()
-        signal._redis = None
+    def test_different_issues_are_independent(self, in_memory_signal):
+        signal = in_memory_signal
 
         signal.cancel("proj", 42, "test")
         assert signal.is_cancelled("proj", 42)
         assert not signal.is_cancelled("proj", 43)
         assert not signal.is_cancelled("other_proj", 42)
+
+    def test_the_in_memory_fallback_writes_nothing_to_redis(self, in_memory_signal):
+        """The property the fixture exists for, pinned: these tests must not
+        depend on -- or write to -- whatever `redis` resolves to on the machine
+        running them."""
+        from services.cancellation import CancellationSignal
+
+        with patch('redis.Redis') as mock_redis_class:
+            in_memory_signal.cancel("proj", 42, "test")
+            in_memory_signal.clear("proj", 42)
+
+        mock_redis_class.assert_not_called()
+        assert isinstance(in_memory_signal, CancellationSignal)
 
     def test_cancel_with_redis(self):
         from services.cancellation import CancellationSignal
@@ -319,12 +341,9 @@ class TestWorkExecutionStateCancelled:
 class TestSignalClearingAfterKill:
     """Test that cancellation signals behave correctly after Web UI kills."""
 
-    def test_signal_cleared_after_cancel_issue_work(self):
+    def test_signal_cleared_after_cancel_issue_work(self, in_memory_signal):
         """After cancel_issue_work + clear, the issue should not be cancelled."""
-        from services.cancellation import CancellationSignal
-
-        signal = CancellationSignal()
-        signal._redis = None
+        signal = in_memory_signal
 
         signal.cancel("proj", 42, "killed via UI")
         assert signal.is_cancelled("proj", 42)
@@ -366,12 +385,9 @@ class TestSignalClearingAfterKill:
         # ...and NOT cleared
         mock_signal.clear.assert_not_called()
 
-    def test_cancel_is_idempotent(self):
+    def test_cancel_is_idempotent(self, in_memory_signal):
         """Calling cancel() twice with the signal already set is harmless (Fix #4)."""
-        from services.cancellation import CancellationSignal
-
-        signal = CancellationSignal()
-        signal._redis = None
+        signal = in_memory_signal
 
         signal.cancel("proj", 42, "first call")
         signal.cancel("proj", 42, "second call")
