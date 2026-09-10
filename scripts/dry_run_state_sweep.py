@@ -1006,12 +1006,26 @@ _NEUTRALIZED_ES_DEFAULT: Dict[str, Any] = {'acknowledged': True}
 def _is_es_namespace(attribute: Any) -> bool:
     """True for an elasticsearch-py sub-client (es.indices, es.ilm, es.cluster).
 
-    Recognised by type rather than by a hardcoded list of names: a namespace
+    Recognised by shape rather than by a hardcoded list of names: a namespace
     nobody enumerated must still be wrapped, because a namespace returned
-    unwrapped hands the sweep the REAL client for every method on it. Namespace
-    clients are not callable and live under the `elasticsearch` package, which
-    is what separates them from the client's own plain attributes.
+    unwrapped hands the sweep the REAL client for every method on it -- and
+    `indices` is in _ES_READ_METHODS for the sake of `es.cat.indices`, so a
+    missed `es.indices` is returned raw by the read-method branch too.
+
+    The structural test is the load-bearing one: a sub-client is the object that
+    holds a back-reference to its parent client AND can issue requests, which is
+    what elasticsearch-py's NamespacedClient carries and what neither the
+    top-level client nor the transport does (neither has `_client`). It is
+    checked first because the nominal test underneath it is the fragile half:
+    it assumes a namespace is non-callable and that its type lives under the
+    `elasticsearch` package, and a release that gives NamespacedClient a
+    __call__ or hands the namespace back through a proxy defined elsewhere would
+    silently turn interception off. NamespacedClient itself is not importable
+    from a public path (elasticsearch 9.5 keeps it in
+    elasticsearch._sync.client._base), so isinstance() is not an option.
     """
+    if hasattr(attribute, '_client') and hasattr(attribute, 'perform_request'):
+        return True
     return (
         not callable(attribute)
         and type(attribute).__module__.split('.')[0] == 'elasticsearch'

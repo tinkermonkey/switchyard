@@ -28,6 +28,9 @@ import yaml
 from scripts.dry_run_state_sweep import (
     _CACHED_CLIENT_GLOBALS,
     _RUNTIME_SINGLETONS,
+    _is_es_namespace,
+    _make_neutralized_elasticsearch_class,
+    ExternalEffectRecorder,
     ExternalWriteRefused,
     Gate,
     IsolationError,
@@ -45,6 +48,17 @@ from scripts.dry_run_state_sweep import (
     snapshot_tree,
     SWEEPS,
 )
+
+
+#  Where the tests that prove a datastore write is INTERCEPTED aim their
+#  clients. The discard port on loopback: nothing listens, so if interception
+#  ever regresses the call raises instead of landing on the production Redis or
+#  the production cluster that 'redis:6379' and 'elasticsearch:9200' resolve to
+#  from inside the orchestrator container, where the repo's own instructions say
+#  to run these tests. Construction is lazy in both clients, so no connection is
+#  attempted while the wrappers are doing their job.
+_DEAD_HOST = '127.0.0.1'
+_DEAD_PORT = 9
 
 
 def _write_record(root: Path, project: str, issue: int, agent: str, outcome: str = 'success'):
@@ -1297,15 +1311,24 @@ class TestExternalEffects:
     def test_redis_writes_are_intercepted_and_reported(self, deployment, tmp_path):
         """A neutralized client still READS production — a guard reading an
         empty scratch Redis answers 'no lock, not queued' and makes the dry run
-        strictly less protected than production — but writes nowhere."""
+        strictly less protected than production — but writes nowhere.
+
+        Deliberately aimed at a dead endpoint and at probe key names: if
+        interception ever regresses, this test must fail LOUDLY rather than
+        quietly perform its writes. Against the real server the SET NX below
+        would return True on a first run and the assertion would pass while the
+        write landed. The real key shapes are pinned by
+        test_both_registered_sweeps_declare_their_production_writes, which reads
+        them out of the SweepSpec without touching a server.
+        """
         redis_module = pytest.importorskip('redis')
 
         def _write_redis(manager):
-            client = redis_module.Redis(host='redis', port=6379, decode_responses=True)
+            client = redis_module.Redis(host=_DEAD_HOST, port=_DEAD_PORT, decode_responses=True)
             # The claim has to look like it succeeded, or every candidate would
             # be reported as skipped-by-claim and the sweep as inert.
-            assert client.set('orchestrator:cleanup_guard:p:1', 'x', nx=True, ex=300) is True
-            client.delete('agent_result:p:1:task-abc')
+            assert client.set('dry-run-harness-probe:claim', 'x', nx=True, ex=300) is True
+            client.delete('dry-run-harness-probe:result')
             return 0
 
         report = _run(_spec(_write_redis), deployment, tmp_path)
@@ -1314,7 +1337,7 @@ class TestExternalEffects:
         assert effects['total'] == 2
         assert effects['by_command'] == {'delete': 1, 'set': 1}
         assert {s['key'] for s in effects['samples']} == {
-            'orchestrator:cleanup_guard:p:1', 'agent_result:p:1:task-abc'
+            'dry-run-harness-probe:claim', 'dry-run-harness-probe:result'
         }
 
     def test_elasticsearch_writes_are_intercepted_and_reported(
@@ -1324,17 +1347,29 @@ class TestExternalEffects:
         observability module and nothing else, so every ES write a sweep made
         reached the production cluster while the report claimed the run touched
         nothing outside state/. Reads still go to the live cluster, for the same
-        reason Redis reads do."""
+        reason Redis reads do.
+
+        The calls below are the two PUTs and the document write
+        PipelineRunManager.__init__ makes, in their real shapes — but pointed at
+        a dead endpoint and at probe resource names, because the failure mode of
+        a test that proves writes are intercepted must be a red assertion, not a
+        live mutation. Named against the real cluster, a regression here would
+        replace pipeline-runs-ilm-policy with an empty policy and strip
+        pipeline-runs-template of its mappings and its lifecycle setting, before
+        reaching a single assertion. That the REAL names are the ones the sweeps
+        write is pinned by
+        test_both_registered_sweeps_declare_their_elasticsearch_writes, which
+        reads them out of the SweepSpecs without touching a cluster.
+        """
         elasticsearch = pytest.importorskip('elasticsearch')
 
         def _write_es(manager):
             from elasticsearch import Elasticsearch
 
-            client = Elasticsearch(['http://elasticsearch:9200'])
-            # The two PipelineRunManager.__init__ makes, unconditionally.
-            client.ilm.put_lifecycle(name='pipeline-runs-ilm-policy', body={})
-            client.indices.put_index_template(name='pipeline-runs-template', body={})
-            client.index(index='pipeline-runs-2026-01-01', document={'id': 'x'})
+            client = Elasticsearch([f'http://{_DEAD_HOST}:{_DEAD_PORT}'])
+            client.ilm.put_lifecycle(name='dry-run-harness-probe-policy', body={})
+            client.indices.put_index_template(name='dry-run-harness-probe-template', body={})
+            client.index(index='dry-run-harness-probe-2026-01-01', document={'id': 'x'})
             return 0
 
         report = _run(_spec(_write_es), deployment, tmp_path)
@@ -1345,7 +1380,9 @@ class TestExternalEffects:
             'ilm.put_lifecycle': 1, 'index': 1, 'indices.put_index_template': 1
         }
         assert {sample['target'] for sample in writes['samples']} == {
-            'pipeline-runs-ilm-policy', 'pipeline-runs-template', 'pipeline-runs-2026-01-01'
+            'dry-run-harness-probe-policy',
+            'dry-run-harness-probe-template',
+            'dry-run-harness-probe-2026-01-01',
         }
         print_report(report)
         assert 'Elasticsearch writes intercepted: 3' in capsys.readouterr().out
@@ -1353,6 +1390,75 @@ class TestExternalEffects:
         # import above — a wrapper that outlives the window is bound to a dead
         # recorder.
         assert elasticsearch.Elasticsearch.__name__ == 'Elasticsearch'
+
+    def test_a_namespace_is_recognised_by_shape_not_by_module_or_callability(self):
+        """The nominal half of _is_es_namespace() — non-callable, type under the
+        `elasticsearch` package — is an assumption about a third-party library,
+        and it is the ONLY thing standing between es.ilm and the live cluster.
+        Both halves of it are already partly false on elasticsearch-py 9.5
+        (es.options is callable), so a namespace has to be recognised by the
+        pair every sub-client carries: a back-reference to its parent client and
+        the ability to issue requests."""
+        class _Client:
+            def perform_request(self, *args, **kwargs):
+                raise AssertionError('the real client must not be reached')
+
+        class _CallableNamespace:
+            def __init__(self, client):
+                self._client = client
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError('the real namespace must not be reached')
+
+            def perform_request(self, *args, **kwargs):
+                raise AssertionError('the real namespace must not be reached')
+
+        client = _Client()
+        assert _is_es_namespace(_CallableNamespace(client))
+        # Neither the top-level client nor the transport is a namespace: both
+        # can issue requests, neither carries `_client`.
+        assert not _is_es_namespace(client)
+        assert not _is_es_namespace(object())
+
+    def test_an_unrecognised_namespace_is_wrapped_rather_than_returned_raw(self):
+        """REGRESSION: the fall-through for a non-callable attribute the wrapper
+        does not recognise is `return attribute` — the RAW namespace, with every
+        write on it live. `indices` is in _ES_READ_METHODS for `es.cat.indices`,
+        so a missed `es.indices` took that same exit. A sub-client handed back
+        through a proxy defined outside the `elasticsearch` package therefore
+        turned interception off silently, which is the one failure mode this
+        harness cannot afford."""
+        performed = []
+
+        class _Ilm:
+            #  Shaped like a sub-client but defined here, so
+            #  type(...).__module__ is this test module rather than
+            #  'elasticsearch' — what a cached_property-produced proxy would
+            #  look like.
+            def __init__(self, client):
+                self._client = client
+
+            def perform_request(self, *args, **kwargs):
+                raise AssertionError('the real namespace must not be reached')
+
+            def put_lifecycle(self, name=None, body=None):
+                performed.append(name)
+
+        class _RealClient:
+            def __init__(self, *args, **kwargs):
+                self.ilm = _Ilm(self)
+
+            def perform_request(self, *args, **kwargs):
+                raise AssertionError('the real client must not be reached')
+
+        recorder = ExternalEffectRecorder()
+        neutralized = _make_neutralized_elasticsearch_class(_RealClient, recorder)
+        neutralized().ilm.put_lifecycle(name='dry-run-harness-probe-policy', body={})
+
+        assert performed == []
+        writes = recorder.summary()['es_writes']
+        assert writes['by_operation'] == {'ilm.put_lifecycle': 1}
+        assert writes['samples'][0]['target'] == 'dry-run-harness-probe-policy'
 
     def test_a_pipeline_run_manager_built_inside_the_window_does_not_outlive_it(
         self, deployment, tmp_path
