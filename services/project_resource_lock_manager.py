@@ -67,6 +67,7 @@ from services.pipeline_lock_manager import (
     PipelineLockManager,
     PipelineLock,
     PROCESS_OWNER_ID,
+    ReleaseResult,
     TouchResult,
     get_pipeline_lock_manager,
     owner_process_role,
@@ -219,7 +220,7 @@ class ProjectResourceLockManager:
 
     def release_resource(
         self, project: str, resource_name: str, issue_number: int, force: bool = False
-    ) -> bool:
+    ) -> ReleaseResult:
         """
         Release the named project-scoped resource lock.
 
@@ -228,8 +229,14 @@ class ProjectResourceLockManager:
         which apply unchanged here.
 
         Returns:
-            True if the lock was released, False if not held by this issue,
-            or if it's retained/unknown and force was not set.
+            The ReleaseResult release_lock() produced, passed through
+            unchanged: RELEASED, NOT_RELEASED (considered and refused -- not
+            held by this issue, or retained/unknown without force), or
+            SERIALIZATION_FAILED (the acquire guard could not be taken, so
+            nothing was attempted and the lock is still held). Only RELEASED is
+            truthy, so this stays drop-in compatible with the bool return this
+            method used to have -- see ReleaseResult for why the distinction
+            was needed.
         """
         return self._lock_manager.release_lock(
             project, self._resource_board(resource_name), issue_number, force=force

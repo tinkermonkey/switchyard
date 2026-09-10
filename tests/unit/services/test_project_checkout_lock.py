@@ -60,6 +60,8 @@ from services.project_checkout_lock import (
     _join_heartbeat_thread_async,
     _log_heartbeat_failure,
     _mint_unique_holder_id,
+    _release_and_warn,
+    _release_and_warn_async,
     HEARTBEAT_FAILURE_ESCALATION_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS,
     ProjectCheckoutLockTimeoutError,
@@ -1177,16 +1179,19 @@ class TestAsyncHeartbeatJoinSurvivesExecutorShutdown:
     async def test_the_lock_is_still_released_after_the_default_executor_is_shut_down(self):
         """
         Shape (c) in this module's docstring, defended rather than only
-        argued: the final _release_and_warn() in
-        project_checkout_lock_async()'s finally must stay SYNCHRONOUS on the
-        loop. Offloading it (the obvious "why is this one still inline?"
-        cleanup) makes it raise RuntimeError out of
+        argued. The final release in project_checkout_lock_async()'s finally
+        is now OFFLOADED (#153 WI-8 review round: release_lock()'s acquire
+        guard made an inline release cost up to two guard budgets of
+        poll-sleeping on the shared event loop), which is exactly the "why is
+        this one still inline?" cleanup this test was originally written to
+        forbid -- because a naive offload raises RuntimeError out of
         _check_default_executor() once asyncio.run()'s teardown has shut the
-        default executor down -- skipping the release entirely, so the lock
-        stays `locked` under a synthetic holder id nothing in the next
-        process knows, until TTL/staleness recovery (7200s-14400s) -- and
-        replacing the guarded body's real exception with one about asyncio
-        internals.
+        default executor down, skipping the release entirely (the lock stays
+        `locked` under a synthetic holder id nothing in the next process
+        knows, until TTL/staleness recovery, 7200s-14400s) AND replacing the
+        guarded body's real exception with one about asyncio internals. So the
+        offload carries _release_and_warn_async()'s synchronous fallback, and
+        this test now pins that fallback rather than the inline call.
         """
         facade = MagicMock()
         facade.acquire_resource.return_value = (True, "acquired")
@@ -1838,6 +1843,207 @@ class TestDefaultFacadeConstructedOffTheEventLoop:
         assert isinstance(facade, _ProbeFacade)
         assert len(constructing_threads) == 1
         assert constructing_threads[0] != loop_thread_id
+
+
+@pytest.mark.asyncio
+class TestAsyncReleaseRunsOffTheEventLoop:
+    """
+    REGRESSION (#153 WI-8 review round). project_checkout_lock_async()'s and
+    dev_container_build_lock_async()'s release was deliberately left inline on
+    the event loop -- shape (c) in the module docstring -- justified by
+    "bounded by PipelineLockManager's own Redis socket timeouts". That stopped
+    being true in this work item: release_lock() gained a
+    '<state>.yaml.acquire.lock' guard whose wait is a `time.sleep(0.1)` poll
+    loop on the calling thread, for RELEASE_GUARD_TIMEOUT_SECONDS and then
+    RELEASE_GUARD_RETRY_TIMEOUT_SECONDS.
+
+    The trigger is the one that budget's own comment predicts: with Redis
+    unavailable every try_acquire_lock() takes that same guard on its
+    YAML-fallback path and burns 5s Redis socket timeouts inside it, while
+    this module's waiters re-poll every DEFAULT_POLL_INTERVAL_SECONDS -- so the
+    guard is held near-continuously. Every exit of an
+    `async with project_checkout_lock_async(...)` (claude_integration,
+    auto_commit, feature_branch_manager, repair_cycle) would then stall the
+    whole orchestrator for that budget: no board polling, no dispatch, no
+    board-lock heartbeat sweep, no progression, for every project at once,
+    and concurrent releases across projects serialize.
+    """
+
+    async def test_release_resource_is_called_off_the_event_loop_thread(self):
+        loop_thread_id = threading.get_ident()
+        calling_threads = []
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+        facade.release_resource.side_effect = lambda *args: (
+            calling_threads.append(threading.get_ident()), True
+        )[1]
+
+        async with project_checkout_lock_async("proj", facade=facade):
+            pass
+
+        assert calling_threads, "release_resource() was never called"
+        assert all(tid != loop_thread_id for tid in calling_threads)
+
+    async def test_a_slow_release_does_not_stall_other_event_loop_tasks(self):
+        """The behavioural half: a guard budget spent here is a budget the
+        monitor loop is not polling boards in."""
+        ticks = []
+
+        async def _ticker():
+            while True:
+                await asyncio.sleep(0.01)
+                ticks.append(1)
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+        facade.release_resource.side_effect = lambda *a: (time.sleep(0.2), True)[1]
+
+        ticker_task = asyncio.create_task(_ticker())
+        ticks_before = len(ticks)
+        async with project_checkout_lock_async("proj", facade=facade):
+            pass
+        ticks_during_release = len(ticks) - ticks_before
+        ticker_task.cancel()
+
+        assert ticks_during_release >= 5, (
+            "the event loop was stalled for the whole release"
+        )
+
+    async def test_the_dev_container_build_lock_release_is_offloaded_too(self):
+        """The two modules share every other helper; the release was the one
+        place each spelled the call out itself, so each had to be moved."""
+        from services.dev_container_build_lock import dev_container_build_lock_async
+
+        loop_thread_id = threading.get_ident()
+        calling_threads = []
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, "acquired")
+        facade.touch_resource.return_value = TouchResult.REFRESHED
+        facade.release_resource.side_effect = lambda *args: (
+            calling_threads.append(threading.get_ident()), True
+        )[1]
+
+        async with dev_container_build_lock_async("proj", facade=facade):
+            pass
+
+        assert calling_threads, "release_resource() was never called"
+        assert all(tid != loop_thread_id for tid in calling_threads)
+
+    async def test_a_cancellation_waits_for_the_in_flight_release_exactly_once(self):
+        """
+        Offloading must not weaken what shape (b) already guaranteed: a
+        skipped release has no orphan-cleanup path, so the cancellation
+        fallback waits for the call already in flight -- rather than returning
+        early (leaking the hold) or making a second call (a spurious "may
+        already be released" and the stall back on the loop).
+        """
+        release_entered = threading.Event()
+        let_release_finish = threading.Event()
+        calls = []
+
+        def _slow_release(*args):
+            calls.append(1)
+            release_entered.set()
+            let_release_finish.wait(timeout=5.0)
+            return True
+
+        facade = MagicMock()
+        facade.release_resource.side_effect = _slow_release
+
+        async def _releaser():
+            await _release_and_warn_async(facade, RESOURCE_NAME, "proj", -42, 7)
+
+        task = asyncio.create_task(_releaser())
+        await asyncio.to_thread(release_entered.wait, 5.0)
+        # From a real OS thread: once the cancellation lands, the wait is
+        # synchronous on the loop, so nothing scheduled on the loop could
+        # unblock it.
+        threading.Timer(0.2, let_release_finish.set).start()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The cancellation propagated only AFTER the release finished, and
+        # nothing started a second one.
+        assert let_release_finish.is_set()
+        assert calls == [1]
+
+    async def test_the_release_still_happens_once_the_default_executor_is_shut_down(self):
+        """The submission is inside the try for the same reason it is in
+        _join_heartbeat_thread_async(): run_in_executor() raises its
+        RuntimeErrors synchronously at call time, so a submission above the try
+        would skip the release outright during asyncio.run()'s teardown."""
+        facade = MagicMock()
+        facade.release_resource.return_value = True
+
+        loop = asyncio.get_running_loop()
+        await loop.shutdown_default_executor()
+
+        await _release_and_warn_async(facade, RESOURCE_NAME, "proj", -42, 7)
+
+        facade.release_resource.assert_called_once()
+
+
+class TestReleaseAndWarnReportsWhyTheReleaseFailed(unittest.TestCase):
+    """
+    REGRESSION (#153 WI-8 review round): release_lock() now takes the lock's
+    acquire guard, and a guard it cannot take used to come back as the same
+    bare False as a considered-and-refused release. _release_and_warn() said
+    "lock may already be released or retained" at WARNING for both -- but the
+    guard case is the one with real consequences, and this module's own call
+    site spells them out: nothing else in the process knows this holder_id,
+    so an unreleased lock leaks until TTL/staleness recovery and blocks every
+    acquisition of the resource for that project meanwhile.
+    """
+
+    def setUp(self):
+        self.facade = MagicMock()
+
+    def test_a_serialization_failure_is_an_error_naming_the_unreleased_lock(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.SERIALIZATION_FAILED
+
+        with self.assertLogs('services.project_checkout_lock', level='ERROR') as logs:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        text = "\n".join(logs.output)
+        # "did NOT complete" rather than "still held": SERIALIZATION_FAILED now
+        # also covers losing the INNER '<state>.yaml.lock' after the Redis leg
+        # has already deleted its key, where the record is half gone rather
+        # than untouched. Either way it is not a retained/failed lock.
+        self.assertIn("did NOT complete", text)
+        self.assertIn("-42", text)
+        self.assertNotIn("may already be released or retained", text)
+
+    def test_an_ordinary_refusal_stays_a_warning(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.NOT_RELEASED
+
+        with self.assertLogs('services.project_checkout_lock', level='WARNING') as logs:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        text = "\n".join(logs.output)
+        self.assertIn("may already be released or retained", text)
+        self.assertNotIn("ERROR", text)
+
+    def test_a_successful_release_logs_nothing(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.RELEASED
+
+        with patch.object(project_checkout_lock.logger, 'warning') as warn, \
+                patch.object(project_checkout_lock.logger, 'error') as err:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        warn.assert_not_called()
+        err.assert_not_called()
 
 
 if __name__ == '__main__':

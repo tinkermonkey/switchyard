@@ -156,13 +156,23 @@ would cost:
       completes while a cancellation is unwinding or the loop is tearing
       down.
 
-  (c) The final release -- left inline on the loop, the one genuine
-      exception. Not because "every await is cancellable" (shape (b)
-      disproves that as a blanket argument) but because there is no
-      orphan-cleanup path for a SKIPPED release: nothing else in the process
-      knows this holder_id, so a release that never happens leaks the lock
-      until TTL/staleness recovery (7200s-14400s). It is bounded by
-      PipelineLockManager's own Redis socket timeouts.
+  (c) The final release -- shape (b) again, with one extra rule
+      (_release_and_warn_async). It has shape (b)'s "must complete" problem
+      for shape (b)'s reason: there is no orphan-cleanup path for a SKIPPED
+      release, because nothing else in the process knows this holder_id, so a
+      release that never happens leaks the lock until TTL/staleness recovery
+      (7200s-14400s). The extra rule is that its cancellation fallback does
+      NOT re-run the release on the calling thread the way the join does --
+      see that function.
+
+      This was the module's one deliberate on-loop exception until #153 WI-8,
+      justified by "bounded by PipelineLockManager's own Redis socket
+      timeouts". That stopped being true when release_lock() gained its
+      '<state>.yaml.acquire.lock' guard: the dominant term became
+      RELEASE_GUARD_TIMEOUT_SECONDS + RELEASE_GUARD_RETRY_TIMEOUT_SECONDS of
+      poll-sleeping on the calling thread, spent under a failure mode
+      (Redis down, so every try_acquire_lock() takes that same guard on its
+      YAML-fallback path) that this module's own waiters make near-continuous.
 
 _default_facade_off_loop() is a plain asyncio.to_thread() with neither
 shield nor done-callback, and needs neither: constructing a
@@ -180,7 +190,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Dict, List, Optional, Tuple
 
-from services.pipeline_lock_manager import LOCK_TTL_SECONDS
+from services.pipeline_lock_manager import LOCK_TTL_SECONDS, ReleaseResult
 from services.project_resource_lock_manager import ProjectResourceLockManager, TouchResult
 
 logger = logging.getLogger(__name__)
@@ -495,12 +505,112 @@ def _release_and_warn(
     facade: ProjectResourceLockManager, resource_name: str, project: str, holder_id: int, issue_number: Optional[int]
 ) -> None:
     released = facade.release_resource(project, resource_name, holder_id)
-    if not released:
+    if released:
+        return
+    if released is ReleaseResult.SERIALIZATION_FAILED:
+        # Distinct from a refusal, and much worse (found in the WI-8 review
+        # round): the release did not complete, so this holder_id's lock is
+        # still (at least partly) recorded -- and nothing else in the process
+        # knows this holder_id, so there is no orphan-cleanup path for it. It
+        # leaks until the Redis TTL or the 4-hour staleness heuristic, blocking
+        # every acquisition of this resource for this project meanwhile.
+        # Reported at ERROR, and not as "may already be released or retained",
+        # which would send an operator looking for a retained lock that does
+        # not exist.
+        logger.error(
+            f"'{resource_name}' lock release for project {project!r} "
+            f"({_attribution(issue_number)}) could not be serialized against a "
+            f"concurrent acquire/refresh -- it did NOT complete for holder "
+            f"{holder_id} and will now leak until TTL/staleness recovery"
+        )
+        return
+    logger.warning(
+        f"'{resource_name}' lock release for project {project!r} "
+        f"({_attribution(issue_number)}) returned {released} -- lock may already be "
+        "released or retained"
+    )
+
+
+def _log_offloaded_release_outcome(
+    resource_name: str, project: str, issue_number: Optional[int], future
+) -> None:
+    """Done-callback for an offloaded _release_and_warn() whose awaiting
+    coroutine was cancelled -- see _release_and_warn_async(). The release
+    itself keeps running in its worker thread and logs its own outcome; this
+    exists only so an exception raised inside it is retrieved and logged
+    rather than surfacing as an unretrieved-future warning at GC."""
+    try:
+        if future.cancelled():
+            return
+        future.result()
+    except Exception as exc:
         logger.warning(
             f"'{resource_name}' lock release for project {project!r} "
-            f"({_attribution(issue_number)}) returned False -- lock may already be "
-            "released or retained"
+            f"({_attribution(issue_number)}) raised after its awaiting coroutine "
+            f"was cancelled: {exc}"
         )
+
+
+async def _release_and_warn_async(
+    facade: ProjectResourceLockManager, resource_name: str, project: str, holder_id: int, issue_number: Optional[int]
+) -> None:
+    """
+    _release_and_warn() from an async exit path, without spending its wait on
+    the event-loop thread (#153 WI-8 review round) -- shape (b) in this
+    module's docstring, with one deliberate difference on cancellation.
+
+    See shape (c) there for why the release stopped being safe to run inline:
+    PipelineLockManager.release_lock()'s acquire guard now costs up to
+    RELEASE_GUARD_TIMEOUT_SECONDS + RELEASE_GUARD_RETRY_TIMEOUT_SECONDS of
+    `time.sleep(0.1)` polling on the calling thread, and every exit of an
+    `async with project_checkout_lock_async(...)` runs on the loop that also
+    does board polling, dispatch, the board-lock heartbeat sweep and
+    progression for every project.
+
+    Same shape and same reasons as _join_heartbeat_thread_async(): shield() so
+    a cancellation delivered here cannot tear down the release itself, a
+    synchronous fallback because a SKIPPED release has no orphan-cleanup path
+    (nothing else in the process knows this holder_id, so it would leak until
+    TTL/staleness recovery, 7200s-14400s), and the submission INSIDE the try
+    because run_in_executor() raises its RuntimeErrors synchronously at call
+    time, never through the future.
+
+    One difference from the join: the cancellation fallback WAITS for the call
+    already in flight instead of making the call itself. Thread.join() is
+    idempotent; a release is not, and re-running it here would both report a
+    second, spurious "may already be released" and spend the guard budget on
+    the loop after all. Waiting on the executor's own completion event costs
+    the same wall clock as the join's fallback does, on the same rare path,
+    and leaves exactly one release_resource() call.
+    """
+    loop = asyncio.get_running_loop()
+    finished = threading.Event()
+
+    def release():
+        try:
+            _release_and_warn(facade, resource_name, project, holder_id, issue_number)
+        finally:
+            finished.set()
+
+    try:
+        release_future = loop.run_in_executor(None, release)
+        await asyncio.shield(release_future)
+    except asyncio.CancelledError:
+        # Unbounded, exactly as _join_heartbeat_thread_async()'s fallback join
+        # is, and bounded in practice by the same thing: release_lock()'s two
+        # guard budgets. Returning here while the release is still in flight
+        # would let the caller unwind past it.
+        finished.wait()
+        release_future.add_done_callback(
+            functools.partial(
+                _log_offloaded_release_outcome, resource_name, project, issue_number
+            )
+        )
+        raise
+    except RuntimeError:
+        # asyncio's default executor refuses new work once the loop/interpreter
+        # is shutting down -- release directly rather than skipping it.
+        release()
 
 
 # The Redis lock-key TTL every constant below is calibrated against.
@@ -931,6 +1041,31 @@ async def _acquire_and_start_heartbeat_off_loop(
         raise
 
 
+def _stop_heartbeat_and_release(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    issue_number: Optional[int],
+    heartbeat: Optional[Tuple[threading.Event, threading.Thread]],
+) -> None:
+    """Stop a hold's heartbeat and then release it, in that order -- see
+    _release_if_orphan_acquired(), whose off-loop cleanup this is. Swallows
+    and logs its own failures because it usually runs fire-and-forget in a
+    worker thread, with no caller left to observe the future."""
+    try:
+        if heartbeat is not None:
+            stop_event, heartbeat_thread = heartbeat
+            stop_event.set()
+            heartbeat_thread.join()
+        _release_and_warn(facade, resource_name, project, holder_id, issue_number)
+    except Exception as cleanup_exc:
+        logger.warning(
+            f"Failed to auto-release orphaned '{resource_name}' holder for project "
+            f"{project!r} ({_attribution(issue_number)}): {cleanup_exc}"
+        )
+
+
 def _release_if_orphan_acquired(
     facade: ProjectResourceLockManager,
     resource_name: str,
@@ -944,9 +1079,15 @@ def _release_if_orphan_acquired(
     attempt went on to actually acquire the lock, nothing else will ever stop
     its heartbeat or release it, so this does both (heartbeat first, so a
     refresh in flight can't re-establish the lock after the release). Runs
-    synchronously on the event loop thread (asyncio's own done-callback
-    contract) -- a brief, one-off cost only on this rare cancellation
-    path."""
+    on the event loop thread (asyncio's own done-callback contract), so the
+    join-then-release pair it performs is handed to a worker thread rather than
+    run there: the release's own wait is bounded by release_lock()'s two guard
+    budgets, which is far too long to spend on the loop (#153 WI-8 review
+    round; see _release_and_warn_async()). Both halves go in ONE callable
+    because the ordering between them is load-bearing -- a heartbeat refresh
+    still in flight must not land after the release and re-establish the lock.
+    A done-callback cannot await, so if the executor refuses the work (loop
+    tearing down) the pair is run here after all rather than skipped."""
     try:
         if attempt.cancelled():
             return
@@ -959,11 +1100,14 @@ def _release_if_orphan_acquired(
                 "holder immediately instead of leaving it for TTL/staleness recovery "
                 "to eventually reclaim."
             )
-            if heartbeat is not None:
-                stop_event, heartbeat_thread = heartbeat
-                stop_event.set()
-                heartbeat_thread.join()
-            _release_and_warn(facade, resource_name, project, holder_id, issue_number)
+            cleanup = functools.partial(
+                _stop_heartbeat_and_release,
+                facade, resource_name, project, holder_id, issue_number, heartbeat,
+            )
+            try:
+                asyncio.get_running_loop().run_in_executor(None, cleanup)
+            except RuntimeError:
+                cleanup()
     except Exception as cleanup_exc:
         logger.warning(
             f"Failed to auto-release orphaned '{resource_name}' holder for project "
@@ -1050,14 +1194,15 @@ async def project_checkout_lock_async(
             ):
                 yield
         finally:
-            # Deliberately synchronous, not offloaded -- shape (c) in this
-            # module's docstring. NOT because awaits are cancellable in general
-            # (_join_heartbeat_thread_async offloads an exit path safely with
-            # shield + a synchronous fallback), but because a SKIPPED release has
-            # no orphan-cleanup path: nothing else in the process knows this
-            # holder_id, so it would leak until TTL/staleness recovery. Bounded by
-            # PipelineLockManager's own Redis socket timeouts.
-            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+            # Offloaded, not inline -- shape (c) in this module's docstring.
+            # A SKIPPED release has no orphan-cleanup path (nothing else in
+            # the process knows this holder_id), so it has to complete; but
+            # release_lock()'s acquire guard makes "complete" cost up to two
+            # guard budgets of poll-sleeping, which must not be spent on the
+            # shared event loop.
+            await _release_and_warn_async(
+                facade, RESOURCE_NAME, project, holder_id, issue_number
+            )
 
 
 @contextmanager

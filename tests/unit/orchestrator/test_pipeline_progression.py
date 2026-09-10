@@ -571,6 +571,49 @@ class TestReleaseLockAndProcessNext:
         mock_queue.remove_issue_from_queue.assert_not_called()
         mock_run_manager.end_pipeline_run.assert_not_called()
 
+    def test_a_release_that_could_not_be_serialized_is_not_reported_as_retained(self, caplog):
+        """
+        REGRESSION (#153 WI-8 review round): release_lock() now takes the
+        lock's '<state>.yaml.acquire.lock' guard, and a guard it cannot take
+        used to return the same bare False as a considered-and-refused
+        release. This site then told operators the lock was "likely retained
+        due to a failed run" and pointed them at scripts/release_lock.py --
+        a wrong-but-plausible diagnosis for what is actually transient
+        contention (try_acquire_lock()'s YAML-fallback path takes that same
+        guard, and is reached exactly when Redis is down).
+
+        The halt itself is still correct -- the lock genuinely was not
+        released, so the board must not advance -- but it has to be reported
+        as what it is.
+        """
+        import logging
+        from services.pipeline_lock_manager import ReleaseResult
+
+        our_lock = Mock()
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = Mock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = ReleaseResult.SERIALIZATION_FAILED
+
+        mock_queue = Mock()
+        mock_run_manager = Mock()
+
+        with patch('services.pipeline_progression.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_progression.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.pipeline_progression.get_pipeline_run_manager', return_value=mock_run_manager), \
+             patch('monitoring.observability.get_observability_manager'), \
+             caplog.at_level(logging.ERROR, logger='services.pipeline_progression'):
+
+            from services.pipeline_progression import PipelineProgression
+            progression = PipelineProgression(None)
+            progression._release_lock_and_process_next('test-project', 'dev', 100, 'Done', 'test-repo')
+
+        mock_queue.remove_issue_from_queue.assert_not_called()
+        mock_run_manager.end_pipeline_run.assert_not_called()
+        assert 'could not be serialized' in caplog.text
+        assert 'likely retained due to a failed run' not in caplog.text
+
     def test_skips_release_and_processes_queue_when_nothing_is_locked_at_all(self):
         """Control case: no lock exists at all (lock is None) — must not
         crash dereferencing lock.locked_by_issue, and must still proceed

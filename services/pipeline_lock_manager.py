@@ -33,6 +33,67 @@ logger = logging.getLogger(__name__)
 # tests/unit/services/test_project_checkout_lock.py.
 LOCK_TTL_SECONDS = 7200
 
+# How long any single acquisition of the inner '<state>.yaml.lock' will wait
+# before giving up. EVERY acquisition of that file made by this class passes it
+# (found in the WI-8 review round: two of the three taken inside the
+# '<state>.yaml.acquire.lock' guard were still blocking acquires, which left
+# the guard's own hold unbounded and made the retry budget below underivable).
+#
+# Sized against what actually holds this lock rather than left to
+# utils.file_lock's incidental 10s default: every critical section under it is
+# a single small-YAML read, write or unlink against the local filesystem, with
+# no Redis call and no other network I/O anywhere inside it -- the Redis legs
+# of try_acquire_lock()/touch_lock()/release_lock() all run OUTSIDE it. Real
+# holds are sub-millisecond, so this is not a budget a healthy holder can
+# consume; it exists only to turn a wedged or abandoned holder in another
+# process (scripts/release_lock.py, the observability server) into a reported
+# failure instead of a thread parked forever.
+STATE_LOCK_TIMEOUT_SECONDS = 20
+
+# How long release_lock() waits for the '<state>.yaml.acquire.lock' guard on
+# its FIRST attempt. Spelled out rather than left to utils.file_lock's own
+# default so the two budgets below read as one deliberate decision.
+RELEASE_GUARD_TIMEOUT_SECONDS = 10
+
+# How long release_lock() will wait for that same guard on its SECOND attempt,
+# after the budget above has already expired once (found in the WI-8 review
+# round).
+#
+# A release is not symmetric with an acquire, and the 10s first attempt --
+# which was an incidental property of file_lock(), not a budget anyone sized
+# for this -- is far too small on its own. Every acquire site polls, so a
+# refused acquire is retried within seconds; a release has already been
+# authorized by the caller, and abandoning it leaks the lock until the
+# LOCK_TTL_SECONDS Redis TTL or the 4-hour staleness heuristic, blocking every
+# dispatch for that (project, board) in the meantime
+# (services/project_checkout_lock.py's release site spells this consequence out
+# at its call to _release_and_warn). The contention is also
+# asymmetric in the wrong direction: try_acquire_lock()'s YAML-fallback path
+# takes this same guard and is reached exactly when Redis is unavailable, so
+# each attempt holds the guard for several seconds of Redis socket timeouts,
+# and two waiters polling every DEFAULT_POLL_INTERVAL_SECONDS can hold it
+# almost continuously.
+#
+# Sized against the longest a guard holder can now legitimately hold it. The
+# longest guarded section is try_acquire_lock()'s YAML-fallback stale-lock
+# recovery, which takes the inner '<state>.yaml.lock' four times -- its opening
+# get_lock(), the fail-closed read inside _release_lock_unguarded(), that
+# release's own delete, and _create_lock()'s write -- around four Redis round
+# trips at a 5s socket timeout each. All four of those acquisitions are bounded
+# by STATE_LOCK_TIMEOUT_SECONDS (they were not, before the WI-8 review round,
+# which is what made the 35s figure this used to cite underivable), so the
+# worst case is 4 * STATE_LOCK_TIMEOUT_SECONDS + ~20s of Redis, and this budget
+# covers it with margin.
+#
+# Still BOUNDED rather than a blocking acquire, and a release that exhausts
+# even this budget is reported as ReleaseResult.SERIALIZATION_FAILED rather
+# than as a refusal. Spending a budget this size is only safe because the async
+# holders no longer wait it out on the asyncio event loop:
+# services/project_checkout_lock.py's _release_and_warn_async() offloads the
+# release to a worker thread (shape (b) in that module's docstring) instead of
+# running it inline, which it did while this budget was 60s.
+RELEASE_GUARD_RETRY_TIMEOUT_SECONDS = 120
+
 
 def _derive_process_role() -> str:
     """
@@ -110,6 +171,65 @@ class TouchResult(Enum):
 
     def __bool__(self) -> bool:
         return self is TouchResult.REFRESHED
+
+
+class LockStateSerializationError(RuntimeError):
+    """
+    A lock read or write could not be SERIALIZED against a concurrent one --
+    the inner '<state>.yaml.lock' was still held after
+    STATE_LOCK_TIMEOUT_SECONDS.
+
+    Raised rather than folded into the surrounding "the read failed" / "the
+    write failed" bool (found in the WI-8 review round) because for a release
+    those are opposite facts. A failed read means the lock's state is genuinely
+    unknown, so release_lock() must fail closed and refuse -- which its callers
+    correctly report as "held by this issue but likely retained due to a failed
+    run". A serialization timeout establishes nothing about that state and
+    changes nothing either, so reporting it as the same refusal sends an
+    operator to scripts/release_lock.py chasing a durable failure record that
+    does not exist while the board stays wedged behind a release that is still
+    outstanding. That is precisely the misattribution the ReleaseResult split
+    below exists to remove, relocated from the outer guard to the inner lock.
+
+    Caught by _release_lock_to_result(), which maps it to
+    ReleaseResult.SERIALIZATION_FAILED.
+    """
+
+
+class ReleaseResult(Enum):
+    """
+    Outcome of release_lock() -- the same three-state split TouchResult made
+    for touch_lock(), for the same reason (#153 WI-8 review round).
+
+    release_lock() gained an acquire guard in this work item, and its guard
+    timeout returned the same bare False the method already used for "refused:
+    not held by this issue, retained, or state unknown". Those are opposite
+    facts about the lock: a refusal means the release was CONSIDERED and
+    correctly declined, so the lock's state is exactly what the caller was
+    told; a serialization failure means nothing was attempted at all and the
+    release is still outstanding. Every caller read False as the former, and
+    the three that log about it told operators the lock was "likely retained
+    due to a failed run" -- a wrong-but-plausible diagnosis that points at
+    scripts/release_lock.py instead of at the contention that actually
+    happened.
+
+    __bool__ is defined so every existing truthiness-based caller/assertion
+    (`if not released`, assertTrue/assertFalse) keeps its original meaning:
+    only RELEASED is truthy.
+    """
+
+    RELEASED = "released"          # the lock is confirmed gone from the stores
+    NOT_RELEASED = "not_released"  # considered and refused: not held, retained, or state unknown
+    # Could not be serialized against a concurrent lock writer, either on the
+    # '<state>.yaml.acquire.lock' guard (nothing attempted at all) or on the
+    # inner '<state>.yaml.lock' (see LockStateSerializationError). Either way
+    # the release did NOT complete and is still outstanding -- which is a
+    # different instruction to the caller than NOT_RELEASED's "considered, and
+    # correctly declined".
+    SERIALIZATION_FAILED = "serialization_failed"
+
+    def __bool__(self) -> bool:
+        return self is ReleaseResult.RELEASED
 
 
 @dataclass
@@ -210,6 +330,30 @@ class PipelineLockManager:
         """Get YAML state file path for lock"""
         return self.state_dir / f"{project}_{board}.yaml"
 
+    def _get_acquire_guard_file(self, project: str, board: str) -> Path:
+        """
+        The OUTER of this class's two advisory lock files for a (project, board).
+
+        Every operation that decides who holds this lock by reading the current
+        record and then writing a different one -- try_acquire_lock()'s YAML
+        fallback, touch_lock(), release_lock() -- takes this file for the whole
+        of that read-modify-write, so no two of them can interleave, across
+        threads AND across processes (scripts/release_lock.py or the
+        observability server's release endpoint running alongside the
+        orchestrator).
+
+        Deliberately a DIFFERENT file from the '<state>.yaml.lock' those
+        operations take internally around the individual file read/write: the
+        inner lock makes one store access atomic, this one makes the whole
+        decision atomic, and fcntl.flock() conflicts between two descriptors of
+        the same file even within a single process, so they cannot be the same
+        path. The nesting order is always this file OUTER, '<state>.yaml.lock'
+        INNER -- nothing in this class ever takes them the other way round, so
+        there is no ordering cycle to deadlock on.
+        """
+        state_file = self._get_state_file(project, board)
+        return state_file.with_suffix(state_file.suffix + '.acquire.lock')
+
     @staticmethod
     def _lock_to_redis_mapping(lock: PipelineLock) -> dict:
         """
@@ -248,25 +392,108 @@ class PipelineLockManager:
             return None, False
 
     def _read_yaml_lock_only(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
-        """Read the lock from the YAML file only. Returns (lock_or_None, read_succeeded)."""
+        """
+        Read the lock from the YAML file only. Returns (lock_or_None, read_succeeded).
+
+        A read that could not be SERIALIZED collapses into read_succeeded=False
+        here, which every caller of this method already treats fail-closed.
+        The one caller that must tell that apart from a genuine read failure --
+        the release path, see LockStateSerializationError -- goes through
+        _read_yaml_lock_only_detail() instead.
+        """
+        lock, read_ok, _serialization_failed = self._read_yaml_lock_only_detail(project, board)
+        return lock, read_ok
+
+    def _read_yaml_lock_only_detail(
+        self, project: str, board: str
+    ) -> Tuple[Optional[PipelineLock], bool, bool]:
+        """
+        _read_yaml_lock_only(), plus WHY it failed. Returns
+        (lock_or_None, read_succeeded, serialization_failed).
+
+        The inner '<state>.yaml.lock' is taken with enforce_timeout=True
+        (found in the WI-8 review round): this read runs inside the
+        '<state>.yaml.acquire.lock' guard on every one of the three paths that
+        decide who holds the lock, and a blocking acquire here made that
+        OUTER guard's hold unbounded -- so release_lock()'s own bounded wait
+        for the guard could expire against a holder that was itself parked
+        indefinitely on this inner lock.
+        """
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project, board)
         if not state_file.exists():
-            return None, True
+            return None, True, False
         try:
             lock_file = state_file.with_suffix(state_file.suffix + '.lock')
-            with file_lock(lock_file):
-                if not state_file.exists():  # Check again inside lock
-                    return None, True
-                with open(state_file, 'r') as f:
-                    lock_data = yaml.safe_load(f)
-                    if lock_data and lock_data.get('lock_status') == 'locked':
-                        return PipelineLock(**lock_data), True
-                    return None, True
+            with file_lock(
+                lock_file, timeout=STATE_LOCK_TIMEOUT_SECONDS, enforce_timeout=True
+            ):
+                lock, read_ok = self._read_yaml_lock_only_unlocked(project, board)
+                return lock, read_ok, False
+        except TimeoutError as e:
+            # Checked before the generic handler below -- TimeoutError is an
+            # OSError, so it would otherwise be reported as an unknown lock
+            # state, which is a durable fact this read never established.
+            logger.error(
+                f"Could not take the YAML state lock to read {project}/{board} within "
+                f"{STATE_LOCK_TIMEOUT_SECONDS}s: {e}"
+            )
+            return None, False, True
+        except Exception as e:
+            logger.error(f"Failed to load lock state from YAML: {e}")
+            return None, False, False
+
+    def _read_yaml_lock_only_unlocked(
+        self, project: str, board: str
+    ) -> Tuple[Optional[PipelineLock], bool]:
+        """
+        _read_yaml_lock_only() without taking '<state>.yaml.lock'. MUST only be
+        called with that lock already held.
+
+        Exists so a read and the write that depends on it can share ONE
+        critical section (see _touch_lock_yaml_unguarded) -- fcntl.flock()
+        conflicts between two descriptors of the same file even within one
+        process, so the locking variant cannot be nested inside its own lock
+        (utils.file_lock raises ReentrantFileLockError rather than hanging on
+        it).
+        """
+        state_file = self._get_state_file(project, board)
+        try:
+            if not state_file.exists():
+                return None, True
+            with open(state_file, 'r') as f:
+                lock_data = yaml.safe_load(f)
+                if lock_data and lock_data.get('lock_status') == 'locked':
+                    return PipelineLock(**lock_data), True
+                return None, True
         except Exception as e:
             logger.error(f"Failed to load lock state from YAML: {e}")
             return None, False
+
+    def redis_lock_is_missing(self, project: str, board: str) -> bool:
+        """
+        True only when Redis is configured, its read SUCCEEDED, and it holds no
+        'locked' record for this (project, board).
+
+        Deliberately NOT `_read_redis_lock_only(...) == (None, True)`: that
+        method also returns (None, True) when no Redis client is configured at
+        all ("no Redis configured isn't a read failure"), and a YAML-only
+        deployment must not have every one of its locks reported as a key that
+        Redis has lost.
+
+        Exists for project_monitor's board-lock heartbeat sweep, which needs to
+        tell "this hold's liveness refresh isn't due yet" from "the Redis key
+        under this hold is GONE" -- the second is not a liveness question at
+        all and cannot wait for the refresh interval, because
+        try_acquire_lock()'s Redis transaction reads an absent key back as an
+        empty dict and grants the board to the next queued issue without ever
+        consulting the still-'locked' durable record.
+        """
+        if not self.redis_client:
+            return False
+        redis_lock, read_ok = self._read_redis_lock_only(project, board)
+        return read_ok and redis_lock is None
 
     def get_lock(self, project: str, board: str) -> Optional[PipelineLock]:
         """
@@ -310,11 +537,31 @@ class PipelineLockManager:
         unlocked, proceed" — the whole point of this durable check is to never
         silently grant a lock it can't actually verify is safe to grant.
         """
+        lock, reads_healthy, _serialization_failed = self._get_lock_fail_closed_detail(
+            project, board
+        )
+        return lock, reads_healthy
+
+    def _get_lock_fail_closed_detail(
+        self, project: str, board: str
+    ) -> Tuple[Optional[PipelineLock], bool, bool]:
+        """
+        get_lock_fail_closed(), plus whether the YAML leg failed because it
+        could not be SERIALIZED rather than because it could not be read.
+
+        Only the release path needs the distinction -- see
+        LockStateSerializationError -- and it needs it whether or not the read
+        as a whole came back healthy: a serialized-out YAML read that Redis
+        happens to answer for still means this call never saw the one
+        non-expiring copy of retained_reason.
+        """
         redis_lock, redis_ok = self._read_redis_lock_only(project, board)
-        yaml_lock, yaml_ok = self._read_yaml_lock_only(project, board)
+        yaml_lock, yaml_ok, yaml_serialization_failed = self._read_yaml_lock_only_detail(
+            project, board
+        )
 
         if not redis_ok and not yaml_ok:
-            return None, False
+            return None, False, yaml_serialization_failed
 
         # Asymmetric case that matters: YAML is the only non-expiring store for
         # retained_reason (Redis's TTL can lapse on a lock nothing is
@@ -326,15 +573,15 @@ class PipelineLockManager:
         # have an entry, it's a definitive answer on its own regardless of
         # YAML's state, so that case is left to the normal merge below.
         if not yaml_ok and redis_lock is None:
-            return None, False
+            return None, False, yaml_serialization_failed
 
         if redis_lock and yaml_lock and redis_lock.locked_by_issue == yaml_lock.locked_by_issue:
             if yaml_lock.retained_reason and not redis_lock.retained_reason:
                 redis_lock.retained_reason = yaml_lock.retained_reason
                 redis_lock.retained_at = yaml_lock.retained_at
-            return redis_lock, True
+            return redis_lock, True, yaml_serialization_failed
 
-        return (redis_lock or yaml_lock), True
+        return (redis_lock or yaml_lock), True, yaml_serialization_failed
 
     def try_acquire_lock(
         self,
@@ -531,11 +778,13 @@ class PipelineLockManager:
         # _read_yaml_lock_only()/_save_lock_to_yaml()/release_lock() take
         # internally: fcntl.flock() conflicts between two file descriptors of
         # the same file even within a single process, so reusing that path
-        # would self-deadlock on the first nested read below.
+        # would self-deadlock on the first nested read below. See
+        # _get_acquire_guard_file() for the full contract -- touch_lock() and
+        # release_lock() take this same file, so none of the three can
+        # interleave with another.
         from utils.file_lock import file_lock
 
-        state_file = self._get_state_file(project, board)
-        acquire_guard = state_file.with_suffix(state_file.suffix + '.acquire.lock')
+        acquire_guard = self._get_acquire_guard_file(project, board)
         try:
             with file_lock(acquire_guard, enforce_timeout=True):
                 return self._try_acquire_lock_yaml_unguarded(project, board, issue_number)
@@ -617,7 +866,23 @@ class PipelineLockManager:
                 logger.info(
                     f"Auto-releasing stale lock (issue #{lock.locked_by_issue})"
                 )
-                released = self.release_lock(project, board, lock.locked_by_issue)
+                # _release_lock_unguarded, not release_lock: this whole method
+                # already runs inside the acquire guard release_lock() now
+                # takes for itself, and utils.file_lock refuses a re-entrant
+                # acquire (ReentrantFileLockError) rather than hanging on it.
+                try:
+                    released = self._release_lock_unguarded(project, board, lock.locked_by_issue)
+                except LockStateSerializationError as e:
+                    # Caught here rather than left to the generic handler below,
+                    # whose "Failed to check lock age" message would misreport
+                    # it. An acquire is the easy side of this: refusing costs
+                    # one poll cycle, and this caller's own poll loop retries.
+                    logger.warning(
+                        f"try_acquire_lock: could not auto-release the stale lock on "
+                        f"{project}/{board} held by issue #{lock.locked_by_issue}: {e} "
+                        f"— refusing this acquisition rather than stealing the lock"
+                    )
+                    return False, f"locked_by_issue_{lock.locked_by_issue}"
                 if not released:
                     logger.error(
                         f"Could not release stale lock for {project}/{board} held "
@@ -741,10 +1006,51 @@ class PipelineLockManager:
         Callers must already know they hold this lock (e.g. a heartbeat loop
         started immediately after a successful try_acquire_lock() for this
         exact issue_number) -- this does NOT acquire on behalf of a new
-        holder and is not atomic with respect to a concurrent acquire/release
-        for the same lock (acceptable here: it's a periodic liveness refresh
-        for a lock this same process already holds, not the acquisition path
-        itself, which is what needs the atomic transaction).
+        holder.
+
+        Each store's write is a COMPARE-AND-SET against that store's own
+        current record, not a blind overwrite (#153 WI-8, from #140 item 15).
+        The read below stays as a cheap upfront rejection, but it is no longer
+        what authorizes the write: the Redis leg re-reads and writes inside a
+        WATCH/MULTI transaction (the same shape try_acquire_lock() already
+        uses), and the YAML leg re-reads and writes under one held
+        '<state>.yaml.lock'. Before that, a heartbeat that was very late --
+        late enough for its own holder to have been judged stale (7200s Redis
+        TTL, then the 4-hour age heuristic) and the lock handed to a SECOND
+        caller in the meantime -- could still land its refresh on top of that
+        second caller's record and silently take the lock back from a live
+        holder. See _touch_lock_redis()/_touch_lock_yaml_unguarded() for each
+        leg.
+
+        The WHOLE method runs under the '<state>.yaml.acquire.lock' guard, and
+        release_lock() now takes that same guard for the whole of its own
+        two-store delete (found in the WI-8 review round; see
+        _get_acquire_guard_file). That is what makes "the record is gone from a
+        store" unambiguous here. Without it, a touch and a release genuinely
+        interleaved in two ways, both of which put a released lock back:
+
+          - between this method's two legs -- the Redis leg refreshed the key,
+            the release then deleted the key AND unlinked the state file, and
+            the YAML leg re-created the durable record from `fallback_lock`
+            because the Redis leg had said REFRESHED; and
+          - inside the YAML leg itself, whose read and write each took and
+            released '<state>.yaml.lock' separately, so a release could unlink
+            in the gap and the write would re-create the file regardless of
+            what re-establishment was authorized.
+
+        Either one left a durable 'locked' record naming an issue whose run had
+        ended, with the 4h staleness clock reset -- and nothing reclaims that
+        at runtime (see _refresh_held_board_locks()' docstring). Serializing
+        against release_lock() closes both, so the only remaining reading of
+        "gone from a store" is the one this method should self-heal: a store
+        that lost a record while the other still positively names this holder
+        (a lapsed Redis TTL under a live hold, or a YAML write that failed at
+        acquisition time).
+
+        Args:
+            project: Project name
+            board: Board name
+            issue_number: The issue this caller believes holds the lock
 
         Returns:
             TouchResult.REFRESHED if the lock was found (held by
@@ -775,6 +1081,37 @@ class PipelineLockManager:
         below AND returned distinctly (REFRESH_FAILED, not NOT_HELD) rather
         than folded into the "genuinely not held" case.
         """
+        from utils.file_lock import file_lock
+
+        try:
+            with file_lock(self._get_acquire_guard_file(project, board), enforce_timeout=True):
+                return self._touch_lock_guarded(project, board, issue_number)
+        except TimeoutError as e:
+            # Same posture as try_acquire_lock()'s guarded path and as the YAML
+            # leg had on its own before the guard was hoisted here: an
+            # unserialized read-modify-write across two stores is exactly the
+            # race this guard exists to close, so report the refresh as failed
+            # rather than perform one. Every caller of this method is a
+            # heartbeat loop, so a refusal is retried on the next tick.
+            logger.warning(
+                f"touch_lock: could not serialize the refresh for {project}/{board} "
+                f"(issue #{issue_number}): {e} -- reporting it as failed rather than "
+                f"racing a concurrent acquire or release"
+            )
+            return TouchResult.REFRESH_FAILED
+        except OSError as e:
+            logger.warning(
+                f"touch_lock: could not take the refresh guard for {project}/{board} "
+                f"(issue #{issue_number}): {e}"
+            )
+            return TouchResult.REFRESH_FAILED
+
+    def _touch_lock_guarded(self, project: str, board: str, issue_number: int) -> TouchResult:
+        """
+        touch_lock()'s body. MUST only be called with that method's
+        '<state>.yaml.acquire.lock' guard held -- see its docstring for what
+        the guard makes true about the two legs below.
+        """
         lock, reads_healthy = self.get_lock_fail_closed(project, board)
         if not reads_healthy:
             logger.error(
@@ -788,40 +1125,66 @@ class PipelineLockManager:
         if not lock or lock.locked_by_issue != issue_number:
             return TouchResult.NOT_HELD
 
-        refreshed = PipelineLock(
-            project=project,
-            board=board,
-            locked_by_issue=issue_number,
-            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
-            lock_status='locked',
-            # Preserve retained state rather than silently clearing it --
-            # mirrors _create_lock_yaml_only()'s own defensive preservation.
-            # In practice this lock should never be retained while something
-            # is still successfully heartbeating it (mark_lock_failed() is
-            # for a run that has already ended), but this stays defensive
-            # against that edge case rather than relying on a single layer
-            # of protection.
-            retained_reason=lock.retained_reason,
-            retained_at=lock.retained_at,
-            # Preserved, not re-stamped: a heartbeat always runs in the holding
-            # process, so re-stamping would normally be a no-op -- but a touch
-            # that ever ran anywhere else must not silently re-attribute the
-            # lock and make a live foreign holder look like this process's own
-            # dead predecessor to recover_orphaned_resource_locks().
-            owner_process=lock.owner_process,
-        )
-
         redis_ok = False
+        redis_result = None
+        redis_key_present = False
         if self.redis_client:
-            try:
-                lock_key = self._get_lock_key(project, board)
-                self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
-                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
-                redis_ok = True
-            except Exception as e:
-                logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+            # allow_reestablish=False on this first pass, always: re-creating
+            # an absent key from `lock` -- a snapshot read before any of this
+            # -- is exactly what let a touch undo a concurrent release. Only
+            # the guarded YAML read below may authorize that, in the second
+            # pass at the bottom of this method.
+            redis_result, redis_key_present = self._touch_lock_redis(
+                project, board, issue_number, lock, allow_reestablish=False
+            )
+            if redis_result is TouchResult.NOT_HELD and redis_key_present:
+                # Redis is the primary store AND the only expiring one, so its
+                # compare-and-set losing is a definitive "this lock is somebody
+                # else's now" -- return without touching YAML, which would
+                # otherwise write a record contradicting Redis.
+                return TouchResult.NOT_HELD
+            redis_ok = redis_result is TouchResult.REFRESHED
 
-        yaml_ok = self._save_lock_to_yaml(refreshed)
+        yaml_result, yaml_record = self._touch_lock_yaml_unguarded(
+            project, board, issue_number, lock,
+            # A missing/unlocked durable record may only be re-created while
+            # Redis still positively names this holder. No release can be in
+            # flight (this method holds the guard release_lock() takes), so
+            # "Redis has it, YAML doesn't" is a YAML write that failed at
+            # acquisition time -- precisely what this leg should heal.
+            allow_reestablish=redis_ok,
+        )
+        if yaml_result is TouchResult.NOT_HELD and redis_result is not TouchResult.REFRESHED:
+            # The durable record is somebody else's, or gone with nothing in
+            # Redis contradicting it. Gated on Redis having actually produced a
+            # REFRESHED verdict rather than on a client merely being configured
+            # (found in the WI-8 review round): a REFRESH_FAILED leg answered
+            # nothing at all, so folding a YAML-confirmed loss into "both legs
+            # failed" hid the one store that knew -- and left
+            # project_checkout_lock's "may now be racing a different holder"
+            # ERROR unreachable during exactly the Redis outage that produces
+            # the loss. An absent Redis key is likewise no contradiction: it is
+            # what a completed release leaves behind.
+            return TouchResult.NOT_HELD
+        yaml_ok = yaml_result is TouchResult.REFRESHED
+
+        if (self.redis_client and not redis_key_present
+                and redis_result is TouchResult.NOT_HELD and yaml_record is not None):
+            # The Redis key's TTL lapsed under a hold the durable copy -- read
+            # fresh by the YAML leg just above under the state file's own lock,
+            # NOT from this call's opening snapshot -- still records as this
+            # holder's. Re-establish it from that record: this is the self-heal
+            # the heartbeat exists to provide, and routing it through that
+            # re-read is what keeps it from resurrecting a lock release_lock()
+            # has already deleted.
+            redis_result, _ = self._touch_lock_redis(
+                project, board, issue_number, yaml_record, allow_reestablish=True
+            )
+            if redis_result is TouchResult.NOT_HELD:
+                # Somebody acquired the key between the guarded YAML read and
+                # this re-establish. Confirmed loss, not a store failure.
+                return TouchResult.NOT_HELD
+            redis_ok = redis_result is TouchResult.REFRESHED
 
         if not redis_ok and not yaml_ok:
             logger.error(
@@ -857,7 +1220,207 @@ class PipelineLockManager:
 
         return TouchResult.REFRESHED
 
-    def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
+    def _refreshed_from(self, project: str, board: str, issue_number: int, current: PipelineLock) -> PipelineLock:
+        """
+        The record touch_lock() writes: `current` with lock_acquired_at reset
+        to now. Shared by both legs so they can never drift in which fields a
+        refresh is allowed to change.
+
+        retained_reason/retained_at are preserved rather than silently cleared
+        -- mirrors _create_lock_yaml_only()'s own defensive preservation. In
+        practice this lock should never be retained while something is still
+        successfully heartbeating it (mark_lock_failed() is for a run that has
+        already ended), but this stays defensive against that edge case rather
+        than relying on a single layer of protection.
+
+        owner_process is preserved, not re-stamped: a heartbeat normally runs
+        in the holding process, so re-stamping would be a no-op -- but a touch
+        that ever ran anywhere else must not silently re-attribute the lock and
+        make a live foreign holder look like this process's own dead
+        predecessor to recover_orphaned_resource_locks().
+        """
+        return PipelineLock(
+            project=project,
+            board=board,
+            locked_by_issue=issue_number,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked',
+            retained_reason=current.retained_reason,
+            retained_at=current.retained_at,
+            owner_process=current.owner_process,
+        )
+
+    def _touch_lock_redis(
+        self, project: str, board: str, issue_number: int, fallback_lock: PipelineLock,
+        allow_reestablish: bool
+    ) -> Tuple[TouchResult, bool]:
+        """
+        touch_lock()'s Redis leg, as a WATCH/MULTI compare-and-set (#153 WI-8).
+
+        Reads the lock key and writes the refreshed record inside one
+        transaction watching that key, so an acquire that lands between the two
+        aborts and retries this whole callable (redis-py's Redis.transaction()
+        loops on WatchError) -- at which point the re-read sees the new holder
+        and returns NOT_HELD instead of overwriting it. That is the entire
+        point: the previous blind hset could land a very late heartbeat on top
+        of a second caller's freshly-won record.
+
+        WATCH does NOT make an ABSENT key safe to re-create, which an earlier
+        version of this leg claimed: it aborts on a concurrent create, but the
+        absent branch is reached precisely by a concurrent DELETE, and the
+        WatchError retry then re-reads the same absent key and writes anyway.
+        So re-establishing is gated on `allow_reestablish` instead, and
+        touch_lock() only passes True once a guarded read of the durable YAML
+        record -- taken after this leg observed the key missing -- has
+        confirmed the hold is still this holder's. Whether the key was there is
+        returned alongside the result so that caller can tell "confirmed
+        somebody else's" from "gone".
+
+        Returns (result, key_was_present): REFRESHED (written), NOT_HELD
+        (confirmed somebody else's, or absent with re-establishment not
+        authorized), or REFRESH_FAILED (the transaction itself raised -- a
+        connection drop, or a write refused by OOM/MISCONF/READONLY, both of
+        which surface out of the transaction's own execute()).
+        """
+        lock_key = self._get_lock_key(project, board)
+
+        def touch_lock_tx(pipe):
+            lock_data = pipe.hgetall(lock_key)
+            if not lock_data:
+                if not allow_reestablish:
+                    return "absent"
+                current = fallback_lock
+            else:
+                if lock_data.get('lock_status') != 'locked':
+                    return "not_held"
+                if int(lock_data.get('locked_by_issue', 0)) != issue_number:
+                    return "not_held"
+                current = self._lock_from_redis_data(lock_data)
+
+            refreshed = self._refreshed_from(project, board, issue_number, current)
+            pipe.multi()
+            pipe.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
+            pipe.expire(lock_key, LOCK_TTL_SECONDS)
+            return "refreshed" if lock_data else "reestablished"
+
+        try:
+            result = self.redis_client.transaction(
+                touch_lock_tx, lock_key, value_from_callable=True
+            )
+        except Exception as e:
+            logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+            return TouchResult.REFRESH_FAILED, False
+
+        if result == "not_held":
+            logger.warning(
+                f"touch_lock: {project}/{board} is no longer held by issue "
+                f"#{issue_number} in Redis -- refusing to overwrite the current "
+                f"holder's record with this refresh"
+            )
+            return TouchResult.NOT_HELD, True
+        if result == "absent":
+            logger.debug(
+                f"touch_lock: the Redis lock key for {project}/{board} is gone -- "
+                f"not re-creating it for issue #{issue_number} from this refresh's "
+                f"own opening read"
+            )
+            return TouchResult.NOT_HELD, False
+        return TouchResult.REFRESHED, result == "refreshed"
+
+    def _touch_lock_yaml_unguarded(
+        self, project: str, board: str, issue_number: int, fallback_lock: PipelineLock,
+        allow_reestablish: bool
+    ) -> Tuple[TouchResult, Optional[PipelineLock]]:
+        """
+        touch_lock()'s YAML leg (#153 WI-8). MUST only be called with
+        touch_lock()'s '<state>.yaml.acquire.lock' guard held -- that is what
+        serializes it against try_acquire_lock()'s YAML-fallback grant and
+        against release_lock(), the only other two operations that decide who
+        holds this lock.
+
+        Everything here is a read-modify-write: read the current record, verify
+        it is still ours, rewrite it. It runs entirely inside ONE held
+        '<state>.yaml.lock' (found in the WI-8 review round -- the read and the
+        write used to take and release that lock separately, and release_lock()
+        takes only that inner lock, so a release landing in the gap was
+        re-created by the write regardless of what the read had seen).
+        _read_yaml_lock_only_unlocked()/_save_lock_to_yaml_unlocked() exist for
+        exactly this: the locking variants cannot be nested inside their own
+        lock, because fcntl.flock() conflicts between two descriptors of the
+        same file even within one process (utils.file_lock raises
+        ReentrantFileLockError rather than hanging on it).
+
+        The two lock files nest, and always in this order: '.acquire.lock'
+        OUTER, '<state>.yaml.lock' INNER. That is the same order
+        try_acquire_lock()'s guarded path and release_lock() establish, and
+        nothing in this class ever takes '.acquire.lock' while holding
+        '<state>.yaml.lock', so there is no ordering cycle to deadlock on.
+
+        Returns (result, written_record): REFRESHED (written, and the record
+        written is returned so the Redis leg can re-establish a lapsed key from
+        exactly the same content), NOT_HELD (the YAML record names a different
+        holder, or is missing/unlocked with re-establishment not authorized),
+        or REFRESH_FAILED (the inner lock could not be taken, the read failed,
+        or the write failed).
+        """
+        from utils.file_lock import file_lock
+
+        state_file = self._get_state_file(project, board)
+        state_lock = state_file.with_suffix(state_file.suffix + '.lock')
+        try:
+            with file_lock(
+                state_lock, timeout=STATE_LOCK_TIMEOUT_SECONDS, enforce_timeout=True
+            ):
+                existing, read_ok = self._read_yaml_lock_only_unlocked(project, board)
+                if not read_ok:
+                    return TouchResult.REFRESH_FAILED, None
+                if existing is not None and existing.locked_by_issue != issue_number:
+                    logger.warning(
+                        f"touch_lock: the YAML lock record for {project}/{board} names "
+                        f"issue #{existing.locked_by_issue}, not #{issue_number} -- "
+                        f"refusing to overwrite it with this refresh"
+                    )
+                    return TouchResult.NOT_HELD, None
+                if existing is None and not allow_reestablish:
+                    # Missing or unlocked, with nothing in Redis contradicting
+                    # it: that is what release_lock() leaves behind, and
+                    # re-creating it from fallback_lock -- a snapshot read
+                    # taken before this call's guard was even acquired -- would
+                    # silently undo it and wedge the board behind an issue
+                    # whose run has already ended.
+                    logger.warning(
+                        f"touch_lock: the YAML lock record for {project}/{board} is "
+                        f"missing or unlocked and Redis does not name issue "
+                        f"#{issue_number} either -- treating this as a released lock "
+                        f"rather than re-creating it from this refresh's opening read"
+                    )
+                    return TouchResult.NOT_HELD, None
+                # existing is None here only when Redis still positively names
+                # this holder, i.e. the durable copy is the one that is missing
+                # (a YAML write that failed at acquisition time). Re-create it
+                # from fallback_lock.
+                current = existing if existing is not None else fallback_lock
+                refreshed = self._refreshed_from(project, board, issue_number, current)
+                if not self._save_lock_to_yaml_unlocked(refreshed):
+                    return TouchResult.REFRESH_FAILED, None
+                return TouchResult.REFRESHED, refreshed
+        except TimeoutError as e:
+            logger.warning(
+                f"touch_lock: could not take the YAML state lock for {project}/{board} "
+                f"(issue #{issue_number}): {e} -- reporting the YAML leg as failed rather "
+                f"than performing a read and a write that a release could land between"
+            )
+            return TouchResult.REFRESH_FAILED, None
+        except OSError as e:
+            logger.warning(
+                f"touch_lock: could not take the YAML state lock for {project}/{board} "
+                f"(issue #{issue_number}): {e}"
+            )
+            return TouchResult.REFRESH_FAILED, None
+
+    def release_lock(
+        self, project: str, board: str, issue_number: int, force: bool = False
+    ) -> ReleaseResult:
         """
         Release pipeline lock safely.
 
@@ -875,6 +1438,34 @@ class PipelineLockManager:
         be determined (both Redis and YAML reads fail) and force is not set,
         refuses rather than risk releasing a lock that might be retained.
 
+        Runs under the '<state>.yaml.acquire.lock' guard for the whole of its
+        two-store delete (found in the WI-8 review round; see
+        _get_acquire_guard_file). Deleting the Redis key and unlinking the
+        state file are two separate writes, and touch_lock() reads both stores
+        and writes both stores -- so with no shared guard, a heartbeat that
+        overlapped a release re-created the lock from a snapshot that predated
+        it, leaving a durable 'locked' record for an issue whose run had ended
+        and a reset 4h staleness clock. Nothing reclaims that at runtime. The
+        guard makes the release atomic with respect to both touch_lock() and
+        try_acquire_lock()'s YAML-fallback grant.
+
+        Unlike try_acquire_lock()'s guarded path, a guard timeout here is NOT
+        simply refused (found in the WI-8 review round). An acquire that is
+        refused is retried by its own poll loop within seconds; a release has
+        already been authorized by its caller and, if dropped, leaks the lock
+        until the LOCK_TTL_SECONDS Redis TTL or the 4-hour staleness heuristic
+        -- blocking every dispatch for that (project, board) meanwhile, and
+        with no automatic re-attempt at the site that matters most
+        (pipeline_progression._release_lock_and_process_next fires only on the
+        move INTO an exit column, so it never re-fires). So the guard gets a
+        second, much longer bounded attempt (RELEASE_GUARD_RETRY_TIMEOUT_SECONDS),
+        and only a release that exhausts that too is reported -- distinctly, as
+        SERIALIZATION_FAILED rather than as a refusal. The same distinction is
+        made for the INNER '<state>.yaml.lock' this method's body takes twice
+        (see _release_lock_unguarded and LockStateSerializationError): a
+        release that cannot be serialized there is SERIALIZATION_FAILED too,
+        not the "state unknown, refusing" that a failed read means.
+
         Args:
             project: Project name
             board: Board name
@@ -884,11 +1475,126 @@ class PipelineLockManager:
                 should ever pass this.
 
         Returns:
-            True if lock was released, False if not held by this issue, or if
-            it's retained/unknown and force was not set.
+            ReleaseResult.RELEASED if the lock was released;
+            ReleaseResult.NOT_RELEASED if the release was considered and
+            refused (not held by this issue, retained/unknown without force, or
+            a store's delete failed); ReleaseResult.SERIALIZATION_FAILED if the
+            acquire guard could not be taken at all, in which case NOTHING was
+            attempted and the lock is still held exactly as it was. Only
+            RELEASED is truthy (see ReleaseResult), so callers written against
+            the original bool return keep their original meaning, while the
+            three that report a failed release to operators can stop
+            attributing a contention timeout to a retained failed run.
+        """
+        from utils.file_lock import file_lock
+
+        guard_file = self._get_acquire_guard_file(project, board)
+        try:
+            try:
+                with file_lock(
+                    guard_file, timeout=RELEASE_GUARD_TIMEOUT_SECONDS, enforce_timeout=True
+                ):
+                    return self._release_lock_to_result(project, board, issue_number, force)
+            except TimeoutError as first_timeout:
+                # Not fatal on its own -- see the docstring. The usual cause is
+                # try_acquire_lock()'s YAML-fallback path, which takes this same
+                # guard and is reached exactly when Redis is unavailable, so
+                # every attempt holds it for several seconds of socket timeouts
+                # while its waiters re-poll faster than it lets go.
+                logger.warning(
+                    f"release_lock: the acquire guard for {project}/{board} (issue "
+                    f"#{issue_number}) was still contended after "
+                    f"{RELEASE_GUARD_TIMEOUT_SECONDS}s: "
+                    f"{first_timeout} -- retrying for up to "
+                    f"{RELEASE_GUARD_RETRY_TIMEOUT_SECONDS}s rather than abandoning "
+                    f"an authorized release"
+                )
+                with file_lock(
+                    guard_file, timeout=RELEASE_GUARD_RETRY_TIMEOUT_SECONDS, enforce_timeout=True
+                ):
+                    return self._release_lock_to_result(project, board, issue_number, force)
+        except TimeoutError as e:
+            # Still not serialized. An unguarded release is exactly the
+            # interleaving this guard exists to remove, so it is not performed
+            # -- but this is reported as SERIALIZATION_FAILED, NOT as a
+            # refusal: nothing was attempted, the lock is unchanged, and the
+            # release is still outstanding.
+            logger.error(
+                f"release_lock: could not serialize the release of {project}/{board} "
+                f"(issue #{issue_number}) within {RELEASE_GUARD_RETRY_TIMEOUT_SECONDS}s: "
+                f"{e} -- the lock is UNCHANGED and still held; this is contention on "
+                f"'{guard_file.name}', not a retained/failed lock"
+            )
+            return ReleaseResult.SERIALIZATION_FAILED
+        except OSError as e:
+            logger.error(
+                f"release_lock: could not take the release guard for {project}/{board} "
+                f"(issue #{issue_number}): {e} -- the lock is UNCHANGED and still held; "
+                f"this is a guard-file failure, not a retained/failed lock"
+            )
+            return ReleaseResult.SERIALIZATION_FAILED
+
+    def _release_lock_to_result(
+        self, project: str, board: str, issue_number: int, force: bool
+    ) -> ReleaseResult:
+        """
+        _release_lock_unguarded()'s bool, mapped onto release_lock()'s
+        three-state return. MUST only be called with the acquire guard held.
+
+        Its False covers only outcomes the release actually CONSIDERED (not
+        held by this issue, retained without force, unknown state, a store's
+        delete failing), all of which are NOT_RELEASED. The release's own
+        contention on the inner '<state>.yaml.lock' arrives as
+        LockStateSerializationError instead and joins the guard timeout in
+        SERIALIZATION_FAILED -- see that exception for why it must not be
+        reported as one of the considered outcomes.
+        """
+        try:
+            released = self._release_lock_unguarded(project, board, issue_number, force=force)
+        except LockStateSerializationError as e:
+            logger.error(
+                f"release_lock: {e} -- the release did NOT complete and is still "
+                f"outstanding; this is contention on '{self._get_state_file(project, board).name}"
+                f".lock', not a retained/failed lock"
+            )
+            return ReleaseResult.SERIALIZATION_FAILED
+        return ReleaseResult.RELEASED if released else ReleaseResult.NOT_RELEASED
+
+    def _release_lock_unguarded(
+        self, project: str, board: str, issue_number: int, force: bool = False
+    ) -> bool:
+        """
+        release_lock()'s body. MUST only be called with that method's
+        '<state>.yaml.acquire.lock' guard held -- see its docstring for why.
+
+        Called directly by _try_acquire_lock_yaml_unguarded()'s stale-lock
+        recovery, which already runs inside that same guard (utils.file_lock
+        refuses a re-entrant acquire rather than hanging on it).
+
+        Raises:
+            LockStateSerializationError: the inner '<state>.yaml.lock' could
+                not be taken within STATE_LOCK_TIMEOUT_SECONDS, for either the
+                fail-closed state read or the YAML delete. Deliberately not
+                folded into the False return -- see that exception. Both
+                callers handle it: _release_lock_to_result() maps it to
+                ReleaseResult.SERIALIZATION_FAILED, and the stale-lock recovery
+                refuses the acquisition it was clearing the way for.
         """
         if not force:
-            existing_lock, reads_healthy = self.get_lock_fail_closed(project, board)
+            existing_lock, reads_healthy, serialization_failed = self._get_lock_fail_closed_detail(
+                project, board
+            )
+            if serialization_failed:
+                # NOT the fail-closed refusal below (found in the WI-8 review
+                # round): a read that could not be serialized established
+                # nothing about this lock, so reporting it as "state unknown,
+                # refusing" hands the caller a durable-sounding fact that was
+                # never determined. See LockStateSerializationError.
+                raise LockStateSerializationError(
+                    f"could not serialize the state read for {project}/{board} (issue "
+                    f"#{issue_number}) against a concurrent holder of the YAML state "
+                    f"lock within {STATE_LOCK_TIMEOUT_SECONDS}s"
+                )
             if not reads_healthy:
                 logger.error(
                     f"release_lock: could not determine lock state for "
@@ -1002,9 +1708,15 @@ class PipelineLockManager:
         state_file = self._get_state_file(project, board)
         if state_file.exists():
             try:
-                # Use file lock when deleting to prevent race with writers
+                # Use file lock when deleting to prevent race with writers.
+                # Bounded like every other acquisition of this file (found in
+                # the WI-8 review round -- this one was still a blocking
+                # acquire, which left the enclosing '.acquire.lock' guard's
+                # hold unbounded no matter what the reads above did).
                 lock_file = state_file.with_suffix(state_file.suffix + '.lock')
-                with file_lock(lock_file):
+                with file_lock(
+                    lock_file, timeout=STATE_LOCK_TIMEOUT_SECONDS, enforce_timeout=True
+                ):
                     if state_file.exists():  # Check again inside lock
                         # Double check ownership in YAML unless Redis already gave us
                         # a definitive, trustworthy answer. Gated on
@@ -1080,6 +1792,17 @@ class PipelineLockManager:
                         else:
                             return False
 
+            except TimeoutError as e:
+                # Checked before the generic handler below -- TimeoutError is an
+                # OSError. The deletion was neither attempted nor verified, and
+                # the reason is contention rather than an unreadable/undeletable
+                # record, so this is a serialization failure the caller can
+                # retry rather than the considered refusal a bare False means.
+                raise LockStateSerializationError(
+                    f"could not serialize the YAML delete for {project}/{board} (issue "
+                    f"#{issue_number}) against a concurrent holder of the YAML state "
+                    f"lock within {STATE_LOCK_TIMEOUT_SECONDS}s: {e}"
+                )
             except Exception as e:
                 # Any failure here (e.g. file_lock acquisition) means we could not
                 # even attempt/verify the deletion above — fail closed rather than
@@ -1310,9 +2033,30 @@ class PipelineLockManager:
 
         state_file = self._get_state_file(lock.project, lock.board)
         try:
-            with safe_yaml_write(state_file):
-                with open(state_file, 'w') as f:
-                    yaml.dump(asdict(lock), f, default_flow_style=False, sort_keys=False)
+            # Bounded like every other acquisition of '<state>.yaml.lock' made
+            # here (found in the WI-8 review round -- this one was still a
+            # blocking acquire, and it runs inside the '.acquire.lock' guard via
+            # _create_lock(), so it could park that guard's hold indefinitely).
+            # A timeout is just a write failure, which every caller of this
+            # method already models.
+            with safe_yaml_write(
+                state_file, timeout=STATE_LOCK_TIMEOUT_SECONDS, enforce_timeout=True
+            ):
+                return self._save_lock_to_yaml_unlocked(lock)
+        except Exception as e:
+            logger.error(f"Failed to save lock to YAML: {e}")
+            return False
+
+    def _save_lock_to_yaml_unlocked(self, lock: PipelineLock) -> bool:
+        """
+        _save_lock_to_yaml() without taking '<state>.yaml.lock'. MUST only be
+        called with that lock already held -- see
+        _read_yaml_lock_only_unlocked() for why the pair exists.
+        """
+        state_file = self._get_state_file(lock.project, lock.board)
+        try:
+            with open(state_file, 'w') as f:
+                yaml.dump(asdict(lock), f, default_flow_style=False, sort_keys=False)
             logger.debug(f"Saved lock to YAML: {state_file}")
             return True
         except Exception as e:
