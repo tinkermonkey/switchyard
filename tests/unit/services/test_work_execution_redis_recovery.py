@@ -755,20 +755,27 @@ class TestDevEnvironmentSetupContext:
         # queue_dev_environment_setup() reads the status and its timestamp as one
         # snapshot, inside this project's dev_container_build lock (#171). Both
         # are stubbed here so this stays a test of the task context it builds.
+        # The stub MUST be of dev_container_build_lock_attempt_async, the symbol
+        # that function actually calls, and MUST yield its (acquired, reason)
+        # 2-tuple: an earlier version patched ..._if_free_async with a bare True
+        # and was therefore inert, leaving the test to do live acquire/release
+        # I/O against the container's Redis and to invert silently the moment
+        # 'myproject' happened to be locked (#171 review).
         @asynccontextmanager
         async def _free(project, issue_number=None, facade=None):
-            yield True
+            yield (True, None)
 
         mock_queue_instance = MagicMock()
 
         with patch('task_queue.task_manager.TaskQueue', return_value=mock_queue_instance), \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _free), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_attempt_async', _free), \
              patch('services.dev_container_state.dev_container_state') as mock_state:
 
             mock_state.get_status.return_value = DevContainerStatus.UNVERIFIED
             mock_state.get_status_and_updated_at.return_value = (
                 DevContainerStatus.UNVERIFIED, None
             )
+            mock_state.set_status.return_value = True
 
             import asyncio
             from agents.orchestrator_integration import queue_dev_environment_setup

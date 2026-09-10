@@ -401,3 +401,50 @@ class TestStatusAndTimestampComeFromOneSnapshot:
 
         assert status == DevContainerStatus.BLOCKED
         assert updated_at is None
+
+
+class TestSetStatusReportsWhetherTheWriteLanded:
+    """#171 review. set_status() computes _merge_state()'s bool and threw it
+    away, so a write that never reached disk -- the file lock timing out at
+    STATE_LOCK_TIMEOUT_SECONDS against the verifier's own OS process, an
+    unwritable state dir -- was indistinguishable from one that did.
+
+    queue_dev_environment_setup() depends on that distinction: its IN_PROGRESS
+    mark is the ONLY record that a setup is coming, and enqueuing an hour-scale
+    rebuild the state file does not record is what lets the next board poll read
+    the unchanged status and queue a second one."""
+
+    def test_a_landed_write_returns_true(self, manager):
+        assert manager.set_status('proj', DevContainerStatus.IN_PROGRESS) is True
+        assert manager.get_status('proj') == DevContainerStatus.IN_PROGRESS
+
+    def test_a_failed_write_returns_false(self, manager, monkeypatch):
+        def _explode(*args, **kwargs):
+            raise OSError("state dir is read-only")
+
+        monkeypatch.setattr(dev_container_state_module, 'open', _explode, raising=False)
+        assert manager.set_status('proj', DevContainerStatus.VERIFIED) is False
+
+    def test_a_lock_acquire_timeout_returns_false(self, manager):
+        """The realistic failure: another OS process holds the state file's
+        cross-process lock for longer than STATE_LOCK_TIMEOUT_SECONDS."""
+        state_file = manager.get_state_file('proj')
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = manager._state_lock_file(state_file)
+
+        with file_lock(lock_path, timeout=5, enforce_timeout=True):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(dev_container_state_module, 'STATE_LOCK_TIMEOUT_SECONDS', 0.1)
+                assert manager.set_status('proj', DevContainerStatus.VERIFIED) is False
+
+        assert manager.get_status('proj') == DevContainerStatus.UNVERIFIED
+
+    def test_a_refused_precondition_returns_false(self, manager):
+        """A compare-and-set whose `expect` no longer matches is also "the value
+        you decided on is not what is on disk", which is the only thing a caller
+        acts on."""
+        manager.set_status('proj', DevContainerStatus.VERIFIED)
+        assert manager.set_status(
+            'proj', DevContainerStatus.UNVERIFIED, expect={'status': 'in_progress'}
+        ) is False
+        assert manager.get_status('proj') == DevContainerStatus.VERIFIED

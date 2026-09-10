@@ -2346,8 +2346,27 @@ class DockerAgentRunner:
                         f"end_turn; killing stalled background processes..."
                     )
                     try:
-                        subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
-                        _orchestrator_killed = True
+                        kill_result = subprocess.run(
+                            ['docker', 'kill', container_name], capture_output=True, timeout=30
+                        )
+                        # Only a kill that actually landed makes this container's exit
+                        # OURS. subprocess.run without check=True does not raise on a
+                        # non-zero return, so this flag used to be set even when the
+                        # kill did nothing ("No such container", "is not running", a
+                        # transient daemon error) -- and since _raise_for_failed_exit_
+                        # code() now reads it to decide RETRYABILITY, a kill that lost
+                        # the race to the OOM killer would have relabelled that OOM as
+                        # "nothing external terminated it" and sent the same workload
+                        # back for two more retries (#160 review).
+                        if kill_result.returncode == 0:
+                            _orchestrator_killed = True
+                        else:
+                            logger.warning(
+                                f"docker kill returned {kill_result.returncode} for "
+                                f"{container_name}: "
+                                f"{kill_result.stderr.decode(errors='replace').strip()!r} — "
+                                f"not attributing the container's exit to the orchestrator"
+                            )
                     except Exception as kill_err:
                         logger.warning(f"docker kill failed for {container_name}: {kill_err}")
                     if not container_exited.wait(timeout=10):
@@ -2901,8 +2920,16 @@ class DockerAgentRunner:
         "reproduces on every run" class #160's rationale is about: a re-launched
         container very plausibly succeeds. So it raises a plain, retryable
         Exception instead, and says why.
+
+        SCOPED to 137/143, because that is the only claim the flag supports: a
+        SIGKILL this process sent. Ungated it also spoke for exit codes the
+        orchestrator's kill cannot produce -- the container had already exited
+        on its own with some other code, the kill merely arrived afterwards --
+        and reported them with the grace-period narrative and the wrong
+        retryability. See the kill site for the other half of this: the flag is
+        set only when `docker kill` actually returned 0 (#160 review).
         """
-        if orchestrator_killed:
+        if orchestrator_killed and exit_code in (137, 143):
             raise Exception(
                 f"Agent execution failed (exit_code={exit_code}): the orchestrator killed "
                 f"this container after end_turn because background processes kept it "

@@ -2320,6 +2320,17 @@ class ProjectWorkspaceManager:
         best-effort: its worktrees stay on disk for the next startup's sweep, or
         get adopted and reused by get_or_create_epic_worktree() before then.
 
+        It budgets WAITING, not elapsed time. Only the span between asking for a
+        project's project_checkout lock and getting it is charged; the sweep's
+        own git work inside the hold is not. The distinction is the difference
+        between the budget working and the budget defeating itself: a deadline
+        set once before the loop is consumed by successful cleanup -- one crashed
+        project's dozen stale worktrees is easily 300s of rev-parse/rev-list/push/
+        `worktree remove` subprocess timeouts -- and every project after it would
+        get a zero timeout, i.e. exactly the single non-blocking attempt this
+        wait replaced, with no contention having occurred anywhere (#169
+        second-pass review).
+
         The in-flight/liveness/corruption checks below all STAY. They answer a
         different question (is this particular worktree still someone's working
         directory?) than the lock does (is anything else writing this base
@@ -2347,7 +2358,16 @@ class ProjectWorkspaceManager:
             # container regardless of how many worktrees are being considered.
             running_mount_sources = self._get_running_container_mount_sources()
 
-            sweep_deadline = time.monotonic() + PRUNE_SWEEP_LOCK_BUDGET_SECONDS
+            # WAITING time only, not elapsed time -- see the docstring. Deliberately
+            # not a `sweep_deadline = now + BUDGET` computed once: that charges the
+            # budget for every second the sweep spends doing its own git work, so a
+            # first project with a dozen stale worktrees (each costing a rev-parse,
+            # a rev-list, a push and a `worktree remove`, all with multi-second
+            # subprocess timeouts) spends the whole 300s on SUCCESSFUL cleanup and
+            # leaves every later project at a zero timeout -- the single
+            # non-blocking attempt review of #169 rejected, reached with no
+            # contention having occurred at all (#169 second-pass review).
+            lock_wait_spent = 0.0
 
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
@@ -2362,15 +2382,29 @@ class ProjectWorkspaceManager:
                     0.0,
                     min(
                         PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
-                        sweep_deadline - time.monotonic(),
+                        PRUNE_SWEEP_LOCK_BUDGET_SECONDS - lock_wait_spent,
                     ),
                 )
+                budget_already_spent = timeout_seconds <= 0.0
+                wait_started = time.monotonic()
+                acquired_at = None
                 try:
                     with project_checkout_lock_sync(
                         project_staging.name, None, timeout_seconds=timeout_seconds
                     ):
+                        # First statement in the block: everything before it was
+                        # the acquire wait, everything after it is this project's
+                        # own work and must not be charged to the shared budget.
+                        acquired_at = time.monotonic()
+                        lock_wait_spent += acquired_at - wait_started
                         self._prune_project_staging(project_staging, running_mount_sources)
                 except Exception as e:
+                    if acquired_at is None:
+                        # Never got in, so the whole elapsed span was spent waiting.
+                        # Capped at timeout_seconds so a slow poll cannot overdraw.
+                        lock_wait_spent += min(
+                            time.monotonic() - wait_started, timeout_seconds
+                        )
                     # Per project, not per sweep: one held base clone must not cost
                     # every other project its cleanup (the reason the lock is placed
                     # here at all). A lock timeout is the expected shape and gets a
@@ -2378,10 +2412,24 @@ class ProjectWorkspaceManager:
                     # traceback -- but neither propagates, because this method runs
                     # unguarded at every startup.
                     if is_lock_timeout_error(e):
+                        # Two different diagnoses, and an operator cannot act on the
+                        # wrong one: "held for the whole 0s budget" reads as contention
+                        # against a real wait when in fact no wait was attempted.
+                        if budget_already_spent:
+                            why = (
+                                f"the sweep's shared {PRUNE_SWEEP_LOCK_BUDGET_SECONDS:.0f}s "
+                                f"lock budget was already spent waiting on earlier "
+                                f"projects, so this one got a single non-blocking "
+                                f"attempt and its project_checkout lock was held"
+                            )
+                        else:
+                            why = (
+                                f"its project_checkout lock stayed held for the whole "
+                                f"{timeout_seconds:.0f}s this project was allowed to wait"
+                            )
                         logger.warning(
                             f"Skipping the epic-worktree prune sweep for "
-                            f"{project_staging.name} -- its project_checkout lock stayed "
-                            f"held for the whole {timeout_seconds:.0f}s budget, and every "
+                            f"{project_staging.name} -- {why}, and every "
                             f"removal in it rewrites that base clone's own .git "
                             f"({describe_lock_timeout(e)}). Its stale worktrees stay on "
                             f"disk; the next startup's sweep (or "

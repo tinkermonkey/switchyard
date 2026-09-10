@@ -133,7 +133,13 @@ class TestQueueDevEnvironmentSetup:
 
             # Track call order
             call_order = []
-            mock_state.set_status.side_effect = lambda *a, **kw: call_order.append('set_status')
+            # Returns True: set_status()'s bool is the "the mark reached disk"
+            # signal queue_dev_environment_setup() now refuses to enqueue
+            # without (#171 review), so a recorder that returned None would
+            # be stubbing a failed write.
+            mock_state.set_status.side_effect = (
+                lambda *a, **kw: (call_order.append('set_status'), True)[1]
+            )
             mock_queue_instance.enqueue.side_effect = lambda *a, **kw: call_order.append('enqueue')
 
             _status_snapshot_from_stubs(mock_state)
@@ -591,7 +597,9 @@ class TestTheDuplicateGuardIsAtomic:
                 lambda project: (events.append('status_read'),
                                  (DevContainerStatus.UNVERIFIED, None))[1]
             )
-            mock_state.set_status.side_effect = lambda *a, **kw: events.append('set_status')
+            mock_state.set_status.side_effect = (
+                lambda *a, **kw: (events.append('set_status'), True)[1]
+            )
             mock_queue_instance = Mock()
             mock_queue_instance.enqueue.side_effect = lambda *a, **kw: events.append('enqueue')
             MockTaskQueue.return_value = mock_queue_instance
@@ -894,3 +902,171 @@ class TestChangesNeededHasAStalenessEscape:
         )
 
         assert STALE_CHANGES_NEEDED_MINUTES >= STALE_IN_PROGRESS_MINUTES
+
+
+class TestTheOutcomeIsReportedToCallers:
+    """#169 review. queue_dev_environment_setup() has four ways to return
+    without enqueuing anything, and it used to report all of them exactly as it
+    reports success: by returning None. Neither caller could tell, and both
+    assumed the good one -- the dispatch path emitted "setup has been queued ...
+    auto_queued: True" on every pass, and repair_cycle's env-rebuild sub-cycle
+    followed the call with an unbounded poll for a terminal status nobody was
+    going to write."""
+
+    @pytest.mark.asyncio
+    async def test_a_successful_queue_says_queued(self, mock_logger):
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_state.set_status.return_value = True
+            MockTaskQueue.return_value = Mock()
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.QUEUED
+        assert outcome.queued is True
+
+    @pytest.mark.asyncio
+    async def test_a_contended_acquire_says_deferred_not_queued(self, mock_logger):
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            MockTaskQueue.return_value = Mock()
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+        assert outcome.queued is False
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_in_progress_says_deferred_not_queued(self, mock_logger):
+        from datetime import datetime
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.IN_PROGRESS, datetime.now()
+            )
+            MockTaskQueue.return_value = Mock()
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_IN_PROGRESS
+        assert outcome.queued is False
+
+    @pytest.mark.asyncio
+    async def test_a_live_run_found_behind_a_stale_mark_says_deferred(self, mock_logger):
+        from datetime import datetime, timedelta
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            STALE_IN_PROGRESS_MINUTES,
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('agents.orchestrator_integration._dev_setup_in_flight_reason',
+                   return_value="a dev_environment_setup task (abc) is still queued"), \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.IN_PROGRESS,
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1),
+            )
+            MockTaskQueue.return_value = Mock()
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_RUN_IN_FLIGHT
+        assert outcome.queued is False
+
+
+class TestAFailedInProgressMarkBlocksTheQueue:
+    """THE #171-review regression. set_status() swallows its own write errors --
+    _merge_state()'s file_lock acquire timing out at STATE_LOCK_TIMEOUT_SECONDS
+    against the verifier's in-session write or scripts/rebuild_project_images.py
+    becomes an ERROR log and a False -- and this function used to ignore the
+    result and enqueue anyway.
+
+    That is the duplicate hour-scale rebuild this whole critical section exists
+    to prevent, reached from a third direction: the state file still says
+    UNVERIFIED, so the next 30s board poll re-decides needs_dev_setup, takes the
+    now-free build lock, reads UNVERIFIED (so the stale/in-flight probes never
+    run) and queues a SECOND setup."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_mark_queues_nothing(self, mock_logger):
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_state.set_status.return_value = False
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        mock_queue_instance.enqueue.assert_not_called()
+        assert outcome is DevSetupQueueOutcome.FAILED_STATUS_WRITE
+        assert outcome.queued is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_mark_does_not_claim_it_wrote_one(self, mock_logger):
+        """The "Set dev container status to IN_PROGRESS" line was unconditional,
+        so a swallowed write produced a flatly false log statement -- the only
+        operator-facing record of a mark that never landed."""
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import queue_dev_environment_setup
+
+        with _build_lock(True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_state.set_status.return_value = False
+            MockTaskQueue.return_value = Mock()
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        info_lines = " ".join(str(c) for c in mock_logger.info.call_args_list)
+        assert "Set dev container status to IN_PROGRESS" not in info_lines
+        assert mock_logger.error.called

@@ -15,11 +15,11 @@ add/commit/push against that same .git.
 Epic-worktree TEARDOWN -- cleanup_epic_worktree() and prune_epic_worktrees(),
 both of which run `git -C <base clone> worktree remove --force` and `git
 worktree prune` against that same .git/worktrees/ -- was the symmetric gap, and
-is covered here too since #169. The two teardown paths deliberately take the
-lock differently: cleanup_epic_worktree() gets the same bounded wait the
-creation path uses, while prune_epic_worktrees()'s startup sweep gets a single
-NON-BLOCKING attempt per project, because main.py calls it on the event-loop
-thread where a poll could never succeed.
+is covered here too since #169. Both teardown paths take the same bounded wait
+the creation path uses; the sweep's is budgeted per project out of a ceiling
+shared across the whole sweep, and main.py hops the sweep off the event loop so
+the wait neither freezes startup nor starves the in-process holder it is waiting
+behind. That budget measures WAITING only -- see the two tests named for it.
 
 Covers:
 - the lock is acquired BEFORE any git command touches the base clone and released
@@ -37,8 +37,9 @@ Covers:
   project's) resolution;
 - teardown (#169): cleanup_epic_worktree() brackets its push/remove/prune in the
   lock and fails loud rather than proceeding unlocked when it can't get it; the
-  prune sweep takes it per PROJECT, never waits, skips only the busy project,
-  and still covers the trailing `worktree prune` and staging-dir removal.
+  prune sweep takes it per PROJECT with a bounded wait, charges only that wait
+  to the sweep's shared budget, skips only the busy project, and still covers
+  the trailing `worktree prune` and staging-dir removal.
 
 All git operations are mocked (subprocess.run) -- no real git commands run.
 """
@@ -1232,6 +1233,127 @@ class TestPruneTakesTheCheckoutLockPerProject:
             manager.prune_epic_worktrees()
 
         assert [c['timeout_seconds'] for c in calls] == [0.0, 0.0]
+
+    def test_the_budget_is_charged_for_waiting_not_for_the_sweeps_own_work(
+        self, manager, tmp_path
+    ):
+        """THE #169-second-pass regression. The budget was a `sweep_deadline =
+        now + BUDGET` computed once, so every second the sweep spent doing its
+        OWN git work was charged to it. One crashed project's worth of stale
+        worktrees -- each a rev-parse (10s cap), a rev-list (10s), a push (30s)
+        and a `worktree remove` (15s) against a slow remote -- spends the whole
+        300s on SUCCESSFUL cleanup, and every project after it gets timeout 0.0:
+        the single non-blocking attempt review of #169 rejected, reached with no
+        contention having occurred anywhere.
+
+        Here the first project burns 400s of pure work with the lock granted
+        instantly. The projects behind it must still get their full allowance."""
+        for project in ('a-project', 'b-project', 'c-project'):
+            _make_base_clone(tmp_path, project)
+            (tmp_path / '.orchestrator' / 'worktrees' / project / '721' / '.git').mkdir(parents=True)
+
+        clock = {'now': 1000.0}
+
+        def _slow_prune(self_inner, project_staging, running_mount_sources):
+            clock['now'] += 400.0
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_workspace.time.monotonic', lambda: clock['now']), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'a-project', 'b-project', 'c-project'}, calls)), \
+             patch.object(ProjectWorkspaceManager, '_prune_project_staging', _slow_prune), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['timeout_seconds'] for c in calls] == [
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS
+        ] * 3
+
+    def test_waiting_does_spend_the_budget_and_the_ceiling_still_bites(
+        self, manager, tmp_path
+    ):
+        """The other half: real WAITING is still charged, and the shared ceiling
+        still stops N projects becoming N x the per-project timeout of blocked
+        startup. Two contended projects wait out their full allowance each, so
+        the third gets only what is left of the sweep's budget."""
+        for project in ('a-project', 'b-project', 'c-project'):
+            _make_base_clone(tmp_path, project)
+            (tmp_path / '.orchestrator' / 'worktrees' / project / '722' / '.git').mkdir(parents=True)
+
+        from contextlib import contextmanager as _cm
+
+        clock = {'now': 1000.0}
+        calls = []
+
+        @_cm
+        def _lock(project, issue_number=None, **kwargs):
+            calls.append({'project': project, **kwargs})
+            # First two acquires are contended: they block for the whole budget
+            # they were given, then time out. Keyed on call order rather than
+            # project name because staging_root.iterdir() has no defined order.
+            if len(calls) <= 2:
+                clock['now'] += kwargs['timeout_seconds']
+                raise ProjectCheckoutLockTimeoutError(
+                    f"'{RESOURCE_NAME}' lock for project {project!r} held by someone else"
+                )
+            yield None
+
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_workspace.time.monotonic', lambda: clock['now']), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync', _lock), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['timeout_seconds'] for c in calls] == [
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+            PRUNE_SWEEP_LOCK_BUDGET_SECONDS - 2 * PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+        ]
+
+    def test_a_budget_exhausted_skip_says_so_rather_than_blaming_contention(
+        self, manager, tmp_path, caplog
+    ):
+        """"stayed held for the whole 0s budget" reads as contention against a
+        real wait and gives an operator no way to tell the two apart. A skip at
+        timeout 0.0 has to name the budget as the cause (#169 review)."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '723' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+             patch('services.project_workspace.PRUNE_SWEEP_LOCK_BUDGET_SECONDS', 0.0), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock(set(), calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert "shared" in caplog.text and "budget was already spent" in caplog.text
+        assert "stayed held for the whole 0s" not in caplog.text
+
+    def test_a_genuinely_contended_skip_still_reports_the_wait_it_made(
+        self, manager, tmp_path, caplog
+    ):
+        """And the other diagnosis keeps its own wording: this project did get a
+        real allowance and waited it out."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '724' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock(set(), calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert (
+            f"stayed held for the whole {PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS:.0f}s "
+            f"this project was allowed to wait"
+        ) in caplog.text
+        assert "budget was already spent" not in caplog.text
 
 
 class TestPruneAgainstTheRealCheckoutLock:

@@ -154,9 +154,25 @@ class DevContainerStateManager:
         image_name: Optional[str] = None,
         error_message: Optional[str] = None,
         expect: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> bool:
         """
         Set the status of a project's dev container
+
+        Returns:
+            True if the new status reached disk, False if it did not -- either
+            because `expect` no longer matched or because the write itself
+            failed (a file-lock acquire that timed out, an unwritable state
+            dir). _merge_state() already logs which; see its docstring for why
+            the two are not distinguished here.
+
+            Callers that go on to do work the status is supposed to ANNOUNCE
+            must check this. queue_dev_environment_setup() is the one that
+            must: its IN_PROGRESS mark is the only record that a setup is
+            coming, so enqueuing after a failed mark queues an hour-scale
+            rebuild the state file does not know about, and the next board poll
+            reads the unchanged status and queues a second one (#171 review).
+            Callers whose write is merely a record of something that already
+            happened can keep ignoring it.
 
         Args:
             project_name: Name of the project
@@ -197,8 +213,10 @@ class DevContainerStateManager:
             # Clear error message if status changed from blocked
             updates['error_message'] = None
 
-        if self._merge_state(project_name, updates, expect=expect):
+        written = self._merge_state(project_name, updates, expect=expect)
+        if written:
             logger.info(f"Updated dev container status for {project_name}: {status.value}")
+        return written
 
     def set_pending_operation(self, project_name: str, operation: str) -> None:
         """
@@ -494,9 +512,12 @@ class DevContainerStateManager:
         write must not, or it would silently become a no-op.
 
         Returns True if the file was written. A False is either a failure (the
-        ERROR below) or a refused precondition (the INFO below); no current
-        caller distinguishes them, and set_status() uses it only to decide
-        whether to log that it wrote.
+        ERROR below) or a refused precondition (the INFO below). No current
+        caller distinguishes the two -- both mean "the value you decided on is
+        not what is on disk", which is the only thing a caller acts on -- so
+        this stays a bool and set_status() passes it straight through. Should
+        one ever need to tell them apart, widen it to a tri-state here rather
+        than making callers re-read the file to guess.
         """
         from utils.file_lock import file_lock
 

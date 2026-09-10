@@ -120,7 +120,8 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
         mock_decision_emitter.emit_error_decision = Mock()
         mock_emitter.return_value = mock_decision_emitter
 
-        mock_queue.return_value = AsyncMock()
+        from agents.orchestrator_integration import DevSetupQueueOutcome
+        mock_queue.return_value = DevSetupQueueOutcome.QUEUED
 
         from agents.orchestrator_integration import process_task_integrated
         from agents.non_retryable import NonRetryableAgentError
@@ -135,6 +136,8 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
         recovery_message = recovery_call['error_message']
         assert "setup has been queued" in recovery_message or "will be retried" in recovery_message
         assert recovery_call['success'] is True
+        assert recovery_call['recovery_action'] == 'queue_dev_environment_setup'
+        assert recovery_call['context']['auto_queued'] is True
 
 
 @pytest.mark.asyncio
@@ -318,3 +321,73 @@ async def test_validate_task_can_run_stale_in_progress_triggers_resetup():
         result = await validate_task_can_run(mock_task, mock_logger)
         assert result['can_run'] is False
         assert result.get('defer') is True
+
+
+async def _dispatch_and_capture_recovery_event(mock_task, mock_logger, outcome):
+    """Drive process_task_integrated()'s needs_dev_setup branch with
+    queue_dev_environment_setup() returning `outcome`, and hand back the second
+    decision event -- the one that reports what the queue attempt did."""
+    with patch('config.manager.config_manager') as mock_config, \
+         patch('services.dev_container_state.dev_container_state') as mock_dev_state, \
+         patch('monitoring.decision_events.DecisionEventEmitter') as mock_emitter, \
+         patch('monitoring.observability.get_observability_manager'), \
+         patch('agents.orchestrator_integration.queue_dev_environment_setup') as mock_queue:
+
+        mock_agent_config = Mock()
+        mock_agent_config.requires_dev_container = True
+        mock_config.get_project_agent_config.return_value = mock_agent_config
+
+        from services.dev_container_state import DevContainerStatus
+        mock_dev_state.get_status.return_value = DevContainerStatus.UNVERIFIED
+        _snapshot_from_stubs(mock_dev_state)
+
+        mock_decision_emitter = Mock()
+        mock_decision_emitter.emit_error_decision = Mock()
+        mock_emitter.return_value = mock_decision_emitter
+
+        mock_queue.return_value = outcome
+
+        from agents.orchestrator_integration import process_task_integrated
+        from agents.non_retryable import NonRetryableAgentError
+
+        with pytest.raises(NonRetryableAgentError):
+            await process_task_integrated(mock_task, Mock(), mock_logger)
+
+        return mock_decision_emitter.emit_error_decision.call_args_list[1][1]
+
+
+@pytest.mark.asyncio
+async def test_a_deferral_is_not_reported_as_a_queue(mock_task, mock_logger):
+    """THE #169-review regression. queue_dev_environment_setup() returns
+    without raising when it defers to a live holder of the dev_container_build
+    lock -- an operator-triggered rebuild mid-`docker build`, say -- and this
+    path emitted "setup has been queued ... auto_queued: True" anyway, once per
+    30s poll for the whole build window. Everything reading decision events (the
+    ES pattern indices, pipeline-recommendations, an operator triaging a stuck
+    project) saw a stream of successful recoveries for work never enqueued."""
+    from agents.orchestrator_integration import DevSetupQueueOutcome
+
+    recovery_call = await _dispatch_and_capture_recovery_event(
+        mock_task, mock_logger, DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+    )
+
+    assert recovery_call['context']['auto_queued'] is False
+    assert recovery_call['context']['queue_outcome'] == 'deferred_build_lock_held'
+    assert recovery_call['recovery_action'] == 'deferred_to_existing_dev_setup'
+    assert "has been queued" not in recovery_call['error_message']
+
+
+@pytest.mark.asyncio
+async def test_a_failed_mark_is_reported_as_a_failure(mock_task, mock_logger):
+    """The other non-queue outcome is not a deferral at all: nothing covers this
+    project, and the next board poll has to retry. It must not read as success."""
+    from agents.orchestrator_integration import DevSetupQueueOutcome
+
+    recovery_call = await _dispatch_and_capture_recovery_event(
+        mock_task, mock_logger, DevSetupQueueOutcome.FAILED_STATUS_WRITE
+    )
+
+    assert recovery_call['success'] is False
+    assert recovery_call['context']['auto_queued'] is False
+    assert recovery_call['context']['queue_outcome'] == 'failed_status_write'
+    assert "could NOT be queued" in recovery_call['error_message']

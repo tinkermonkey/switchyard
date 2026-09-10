@@ -7,6 +7,7 @@ replacing the legacy agent_stages.py with a proper factory-based approach.
 
 import logging
 import uuid
+from enum import Enum
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from pipeline.base import PipelineStage
@@ -31,6 +32,44 @@ STALE_IN_PROGRESS_MINUTES = 20
 # next attempt -- so 30 minutes is comfortably above any healthy window while still
 # bounding the damage from a sub-cycle that died mid-flight.
 STALE_CHANGES_NEEDED_MINUTES = 30
+
+
+class DevSetupQueueOutcome(Enum):
+    """What queue_dev_environment_setup() actually did.
+
+    That function has four ways to return without enqueuing anything -- three
+    deferrals plus a failed status write -- and used to report all of them the
+    same way it reports success: by returning None. Neither caller could tell
+    the two apart, and both assumed the good one (#169 review):
+
+      - the dispatch path below emitted a "Development environment setup has
+        been queued ... auto_queued: True" decision event on every pass, so a
+        project deferring to somebody else's build produced a stream of
+        successful recoveries for work that was never enqueued; and
+      - repair_cycle's env-rebuild sub-cycle followed the call with an
+        unbounded `while True` poll for a terminal status that, with nothing
+        queued, nobody was going to write.
+
+    Deferral is not failure -- it means another run already covers this project
+    and the next board poll is the retry point -- so callers need the
+    distinction, not just an exception. `queued` is the only question most of
+    them ask; the members are separate so the event stream can say WHICH.
+    """
+
+    QUEUED = 'queued'
+    # A setup is IN_PROGRESS and the mark is still fresh.
+    DEFERRED_IN_PROGRESS = 'deferred_in_progress'
+    # IN_PROGRESS went stale, but _dev_setup_in_flight_reason() found a live run.
+    DEFERRED_RUN_IN_FLIGHT = 'deferred_run_in_flight'
+    # The dev_container_build lock is held by a live holder.
+    DEFERRED_BUILD_LOCK_HELD = 'deferred_build_lock_held'
+    # The IN_PROGRESS mark could not be written, so nothing was enqueued.
+    FAILED_STATUS_WRITE = 'failed_status_write'
+
+    @property
+    def queued(self) -> bool:
+        """True iff a dev_environment_setup task actually reached the queue."""
+        return self is DevSetupQueueOutcome.QUEUED
 
 
 async def validate_task_can_run(task, logger) -> Dict[str, Any]:
@@ -244,7 +283,10 @@ def _dev_setup_in_flight_reason(
     return None
 
 
-async def queue_dev_environment_setup(project: str, logger, change_description: str = "", pipeline_run_id: str = None, cycle_stack: list = None):
+async def queue_dev_environment_setup(
+    project: str, logger, change_description: str = "", pipeline_run_id: str = None,
+    cycle_stack: list = None,
+) -> DevSetupQueueOutcome:
     """
     Queue a dev_environment_setup task for a project.
 
@@ -258,6 +300,15 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
     when that lock is held by a LIVE holder (#169 review) -- see the acquire
     below for why a loser of that race has to stop rather than carry on
     unserialized.
+
+    Returns:
+        DevSetupQueueOutcome -- whether a task was actually enqueued, and if
+        not, which of the four no-op paths was taken. Callers MUST branch on
+        it rather than on "did this raise": deferring is a normal, frequent
+        outcome that raises nothing, and treating it as success is what made
+        the dispatch path claim a queue that never happened and made
+        repair_cycle poll forever for a status nobody would write (#169
+        review). See the enum for the full account.
 
     Args:
         project: Project name
@@ -326,7 +377,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
                 f"won this exact race and is queuing one. Deferring to it rather than "
                 f"queuing a duplicate; the next board poll retries if it did not."
             )
-            return
+            return DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
         if not serialized:
             logger.warning(
                 f"Deciding whether to queue dev_environment_setup for {project} "
@@ -359,7 +410,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
             )
             if not is_stale:
                 logger.info(f"Dev environment setup already in progress for {project}, skipping duplicate queue")
-                return
+                return DevSetupQueueOutcome.DEFERRED_IN_PROGRESS
             # Age alone does not mean the run is gone -- nothing refreshes the status
             # timestamp while a setup is queued or building, so the window elapses over
             # healthy slow runs too. Only re-queue once no live run can be found.
@@ -377,7 +428,7 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
                     f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes), but "
                     f"{in_flight} - skipping duplicate queue"
                 )
-                return
+                return DevSetupQueueOutcome.DEFERRED_RUN_IN_FLIGHT
             logger.warning(
                 f"Dev environment setup for {project} has been IN_PROGRESS since "
                 f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes) with no "
@@ -385,17 +436,41 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
                 f"queuing a fresh setup rather than deferring to a run that is not coming back"
             )
 
-        # Mark as in-progress BEFORE queuing to prevent races
-        dev_container_state.set_status(
+        # Mark as in-progress BEFORE queuing to prevent races.
+        #
+        # And DO NOT queue if the mark did not land (#171 review). set_status()
+        # returns False when its own write failed -- most plausibly the state
+        # file's cross-process lock timing out at STATE_LOCK_TIMEOUT_SECONDS
+        # against the verifier's in-session write or an operator running
+        # scripts/rebuild_project_images.py -- and it only logs. Enqueuing
+        # anyway is the duplicate this whole critical section exists to
+        # prevent, arrived at from a third direction: the file still says
+        # UNVERIFIED, so the next 30s board poll re-decides needs_dev_setup,
+        # reaches here with the build lock now free, reads UNVERIFIED (so the
+        # stale/in-flight probes never run) and queues a SECOND hour-scale
+        # rebuild. Returning instead leaves the state file and the queue
+        # agreeing -- nothing marked, nothing queued -- and that same next poll
+        # retries the whole check-then-mark.
+        marked = dev_container_state.set_status(
             project,
             DevContainerStatus.IN_PROGRESS,
             image_name=f"{project}-agent:latest"
         )
+        if not marked:
+            logger.error(
+                f"Not queuing dev_environment_setup for {project}: its IN_PROGRESS "
+                f"mark could not be written (see the dev container state error above). "
+                f"Queuing a setup the state file does not record would let the next "
+                f"board poll read the unchanged status and queue a second one; the "
+                f"next poll retries this whole check-then-mark instead."
+            )
+            return DevSetupQueueOutcome.FAILED_STATUS_WRITE
         logger.info(f"Set dev container status to IN_PROGRESS for {project}")
 
         await _enqueue_dev_environment_setup(
             project, logger, change_description, pipeline_run_id, cycle_stack
         )
+        return DevSetupQueueOutcome.QUEUED
 
 
 async def _enqueue_dev_environment_setup(
@@ -410,10 +485,18 @@ async def _enqueue_dev_environment_setup(
 
     Split out of queue_dev_environment_setup() (#171) only so that function's
     decision -- which now runs inside the dev_container_build lock -- stays
-    readable next to the guard it belongs to. Called with that lock held: the
-    enqueue is a single Redis push, and rolling the status back has to happen
-    under the same hold that wrote it, or another caller could observe the
-    IN_PROGRESS this call is in the middle of retracting.
+    readable next to the guard it belongs to. Called from inside the `async
+    with` on that lock: the enqueue is a single Redis push, and rolling the
+    status back has to happen under the same hold that wrote it, or another
+    caller could observe the IN_PROGRESS this call is in the middle of
+    retracting.
+
+    "Inside the `with`" is not the same as "holding the lock", and on the
+    degraded / fail-closed / retained path it is not holding it -- the acquire
+    was refused for a reason that is not a live holder, and the caller
+    deliberately carries on unserialized rather than drop the setup for good
+    (see the acquire's own comment). The rollback is best-effort there, exactly
+    as the check-then-mark above it is.
     """
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
@@ -695,13 +778,47 @@ async def process_task_integrated(task, state_manager, logger):
                 pipeline_run_id=pipeline_run_id
             )
             try:
-                await queue_dev_environment_setup(task.project, logger)
+                outcome = await queue_dev_environment_setup(task.project, logger)
 
-                # EMIT DECISION EVENT: Recovery successful
-                recovery_message = (
-                    f"Development environment setup has been queued for project '{task.project}'. "
-                    f"Task will be retried automatically once the environment is ready."
-                )
+                # EMIT DECISION EVENT: what actually happened, which is not always
+                # "queued" (#169 review). This used to report success/auto_queued
+                # unconditionally, so a project deferring to somebody else's build
+                # -- or one whose IN_PROGRESS mark failed to write -- produced the
+                # same "has been queued" event on every 30s poll for the whole
+                # window, and everything reading decision events (the ES pattern
+                # indices, pipeline-recommendations, an operator asking why a
+                # project is stuck) saw a stream of recoveries for work that was
+                # never enqueued. That is the symptom the #152 review flagged;
+                # these three branches are it fixed at the source.
+                if outcome.queued:
+                    recovery_message = (
+                        f"Development environment setup has been queued for project '{task.project}'. "
+                        f"Task will be retried automatically once the environment is ready."
+                    )
+                    recovery_action = 'queue_dev_environment_setup'
+                    recovery_success = True
+                elif outcome is DevSetupQueueOutcome.FAILED_STATUS_WRITE:
+                    recovery_message = (
+                        f"Development environment setup could NOT be queued for project "
+                        f"'{task.project}': its in-progress mark could not be written, so "
+                        f"nothing was enqueued. The next board poll retries."
+                    )
+                    recovery_action = 'queue_dev_environment_setup'
+                    recovery_success = False
+                else:
+                    # A deferral is the correct recovery, not a failure: another
+                    # setup/verify run already covers this project, and queuing a
+                    # second one is the duplicate hour-scale rebuild the guard
+                    # exists to prevent. Reported as its own action so it can never
+                    # be counted as a queue.
+                    recovery_message = (
+                        f"Development environment setup was NOT queued for project "
+                        f"'{task.project}' ({outcome.value}): a setup is already under way, "
+                        f"so this task defers to it rather than queuing a duplicate. "
+                        f"Task will be retried automatically once the environment is ready."
+                    )
+                    recovery_action = 'deferred_to_existing_dev_setup'
+                    recovery_success = True
                 decision_events.emit_error_decision(
                     error_type='TaskValidationError',
                     error_message=recovery_message,
@@ -710,10 +827,11 @@ async def process_task_integrated(task, state_manager, logger):
                         'agent': task.agent,
                         'issue_number': issue_number,
                         'board': board_name,
-                        'auto_queued': True
+                        'auto_queued': outcome.queued,
+                        'queue_outcome': outcome.value
                     },
-                    recovery_action='queue_dev_environment_setup',
-                    success=True,
+                    recovery_action=recovery_action,
+                    success=recovery_success,
                     project=task.project,
                     pipeline_run_id=pipeline_run_id
                 )

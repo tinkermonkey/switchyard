@@ -214,3 +214,136 @@ class TestRunTestsDoesNotRetryATerminatedContainer:
                 await stage._run_tests(stage.test_configs[0], _context(), 1, 0)
 
         assert executor.execute_agent.call_count == 1
+
+
+class TestTheEnvRebuildPollIsBoundedWhenNothingWasQueued:
+    """#169 review. The sub-cycle followed queue_dev_environment_setup() with a
+    `while True` poll that exits only on a terminal dev container status, with
+    no timer -- justified by "image builds can legitimately take longer than any
+    test-type timeout", which assumes a build was queued.
+
+    queue_dev_environment_setup() frequently queues nothing and raises nothing:
+    it defers to whatever holds the dev_container_build lock. Some of those
+    holders do end in a terminal status; the short bookkeeping ones
+    (dev_container_build_lock_if_free_sync, _finalize_unconfirmed_changes_needed)
+    never do, and neither does a holder that dies inside its window. The poll
+    then waited forever for a write nobody would make, and the comment's stated
+    backstop does not cover it -- _monitor_repair_cycle_container's 1-hour stall
+    check lives in services/project_monitor.py and watches a repair-cycle
+    CONTAINER, not this in-process loop."""
+
+    async def _run(self, outcome, statuses):
+        from services.dev_container_state import DevContainerStatus
+        from pipeline.repair_cycle import SystemicAnalysisResult
+
+        stage = _stage()
+        analysis = SystemicAnalysisResult(
+            has_env_issues=True,
+            has_systemic_code_issues=False,
+            env_issue_description="pytest is missing from the image",
+            systemic_issue_description="",
+            affected_files=[],
+            raw_json={},
+        )
+
+        slept = []
+
+        async def _no_sleep(seconds):
+            slept.append(seconds)
+
+        clock = {'now': 0.0}
+
+        def _monotonic():
+            # Every poll interval advances the clock by that interval, so the
+            # deadline is reached in bounded test time rather than real time.
+            return clock['now']
+
+        def _advance_and_get(project):
+            clock['now'] += 30.0
+            return statuses.pop(0) if statuses else DevContainerStatus.UNVERIFIED
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup',
+                   AsyncMock(return_value=outcome)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', _no_sleep), \
+             patch('pipeline.repair_cycle.time.monotonic', _monotonic), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch.object(stage, '_run_tests', AsyncMock(return_value=RepairTestResult(
+                 test_type="integration", iteration=1, passed=1, failed=0, warnings=0,
+                 failures=[], warning_list=[], raw_output="",
+                 timestamp="2026-01-01T00:00:00",
+             ))):
+            mock_state.set_status.return_value = True
+            mock_state.get_status.side_effect = _advance_and_get
+
+            result = await stage._run_env_rebuild_sub_cycle(
+                analysis, RepairTestRunConfig(test_type="integration"),
+                _context(), 1, 0,
+            )
+
+        return result, slept, mock_state
+
+    @pytest.mark.asyncio
+    async def test_a_deferral_does_not_poll_forever(self):
+        """THE regression. With nothing queued and no terminal status ever
+        written, this used to be an infinite loop whose only escape was the
+        pipeline watchdog reaping the run as a containerless zombie."""
+        from agents.orchestrator_integration import DevSetupQueueOutcome
+        from pipeline.repair_cycle import (
+            DEFERRED_ENV_REBUILD_POLL_SECONDS,
+            MAX_SYSTEMIC_SUB_CYCLES,
+        )
+
+        result, slept, _state = await self._run(
+            DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD, statuses=[]
+        )
+
+        # Bounded: at most one deadline's worth of 30s polls per attempt, and
+        # the attempt loop is itself bounded by MAX_SYSTEMIC_SUB_CYCLES.
+        assert len(slept) <= (
+            (DEFERRED_ENV_REBUILD_POLL_SECONDS / 30.0) + 1
+        ) * MAX_SYSTEMIC_SUB_CYCLES
+        assert result.has_failures(), "no rebuild ever completed, so this is a failure"
+
+    @pytest.mark.asyncio
+    async def test_every_attempt_is_retried_rather_than_abandoned(self):
+        """A deferred attempt is not a dead end: the next `for attempt`
+        iteration resets to UNVERIFIED and re-queues, so all
+        MAX_SYSTEMIC_SUB_CYCLES attempts still get made."""
+        from agents.orchestrator_integration import DevSetupQueueOutcome
+        from pipeline.repair_cycle import MAX_SYSTEMIC_SUB_CYCLES
+
+        _result, _slept, mock_state = await self._run(
+            DevSetupQueueOutcome.DEFERRED_RUN_IN_FLIGHT, statuses=[]
+        )
+
+        # One UNVERIFIED reset per attempt, plus the terminal CHANGES_NEEDED
+        # finalization check (which finds no CHANGES_NEEDED and writes nothing).
+        unverified_writes = [
+            c for c in mock_state.set_status.call_args_list
+            if c.args[1].value == 'unverified'
+        ]
+        assert len(unverified_writes) == MAX_SYSTEMIC_SUB_CYCLES
+
+    @pytest.mark.asyncio
+    async def test_a_real_queue_still_gets_the_untimed_poll(self):
+        """The case the "no timer here" comment was written for is unchanged: a
+        setup really was queued, so the poll waits however long the build takes
+        rather than giving up on it."""
+        from agents.orchestrator_integration import DevSetupQueueOutcome
+        from services.dev_container_state import DevContainerStatus
+        from pipeline.repair_cycle import DEFERRED_ENV_REBUILD_POLL_SECONDS
+
+        # Stays non-terminal for longer than the deferred deadline would allow,
+        # then verifies. A bounded poll would have given up before this.
+        polls_past_the_deadline = int(DEFERRED_ENV_REBUILD_POLL_SECONDS / 30.0) + 5
+        statuses = (
+            [DevContainerStatus.IN_PROGRESS] * polls_past_the_deadline
+            + [DevContainerStatus.VERIFIED]
+        )
+
+        result, slept, _state = await self._run(
+            DevSetupQueueOutcome.QUEUED, statuses=statuses
+        )
+
+        assert len(slept) == polls_past_the_deadline + 1
+        assert not result.has_failures()

@@ -204,3 +204,74 @@ class TestTheOrchestratorsOwnKillStaysRetryable:
             runner._raise_for_failed_exit_code(1, "tests failed")
 
         assert not isinstance(excinfo.value, NonRetryableAgentError)
+
+    def test_the_grace_period_narrative_is_scoped_to_the_signals_it_can_cause(self):
+        """#160 review. The orchestrator_killed branch was ungated on exit_code,
+        so a container that had already exited on its OWN with some other code --
+        the kill merely arriving afterwards -- was reported with the
+        grace-period-kill narrative and made retryable. The flag speaks for one
+        thing only: a SIGKILL this process sent."""
+        runner = DockerAgentRunner()
+
+        with pytest.raises(Exception) as excinfo:
+            runner._raise_for_failed_exit_code(1, "tests failed", orchestrator_killed=True)
+
+        assert not isinstance(excinfo.value, NonRetryableAgentError)
+        assert "the orchestrator killed" not in str(excinfo.value)
+        assert "exit_code=1" in str(excinfo.value)
+
+    def test_a_143_from_our_own_kill_is_still_retryable(self):
+        """`docker kill` defaults to SIGKILL, but the branch covers both signals
+        the orchestrator's own stop paths can produce."""
+        runner = DockerAgentRunner()
+
+        with pytest.raises(Exception) as excinfo:
+            runner._raise_for_failed_exit_code(143, "stderr", orchestrator_killed=True)
+
+        assert not isinstance(excinfo.value, NonRetryableAgentError)
+
+
+class TestTheKillIsOnlyAttributedToUsWhenItLanded:
+    """THE #160-review regression, other half. `_orchestrator_killed` used to be
+    set from a `subprocess.run(['docker', 'kill', ...])` whose return code was
+    never inspected -- and subprocess.run without check=True does not raise on a
+    non-zero return. So "No such container", "is not running" or a transient
+    daemon error all set the flag anyway, silently.
+
+    That was harmless while the flag only chose a log line. It is not harmless
+    now that _raise_for_failed_exit_code() reads it to decide RETRYABILITY: a
+    kill that lost the race to the OOM killer relabels that OOM as "nothing
+    external terminated it", and agent_executor relaunches the same workload
+    twice more against the memory ceiling that just killed it."""
+
+    def test_the_flag_is_set_only_under_a_check_of_the_kills_return_code(self):
+        """Pins the structure the fix rests on: there is exactly ONE place that
+        claims a container's exit for the orchestrator, and it sits directly
+        under a check of what `docker kill` returned.
+
+        (The module's other `docker kill` -- _do_docker_wait's hard-timeout kill
+        -- deliberately sets no flag, so it is not covered by this.)"""
+        import inspect
+
+        from claude import docker_runner
+
+        lines = inspect.getsource(docker_runner.DockerAgentRunner).splitlines()
+        assignments = [
+            i for i, line in enumerate(lines)
+            if line.strip() == '_orchestrator_killed = True'
+        ]
+        assert len(assignments) == 1, (
+            f"expected exactly one attribution site, found {len(assignments)}"
+        )
+        guard = lines[assignments[0] - 1].strip()
+        assert guard == 'if kill_result.returncode == 0:', guard
+
+    def test_a_kill_that_did_nothing_is_reported(self):
+        """A refused kill must not pass silently either -- it is the only signal
+        that the container's exit belongs to something else."""
+        import inspect
+
+        from claude import docker_runner
+
+        source = inspect.getsource(docker_runner.DockerAgentRunner)
+        assert "not attributing the container's exit to the orchestrator" in source
