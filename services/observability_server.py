@@ -297,51 +297,97 @@ def rebuild_image(project):
         #
         # IN_PROGRESS is marked INSIDE the lock, not before spawning this
         # thread: a rebuild that never gets the lock never runs, and must not
-        # leave the project's status claiming a build is under way.
+        # leave the project's status claiming a build is under way. The wait
+        # itself is represented by the pending-operation marker the request
+        # handler set (see set_pending_operation) rather than by leaving the
+        # pre-existing status to speak for it.
         try:
-            with dev_container_build_lock_sync(
-                project, timeout_seconds=REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS
-            ):
-                dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
-                try:
-                    ok = rebuild_project_image(project, update_state=True, lock_held_by_caller=True)
-                    if not ok:
-                        dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
-                except Exception as e:
-                    dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
-        except DevContainerBuildLockTimeoutError as e:
-            # Contention, not a build failure -- nothing ran. But this endpoint
-            # already answered {"success": true, "triggered": true} and its only
-            # feedback channel is the state file every caller polls (mcp/server.py's
-            # get_image_build_status reads it directly), so a bare log line here
-            # left that caller reading the project's PRE-EXISTING status -- commonly
-            # 'verified' -- and concluding the rebuild had finished (#152 review).
-            # Record the drop instead.
-            #
-            # Under the non-blocking variant, so this never lands on top of a build
-            # that is genuinely running: if the lock frees up in the meantime the
-            # write is accurate, and if it does not, its holder owns the status and
-            # writes a better one itself (_log_skipped reports which).
-            logger.error(f"Rebuild of {project} never started: {e}")
             try:
-                with dev_container_build_lock_if_free_sync(project) as acquired:
-                    if acquired:
-                        dev_container_state.set_status(
-                            project,
-                            DevContainerStatus.BLOCKED,
-                            error_message=(
-                                f"rebuild never started: the dev_container_build lock was held "
-                                f"for the whole {REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS:.0f}s wait"
-                            ),
-                        )
-            except Exception as record_error:
+                with dev_container_build_lock_sync(
+                    project, timeout_seconds=REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS
+                ):
+                    dev_container_state.clear_pending_operation(project)
+                    dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
+                    try:
+                        ok = rebuild_project_image(project, update_state=True, lock_held_by_caller=True)
+                        if not ok:
+                            dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
+                    except Exception as e:
+                        dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+            except DevContainerBuildLockTimeoutError as e:
+                # Contention, not a build failure -- nothing ran. But this endpoint
+                # already answered {"success": true, "triggered": true} and its only
+                # feedback channel is the state file every caller polls (mcp/server.py's
+                # get_image_build_status reads it directly), so a bare log line here
+                # left that caller reading the project's PRE-EXISTING status -- commonly
+                # 'verified' -- and concluding the rebuild had finished (#152 review).
+                # Record the drop instead.
+                #
+                # Under the non-blocking variant, so this never lands on top of a build
+                # that is genuinely running: if the lock frees up in the meantime the
+                # write is accurate, and if it does not, its holder owns the status and
+                # writes a better one itself (_log_skipped reports which).
+                logger.error(f"Rebuild of {project} never started: {e}")
+                try:
+                    with dev_container_build_lock_if_free_sync(project) as acquired:
+                        if acquired:
+                            # Re-read INSIDE the lock and re-decide there, like every
+                            # other writer this work item touched. Taking the lock is
+                            # not enough on its own: between the failed blocking
+                            # acquire and this one the previous holder can finish and
+                            # release (log formatting plus a possible Redis connect sit
+                            # in between), and BLOCKED written on top of the VERIFIED it
+                            # just wrote is terminal -- validate_task_can_run gives the
+                            # terminal statuses no staleness escape, so every task for
+                            # the project would be refused indefinitely over lock
+                            # contention against a healthy, freshly-verified image
+                            # (#152 review). Lock contention is not a verdict on the
+                            # image, so it only gets to speak when nothing better has.
+                            current = dev_container_state.get_status(project)
+                            if current in (DevContainerStatus.VERIFIED, DevContainerStatus.IN_PROGRESS):
+                                logger.warning(
+                                    f"Not recording the dropped rebuild of {project} as blocked: "
+                                    f"its status moved to {current.value} while this thread was "
+                                    f"waiting for the lock, and that is a real verdict on the "
+                                    f"image where lock contention is not"
+                                )
+                            else:
+                                dev_container_state.set_status(
+                                    project,
+                                    DevContainerStatus.BLOCKED,
+                                    error_message=(
+                                        f"rebuild never started: the dev_container_build lock was held "
+                                        f"for the whole {REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS:.0f}s wait"
+                                    ),
+                                )
+                except Exception as record_error:
+                    logger.error(
+                        f"Could not record the dropped rebuild of {project}: {record_error}",
+                        exc_info=True,
+                    )
+        finally:
+            # The marker describes a REQUEST that has not started yet, so it must
+            # not outlive this thread by any exit path -- including the lock
+            # timeout above and an unexpected raise. Clearing it twice on the happy
+            # path is harmless.
+            try:
+                dev_container_state.clear_pending_operation(project)
+            except Exception as clear_error:
                 logger.error(
-                    f"Could not record the dropped rebuild of {project}: {record_error}",
+                    f"Could not clear the pending-rebuild marker for {project}: {clear_error}",
                     exc_info=True,
                 )
 
+    # Set BEFORE the thread starts, so it is already visible to the first poll a
+    # caller makes after this endpoint answers -- the thread may sit in the lock
+    # wait for up to REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS before writing anything.
+    try:
+        dev_container_state.set_pending_operation(project, 'rebuild')
+    except Exception as e:
+        logger.error(f"Could not mark the rebuild of {project} as pending: {e}", exc_info=True)
+
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"success": True, "triggered": True, "project": project})
+    return jsonify({"success": True, "triggered": True, "project": project, "status": "queued"})
 
 def get_claude_token_usage():
     """
@@ -4236,7 +4282,13 @@ def get_projects():
                         'status': container_status.value,
                         'image_name': image_name,
                         'updated_at': state_details.get('updated_at'),
-                        'error_message': state_details.get('error_message')
+                        'error_message': state_details.get('error_message'),
+                        # A rebuild that has been requested but is still waiting for
+                        # the dev_container_build lock. 'status' above is the image's
+                        # own state and does NOT move while that wait is on -- see
+                        # DevContainerStateManager.set_pending_operation.
+                        'pending_operation': state_details.get('pending_operation'),
+                        'pending_operation_at': state_details.get('pending_operation_at')
                     }
                 })
 
@@ -4901,6 +4953,23 @@ def redis_subscriber_thread():
 
 def start_observability_server(host='0.0.0.0', port=5001):
     """Start the observability WebSocket server"""
+    # Release dev_container_build locks left behind by THIS server's own dead
+    # predecessor. The mirror image of main.py's call: /api/projects/<p>/rebuild-image
+    # holds that lock for the whole duration of an operator-triggered build, so a
+    # crash mid-build leaves it parked until the 4-hour staleness heuristic or the
+    # 7200s Redis TTL, and the orchestrator's own recovery now (correctly) refuses
+    # to touch a lock stamped with this process's kind. Each process kind reclaims
+    # its own -- see recover_orphaned_resource_locks().
+    try:
+        from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
+        from services.project_resource_lock_manager import ProjectResourceLockManager
+        released = ProjectResourceLockManager().recover_orphaned_resource_locks(
+            DEV_CONTAINER_BUILD_RESOURCE
+        )
+        logger.info(f"Orphaned dev_container_build lock recovery: {released} released")
+    except Exception as e:
+        logger.error(f"Could not recover orphaned dev_container_build locks: {e}", exc_info=True)
+
     # Start Redis subscriber in background thread
     subscriber = threading.Thread(target=redis_subscriber_thread, daemon=True)
     subscriber.start()

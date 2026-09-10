@@ -493,11 +493,20 @@ function PipelineRunView() {
         setTriggeringAnalysis(false)
         return
       }
+      // Anything already on the document when the retry was requested describes
+      // the PREVIOUS attempt, not this one. The service clears the old
+      // analysis_error as soon as the new attempt starts, but the first poll can
+      // land in the gap before that write; without this the stale "Analysis
+      // failed" would stop the poll seconds after the operator asked for a retry
+      // and the eventual success would never be shown (#152 review).
+      const triggeredAt = Date.now()
+      const isStalePayload = (a) =>
+        Boolean(a.error) && a.attemptedAt && Date.parse(a.attemptedAt) < triggeredAt
       const poll = setInterval(async () => {
         try {
           const r = await fetch(`/api/pipeline-run/${selectedRunId}/analysis`)
           const d = await r.json()
-          if (d.success && d.analysis) {
+          if (d.success && d.analysis && !isStalePayload(d.analysis)) {
             setAnalysis(d.analysis)
             setTriggeringAnalysis(false)
             clearInterval(analysisPollRef.current.interval)

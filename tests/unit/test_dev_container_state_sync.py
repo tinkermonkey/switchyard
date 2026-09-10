@@ -545,3 +545,55 @@ class TestReconciliationTakesTheDevContainerBuildLock:
         )
 
         assert dev_container_mgr.get_status(project_name) == DevContainerStatus.VERIFIED
+
+    def _run_cleanup_with_stuck_setup(self, execution_tracker, dev_container_mgr,
+                                      lock_granted, initial_status):
+        """The same seeding for a stuck dev_environment_SETUP record, which takes
+        a different path through the sweep than the verifier does."""
+        project_name = "test-project"
+        execution_tracker.record_execution_start(
+            issue_number=42,
+            column="Environment Setup",
+            agent="dev_environment_setup",
+            trigger_source='manual',
+            project_name=project_name
+        )
+        dev_container_mgr.set_status(
+            project_name=project_name,
+            status=initial_status,
+            image_name=f"{project_name}-agent:latest"
+        )
+        self._run_cleanup(dev_container_mgr, lock_granted, execution_tracker)
+        return project_name
+
+    def test_a_stuck_setup_does_not_clobber_a_verified_project(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """#152 review: a non-recovered stuck dev_environment_setup record took
+        TWO dev-container writes in the same loop iteration. The first carries
+        skip_when=(VERIFIED,) and correctly leaves a project a LATER setup+verify
+        has since verified alone; the second, ~100 lines down the failure branch,
+        had neither skip_when nor the `and recovered` gate its verifier
+        counterpart has, and silently undid the first. The lock cannot help --
+        both writes are the same process, the same sweep, sequential
+        acquisitions. Result: a crashed setup left behind an in_progress record
+        that reset a healthy project to UNVERIFIED 20 minutes later, refusing
+        every task for it until a redundant setup ran."""
+        project_name = self._run_cleanup_with_stuck_setup(
+            execution_tracker, dev_container_mgr,
+            lock_granted=True, initial_status=DevContainerStatus.VERIFIED,
+        )
+
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.VERIFIED
+
+    def test_a_stuck_setup_still_resets_a_project_that_is_not_verified(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """The guard narrows the write, it does not remove it: a setup that died
+        mid-build must still leave the project retryable."""
+        project_name = self._run_cleanup_with_stuck_setup(
+            execution_tracker, dev_container_mgr,
+            lock_granted=True, initial_status=DevContainerStatus.IN_PROGRESS,
+        )
+
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.UNVERIFIED

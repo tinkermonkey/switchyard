@@ -55,6 +55,7 @@ not wired into any call site by this issue -- that is a follow-up (#54).
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 # TouchResult is imported (and re-exported) so callers of this facade --
@@ -62,10 +63,13 @@ from typing import Optional, Tuple
 # touch_resource()'s tri-state return without reaching past the facade into
 # PipelineLockManager directly.
 from services.pipeline_lock_manager import (
+    LOCK_TTL_SECONDS,
     PipelineLockManager,
     PipelineLock,
+    PROCESS_OWNER_ID,
     TouchResult,
     get_pipeline_lock_manager,
+    owner_process_role,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,21 @@ RESOURCE_BOARD_PREFIX = "__resource__"
 # UTF-8 byte count, not a character count -- ext4's limit is byte-based, and
 # resource_name may contain multi-byte characters (see _resource_board).
 MAX_RESOURCE_NAME_BYTES = 150
+
+# How long a resource lock owned by a DIFFERENT kind of process (see
+# recover_orphaned_resource_locks) may go without its liveness being refreshed
+# before startup recovery stops believing its owner is alive.
+#
+# Derived from the Redis TTL rather than restated, because the number that
+# actually matters here is services/project_checkout_lock.py's
+# HEARTBEAT_INTERVAL_SECONDS -- itself REDIS_LOCK_TTL_SECONDS / 4 -- which is how
+# often every held-with-heartbeat context manager in this codebase calls
+# touch_resource() and so resets lock_acquired_at. Three intervals gives a live
+# holder two missed ticks of slack before it is declared dead. Expressed against
+# LOCK_TTL_SECONDS (already imported here) instead of importing that constant
+# directly, because project_checkout_lock imports THIS module -- the import would
+# be circular.
+FOREIGN_OWNER_LIVENESS_GRACE_SECONDS = LOCK_TTL_SECONDS * 0.75
 
 
 class InvalidResourceNameError(ValueError):
@@ -216,42 +235,88 @@ class ProjectResourceLockManager:
             project, self._resource_board(resource_name), issue_number, force=force
         )
 
+    def _foreign_owner_is_plausibly_alive(self, lock: PipelineLock) -> bool:
+        """
+        True when `lock` is stamped with a different process KIND's owner id and
+        its liveness has been refreshed recently enough that that process is
+        plausibly still running -- see FOREIGN_OWNER_LIVENESS_GRACE_SECONDS and
+        recover_orphaned_resource_locks().
+
+        An unparseable/missing lock_acquired_at counts as alive: this decides
+        whether to DISPOSSESS a holder, so the unknown case must fail closed.
+        """
+        try:
+            acquired_at = datetime.fromisoformat(lock.lock_acquired_at.replace('Z', '+00:00'))
+        except Exception:
+            return True
+        if acquired_at.tzinfo is None:
+            acquired_at = acquired_at.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - acquired_at).total_seconds()
+        return age_seconds < FOREIGN_OWNER_LIVENESS_GRACE_SECONDS
+
     def recover_orphaned_resource_locks(self, resource_name: str) -> int:
         """
-        Release every currently-held lock for `resource_name`, across all
-        projects. STARTUP ONLY -- see the caller in main.py.
+        Release the locks for `resource_name`, across all projects, that belong
+        to a DEAD incarnation of the calling process. STARTUP ONLY -- see the
+        callers in main.py and services/observability_server.py.
 
-        Every holder of a resource lock is an in-process operation of the
-        orchestrator that took it (a Claude Code session, an image build), so a
-        freshly-started process has no legitimate holders by construction: any
-        lock still present belongs to the process that died. Nothing else frees
-        them -- main.py's stale-lock recovery iterates configured pipeline
-        BOARDS, and a resource lock lives under the reserved board
-        `__resource__{resource_name}` (see RESOURCE_BOARD_PREFIX), so that loop
-        never sees one -- and PipelineLockManager's own reclamation waits out
-        either its 4-hour staleness heuristic or the 7200s Redis TTL. Until this
-        existed, a crash mid-build left the lock live for up to ~2 hours and made
-        services/work_execution_state.py's post-restart dev-container
+        Nothing else frees these: main.py's stale-lock recovery iterates
+        configured pipeline BOARDS, and a resource lock lives under the reserved
+        board `__resource__{resource_name}` (see RESOURCE_BOARD_PREFIX), so that
+        loop never sees one -- and PipelineLockManager's own reclamation waits
+        out either its 4-hour staleness heuristic or the 7200s Redis TTL. Until
+        this existed, a crash mid-build left the lock live for up to ~2 hours and
+        made services/work_execution_state.py's post-restart dev-container
         reconciliation a guaranteed no-op in exactly the case it was written for
         (#152 review).
 
-        A retained lock (marked by mark_lock_failed for deliberate human
-        recovery) is deliberately NOT released: release_resource() refuses it
-        without force, and force is reserved for scripts/release_lock.py's
-        explicit confirmation flow.
+        Which locks belong to a dead incarnation
+        ----------------------------------------
+        This used to release EVERY non-retained holder, on the premise that
+        "every holder of a resource lock is an in-process operation of the
+        orchestrator that took it, so a freshly-started process has no
+        legitimate holders by construction". That premise was false, and #152
+        WI-7 is what falsified it: docker-compose.yml runs observability-server
+        as its OWN container (`python -m services.observability_server`,
+        separate from the orchestrator's `python main.py`, sharing the same
+        Redis and state mount), and its /api/projects/<p>/rebuild-image handler
+        now holds this very lock for the whole duration of an operator-triggered
+        `docker build` -- minutes to tens of minutes. An orchestrator restart
+        inside that window blanket-released a lock whose holder was very much
+        alive, and the theft was silent: touch_resource() returns NOT_HELD
+        rather than re-acquiring, and the heartbeat only ticks every
+        REDIS_LOCK_TTL_SECONDS/4, so a sub-30-minute build never noticed at all
+        (#152 review, findings 1 and 4).
 
-        The one caller that can legitimately be holding a resource lock across an
-        orchestrator restart is an admin script (scripts/rebuild_project_images.py,
-        scripts/set_dev_container_verified.py) run by hand at the same moment.
-        That is accepted and logged: the operation itself is not interrupted, it
-        just loses its mutual exclusion for the rest of its run, which is strictly
-        better than every project's reconciliation silently doing nothing after
-        every restart.
+        So a lock is only released when its owner is provably not running:
+
+          - `owner_process` names THIS process's own kind (PROCESS_OWNER_ID's
+            role half -- see _derive_process_role). Every such kind is a
+            docker-compose singleton, and this method is startup-only, called
+            before this process has acquired anything: a lock stamped with my
+            own role is therefore my dead predecessor's, whatever its instance
+            id says.
+          - `owner_process` is absent entirely -- a lock written before the
+            stamp existed, i.e. by a process from before this upgrade, which by
+            definition is not the one running now. Preserves the pre-stamp
+            behaviour for the one deploy in which such a row can still exist.
+          - `owner_process` names a DIFFERENT kind (observability-server, an
+            admin script) AND its liveness has not been refreshed within
+            FOREIGN_OWNER_LIVENESS_GRACE_SECONDS. Every held-with-heartbeat
+            context manager in this codebase touches its lock several times
+            inside that window, so a foreign owner that has gone quiet for that
+            long is dead; one that has not is left strictly alone.
+
+        A retained lock (marked by mark_lock_failed for deliberate human
+        recovery) is deliberately NOT released either: release_resource()
+        refuses it without force, and force is reserved for
+        scripts/release_lock.py's explicit confirmation flow.
 
         Returns:
             Number of locks released.
         """
         board = self._resource_board(resource_name)
+        my_role = owner_process_role(PROCESS_OWNER_ID)
         released = 0
         try:
             locks = self._lock_manager.get_all_locks()
@@ -269,11 +334,33 @@ class ProjectResourceLockManager:
                     f"scripts/release_lock.py's deliberate recovery flow may clear it"
                 )
                 continue
-            logger.warning(
-                f"Releasing orphaned '{resource_name}' lock for {lock.project} "
-                f"(held by #{lock.locked_by_issue} since {lock.lock_acquired_at}) -- "
-                f"its holder did not survive the previous orchestrator process"
-            )
+
+            owner_role = owner_process_role(lock.owner_process)
+            if owner_role is not None and owner_role != my_role:
+                if self._foreign_owner_is_plausibly_alive(lock):
+                    logger.info(
+                        f"Leaving '{resource_name}' lock for {lock.project} in place "
+                        f"(holder #{lock.locked_by_issue}, owner {lock.owner_process}) -- "
+                        f"it belongs to a different process than this one ({PROCESS_OWNER_ID}) "
+                        f"and its liveness was refreshed at {lock.lock_acquired_at}, so that "
+                        f"process is still running and the operation it guards is still going"
+                    )
+                    continue
+                logger.warning(
+                    f"Releasing '{resource_name}' lock for {lock.project} owned by "
+                    f"{lock.owner_process} (holder #{lock.locked_by_issue}) -- a different "
+                    f"process than this one ({PROCESS_OWNER_ID}), but its liveness has not "
+                    f"been refreshed since {lock.lock_acquired_at}, well past the "
+                    f"{FOREIGN_OWNER_LIVENESS_GRACE_SECONDS:.0f}s heartbeat grace, so it is "
+                    f"no longer running"
+                )
+            else:
+                logger.warning(
+                    f"Releasing orphaned '{resource_name}' lock for {lock.project} "
+                    f"(held by #{lock.locked_by_issue} since {lock.lock_acquired_at}, owner "
+                    f"{lock.owner_process or 'unknown (pre-stamp)'}) -- its holder did not "
+                    f"survive the previous {my_role} process"
+                )
             try:
                 if self._lock_manager.release_lock(lock.project, board, lock.locked_by_issue):
                     released += 1

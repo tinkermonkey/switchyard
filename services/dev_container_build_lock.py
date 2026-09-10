@@ -202,12 +202,15 @@ What that skip is NOT is self-healing on its own, and two review rounds on
     (PipelineLockManager only reclaims it after its 4-hour staleness heuristic
     or the 7200s TTL), and a dead holder writes nothing, ever. That is exactly
     the crash-during-build case the reconciliation exists for, so the skip was
-    not occasional there -- it was deterministic. main.py now recovers this
-    resource's orphaned locks at startup, BEFORE
+    not occasional there -- it was deterministic. main.py now recovers the
+    orphaned locks of THIS process's own dead predecessor at startup, BEFORE
     cleanup_stuck_in_progress_states() runs, so the acquire succeeds (see
-    ProjectResourceLockManager.recover_orphaned_resource_locks); and when it
-    still does not, that reconciliation leaves its execution record
-    `in_progress` for the next sweep to retry rather than consuming it.
+    ProjectResourceLockManager.recover_orphaned_resource_locks -- it is
+    deliberately not a blanket release, since observability-server runs as its
+    own container and legitimately holds this lock across an orchestrator
+    restart); and when the acquire still does not succeed, that reconciliation
+    leaves its execution record `in_progress` for the next sweep to retry
+    rather than consuming it.
   - "Not acquired" is not always contention at all. try_acquire_lock() also
     fails CLOSED on unknown/degraded lock state (both stores unreadable, the
     YAML-fallback acquire guard unavailable) and refuses a retained lock from

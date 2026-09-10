@@ -11,7 +11,9 @@ import yaml
 import redis
 import logging
 import os
+import sys
 import threading
+import uuid
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
@@ -30,6 +32,53 @@ logger = logging.getLogger(__name__)
 # there rather than restated, and asserted against in
 # tests/unit/services/test_project_checkout_lock.py.
 LOCK_TTL_SECONDS = 7200
+
+
+def _derive_process_role() -> str:
+    """
+    Name the KIND of process this is, from its entry point.
+
+    docker-compose.yml runs each long-lived orchestrator process as its own
+    container with its own `command:` -- `python main.py` (the orchestrator),
+    `python -m services.observability_server` (the API/rebuild server) -- and
+    the hand-run admin scripts are their own entry points again
+    (scripts/rebuild_project_images.py, scripts/set_dev_container_verified.py).
+    sys.argv[0] is the script path in every one of those cases (`python -m pkg.mod`
+    sets argv[0] to the module's own file), so its basename is a stable, automatic
+    name for the process kind with nothing to keep in sync by hand.
+
+    Used by PROCESS_OWNER_ID below, whose only consumer is
+    ProjectResourceLockManager.recover_orphaned_resource_locks() -- see that
+    method for why the KIND, not just the instance, is the part that matters.
+    """
+    try:
+        entry = sys.argv[0] if sys.argv else ''
+    except Exception:  # pragma: no cover -- sys.argv is always present in practice
+        entry = ''
+    return Path(entry).name or 'unknown'
+
+
+# Identity of THIS process incarnation, stamped onto every lock it acquires
+# (PipelineLock.owner_process). Two halves, both load-bearing:
+#
+#   <role>#<instance>
+#
+# `role` names the process KIND (see _derive_process_role). Every one of those
+# kinds is a singleton -- docker-compose runs exactly one orchestrator container
+# and one observability-server container -- so "a lock owned by MY role that I
+# did not acquire" is provably a dead predecessor of mine, while "a lock owned
+# by a DIFFERENT role" may well be a live peer.
+#
+# `instance` distinguishes two incarnations of the same role, so a log line can
+# say which one.
+PROCESS_OWNER_ID = f"{_derive_process_role()}#{uuid.uuid4().hex[:12]}"
+
+
+def owner_process_role(owner_process: Optional[str]) -> Optional[str]:
+    """Role half of an owner_process stamp (see PROCESS_OWNER_ID), or None."""
+    if not owner_process:
+        return None
+    return owner_process.split('#', 1)[0] or None
 
 
 class TouchResult(Enum):
@@ -82,6 +131,16 @@ class PipelineLock:
     # off Elasticsearch after 7 days.
     retained_reason: Optional[str] = None
     retained_at: Optional[str] = None
+    # Which process incarnation acquired this lock (PROCESS_OWNER_ID at the time
+    # of acquisition). Deliberately defaults to None rather than to the CURRENT
+    # process: a lock deserialized from a Redis hash or a YAML file written
+    # before this field existed must read back as "owner unknown", not as
+    # "owned by whoever happens to be reading it".
+    #
+    # Read by ProjectResourceLockManager.recover_orphaned_resource_locks(), which
+    # cannot otherwise tell a lock left behind by its own dead predecessor from
+    # one a live sibling process is holding right now -- see that method.
+    owner_process: Optional[str] = None
 
     def __post_init__(self):
         # Normalize a whitespace-only or empty retained_reason to None at the
@@ -172,6 +231,7 @@ class PipelineLockManager:
             lock_status=lock_data['lock_status'],
             retained_reason=(lock_data.get('retained_reason') or None),
             retained_at=(lock_data.get('retained_at') or None),
+            owner_process=(lock_data.get('owner_process') or None),
         )
 
     def _read_redis_lock_only(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
@@ -418,7 +478,8 @@ class PipelineLockManager:
                                     board=board,
                                     locked_by_issue=issue_number,
                                     lock_acquired_at=datetime.now(timezone.utc).isoformat(),
-                                    lock_status='locked'
+                                    lock_status='locked',
+                                    owner_process=PROCESS_OWNER_ID,
                                 )
                                 
                                 pipe.multi()
@@ -606,7 +667,8 @@ class PipelineLockManager:
             board=board,
             locked_by_issue=issue_number,
             lock_acquired_at=datetime.now(timezone.utc).isoformat(),
-            lock_status='locked'
+            lock_status='locked',
+            owner_process=PROCESS_OWNER_ID,
         )
         self._save_lock_to_yaml(lock)
 
@@ -628,7 +690,8 @@ class PipelineLockManager:
             board=board,
             locked_by_issue=issue_number,
             lock_acquired_at=datetime.now(timezone.utc).isoformat(),
-            lock_status='locked'
+            lock_status='locked',
+            owner_process=PROCESS_OWNER_ID,
         )
 
         # Write to Redis with 2 hour TTL
@@ -740,6 +803,12 @@ class PipelineLockManager:
             # of protection.
             retained_reason=lock.retained_reason,
             retained_at=lock.retained_at,
+            # Preserved, not re-stamped: a heartbeat always runs in the holding
+            # process, so re-stamping would normally be a no-op -- but a touch
+            # that ever ran anywhere else must not silently re-attribute the
+            # lock and make a live foreign holder look like this process's own
+            # dead predecessor to recover_orphaned_resource_locks().
+            owner_process=lock.owner_process,
         )
 
         redis_ok = False

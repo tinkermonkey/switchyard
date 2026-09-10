@@ -159,6 +159,70 @@ class TestFailuresAreRecordedNotDropped:
         service.es.update.assert_not_called()
 
 
+class TestANewAttemptSupersedesThePreviousOnesError:
+    """
+    #152 review: _record_analysis_failure() writes `analysis_error` and
+    deliberately never writes `summary`, so the run stays re-analysable -- but
+    nothing cleared that error when a NEW attempt started. POST
+    /api/pipeline-run/<id>/analyze just fires the analysis and returns, and the
+    endpoint now serves a non-null `analysis` payload whenever analysis_error is
+    set, which the UI's 5-second poll stops on. So an operator who re-triggered a
+    failed analysis saw the OLD failure rendered seconds later, the spinner
+    cleared and the poll cancelled -- and never learned that the retry succeeded
+    minutes afterwards. That is a worse form of the "operator loop never closes"
+    symptom the surrounding change set exists to fix.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_previous_errors_marker_is_cleared_when_the_attempt_starts(self):
+        service = _service()
+        service.es.search.return_value = _es_hit(
+            {"summary": "", "project": "p", "analysis_error": "TimeoutError: an earlier attempt"}
+        )
+
+        started = []
+        with patch('claude.claude_integration.run_claude_code', new_callable=AsyncMock) as mock_run:
+            async def _capture(*args, **kwargs):
+                # Whatever the document says WHILE the attempt is in flight is
+                # what a polling UI reads, so that is what this asserts on.
+                started.append([c.kwargs['body']['doc'] for c in service.es.update.call_args_list])
+                return "no delimiters here"
+            mock_run.side_effect = _capture
+            await service._run_analysis_inner("run-1", "2026-01-01T00:00:00")
+
+        assert started, "run_claude_code was never reached"
+        assert started[0][-1]['analysis_error'] is None
+        assert started[0][-1]['analysis_attempted_at']
+
+    @pytest.mark.asyncio
+    async def test_the_clear_never_marks_the_run_analysed(self):
+        """It must not write `summary`: _already_analyzed() keys off that, and a
+        run marked analysed by its own retry could never be retried again."""
+        service = _service()
+        service.es.search.return_value = _es_hit(
+            {"summary": "", "project": "p", "analysis_error": "TimeoutError: an earlier attempt"}
+        )
+
+        with patch('claude.claude_integration.run_claude_code', new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = "no delimiters here"
+            await service._run_analysis_inner("run-1", "2026-01-01T00:00:00")
+
+        first_doc = service.es.update.call_args_list[0].kwargs['body']['doc']
+        assert 'summary' not in first_doc
+        assert first_doc['analysis_error'] is None
+
+    @pytest.mark.asyncio
+    async def test_an_already_summarised_run_writes_nothing_at_all(self):
+        """The clear sits AFTER the already-analysed check, so a skipped run is
+        still untouched."""
+        service = _service()
+        service.es.search.return_value = _es_hit({"summary": "done already", "project": "p"})
+
+        await service._run_analysis_inner("run-1", "2026-01-01T00:00:00")
+
+        service.es.update.assert_not_called()
+
+
 class TestTheRecordedFailureIsRetrievable:
     """
     #152 review: writing `analysis_error` is only half the fix. The only surface

@@ -111,6 +111,24 @@ class PipelineRunAnalysisService:
 
         logger.info(f"pipeline_run_analysis: starting analysis for run {run_id}")
 
+        # Clear the PREVIOUS attempt's failure marker now that a new attempt is
+        # genuinely under way, so `analysis_error` always describes the attempt in
+        # flight rather than a dead one. Without this, a re-analysis triggered
+        # after a failure had the old error still on the document: the UI's poll
+        # reads the run every 5s and stops on the first non-null `analysis`
+        # payload, so it rendered the stale "Analysis failed — ...", cleared its
+        # spinner and cancelled the poll seconds after the operator asked for the
+        # retry -- then never learned that the retry succeeded minutes later
+        # (#152 review). _update_es_document() clearing it on SUCCESS is not
+        # enough; the window that matters is the one before that.
+        self._merge_into_run_document(
+            run_id,
+            {
+                "analysis_error": None,
+                "analysis_attempted_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
         prompt = self._build_prompt(run_id)
         context = self._build_context(run_id, (source or {}).get("project"))
 

@@ -278,7 +278,11 @@ async def main():
     workspace_manager.prune_epic_worktrees()
     logger.info("Epic worktree prune complete")
 
-    # Release dev_container_build locks left behind by the process that died.
+    # Release dev_container_build locks left behind by THIS process's own dead
+    # predecessor -- not every holder: observability-server runs as its own
+    # container and legitimately holds this lock across an orchestrator restart
+    # while an operator-triggered rebuild is building. See
+    # recover_orphaned_resource_locks() for how the two are told apart.
     # MUST run BEFORE cleanup_stuck_in_progress_states() below: that sweep
     # reconciles a project's dev container state under this very lock, and a
     # crash mid-build is both the reason it has work to do AND the reason the

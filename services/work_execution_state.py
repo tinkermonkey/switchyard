@@ -64,10 +64,11 @@ def _transition_dev_container_state(
 
       - Right after a restart, the lock of the process that died is still in
         Redis under its own TTL, and a dead holder never writes a fresher status.
-        That case is now removed at the source -- main.py releases this
-        resource's orphaned locks BEFORE this sweep runs (see
-        ProjectResourceLockManager.recover_orphaned_resource_locks) -- and, for
-        whatever is left, by the caller retrying rather than consuming the record.
+        That case is now removed at the source -- main.py releases the locks left
+        by its OWN dead predecessor BEFORE this sweep runs (see
+        ProjectResourceLockManager.recover_orphaned_resource_locks, which leaves
+        a live cross-process holder's lock alone) -- and, for whatever is left,
+        by the caller retrying rather than consuming the record.
       - "Not acquired" is not always contention: try_acquire_lock() also fails
         closed on unknown/degraded lock state. dev_container_build_lock's
         _log_skipped() reports those at ERROR with the real reason instead of
@@ -2909,12 +2910,23 @@ class WorkExecutionStateTracker:
 
                                     # Special handling for dev_environment_setup agent failures
                                     # Reset to UNVERIFIED so setup can be retried automatically
-                                    if agent == 'dev_environment_setup':
+                                    #
+                                    # Gated on `recovered`, exactly like the verifier block
+                                    # above it. The non-recovered case is ALREADY handled, ~100
+                                    # lines earlier and correctly: that transition carries
+                                    # skip_when=(VERIFIED,) because a stuck record says nothing
+                                    # about an image a LATER setup+verify has since verified.
+                                    # Without this gate the same loop iteration wrote the state
+                                    # twice, and this second, unguarded write silently undid the
+                                    # guard -- the lock cannot help, both writes being the same
+                                    # process, the same sweep, sequential acquisitions. A stale
+                                    # in_progress record therefore reset a healthy VERIFIED
+                                    # project to UNVERIFIED, refusing every task for it until a
+                                    # redundant setup ran (#152 review). A RECOVERED failure is
+                                    # different: it is this record's own verdict, read back from
+                                    # the run's real result, so it gets no skip_when.
+                                    if agent == 'dev_environment_setup' and recovered:
                                         from services.dev_container_state import DevContainerStatus
-                                        # No skip_when: resetting a failed setup to UNVERIFIED
-                                        # so it retries is right whatever the current status
-                                        # says. As above, the lock is what stops it landing on
-                                        # top of an in-flight build.
                                         _transition_dev_container_state(
                                             project_name,
                                             DevContainerStatus.UNVERIFIED,

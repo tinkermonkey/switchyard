@@ -145,6 +145,98 @@ class DevContainerStateManager:
         except Exception as e:
             logger.error(f"Failed to save dev container state for {project_name}: {e}")
 
+    def set_pending_operation(self, project_name: str, operation: str) -> None:
+        """
+        Record that `operation` has been REQUESTED for this project but has not
+        started yet, without touching `status`.
+
+        Exists because an operator-triggered rebuild does not begin when the
+        request is accepted: services/observability_server.py's
+        /api/projects/<p>/rebuild-image answers {"success": true, "triggered":
+        true} immediately and its worker thread then waits up to
+        REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS for the dev_container_build lock,
+        marking IN_PROGRESS only once it has it (a rebuild that never gets the
+        lock must not leave the project claiming a build is under way). This
+        state file is that request's ONLY feedback channel -- mcp/server.py's
+        get_image_build_status reads it directly -- so for the whole wait a
+        caller polling it read the project's PRE-EXISTING status, commonly
+        'verified', and concluded the rebuild had already finished (#152
+        review). This gives the waiting phase its own representation instead of
+        leaving the previous status to speak for it.
+
+        Deliberately NOT a DevContainerStatus value: 'queued' is orthogonal to
+        the image's actual state (the image really is still verified while a
+        rebuild waits), and every `status ==` branch in the codebase would have
+        to learn about it.
+        """
+        self._merge_state(
+            project_name,
+            {
+                'pending_operation': operation,
+                'pending_operation_at': datetime.now().isoformat(),
+            },
+        )
+
+    def clear_pending_operation(self, project_name: str) -> None:
+        """
+        Clear the marker set by set_pending_operation() -- the requested
+        operation has either started (and now owns `status`) or been dropped.
+        """
+        self._merge_state(project_name, {'pending_operation': None, 'pending_operation_at': None})
+
+    def get_pending_operation(self, project_name: str) -> Optional[Dict[str, str]]:
+        """
+        The operation requested but not yet started for this project, as
+        {'operation': ..., 'requested_at': ...}, or None.
+        """
+        state_file = self.get_state_file(project_name)
+
+        if not state_file.exists():
+            return None
+
+        try:
+            with open(state_file, 'r') as f:
+                state = yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Failed to read dev container pending operation for {project_name}: {e}")
+            return None
+
+        operation = state.get('pending_operation')
+        if not operation:
+            return None
+        return {'operation': operation, 'requested_at': state.get('pending_operation_at')}
+
+    def _merge_state(self, project_name: str, updates: Dict) -> None:
+        """
+        Read-modify-write the project's state file, applying `updates` and
+        deleting any key whose new value is None. Used by the pending-operation
+        markers, which must not disturb `status`/`updated_at` the way
+        set_status() does.
+        """
+        state_file = self.get_state_file(project_name)
+
+        if state_file.exists():
+            try:
+                with open(state_file, 'r') as f:
+                    state = yaml.safe_load(f) or {}
+            except Exception as e:
+                logger.warning(f"Failed to read existing state, creating new: {e}")
+                state = {}
+        else:
+            state = {}
+
+        for key, value in updates.items():
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+
+        try:
+            with open(state_file, 'w') as f:
+                yaml.dump(state, f, default_flow_style=False)
+        except Exception as e:
+            logger.error(f"Failed to save dev container state for {project_name}: {e}")
+
     def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
         """
         Get the timestamp of the last status update for a project's dev container.

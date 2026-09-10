@@ -137,6 +137,90 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
         }
 
 
+def _dev_setup_in_flight_reason(project: str, logger) -> Optional[str]:
+    """
+    Describe the dev_environment_setup run that is genuinely still alive for
+    `project`, or None if none is.
+
+    The IN_PROGRESS staleness window (STALE_IN_PROGRESS_MINUTES) measures the
+    wall-clock age of the last status WRITE, and nothing refreshes that
+    timestamp while a setup is queued or running: queue_dev_environment_setup()
+    stamps IN_PROGRESS at ENQUEUE time, ORCHESTRATOR_WORKERS defaults to 1, and
+    dev_environment_setup is configured timeout: 3600 precisely because image
+    builds legitimately run long. So the window routinely elapses over a setup
+    that is merely slow or still waiting for a worker, and treating that as
+    "the run it would defer to is not coming back" queued a duplicate every 20
+    minutes -- each one later serializing behind the real build on the
+    dev_container_build lock, running a full redundant Claude-driven rebuild,
+    flipping the project back to IN_PROGRESS and re-deferring every task for it
+    (#152 review).
+
+    These three probes are the liveness signal that age is not. Each is
+    independently sufficient, and a probe that RAISES counts as "cannot rule out
+    a live run": re-queueing wrongly costs an hour-scale redundant agent run,
+    while skipping wrongly costs one 30-second sweep, since every caller of this
+    is itself retried.
+    """
+    from task_queue.task_manager import TaskQueue
+
+    # 1. Still sitting in the queue, never dequeued. Automated setup tasks are
+    #    always enqueued with issue_number 0 (see below and main.py's startup
+    #    queueing), so the agent+project pair identifies them.
+    try:
+        pending = TaskQueue(use_redis=True).get_pending_tasks(agent='dev_environment_setup')
+        for task in pending:
+            if task.project == project:
+                return f"a dev_environment_setup task ({task.id}) is still queued"
+    except Exception as e:
+        logger.warning(
+            f"Could not check the task queue for a pending dev_environment_setup for "
+            f"{project}: {e} - assuming one may be queued rather than risk a duplicate"
+        )
+        return "the task queue could not be checked"
+
+    # 2. Dequeued and running: an execution record still marked in_progress.
+    try:
+        from services.work_execution_state import work_execution_tracker
+        state = work_execution_tracker.load_state(project, 0)
+        for execution in state.get('execution_history', []):
+            if (
+                execution.get('agent') == 'dev_environment_setup'
+                and execution.get('outcome') == 'in_progress'
+            ):
+                return (
+                    f"a dev_environment_setup execution started "
+                    f"{execution.get('timestamp')} is still in progress"
+                )
+    except Exception as e:
+        logger.warning(
+            f"Could not check execution state for a running dev_environment_setup for "
+            f"{project}: {e} - assuming one may be running rather than risk a duplicate"
+        )
+        return "the execution state could not be checked"
+
+    # 3. Building. The setup session's own `docker build` holds this for the whole
+    #    build window, which is the part that outlasts the staleness window most
+    #    often -- and a held lock means a build genuinely IS running, whoever
+    #    started it.
+    try:
+        from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
+        from services.project_resource_lock_manager import ProjectResourceLockManager
+        lock = ProjectResourceLockManager().get_resource_lock(project, DEV_CONTAINER_BUILD_RESOURCE)
+        if lock and not lock.retained_reason:
+            return (
+                f"the dev_container_build lock has been held since "
+                f"{lock.lock_acquired_at}, so a build is running"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Could not check the dev_container_build lock for {project}: {e} - "
+            f"assuming a build may be running rather than risk a duplicate"
+        )
+        return "the dev_container_build lock could not be checked"
+
+    return None
+
+
 async def queue_dev_environment_setup(project: str, logger, change_description: str = "", pipeline_run_id: str = None, cycle_stack: list = None):
     """
     Queue a dev_environment_setup task for a project.
@@ -180,9 +264,21 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         if not is_stale:
             logger.info(f"Dev environment setup already in progress for {project}, skipping duplicate queue")
             return
+        # Age alone does not mean the run is gone -- nothing refreshes the status
+        # timestamp while a setup is queued or building, so the window elapses over
+        # healthy slow runs too. Only re-queue once no live run can be found.
+        in_flight = _dev_setup_in_flight_reason(project, logger)
+        if in_flight:
+            logger.info(
+                f"Dev environment setup for {project} has been IN_PROGRESS since "
+                f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes), but "
+                f"{in_flight} - skipping duplicate queue"
+            )
+            return
         logger.warning(
             f"Dev environment setup for {project} has been IN_PROGRESS since "
-            f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes) - "
+            f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes) with no "
+            f"queued task, no running execution and no build holding the lock - "
             f"queuing a fresh setup rather than deferring to a run that is not coming back"
         )
 
