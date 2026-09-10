@@ -232,13 +232,30 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 # budget services/cancellation.py gives the same query.
 _CONTAINER_PROBE_TIMEOUT_SECONDS = 10
 
+# The label every managed container carries recording whether its working
+# directory IS the project's shared base clone -- the one directory this lock
+# protects -- or an isolated epic worktree, which shares nothing with it.
+# Stamped by claude/docker_runner.py's _build_docker_command() from the same
+# is_base_clone_dir() predicate claude_integration.py uses to decide whether to
+# take this lock at all, and unconditionally 'true' by
+# services/project_monitor.py's repair-cycle launch (that container mounts the
+# base clone at its conventional path regardless of where its own work
+# happens). Read by the survivor probe below -- see there for why a MISSING
+# value counts as base-clone-scoped.
+BASE_CLONE_LABEL = 'org.switchyard.base_clone'
+
+# Separator between the two fields the probe's `docker ps --format` asks for.
+# Legal in neither a container name (docker restricts those to
+# [a-zA-Z0-9][a-zA-Z0-9_.-]*) nor in the label's own 'true'/'false' values.
+_PROBE_FIELD_SEPARATOR = '|'
+
 
 def project_has_live_agent_container(project: str) -> bool:
     """
-    True when a container launched for `project` is still running -- the probe
-    main.py hands recover_orphaned_resource_locks() so that startup does not
-    release a project_checkout lock whose guarded work survived the restart
-    (#169 review).
+    True when a container launched for `project` that could be working IN ITS
+    SHARED BASE CLONE is still running -- the probe main.py hands
+    recover_orphaned_resource_locks() so that startup does not release a
+    project_checkout lock whose guarded work survived the restart (#169 review).
 
     A dead holding PROCESS does not mean dead guarded WORK for this resource:
     claude/claude_integration.py holds this lock across
@@ -257,16 +274,43 @@ def project_has_live_agent_container(project: str) -> bool:
     narrowed to agent containers: a repair-cycle container works in the same
     checkout, and this is a "leave it alone" test, not an attribution.
 
-    Fails CLOSED (True) when Docker cannot be reached at all: the caller uses
-    this to decide whether to dispossess a lock holder, and a docker socket that
-    is not answering says nothing about what is running behind it.
+    Narrowed to the base clone, though (#171 review). Those sibling queries all
+    add org.switchyard.issue_number, because they ask about ONE dispatch's
+    containers; this one cannot -- project_checkout mints a synthetic unique
+    holder id rather than storing a real issue number (see this module's
+    docstring), so lock.locked_by_issue names nothing to filter on. Left at
+    org.switchyard.project alone, the question it answered was "is ANY managed
+    container running for this project", and the overwhelmingly common such
+    container is an epic-worktree-scoped agent run, which
+    project_checkout_lock_if_shared_async() deliberately never locks and which
+    touches no directory this lock protects. A True for one of those re-created
+    exactly the no-op this sweep exists to remove: initialize_project() would
+    burn its 120s checkout wait, prune_epic_worktrees() would skip the project,
+    and every base-clone-scoped dispatch would poll a dead row until the
+    7200s-14400s TTL/staleness window lapsed -- and a surviving container is the
+    NORMAL restart shape (it is why agent_container_recovery.py exists at all).
+    So the answer is narrowed by BASE_CLONE_LABEL to containers that can
+    actually be inside the base clone.
+
+    Fails CLOSED (True) in both directions that matter, because the caller uses
+    this to decide whether to dispossess a lock holder:
+
+      - Docker cannot be reached, or answers non-zero: a socket that is not
+        answering says nothing about what is running behind it.
+      - A container carries no BASE_CLONE_LABEL at all: it was started by a
+        process from before that label existed (i.e. by exactly the crashed
+        predecessor whose locks this sweep is reading), so its working
+        directory is unknown and must be assumed shared. Only an explicit
+        'false' -- a container this build stamped as worktree-scoped -- is
+        treated as unable to touch the base clone.
     """
     try:
         result = subprocess.run(
             [
                 'docker', 'ps',
                 '--filter', f'label=org.switchyard.project={project}',
-                '--format', '{{.Names}}',
+                '--format',
+                '{{.Names}}' + _PROBE_FIELD_SEPARATOR + '{{.Label "' + BASE_CLONE_LABEL + '"}}',
             ],
             capture_output=True,
             text=True,
@@ -288,13 +332,30 @@ def project_has_live_agent_container(project: str) -> bool:
         )
         return True
 
-    containers = [name for name in result.stdout.strip().split('\n') if name]
-    if containers:
+    base_clone_containers: List[str] = []
+    worktree_containers: List[str] = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        name, _, base_clone = line.partition(_PROBE_FIELD_SEPARATOR)
+        if base_clone.strip().lower() == 'false':
+            worktree_containers.append(name)
+        else:
+            base_clone_containers.append(name)
+
+    if worktree_containers:
         logger.info(
-            f"Project {project!r} still has {len(containers)} container(s) running from "
-            f"before this process started: {', '.join(containers)}"
+            f"Ignoring {len(worktree_containers)} surviving {project!r} container(s) working "
+            f"in an isolated epic worktree, which the '{RESOURCE_NAME}' lock does not protect: "
+            f"{', '.join(worktree_containers)}"
         )
-    return bool(containers)
+    if base_clone_containers:
+        logger.info(
+            f"Project {project!r} still has {len(base_clone_containers)} container(s) running "
+            f"from before this process started that may be working in its shared base clone: "
+            f"{', '.join(base_clone_containers)}"
+        )
+    return bool(base_clone_containers)
 
 # Seeds _mint_unique_holder_id()'s counter so it differs across process
 # restarts, not just within one process's lifetime. Found in code review: a

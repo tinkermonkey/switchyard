@@ -411,6 +411,14 @@ def _launch_repair_cycle_container(
             '--label', f'org.switchyard.issue_number={issue_number}',
             '--label', f'org.switchyard.pipeline_run_id={pipeline_run_id}',
             '--label', f'org.switchyard.execution_type=repair_cycle',
+            # Unconditionally true, unlike an agent container's own derived value
+            # (#171 review): this container mounts the base clone at its
+            # conventional /workspace/<project> path below no matter where
+            # project_dir points, precisely so base-clone-scoped git operations
+            # inside it still work. project_checkout_lock's startup survivor probe
+            # reads this to decide whether a survivor could be inside the
+            # directory that lock protects, and for this one it can.
+            '--label', f'org.switchyard.base_clone=true',
 
             # Volume mounts
             # Mount orchestrator code (live code for development)

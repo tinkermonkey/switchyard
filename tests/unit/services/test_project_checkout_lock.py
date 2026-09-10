@@ -1947,10 +1947,10 @@ class TestProjectHasLiveAgentContainer(unittest.TestCase):
         result.stderr = stderr
         return result
 
-    def test_a_surviving_container_reports_the_work_as_alive(self):
+    def test_a_surviving_base_clone_container_reports_the_work_as_alive(self):
         with patch.object(
             project_checkout_lock.subprocess, 'run',
-            return_value=self._docker_ps(stdout="claude-agent-proj-task1\n"),
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|true\n"),
         ) as run:
             self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
 
@@ -1987,6 +1987,70 @@ class TestProjectHasLiveAgentContainer(unittest.TestCase):
         args = run.call_args[0][0]
         self.assertIn('label=org.switchyard.project=other-project', args)
         self.assertNotIn('label=org.switchyard.project=proj', args)
+
+    def test_it_asks_docker_for_the_base_clone_label(self):
+        """#171 review: the answer has to distinguish a survivor that could be
+        inside the base clone from one that provably cannot, so the query must
+        bring that label back alongside the name."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run', return_value=self._docker_ps(stdout="")
+        ) as run:
+            project_checkout_lock.project_has_live_agent_container("proj")
+
+        args = run.call_args[0][0]
+        fmt = args[args.index('--format') + 1]
+        self.assertIn('{{.Names}}', fmt)
+        self.assertIn(project_checkout_lock.BASE_CLONE_LABEL, fmt)
+        self.assertIn(project_checkout_lock._PROBE_FIELD_SEPARATOR, fmt)
+
+    def test_a_worktree_scoped_survivor_does_not_hold_the_base_clone(self):
+        """#171 review, the finding this narrowing exists for. An epic-worktree
+        agent run never took this lock (project_checkout_lock_if_shared_async()
+        skips it) and shares no directory with the base clone, so counting it
+        would leave a dead lock row in place for the whole 7200s-14400s
+        TTL/staleness window -- turning initialize_project()'s 120s wait and
+        prune_epic_worktrees()'s bounded wait back into the guaranteed no-op
+        this sweep exists to remove, in the ordinary restart shape."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(
+                stdout="claude-agent-proj-task1|false\nclaude-agent-proj-task2|false\n"
+            ),
+        ):
+            self.assertFalse(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_one_base_clone_survivor_among_worktree_ones_still_holds_it(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(
+                stdout="claude-agent-proj-task1|false\nclaude-agent-proj-task2|true\n"
+            ),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_an_unlabelled_survivor_fails_closed(self):
+        """A container started before this label existed -- i.e. by exactly the
+        crashed predecessor whose locks this sweep reads -- has an unknown
+        working directory, and only an explicit 'false' may dispossess a
+        holder."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_an_unrecognized_label_value_fails_closed(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|maybe\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
 
 
 if __name__ == '__main__':

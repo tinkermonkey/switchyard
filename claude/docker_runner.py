@@ -1330,6 +1330,34 @@ class DockerAgentRunner:
             return f'{host_workspace}/switchyard/{container_path[len("/app/"):]}'
         return container_path
 
+    @staticmethod
+    def _is_base_clone_label(context: Dict[str, Any], project_dir: Path) -> str:
+        """'true'/'false' for the org.switchyard.base_clone label -- does this
+        container's mounted working directory IS the project's shared base clone,
+        rather than one of the isolated epic worktrees that share nothing with it?
+
+        Fails CLOSED ('true') on anything it cannot answer, matching
+        is_base_clone_dir()'s own fail-closed contract and for the same reason
+        one level up: the only consumer (project_checkout_lock's startup survivor
+        probe) uses a 'false' to decide that a surviving container cannot be
+        holding the base clone, so an unknown must never read as 'false'.
+
+        Function-local import, matching the module's other project_workspace
+        imports: services/project_workspace.py imports this module's package.
+        """
+        try:
+            from services.project_workspace import workspace_manager
+            project = context.get('project')
+            if not project:
+                return 'true'
+            return 'true' if workspace_manager.is_base_clone_dir(project, project_dir) else 'false'
+        except Exception as e:
+            logger.warning(
+                f"Could not determine whether {project_dir} is the shared base clone: {e} "
+                "- labelling the container org.switchyard.base_clone=true (fail closed)"
+            )
+            return 'true'
+
     def _build_docker_command(
         self,
         container_name: str,
@@ -1418,7 +1446,19 @@ class DockerAgentRunner:
             '--label', f'org.switchyard.agent={agent}',
             '--label', f'org.switchyard.task_id={context.get("task_id", "unknown")}',
             '--label', f'org.switchyard.execution_type={execution_type_label}',
-            '--label', 'org.switchyard.managed=true'
+            '--label', 'org.switchyard.managed=true',
+            # Whether this run's mounted working directory IS the project's
+            # shared base clone or an isolated epic worktree (#171 review).
+            # Read at startup by project_checkout_lock's survivor probe, which
+            # must decide whether a container that outlived the previous
+            # orchestrator process could still be working inside the directory a
+            # surviving project_checkout lock protects -- without it, every
+            # worktree-scoped survivor (the common case) pinned that project's
+            # base clone for a whole TTL window. Derived from the same
+            # is_base_clone_dir() predicate claude_integration.py uses to decide
+            # whether to take that lock around this very call, on the same
+            # project_dir, so label and lock cannot disagree.
+            '--label', f'org.switchyard.base_clone={self._is_base_clone_label(context, project_dir)}',
         ])
 
         # Add optional labels if available

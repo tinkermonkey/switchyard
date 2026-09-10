@@ -239,7 +239,11 @@ async def main():
     # `git pull --ff-only` and to prune_epic_worktrees()'s .git/worktrees
     # rewrite while the adopted agent is still working in it -- and both of
     # those run BEFORE anything here has enumerated which containers survived.
-    # See project_has_live_agent_container().
+    # That probe asks only about survivors that could be inside the BASE CLONE
+    # (org.switchyard.base_clone) -- an epic-worktree-scoped survivor, which is
+    # the common one, never held this lock and shares no directory with it, so
+    # counting it would restore the very no-op described above. See
+    # project_has_live_agent_container().
     logger.info("Recovering orphaned project_checkout resource locks")
     from services.project_checkout_lock import (
         RESOURCE_NAME as PROJECT_CHECKOUT_RESOURCE,
