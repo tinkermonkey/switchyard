@@ -47,7 +47,11 @@ from services.pipeline_lock_manager import PipelineLockManager, TouchResult
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services import project_checkout_lock
 from services.dev_container_build_lock import (
+    agent_holds_build_window,
+    BUILD_WINDOW_AGENTS,
     dev_container_build_lock_async,
+    dev_container_build_lock_if_free_async,
+    dev_container_build_lock_if_free_sync,
     dev_container_build_lock_sync,
     DevContainerBuildLockTimeoutError,
     RESOURCE_NAME,
@@ -653,3 +657,151 @@ class TestAsyncPathSharesTheEventLoopFixes:
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBuildWindowAgentGate(unittest.TestCase):
+    """
+    #152 item B: which agents this lock is acquired FOR. The gate used to be
+    claude_integration's `use_docker=False` branch, which five non-building
+    callers also reach -- see agent_holds_build_window()'s docstring and
+    tests/unit/test_claude_integration_dev_container_lock_gating.py for the
+    call-site regression coverage.
+    """
+
+    def test_only_the_two_build_agents_are_members(self):
+        self.assertEqual(
+            BUILD_WINDOW_AGENTS,
+            frozenset({"dev_environment_setup", "dev_environment_verifier"}),
+        )
+
+    def test_predicate_matches_the_set(self):
+        for agent in BUILD_WINDOW_AGENTS:
+            self.assertTrue(agent_holds_build_window(agent))
+        for agent in ("pipeline_analysis", "strategy_generator", "unknown", None, ""):
+            self.assertFalse(agent_holds_build_window(agent))
+
+
+class TestIfFreeSyncVariant(unittest.TestCase):
+    """
+    #152 item A: the non-blocking variant used by bookkeeping writers of
+    dev_container_state that own no build window (see this module's docstring,
+    "Bookkeeping writers"). Never waits, never raises a lock timeout, and yields
+    whether the lock was actually taken.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.facade = _make_facade(self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_yields_true_and_releases_when_free(self):
+        with dev_container_build_lock_if_free_sync("proj", 7, facade=self.facade) as acquired:
+            self.assertTrue(acquired)
+            lock = self.facade.get_resource_lock("proj", RESOURCE_NAME)
+            self.assertIsNotNone(lock)
+            self.assertLess(lock.locked_by_issue, 0)
+
+        self.assertIsNone(self.facade.get_resource_lock("proj", RESOURCE_NAME))
+
+    def test_yields_false_without_waiting_when_busy(self):
+        """The whole point: a startup reconciliation must not block behind a
+        build (or behind the dead previous process's still-TTL'd lock)."""
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)  # never released
+
+        start = time.monotonic()
+        with dev_container_build_lock_if_free_sync("proj", 7, facade=self.facade) as acquired:
+            self.assertFalse(acquired)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 1.0)
+        # The other holder's lock is untouched -- nothing stolen, nothing released.
+        self.assertEqual(self.facade.get_resource_lock("proj", RESOURCE_NAME).locked_by_issue, 1)
+
+    def test_does_not_raise_a_lock_timeout_when_busy(self):
+        """Contention is the expected outcome here, not a failure. Raising
+        DevContainerBuildLockTimeoutError would misreport it to every consumer
+        of services/resource_lock_errors.is_lock_timeout_error()."""
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
+        try:
+            with dev_container_build_lock_if_free_sync("proj", facade=self.facade):
+                pass
+        except DevContainerBuildLockTimeoutError:  # pragma: no cover
+            self.fail("non-blocking variant must not raise a lock timeout")
+
+    def test_releases_on_exception_inside_the_body(self):
+        with self.assertRaises(ValueError):
+            with dev_container_build_lock_if_free_sync("proj", facade=self.facade) as acquired:
+                self.assertTrue(acquired)
+                raise ValueError("boom")
+
+        self.assertIsNone(self.facade.get_resource_lock("proj", RESOURCE_NAME))
+
+    def test_a_held_if_free_lock_blocks_the_blocking_variant(self):
+        """It really is the same resource: a bookkeeping write in flight
+        serializes a build that starts at the same moment, and vice versa."""
+        with dev_container_build_lock_if_free_sync("proj", facade=self.facade) as acquired:
+            self.assertTrue(acquired)
+            with self.assertRaises(DevContainerBuildLockTimeoutError):
+                with dev_container_build_lock_sync(
+                    "proj", facade=self.facade, timeout_seconds=0.1, poll_interval_seconds=0.02
+                ):
+                    pass  # pragma: no cover
+
+
+@pytest.mark.asyncio
+class TestIfFreeAsyncVariant:
+    """Async counterpart of TestIfFreeSyncVariant."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.facade = _make_facade(self.test_dir)
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    async def test_yields_true_and_releases_when_free(self):
+        async with dev_container_build_lock_if_free_async("proj", 7, facade=self.facade) as acquired:
+            assert acquired is True
+            assert self.facade.get_resource_lock("proj", RESOURCE_NAME) is not None
+
+        assert self.facade.get_resource_lock("proj", RESOURCE_NAME) is None
+
+    async def test_yields_false_without_waiting_when_busy(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
+
+        start = time.monotonic()
+        async with dev_container_build_lock_if_free_async("proj", 7, facade=self.facade) as acquired:
+            assert acquired is False
+        assert time.monotonic() - start < 1.0
+        assert self.facade.get_resource_lock("proj", RESOURCE_NAME).locked_by_issue == 1
+
+    async def test_does_not_raise_a_lock_timeout_when_busy(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
+        async with dev_container_build_lock_if_free_async("proj", facade=self.facade) as acquired:
+            assert acquired is False
+
+    async def test_releases_on_exception_inside_the_body(self):
+        with pytest.raises(ValueError):
+            async with dev_container_build_lock_if_free_async("proj", facade=self.facade):
+                raise ValueError("boom")
+
+        assert self.facade.get_resource_lock("proj", RESOURCE_NAME) is None
+
+    async def test_acquire_runs_off_the_event_loop_thread(self):
+        """Same rule as the polling variant: no synchronous lock I/O on the
+        event-loop thread (see project_checkout_lock.py's module docstring)."""
+        loop_thread = threading.get_ident()
+        seen = []
+        real_acquire = self.facade.acquire_resource
+
+        def recording_acquire(project, resource_name, holder_id):
+            seen.append(threading.get_ident())
+            return real_acquire(project, resource_name, holder_id)
+
+        with patch.object(self.facade, "acquire_resource", side_effect=recording_acquire):
+            async with dev_container_build_lock_if_free_async("proj", facade=self.facade) as acquired:
+                assert acquired is True
+
+        assert seen and all(t != loop_thread for t in seen)

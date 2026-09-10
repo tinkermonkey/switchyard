@@ -268,17 +268,40 @@ def kill_agent(container_name):
 def rebuild_image(project):
     """Trigger a background rebuild of a project's agent Docker image."""
     from scripts.rebuild_project_images import rebuild_project_image
+    from services.dev_container_build_lock import (
+        dev_container_build_lock_sync,
+        DevContainerBuildLockTimeoutError,
+    )
     from services.dev_container_state import dev_container_state, DevContainerStatus
 
-    dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
-
     def _run():
+        # dev_container_build lock (#152 item A): this endpoint is the third
+        # operator-triggered build alongside the two admin scripts #56 wired up,
+        # and was the only one still writing dev_container_state unlocked -- the
+        # IN_PROGRESS mark ran before rebuild_project_image() took the lock, and
+        # both BLOCKED marks ran after it released. Holding the lock across the
+        # whole sequence puts every one of those writes inside the same window
+        # as the build they describe. rebuild_project_image() is told the lock
+        # is already held: that lock is not reentrant (see its module
+        # docstring), so letting it acquire again would self-block.
+        #
+        # IN_PROGRESS is marked INSIDE the lock, not before spawning this
+        # thread: a rebuild that never gets the lock never runs, and must not
+        # leave the project's status claiming a build is under way.
         try:
-            ok = rebuild_project_image(project, update_state=True)
-            if not ok:
-                dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
-        except Exception as e:
-            dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+            with dev_container_build_lock_sync(project):
+                dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
+                try:
+                    ok = rebuild_project_image(project, update_state=True, lock_held_by_caller=True)
+                    if not ok:
+                        dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
+                except Exception as e:
+                    dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+        except DevContainerBuildLockTimeoutError as e:
+            # Contention, not a build failure -- nothing ran, so nothing about
+            # this project's container state changed and none of it should be
+            # rewritten (#148/WI-3). The operator retries.
+            logger.error(f"Rebuild of {project} never started: {e}")
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"success": True, "triggered": True, "project": project})

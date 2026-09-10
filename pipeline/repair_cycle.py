@@ -2288,7 +2288,7 @@ class RepairCycleStage(PipelineStage):
         # even if the very first attempt breaks before ever polling.
         final_status = None
 
-        def _finalize_unconfirmed_changes_needed(reason: str) -> None:
+        async def _finalize_unconfirmed_changes_needed(reason: str) -> None:
             """Force the terminal BLOCKED transition if we're about to stop
             driving this sub-cycle while the dev container is still sitting at
             CHANGES_NEEDED. CHANGES_NEEDED has no other owner once this
@@ -2300,17 +2300,43 @@ class RepairCycleStage(PipelineStage):
             breaker) as well as from the `else` clause itself on exhaustion —
             a `break` after the setup-queue exception is exempt because that
             path resets state to UNVERIFIED (self-healing) before it can fail.
+
+            The write goes through dev_container_build_lock_if_free_async()
+            (#152 item A). `final_status` was observed one poll interval to
+            several minutes ago, so writing BLOCKED on the strength of it can
+            clobber a newer status a concurrent build/verify or an operator
+            rebuild has since written — turning a project that just came back
+            VERIFIED into a permanently BLOCKED one. Re-reading INSIDE the lock
+            is what makes this check-then-act atomic; locking the write alone
+            would not have. The non-blocking variant is deliberate: if the lock
+            is busy, its holder owns this project's container state and is about
+            to write a terminal status of its own, so waiting out a build for a
+            one-statement write buys nothing. See that module's docstring.
             """
             if final_status != DevContainerStatus.CHANGES_NEEDED:
                 return
-            dev_container_state.set_status(
-                project,
-                DevContainerStatus.BLOCKED,
-                error_message=(
-                    f"Env rebuild sub-cycle {reason}; verifier never confirmed "
-                    f"the required fix: {analysis.env_issue_description[:200]}"
-                ),
-            )
+
+            from services.dev_container_build_lock import dev_container_build_lock_if_free_async
+
+            async with dev_container_build_lock_if_free_async(project, issue_number) as acquired:
+                if not acquired:
+                    return
+                current_status = dev_container_state.get_status(project)
+                if current_status != DevContainerStatus.CHANGES_NEEDED:
+                    logger.info(
+                        f"Env rebuild sub-cycle {reason} for {project}, but the dev container "
+                        f"has since moved to {current_status.value} — leaving it alone instead "
+                        f"of forcing BLOCKED"
+                    )
+                    return
+                dev_container_state.set_status(
+                    project,
+                    DevContainerStatus.BLOCKED,
+                    error_message=(
+                        f"Env rebuild sub-cycle {reason}; verifier never confirmed "
+                        f"the required fix: {analysis.env_issue_description[:200]}"
+                    ),
+                )
             if obs:
                 obs.emit(
                     EventType.ERROR_ENCOUNTERED,
@@ -2354,7 +2380,7 @@ class RepairCycleStage(PipelineStage):
                 # CHANGES_NEEDED->BLOCKED terminal transition) is skipped by
                 # this `break` — a prior attempt could have left the dev
                 # container at CHANGES_NEEDED with no attempt left to retry it.
-                _finalize_unconfirmed_changes_needed("was stopped by the circuit breaker")
+                await _finalize_unconfirmed_changes_needed("was stopped by the circuit breaker")
                 break
 
             logger.info(
@@ -2524,7 +2550,7 @@ class RepairCycleStage(PipelineStage):
             # above, since it also skips this clause). Exhausting attempts
             # while still at CHANGES_NEEDED needs the same terminal transition
             # as the circuit-breaker case; see _finalize_unconfirmed_changes_needed.
-            _finalize_unconfirmed_changes_needed("exhausted all attempts")
+            await _finalize_unconfirmed_changes_needed("exhausted all attempts")
 
         if obs:
             obs.emit(

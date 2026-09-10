@@ -12,6 +12,7 @@ import pytest
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, Mock, patch
 
 from pipeline.repair_cycle import (
@@ -23,6 +24,21 @@ from pipeline.repair_cycle import (
     MAX_SYSTEMIC_SUB_CYCLES,
 )
 from services.dev_container_state import DevContainerStatus
+
+
+def _lock(granted: bool):
+    """Stand-in for dev_container_build_lock_if_free_async (#152 item A).
+
+    _finalize_unconfirmed_changes_needed() now takes that lock non-blockingly
+    before forcing CHANGES_NEEDED -> BLOCKED, so every test here has to say
+    whether the lock was free. Patched rather than left real so these stay unit
+    tests -- the real one would reach the process-wide PipelineLockManager and
+    its Redis/YAML stores.
+    """
+    @asynccontextmanager
+    async def _cm(*args, **kwargs):
+        yield granted
+    return _cm
 
 
 def _stage():
@@ -67,6 +83,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock(return_value=_passing_result())) as mock_run_tests:
 
@@ -91,6 +108,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -125,6 +143,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock(return_value=failing_result)) as mock_run_tests:
 
@@ -160,6 +179,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock(side_effect=_queue_side_effect)) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -190,6 +210,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -209,3 +230,85 @@ class TestEnvRebuildSubCycleRetrySemantics:
         last_call = mock_state.set_status.call_args_list[-1]
         assert last_call.args[1] == DevContainerStatus.BLOCKED
         assert "test-project" in last_call.args[0]
+
+
+@pytest.mark.asyncio
+class TestFinalizeTakesTheDevContainerBuildLock:
+    """
+    #152 item A: _finalize_unconfirmed_changes_needed() used to write BLOCKED
+    unlocked, on the strength of a `final_status` observed a poll interval to
+    several minutes earlier. A concurrent build/verify or an operator rebuild
+    that finished in between had its result clobbered -- turning a project that
+    just came back VERIFIED into a permanently BLOCKED one.
+    """
+
+    async def test_no_blocked_write_when_the_build_lock_is_busy(self):
+        """A busy lock means a build/verify owns this project's container state
+        and is about to write a terminal status of its own. Skipping is correct;
+        waiting out a whole build for a one-statement write is not."""
+        stage = _stage()
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(False)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
+             patch.object(stage, '_run_tests', new=AsyncMock()):
+
+            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+
+            await stage._run_env_rebuild_sub_cycle(
+                _analysis(), RepairTestRunConfig(test_type="unit"), _context(),
+                test_cycle_iteration=1, test_type_index=0,
+            )
+
+        written = [c.args[1] for c in mock_state.set_status.call_args_list]
+        assert DevContainerStatus.BLOCKED not in written
+        # The per-attempt UNVERIFIED resets that drive the sub-cycle are untouched.
+        assert DevContainerStatus.UNVERIFIED in written
+
+    async def test_a_status_that_moved_under_the_lock_is_not_clobbered(self):
+        """THE regression: the decision was already stale by the time the write
+        ran, so locking the write alone would not have fixed it -- the status is
+        re-read INSIDE the lock and re-decided there."""
+        stage = _stage()
+
+        statuses = [DevContainerStatus.CHANGES_NEEDED] * MAX_SYSTEMIC_SUB_CYCLES
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
+             patch.object(stage, '_run_tests', new=AsyncMock()):
+
+            # Every poll sees CHANGES_NEEDED; the final re-read inside the lock
+            # sees VERIFIED -- an operator rebuild landed while this sub-cycle
+            # was deciding to give up.
+            mock_state.get_status.side_effect = statuses + [DevContainerStatus.VERIFIED]
+
+            await stage._run_env_rebuild_sub_cycle(
+                _analysis(), RepairTestRunConfig(test_type="unit"), _context(),
+                test_cycle_iteration=1, test_type_index=0,
+            )
+
+        written = [c.args[1] for c in mock_state.set_status.call_args_list]
+        assert DevContainerStatus.BLOCKED not in written
+
+    async def test_still_blocks_when_the_status_is_unchanged_under_the_lock(self):
+        """The transition this method exists for must still happen: nothing else
+        owns retrying CHANGES_NEEDED once the sub-cycle stops."""
+        stage = _stage()
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
+             patch.object(stage, '_run_tests', new=AsyncMock()):
+
+            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+
+            await stage._run_env_rebuild_sub_cycle(
+                _analysis(), RepairTestRunConfig(test_type="unit"), _context(),
+                test_cycle_iteration=1, test_type_index=0,
+            )
+
+        assert mock_state.set_status.call_args_list[-1].args[1] == DevContainerStatus.BLOCKED

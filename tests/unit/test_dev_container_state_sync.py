@@ -6,6 +6,7 @@ and DevContainerStateManager were not synchronized when a dev_environment_verifi
 container died unexpectedly.
 """
 
+import contextlib
 import os
 import pytest
 import tempfile
@@ -25,6 +26,21 @@ try:
     from services.dev_container_state import DevContainerStateManager, DevContainerStatus
 except ImportError:
     pytest.skip("Requires Docker container environment", allow_module_level=True)
+
+
+def _build_lock(granted: bool):
+    """Stand-in for dev_container_build_lock_if_free_sync (#152 item A).
+
+    cleanup_stuck_in_progress_states() now reconciles dev container state under
+    that lock, non-blockingly, and skips the write when it is busy. These tests
+    already replace Redis with a MagicMock, under which the real facade
+    fail-closes to "busy", so the lock has to be stated explicitly rather than
+    left to fall out of the mock.
+    """
+    @contextlib.contextmanager
+    def _cm(*args, **kwargs):
+        yield granted
+    return _cm
 
 
 class TestDevContainerStateSync:
@@ -104,7 +120,8 @@ class TestDevContainerStateSync:
                 mock_redis_client.lrange.return_value = []
 
                 # Patch the module-level singleton used in cleanup_stuck_in_progress_states
-                with patch('services.dev_container_state.dev_container_state', dev_container_mgr):
+                with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _build_lock(True)):
                     # Run cleanup
                     execution_tracker.cleanup_stuck_in_progress_states()
 
@@ -186,7 +203,8 @@ class TestDevContainerStateSync:
                 })
 
                 # Patch the module-level singleton
-                with patch('services.dev_container_state.dev_container_state', dev_container_mgr):
+                with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _build_lock(True)):
                     # Run cleanup
                     execution_tracker.cleanup_stuck_in_progress_states()
 
@@ -261,7 +279,8 @@ class TestDevContainerStateSync:
                      patch('monitoring.observability.get_observability_manager'), \
                      patch('services.pipeline_run.get_pipeline_run_manager'):
                     # Patch the module-level singleton
-                    with patch('services.dev_container_state.dev_container_state', dev_container_mgr):
+                    with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _build_lock(True)):
                         # Run cleanup
                         execution_tracker.cleanup_stuck_in_progress_states()
 
@@ -323,7 +342,8 @@ class TestDevContainerStateSync:
                 mock_redis_client.lrange.return_value = []
 
                 # Patch the module-level singleton
-                with patch('services.dev_container_state.dev_container_state', dev_container_mgr):
+                with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _build_lock(True)):
                     execution_tracker.cleanup_stuck_in_progress_states()
 
         # Verify: Work execution state should be marked as failure
@@ -394,3 +414,106 @@ class TestDevContainerStateSync:
         # Verify: Dev container state should remain VERIFIED (unchanged)
         status = dev_container_mgr.get_status(project_name)
         assert status == DevContainerStatus.VERIFIED
+
+
+class TestReconciliationTakesTheDevContainerBuildLock:
+    """
+    #152 item A: cleanup_stuck_in_progress_states() writes dev container state
+    at five points when a dev_environment_setup/verifier execution is found
+    stuck, and every one of them used to be an unlocked read-then-write -- run
+    from main.py's startup, i.e. exactly when a build started by the previous
+    process can still be in flight and holding that project's build lock.
+    """
+
+    @pytest.fixture
+    def temp_dirs(self):
+        with tempfile.TemporaryDirectory() as exec_dir, \
+             tempfile.TemporaryDirectory() as dev_dir:
+            yield Path(exec_dir), Path(dev_dir)
+
+    @pytest.fixture
+    def execution_tracker(self, temp_dirs):
+        exec_dir, _ = temp_dirs
+        return WorkExecutionStateTracker(state_dir=exec_dir)
+
+    @pytest.fixture
+    def dev_container_mgr(self, temp_dirs):
+        _, dev_dir = temp_dirs
+        return DevContainerStateManager(state_dir=dev_dir)
+
+    def _run_cleanup_with_stuck_verifier(self, execution_tracker, dev_container_mgr,
+                                         lock_granted, initial_status):
+        project_name = "test-project"
+        execution_tracker.record_execution_start(
+            issue_number=42,
+            column="Verification",
+            agent="dev_environment_verifier",
+            trigger_source='manual',
+            project_name=project_name
+        )
+        dev_container_mgr.set_status(
+            project_name=project_name,
+            status=initial_status,
+            image_name=f"{project_name}-agent:latest"
+        )
+
+        with patch('subprocess.run') as mock_run:
+            mock_run.return_value = Mock(returncode=0, stdout='', stderr='')
+            with patch('redis.Redis') as mock_redis:
+                mock_redis_client = MagicMock()
+                mock_redis.return_value = mock_redis_client
+                mock_redis_client.scan_iter.return_value = []
+                mock_redis_client.exists.return_value = False
+                mock_redis_client.keys.return_value = []
+                mock_redis_client.lrange.return_value = []
+
+                with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync',
+                           _build_lock(lock_granted)):
+                    execution_tracker.cleanup_stuck_in_progress_states()
+
+        return project_name
+
+    def test_a_busy_build_lock_skips_the_dev_container_write(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """THE regression: a build/verify holding the lock owns this project's
+        container state, and this stuck record must not overwrite it. Skipping
+        is recoverable -- validate_task_can_run()'s staleness check on
+        get_status_updated_at() picks up a status left at IN_PROGRESS."""
+        project_name = self._run_cleanup_with_stuck_verifier(
+            execution_tracker, dev_container_mgr,
+            lock_granted=False, initial_status=DevContainerStatus.IN_PROGRESS,
+        )
+
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.IN_PROGRESS
+
+    def test_the_work_execution_record_is_still_reconciled_when_the_lock_is_busy(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """Only the dev container write is skipped: the execution record itself
+        is this module's own state and has nothing to do with the build lock."""
+        self._run_cleanup_with_stuck_verifier(
+            execution_tracker, dev_container_mgr,
+            lock_granted=False, initial_status=DevContainerStatus.IN_PROGRESS,
+        )
+
+        last_exec = execution_tracker.get_last_execution(
+            project_name="test-project",
+            issue_number=42,
+            column="Verification",
+            agent="dev_environment_verifier",
+        )
+        assert last_exec['outcome'] == 'failure'
+
+    def test_a_status_that_moved_under_the_lock_is_not_clobbered(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """The re-read happens INSIDE the lock, so a VERIFIED written by a later
+        execution that already succeeded survives this superseded record."""
+        project_name = self._run_cleanup_with_stuck_verifier(
+            execution_tracker, dev_container_mgr,
+            lock_granted=True, initial_status=DevContainerStatus.VERIFIED,
+        )
+
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.VERIFIED

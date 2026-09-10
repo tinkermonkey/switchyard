@@ -34,6 +34,83 @@ _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp a
 _WATCHDOG_MAX_RECORD_AGE_HOURS = 24
 
 
+def _transition_dev_container_state(
+    project_name: str,
+    status,
+    *,
+    reason: str,
+    skip_when: Tuple = (),
+    image_name: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """
+    Reconcile a project's dev container state under the dev_container_build lock.
+
+    cleanup_stuck_in_progress_states() writes dev_container_state at five points
+    when a dev_environment_setup/verifier execution is found stuck, and every one
+    of them used to be an unlocked read-then-write (#152 item A) -- running right
+    after a crash/restart, which is exactly when a build started by the previous
+    process may still be in flight and holding this lock. Each site re-read
+    get_status() outside the lock and then wrote on the strength of that read, so
+    a status the live holder changed in between was silently clobbered.
+
+    Uses the NON-BLOCKING variant of the lock, and skips the write entirely when
+    it is busy. That is deliberate on this path above all others: this runs from
+    main.py's startup and from inside the per-project execution state file lock,
+    and right after a restart the dead process's lock is routinely still in Redis
+    under its own TTL -- so a blocking acquire here would burn its whole timeout
+    every time, holding the file lock throughout, before failing anyway. Skipping
+    is also the correct outcome: the holder owns this project's container state
+    and is writing a fresher status than this stuck record could. A skipped reset
+    is recovered by validate_task_can_run()'s staleness check on
+    get_status_updated_at(). See services/dev_container_build_lock.py's module
+    docstring ("Bookkeeping writers").
+
+    Args:
+        project_name: project whose dev container state to reconcile.
+        status: DevContainerStatus to write.
+        reason: human-readable description of why, for the log line.
+        skip_when: statuses that mean this write is already superseded -- checked
+            against a re-read taken INSIDE the lock, which is what makes the
+            check-then-act atomic rather than merely serialized.
+        image_name / error_message: passed through to set_status().
+    """
+    try:
+        from services.dev_container_build_lock import dev_container_build_lock_if_free_sync
+        from services.dev_container_state import dev_container_state
+
+        with dev_container_build_lock_if_free_sync(project_name) as acquired:
+            if not acquired:
+                logger.warning(
+                    f"Skipped dev container state reconciliation for {project_name} "
+                    f"({reason}): a build/verify holds the lock and owns that state"
+                )
+                return
+
+            current_status = dev_container_state.get_status(project_name)
+            if current_status in skip_when:
+                logger.info(
+                    f"{reason} for {project_name}, but dev container is already "
+                    f"{current_status.value} — skipping reset"
+                )
+                return
+
+            logger.info(
+                f"{reason} for {project_name}, setting dev container state to {status.value}"
+            )
+            dev_container_state.set_status(
+                project_name=project_name,
+                status=status,
+                image_name=image_name,
+                error_message=error_message,
+            )
+    except Exception as e:
+        logger.error(
+            f"Failed to update dev container state for {project_name}: {e}",
+            exc_info=True
+        )
+
+
 def _parse_iso_timestamp(value: str) -> datetime:
     """Parse a recorded ISO timestamp as an aware UTC datetime.
 
@@ -2664,56 +2741,26 @@ class WorkExecutionStateTracker:
                                     # this stuck record is from a superseded execution and should not clobber
                                     # the verified state.
                                     if agent == 'dev_environment_verifier':
-                                        try:
-                                            from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            current_status = dev_container_state.get_status(project_name)
-                                            if current_status == DevContainerStatus.VERIFIED:
-                                                logger.info(
-                                                    f"Stuck dev_environment_verifier detected for {project_name}, "
-                                                    f"but dev container is already VERIFIED — skipping reset"
-                                                )
-                                            else:
-                                                logger.info(
-                                                    f"Stuck dev_environment_verifier detected for {project_name}, "
-                                                    f"resetting dev container state to UNVERIFIED"
-                                                )
-                                                dev_container_state.set_status(
-                                                    project_name=project_name,
-                                                    status=DevContainerStatus.UNVERIFIED,
-                                                    error_message="Verification container died before completion"
-                                                )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to update dev container state for {project_name}: {e}",
-                                                exc_info=True
-                                            )
+                                        from services.dev_container_state import DevContainerStatus
+                                        _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.UNVERIFIED,
+                                            reason="Stuck dev_environment_verifier detected",
+                                            skip_when=(DevContainerStatus.VERIFIED,),
+                                            error_message="Verification container died before completion",
+                                        )
 
                                     # Special handling for dev_environment_setup agent
                                     # Only reset if not already VERIFIED (a verifier may have already confirmed).
                                     if agent == 'dev_environment_setup':
-                                        try:
-                                            from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            current_status = dev_container_state.get_status(project_name)
-                                            if current_status == DevContainerStatus.VERIFIED:
-                                                logger.info(
-                                                    f"Stuck dev_environment_setup detected for {project_name}, "
-                                                    f"but dev container is already VERIFIED — skipping reset"
-                                                )
-                                            else:
-                                                logger.info(
-                                                    f"Stuck dev_environment_setup detected for {project_name}, "
-                                                    f"resetting dev container state to UNVERIFIED"
-                                                )
-                                                dev_container_state.set_status(
-                                                    project_name=project_name,
-                                                    status=DevContainerStatus.UNVERIFIED,
-                                                    error_message="Setup container died before completion"
-                                                )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to update dev container state for {project_name}: {e}",
-                                                exc_info=True
-                                            )
+                                        from services.dev_container_state import DevContainerStatus
+                                        _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.UNVERIFIED,
+                                            reason="Stuck dev_environment_setup detected",
+                                            skip_when=(DevContainerStatus.VERIFIED,),
+                                            error_message="Setup container died before completion",
+                                        )
 
                                 modified = True
                                 cleaned_count += 1
@@ -2733,25 +2780,17 @@ class WorkExecutionStateTracker:
                                     # Verify dev container state consistency for dev_environment_verifier
                                     # The agent should have already set state to VERIFIED before exiting
                                     if agent == 'dev_environment_verifier':
-                                        try:
-                                            from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            current_status = dev_container_state.get_status(project_name)
-                                            if current_status != DevContainerStatus.VERIFIED:
-                                                logger.warning(
-                                                    f"Dev environment verifier succeeded for {project_name} but "
-                                                    f"state is {current_status.value}, expected VERIFIED. "
-                                                    f"Correcting state now."
-                                                )
-                                                dev_container_state.set_status(
-                                                    project_name=project_name,
-                                                    status=DevContainerStatus.VERIFIED,
-                                                    image_name=f"{project_name}-agent:latest"
-                                                )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to verify dev container state for {project_name}: {e}",
-                                                exc_info=True
-                                            )
+                                        from services.dev_container_state import DevContainerStatus
+                                        _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.VERIFIED,
+                                            reason=(
+                                                "Dev environment verifier succeeded (recovered from Redis) "
+                                                "but state was not VERIFIED"
+                                            ),
+                                            skip_when=(DevContainerStatus.VERIFIED,),
+                                            image_name=f"{project_name}-agent:latest",
+                                        )
 
                                     try:
                                         from monitoring.decision_events import DecisionEventEmitter
@@ -2803,45 +2842,36 @@ class WorkExecutionStateTracker:
                                     # Note: Non-recovered failures already handled above at line ~1460, but
                                     # this ensures recovered failures also update the state
                                     if agent == 'dev_environment_verifier' and recovered:
-                                        try:
-                                            from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            logger.info(
-                                                f"Dev environment verification failed for {project_name} "
-                                                f"(recovered from Redis with failure), marking as BLOCKED"
-                                            )
-                                            # Extract error from execution for context
-                                            error_msg = execution.get('error', 'Verification failed')[:200]
-                                            dev_container_state.set_status(
-                                                project_name=project_name,
-                                                status=DevContainerStatus.BLOCKED,
-                                                error_message=error_msg
-                                            )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to update dev container state for {project_name}: {e}",
-                                                exc_info=True
-                                            )
+                                        from services.dev_container_state import DevContainerStatus
+                                        # No skip_when: a recovered verifier FAILURE is this
+                                        # record's own verdict on the image, and BLOCKED is
+                                        # deliberately terminal. The lock is still what keeps
+                                        # it from landing on top of a build that is running
+                                        # right now (that acquire fails, and this is skipped).
+                                        _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.BLOCKED,
+                                            reason=(
+                                                "Dev environment verification failed "
+                                                "(recovered from Redis with failure)"
+                                            ),
+                                            error_message=execution.get('error', 'Verification failed')[:200],
+                                        )
 
                                     # Special handling for dev_environment_setup agent failures
                                     # Reset to UNVERIFIED so setup can be retried automatically
                                     if agent == 'dev_environment_setup':
-                                        try:
-                                            from services.dev_container_state import dev_container_state, DevContainerStatus
-                                            logger.info(
-                                                f"Dev environment setup failed for {project_name}, "
-                                                f"resetting dev container state to UNVERIFIED"
-                                            )
-                                            error_msg = execution.get('error', 'Setup failed')[:200]
-                                            dev_container_state.set_status(
-                                                project_name=project_name,
-                                                status=DevContainerStatus.UNVERIFIED,
-                                                error_message=error_msg
-                                            )
-                                        except Exception as e:
-                                            logger.error(
-                                                f"Failed to update dev container state for {project_name}: {e}",
-                                                exc_info=True
-                                            )
+                                        from services.dev_container_state import DevContainerStatus
+                                        # No skip_when: resetting a failed setup to UNVERIFIED
+                                        # so it retries is right whatever the current status
+                                        # says. As above, the lock is what stops it landing on
+                                        # top of an in-flight build.
+                                        _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.UNVERIFIED,
+                                            reason="Dev environment setup failed",
+                                            error_message=execution.get('error', 'Setup failed')[:200],
+                                        )
 
                                     # CRITICAL CHANGE: DO NOT call end_pipeline_run()
                                     #
