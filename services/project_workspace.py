@@ -484,11 +484,20 @@ class ProjectWorkspaceManager:
         raw strings a caller might pass in a different but equivalent form
         (relative, trailing slash, unresolved symlink, ...). Fails closed --
         if path resolution raises for any reason, OR project_dir doesn't
-        exist on disk at all (e.g. a caller's default/unset placeholder like
-        Path('.') from a missing context field -- Path.resolve() succeeds
-        without error even for a nonexistent path, so an existence check is
-        needed too), returns True (assume it IS the shared base clone)
-        rather than silently skipping the lock this method exists to gate.
+        exist on disk at all (Path.resolve() succeeds without error even for a
+        nonexistent path, so an existence check is needed too), returns True
+        (assume it IS the shared base clone) rather than silently skipping the
+        lock this method exists to gate.
+
+        What fails-closed deliberately does NOT cover is a caller's own
+        placeholder for a MISSING directory (#151/WI-6 item 12): the case
+        originally cited here was claude_integration.py's
+        Path(context.get('work_dir', '.')), and '.' resolves to the
+        orchestrator's own cwd, which always exists -- so the existence check
+        never fired for it and the real comparison returned False, skipping the
+        lock. That is not fixable here (this method cannot tell a deliberate '.'
+        from a defaulted one); it is fixed at the call site, which now refuses a
+        missing work_dir outright. See claude_integration._require_work_dir().
         """
         try:
             resolved_dir = Path(project_dir).resolve()
@@ -532,6 +541,7 @@ class ProjectWorkspaceManager:
         epic_id: str,
         branch_name: Optional[str] = None,
         default_branch: str = 'main',
+        checkout_lock_timeout_seconds: float = 120.0,
     ) -> Path:
         """
         Get (creating if absent) an isolated, non-detached git worktree for one epic.
@@ -561,6 +571,12 @@ class ProjectWorkspaceManager:
                 this epic's worktree is created; unused on reuse.
             default_branch: Base branch to cut a new epic branch from if branch_name
                 doesn't exist on origin yet.
+            checkout_lock_timeout_seconds: How long the brand-new-worktree path below
+                waits for this project's project_checkout lock before giving up
+                (#151/WI-6 item 1). Deliberately short, for the reasons spelled out
+                at that call site; only the creation path consults it at all (a cache
+                hit, a restart adoption and every failure branch above never touch
+                the base clone, so they never take the lock).
 
         Returns:
             The epic's worktree path.
@@ -568,6 +584,12 @@ class ProjectWorkspaceManager:
         Raises:
             ValueError: No worktree exists yet for this epic and branch_name was not
                 given, or the project has no base clone to source the worktree from.
+            ProjectCheckoutLockTimeoutError: A brand-new worktree had to be created
+                but this project's shared base clone was busy for the whole of
+                checkout_lock_timeout_seconds -- nothing was fetched, checked out or
+                registered. Propagates untouched (#148/WI-3 keeps lock-timeout types
+                out of the generic retry loop and the circuit breaker) so the
+                dispatch fails loudly and its next trigger retries.
             RuntimeError: Either the underlying `git worktree add` command failed
                 (the pre-existing cause), OR (issue found investigating a
                 code-wrapper dev-container block, 2026-09-06) the worktree
@@ -722,7 +744,64 @@ class ProjectWorkspaceManager:
 
             worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-            self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
+            # project_checkout lock (#151/WI-6 item 1). _add_epic_worktree() is a
+            # base-clone WRITER: it fetches into base_repo_dir's refs, detaches its
+            # HEAD (_free_branch_from_base_clone), pushes from it
+            # (_push_stray_branch_if_ahead) and registers the new worktree in its
+            # own .git/worktrees/. Nothing gated it, because every other call site
+            # decides whether to lock from its FINAL resolved directory
+            # (is_base_clone_dir()) -- which here is the new worktree path, by
+            # definition never the base clone -- so this was the one writer free to
+            # race the startup clone/update, a base-clone-scoped container run and
+            # auto_commit's add/commit/push against that same .git.
+            #
+            # Sync, not async: this is a plain sync method with sync callers. #146
+            # WI-1 made that safe for the HOLD -- the heartbeat runs on a real OS
+            # thread, so a guarded body that never yields to the event loop still
+            # gets its lock refreshed, with no change to this method's control
+            # flow. It does NOT make the WAIT safe: this method is reached from the
+            # event-loop thread (agent_executor's _build_execution_context and
+            # _failsafe_commit_check, claude_integration's run_claude_code) whenever
+            # task_context['project_dir'] wasn't already resolved off-loop by
+            # PipelineRunManager.resolve_workspace(), and a poll loop there stalls
+            # every other coroutine for its whole duration.
+            #
+            # Hence a short timeout rather than DEFAULT_TIMEOUT_SECONDS (~3h) --
+            # the same tradeoff, and the same 120s default, initialize_project()
+            # already settled for its own startup call site, for the same reason:
+            # the thing worth waiting for is another short base-clone operation,
+            # and anything longer means the base clone is held by an agent
+            # container run this dispatch cannot usefully wait behind. It is also
+            # strictly less added stall than the guarded body can already impose on
+            # that same thread today (_add_epic_worktree's own git subprocess
+            # timeouts sum to ~330s), and a timeout here raises rather than
+            # proceeding unlocked, so the next board poll retries.
+            #
+            # Lock ordering: self._epic_worktree_lock is held here and the
+            # project_checkout lock is taken INSIDE it. Nothing acquires them the
+            # other way round -- no project_checkout holder calls back into this
+            # method -- so the nesting cannot deadlock.
+            from services.project_checkout_lock import project_checkout_lock_sync
+
+            # Log attribution only, never the lock's holder identity (see
+            # project_checkout_lock.py's module docstring). The epic id is the
+            # nearest real GitHub issue number in scope here; it is deliberately
+            # NOT relied on for #150/WI-5's watchdog exemption, which is keyed on
+            # the SUB-issue whose pipeline run is at risk of being reaped -- a wait
+            # bounded at checkout_lock_timeout_seconds is far below that watchdog's
+            # 30-minute zombie threshold, so there is nothing here for it to
+            # misjudge.
+            try:
+                lock_issue_number = int(str(epic_id).strip())
+            except (TypeError, ValueError):
+                lock_issue_number = None
+
+            with project_checkout_lock_sync(
+                project_name,
+                lock_issue_number,
+                timeout_seconds=checkout_lock_timeout_seconds,
+            ):
+                self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
 
             self._epic_worktrees[key] = str(worktree_path)
             self._epic_worktree_branches[key] = branch_name

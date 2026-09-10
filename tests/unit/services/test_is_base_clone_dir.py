@@ -44,11 +44,16 @@ class TestIsBaseCloneDir(unittest.TestCase):
 
     def test_fails_closed_true_when_directory_does_not_exist(self):
         """
-        The real bug this covers: a caller's unset/default placeholder (e.g.
-        claude_integration.py's `Path(context.get('work_dir', '.'))` when
-        'work_dir' is absent) resolves without error via Path.resolve() even
-        though nothing exists there -- must still fail closed (True), not
-        silently compare-and-return-False.
+        A path that resolves without error via Path.resolve() even though
+        nothing exists there must still fail closed (True), not silently
+        compare-and-return-False.
+
+        The example originally cited here -- claude_integration.py's
+        `Path(context.get('work_dir', '.'))` with 'work_dir' absent -- was
+        never actually covered by this branch (#151/WI-6 item 12): '.'
+        resolves to the orchestrator's own cwd, which always exists. That
+        case is fixed at the call site instead, and covered by
+        tests/unit/test_claude_integration_work_dir_required.py.
         """
         nonexistent = self.workspace_root / "proj" / "does-not-exist-at-all"
         self.assertFalse(nonexistent.exists())

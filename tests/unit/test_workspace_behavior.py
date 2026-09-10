@@ -9,7 +9,14 @@ import pytest
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
+
+
+@asynccontextmanager
+async def _noop_checkout_lock(*args, **kwargs):
+    """Stand-in for project_checkout_lock_async() (#54, #151) -- see its use below."""
+    yield
 
 
 @pytest.fixture
@@ -229,7 +236,14 @@ class TestFeatureBranchManagerStandalone:
 
         fbm = FeatureBranchManager(workspace_root='/tmp/test')
 
+        # No project_dir_override, so this exercises the shared-base-clone
+        # fallback -- which now takes the project_checkout lock (#151/WI-6 item
+        # 16). Neutralized here so this behavior test doesn't acquire a real
+        # Redis/YAML lock as a side effect; the lock itself is covered by
+        # tests/unit/services/test_finalize_checkout_lock.py.
         with patch.object(fbm, 'get_feature_branch_for_issue', return_value=None), \
+             patch('services.project_checkout_lock.project_checkout_lock_async',
+                   _noop_checkout_lock), \
              patch.object(fbm, 'git_add_all', new_callable=AsyncMock), \
              patch.object(fbm, 'git_commit', new_callable=AsyncMock), \
              patch.object(fbm, 'git_push', new_callable=AsyncMock), \

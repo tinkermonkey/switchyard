@@ -18,6 +18,39 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
+    """
+    Read the local-execution working directory off `context`, refusing a missing
+    one instead of defaulting it (#151/WI-6 item 12).
+
+    Both readers of this value used to be `Path(context.get('work_dir', '.'))`.
+    That default is what kept is_base_clone_dir()'s fail-closed branch from ever
+    firing for the very case its docstring cites: that branch treats a directory
+    that doesn't exist as the shared base clone rather than silently skipping the
+    lock, but '.' resolves to the orchestrator's OWN cwd, which always exists --
+    so a context with no work_dir fell through to the real comparison, came back
+    False, and skipped the project_checkout lock entirely. The fix belongs here
+    rather than in is_base_clone_dir(), which cannot tell a deliberate '.' from a
+    defaulted one.
+
+    The same default was independently wrong for _run_claude_code_locally(), which
+    would have run the agent's Claude Code session in the orchestrator's own
+    checkout. Neither is a state to guess at: every production producer of this
+    context sets work_dir (agent_executor.py's _build_execution_context, the
+    services/workspace/ context classes, services/pipeline_run_analysis.py, and
+    the scripts/ entry points), so its absence is a construction bug upstream.
+    """
+    raw_work_dir = context.get('work_dir')
+    if raw_work_dir is None or not str(raw_work_dir).strip():
+        raise Exception(
+            f"Agent {agent} reached local (non-Docker) execution with no 'work_dir' in "
+            f"its context -- there is no directory to run it in, and no basis to decide "
+            f"whether the project_checkout lock is needed. This is a bug in whatever "
+            f"built this context. Context keys: {list(context.keys())}"
+        )
+    return Path(str(raw_work_dir))
+
 async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     """Execute Claude Code with given prompt and context"""
     logger.info("run_claude_code called")
@@ -174,6 +207,12 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     task_context_for_dev_lock = context.get('context', {}) or {}
     issue_number_for_dev_lock = task_context_for_dev_lock.get('issue_number') or context.get('issue_number')
 
+    # Resolved BEFORE either lock below (#151/WI-6 item 12): a context with no
+    # work_dir is a construction bug in whatever built it, and failing on it
+    # here means no lock is taken only to be abandoned a line later. See
+    # _require_work_dir() for why this must not fall back to '.'.
+    work_dir_for_lock = _require_work_dir(context, agent)
+
     from services.dev_container_build_lock import dev_container_build_lock_async
 
     async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
@@ -186,7 +225,6 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         # for why locking epic-worktree-scoped runs too would be wrong. Distinct
         # resource from dev_container_build above, so nesting the two here is
         # safe -- neither lock is ever acquired twice for the same resource.
-        work_dir_for_lock = Path(context.get('work_dir', '.'))
         if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
             from services.project_checkout_lock import project_checkout_lock_async
 
@@ -221,8 +259,12 @@ async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: 
     # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
     logger.warning(f"Running agent {agent} locally (not in Docker) - this should ONLY be dev_environment_setup or dev_environment_verifier!")
 
-    # Prepare working directory
-    work_dir = Path(context.get('work_dir', '.'))
+    # Prepare working directory. Refuses a missing work_dir rather than running
+    # the agent in the orchestrator's own cwd -- see _require_work_dir(). In
+    # practice run_claude_code() has already resolved the same value for its lock
+    # decision before calling here, so this is a second read of an already-
+    # validated field, not a new failure point.
+    work_dir = _require_work_dir(context, agent)
     logger.info(f"Work directory: {work_dir}")
 
     # Prepare context information
