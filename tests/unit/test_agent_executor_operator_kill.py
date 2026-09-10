@@ -170,7 +170,14 @@ class TestNothingElseIsReclassified:
         self, agent_executor
     ):
         """An OOM kill is not an operator stop: it still terminates the run and
-        still counts, it just must not be retried."""
+        still counts, it just must not be retried.
+
+        An operator stop cannot arrive this way any more (#160 review): the kill
+        endpoint recovers project/issue from the container's Docker labels when
+        the Redis tracking hash is gone, and that hash's TTL now outlasts the
+        longest configured agent timeout -- see
+        tests/unit/test_operator_kill_attribution.py. Nor can docker_runner's own
+        grace-period kill, which no longer raises this type at all."""
         original = NonRetryableAgentError(
             "Agent container was terminated by signal (exit_code=137): OOM"
         )

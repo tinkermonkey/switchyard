@@ -557,13 +557,13 @@ def dev_container_build_lock_sync(
 #                                               a durable marker, not a holder)
 #
 # See PipelineLockManager.try_acquire_lock() for each one's own comment.
-# acquire_failure_is_contention() moved to services/project_checkout_lock.py
-# (#169): project_checkout_lock_if_free_sync() needs the identical
-# classification for the identical reason, and the reasons it classifies come
-# from the shared ProjectResourceLockManager facade rather than from anything
-# specific to this lock. Re-exported here (it is imported at the top of this
-# module) so `from services.dev_container_build_lock import
-# acquire_failure_is_contention` keeps working.
+# acquire_failure_is_contention() lives in services/project_checkout_lock.py
+# (#169): the reasons it classifies come from the shared
+# ProjectResourceLockManager facade rather than from anything specific to this
+# lock, and both locks need the identical classification. Re-exported here (it
+# is imported at the top of this module) so `from
+# services.dev_container_build_lock import acquire_failure_is_contention` keeps
+# working.
 
 
 def _log_skipped(project: str, issue_number: Optional[int], reason: str) -> None:
@@ -587,22 +587,36 @@ def _log_skipped(project: str, issue_number: Optional[int], reason: str) -> None
 
 
 @asynccontextmanager
-async def dev_container_build_lock_if_free_async(
+async def dev_container_build_lock_attempt_async(
     project: str,
     issue_number: Optional[int] = None,
     facade: Optional[ProjectResourceLockManager] = None,
 ):
     """
     Async context manager making ONE non-blocking attempt at `project`'s
-    dev_container_build lock, and yielding whether it got it.
+    dev_container_build lock, and yielding `(acquired, refusal_reason)`.
 
-    For bookkeeping writers of dev_container_state that own no build window --
-    see this module's docstring ("Bookkeeping writers, and why they get a
-    NON-BLOCKING variant") for why waiting would be both harmful and useless
-    for them. Yields True inside the hold (release and heartbeat handled
-    exactly as dev_container_build_lock_async() does), or False having taken
-    nothing, in which case the caller MUST skip its write rather than perform
-    it unlocked.
+    The full-information form of dev_container_build_lock_if_free_async()
+    below, which is a thin wrapper over this. Both are for callers that own no
+    build window -- see this module's docstring ("Bookkeeping writers, and why
+    they get a NON-BLOCKING variant") for why waiting would be both harmful and
+    useless for them.
+
+    Yields `(True, None)` inside the hold (release and heartbeat handled
+    exactly as dev_container_build_lock_async() does), or `(False, reason)`
+    having taken nothing, in which case the caller MUST NOT perform the guarded
+    operation unlocked as if it had the lock.
+
+    `reason` exists because a bool cannot answer the question a caller with a
+    FALLBACK needs answered (#169 review). "Somebody else is in this critical
+    section right now" and "the lock store is degraded / a retained marker is
+    present" both arrive as False, and they call for opposite behaviour: the
+    first means a winner is already doing the work, so the loser must defer;
+    the second means nobody is doing it, so a caller whose alternative to
+    running unserialized is never running at all may fall back. Pass `reason`
+    to acquire_failure_is_contention() (re-exported by this module) to tell
+    them apart -- a caller that just skips its write on any False wants the
+    simpler wrapper instead.
 
     Never raises DevContainerBuildLockTimeoutError: contention is the ordinary,
     expected outcome here rather than a failure, and manufacturing a lock
@@ -627,20 +641,40 @@ async def dev_container_build_lock_if_free_async(
     )
     if not can_execute:
         _log_skipped(project, issue_number, reason)
-        yield False
+        yield False, reason
         return
 
     try:
         async with _held_with_heartbeat_async(
             facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
         ):
-            yield True
+            yield True, None
     finally:
         # Offloaded for the same reason dev_container_build_lock_async()'s
         # release is -- see project_checkout_lock._release_and_warn_async().
         await _release_and_warn_async(
             facade, RESOURCE_NAME, project, holder_id, issue_number
         )
+
+
+@asynccontextmanager
+async def dev_container_build_lock_if_free_async(
+    project: str,
+    issue_number: Optional[int] = None,
+    facade: Optional[ProjectResourceLockManager] = None,
+):
+    """
+    dev_container_build_lock_attempt_async() for the callers that only need the
+    bool: yields True inside the hold, or False having taken nothing, in which
+    case the caller MUST skip its write rather than perform it unlocked.
+
+    See that function for the full contract, and for when the refusal reason
+    matters instead.
+    """
+    async with dev_container_build_lock_attempt_async(
+        project, issue_number, facade
+    ) as (acquired, _reason):
+        yield acquired
 
 
 @contextmanager

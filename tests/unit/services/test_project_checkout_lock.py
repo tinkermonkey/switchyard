@@ -53,7 +53,6 @@ from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_checkout_lock import (
     acquire_failure_is_contention,
     project_checkout_lock_async,
-    project_checkout_lock_if_free_sync,
     project_checkout_lock_sync,
     _acquire_and_start_heartbeat_off_loop,
     _default_facade_off_loop,
@@ -1906,101 +1905,10 @@ class TestReleaseAndWarnReportsWhyTheReleaseFailed(unittest.TestCase):
         err.assert_not_called()
 
 
-class TestProjectCheckoutLockIfFreeSync(unittest.TestCase):
-    """The non-blocking variant added for prune_epic_worktrees()'s startup
-    sweep (#169), which main.py calls on the event-loop thread where the
-    polling variant's time.sleep() could never succeed."""
-
-    def setUp(self):
-        self.test_dir = tempfile.mkdtemp()
-        self.facade = _make_facade(self.test_dir)
-
-    def tearDown(self):
-        shutil.rmtree(self.test_dir)
-
-    def test_yields_true_and_releases_when_free(self):
-        with project_checkout_lock_if_free_sync("proj", 7, facade=self.facade) as acquired:
-            self.assertTrue(acquired)
-            lock = self.facade.get_resource_lock("proj", RESOURCE_NAME)
-            self.assertIsNotNone(lock)
-            # An internally-minted unique id, never the caller's issue_number.
-            self.assertLess(lock.locked_by_issue, 0)
-
-        self.assertIsNone(self.facade.get_resource_lock("proj", RESOURCE_NAME))
-
-    def test_yields_false_without_waiting_when_busy(self):
-        """The whole point: the caller is on a thread that must not sleep."""
-        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)  # never released
-
-        start = time.monotonic()
-        with project_checkout_lock_if_free_sync("proj", 7, facade=self.facade) as acquired:
-            self.assertFalse(acquired)
-        elapsed = time.monotonic() - start
-
-        self.assertLess(elapsed, 1.0)
-        # The other holder's lock is untouched -- nothing stolen, nothing released.
-        self.assertEqual(self.facade.get_resource_lock("proj", RESOURCE_NAME).locked_by_issue, 1)
-
-    def test_does_not_raise_a_lock_timeout_when_busy(self):
-        """Contention is the expected outcome for a caller that deliberately did
-        not wait. Raising ProjectCheckoutLockTimeoutError would misreport it to
-        every consumer of resource_lock_errors.is_lock_timeout_error()."""
-        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
-        try:
-            with project_checkout_lock_if_free_sync("proj", facade=self.facade):
-                pass
-        except ProjectCheckoutLockTimeoutError:  # pragma: no cover
-            self.fail("the non-blocking variant must not raise a lock timeout")
-
-    def test_releases_on_exception_inside_the_body(self):
-        with self.assertRaises(ValueError):
-            with project_checkout_lock_if_free_sync("proj", facade=self.facade) as acquired:
-                self.assertTrue(acquired)
-                raise ValueError("boom")
-
-        self.assertIsNone(self.facade.get_resource_lock("proj", RESOURCE_NAME))
-
-    def test_a_held_if_free_lock_blocks_the_blocking_variant(self):
-        """It really is the same resource: a prune sweep in flight serializes a
-        base-clone operation that starts at the same moment, and vice versa."""
-        with project_checkout_lock_if_free_sync("proj", facade=self.facade) as acquired:
-            self.assertTrue(acquired)
-            with self.assertRaises(ProjectCheckoutLockTimeoutError):
-                with project_checkout_lock_sync(
-                    "proj", facade=self.facade, timeout_seconds=0.1, poll_interval_seconds=0.02
-                ):
-                    pass  # pragma: no cover
-
-    def test_a_busy_lock_is_reported_as_contention_not_as_a_degraded_store(self):
-        """The two skips read very differently to an operator, so they are
-        logged differently -- INFO for a live holder, ERROR for a lock whose
-        state could not be established at all."""
-        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
-
-        with self.assertLogs('services.project_checkout_lock', level='INFO') as logs:
-            with project_checkout_lock_if_free_sync("proj", facade=self.facade) as acquired:
-                self.assertFalse(acquired)
-
-        text = "\n".join(logs.output)
-        self.assertIn("is busy", text)
-        self.assertNotIn("ERROR", text)
-
-    def test_a_degraded_acquire_is_reported_as_not_contention(self):
-        degraded = MagicMock()
-        degraded.acquire_resource.return_value = (False, "lock_state_unknown_failing_closed")
-
-        with self.assertLogs('services.project_checkout_lock', level='ERROR') as logs:
-            with project_checkout_lock_if_free_sync("proj", facade=degraded) as acquired:
-                self.assertFalse(acquired)
-
-        text = "\n".join(logs.output)
-        self.assertIn("NOT contention", text)
-        degraded.release_resource.assert_not_called()
-
-
 class TestAcquireFailureIsContention(unittest.TestCase):
-    """Moved here from dev_container_build_lock (#169) so both non-blocking
-    variants classify their skips the same way. Re-exported there, so
+    """Moved here from dev_container_build_lock (#169): the reasons it
+    classifies come from the shared ProjectResourceLockManager facade, not from
+    either lock. Re-exported there, so
     `from services.dev_container_build_lock import acquire_failure_is_contention`
     still resolves."""
 

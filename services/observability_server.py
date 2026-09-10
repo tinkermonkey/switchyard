@@ -185,6 +185,60 @@ def test_pubsub():
         logger.error(f"Failed to publish test event: {e}")
         return jsonify({'error': str(e)}), 500
 
+def _container_attribution_from_labels(container_name):
+    """(project, issue_number) read from a running container's Docker labels, or
+    (None, None).
+
+    The kill switch's second source of attribution (#160 review). claude/
+    docker_runner.py stamps `org.switchyard.project` and (whenever the dispatch
+    has one) `org.switchyard.issue_number` at `docker run` time, for the same
+    reason AgentContainerRecovery reads them: labels live and die with the
+    container, so unlike the `agent:container:*` Redis hash they cannot expire
+    under a live container or vanish because Redis is down.
+
+    Best-effort by construction -- a container that has already exited, an
+    unreadable label, or a docker CLI that does not answer within the timeout all
+    come back as (None, None) and leave the caller on its unattributed path.
+    """
+    try:
+        result = subprocess.run(
+            ['docker', 'inspect', '--format',
+             '{{index .Config.Labels "org.switchyard.project"}}|'
+             '{{index .Config.Labels "org.switchyard.issue_number"}}',
+             container_name],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Could not inspect {container_name} for kill-switch attribution: "
+                f"{result.stderr.strip()}"
+            )
+            return None, None
+
+        project_label, _, issue_label = result.stdout.strip().partition('|')
+        project = project_label.strip() or None
+        if project in ('<no value>', 'unknown'):
+            project = None
+
+        issue_number = None
+        issue_label = issue_label.strip()
+        if issue_label and issue_label not in ('<no value>', 'unknown'):
+            try:
+                issue_number = int(issue_label)
+            except ValueError:
+                logger.warning(
+                    f"Container {container_name} carries a non-numeric "
+                    f"org.switchyard.issue_number label ({issue_label!r})"
+                )
+
+        return project, issue_number
+    except Exception as e:
+        logger.warning(f"Failed to read Docker labels for {container_name}: {e}")
+        return None, None
+
+
 @app.route('/agents/kill/<container_name>', methods=['POST'])
 def kill_agent(container_name):
     """Emergency kill switch - immediately stop an agent container"""
@@ -205,6 +259,30 @@ def kill_agent(container_name):
         except Exception as e:
             logger.warning(f"Could not read container metadata from Redis: {e}")
 
+        # Docker's own labels are the fallback, not the unattributed branch below
+        # (#160 review). Which branch this request takes is not cosmetic: only the
+        # cancellation flow marks the kill as deliberate, and without it
+        # docker_runner's exit-137 NonRetryableAgentError reaches agent_executor as
+        # an ordinary agent failure -- three of those on one issue reach
+        # MAX_CONSECUTIVE_DISPATCH_FAILURES, mark_failed(), and a durably retained
+        # board lock needing scripts/release_lock.py. Deciding that on whether a
+        # Redis key happens to still be there is exactly the kind of silent
+        # dependency this endpoint should not have: the key can be gone because
+        # Redis is unreachable (the except above), or because it aged out. The
+        # container itself carries the same attribution in labels that
+        # docker_runner sets at `docker run` time and that outlive nothing.
+        if not (project and issue_number):
+            label_project, label_issue = _container_attribution_from_labels(container_name)
+            project = project or label_project
+            if issue_number is None:
+                issue_number = label_issue
+            if project and issue_number:
+                logger.info(
+                    f"Recovered kill-switch attribution for {container_name} from its "
+                    f"Docker labels ({project}/#{issue_number}) -- its Redis tracking "
+                    f"hash was missing or unreadable"
+                )
+
         # If we have project/issue, use full cancellation flow
         if project and issue_number:
             from services.cancellation import cancel_issue_work
@@ -218,7 +296,17 @@ def kill_agent(container_name):
                 'issue_number': issue_number
             }), 200
 
-        # Fallback: kill just this container (no project/issue context)
+        # Fallback: kill just this container (no project/issue context).
+        # Reached only when NEITHER Redis nor the container's own labels name an
+        # issue -- a project-scoped dispatch, or a container that is already gone.
+        # Logged at WARNING because a kill that sets no cancellation signal is
+        # counted as an agent failure by whatever dispatched it (see above).
+        logger.warning(
+            f"Killing {container_name} without a cancellation signal: neither its Redis "
+            f"tracking hash nor its Docker labels named a project and issue. If this "
+            f"container belonged to an issue dispatch, the kill will be recorded as an "
+            f"agent failure rather than as a deliberate stop."
+        )
         result = subprocess.run(
             ['docker', 'rm', '-f', container_name],
             capture_output=True,

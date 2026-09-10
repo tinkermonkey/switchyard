@@ -14,7 +14,7 @@ import logging
 import subprocess
 import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from enum import Enum
 from datetime import datetime
 
@@ -153,7 +153,7 @@ class DevContainerStateManager:
         status: DevContainerStatus,
         image_name: Optional[str] = None,
         error_message: Optional[str] = None,
-        expect_status: Optional[DevContainerStatus] = None,
+        expect: Optional[Dict[str, Any]] = None,
     ):
         """
         Set the status of a project's dev container
@@ -163,12 +163,24 @@ class DevContainerStateManager:
             status: New status
             image_name: Docker image name (e.g., "context-studio-agent:latest")
             error_message: Error message if status is BLOCKED
-            expect_status: when given, the write only lands if the status ON
-                DISK is still this value when _merge_state() has the file lock.
-                Turns a read-decide-write whose decision was made outside the
-                lock into a compare-and-set (#171); see _merge_state()'s
-                `expect` argument for why the check has to happen in there
-                rather than as a get_status() call right before this one.
+            expect: when given, the write only lands if EVERY key in it still
+                matches the state ON DISK when _merge_state() has the file lock
+                -- raw values as they are stored, e.g.
+                {'status': 'verified', 'updated_at': '<iso>'}. Turns a
+                read-decide-write whose decision was made outside the lock into
+                a compare-and-set (#171); see _merge_state()'s own `expect`
+                argument for why the check has to happen in there rather than as
+                a get_status() call right before this one.
+
+                Started out as an `expect_status` shorthand taking just a
+                status. Widened in review of #169: a status alone identifies a
+                VALUE, not a VERSION, so a concurrent writer that moved the
+                record on and back to the same status -- a rebuild finishing
+                with a fresh VERIFIED being the case that matters -- satisfied
+                the precondition and got reverted anyway. Pair the status with
+                'updated_at' (and anything else the decision rested on) to
+                identify the version actually read.
+
                 Default None keeps every existing caller's unconditional write.
         """
         updates = {
@@ -185,9 +197,6 @@ class DevContainerStateManager:
             # Clear error message if status changed from blocked
             updates['error_message'] = None
 
-        expect = (
-            None if expect_status is None else {'status': expect_status.value}
-        )
         if self._merge_state(project_name, updates, expect=expect):
             logger.info(f"Updated dev container status for {project_name}: {status.value}")
 
@@ -585,7 +594,9 @@ class DevContainerStateManager:
         """Check if a project's dev container setup is blocked"""
         return self.get_status(project_name) == DevContainerStatus.BLOCKED
 
-    def verify_image_exists(self, project_name: str) -> bool:
+    def verify_image_exists(
+        self, project_name: str, image_name: Optional[str] = None
+    ) -> bool:
         """
         Verify that the Docker image for a project actually exists locally AND
         is genuinely a switchyard-built agent environment (carries
@@ -600,12 +611,19 @@ class DevContainerStateManager:
 
         Args:
             project_name: Name of the project
+            image_name: The tag to inspect. Defaults to whatever the state file
+                records. Passed explicitly by a caller that will make a
+                compare-and-set decision out of the answer (#169 review), so the
+                image this probe actually looked at is the same one the
+                precondition names — re-reading it afterwards would silently
+                pair a verdict about one tag with a write about another.
 
         Returns:
             True if the image exists locally and carries the switchyard
             agent-environment label, False otherwise
         """
-        image_name = self.get_image_name(project_name)
+        if image_name is None:
+            image_name = self.get_image_name(project_name)
 
         if not image_name:
             logger.debug(f"No image name recorded for {project_name}")
@@ -658,34 +676,55 @@ class DevContainerStateManager:
         Returns:
             True if image exists (or status is not verified), False if image is missing
         """
-        status = self.get_status(project_name)
+        # ONE snapshot, not three separate locked reads (#169 review). Status,
+        # the timestamp that versions it, and the image name the verdict is
+        # about all have to come from the same version of the file, or the
+        # compare-and-set below cannot name the version it is actually
+        # conditional on.
+        state = self._read_state(project_name)
+        try:
+            status = DevContainerStatus(state.get('status', 'unverified'))
+        except Exception as e:
+            logger.error(f"Failed to read dev container status for {project_name}: {e}")
+            status = DevContainerStatus.UNVERIFIED
+        updated_at = state.get('updated_at')
+        image_name = state.get('image_name')
 
         # Only verify if status is VERIFIED
         if status != DevContainerStatus.VERIFIED:
             return True  # No verification needed for other states
 
         # Check if image actually exists
-        if self.verify_image_exists(project_name):
+        if self.verify_image_exists(project_name, image_name=image_name):
             return True  # Image exists, all good
 
         # Image is missing, or the tag now points at something that isn't a
         # genuine switchyard agent environment (see verify_image_exists) -
         # reset status to UNVERIFIED either way so a rebuild is forced.
-        image_name = self.get_image_name(project_name)
         logger.warning(
             f"Project {project_name} marked as verified but image {image_name} is missing "
             f"or is not a genuine agent-environment image. Resetting status to unverified."
         )
 
-        # expect_status makes this a compare-and-set (#171). The decision above
-        # rests on a status read several seconds ago -- verify_image_exists()
-        # shells out to `docker image inspect` with a 10s timeout in between --
-        # and this method's two live callers are the ones most likely to be
-        # running while something else writes: claude/docker_runner.py's image
-        # resolution on every container launch, and main.py's startup sweep
-        # (which runs while the observability server, a separate container, may
-        # be finishing an operator-triggered rebuild). Writing unconditionally
-        # would revert that rebuild's fresh VERIFIED and force a redundant one.
+        # `expect` makes this a compare-and-set (#171). The decision above rests
+        # on a read several seconds ago -- verify_image_exists() shells out to
+        # `docker image inspect` with a 10s timeout in between -- and this
+        # method's two live callers are the ones most likely to be running while
+        # something else writes: claude/docker_runner.py's image resolution on
+        # every container launch, and main.py's startup sweep (which runs while
+        # the observability server, a separate container, may be finishing an
+        # operator-triggered rebuild). Writing unconditionally would revert that
+        # rebuild's fresh VERIFIED and force a redundant one.
+        #
+        # The precondition names the VERSION, not just the status (#169 review).
+        # A rebuild that FINISHES in that window ends by writing VERIFIED
+        # (rebuild_project_image -> set_status(VERIFIED)), so a status-only
+        # precondition still matched afterwards and reverted exactly the write
+        # this guard was added for -- it only ever caught a writer that left the
+        # record on some OTHER status. 'updated_at' is what distinguishes the
+        # record this call read from a later one carrying the same status, and
+        # 'image_name' pins the verdict to the tag the probe actually inspected.
+        #
         # The return value stays False either way: the image this call actually
         # looked at was genuinely missing, and reporting otherwise would tell
         # docker_runner to launch against it.
@@ -697,7 +736,11 @@ class DevContainerStateManager:
                 "Image missing, or tag now points at an unrelated image (e.g. overwritten "
                 "by another docker build/compose using the same name) - rebuild required"
             ),
-            expect_status=DevContainerStatus.VERIFIED,
+            expect={
+                'status': DevContainerStatus.VERIFIED.value,
+                'updated_at': updated_at,
+                'image_name': image_name,
+            },
         )
 
         return False

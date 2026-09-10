@@ -32,20 +32,25 @@ def _status_snapshot_from_stubs(mock_state):
 
 
 @contextmanager
-def _build_lock(acquired: bool):
-    """Stand-in for dev_container_build_lock_if_free_async (#171).
+def _build_lock(acquired: bool, reason: str = "lock_state_unknown_failing_closed"):
+    """Stand-in for dev_container_build_lock_attempt_async (#171).
 
     queue_dev_environment_setup() takes that lock around its check-then-mark.
     These tests are about the guard, not the lock, and the real acquire would
     reach Redis / the on-disk lock store; the lock's own behaviour is covered by
     tests/unit/services/test_dev_container_build_lock.py.
+
+    `reason` is what the refusal is attributed to, and it decides which branch
+    the caller takes (#169 review): a live holder means defer, anything else
+    means fall back unserialized. The default is a degraded store, so every test
+    that only cares "the acquire failed" keeps the fallback it was written for.
     """
     @asynccontextmanager
     async def _ctx(project, issue_number=None, facade=None):
-        yield acquired
+        yield (True, None) if acquired else (False, reason)
 
     with patch(
-        'services.dev_container_build_lock.dev_container_build_lock_if_free_async', _ctx
+        'services.dev_container_build_lock.dev_container_build_lock_attempt_async', _ctx
     ):
         yield
 
@@ -573,11 +578,11 @@ class TestTheDuplicateGuardIsAtomic:
         async def _recording_lock(project, issue_number=None, facade=None):
             events.append('lock_acquired')
             try:
-                yield True
+                yield True, None
             finally:
                 events.append('lock_released')
 
-        with patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async',
+        with patch('services.dev_container_build_lock.dev_container_build_lock_attempt_async',
                    _recording_lock), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
@@ -600,13 +605,67 @@ class TestTheDuplicateGuardIsAtomic:
         ], events
 
     @pytest.mark.asyncio
+    async def test_a_contended_acquire_defers_instead_of_queuing_a_duplicate(self, mock_logger):
+        """THE #169-review regression. The earlier fallback ran the identical
+        unserialized sequence on ANY refusal, which left the race wide open for
+        the racer the lock was added to stop: A wins the lock, B is refused, B
+        reads UNVERIFIED before A's IN_PROGRESS write lands, and both enqueue.
+        A live holder is either that winner (queuing on our behalf) or a
+        build/verify session (a setup already running) -- both mean stop."""
+        from services.dev_container_state import DevContainerStatus
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        # Nothing read, nothing marked, nothing queued -- the loser stops.
+        mock_state.get_status_and_updated_at.assert_not_called()
+        mock_state.set_status.assert_not_called()
+        mock_queue_instance.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_retained_lock_is_not_treated_as_a_live_holder(self, mock_logger):
+        """`locked_by_issue_N_failed` is a durable marker left for deliberate
+        human recovery -- its 'holder' is a run that already ended. Deferring to
+        it would be a NEW way for a project to never get a setup queued."""
+        from services.dev_container_state import DevContainerStatus
+
+        with _build_lock(False, reason="locked_by_issue_42_failed"), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        mock_queue_instance.enqueue.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_a_refused_acquire_falls_back_rather_than_never_queuing(self, mock_logger):
-        """A retained lock from a failed run, or a degraded lock store, refuses
-        the acquire without any build being in flight -- and probe 3 of
-        _dev_setup_in_flight_reason() deliberately does not treat either as a
-        live run. Skipping outright there would be a NEW way for a project to
-        never get a setup queued, so the fallback keeps the previous
-        (unserialized) behaviour and says so."""
+        """A degraded/fail-closed lock store refuses the acquire without any
+        build being in flight -- and probe 3 of _dev_setup_in_flight_reason()
+        deliberately does not treat it as a live run. Skipping outright there
+        would be a NEW way for a project to never get a setup queued, so the
+        fallback keeps the previous (unserialized) behaviour and says so.
+        Contrast test_a_contended_acquire_defers_instead_of_queuing_a_duplicate:
+        the two refusals call for opposite behaviour, which is why the acquire
+        surfaces its reason (#169 review)."""
         from services.dev_container_state import DevContainerStatus
 
         with _build_lock(False), \

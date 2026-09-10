@@ -51,6 +51,7 @@ from services.dev_container_build_lock import (
     agent_holds_build_window,
     BUILD_WINDOW_AGENTS,
     dev_container_build_lock_async,
+    dev_container_build_lock_attempt_async,
     dev_container_build_lock_if_free_async,
     dev_container_build_lock_if_free_sync,
     dev_container_build_lock_sync,
@@ -736,6 +737,63 @@ class TestIfFreeAsyncVariant:
                 assert acquired is True
 
         assert seen and all(t != loop_thread for t in seen)
+
+
+@pytest.mark.asyncio
+class TestAttemptAsyncSurfacesTheRefusalReason:
+    """#169 review. A bool cannot answer the question a caller with a FALLBACK
+    needs answered: "somebody is in this critical section right now" (defer) and
+    "the lock store is degraded" (fall back unserialized) both arrive as False,
+    and they call for opposite behaviour. agents/orchestrator_integration.py's
+    queue_dev_environment_setup() is that caller."""
+
+    def setup_method(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.facade = _make_facade(self.test_dir)
+
+    def teardown_method(self):
+        shutil.rmtree(self.test_dir)
+
+    async def test_a_granted_acquire_yields_no_reason(self):
+        async with dev_container_build_lock_attempt_async(
+            "proj", 7, facade=self.facade
+        ) as (acquired, reason):
+            assert acquired is True
+            assert reason is None
+
+        assert self.facade.get_resource_lock("proj", RESOURCE_NAME) is None
+
+    async def test_a_live_holder_yields_a_contention_reason(self):
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
+
+        async with dev_container_build_lock_attempt_async(
+            "proj", 7, facade=self.facade
+        ) as (acquired, reason):
+            assert acquired is False
+            assert acquire_failure_is_contention(reason), reason
+
+        assert self.facade.get_resource_lock("proj", RESOURCE_NAME).locked_by_issue == 1
+
+    async def test_a_degraded_store_yields_a_reason_that_is_not_contention(self):
+        degraded = MagicMock()
+        degraded.acquire_resource.return_value = (False, "lock_state_unknown_failing_closed")
+
+        async with dev_container_build_lock_attempt_async(
+            "proj", facade=degraded
+        ) as (acquired, reason):
+            assert acquired is False
+            assert not acquire_failure_is_contention(reason)
+
+        degraded.release_resource.assert_not_called()
+
+    async def test_the_if_free_wrapper_still_yields_a_bare_bool(self):
+        """Every caller that only needs the bool keeps the simpler contract."""
+        async with dev_container_build_lock_if_free_async("proj", facade=self.facade) as acquired:
+            assert acquired is True
+
+        self.facade.acquire_resource("proj", RESOURCE_NAME, 1)
+        async with dev_container_build_lock_if_free_async("proj", facade=self.facade) as acquired:
+            assert acquired is False
 
 
 class TestAcquireFailureClassification(unittest.TestCase):

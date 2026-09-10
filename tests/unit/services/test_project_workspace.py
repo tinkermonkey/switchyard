@@ -61,12 +61,7 @@ def _no_op_checkout_lock():
     def _noop(*args, **kwargs):
         yield
 
-    @contextmanager
-    def _free(*args, **kwargs):
-        yield True
-
-    with patch('services.project_checkout_lock.project_checkout_lock_sync', _noop), \
-         patch('services.project_checkout_lock.project_checkout_lock_if_free_sync', _free):
+    with patch('services.project_checkout_lock.project_checkout_lock_sync', _noop):
         yield
 
 

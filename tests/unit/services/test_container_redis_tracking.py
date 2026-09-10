@@ -72,6 +72,8 @@ class TestRegisterActiveContainer:
         return runner, mock_redis
 
     def test_first_attempt_success(self):
+        from claude.docker_runner import ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
+
         runner, mock_redis = self._make_runner_with_redis()
 
         runner._register_active_container(
@@ -91,7 +93,13 @@ class TestRegisterActiveContainer:
         assert mapping['issue_number'] == '42'
         assert mapping['pipeline_run_id'] == 'run-1'
 
-        mock_redis.expire.assert_called_once_with('agent:container:claude-agent-proj-123', 7200)
+        # The TTL must outlast the longest configured agent timeout, or the hash
+        # expires under a live container and the kill switch loses the only
+        # attribution it had (#160 review) -- see
+        # tests/unit/test_operator_kill_attribution.py.
+        mock_redis.expire.assert_called_once_with(
+            'agent:container:claude-agent-proj-123', ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
+        )
 
     def test_container_id_passthrough(self):
         """container_id from docker run output is stored directly — no docker ps lookup."""

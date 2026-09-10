@@ -165,7 +165,7 @@ class TestReadDecideWriteCallersReDecideUnderTheLock:
         manager.set_status(
             "proj",
             DevContainerStatus.UNVERIFIED,
-            expect_status=DevContainerStatus.VERIFIED,
+            expect={'status': DevContainerStatus.VERIFIED.value},
         )
 
         assert manager.get_status("proj") == DevContainerStatus.IN_PROGRESS
@@ -176,14 +176,14 @@ class TestReadDecideWriteCallersReDecideUnderTheLock:
         manager.set_status(
             "proj",
             DevContainerStatus.UNVERIFIED,
-            expect_status=DevContainerStatus.VERIFIED,
+            expect={'status': DevContainerStatus.VERIFIED.value},
         )
 
         assert manager.get_status("proj") == DevContainerStatus.UNVERIFIED
 
     def test_an_unconditional_write_is_unaffected(self, manager):
         """Only callers whose decision depends on an earlier read pass
-        expect_status; everything else must keep writing unconditionally."""
+        expect; everything else must keep writing unconditionally."""
         manager.set_status("proj", DevContainerStatus.IN_PROGRESS)
         manager.set_status("proj", DevContainerStatus.BLOCKED, error_message="nope")
 
@@ -218,7 +218,7 @@ class TestReadDecideWriteCallersReDecideUnderTheLock:
         manager.set_status(
             "proj",
             DevContainerStatus.UNVERIFIED,
-            expect_status=DevContainerStatus.VERIFIED,
+            expect={'status': DevContainerStatus.VERIFIED.value},
         )
 
         assert interleaved.is_set(), "test setup: the competing write never ran"
@@ -230,22 +230,39 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
     inspect` (10s timeout), and only then writes UNVERIFIED. Its two live
     callers are docker_runner's per-launch image resolution and main.py's
     startup sweep -- both of which can run while the observability server, a
-    separate container, is finishing an operator-triggered rebuild (#171)."""
+    separate container, is finishing an operator-triggered rebuild (#171).
+
+    The precondition names the VERSION it read, not just the status (#169
+    review): a status-only check caught an interleaving writer that moved the
+    record to IN_PROGRESS, but not the one that actually matters -- a rebuild
+    that FINISHES in the window and writes a fresh VERIFIED."""
+
+    @staticmethod
+    def _probe(returns, side_effect=None):
+        """Stand-in for verify_image_exists, recording the tag it was asked
+        about and optionally letting a competing writer land first."""
+        seen = []
+
+        def _verify(self, project_name, image_name=None):
+            seen.append(image_name)
+            if side_effect is not None:
+                side_effect()
+            return returns
+
+        return _verify, seen
 
     def test_a_rebuild_that_landed_during_the_docker_probe_is_not_reverted(self, manager):
         manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
 
-        def _rebuild_lands_during_the_probe(project_name):
+        def _rebuild_lands_during_the_probe():
             manager.set_status(
                 "proj", DevContainerStatus.IN_PROGRESS, image_name="proj-agent:latest"
             )
-            return False
 
+        probe, _seen = self._probe(False, side_effect=_rebuild_lands_during_the_probe)
         original = DevContainerStateManager.verify_image_exists
         try:
-            DevContainerStateManager.verify_image_exists = (
-                lambda self, project_name: _rebuild_lands_during_the_probe(project_name)
-            )
+            DevContainerStateManager.verify_image_exists = probe
             result = manager.verify_and_update_status("proj")
         finally:
             DevContainerStateManager.verify_image_exists = original
@@ -256,12 +273,84 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
         # ...but the fresher verdict on disk is left alone.
         assert manager.get_status("proj") == DevContainerStatus.IN_PROGRESS
 
+    def test_a_rebuild_that_FINISHED_during_the_probe_is_not_reverted_either(self, manager):
+        """THE regression (#169 review). A finishing rebuild ends by writing
+        VERIFIED -- observability_server's endpoint sets IN_PROGRESS and then
+        rebuild_project_image(update_state=True) writes VERIFIED. Against a
+        status-only precondition that still read 'verified' on disk, so the
+        stale verdict landed: a freshly built, present image marked UNVERIFIED,
+        and the next dispatch queuing a second hour-scale rebuild of it."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        def _rebuild_finishes_during_the_probe():
+            # Same status, same image name, new version of the record -- only
+            # the timestamp distinguishes it from what this call read.
+            time.sleep(0.01)
+            manager.set_status(
+                "proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest"
+            )
+
+        probe, _seen = self._probe(False, side_effect=_rebuild_finishes_during_the_probe)
+        original = DevContainerStateManager.verify_image_exists
+        try:
+            DevContainerStateManager.verify_image_exists = probe
+            result = manager.verify_and_update_status("proj")
+        finally:
+            DevContainerStateManager.verify_image_exists = original
+
+        # The tag this call inspected was genuinely absent, so its own caller is
+        # still told not to launch against it...
+        assert result is False
+        # ...but the rebuild that just finished keeps its verdict.
+        assert manager.get_status("proj") == DevContainerStatus.VERIFIED
+
+    def test_a_retag_during_the_probe_is_not_reverted(self, manager):
+        """The image name is part of the version too: a verdict about
+        proj-agent:latest must not land on a record that now names a different
+        tag."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        def _retag_during_the_probe():
+            time.sleep(0.01)
+            manager.set_status(
+                "proj", DevContainerStatus.VERIFIED, image_name="proj-agent:v2"
+            )
+
+        probe, seen = self._probe(False, side_effect=_retag_during_the_probe)
+        original = DevContainerStateManager.verify_image_exists
+        try:
+            DevContainerStateManager.verify_image_exists = probe
+            result = manager.verify_and_update_status("proj")
+        finally:
+            DevContainerStateManager.verify_image_exists = original
+
+        assert result is False
+        assert seen == ["proj-agent:latest"], "the probe must inspect the tag it read"
+        assert manager.get_image_name("proj") == "proj-agent:v2"
+        assert manager.get_status("proj") == DevContainerStatus.VERIFIED
+
+    def test_the_probe_inspects_the_tag_from_the_same_snapshot(self, manager):
+        """Re-reading the image name after the probe would pair a verdict about
+        one tag with a write about another."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        probe, seen = self._probe(True)
+        original = DevContainerStateManager.verify_image_exists
+        try:
+            DevContainerStateManager.verify_image_exists = probe
+            assert manager.verify_and_update_status("proj") is True
+        finally:
+            DevContainerStateManager.verify_image_exists = original
+
+        assert seen == ["proj-agent:latest"]
+
     def test_it_still_resets_a_status_nothing_else_touched(self, manager):
         manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
 
+        probe, _seen = self._probe(False)
         original = DevContainerStateManager.verify_image_exists
         try:
-            DevContainerStateManager.verify_image_exists = lambda self, project_name: False
+            DevContainerStateManager.verify_image_exists = probe
             result = manager.verify_and_update_status("proj")
         finally:
             DevContainerStateManager.verify_image_exists = original

@@ -529,8 +529,15 @@ def acquire_failure_is_contention(reason: Optional[str]) -> bool:
 
     Shared by every project-scoped resource lock built on this module's
     poll/timeout/release shape: services/dev_container_build_lock.py re-exports
-    it under its own name for its bookkeeping writers, and
-    project_checkout_lock_if_free_sync() below uses it for the same purpose.
+    it under its own name, both for its bookkeeping writers' skip logging and
+    for agents/orchestrator_integration.py's queue_dev_environment_setup(),
+    which has to tell "someone is in this critical section right now" (defer,
+    the winner is queuing anyway) from "the lock store is degraded" (fall back
+    unserialized) -- see dev_container_build_lock_attempt_async().
+
+    It lives here rather than there because the reasons it classifies come from
+    the shared ProjectResourceLockManager facade, not from anything specific to
+    either lock.
     """
     if not isinstance(reason, str) or not reason.startswith("locked_by_issue_"):
         return False
@@ -1368,75 +1375,6 @@ def project_checkout_lock_sync(
                 yield
         finally:
             _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
-
-
-@contextmanager
-def project_checkout_lock_if_free_sync(
-    project: str,
-    issue_number: Optional[int] = None,
-    facade: Optional[ProjectResourceLockManager] = None,
-):
-    """
-    Synchronous context manager making ONE non-blocking attempt at `project`'s
-    project_checkout lock, and yielding whether it got it.
-
-    For base-clone writers that run on a thread which MUST NOT sleep -- today
-    ProjectWorkspaceManager.prune_epic_worktrees()'s startup sweep, which
-    main.py calls directly on the event-loop thread (#169). Both reasons
-    project_checkout_lock_sync() gives for never polling there apply in full:
-    the poll is a time.sleep(), and every in-process holder of this lock
-    releases from a coroutine on that same loop, so a wait there starves the
-    holder it is waiting for and can never succeed. A single attempt has
-    neither problem.
-
-    Yields True inside the hold (release and heartbeat handled exactly as
-    project_checkout_lock_sync() does), or False having taken nothing, in
-    which case the caller MUST skip the guarded operation rather than run it
-    unlocked.
-
-    Never raises ProjectCheckoutLockTimeoutError: contention is the ordinary,
-    expected outcome for a caller that deliberately did not wait, and
-    manufacturing a lock timeout for it would misreport it to every consumer
-    of services/resource_lock_errors.is_lock_timeout_error(). Same shape and
-    same rationale as dev_container_build_lock_if_free_sync().
-
-    Does not register with the watchdog activity registry either, for the same
-    reason that one doesn't: the registry exists to stop the zombie reaper
-    redispatching a run parked in a poll loop, and there is no poll loop here.
-
-    Args:
-        project: Project name.
-        issue_number: log attribution only, never the lock's holder identity --
-            see this module's docstring.
-        facade: injected ProjectResourceLockManager -- for tests only.
-    """
-    facade = facade if facade is not None else ProjectResourceLockManager()
-    holder_id = _mint_unique_holder_id()
-    can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
-    if not can_execute:
-        if acquire_failure_is_contention(reason):
-            logger.info(
-                f"'{RESOURCE_NAME}' lock for project {project!r} "
-                f"({_attribution(issue_number)}) is busy ({reason}) -- skipping the "
-                f"guarded base-clone operation rather than waiting for it or running "
-                f"it unlocked"
-            )
-        else:
-            logger.error(
-                f"'{RESOURCE_NAME}' lock for project {project!r} "
-                f"({_attribution(issue_number)}) could not be taken ({reason}) -- this "
-                f"is NOT contention: nobody is working in this project's base clone. "
-                f"The guarded operation was still skipped (this module never runs one "
-                f"unlocked)."
-            )
-        yield False
-        return
-
-    try:
-        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
-            yield True
-    finally:
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 
 @asynccontextmanager

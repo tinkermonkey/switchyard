@@ -4,6 +4,7 @@ import subprocess
 import logging
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from enum import Enum
@@ -24,6 +25,27 @@ logger = logging.getLogger(__name__)
 # attribution and the watchdog reaps the run and redispatches the issue while
 # this thread is still waiting to create its worktree.
 UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS = 900.0
+
+# prune_epic_worktrees()'s per-project project_checkout wait, and the budget it
+# shares across the whole sweep (#169 review).
+#
+# Per project: the same deliberately short wait initialize_project() uses, for
+# the same reason. Both run once per project at STARTUP, before the dispatch
+# loop begins, and both already treat a per-project failure as per-project --
+# so a restart is itself the natural retry, and waiting out project_checkout_
+# lock's own ~3h DEFAULT_TIMEOUT_SECONDS here would stall the entire startup
+# sequence over one project's cleanup. The realistic contender is container
+# recovery's auto-commit thread, which main.py starts seconds earlier and which
+# finishes on its own well inside this.
+#
+# Shared across the sweep: without a shared ceiling the worst case is
+# len(projects) x the per-project timeout of blocked startup, which at this
+# deployment's project count is over half an hour of a monitor loop that has
+# not begun. Once the budget is spent the remaining projects each get a single
+# attempt (timeout 0.0) and are skipped if refused -- degrading to the sweep's
+# pre-#169-review behaviour rather than to an unbounded startup.
+PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS = 120.0
+PRUNE_SWEEP_LOCK_BUDGET_SECONDS = 300.0
 
 # Resource name the per-epic serializer's waits are published under in
 # project_checkout_lock's activity registry (code review on #151/WI-6). Distinct
@@ -406,11 +428,14 @@ class ProjectWorkspaceManager:
                 aborting the whole startup sequence. Waiting out
                 project_checkout_lock's own default (~3h,
                 DEFAULT_TIMEOUT_SECONDS) here would mean a single stale lock
-                left by a crashed prior process -- which startup's own later
-                stale-lock recovery step doesn't cover for resource locks
-                like this one -- stalls the ENTIRE startup sequence (every
-                other, unrelated project) for hours, with no automated way
-                out. A restart is itself the natural retry for this specific
+                left by a crashed prior process stalls the ENTIRE startup
+                sequence (every other, unrelated project) for hours, with no
+                automated way out. main.py now clears that specific case
+                before calling this (its project_checkout
+                recover_orphaned_resource_locks() step, #169 review), but only
+                for locks provably belonging to a dead incarnation -- a live
+                foreign holder is still waited on here, and still bounded.
+                A restart is itself the natural retry for this specific
                 call site, so failing fast and letting the per-project
                 except handle it is strictly better than a multi-hour wait.
                 A future on-demand (non-startup) caller of this method can
@@ -1209,8 +1234,8 @@ class ProjectWorkspaceManager:
                 # cleanup_epic_worktree() takes this lock the same way (bounded
                 # wait, inside the same per-key serializer), and
                 # prune_epic_worktrees()'s startup sweep takes it per project with
-                # a single non-blocking attempt -- see that method's docstring for
-                # why a wait there could never succeed.
+                # a bounded wait of its own -- see that method's docstring for why
+                # its budget is shorter than this one's.
                 #
                 # Sync, not async: this is a plain sync method with sync callers. #146
                 # WI-1 made that safe for the HOLD -- the heartbeat runs on a real OS
@@ -1894,8 +1919,9 @@ class ProjectWorkspaceManager:
             # deliberately not held across the wait -- see
             # _epic_worktree_key_lock().
             #
-            # Sync and blocking, unlike prune_epic_worktrees()'s sweep: this has
-            # no startup/event-loop caller to freeze, and
+            # Sync and blocking, on the full calibrated budget rather than
+            # prune_epic_worktrees()'s deliberately short startup one: this has no
+            # startup sequence waiting on it, and
             # _resolve_checkout_lock_timeout() clamps a stray on-loop caller to a
             # single non-blocking attempt anyway. A timeout raises rather than
             # proceeding unlocked, so nothing is pushed, removed or untracked
@@ -2068,9 +2094,11 @@ class ProjectWorkspaceManager:
             # is actively populating, and this sweep would force-remove
             # it. The pending map is published under this same guard
             # BEFORE any of that work starts, so the check still sees the
-            # in-flight case, without prune ever blocking (it runs on the
-            # event-loop thread at startup; taking the per-key lock here
-            # would freeze the loop for the creation's whole ~3h budget).
+            # in-flight case, without prune ever blocking on a resolution
+            # that is already under way (taking the per-key lock here would
+            # park the sweep for that creation's whole ~3h budget, which no
+            # amount of moving the sweep off the event loop makes acceptable
+            # at startup).
             with self._epic_worktree_lock:
                 currently_tracked = (
                     str(worktree_path) in self._epic_worktrees.values()
@@ -2262,17 +2290,35 @@ class ProjectWorkspaceManager:
             prune and rmdir, and one busy project costs only that project's
             sweep.
 
-        NON-BLOCKING (project_checkout_lock_if_free_sync), not the bounded wait
-        get_or_create_epic_worktree() and cleanup_epic_worktree() use. main.py
-        calls this directly on the event-loop thread, and
-        project_checkout_lock_sync()'s poll is a time.sleep() whose in-process
-        holders can only reach their release by being rescheduled on that same
-        loop -- so a wait here would starve the holder it is waiting for and
-        could never succeed, on the one path where stalling means a frozen
-        orchestrator rather than a slow one. A single attempt has neither
-        problem, and this sweep is best-effort by construction: a skipped
-        project's worktrees stay on disk for the next startup's sweep, or get
-        adopted and reused by get_or_create_epic_worktree() before then.
+        A BOUNDED WAIT (project_checkout_lock_sync), the same variant
+        get_or_create_epic_worktree() and cleanup_epic_worktree() use, budgeted
+        by PRUNE_SWEEP_LOCK_BUDGET_SECONDS across the whole sweep. This started
+        out as a single non-blocking attempt, justified by "main.py calls this
+        directly on the event-loop thread"; review of #169 pointed out that is
+        a property of the CALL SITE, not of the sweep, and that main.py already
+        hops initialize_all_projects() and recover_or_cleanup_repair_cycle_
+        containers() off the loop for exactly this reason. It now does the same
+        for this call, so the wait neither starves an in-process holder
+        (releases happen on the loop, which is free) nor freezes startup.
+
+        The non-blocking version was a no-op in the case the sweep exists for.
+        Its only realistic startup contenders are (a) a stale lock left by a
+        crashed prior process, which does not clear until PipelineLockManager's
+        own 7200s TTL / 14400s staleness window, and (b) container recovery's
+        auto-commit thread, which main.py starts seconds earlier and which
+        finishes on its own. One attempt loses to both, and "the next startup's
+        sweep picks them up" is false for (a): the next startup inside that
+        window hits the identical refusal. (a) is now also cleared before this
+        runs -- main.py recovers orphaned project_checkout resource locks at
+        startup, the way it already did for dev_container_build -- and (b) is
+        what the wait is for.
+
+        The budget is shared across the sweep rather than per project so a
+        pathological startup cannot turn N projects into N x the per-project
+        timeout of blocked startup; once it is spent, the remaining projects
+        degrade to a single attempt each. A project skipped either way is still
+        best-effort: its worktrees stay on disk for the next startup's sweep, or
+        get adopted and reused by get_or_create_epic_worktree() before then.
 
         The in-flight/liveness/corruption checks below all STAY. They answer a
         different question (is this particular worktree still someone's working
@@ -2282,7 +2328,8 @@ class ProjectWorkspaceManager:
         keep tracking it, and a container that survived the restart holds no
         in-process lock at all.
         """
-        from services.project_checkout_lock import project_checkout_lock_if_free_sync
+        from services.project_checkout_lock import project_checkout_lock_sync
+        from services.resource_lock_errors import describe_lock_timeout, is_lock_timeout_error
 
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         try:
@@ -2300,24 +2347,51 @@ class ProjectWorkspaceManager:
             # container regardless of how many worktrees are being considered.
             running_mount_sources = self._get_running_container_mount_sources()
 
+            sweep_deadline = time.monotonic() + PRUNE_SWEEP_LOCK_BUDGET_SECONDS
+
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
                     continue
-                # project_checkout lock, taken per project and NON-BLOCKING -- see
-                # this method's docstring for why that placement and not the other
-                # two, and why a wait here could never succeed (#169).
-                with project_checkout_lock_if_free_sync(project_staging.name) as acquired:
-                    if not acquired:
+                # project_checkout lock, taken per project with a bounded wait --
+                # see this method's docstring for why that placement and not the
+                # other two, and why the wait is safe here (#169). The per-project
+                # budget is whatever is left of the sweep's shared one, capped at
+                # PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS; at zero the call degrades to
+                # a single attempt and raises straight away.
+                timeout_seconds = max(
+                    0.0,
+                    min(
+                        PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+                        sweep_deadline - time.monotonic(),
+                    ),
+                )
+                try:
+                    with project_checkout_lock_sync(
+                        project_staging.name, None, timeout_seconds=timeout_seconds
+                    ):
+                        self._prune_project_staging(project_staging, running_mount_sources)
+                except Exception as e:
+                    # Per project, not per sweep: one held base clone must not cost
+                    # every other project its cleanup (the reason the lock is placed
+                    # here at all). A lock timeout is the expected shape and gets a
+                    # WARNING; anything else is a real failure and keeps its
+                    # traceback -- but neither propagates, because this method runs
+                    # unguarded at every startup.
+                    if is_lock_timeout_error(e):
                         logger.warning(
                             f"Skipping the epic-worktree prune sweep for "
-                            f"{project_staging.name} -- its project_checkout lock could not "
-                            f"be taken, and every removal in it rewrites that base clone's "
-                            f"own .git. Its stale worktrees stay on disk; the next startup's "
-                            f"sweep (or get_or_create_epic_worktree()'s adoption path) picks "
-                            f"them up."
+                            f"{project_staging.name} -- its project_checkout lock stayed "
+                            f"held for the whole {timeout_seconds:.0f}s budget, and every "
+                            f"removal in it rewrites that base clone's own .git "
+                            f"({describe_lock_timeout(e)}). Its stale worktrees stay on "
+                            f"disk; the next startup's sweep (or "
+                            f"get_or_create_epic_worktree()'s adoption path) picks them up."
                         )
-                        continue
-                    self._prune_project_staging(project_staging, running_mount_sources)
+                    else:
+                        logger.error(
+                            f"Epic-worktree prune sweep for {project_staging.name} failed: {e}",
+                            exc_info=True,
+                        )
 
             logger.info(f"Pruned epic worktrees under {staging_root}")
         except Exception as e:

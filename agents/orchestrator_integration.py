@@ -254,7 +254,10 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
     queued (see the guard's own comment).
     Sets status to IN_PROGRESS before enqueuing to prevent races, and takes this
     project's dev_container_build lock across both so the check and the mark are
-    one critical section rather than two (#171).
+    one critical section rather than two (#171). Also returns without queuing
+    when that lock is held by a LIVE holder (#169 review) -- see the acquire
+    below for why a loser of that race has to stop rather than carry on
+    unserialized.
 
     Args:
         project: Project name
@@ -267,7 +270,10 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
         cycle_stack: If provided, propagates the caller's cycle stack into the
             queued task context so agent_initialized events carry full hierarchy.
     """
-    from services.dev_container_build_lock import dev_container_build_lock_if_free_async
+    from services.dev_container_build_lock import (
+        acquire_failure_is_contention,
+        dev_container_build_lock_attempt_async,
+    )
     from services.dev_container_state import dev_container_state, DevContainerStatus
 
     # The whole check-then-mark runs inside this project's dev_container_build
@@ -286,24 +292,50 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
     # agent_holds_build_window), so a bounded wait here would park a dispatch
     # behind the very build it is trying not to duplicate.
     #
-    # A failed acquire falls back to the previous, unserialized behaviour rather
-    # than skipping outright. Skipping would be a NEW way for a project to
-    # never get a setup queued -- a retained lock from a failed run, or a
-    # degraded/fail-closed store, refuses the acquire without any build being
-    # in flight, and _dev_setup_in_flight_reason()'s probe 3 deliberately does
-    # NOT treat either as a live run. The fallback keeps that judgement where it
-    # already is (probe 3, which runs in that branch) and leaves this function
-    # no worse than it was, while closing the race whenever the lock is free --
-    # which is precisely the case the race needs, since two racers both find it
-    # free and only one can win it.
-    async with dev_container_build_lock_if_free_async(project) as serialized:
+    # What a refused acquire means depends on WHY, and the two answers are
+    # opposite (#169 review). An earlier version fell back to the previous,
+    # unserialized behaviour on any refusal, on the reasoning that this "closes
+    # the race whenever the lock is free -- which is precisely the case the race
+    # needs, since two racers both find it free and only one can win it". That
+    # does not hold, because the loser did not stop: A wins the lock, B is
+    # refused, B carries on, reads the status before A's IN_PROGRESS write
+    # lands, and both enqueue. The lock changed which of them was serialized,
+    # not how many tasks got queued.
+    #
+    #   - GENUINE CONTENTION (a live holder): return without queuing. Somebody
+    #     is inside this critical section right now -- either the winner of this
+    #     exact race, who is queuing on our behalf, or a build/verify session
+    #     holding its own window, which is a setup already running. Either way a
+    #     second task is the duplicate hour-scale rebuild
+    #     _dev_setup_in_flight_reason()'s docstring exists to prevent, and the
+    #     next 30s board poll is the retry point if the winner somehow queued
+    #     nothing.
+    #   - DEGRADED / FAIL-CLOSED / RETAINED: fall back and decide unserialized.
+    #     Nobody holds a build window in any of these -- a retained lock is a
+    #     marker left by a run that already ended -- so skipping would be a NEW
+    #     way for a project to never get a setup queued at all.
+    #     _dev_setup_in_flight_reason()'s probe 3 deliberately does not treat
+    #     either as a live run, and this leaves that judgement where it already
+    #     is.
+    async with dev_container_build_lock_attempt_async(project) as (serialized, refusal_reason):
+        if not serialized and acquire_failure_is_contention(refusal_reason):
+            logger.info(
+                f"Not queuing dev_environment_setup for {project}: its "
+                f"dev_container_build lock is held right now ({refusal_reason}), so "
+                f"either a setup/verify session is already running or another caller "
+                f"won this exact race and is queuing one. Deferring to it rather than "
+                f"queuing a duplicate; the next board poll retries if it did not."
+            )
+            return
         if not serialized:
             logger.warning(
                 f"Deciding whether to queue dev_environment_setup for {project} "
-                f"WITHOUT its dev_container_build lock -- the acquire did not "
-                f"succeed (see the preceding log line for whether that is a live "
-                f"build window or a degraded lock store). The check-then-mark below "
-                f"is not atomic against another caller doing the same thing."
+                f"WITHOUT its dev_container_build lock -- the acquire failed for a "
+                f"reason that is NOT a live holder ({refusal_reason}: a degraded/"
+                f"fail-closed store, or a lock retained after a failed run). Nothing "
+                f"is in this critical section, so skipping would drop the setup for "
+                f"good; the check-then-mark below runs unserialized instead, exactly "
+                f"as it did before this lock existed."
             )
 
         # Check if setup is already in progress - avoid duplicate queuing.
