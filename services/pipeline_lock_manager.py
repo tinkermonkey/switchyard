@@ -33,6 +33,43 @@ logger = logging.getLogger(__name__)
 # tests/unit/services/test_project_checkout_lock.py.
 LOCK_TTL_SECONDS = 7200
 
+# How long release_lock() waits for the '<state>.yaml.acquire.lock' guard on
+# its FIRST attempt. Spelled out rather than left to utils.file_lock's own
+# default so the two budgets below read as one deliberate decision.
+RELEASE_GUARD_TIMEOUT_SECONDS = 10
+
+# How long release_lock() will wait for that same guard on its SECOND attempt,
+# after the budget above has already expired once (found in the WI-8 review
+# round).
+#
+# A release is not symmetric with an acquire, and the 10s first attempt --
+# which was an incidental property of file_lock(), not a budget anyone sized
+# for this -- is far too small on its own. Every acquire site polls, so a
+# refused acquire is retried within seconds; a release has already been
+# authorized by the caller, and abandoning it leaks the lock until the
+# LOCK_TTL_SECONDS Redis TTL or the 4-hour staleness heuristic, blocking every
+# dispatch for that (project, board) in the meantime
+# (services/project_checkout_lock.py's release site spells this consequence out
+# at its call to _release_and_warn). The contention is also
+# asymmetric in the wrong direction: try_acquire_lock()'s YAML-fallback path
+# takes this same guard and is reached exactly when Redis is unavailable, so
+# each attempt holds the guard for several seconds of Redis socket timeouts,
+# and two waiters polling every DEFAULT_POLL_INTERVAL_SECONDS can hold it
+# almost continuously.
+#
+# Sized against the longest a guard holder can now legitimately hold it: the
+# guarded sections of try_acquire_lock()/touch_lock()/release_lock() are all
+# bounded reads and writes over Redis (5s socket timeouts) and the inner
+# '<state>.yaml.lock' (now taken with enforce_timeout=True everywhere, so no
+# holder can block indefinitely on it) -- roughly 35s worst case. Still
+# BOUNDED rather than a blocking acquire: project_checkout_lock_async()'s
+# release is deliberately synchronous on the asyncio event loop, so an
+# unbounded wait there would stall the whole orchestrator behind a wedged
+# holder in another process (scripts/release_lock.py, the observability
+# server). A release that exhausts even this budget is reported as
+# ReleaseResult.SERIALIZATION_FAILED rather than as a refusal.
+RELEASE_GUARD_RETRY_TIMEOUT_SECONDS = 60
+
 
 def _derive_process_role() -> str:
     """
@@ -110,6 +147,36 @@ class TouchResult(Enum):
 
     def __bool__(self) -> bool:
         return self is TouchResult.REFRESHED
+
+
+class ReleaseResult(Enum):
+    """
+    Outcome of release_lock() -- the same three-state split TouchResult made
+    for touch_lock(), for the same reason (#153 WI-8 review round).
+
+    release_lock() gained an acquire guard in this work item, and its guard
+    timeout returned the same bare False the method already used for "refused:
+    not held by this issue, retained, or state unknown". Those are opposite
+    facts about the lock: a refusal means the release was CONSIDERED and
+    correctly declined, so the lock's state is exactly what the caller was
+    told; a serialization failure means nothing was attempted at all and the
+    release is still outstanding. Every caller read False as the former, and
+    the three that log about it told operators the lock was "likely retained
+    due to a failed run" -- a wrong-but-plausible diagnosis that points at
+    scripts/release_lock.py instead of at the contention that actually
+    happened.
+
+    __bool__ is defined so every existing truthiness-based caller/assertion
+    (`if not released`, assertTrue/assertFalse) keeps its original meaning:
+    only RELEASED is truthy.
+    """
+
+    RELEASED = "released"          # the lock is confirmed gone from the stores
+    NOT_RELEASED = "not_released"  # considered and refused: not held, retained, or state unknown
+    SERIALIZATION_FAILED = "serialization_failed"  # guard unavailable -- nothing attempted, still held
+
+    def __bool__(self) -> bool:
+        return self is ReleaseResult.RELEASED
 
 
 @dataclass
@@ -272,7 +339,19 @@ class PipelineLockManager:
             return None, False
 
     def _read_yaml_lock_only(self, project: str, board: str) -> Tuple[Optional[PipelineLock], bool]:
-        """Read the lock from the YAML file only. Returns (lock_or_None, read_succeeded)."""
+        """
+        Read the lock from the YAML file only. Returns (lock_or_None, read_succeeded).
+
+        The inner '<state>.yaml.lock' is taken with enforce_timeout=True
+        (found in the WI-8 review round): this read runs inside the
+        '<state>.yaml.acquire.lock' guard on every one of the three paths that
+        decide who holds the lock, and a blocking acquire here made that
+        OUTER guard's hold unbounded -- so release_lock()'s own bounded wait
+        for the guard could expire against a holder that was itself parked
+        indefinitely on this inner lock. A read that cannot be serialized is
+        reported as a read FAILURE, which every caller of this method already
+        treats fail-closed.
+        """
         from utils.file_lock import file_lock
 
         state_file = self._get_state_file(project, board)
@@ -280,7 +359,7 @@ class PipelineLockManager:
             return None, True
         try:
             lock_file = state_file.with_suffix(state_file.suffix + '.lock')
-            with file_lock(lock_file):
+            with file_lock(lock_file, enforce_timeout=True):
                 return self._read_yaml_lock_only_unlocked(project, board)
         except Exception as e:
             logger.error(f"Failed to load lock state from YAML: {e}")
@@ -312,6 +391,30 @@ class PipelineLockManager:
         except Exception as e:
             logger.error(f"Failed to load lock state from YAML: {e}")
             return None, False
+
+    def redis_lock_is_missing(self, project: str, board: str) -> bool:
+        """
+        True only when Redis is configured, its read SUCCEEDED, and it holds no
+        'locked' record for this (project, board).
+
+        Deliberately NOT `_read_redis_lock_only(...) == (None, True)`: that
+        method also returns (None, True) when no Redis client is configured at
+        all ("no Redis configured isn't a read failure"), and a YAML-only
+        deployment must not have every one of its locks reported as a key that
+        Redis has lost.
+
+        Exists for project_monitor's board-lock heartbeat sweep, which needs to
+        tell "this hold's liveness refresh isn't due yet" from "the Redis key
+        under this hold is GONE" -- the second is not a liveness question at
+        all and cannot wait for the refresh interval, because
+        try_acquire_lock()'s Redis transaction reads an absent key back as an
+        empty dict and grants the board to the next queued issue without ever
+        consulting the still-'locked' durable record.
+        """
+        if not self.redis_client:
+            return False
+        redis_lock, read_ok = self._read_redis_lock_only(project, board)
+        return read_ok and redis_lock is None
 
     def get_lock(self, project: str, board: str) -> Optional[PipelineLock]:
         """
@@ -1202,7 +1305,9 @@ class PipelineLockManager:
             )
             return TouchResult.REFRESH_FAILED, None
 
-    def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
+    def release_lock(
+        self, project: str, board: str, issue_number: int, force: bool = False
+    ) -> ReleaseResult:
         """
         Release pipeline lock safely.
 
@@ -1231,6 +1336,19 @@ class PipelineLockManager:
         guard makes the release atomic with respect to both touch_lock() and
         try_acquire_lock()'s YAML-fallback grant.
 
+        Unlike try_acquire_lock()'s guarded path, a guard timeout here is NOT
+        simply refused (found in the WI-8 review round). An acquire that is
+        refused is retried by its own poll loop within seconds; a release has
+        already been authorized by its caller and, if dropped, leaks the lock
+        until the LOCK_TTL_SECONDS Redis TTL or the 4-hour staleness heuristic
+        -- blocking every dispatch for that (project, board) meanwhile, and
+        with no automatic re-attempt at the site that matters most
+        (pipeline_progression._release_lock_and_process_next fires only on the
+        move INTO an exit column, so it never re-fires). So the guard gets a
+        second, much longer bounded attempt (RELEASE_GUARD_RETRY_TIMEOUT_SECONDS),
+        and only a release that exhausts that too is reported -- distinctly, as
+        SERIALIZATION_FAILED rather than as a refusal.
+
         Args:
             project: Project name
             board: Board name
@@ -1240,36 +1358,79 @@ class PipelineLockManager:
                 should ever pass this.
 
         Returns:
-            True if lock was released, False if not held by this issue, if
-            it's retained/unknown and force was not set, or if the release
-            could not be serialized against a concurrent acquire/refresh.
+            ReleaseResult.RELEASED if the lock was released;
+            ReleaseResult.NOT_RELEASED if the release was considered and
+            refused (not held by this issue, retained/unknown without force, or
+            a store's delete failed); ReleaseResult.SERIALIZATION_FAILED if the
+            acquire guard could not be taken at all, in which case NOTHING was
+            attempted and the lock is still held exactly as it was. Only
+            RELEASED is truthy (see ReleaseResult), so callers written against
+            the original bool return keep their original meaning, while the
+            three that report a failed release to operators can stop
+            attributing a contention timeout to a retained failed run.
         """
         from utils.file_lock import file_lock
 
+        guard_file = self._get_acquire_guard_file(project, board)
         try:
-            with file_lock(self._get_acquire_guard_file(project, board), enforce_timeout=True):
-                return self._release_lock_unguarded(project, board, issue_number, force=force)
+            try:
+                with file_lock(
+                    guard_file, timeout=RELEASE_GUARD_TIMEOUT_SECONDS, enforce_timeout=True
+                ):
+                    return self._release_lock_to_result(project, board, issue_number, force)
+            except TimeoutError as first_timeout:
+                # Not fatal on its own -- see the docstring. The usual cause is
+                # try_acquire_lock()'s YAML-fallback path, which takes this same
+                # guard and is reached exactly when Redis is unavailable, so
+                # every attempt holds it for several seconds of socket timeouts
+                # while its waiters re-poll faster than it lets go.
+                logger.warning(
+                    f"release_lock: the acquire guard for {project}/{board} (issue "
+                    f"#{issue_number}) was still contended after "
+                    f"{RELEASE_GUARD_TIMEOUT_SECONDS}s: "
+                    f"{first_timeout} -- retrying for up to "
+                    f"{RELEASE_GUARD_RETRY_TIMEOUT_SECONDS}s rather than abandoning "
+                    f"an authorized release"
+                )
+                with file_lock(
+                    guard_file, timeout=RELEASE_GUARD_RETRY_TIMEOUT_SECONDS, enforce_timeout=True
+                ):
+                    return self._release_lock_to_result(project, board, issue_number, force)
         except TimeoutError as e:
-            # Same fail-closed posture as try_acquire_lock()'s guarded path.
-            # The guard is only ever held for one Redis round-trip plus one
-            # small file read/write, so a timeout here means something is
-            # genuinely wedged -- and an unserialized release is exactly the
-            # interleaving this guard exists to remove. Every automatic release
-            # site is re-reached by the next board poll, so refusing defers the
-            # release rather than losing it.
+            # Still not serialized. An unguarded release is exactly the
+            # interleaving this guard exists to remove, so it is not performed
+            # -- but this is reported as SERIALIZATION_FAILED, NOT as a
+            # refusal: nothing was attempted, the lock is unchanged, and the
+            # release is still outstanding.
             logger.error(
                 f"release_lock: could not serialize the release of {project}/{board} "
-                f"(issue #{issue_number}): {e} -- refusing rather than racing a "
-                f"concurrent acquire or liveness refresh"
+                f"(issue #{issue_number}) within {RELEASE_GUARD_RETRY_TIMEOUT_SECONDS}s: "
+                f"{e} -- the lock is UNCHANGED and still held; this is contention on "
+                f"'{guard_file.name}', not a retained/failed lock"
             )
-            return False
+            return ReleaseResult.SERIALIZATION_FAILED
         except OSError as e:
             logger.error(
                 f"release_lock: could not take the release guard for {project}/{board} "
-                f"(issue #{issue_number}): {e} -- refusing rather than racing a "
-                f"concurrent acquire or liveness refresh"
+                f"(issue #{issue_number}): {e} -- the lock is UNCHANGED and still held; "
+                f"this is a guard-file failure, not a retained/failed lock"
             )
-            return False
+            return ReleaseResult.SERIALIZATION_FAILED
+
+    def _release_lock_to_result(
+        self, project: str, board: str, issue_number: int, force: bool
+    ) -> ReleaseResult:
+        """
+        _release_lock_unguarded()'s bool, mapped onto release_lock()'s
+        three-state return. MUST only be called with the acquire guard held.
+
+        Its False covers only outcomes the release actually CONSIDERED (not
+        held by this issue, retained without force, unknown state, a store's
+        delete failing), all of which are NOT_RELEASED -- SERIALIZATION_FAILED
+        is reserved for never having got as far as considering it.
+        """
+        released = self._release_lock_unguarded(project, board, issue_number, force=force)
+        return ReleaseResult.RELEASED if released else ReleaseResult.NOT_RELEASED
 
     def _release_lock_unguarded(
         self, project: str, board: str, issue_number: int, force: bool = False

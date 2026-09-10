@@ -77,6 +77,10 @@ class BoardLockHeartbeatTestBase(unittest.TestCase):
 
         self.lock_manager = MagicMock()
         self.lock_manager.touch_lock.return_value = TouchResult.REFRESHED
+        # The ordinary case: Redis still holds the key under this hold, so the
+        # heartbeat interval is the only thing deciding whether a refresh is
+        # due. Tests about a LOST key set this True explicitly.
+        self.lock_manager.redis_lock_is_missing.return_value = False
 
     def sweep(self):
         with patch(
@@ -214,6 +218,74 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
 
         self.lock_manager.touch_lock.assert_not_called()
 
+    def test_a_lost_redis_key_is_re_established_without_waiting_for_the_interval(self):
+        """
+        REGRESSION (WI-8 review round): the heartbeat interval gated
+        re-establishment as well as the liveness refresh, so the sweep could
+        not heal the exact failure it exists for during the first 30 minutes of
+        every hold -- the window most stages live in.
+
+        `docker-compose restart redis` (or a FLUSHDB, or an allkeys-lru
+        eviction) two minutes into a hold drops the key while
+        state/pipeline_locks/<proj>_board.yaml still reads locked. The durable
+        gate in try_acquire_lock() passes it (nothing is retained), its Redis
+        transaction reads the absent key back as an empty dict and returns
+        "lock_acquired" without ever consulting that record, and
+        _create_lock_yaml_only() then overwrites it -- two agents on one board.
+        Nothing else re-creates the key at runtime: sync_yaml_locks_to_redis()
+        only runs from main.py's startup block.
+        """
+        self.lock_manager.get_lock_fail_closed.return_value = (
+            _lock(age_seconds=120), True
+        )
+        self.lock_manager.redis_lock_is_missing.return_value = True
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_lost_redis_key_is_still_held_to_the_same_liveness_predicate(self):
+        """
+        Re-establishment skips the AGE gate, not the liveness gate. Re-creating
+        a key for a holder whose run has already died would pin the board with
+        the one clock that could still have reclaimed it (the 7200s TTL, which
+        the missing key had effectively already run out) reset.
+        """
+        self.lock_manager.get_lock_fail_closed.return_value = (
+            _lock(age_seconds=120), True
+        )
+        self.lock_manager.redis_lock_is_missing.return_value = True
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = None
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_a_yaml_only_deployment_is_not_read_as_a_lost_redis_key(self):
+        """
+        redis_lock_is_missing() answers False when no Redis client is
+        configured at all -- otherwise every lock in a YAML-only deployment
+        would be touched on every 60s sweep instead of once per interval, and
+        the age gate would effectively not exist.
+        """
+        from services.pipeline_lock_manager import PipelineLockManager
+
+        manager = PipelineLockManager.__new__(PipelineLockManager)
+        manager.redis_client = None
+
+        self.assertFalse(manager.redis_lock_is_missing("proj", "board"))
+
+    def test_a_redis_read_failure_is_not_read_as_a_lost_redis_key(self):
+        """An unreadable Redis is not evidence the key is gone -- that is the
+        same fail-closed posture get_lock_fail_closed() takes."""
+        from services.pipeline_lock_manager import PipelineLockManager
+
+        manager = PipelineLockManager.__new__(PipelineLockManager)
+        manager.redis_client = MagicMock()
+        manager.redis_client.hgetall.side_effect = Exception("redis down")
+
+        self.assertFalse(manager.redis_lock_is_missing("proj", "board"))
+
     def test_does_not_refresh_when_the_holder_has_no_active_pipeline_run(self):
         """Refreshing unconditionally would pin an abandoned lock forever and
         disable both recovery paths board locks actually have at runtime (the
@@ -265,14 +337,18 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
 
 class TestNoEventTimeIsNotOneState(BoardLockHeartbeatTestBase):
     """
-    Found in the WI-8 review round. `last_event_at is None` was read as "still
-    progressing" unconditionally, justified by a bound that only covers ONE of
-    the three ways _get_last_pipeline_run_event_time() produces it. The other
-    two happen with Elasticsearch UP, where get_active_pipeline_run() keeps
-    resolving the run from the pipeline-runs-* search for as long as its doc
-    reads 'active' -- so the "the Redis run blob expires within the hour"
-    bound does not apply to them at all, and a run that never emitted a
-    decision event was refreshed every sweep forever.
+    Found in the WI-8 review round, and narrowed again in the round after it.
+    `last_event_at is None` was read as "still progressing" unconditionally,
+    justified by a bound that only covers ONE of the three ways
+    _get_last_pipeline_run_event_time() produces it: 'es_unavailable', where
+    PipelineRunManager has no usable client either and get_active_pipeline_run()
+    resolves entirely from a Redis run blob a dead run stops refreshing.
+
+    Neither of the other two has that bound. Both happen with an ES client
+    present, where get_active_pipeline_run() keeps resolving the run from the
+    pipeline-runs-* search for as long as its doc reads 'active' -- so both are
+    bounded by the run's own started_at instead. 'no_events' was fixed first;
+    'query_failed' kept returning True unconditionally for one more round.
     """
 
     def test_es_being_unavailable_still_counts_as_progressing(self):
@@ -294,15 +370,47 @@ class TestNoEventTimeIsNotOneState(BoardLockHeartbeatTestBase):
 
         self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
 
-    def test_a_failed_events_query_still_counts_as_progressing(self):
-        """ES up but not answering is just as unknown as ES being down. What
-        changes is that the failure is logged at WARNING rather than swallowed
-        at DEBUG -- see _get_last_pipeline_run_event_time_with_reason()."""
+    def test_a_failed_events_query_is_bounded_by_started_at_too(self):
+        """
+        REGRESSION (WI-8 review round): 'query_failed' returned True
+        unconditionally, borrowing 'es_unavailable's bound -- and that bound
+        does not exist here. obs.es being present means PipelineRunManager.es
+        is too (both build Elasticsearch([...]) lazily, so the client exists
+        even with ES down), so get_active_pipeline_run() keeps resolving the
+        run from the pipeline-runs-* search for as long as its doc reads
+        'active' and the Redis-blob TTL never applies. A run whose container
+        was killed out from under the orchestrator plus a persistently failing
+        decision-events-* query therefore had its lock touched every 60s
+        forever, defeating BOTH the Redis TTL and the 4-hour staleness
+        heuristic. The run's own started_at bounds it without needing events
+        at all.
+        """
         self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
         self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
         self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
             id="run-1", status='active',
             started_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'query_failed')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_a_failed_events_query_on_a_young_run_still_counts_as_progressing(self):
+        """
+        The other half of that bound: a failing events query must not become a
+        reason to stop protecting a hold that has not yet been running long
+        enough for any holder to have gone legitimately silent -- that would
+        re-open the double-dispatch for the whole of every ES incident.
+        """
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active',
+            started_at=(datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat(),
         )
         self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
             return_value=(None, 'query_failed')

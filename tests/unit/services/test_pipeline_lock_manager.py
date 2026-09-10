@@ -13,7 +13,12 @@ from datetime import datetime, timezone, timedelta
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
-from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, TouchResult
+from services.pipeline_lock_manager import (
+    PipelineLockManager,
+    PipelineLock,
+    ReleaseResult,
+    TouchResult,
+)
 
 
 def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=None, before=None):
@@ -741,7 +746,7 @@ class TestTouchAndReleaseCannotInterleave(unittest.TestCase):
         for worker in workers:
             worker.join(timeout=10)
             self.assertFalse(worker.is_alive())
-        self.assertEqual(released, [True])
+        self.assertEqual(released, [ReleaseResult.RELEASED])
         self.assertFalse(self.state_file.exists())
         self.assertIsNone(self.manager.get_lock("proj", "board"))
 
@@ -950,6 +955,160 @@ class TestYamlFallbackAcquisitionIsSerialized(unittest.TestCase):
         self.assertFalse(success)
         self.assertEqual(reason, "lock_acquire_serialization_timeout")
         self.assertIsNone(self.manager.get_lock("proj", "board"))
+
+
+class TestReleaseIsNotAbandonedByGuardContention(unittest.TestCase):
+    """
+    Found in the WI-8 review round. release_lock() gained the acquire guard in
+    this work item, with utils.file_lock's incidental 10s default as its only
+    budget and a bare False on timeout -- and both halves of that were wrong:
+
+      - The contention is asymmetric against the release. try_acquire_lock()'s
+        YAML-fallback path takes the SAME guard and is reached exactly when
+        Redis is unavailable, so every attempt holds it for several seconds of
+        Redis socket timeouts while its waiters re-poll every
+        DEFAULT_POLL_INTERVAL_SECONDS. An acquire that loses is retried
+        seconds later; a release that loses is simply dropped, and the comment
+        at project_checkout_lock's release site spells out the cost -- nothing
+        else in the process knows that holder_id, so the lock leaks until the
+        7200s TTL or the 4-hour staleness heuristic, blocking every
+        acquisition for that project meanwhile.
+      - Every caller read that False as "retained", the same value the method
+        returns for a considered-and-refused release. The three that log about
+        it told operators to go looking for a durable failure record that does
+        not exist.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.state_file = self.manager._get_state_file("proj", "board")
+        self.manager._create_lock("proj", "board", 123)
+        self.guard_file = self.manager._get_acquire_guard_file("proj", "board")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    @contextlib.contextmanager
+    def _guard_held_elsewhere(self, hold_seconds):
+        """
+        Hold the acquire guard from ANOTHER thread for `hold_seconds`, the way
+        a concurrent try_acquire_lock() burning Redis socket timeouts does.
+        Another thread rather than this one because utils.file_lock refuses a
+        re-entrant acquire outright instead of contending.
+        """
+        from utils.file_lock import file_lock
+
+        taken = threading.Event()
+
+        def hold():
+            with file_lock(self.guard_file):
+                taken.set()
+                time.sleep(hold_seconds)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(taken.wait(timeout=10))
+        try:
+            yield
+        finally:
+            holder.join(timeout=30)
+            self.assertFalse(holder.is_alive())
+
+    def test_a_contended_guard_is_retried_on_a_longer_budget_and_the_release_happens(self):
+        """
+        The release must not be abandoned just because the first, short
+        attempt lost the guard -- it has already been authorized, and its
+        caller does not re-reach this site (pipeline_progression's release
+        fires only on the move INTO an exit column, so it never re-fires).
+        """
+        with patch('services.pipeline_lock_manager.RELEASE_GUARD_TIMEOUT_SECONDS', 0), \
+                patch('services.pipeline_lock_manager.RELEASE_GUARD_RETRY_TIMEOUT_SECONDS', 10), \
+                self.assertLogs('services.pipeline_lock_manager', level='WARNING') as logs, \
+                self._guard_held_elsewhere(0.4):
+            result = self.manager.release_lock("proj", "board", 123)
+
+        self.assertIs(result, ReleaseResult.RELEASED)
+        self.assertFalse(self.state_file.exists())
+        # The first attempt really did lose the guard -- otherwise this test
+        # would pass without the retry existing at all.
+        self.assertTrue(
+            any("retrying for up to" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_guard_that_never_frees_reports_serialization_failed_not_a_refusal(self):
+        """
+        The distinction the three logging callers depend on. NOT_RELEASED means
+        the release was considered and correctly declined, so the lock's state
+        is exactly what the caller was told; SERIALIZATION_FAILED means nothing
+        was attempted at all and the release is still outstanding. Both are
+        falsy, so callers written against the old bool keep their meaning.
+        """
+        with patch('services.pipeline_lock_manager.RELEASE_GUARD_TIMEOUT_SECONDS', 0), \
+                patch('services.pipeline_lock_manager.RELEASE_GUARD_RETRY_TIMEOUT_SECONDS', 0), \
+                self._guard_held_elsewhere(0.6):
+            result = self.manager.release_lock("proj", "board", 123)
+
+        self.assertIs(result, ReleaseResult.SERIALIZATION_FAILED)
+        self.assertFalse(result)
+        # Nothing was attempted, so the lock is exactly as it was.
+        self.assertTrue(self.state_file.exists())
+        self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 123)
+
+    def test_a_guard_file_that_cannot_be_opened_is_also_serialization_failed(self):
+        """An OSError on the guard file is the same fact as a timeout: the
+        release was never considered, so it must not be reported as one that
+        was."""
+        with patch('utils.file_lock.file_lock', side_effect=OSError("no fds")):
+            result = self.manager.release_lock("proj", "board", 123)
+
+        self.assertIs(result, ReleaseResult.SERIALIZATION_FAILED)
+        self.assertTrue(self.state_file.exists())
+
+    def test_a_considered_refusal_is_still_not_released(self):
+        """The other side of the split: a release that IS considered and
+        declined (here, by an issue that does not hold the lock) must stay
+        NOT_RELEASED, or the new sentinel would swallow the retained-lock
+        diagnosis it was added to protect."""
+        result = self.manager.release_lock("proj", "board", 456)
+
+        self.assertIs(result, ReleaseResult.NOT_RELEASED)
+        self.assertTrue(self.state_file.exists())
+
+    def test_the_yaml_read_inside_the_guard_cannot_block_indefinitely(self):
+        """
+        The other half of the same failure: release_lock()'s wait for the guard
+        is only meaningful if a guard HOLDER is itself bounded.
+        _read_yaml_lock_only() runs inside the guard on all three of the paths
+        that decide who holds the lock, and it took '<state>.yaml.lock' with a
+        blocking, unbounded file_lock -- so a holder parked on the inner lock
+        made the outer guard's hold unbounded too, and no release budget could
+        be honoured. A read that cannot be serialized is a read FAILURE, which
+        every caller already treats fail-closed.
+        """
+        seen = []
+        import utils.file_lock as file_lock_module
+        real_file_lock = file_lock_module.file_lock
+
+        @contextlib.contextmanager
+        def noting(path, *args, **kwargs):
+            seen.append((str(path), kwargs.get('enforce_timeout', False)))
+            with real_file_lock(path, *args, **kwargs):
+                yield
+
+        with patch('utils.file_lock.file_lock', side_effect=noting):
+            self.manager._read_yaml_lock_only("proj", "board")
+
+        state_lock = str(self.state_file) + '.lock'
+        self.assertEqual(seen, [(state_lock, True)])
+
+    def test_an_unserializable_yaml_read_is_reported_as_a_read_failure(self):
+        with patch('utils.file_lock.file_lock', side_effect=TimeoutError("inner lock busy")):
+            lock, read_ok = self.manager._read_yaml_lock_only("proj", "board")
+
+        self.assertIsNone(lock)
+        self.assertFalse(read_ok)
 
 
 if __name__ == '__main__':

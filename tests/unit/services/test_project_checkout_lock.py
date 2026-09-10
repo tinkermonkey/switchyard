@@ -60,6 +60,7 @@ from services.project_checkout_lock import (
     _join_heartbeat_thread_async,
     _log_heartbeat_failure,
     _mint_unique_holder_id,
+    _release_and_warn,
     HEARTBEAT_FAILURE_ESCALATION_SECONDS,
     HEARTBEAT_INTERVAL_SECONDS,
     ProjectCheckoutLockTimeoutError,
@@ -1838,6 +1839,59 @@ class TestDefaultFacadeConstructedOffTheEventLoop:
         assert isinstance(facade, _ProbeFacade)
         assert len(constructing_threads) == 1
         assert constructing_threads[0] != loop_thread_id
+
+
+class TestReleaseAndWarnReportsWhyTheReleaseFailed(unittest.TestCase):
+    """
+    REGRESSION (#153 WI-8 review round): release_lock() now takes the lock's
+    acquire guard, and a guard it cannot take used to come back as the same
+    bare False as a considered-and-refused release. _release_and_warn() said
+    "lock may already be released or retained" at WARNING for both -- but the
+    guard case is the one with real consequences, and this module's own call
+    site spells them out: nothing else in the process knows this holder_id,
+    so an unreleased lock leaks until TTL/staleness recovery and blocks every
+    acquisition of the resource for that project meanwhile.
+    """
+
+    def setUp(self):
+        self.facade = MagicMock()
+
+    def test_a_serialization_failure_is_an_error_naming_the_still_held_lock(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.SERIALIZATION_FAILED
+
+        with self.assertLogs('services.project_checkout_lock', level='ERROR') as logs:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        text = "\n".join(logs.output)
+        self.assertIn("STILL HELD", text)
+        self.assertIn("-42", text)
+        self.assertNotIn("may already be released or retained", text)
+
+    def test_an_ordinary_refusal_stays_a_warning(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.NOT_RELEASED
+
+        with self.assertLogs('services.project_checkout_lock', level='WARNING') as logs:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        text = "\n".join(logs.output)
+        self.assertIn("may already be released or retained", text)
+        self.assertNotIn("ERROR", text)
+
+    def test_a_successful_release_logs_nothing(self):
+        from services.pipeline_lock_manager import ReleaseResult
+
+        self.facade.release_resource.return_value = ReleaseResult.RELEASED
+
+        with patch.object(project_checkout_lock.logger, 'warning') as warn, \
+                patch.object(project_checkout_lock.logger, 'error') as err:
+            _release_and_warn(self.facade, RESOURCE_NAME, "proj", -42, 7)
+
+        warn.assert_not_called()
+        err.assert_not_called()
 
 
 if __name__ == '__main__':

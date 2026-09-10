@@ -180,7 +180,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Dict, List, Optional, Tuple
 
-from services.pipeline_lock_manager import LOCK_TTL_SECONDS
+from services.pipeline_lock_manager import LOCK_TTL_SECONDS, ReleaseResult
 from services.project_resource_lock_manager import ProjectResourceLockManager, TouchResult
 
 logger = logging.getLogger(__name__)
@@ -495,12 +495,29 @@ def _release_and_warn(
     facade: ProjectResourceLockManager, resource_name: str, project: str, holder_id: int, issue_number: Optional[int]
 ) -> None:
     released = facade.release_resource(project, resource_name, holder_id)
-    if not released:
-        logger.warning(
+    if released:
+        return
+    if released is ReleaseResult.SERIALIZATION_FAILED:
+        # Distinct from a refusal, and much worse (found in the WI-8 review
+        # round): nothing was attempted, so this holder_id's lock is still
+        # held -- and nothing else in the process knows this holder_id, so
+        # there is no orphan-cleanup path for it. It leaks until the Redis TTL
+        # or the 4-hour staleness heuristic, blocking every acquisition of this
+        # resource for this project meanwhile. Reported at ERROR, and not as
+        # "may already be released or retained", which would send an operator
+        # looking for a retained lock that does not exist.
+        logger.error(
             f"'{resource_name}' lock release for project {project!r} "
-            f"({_attribution(issue_number)}) returned False -- lock may already be "
-            "released or retained"
+            f"({_attribution(issue_number)}) could not be serialized against a "
+            f"concurrent acquire/refresh -- the lock is STILL HELD by holder "
+            f"{holder_id} and will now leak until TTL/staleness recovery"
         )
+        return
+    logger.warning(
+        f"'{resource_name}' lock release for project {project!r} "
+        f"({_attribution(issue_number)}) returned {released} -- lock may already be "
+        "released or retained"
+    )
 
 
 # The Redis lock-key TTL every constant below is calibrated against.

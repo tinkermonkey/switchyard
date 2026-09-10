@@ -1563,7 +1563,7 @@ class PipelineRunManager:
                 )
             return True
         try:
-            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            from services.pipeline_lock_manager import ReleaseResult, get_pipeline_lock_manager
             lock_manager = get_pipeline_lock_manager()
             current_lock = lock_manager.get_lock(project, pipeline_run.board)
             if current_lock and current_lock.lock_status == 'locked' and current_lock.locked_by_issue == issue_number:
@@ -1574,6 +1574,20 @@ class PipelineRunManager:
                 # proceed to dispatch the next queued issue as if this one
                 # cleanly released.
                 released = lock_manager.release_lock(project, pipeline_run.board, issue_number)
+                if released is ReleaseResult.SERIALIZATION_FAILED:
+                    # Reported distinctly from a refusal (found in the WI-8
+                    # review round): nothing was attempted, so the lock is
+                    # still held exactly as it was and this is contention on
+                    # its acquire guard rather than a retained failure record
+                    # an operator has to clear.
+                    logger.error(
+                        f"Could not release pipeline lock for {project} issue "
+                        f"#{issue_number} after ending run — the release could not be "
+                        f"serialized against a concurrent acquire or liveness refresh, "
+                        f"so it did not happen. Not dispatching the next queued issue. "
+                        f"This is lock contention, not a retained/failed lock."
+                    )
+                    return True
                 if not released:
                     logger.error(
                         f"Could not release pipeline lock for {project} issue "

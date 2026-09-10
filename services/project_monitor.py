@@ -8871,7 +8871,11 @@ _Repair cycle initiated by Switchyard_
         visits every active board every cycle, and already does synchronous lock
         I/O per board. Refreshing here costs zero new threads and no new
         blocking condition — just one lock read per board per sweep, and one
-        touch_lock() per held board per HEARTBEAT_INTERVAL_SECONDS.
+        touch_lock() per held board per HEARTBEAT_INTERVAL_SECONDS (plus one
+        immediate touch_lock() whenever a held board's Redis key is found
+        MISSING, which is a re-establishment rather than a liveness refresh and
+        so is deliberately not held to that interval — see
+        _refresh_held_board_lock()).
 
         Refreshing is deliberately held to a STRICTER predicate than the one
         _reconcile_active_runs()'s stale-lock watchdog uses to decide a lock is
@@ -8988,7 +8992,35 @@ _Repair cycle initiated by Switchyard_
             )
             return
         if age_seconds < heartbeat_interval_seconds:
-            return
+            # The LIVENESS refresh is not due yet -- but re-establishing a LOST
+            # Redis key is a different decision, and gating it on the same
+            # interval left this sweep unable to heal the exact failure it
+            # exists for (found in the WI-8 review round). A Redis restart
+            # without persistence, a FLUSHDB or an allkeys-lru eviction two
+            # minutes into a hold drops the key while the durable YAML record
+            # still reads 'locked'; try_acquire_lock()'s Redis transaction then
+            # reads the absent key back as an empty dict and grants the board
+            # to the next queued issue without ever consulting that record, and
+            # nothing else re-creates it at runtime (sync_yaml_locks_to_redis()
+            # runs only from main.py's startup block). Held to the same
+            # heartbeat interval, that heal was unreachable for the first
+            # 30 minutes of every hold -- the window most stages live in.
+            #
+            # So the age gate applies only while Redis still HAS the key. A
+            # missing one falls through to the same active-run and progress
+            # predicates below and, if they pass, to touch_lock(), which
+            # re-establishes the key from its own guarded re-read of the
+            # durable record rather than from anything read here.
+            if not lock_manager.redis_lock_is_missing(project_name, board_name):
+                return
+            logger.warning(
+                f"Board-lock heartbeat: the Redis lock key for {project_name}/{board_name} "
+                f"is gone while its durable record still names issue "
+                f"#{lock.locked_by_issue} ({age_seconds / 60:.0f} minutes into the hold) — "
+                f"re-establishing it now rather than waiting for the "
+                f"{heartbeat_interval_seconds / 60:.0f}-minute refresh interval, which "
+                f"would leave the board grantable to a second issue meanwhile"
+            )
 
         pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
             project_name, lock.locked_by_issue,
@@ -9149,20 +9181,36 @@ _Repair cycle initiated by Switchyard_
         as legitimate silence (describe_active_resource_lock_activity()); this
         is the same carve-out, expressed as a bound.
 
-        `last_event_at is None` is NOT one state but three, and they are
-        bounded differently (also found in that round):
+        `last_event_at is None` is NOT one state but three, and only ONE of
+        them is unbounded (also found in that round, and narrowed to one in
+        the round after it):
 
           - Elasticsearch unavailable: no answer to be had, and refusing to
             refresh then would re-open the double-dispatch for every ES
-            outage. Bounded from the other side instead — without ES,
-            get_active_pipeline_run() resolves entirely from the run blob in
-            Redis, which a dead run stops refreshing and which expires on its
-            own within the hour. Treated as progressing.
-          - The events query FAILED with ES up: genuinely unknown, same
-            reasoning, treated as progressing — but logged at WARNING by
-            _get_last_pipeline_run_event_time_with_reason() rather than
-            swallowed at DEBUG, so "the board-lock heartbeat is pinning every
-            lock because its liveness probe is failing" is visible somewhere.
+            outage. Bounded from the other side instead — with no ES client at
+            all, get_active_pipeline_run() resolves entirely from the run blob
+            in Redis, which a dead run stops refreshing and which expires on
+            its own within the hour. Treated as progressing. That bound holds
+            ONLY because PipelineRunManager's own client is unusable in the
+            same breath: it is not a general "ES is having trouble" argument,
+            which is why the next case no longer borrows it.
+          - The events query FAILED with ES up: bounded by started_at, exactly
+            like the no-events case below, and for the same reason. This was
+            the one fail-open default left in this mechanism, and its
+            justification did not survive checking: obs.es being present means
+            PipelineRunManager.es is too (both build Elasticsearch([...])
+            lazily, so the client exists whenever the import succeeded, even
+            with ES down), and get_active_pipeline_run() then keeps returning
+            the run from the pipeline-runs-* search for as long as its doc
+            reads 'active' — the Redis-blob TTL never applies. A run whose
+            container was killed out from under the orchestrator (host OOM,
+            docker restart) so end_pipeline_run() never ran, plus a
+            decision-events-* query that fails persistently (a red shard, a
+            sort-on-timestamp mapping conflict after a rollover), would
+            otherwise have its lock touched every 60s forever, defeating BOTH
+            the Redis TTL and the 4-hour staleness heuristic. Still logged at
+            WARNING by _get_last_pipeline_run_event_time_with_reason() rather
+            than swallowed at DEBUG, so a failing liveness probe is visible.
           - ES answered with NO events for this run: that is an answer. With ES
             up, get_active_pipeline_run() keeps returning the run from the
             pipeline-runs-* search for as long as its doc reads 'active', so
@@ -9193,9 +9241,14 @@ _Repair cycle initiated by Switchyard_
             pipeline_run.id
         )
         if last_event_at is None:
-            if reason != 'no_events':
-                # ES unavailable, or its query failed — see the docstring.
+            if reason == 'es_unavailable':
+                # No answer to be had anywhere — see the docstring.
                 return True
+            # 'query_failed' and 'no_events' alike: the run's own start time
+            # bounds this probe without needing decision events at all, and
+            # applying it to both is what keeps a persistently-failing events
+            # query from pinning the board forever (found in the WI-8 review
+            # round — 'query_failed' used to return True unconditionally).
             started_at_str = getattr(pipeline_run, 'started_at', None)
             if not started_at_str:
                 return True
@@ -9208,10 +9261,15 @@ _Repair cycle initiated by Switchyard_
             silence_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
             if silence_seconds <= max_silence:
                 return True
+            no_activity_phrase = (
+                "has NEVER written a decision event" if reason == 'no_events'
+                else "cannot be shown to have written a decision event (its events "
+                     "query keeps failing)"
+            )
             logger.warning(
                 f"Board lock on {project_name}/{board_name} is held by issue #{issue_number} "
-                f"whose run {pipeline_run.id} still reads '{pipeline_run.status}' but has "
-                f"NEVER written a decision event, {silence_seconds / 3600:.1f} hours after "
+                f"whose run {pipeline_run.id} still reads '{pipeline_run.status}' but "
+                f"{no_activity_phrase}, {silence_seconds / 3600:.1f} hours after "
                 f"it started — no longer refreshing its liveness, so the board's own TTL "
                 f"and staleness recovery can reclaim it"
             )
@@ -9882,8 +9940,10 @@ _Repair cycle initiated by Switchyard_
             'no_events'       ES answered, and this run has no decision events
 
         'query_failed' is logged at WARNING rather than DEBUG: it is the case
-        where a liveness probe is silently failing while its callers keep
-        reading the failure as "still alive", and a DEBUG line left that
+        where a liveness probe is silently failing while its callers can only
+        fall back on a coarser bound (_board_lock_holder_is_still_progressing()
+        falls back to the run's started_at, and _find_stalled_issues_for_pipeline()
+        to the board's own last-activity timestamp), and a DEBUG line left that
         invisible in production.
         """
         try:

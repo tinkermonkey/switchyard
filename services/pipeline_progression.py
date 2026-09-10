@@ -17,7 +17,7 @@ from config.state_manager import state_manager
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from datetime import datetime
 import time
-from services.pipeline_lock_manager import get_pipeline_lock_manager
+from services.pipeline_lock_manager import ReleaseResult, get_pipeline_lock_manager
 from services.pipeline_queue_manager import (
     describe_rollback_reset,
     get_pipeline_queue_manager,
@@ -469,6 +469,25 @@ class PipelineProgression:
                 # refused rather than silently discarding the durable failure
                 # record and proceeding as if everything succeeded.
                 released = lock_manager.release_lock(project_name, board_name, issue_number)
+                if released is ReleaseResult.SERIALIZATION_FAILED:
+                    # NOT the retained-lock case, and misreporting it as one
+                    # sent operators to scripts/release_lock.py looking for a
+                    # durable failure record that does not exist (found in the
+                    # WI-8 review round). Nothing was attempted: the release is
+                    # still outstanding, so the board must not advance — but
+                    # this is transient contention on the lock's own acquire
+                    # guard, not a decision anyone has to make.
+                    logger.error(
+                        f"Could not release pipeline lock for {project_name}/{board_name} "
+                        f"(issue #{issue_number} reached '{exit_column}') — the release "
+                        f"could not be serialized against a concurrent acquire or liveness "
+                        f"refresh, so it did not happen. NOT ending the pipeline run as "
+                        f"successful or dispatching the next queued issue. This is lock "
+                        f"contention, not a retained/failed lock; the run stays 'active' "
+                        f"for PipelineWatchdog.check_for_zombie_runs() to reap, or run "
+                        f"scripts/release_lock.py to clear it now."
+                    )
+                    return
                 if not released:
                     logger.error(
                         f"Could not release pipeline lock for {project_name}/{board_name} "
