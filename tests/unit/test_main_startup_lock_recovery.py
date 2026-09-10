@@ -67,6 +67,32 @@ class TestProjectCheckoutOrphanRecoveryRunsFirst:
         assert recovery < initialize
         assert recovery < prune
 
+    def test_it_does_not_release_a_lock_whose_agent_container_survived(self, main_source):
+        """#169 review. The owner-kind rules establish that the holding PROCESS
+        is dead; for this resource the guarded work need not have died with it.
+        claude_integration.py holds this lock across a base-clone-scoped agent
+        CONTAINER run, and recover_or_cleanup_containers() exists precisely
+        because those containers survive a restart and get adopted -- and it
+        runs AFTER both of the steps below, so nothing has yet worked out which
+        containers survived when this recovery decides."""
+        assert 'project_has_live_agent_container' in main_source, (
+            "startup releases project_checkout locks with no check for work that "
+            "outlived this process"
+        )
+        assert re.search(
+            r'recover_orphaned_resource_locks,\s*\n\s*PROJECT_CHECKOUT_RESOURCE,'
+            r'\s*\n\s*project_has_live_agent_container,',
+            main_source,
+        ), "the survivor probe is no longer passed to the project_checkout recovery"
+
+    def test_the_probe_decides_before_the_two_steps_that_would_race_it(self, main_source):
+        recovery = _index_of(main_source, 'project_has_live_agent_container,')
+        initialize = _index_of(main_source, 'workspace_manager.initialize_all_projects')
+        prune = _index_of(main_source, 'workspace_manager.prune_epic_worktrees')
+
+        assert recovery < initialize
+        assert recovery < prune
+
     def test_the_dev_container_build_recovery_is_still_there_too(self, main_source):
         """The two are separate resources with separate reasons; adding one must
         not have replaced the other (#152)."""

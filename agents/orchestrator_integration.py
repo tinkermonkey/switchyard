@@ -61,7 +61,8 @@ class DevSetupQueueOutcome(Enum):
     DEFERRED_IN_PROGRESS = 'deferred_in_progress'
     # IN_PROGRESS went stale, but _dev_setup_in_flight_reason() found a live run.
     DEFERRED_RUN_IN_FLIGHT = 'deferred_run_in_flight'
-    # The dev_container_build lock is held by a live holder.
+    # The dev_container_build lock is held by a holder confirmed still alive --
+    # not merely by a row saying so (see _live_build_lock_reason).
     DEFERRED_BUILD_LOCK_HELD = 'deferred_build_lock_held'
     # The IN_PROGRESS mark could not be written, so nothing was enqueued.
     FAILED_STATUS_WRITE = 'failed_status_write'
@@ -208,7 +209,8 @@ def _dev_setup_in_flight_reason(
     is itself retried.
 
     Args:
-        check_build_lock: run probe 3 (is the dev_container_build lock held?).
+        check_build_lock: run probe 3 (does a LIVE holder own the
+            dev_container_build lock?).
             queue_dev_environment_setup() passes False when it is itself holding
             that lock (#171): probe 3 would find its own hold and report a build
             that is not running, turning the stale-IN_PROGRESS recovery into a
@@ -217,7 +219,9 @@ def _dev_setup_in_flight_reason(
             it: no other holder existed a moment ago, and none can appear while
             this caller keeps holding it. The caller that could NOT take the
             lock still passes True, because a refused acquire is not by itself
-            evidence of a live build (see this probe's retained_reason check).
+            evidence of a live build -- see _live_build_lock_reason(), which
+            probe 3 delegates to and which the refused-acquire caller consults
+            for the same reason.
     """
     from task_queue.task_manager import TaskQueue
 
@@ -258,29 +262,78 @@ def _dev_setup_in_flight_reason(
 
     # 3. Building. The setup session's own `docker build` holds this for the whole
     #    build window, which is the part that outlasts the staleness window most
-    #    often -- and a held lock means a build genuinely IS running, whoever
+    #    often -- and a LIVE holder means a build genuinely IS running, whoever
     #    started it. Skipped for a caller that already holds it; see
     #    check_build_lock.
     if not check_build_lock:
         return None
 
+    return _live_build_lock_reason(project, logger)
+
+
+def _live_build_lock_reason(project: str, logger) -> Optional[str]:
+    """
+    Describe the LIVE holder of `project`'s dev_container_build lock, or None
+    when nothing is holding it -- including when a row says held but its holder
+    is gone.
+
+    "There is a lock row" is not "a build is running" (#169 review). A row
+    outlives its holder in ways nothing in this process cleans up: a release
+    that could not be serialized against a concurrent acquire/refresh does not
+    complete, and the holder id it was for is known to nobody, so it leaks until
+    the Redis TTL or the 4-hour staleness heuristic (see
+    services/project_checkout_lock.py's _release_and_warn). Reading the row alone
+    then defers every caller for that whole window to a build that does not
+    exist and cannot be started -- and, on queue_dev_environment_setup()'s path,
+    reports each deferral as a successful recovery, every 30s board poll, for
+    hours.
+
+    Liveness is the same evidence startup recovery uses to decide a lock's owner
+    is gone: every holder of this lock heartbeats it (touch_resource(), which
+    resets lock_acquired_at) several times inside
+    FOREIGN_OWNER_LIVENESS_GRACE_SECONDS, so one that has gone quiet for longer
+    is not working. Unknowns fail CLOSED -- an unreadable lock store, an
+    unparseable timestamp -- because re-queueing wrongly costs an hour-scale
+    redundant agent run while skipping wrongly costs one 30-second sweep.
+
+    Returns:
+        A reason string suitable for _dev_setup_in_flight_reason()'s contract
+        (why a run cannot be ruled out), or None when the lock is genuinely not
+        guarding anything.
+    """
     try:
         from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
-        from services.project_resource_lock_manager import ProjectResourceLockManager
-        lock = ProjectResourceLockManager().get_resource_lock(project, DEV_CONTAINER_BUILD_RESOURCE)
-        if lock and not lock.retained_reason:
-            return (
-                f"the dev_container_build lock has been held since "
-                f"{lock.lock_acquired_at}, so a build is running"
+        from services.project_resource_lock_manager import (
+            FOREIGN_OWNER_LIVENESS_GRACE_SECONDS,
+            ProjectResourceLockManager,
+        )
+        manager = ProjectResourceLockManager()
+        lock = manager.get_resource_lock(project, DEV_CONTAINER_BUILD_RESOURCE)
+        if not lock or lock.retained_reason:
+            return None
+        if not manager.holder_liveness_is_fresh(lock):
+            logger.warning(
+                f"The dev_container_build lock for {project} says it has been held since "
+                f"{lock.lock_acquired_at} (holder #{lock.locked_by_issue}), but nothing "
+                f"has refreshed that holder's liveness in over "
+                f"{FOREIGN_OWNER_LIVENESS_GRACE_SECONDS:.0f}s -- every holder heartbeats "
+                f"this lock several times inside that window while it works, so this row "
+                f"is abandoned rather than busy (a release that could not be serialized "
+                f"leaks exactly this way). Treating it as unheld instead of deferring to "
+                f"a build that is not running; it will be reclaimed by the TTL/staleness "
+                f"path"
             )
+            return None
+        return (
+            f"the dev_container_build lock has been held since "
+            f"{lock.lock_acquired_at}, so a build is running"
+        )
     except Exception as e:
         logger.warning(
             f"Could not check the dev_container_build lock for {project}: {e} - "
             f"assuming a build may be running rather than risk a duplicate"
         )
         return "the dev_container_build lock could not be checked"
-
-    return None
 
 
 async def queue_dev_environment_setup(
@@ -353,14 +406,17 @@ async def queue_dev_environment_setup(
     # lands, and both enqueue. The lock changed which of them was serialized,
     # not how many tasks got queued.
     #
-    #   - GENUINE CONTENTION (a live holder): return without queuing. Somebody
+    #   - GENUINE CONTENTION, CONFIRMED LIVE: return without queuing. Somebody
     #     is inside this critical section right now -- either the winner of this
     #     exact race, who is queuing on our behalf, or a build/verify session
     #     holding its own window, which is a setup already running. Either way a
     #     second task is the duplicate hour-scale rebuild
     #     _dev_setup_in_flight_reason()'s docstring exists to prevent, and the
     #     next 30s board poll is the retry point if the winner somehow queued
-    #     nothing.
+    #     nothing. "Confirmed live" is not redundant: the refusal reason names
+    #     the holder recorded in the row, not one observed to be running, and an
+    #     abandoned row is indistinguishable from a busy one by that string alone
+    #     -- see _live_build_lock_reason().
     #   - DEGRADED / FAIL-CLOSED / RETAINED: fall back and decide unserialized.
     #     Nobody holds a build window in any of these -- a retained lock is a
     #     marker left by a run that already ended -- so skipping would be a NEW
@@ -369,21 +425,38 @@ async def queue_dev_environment_setup(
     #     either as a live run, and this leaves that judgement where it already
     #     is.
     async with dev_container_build_lock_attempt_async(project) as (serialized, refusal_reason):
-        if not serialized and acquire_failure_is_contention(refusal_reason):
-            logger.info(
-                f"Not queuing dev_environment_setup for {project}: its "
-                f"dev_container_build lock is held right now ({refusal_reason}), so "
-                f"either a setup/verify session is already running or another caller "
-                f"won this exact race and is queuing one. Deferring to it rather than "
-                f"queuing a duplicate; the next board poll retries if it did not."
+        unserialized_because = None
+        if not serialized:
+            unserialized_because = (
+                f"{refusal_reason}: a degraded/fail-closed store, or a lock retained "
+                f"after a failed run"
             )
-            return DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+        if not serialized and acquire_failure_is_contention(refusal_reason):
+            # The refusal reason names a holder; whether that holder still
+            # EXISTS is a separate question (#169 review). An abandoned row --
+            # a release that could not be serialized, leaked until its TTL --
+            # reads as genuine contention here, and short-circuiting on it
+            # blocks every setup this project needs for the rest of that window
+            # while reporting each deferral as a successful recovery.
+            live_holder = _live_build_lock_reason(project, logger)
+            if live_holder:
+                logger.info(
+                    f"Not queuing dev_environment_setup for {project}: its "
+                    f"dev_container_build lock is held right now ({refusal_reason}) and "
+                    f"{live_holder}, so either a setup/verify session is already running "
+                    f"or another caller won this exact race and is queuing one. Deferring "
+                    f"to it rather than queuing a duplicate; the next board poll retries "
+                    f"if it did not."
+                )
+                return DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+            unserialized_because = (
+                f"{refusal_reason}, but that holder is gone -- see the warning above"
+            )
         if not serialized:
             logger.warning(
                 f"Deciding whether to queue dev_environment_setup for {project} "
                 f"WITHOUT its dev_container_build lock -- the acquire failed for a "
-                f"reason that is NOT a live holder ({refusal_reason}: a degraded/"
-                f"fail-closed store, or a lock retained after a failed run). Nothing "
+                f"reason that is NOT a live holder ({unserialized_because}). Nothing "
                 f"is in this critical section, so skipping would drop the setup for "
                 f"good; the check-then-mark below runs unserialized instead, exactly "
                 f"as it did before this lock existed."

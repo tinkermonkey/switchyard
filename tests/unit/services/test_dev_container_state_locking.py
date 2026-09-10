@@ -22,6 +22,8 @@ import os
 import tempfile
 import threading
 import time
+from datetime import datetime
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,7 +33,11 @@ import pytest
 os.environ.setdefault('ORCHESTRATOR_ROOT', tempfile.mkdtemp(prefix='dev_container_state_test_'))
 
 import services.dev_container_state as dev_container_state_module
-from services.dev_container_state import DevContainerStateManager, DevContainerStatus
+from services.dev_container_state import (
+    DevContainerStateManager,
+    DevContainerStatus,
+    StateWriteResult,
+)
 from utils.file_lock import file_lock
 
 
@@ -414,16 +420,20 @@ class TestSetStatusReportsWhetherTheWriteLanded:
     rebuild the state file does not record is what lets the next board poll read
     the unchanged status and queue a second one."""
 
-    def test_a_landed_write_returns_true(self, manager):
-        assert manager.set_status('proj', DevContainerStatus.IN_PROGRESS) is True
+    def test_a_landed_write_returns_written(self, manager):
+        result = manager.set_status('proj', DevContainerStatus.IN_PROGRESS)
+        assert result is StateWriteResult.WRITTEN
+        assert bool(result) is True
         assert manager.get_status('proj') == DevContainerStatus.IN_PROGRESS
 
-    def test_a_failed_write_returns_false(self, manager, monkeypatch):
+    def test_a_failed_write_returns_failed(self, manager, monkeypatch):
         def _explode(*args, **kwargs):
             raise OSError("state dir is read-only")
 
         monkeypatch.setattr(dev_container_state_module, 'open', _explode, raising=False)
-        assert manager.set_status('proj', DevContainerStatus.VERIFIED) is False
+        result = manager.set_status('proj', DevContainerStatus.VERIFIED)
+        assert result is StateWriteResult.FAILED
+        assert bool(result) is False
 
     def test_a_lock_acquire_timeout_returns_false(self, manager):
         """The realistic failure: another OS process holds the state file's
@@ -435,16 +445,195 @@ class TestSetStatusReportsWhetherTheWriteLanded:
         with file_lock(lock_path, timeout=5, enforce_timeout=True):
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(dev_container_state_module, 'STATE_LOCK_TIMEOUT_SECONDS', 0.1)
-                assert manager.set_status('proj', DevContainerStatus.VERIFIED) is False
+                result = manager.set_status('proj', DevContainerStatus.VERIFIED)
+                assert result is StateWriteResult.FAILED
+                assert bool(result) is False
 
         assert manager.get_status('proj') == DevContainerStatus.UNVERIFIED
 
-    def test_a_refused_precondition_returns_false(self, manager):
-        """A compare-and-set whose `expect` no longer matches is also "the value
-        you decided on is not what is on disk", which is the only thing a caller
-        acts on."""
+    def test_a_refused_precondition_is_distinguishable_from_a_failure(self, manager):
+        """Both are falsy -- "the value you decided on is not what is on disk" --
+        but a caller that REPORTS what happened needs the two apart: a refusal
+        means somebody else's fresher record is standing, a failure means this
+        call's own verdict never reached disk (#171 review)."""
         manager.set_status('proj', DevContainerStatus.VERIFIED)
-        assert manager.set_status(
+        result = manager.set_status(
             'proj', DevContainerStatus.UNVERIFIED, expect={'status': 'in_progress'}
-        ) is False
+        )
+        assert result is StateWriteResult.PRECONDITION_REFUSED
+        assert bool(result) is False
         assert manager.get_status('proj') == DevContainerStatus.VERIFIED
+
+
+class TestTheResetIsAnnouncedOnlyIfItHappened:
+    """#171 review. verify_and_update_status() logged "Resetting status to
+    unverified" BEFORE its compare-and-set and then threw the CAS's answer away,
+    so a refused write -- the case the CAS was added for -- was reported as a
+    completed reset. The only contradiction was an INFO from inside
+    _merge_state(), which is not what an operator reading a WARNING goes looking
+    for.
+
+    The reset itself is covered above; this is about whether the log matches
+    what reached disk."""
+
+    @staticmethod
+    def _missing_image_probe():
+        def _verify(self, project_name, image_name=None):
+            return False
+
+        return _verify
+
+    @staticmethod
+    def _messages(mock_logger_method):
+        return [str(call) for call in mock_logger_method.call_args_list]
+
+    def _run_with_missing_image(self, manager, monkeypatch, side_effect=None):
+        """verify_and_update_status() against an image the probe says is gone,
+        with the module logger captured."""
+        probe = self._missing_image_probe()
+        if side_effect is not None:
+            original_probe = probe
+
+            def probe(self, project_name, image_name=None):  # noqa: F811
+                side_effect()
+                return original_probe(self, project_name, image_name=image_name)
+
+        monkeypatch.setattr(DevContainerStateManager, 'verify_image_exists', probe)
+        captured = MagicMock()
+        monkeypatch.setattr(dev_container_state_module, 'logger', captured)
+        result = manager.verify_and_update_status("proj")
+        return result, captured
+
+    def test_a_refused_reset_is_not_reported_as_a_reset(self, manager, monkeypatch):
+        """THE regression. A rebuild finishing during the 10s `docker image
+        inspect` writes a fresh VERIFIED, the CAS correctly declines to revert
+        it -- and the log claimed the revert happened anyway."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        def _a_rebuild_finishes_during_the_probe():
+            time.sleep(0.01)
+            manager.set_status(
+                "proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest"
+            )
+
+        result, captured = self._run_with_missing_image(
+            manager, monkeypatch, side_effect=_a_rebuild_finishes_during_the_probe
+        )
+
+        warnings = self._messages(captured.warning)
+        assert not any("Status reset to unverified" in message for message in warnings), (
+            "a refused compare-and-set is still being logged as a completed reset"
+        )
+        assert any("NOT resetting proj to unverified" in message for message in warnings)
+        # And the verdict this call reached is unchanged: the tag it inspected
+        # really was absent, so its caller must still not launch against it.
+        assert result is False
+        assert manager.get_status("proj") == DevContainerStatus.VERIFIED
+
+    def test_a_landed_reset_is_announced_after_the_write(self, manager, monkeypatch):
+        """Ordering, not just wording: the announcement has to be able to see
+        the state it announces."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        on_disk_when_logged = []
+        captured = MagicMock()
+        captured.warning.side_effect = lambda *a, **kw: on_disk_when_logged.append(
+            manager.get_status("proj")
+        )
+        monkeypatch.setattr(
+            DevContainerStateManager, 'verify_image_exists', self._missing_image_probe()
+        )
+        monkeypatch.setattr(dev_container_state_module, 'logger', captured)
+
+        assert manager.verify_and_update_status("proj") is False
+
+        assert on_disk_when_logged == [DevContainerStatus.UNVERIFIED], (
+            "the reset is still announced before it has reached disk"
+        )
+        assert any(
+            "Status reset to unverified" in message
+            for message in self._messages(captured.warning)
+        )
+
+    def test_a_failed_write_is_reported_as_a_failure_not_a_refusal(self, manager, monkeypatch):
+        """The two Falses mean opposite things: a refusal leaves somebody else's
+        fresher record standing, a failure leaves THIS call's verdict unwritten
+        and the project still advertising an image that is not there."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+        monkeypatch.setattr(
+            DevContainerStateManager,
+            '_merge_state',
+            lambda self, project_name, updates, expect=None: StateWriteResult.FAILED,
+        )
+
+        result, captured = self._run_with_missing_image(manager, monkeypatch)
+
+        assert result is False
+        assert any(
+            "Could NOT reset proj to unverified" in message
+            for message in self._messages(captured.error)
+        )
+        assert not any(
+            "Status reset to unverified" in message
+            for message in self._messages(captured.warning)
+        )
+
+
+class TestTheStaleMarkerSweepAnnouncesOnlyWhatItCleared:
+    """Same shape as above, at clear_stale_pending_operations() (#171 review):
+    "Clearing abandoned '<op>' marker" was logged at WARNING before a
+    conditional write that can decline. The count was right; the line was not."""
+
+    @staticmethod
+    def _stale_marker(manager, project, operation='rebuild'):
+        manager.set_status(project, DevContainerStatus.VERIFIED)
+        manager._merge_state(
+            project,
+            {
+                'pending_operation': operation,
+                'pending_operation_at': '2020-01-01T00:00:00',
+            },
+        )
+
+    def test_a_cleared_marker_is_announced(self, manager, monkeypatch):
+        self._stale_marker(manager, 'proj')
+        captured = MagicMock()
+        monkeypatch.setattr(dev_container_state_module, 'logger', captured)
+
+        assert manager.clear_stale_pending_operations() == 1
+        assert any(
+            "Cleared abandoned 'rebuild' marker" in str(call)
+            for call in captured.warning.call_args_list
+        )
+
+    def test_a_refused_clear_is_not_announced_as_a_clear(self, manager, monkeypatch):
+        """A rebuild requested in the gap owns the marker now, and its 'queued'
+        display -- the request's only feedback channel -- is correctly left
+        standing. Saying it was cleared sends an operator looking for a marker
+        that is still there and still correct."""
+        self._stale_marker(manager, 'proj')
+        original_merge = DevContainerStateManager._merge_state
+
+        def _merge_after_a_fresh_request(self, project_name, updates, expect=None):
+            if expect is not None:
+                original_merge(
+                    self,
+                    project_name,
+                    {
+                        'pending_operation': 'rebuild',
+                        'pending_operation_at': datetime.now().isoformat(),
+                    },
+                )
+            return original_merge(self, project_name, updates, expect=expect)
+
+        monkeypatch.setattr(
+            DevContainerStateManager, '_merge_state', _merge_after_a_fresh_request
+        )
+        captured = MagicMock()
+        monkeypatch.setattr(dev_container_state_module, 'logger', captured)
+
+        assert manager.clear_stale_pending_operations() == 0
+        assert not any(
+            "Cleared abandoned" in str(call) for call in captured.warning.call_args_list
+        )
+        assert manager.get_pending_operation('proj') is not None

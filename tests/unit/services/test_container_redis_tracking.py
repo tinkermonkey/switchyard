@@ -245,7 +245,15 @@ class TestRepairMissingRedisTracking:
         assert mapping['pipeline_run_id'] == 'run-7'
         assert mapping['repaired'] == 'true'
 
-        mock_redis.expire.assert_called_once_with('agent:container:claude-agent-myproject-task99', 7200)
+        # Same TTL invariant as the original registration (#160 review): this
+        # path's entire job is restoring a tracking hash that went missing under
+        # a live container, so restoring it with a TTL shorter than that
+        # container's agent timeout just re-arms the defect.
+        from claude.docker_runner import ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
+        mock_redis.expire.assert_called_once_with(
+            'agent:container:claude-agent-myproject-task99',
+            ACTIVE_CONTAINER_TRACKING_TTL_SECONDS,
+        )
 
     def test_repair_handles_inspect_failure(self, tmp_path):
         tracker = self._make_tracker(tmp_path)
@@ -558,3 +566,51 @@ class TestCheckRedisTrackingUseScanIter:
             result = tracker._check_redis_tracking_for_agent('proj', 'code_agent', 42)
 
         assert result is True
+
+
+class TestEveryWriterOfTheTrackingKeyHonoursTheSameTTL:
+    """#160 review, second pass. ACTIVE_CONTAINER_TRACKING_TTL_SECONDS carries an
+    invariant -- the `agent:container:<name>` hash MUST outlast the longest agent
+    a container can be running, because it is the only thing that gives POST
+    /agents/kill/<container> a project and an issue number to cancel work for --
+    but only _register_active_container() was moved onto it. The two paths that
+    RE-write the same key after a restart kept a hardcoded 7200, so a
+    senior_software_engineer (timeout 10800s) adopted 30 minutes into its run had
+    its tracking expire under it two hours later: the exact defect the constant
+    documents, reachable on every restart-with-surviving-container.
+
+    Asserted by reading the source rather than by driving each writer, because
+    the invariant is "all three agree", which no single call can show.
+    """
+
+    @staticmethod
+    def _source(relative_path):
+        from pathlib import Path
+        return (Path(__file__).resolve().parents[3] / relative_path).read_text()
+
+    def test_the_constant_outlasts_the_longest_configured_agent_timeout(self):
+        import yaml
+        from pathlib import Path
+        from claude.docker_runner import ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
+
+        agents = yaml.safe_load(
+            (Path(__file__).resolve().parents[3] / 'config/foundations/agents.yaml').read_text()
+        )
+        timeouts = [
+            (definition or {}).get('timeout', 0)
+            for definition in (agents.get('agents') or {}).values()
+        ]
+
+        assert ACTIVE_CONTAINER_TRACKING_TTL_SECONDS > max(timeouts)
+
+    def test_the_recovery_re_registration_uses_the_constant(self):
+        source = self._source('services/agent_container_recovery.py')
+
+        assert 'ACTIVE_CONTAINER_TRACKING_TTL_SECONDS' in source
+        assert "expire(f'agent:container:{container_name}', 7200)" not in source
+
+    def test_the_redis_tracking_repair_uses_the_constant(self):
+        source = self._source('services/work_execution_state.py')
+
+        assert 'ACTIVE_CONTAINER_TRACKING_TTL_SECONDS' in source
+        assert "expire(f'agent:container:{container_name}', 7200)" not in source

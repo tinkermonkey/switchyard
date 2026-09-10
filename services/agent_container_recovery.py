@@ -616,11 +616,23 @@ class AgentContainerRecovery:
                         # Extract column to pass through recovery chain
                         column = execution.get('column', 'unknown')
 
+                # Same TTL invariant as the original registration (#160 review):
+                # this hash is the only thing that gives POST /agents/kill/<c> a
+                # project and an issue number, so it MUST outlast the longest
+                # agent a container can be running. A hardcoded 7200 here expired
+                # it under a live 10800s agent on every restart-with-survivor --
+                # which is exactly the container this path adopts.
+                from claude.docker_runner import (
+                    ACTIVE_CONTAINER_TRACKING_TTL_SECONDS,
+                    DockerAgentRunner,
+                )
                 self.redis.hset(f'agent:container:{container_name}', mapping=container_info)
-                self.redis.expire(f'agent:container:{container_name}', 7200)
+                self.redis.expire(
+                    f'agent:container:{container_name}',
+                    ACTIVE_CONTAINER_TRACKING_TTL_SECONDS,
+                )
 
                 # CRITICAL: Restart monitoring thread
-                from claude.docker_runner import DockerAgentRunner
                 docker_runner = DockerAgentRunner()
 
                 if issue_number:

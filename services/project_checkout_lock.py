@@ -185,6 +185,7 @@ import functools
 import itertools
 import logging
 import os
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -226,6 +227,74 @@ RESOURCE_NAME = "project_checkout"
 # proceeding unlocked.
 DEFAULT_TIMEOUT_SECONDS = 10900.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+
+# How long `docker ps` gets to answer the survivor probe below. Matches the
+# budget services/cancellation.py gives the same query.
+_CONTAINER_PROBE_TIMEOUT_SECONDS = 10
+
+
+def project_has_live_agent_container(project: str) -> bool:
+    """
+    True when a container launched for `project` is still running -- the probe
+    main.py hands recover_orphaned_resource_locks() so that startup does not
+    release a project_checkout lock whose guarded work survived the restart
+    (#169 review).
+
+    A dead holding PROCESS does not mean dead guarded WORK for this resource:
+    claude/claude_integration.py holds this lock across
+    docker_runner.run_agent_in_container() for a base-clone-scoped run, and
+    services/agent_container_recovery.py exists because those containers outlive
+    an orchestrator restart and are adopted rather than killed. Releasing under
+    one of them lets initialize_project()'s `git fetch` / `git pull --ff-only`
+    and prune_epic_worktrees()'s .git/worktrees rewrite run in the same
+    directory the adopted agent is working in.
+
+    Asked of Docker rather than of Redis: the `agent:container:*` tracking hash
+    is the very thing a crash can leave incomplete, and every managed container
+    carries org.switchyard.project regardless of naming convention -- the same
+    label query services/pipeline_watchdog.py, services/cancellation.py and
+    services/agent_container_recovery.py already route through. Deliberately NOT
+    narrowed to agent containers: a repair-cycle container works in the same
+    checkout, and this is a "leave it alone" test, not an attribution.
+
+    Fails CLOSED (True) when Docker cannot be reached at all: the caller uses
+    this to decide whether to dispossess a lock holder, and a docker socket that
+    is not answering says nothing about what is running behind it.
+    """
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'ps',
+                '--filter', f'label=org.switchyard.project={project}',
+                '--format', '{{.Names}}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_CONTAINER_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not ask Docker whether {project!r} still has a running container: {e} "
+            f"- assuming one may be, rather than releasing a '{RESOURCE_NAME}' lock out "
+            f"from under it"
+        )
+        return True
+
+    if result.returncode != 0:
+        logger.warning(
+            f"docker ps failed while checking for running {project!r} containers "
+            f"(exit {result.returncode}): {result.stderr.strip()} - assuming one may be "
+            f"running, rather than releasing a '{RESOURCE_NAME}' lock out from under it"
+        )
+        return True
+
+    containers = [name for name in result.stdout.strip().split('\n') if name]
+    if containers:
+        logger.info(
+            f"Project {project!r} still has {len(containers)} container(s) running from "
+            f"before this process started: {', '.join(containers)}"
+        )
+    return bool(containers)
 
 # Seeds _mint_unique_holder_id()'s counter so it differs across process
 # restarts, not just within one process's lifetime. Found in code review: a

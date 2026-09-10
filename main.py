@@ -229,12 +229,27 @@ async def main():
     # restart after a crash. Runs here rather than next to the
     # dev_container_build recovery because that one runs ~50 lines too late to
     # help these two.
+    #
+    # UNLIKE the dev_container_build one, this passes a survivor probe (#169
+    # review). A dead holding process does not mean dead guarded work here:
+    # claude_integration.py holds this lock across a base-clone-scoped agent
+    # CONTAINER run, and recover_or_cleanup_containers() below exists precisely
+    # because those containers survive a restart and get adopted. Releasing
+    # under one of them would hand the base clone to initialize_project()'s
+    # `git pull --ff-only` and to prune_epic_worktrees()'s .git/worktrees
+    # rewrite while the adopted agent is still working in it -- and both of
+    # those run BEFORE anything here has enumerated which containers survived.
+    # See project_has_live_agent_container().
     logger.info("Recovering orphaned project_checkout resource locks")
-    from services.project_checkout_lock import RESOURCE_NAME as PROJECT_CHECKOUT_RESOURCE
+    from services.project_checkout_lock import (
+        RESOURCE_NAME as PROJECT_CHECKOUT_RESOURCE,
+        project_has_live_agent_container,
+    )
     from services.project_resource_lock_manager import ProjectResourceLockManager
     checkout_locks_released = await asyncio.to_thread(
         ProjectResourceLockManager().recover_orphaned_resource_locks,
         PROJECT_CHECKOUT_RESOURCE,
+        project_has_live_agent_container,
     )
     logger.info(f"Orphaned project_checkout lock recovery: {checkout_locks_released} released")
 

@@ -59,6 +59,32 @@ PENDING_OPERATION_MAX_AGE_SECONDS = 1200.0
 STATE_LOCK_TIMEOUT_SECONDS = 10
 
 
+class StateWriteResult(Enum):
+    """
+    What became of a write to a project's state file.
+
+    _merge_state() used to return a plain bool, on the reasoning that "both mean
+    'the value you decided on is not what is on disk', which is the only thing a
+    caller acts on" -- with a note that a caller needing to tell them apart
+    should widen it HERE rather than re-read the file and guess. #171's review
+    found the caller: verify_and_update_status() logs a completed reset, and the
+    two Falses need opposite sentences. A refused precondition means somebody
+    else's fresher record is standing and this call's verdict no longer applies;
+    a failed write means THIS call's verdict is the current one and it never
+    reached disk, so the project is still advertising an image that is not there.
+
+    Truthy only for WRITTEN, so every existing `if written:` / `if not marked:`
+    caller keeps the bool semantics it was written against.
+    """
+
+    WRITTEN = "written"
+    PRECONDITION_REFUSED = "precondition_refused"
+    FAILED = "failed"
+
+    def __bool__(self) -> bool:
+        return self is StateWriteResult.WRITTEN
+
+
 class DevContainerStatus(Enum):
     """Status of a project's development container"""
     UNVERIFIED = "unverified"  # Default for new projects
@@ -154,16 +180,18 @@ class DevContainerStateManager:
         image_name: Optional[str] = None,
         error_message: Optional[str] = None,
         expect: Optional[Dict[str, Any]] = None,
-    ) -> bool:
+    ) -> StateWriteResult:
         """
         Set the status of a project's dev container
 
         Returns:
-            True if the new status reached disk, False if it did not -- either
-            because `expect` no longer matched or because the write itself
-            failed (a file-lock acquire that timed out, an unwritable state
-            dir). _merge_state() already logs which; see its docstring for why
-            the two are not distinguished here.
+            StateWriteResult -- WRITTEN when the new status reached disk,
+            PRECONDITION_REFUSED when `expect` no longer matched, FAILED when
+            the write itself failed (a file-lock acquire that timed out, an
+            unwritable state dir). Only WRITTEN is truthy, so a caller that only
+            needs "did it land" can keep testing it as a bool; one that reports
+            what happened has to tell the two Falses apart, because they mean
+            opposite things (see StateWriteResult).
 
             Callers that go on to do work the status is supposed to ANNOUNCE
             must check this. queue_dev_environment_setup() is the one that
@@ -318,11 +346,6 @@ class DevContainerStateManager:
                 continue
             if not self._is_stale_pending_operation(state.get('pending_operation_at')):
                 continue
-            logger.warning(
-                f"Clearing abandoned '{state['pending_operation']}' marker for "
-                f"{project_name} (requested {state.get('pending_operation_at')}) - "
-                f"the thread that owned it never came back"
-            )
             # Conditional on the marker still being the one just read (#171).
             # This is a read-decide-write with the lock released in between:
             # clear_pending_operation() would clear whatever is there by the
@@ -338,15 +361,42 @@ class DevContainerStateManager:
             # `finally`. Sequential, not nested: _read_state() above has already
             # released the file lock -- see _state_lock_file() on why nothing
             # here may nest.
-            if self._merge_state(
+            #
+            # Announced AFTER the write, for the same reason
+            # verify_and_update_status() is (#171 review): a line logged before a
+            # compare-and-set claims a clear the CAS may refuse, and here the
+            # refusal is the interesting case -- it means a rebuild was requested
+            # in the gap and its 'queued' display is (correctly) still standing.
+            written = self._merge_state(
                 project_name,
                 {'pending_operation': None, 'pending_operation_at': None},
                 expect={
                     'pending_operation': state['pending_operation'],
                     'pending_operation_at': state.get('pending_operation_at'),
                 },
-            ):
+            )
+            if written:
                 cleared += 1
+                logger.warning(
+                    f"Cleared abandoned '{state['pending_operation']}' marker for "
+                    f"{project_name} (requested {state.get('pending_operation_at')}) - "
+                    f"the thread that owned it never came back"
+                )
+            elif written is StateWriteResult.PRECONDITION_REFUSED:
+                logger.info(
+                    f"Left the '{state['pending_operation']}' marker for {project_name} "
+                    f"alone: it is no longer the one this sweep read (see above), so it "
+                    f"belongs to a request made since rather than to a thread that never "
+                    f"came back"
+                )
+            else:
+                logger.error(
+                    f"Could NOT clear the abandoned '{state['pending_operation']}' marker "
+                    f"for {project_name} (requested "
+                    f"{state.get('pending_operation_at')}): the write failed (see the "
+                    f"error logged above). get_pending_operation() still refuses to report "
+                    f"it, so nothing is masked -- but it stays on disk until a later write"
+                )
         return cleared
 
     def set_last_operation_error(self, project_name: str, message: str) -> None:
@@ -466,7 +516,7 @@ class DevContainerStateManager:
 
     def _merge_state(
         self, project_name: str, updates: Dict, expect: Optional[Dict] = None
-    ) -> bool:
+    ) -> StateWriteResult:
         """
         Read-modify-write the project's state file, applying `updates` and
         deleting any key whose new value is None. Every writer of this file goes
@@ -511,13 +561,15 @@ class DevContainerStateManager:
         decision depends on a value they read earlier pass it; an unconditional
         write must not, or it would silently become a no-op.
 
-        Returns True if the file was written. A False is either a failure (the
-        ERROR below) or a refused precondition (the INFO below). No current
-        caller distinguishes the two -- both mean "the value you decided on is
-        not what is on disk", which is the only thing a caller acts on -- so
-        this stays a bool and set_status() passes it straight through. Should
-        one ever need to tell them apart, widen it to a tri-state here rather
-        than making callers re-read the file to guess.
+        Returns a StateWriteResult, which set_status() passes straight through.
+        It was a bool -- "both Falses mean 'the value you decided on is not what
+        is on disk', which is the only thing a caller acts on" -- with a note to
+        widen it HERE, rather than have callers re-read the file and guess,
+        should one ever need to tell a failure (the ERROR below) from a refused
+        precondition (the INFO below). verify_and_update_status() is that caller
+        (#171 review): the two need opposite sentences in its log, because a
+        refusal means somebody else's fresher record is standing while a failure
+        means this call's own verdict never reached disk.
         """
         from utils.file_lock import file_lock
 
@@ -552,7 +604,7 @@ class DevContainerStateManager:
                             f"else wrote a fresher value while this caller was "
                             f"deciding, so its decision no longer applies"
                         )
-                        return False
+                        return StateWriteResult.PRECONDITION_REFUSED
 
                 for key, value in updates.items():
                     if value is None:
@@ -568,10 +620,10 @@ class DevContainerStateManager:
 
                 with open(state_file, 'w') as f:
                     yaml.dump(state, f, default_flow_style=False)
-                return True
+                return StateWriteResult.WRITTEN
         except Exception as e:
             logger.error(f"Failed to save dev container state for {project_name}: {e}")
-            return False
+            return StateWriteResult.FAILED
 
     def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
         """
@@ -720,13 +772,16 @@ class DevContainerStateManager:
             return True  # Image exists, all good
 
         # Image is missing, or the tag now points at something that isn't a
-        # genuine switchyard agent environment (see verify_image_exists) -
-        # reset status to UNVERIFIED either way so a rebuild is forced.
-        logger.warning(
-            f"Project {project_name} marked as verified but image {image_name} is missing "
-            f"or is not a genuine agent-environment image. Resetting status to unverified."
-        )
-
+        # genuine switchyard agent environment (see verify_image_exists) - reset
+        # status to UNVERIFIED either way so a rebuild is forced.
+        #
+        # Nothing is logged until the write has been attempted (#171 review).
+        # This is a compare-and-set that can legitimately be refused, and an
+        # announcement made BEFORE it claimed a reset that had not happened and,
+        # when refused, never happened at all -- leaving an operator reading back
+        # a "Resetting status to unverified" line against a record still saying
+        # verified, with only an INFO from inside _merge_state() to contradict it.
+        #
         # `expect` makes this a compare-and-set (#171). The decision above rests
         # on a read several seconds ago -- verify_image_exists() shells out to
         # `docker image inspect` with a 10s timeout in between -- and this
@@ -746,10 +801,14 @@ class DevContainerStateManager:
         # record this call read from a later one carrying the same status, and
         # 'image_name' pins the verdict to the tag the probe actually inspected.
         #
-        # The return value stays False either way: the image this call actually
-        # looked at was genuinely missing, and reporting otherwise would tell
-        # docker_runner to launch against it.
-        self.set_status(
+        # The return value stays False in all three outcomes, deliberately (#171
+        # review): the image this call actually looked at was genuinely missing,
+        # and reporting otherwise would tell docker_runner -- the caller that
+        # reaches here on every container launch -- to launch against it. What
+        # differs is what an operator is told, because a refusal and a failure
+        # leave the project in opposite states and only one of them is this
+        # call's to explain.
+        reset = self.set_status(
             project_name,
             DevContainerStatus.UNVERIFIED,
             image_name=image_name,
@@ -763,6 +822,31 @@ class DevContainerStateManager:
                 'image_name': image_name,
             },
         )
+
+        if reset is StateWriteResult.PRECONDITION_REFUSED:
+            logger.warning(
+                f"NOT resetting {project_name} to unverified after all: image {image_name} "
+                f"was missing when this call inspected it, but something else wrote a "
+                f"fresher dev container record while that was happening (see the skip "
+                f"logged above for what is on disk now), so this verdict is about a "
+                f"version that no longer exists and that record is left alone. Still "
+                f"reporting the image as missing to this caller, which means a rebuild may "
+                f"be queued against a record this call did not write"
+            )
+        elif reset is StateWriteResult.FAILED:
+            logger.error(
+                f"Could NOT reset {project_name} to unverified: image {image_name} is "
+                f"missing or is not a genuine agent-environment image, but the write "
+                f"failed (see the error logged above). The record still says verified, so "
+                f"every reader of it until the next successful write is told an image is "
+                f"there that is not"
+            )
+        else:
+            logger.warning(
+                f"Project {project_name} was marked as verified but image {image_name} is "
+                f"missing or is not a genuine agent-environment image. Status reset to "
+                f"unverified so a rebuild is forced."
+            )
 
         return False
 

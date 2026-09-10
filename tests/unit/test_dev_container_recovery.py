@@ -55,6 +55,34 @@ def _build_lock(acquired: bool, reason: str = "lock_state_unknown_failing_closed
         yield
 
 
+@contextmanager
+def _build_lock_row(*, held=True, holder_is_live=True, retained_reason=None):
+    """Stand-in for the dev_container_build lock ROW that
+    _live_build_lock_reason() reads (#169 review).
+
+    "The acquire was refused naming a holder" and "that holder still exists" are
+    different questions, and only the second one licenses deferring: a release
+    that could not be serialized against a concurrent acquire/refresh leaves a
+    row behind that nothing in this process will ever clean up, and it reads as
+    genuine contention until its TTL lapses. `holder_is_live` is the heartbeat
+    evidence that tells the two apart.
+    """
+    lock = Mock()
+    lock.retained_reason = retained_reason
+    lock.lock_acquired_at = '2026-01-01T00:00:00+00:00'
+    lock.locked_by_issue = -4242
+
+    facade = MagicMock()
+    facade.get_resource_lock.return_value = lock if held else None
+    facade.holder_liveness_is_fresh.return_value = holder_is_live
+
+    with patch(
+        'services.project_resource_lock_manager.ProjectResourceLockManager',
+        return_value=facade,
+    ):
+        yield facade
+
+
 @pytest.fixture
 def mock_logger():
     """Create a mock logger."""
@@ -423,11 +451,16 @@ class TestQueueDevEnvironmentSetup:
         held = Mock()
         held.retained_reason = None
         held.lock_acquired_at = '2026-01-01T00:00:00+00:00'
+        held.locked_by_issue = -4242
 
         tracker = MagicMock()
         tracker.load_state.return_value = {'execution_history': []}
         facade = MagicMock()
         facade.get_resource_lock.return_value = held
+        # Stated rather than left to a MagicMock's truthiness (#169 review):
+        # probe 3 now asks whether the recorded holder is still HEARTBEATING,
+        # and this test is about the branch where it is.
+        facade.holder_liveness_is_fresh.return_value = True
 
         with _build_lock(False), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
@@ -623,6 +656,7 @@ class TestTheDuplicateGuardIsAtomic:
         from services.dev_container_state import DevContainerStatus
 
         with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=True, holder_is_live=True), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
 
@@ -945,6 +979,7 @@ class TestTheOutcomeIsReportedToCallers:
         )
 
         with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=True, holder_is_live=True), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
 
@@ -1070,3 +1105,199 @@ class TestAFailedInProgressMarkBlocksTheQueue:
         info_lines = " ".join(str(c) for c in mock_logger.info.call_args_list)
         assert "Set dev container status to IN_PROGRESS" not in info_lines
         assert mock_logger.error.called
+
+
+class TestAnAbandonedBuildLockDoesNotBlockSetupForever:
+    """#169 review, second pass. The contention short-circuit trusts the acquire's
+    refusal REASON, which names the holder recorded in the row -- not one observed
+    to be running. A row outlives its holder in a way nothing in this process
+    cleans up: when release_resource() returns SERIALIZATION_FAILED the release
+    did not complete and the holder id it was for is known to nobody, so the row
+    leaks until the Redis TTL or the 4-hour staleness heuristic (see
+    project_checkout_lock._release_and_warn).
+
+    That row reads as `locked_by_issue_<n>` with no `_failed` suffix -- genuine
+    contention by acquire_failure_is_contention()'s definition -- and startup's
+    orphan recovery only runs at startup. So every dispatch for the project hit
+    the short-circuit, queued nothing, and reported `success=True,
+    recovery_action='deferred_to_existing_dev_setup'` every 30s board poll, for
+    hours, deferring to a setup that did not exist and could not be started.
+
+    The evidence that tells a leaked row from a busy one is the heartbeat every
+    holder of this lock ticks while it works."""
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_row_falls_through_and_queues(self, mock_logger):
+        """THE regression."""
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=True, holder_is_live=False), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.QUEUED
+        mock_queue_instance.enqueue.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_abandoned_row_is_reported_at_warning(self, mock_logger):
+        """An operator has to be able to find the leaked lock; the fall-through
+        is a workaround for it, not a fix."""
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import queue_dev_environment_setup
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=True, holder_is_live=False), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            MockTaskQueue.return_value = Mock()
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+        warnings = " ".join(str(call) for call in mock_logger.warning.call_args_list)
+        assert "abandoned rather than busy" in warnings
+        assert "WITHOUT its dev_container_build lock" in warnings
+
+    @pytest.mark.asyncio
+    async def test_a_live_holder_is_still_deferred_to(self, mock_logger):
+        """The other side. A holder that is heartbeating is either the winner of
+        this exact race (queuing on our behalf) or a build/verify session -- both
+        mean stop, and this must not have become a way to queue duplicates."""
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=True, holder_is_live=True), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+        mock_queue_instance.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_lock_store_that_cannot_be_read_still_fails_closed(self, mock_logger):
+        """Re-queueing wrongly costs an hour-scale redundant agent run; skipping
+        wrongly costs one 30-second sweep. An unreadable store takes the cheap
+        side, exactly as the other probes do."""
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             patch('services.project_resource_lock_manager.ProjectResourceLockManager',
+                   side_effect=RuntimeError("redis down")), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.UNVERIFIED, None
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_BUILD_LOCK_HELD
+        mock_queue_instance.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_row_released_in_the_meantime_is_not_deferred_to(self, mock_logger):
+        """The acquire lost a race that was over by the time the row was read.
+        Whoever won it holds no lock now, and the check-then-mark below reads the
+        IN_PROGRESS they wrote under it -- so falling through costs nothing and
+        deferring to a hold that has ended costs a poll."""
+        from datetime import datetime
+        from services.dev_container_state import DevContainerStatus
+        from agents.orchestrator_integration import (
+            DevSetupQueueOutcome,
+            queue_dev_environment_setup,
+        )
+
+        with _build_lock(False, reason="locked_by_issue_-4242"), \
+             _build_lock_row(held=False), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status_and_updated_at.return_value = (
+                DevContainerStatus.IN_PROGRESS, datetime.now()
+            )
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            outcome = await queue_dev_environment_setup("test-project", mock_logger)
+
+        assert outcome is DevSetupQueueOutcome.DEFERRED_IN_PROGRESS
+        mock_queue_instance.enqueue.assert_not_called()
+
+
+class TestProbeThreeAsksTheSameLivenessQuestion:
+    """_dev_setup_in_flight_reason()'s probe 3 had the identical blindness --
+    `lock and not lock.retained_reason` with no liveness test -- and it is the
+    probe that keeps a stale IN_PROGRESS from ever being re-queued. Both call
+    sites now route through _live_build_lock_reason(), so the fix is one
+    judgement rather than two that can drift."""
+
+    def test_an_abandoned_row_is_not_a_live_run(self, mock_logger):
+        from agents.orchestrator_integration import _live_build_lock_reason
+
+        with _build_lock_row(held=True, holder_is_live=False):
+            assert _live_build_lock_reason("test-project", mock_logger) is None
+
+    def test_a_heartbeating_row_is(self, mock_logger):
+        from agents.orchestrator_integration import _live_build_lock_reason
+
+        with _build_lock_row(held=True, holder_is_live=True):
+            reason = _live_build_lock_reason("test-project", mock_logger)
+
+        assert reason is not None
+        assert "a build is running" in reason
+
+    def test_a_retained_row_is_not_a_live_run_and_is_not_probed_for_liveness(
+        self, mock_logger
+    ):
+        """A retained marker's 'holder' is a run that already ended, so its
+        liveness is not a question worth asking."""
+        from agents.orchestrator_integration import _live_build_lock_reason
+
+        with _build_lock_row(held=True, retained_reason="build blew up") as facade:
+            assert _live_build_lock_reason("test-project", mock_logger) is None
+
+        facade.holder_liveness_is_fresh.assert_not_called()
+
+    def test_an_unreadable_store_is_reported_as_uncheckable(self, mock_logger):
+        from agents.orchestrator_integration import _live_build_lock_reason
+
+        with patch('services.project_resource_lock_manager.ProjectResourceLockManager',
+                   side_effect=RuntimeError("redis down")):
+            reason = _live_build_lock_reason("test-project", mock_logger)
+
+        assert reason == "the dev_container_build lock could not be checked"
