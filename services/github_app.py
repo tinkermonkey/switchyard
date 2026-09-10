@@ -30,6 +30,21 @@ RATE_LIMIT_HOLD_FALLBACK_SECONDS = 60
 # guards against a malformed/absurd header parking the App offline.
 RATE_LIMIT_HOLD_MAX_SECONDS = 3600
 
+# The two credentials graphql_request() can spend, held SEPARATELY because
+# they are separate budgets: exhausting the App installation's 5000/hr says
+# nothing about the PAT's, and a shared hold would park a working credential.
+# The PAT leg is not hypothetical - graphql_request() never checks
+# self.enabled, so a PAT-configured deployment (a supported mode) routes
+# every discussions / human_feedback_loop / review_cycle / pr_review_stage
+# query through it, and without a hold each one logs its own ERROR: the same
+# 484-lines-in-three-hours burst #168 reports, just on the other credential.
+CREDENTIAL_APP = 'app'
+CREDENTIAL_PAT = 'pat'
+_CREDENTIAL_LABELS = {
+    CREDENTIAL_APP: 'GitHub App',
+    CREDENTIAL_PAT: 'PAT fallback',
+}
+
 
 class GitHubApp:
     """GitHub App authentication and API client"""
@@ -42,17 +57,19 @@ class GitHubApp:
         self._installation_token = None
         self._token_expires_at = None
 
-        # Rate-limit hold state for the App's GraphQL budget (#168). Once
-        # GitHub reports the budget exhausted, every further query in that
-        # window is certain to fail, and the observed cost of issuing them
-        # anyway was 484 ERROR lines in three hours - enough to bury the one
-        # genuinely new error an operator is reading the log for. While the
-        # hold is in force graphql_request() returns None WITHOUT a network
-        # call: the same value every caller already handles for a failed
-        # query, so no caller sees new behaviour, just fewer wasted calls.
-        self._graphql_hold_until: Optional[float] = None
-        self._graphql_hold_reset_at: Optional[datetime] = None
-        self._graphql_calls_suppressed = 0
+        # Rate-limit hold state, one entry per credential (#168). Once GitHub
+        # reports a GraphQL budget exhausted, every further query on that
+        # credential in that window is certain to fail, and the observed cost
+        # of issuing them anyway was 484 ERROR lines in three hours - enough
+        # to bury the one genuinely new error an operator is reading the log
+        # for. While a hold is in force graphql_request() returns None WITHOUT
+        # a network call: the same value every caller already handles for a
+        # failed query, so no caller sees new behaviour, just fewer wasted
+        # calls. Kept per-credential - see CREDENTIAL_APP/CREDENTIAL_PAT.
+        self._graphql_holds: Dict[str, Dict[str, Any]] = {
+            CREDENTIAL_APP: {'until': None, 'reset_at': None, 'suppressed': 0},
+            CREDENTIAL_PAT: {'until': None, 'reset_at': None, 'suppressed': 0},
+        }
 
         if not all([self.app_id, self.installation_id, self.private_key_path]):
             logger.warning("GitHub App credentials not fully configured - some features may be limited")
@@ -156,40 +173,61 @@ class GitHubApp:
             get_github_client().record_external_call(
                 rate_limited=rate_limited,
                 failed=failed,
-                app_graphql_headers=dict(headers) if headers else None,
+                # Keys LOWERCASED, not just copied out of the
+                # CaseInsensitiveDict `requests` returns: GitHub sends
+                # `X-RateLimit-Remaining` and
+                # GitHubRateLimitStatus.update_from_response_headers() looks
+                # up the lowercase spelling. A bare dict() preserves GitHub's
+                # casing, every lookup misses, and the bucket keeps its
+                # 5000/5000 constructor defaults while being stamped
+                # ever_updated - /health would then report a fresh, healthy
+                # App budget for a fully exhausted one, which is the exact
+                # misdiagnosis rate_limit_app_graphql exists to prevent
+                # (#168).
+                app_graphql_headers=(
+                    {str(k).lower(): v for k, v in headers.items()} if headers else None
+                ),
             )
         except Exception as e:
             logger.debug(f"Could not record GitHub App call in API accounting: {e}")
 
-    def _graphql_hold_remaining(self) -> Optional[float]:
-        """Seconds left on the App GraphQL rate-limit hold, or None if none is
-        in force. Clears an expired hold (and reports what it suppressed)."""
-        if self._graphql_hold_until is None:
+    def _graphql_hold_remaining(self, credential: str = CREDENTIAL_APP) -> Optional[float]:
+        """Seconds left on `credential`'s GraphQL rate-limit hold, or None if
+        none is in force. Clears an expired hold (and reports what it
+        suppressed)."""
+        hold = self._graphql_holds[credential]
+        if hold['until'] is None:
             return None
 
-        remaining = self._graphql_hold_until - time.monotonic()
+        remaining = hold['until'] - time.monotonic()
         if remaining > 0:
             return remaining
 
         logger.info(
-            f"GitHub App GraphQL rate-limit hold expired "
-            f"({self._graphql_calls_suppressed} request(s) skipped while it was "
-            f"in force) - resuming App GraphQL requests"
+            f"{_CREDENTIAL_LABELS[credential]} GraphQL rate-limit hold expired "
+            f"({hold['suppressed']} request(s) skipped while it was in force) - "
+            f"resuming GraphQL requests on this credential"
         )
-        self._graphql_hold_until = None
-        self._graphql_hold_reset_at = None
-        self._graphql_calls_suppressed = 0
+        hold['until'] = None
+        hold['reset_at'] = None
+        hold['suppressed'] = 0
         return None
 
-    def _start_graphql_hold(self, headers: Optional[Any], errors: Any):
-        """Begin (or extend) the App GraphQL rate-limit hold after GitHub
-        reported the App's GraphQL budget exhausted.
+    def _start_graphql_hold(self, headers: Optional[Any], errors: Any,
+                            credential: str = CREDENTIAL_APP):
+        """Begin (or extend) `credential`'s GraphQL rate-limit hold after
+        GitHub reported that budget exhausted.
 
         Prefers the response's own x-ratelimit-reset over a guess, and logs
         ONCE per hold at WARNING instead of once per rejected query at ERROR -
         the same collapse the all-NOT_FOUND branch in graphql_request() already
         applies, and the reason the raw volume was 484 ERROR lines in three
         hours (#168).
+
+        Applied to the PAT leg too, not just the App's: a PAT-configured
+        deployment sends every one of this module's queries on the PAT, so
+        leaving that leg unheld reproduces the whole of #168 in a supported
+        configuration. The two holds are independent - see CREDENTIAL_APP.
         """
         hold_seconds = RATE_LIMIT_HOLD_FALLBACK_SECONDS
         reset_at = None
@@ -205,35 +243,35 @@ class GitHubApp:
                 # us this very request was rejected.
                 hold_seconds = max(1.0, min(hold_seconds, RATE_LIMIT_HOLD_MAX_SECONDS))
             except (ValueError, TypeError) as e:
-                logger.debug(f"Could not parse x-ratelimit-reset from App response: {e}")
+                logger.debug(f"Could not parse x-ratelimit-reset from response: {e}")
                 reset_at = None
 
-        already_held = self._graphql_hold_remaining() is not None
-        self._graphql_hold_until = time.monotonic() + hold_seconds
-        self._graphql_hold_reset_at = reset_at
+        already_held = self._graphql_hold_remaining(credential) is not None
+        hold = self._graphql_holds[credential]
+        hold['until'] = time.monotonic() + hold_seconds
+        hold['reset_at'] = reset_at
 
         if not already_held:
+            if credential == CREDENTIAL_APP:
+                budget_note = (
+                    "NOTE: this is the App installation's own budget, which is "
+                    "separate from the PAT budget `gh api rate_limit` reports. "
+                )
+            else:
+                budget_note = (
+                    "NOTE: this is the PAT budget (the App credential was "
+                    "unavailable or not configured), the same one `gh api "
+                    "rate_limit` reports. "
+                )
             logger.warning(
-                f"🔴 GitHub App GraphQL rate limit exhausted - pausing App GraphQL "
-                f"requests for {hold_seconds:.0f}s"
+                f"🔴 {_CREDENTIAL_LABELS[credential]} GraphQL rate limit exhausted - "
+                f"pausing GraphQL requests on this credential for {hold_seconds:.0f}s"
                 + (f" (resets at {reset_at.isoformat()})" if reset_at else " (no reset header)")
-                + f". NOTE: this is the App installation's own budget, which is "
-                f"separate from the PAT budget `gh api rate_limit` reports. "
-                f"GitHub said: {errors}"
+                + f". {budget_note}GitHub said: {errors}"
             )
 
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute a GraphQL request using GitHub App authentication (with PAT fallback)"""
-
-        hold_remaining = self._graphql_hold_remaining()
-        if hold_remaining is not None:
-            self._graphql_calls_suppressed += 1
-            logger.debug(
-                f"Skipping App GraphQL request: rate-limit hold has "
-                f"{hold_remaining:.0f}s left "
-                f"({self._graphql_calls_suppressed} skipped so far)"
-            )
-            return None
 
         token = self._get_token()
         if not token:
@@ -244,7 +282,29 @@ class GitHubApp:
         # falls back to a PAT when the App is disabled or its token fetch
         # failed, and the two have SEPARATE quotas, so everything downstream
         # that attributes a rate-limit reading has to know which one this was.
-        used_app_token = bool(self.enabled and token == self._installation_token)
+        #
+        # `token and` is load-bearing: _get_token(force_refresh=True) below
+        # invalidates the cached installation token FIRST, so a failed refresh
+        # with no PAT configured leaves both sides None and a bare `==` reads
+        # None == None as "this was the App credential" - attributing an
+        # unauthenticated 60/hr reading to the App bucket at exactly the moment
+        # App auth is broken (#168's misdiagnosis, relocated).
+        used_app_token = bool(self.enabled and token and token == self._installation_token)
+        credential = CREDENTIAL_APP if used_app_token else CREDENTIAL_PAT
+
+        # Checked AFTER resolving the credential: a hold belongs to one budget,
+        # and holding a PAT-fallback query because the App is exhausted (or the
+        # reverse) would suppress calls that would have succeeded.
+        hold_remaining = self._graphql_hold_remaining(credential)
+        if hold_remaining is not None:
+            hold = self._graphql_holds[credential]
+            hold['suppressed'] += 1
+            logger.debug(
+                f"Skipping {_CREDENTIAL_LABELS[credential]} GraphQL request: "
+                f"rate-limit hold has {hold_remaining:.0f}s left "
+                f"({hold['suppressed']} skipped so far)"
+            )
+            return None
 
         payload = {'query': query}
         if variables:
@@ -269,7 +329,14 @@ class GitHubApp:
             if response.status_code == 401 and self.enabled:
                 logger.warning("GraphQL request got 401, refreshing token and retrying")
                 token = self._get_token(force_refresh=True)
-                used_app_token = bool(self.enabled and token == self._installation_token)
+                # See the `token and` note above: force_refresh clears
+                # _installation_token before fetching, so a failed refresh
+                # with no PAT leaves both None and a bare `==` would claim
+                # this unauthenticated request was on the App credential.
+                used_app_token = bool(
+                    self.enabled and token and token == self._installation_token
+                )
+                credential = CREDENTIAL_APP if used_app_token else CREDENTIAL_PAT
                 if token:
                     response = requests.post(
                         'https://api.github.com/graphql',
@@ -286,6 +353,7 @@ class GitHubApp:
                         if pat and pat != token:
                             logger.warning("GraphQL retry still 401, falling back to PAT")
                             used_app_token = False
+                            credential = CREDENTIAL_PAT
                             response = requests.post(
                                 'https://api.github.com/graphql',
                                 headers={
@@ -324,12 +392,15 @@ class GitHubApp:
                 # never sees it and nothing counted it (#168). Classify it,
                 # count it, and stop issuing queries that cannot succeed until
                 # the budget resets, rather than logging one ERROR per attempt.
+                #
+                # Held per credential, including the PAT leg: `graphql_request`
+                # never checks self.enabled, so a PAT-configured deployment
+                # sends ALL of this module's queries on the PAT, and logging
+                # one ERROR per rejected query there is the same burst #168
+                # measured, just on the other budget.
                 if is_graphql_rate_limit_error(errors):
                     self._report_call(rate_limited=True, headers=app_headers)
-                    if used_app_token:
-                        self._start_graphql_hold(response.headers, errors)
-                    else:
-                        logger.error(f"GraphQL rate limit hit on PAT fallback: {errors}")
+                    self._start_graphql_hold(response.headers, errors, credential)
                     return None
 
                 self._report_call(failed=True, headers=app_headers)

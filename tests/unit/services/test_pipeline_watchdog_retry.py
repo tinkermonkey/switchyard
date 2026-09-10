@@ -419,6 +419,95 @@ class TestRedispatchSameIssue:
             assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
         watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
 
+
+class TestRedispatchPermanentDecline:
+    """The race-window twin of the explicit closed-issue check: the issue was
+    OPEN when _redispatch_same_issue read it and CLOSED by the time
+    trigger_agent_for_status read it again, so the outcome comes back as a
+    DispatchDecline instead.
+
+    It is the SAME outcome -- closed, lock released, nothing to retry -- and
+    must be reported the same way. Returning False here would send both callers
+    down the redispatch-failure path: mark_lock_failed() to durably re-retain
+    the board lock, an ERROR, a CRITICAL when that mark fails (which it does,
+    because the lock is no longer this issue's), and a manual-intervention
+    comment posted on a closed issue. That is the recurring unactionable
+    ERROR this branch exists to remove, plus a board blocked until someone
+    runs scripts/release_lock.py.
+    """
+
+    def _fake_project_config(self):
+        cfg = Mock()
+        cfg.github = {"org": "the-org", "repo": "the-repo"}
+        return cfg
+
+    def _decline(self, watchdog, lock_after_dispatch):
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock = Mock(return_value=lock_after_dispatch)
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            return watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+    def test_a_released_lock_makes_the_decline_a_clean_self_heal(self, watchdog):
+        """trigger_agent_for_status' closed branch released the lock (and may
+        have handed it straight to the next queued issue), so there is nothing
+        left to re-retain and nothing to escalate."""
+        assert self._decline(watchdog, lock_after_dispatch=None) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_the_lock_having_moved_on_is_also_a_clean_self_heal(self, watchdog):
+        """_release_pipeline_lock_and_process_next() can dispatch the next
+        queued issue onto the freed lock. Re-retaining THAT issue's lock is
+        the specific harm -- it blocks a board on behalf of a closed issue."""
+        next_holder = Mock(locked_by_issue=170)
+
+        assert self._decline(watchdog, lock_after_dispatch=next_holder) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_a_lock_still_held_by_this_issue_is_a_real_failure(self, watchdog):
+        """Confirmed, not assumed: if the lock did NOT come back, the self-heal
+        genuinely did not complete and False -- with the caller's re-retain --
+        is the correct answer."""
+        assert self._decline(
+            watchdog, lock_after_dispatch=Mock(locked_by_issue=159)
+        ) is False
+
+    def test_an_unreadable_lock_fails_closed(self, watchdog):
+        """An unreadable lock is not evidence it was released; leaving it
+        un-retained is the orphaning the callers' fail-safe exists to stop."""
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock = Mock(side_effect=RuntimeError("redis down"))
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is False
+
+    def test_a_clean_decline_logs_no_error(self, watchdog, caplog):
+        """The whole point of the branch: no recurring unactionable ERROR for a
+        condition that will never change (#177 Phase 1)."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="services.pipeline_watchdog"):
+            self._decline(watchdog, lock_after_dispatch=None)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors == [], [r.getMessage() for r in errors]
+
     def test_continues_dispatch_when_abandon_stale_entries_raises(self, watchdog):
         """abandon_stale_in_progress_entries is a best-effort call — if it
         raises, the redispatch attempt must still proceed (it's more useful

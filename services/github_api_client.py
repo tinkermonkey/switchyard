@@ -172,6 +172,18 @@ class GitHubRateLimitStatus:
     def update_from_response_headers(self, headers: Dict[str, str]):
         """Update rate limit info from GitHub API response headers."""
         try:
+            # Normalised here rather than trusted from the caller. GitHub
+            # sends `X-RateLimit-Remaining`; `requests` hands that back in a
+            # CaseInsensitiveDict where these lowercase lookups work, but a
+            # plain dict() copy of one keeps GitHub's casing and every lookup
+            # below silently misses - leaving the bucket at its 5000/5000
+            # constructor defaults while still stamping ever_updated, i.e.
+            # reporting a healthy budget for an exhausted one. This method is
+            # now reachable with a plain dict from more than one direction
+            # (see record_external_call), so it normalises rather than
+            # assuming (#168).
+            headers = {str(k).lower(): v for k, v in headers.items()}
+
             if 'x-ratelimit-limit' in headers:
                 self.limit = int(headers['x-ratelimit-limit'])
             if 'x-ratelimit-remaining' in headers:

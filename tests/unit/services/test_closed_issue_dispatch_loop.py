@@ -169,6 +169,112 @@ class TestStalledDetectionSkipsClosedIssues:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Neither does the OTHER board-driven stalled scan
+# ---------------------------------------------------------------------------
+
+def _rescan(state):
+    """Drive _rescan_boards_for_stalled_items() for one item in an
+    agent-bearing column with no active run, no active execution and no lock --
+    the startup-reconciliation twin of the sweep above, reading the same
+    ProjectItems out of self.last_state."""
+    import threading
+
+    monitor = object.__new__(ProjectMonitor)
+    monitor.pipeline_run_manager = MagicMock()
+    monitor.pipeline_run_manager.get_active_pipeline_run.return_value = None
+    monitor.task_queue = MagicMock()
+    monitor._last_state_lock = threading.Lock()
+    monitor._check_and_create_discussion = MagicMock()
+    monitor._sort_items_by_board_position = lambda items: items
+    monitor.process_board_changes = MagicMock()
+
+    item = ProjectItem(
+        item_id='i1', content_id='c1', issue_number=ISSUE, title='t',
+        status=COLUMN, repository='code-wrapper',
+        last_updated='2026-01-01T00:00:00Z', state=state,
+    )
+    monitor.last_state = {f'{PROJECT}_{BOARD}': {item.item_id: item}}
+
+    pipeline = MagicMock()
+    pipeline.active = True
+    pipeline.board_name = BOARD
+    pipeline.workflow = 'planning_workflow'
+    pipeline.template = 'planning_design'
+    pipeline.workspace = 'issues'
+    project_config = MagicMock()
+    project_config.pipelines = [pipeline]
+    project_config.github = {'org': 'tinkermonkey', 'repo': 'code-wrapper'}
+
+    column = MagicMock()
+    column.name = COLUMN
+    column.agent = 'technical_reviewer'
+    column.stage_mapping = None
+    workflow_template = MagicMock()
+    workflow_template.columns = [column]
+
+    monitor.config_manager = MagicMock()
+    monitor.config_manager.list_visible_projects.return_value = [PROJECT]
+    monitor.config_manager.get_project_config.return_value = project_config
+    monitor.config_manager.get_workflow_template.return_value = workflow_template
+    monitor.config_manager.get_pipeline_template.return_value = MagicMock(stages=[])
+
+    state_mgr = MagicMock()
+    state_mgr.load_project_state.return_value = MagicMock(boards={BOARD: MagicMock()})
+
+    lock_manager = MagicMock()
+    lock_manager.get_lock_fail_closed.return_value = (None, True)
+
+    tracker = MagicMock()
+    tracker.has_active_execution.return_value = False
+
+    # No prior agent output on the issue, so nothing else short-circuits the
+    # dispatch -- the state check has to be what stops it.
+    gh = MagicMock(returncode=0, stdout='{"comments": []}', stderr='')
+
+    with patch('config.state_manager.state_manager', state_mgr), \
+         patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+               return_value=lock_manager), \
+         patch('services.work_execution_state.work_execution_tracker', tracker), \
+         patch('services.project_monitor.subprocess.run', return_value=gh):
+        monitor._rescan_boards_for_stalled_items()
+
+    return monitor
+
+
+class TestRescanSkipsClosedIssues:
+    """The CLOSED skip landed in _find_stalled_issues_for_pipeline() only, and
+    _rescan_boards_for_stalled_items() is the OTHER board-driven scan over the
+    same items. Left asymmetric, the per-sweep loop is fixed but the
+    per-restart one is not: the four closed code-wrapper issues from #165 would
+    each still cost a `gh issue view`, a lock read and a queue write on every
+    restart -- inside the startup-reconciliation window #168 measures as the
+    App budget-exhaustion burst.
+    """
+
+    def test_a_closed_issue_is_not_dispatched_on_restart(self):
+        monitor = _rescan('CLOSED')
+
+        monitor.process_board_changes.assert_not_called()
+
+    def test_an_open_issue_in_the_same_state_is_still_dispatched(self):
+        """Pins that the fixture actually reaches dispatch -- this method
+        swallows every exception into a logged error, so a broken stub would
+        otherwise make the test above pass for the wrong reason."""
+        monitor = _rescan('OPEN')
+
+        monitor.process_board_changes.assert_called_once()
+        change = monitor.process_board_changes.call_args[0][0][0]
+        assert change['issue_number'] == ISSUE
+
+    def test_a_closed_issue_does_not_even_get_a_discussion(self):
+        """A closed issue has no pipeline left to run, so opening a discussion
+        for it is another GitHub call spent on work that will never happen."""
+        monitor = _rescan('CLOSED')
+
+        monitor._check_and_create_discussion.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 3. The closed-issue branch dequeues, and says so permanently
 # ---------------------------------------------------------------------------
 

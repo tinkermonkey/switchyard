@@ -9,7 +9,7 @@ import logging
 import uuid
 import inspect
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from enum import Enum
 from monitoring.timestamp_utils import utc_isoformat
@@ -2730,7 +2730,7 @@ class ProjectMonitor:
         lock_already_acquired: bool = False,
         raise_on_error: bool = False,
         already_activated_at: Optional[str] = None
-    ) -> Optional[str]:
+    ) -> Union[str, 'DispatchDecline', None]:
         """
         Determine which agent should handle this status and create a task or review cycle
 
@@ -2760,7 +2760,20 @@ class ProjectMonitor:
 
         Returns:
             The agent name when work was actually dispatched (a task enqueued or a
-            conversational loop started), None otherwise.
+            conversational loop started).
+
+            A falsy DispatchDecline when the dispatch was declined for a reason
+            no retry can fix (today: the issue is closed). Test for it with
+            is_permanent_decline(), NEVER with `is None` — a DispatchDecline is
+            falsy but is not None, so `if result is None:` reads it as a
+            successful dispatch and skips the rollback, leaving the lock held
+            and the queue entry stuck at 'active' (the #142/#147 end state).
+            `if not result:` is the safe truthiness test.
+
+            None for every other non-dispatch: a transient decline (a duplicate
+            pending task, a review cycle already running, a retained lock) or,
+            unless raise_on_error is set, an internal failure. These are the
+            outcomes a caller SHOULD roll back and may retry.
         """
         try:
             # Get workflow template for this board
@@ -4219,7 +4232,14 @@ class ProjectMonitor:
                 issue. None for conversational dispatch, which runs without one.
 
         Returns:
-            True if an agent was dispatched, False if the acquisition was rolled back.
+            True if an agent was dispatched, False if the acquisition was rolled
+            back. False covers two distinguishable cases internally, and the
+            difference decides what happens to the QUEUE entry (the lock comes
+            back either way): a transient decline returns the entry to 'waiting'
+            so it is retried, while a permanent DispatchDecline deliberately
+            leaves it out — re-arming a closed issue is what turned a one-time
+            decline into a per-sweep retry loop (#165). See the
+            is_permanent_decline() branch below.
         """
         dispatched_agent = None
         permanent_decline = False
@@ -9863,6 +9883,38 @@ _Repair cycle initiated by Switchyard_
                         )
 
                         if not column_config:
+                            continue
+
+                        # Skip CLOSED issues, for the same reason
+                        # _find_stalled_issues_for_pipeline() does (#165):
+                        # Projects v2 items stay on the board after closing, so
+                        # a closed issue parked in an agent-bearing column looks
+                        # exactly like work that never got dispatched. This scan
+                        # then spends a `gh issue view` on its existing-output
+                        # check, a lock read and a queue write per closed issue,
+                        # calls trigger_agent_for_status(), and hits that
+                        # method's closed-issue branch — every restart, forever,
+                        # for a condition no retry resolves. On a board holding
+                        # the four closed code-wrapper issues #165 was filed
+                        # against that is four wasted GitHub calls in the
+                        # startup-reconciliation window #168 measured as the
+                        # budget-exhaustion burst.
+                        #
+                        # Checked BEFORE _check_and_create_discussion too: a
+                        # closed issue has no pipeline left to run, so opening a
+                        # discussion for it is another GitHub call spent on
+                        # work that will never happen. Reopening re-enqueues the
+                        # issue through the normal board paths.
+                        #
+                        # Defaults to OPEN when state is missing so an
+                        # unparseable state keeps the pre-#165 behaviour rather
+                        # than silently dropping an issue from the scan.
+                        if (getattr(item, 'state', None) or 'OPEN').upper() == 'CLOSED':
+                            logger.debug(
+                                f"Rescan skipping closed issue #{item.issue_number} in "
+                                f"'{item.status}' for {project_name}/{pipeline.board_name} "
+                                f"— closed issues are not stalled work"
+                            )
                             continue
 
                         # Check for missing discussions (e.g. Backlog items added while offline)

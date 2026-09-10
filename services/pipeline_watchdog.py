@@ -840,16 +840,27 @@ class PipelineWatchdog:
         makes "closed, nothing to retry" its own clean, correctly-labeled
         outcome instead of an indistinguishable dispatch failure.
 
+        That upfront check cannot be the ONLY one, though: it reads the
+        issue state seconds before trigger_agent_for_status() reads it
+        again, and an issue closed inside that window arrives back here as
+        a DispatchDecline.ISSUE_CLOSED instead. That is the same "closed,
+        nothing to retry" outcome, reached by a race rather than by the
+        explicit check, and it is handled the same way — see the
+        is_permanent_decline() branch below.
+
         Returns:
             True if either a real dispatch happened (trigger_agent_for_
-            status() returned non-None — see incident e42ca133's follow-up
-            investigation: that method has over a dozen legitimate internal
-            branches that dispatch nothing and return None, several silent
-            by design; treating "no exception raised" as success let the
-            self-heal report success while nothing actually ran), OR the
+            status() returned an agent name — see incident e42ca133's
+            follow-up investigation: that method has over a dozen legitimate
+            internal branches that dispatch nothing and return None, several
+            silent by design; treating "no exception raised" as success let
+            the self-heal report success while nothing actually ran), OR the
             issue turned out to be closed and its lock was cleanly released
-            (nothing to retry). False for every other outcome — callers must
-            treat False as "the retry did not actually happen."
+            (nothing to retry) — whether that was found by the explicit
+            check below or reported back as a permanent DispatchDecline.
+            False for every other outcome — callers must treat False as "the
+            retry did not actually happen", because they respond to it by
+            durably re-retaining the lock and paging a human.
         """
         try:
             from config.manager import config_manager
@@ -969,16 +980,71 @@ class PipelineWatchdog:
                 from services.project_monitor import is_permanent_decline
 
                 if is_permanent_decline(result):
+                    # The race-window twin of the explicit closed-issue check
+                    # above: the issue was OPEN when this method read it and
+                    # CLOSED by the time trigger_agent_for_status() read it
+                    # again, so the decline arrives here instead. Same
+                    # outcome, and it must be reported the same way — True.
+                    #
+                    # Returning False here would be actively harmful, not
+                    # merely mislabelled: both callers treat False as "the
+                    # retry did not actually happen" and respond by calling
+                    # mark_lock_failed() to durably re-retain the board lock,
+                    # logging an ERROR (plus a CRITICAL when the mark fails,
+                    # which it does when the lock is no longer this issue's)
+                    # and posting a manual-intervention comment on a closed
+                    # issue. That is the recurring unactionable ERROR this
+                    # branch exists to remove, and a board blocked until
+                    # someone runs scripts/release_lock.py.
+                    #
+                    # Confirmed, not assumed: trigger_agent_for_status()'s
+                    # closed branch releases the lock itself (and may hand it
+                    # straight to the next queued issue), but only when it
+                    # was held by THIS issue. If it is still held here, the
+                    # self-heal genuinely did not complete and False — with
+                    # the caller's re-retain — is the correct answer.
+                    lock_mgr = self.lock_manager
+                    if lock_mgr is None:
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        lock_mgr = get_pipeline_lock_manager()
+                    try:
+                        lock = lock_mgr.get_lock(project, board)
+                        still_held = bool(lock and lock.locked_by_issue == issue_number)
+                    except Exception as e:
+                        # Fail closed: an unreadable lock is not evidence it
+                        # was released, and leaving it un-retained is the
+                        # orphaning the callers' fail-safe exists to stop.
+                        logger.error(
+                            f"_redispatch_same_issue: {project} issue "
+                            f"#{issue_number} declined permanently "
+                            f"({result.value}) but its lock state on board "
+                            f"'{board}' could not be read — treating as a "
+                            f"redispatch failure: {e}"
+                        )
+                        return False
+
+                    if still_held:
+                        logger.error(
+                            f"_redispatch_same_issue: {project} issue "
+                            f"#{issue_number} declined permanently "
+                            f"({result.value}) but still holds the "
+                            f"'{board}' lock — treating as a redispatch "
+                            f"failure so it gets re-retained"
+                        )
+                        return False
+
                     # Not a redispatch FAILURE — there is nothing here to
-                    # redispatch. Logged at INFO so the watchdog stops
-                    # contributing a recurring, unactionable ERROR for a
-                    # condition that will never change (#177 Phase 1).
+                    # redispatch, and the lock is already gone. Logged at
+                    # INFO so the watchdog stops contributing a recurring,
+                    # unactionable ERROR for a condition that will never
+                    # change (#177 Phase 1).
                     logger.info(
                         f"_redispatch_same_issue: nothing to redispatch for "
                         f"{project} issue #{issue_number} (column "
-                        f"'{current_column}'): {result.value}"
+                        f"'{current_column}'): {result.value} — its lock was "
+                        f"already released, self-heal complete"
                     )
-                    return False
+                    return True
 
                 logger.error(
                     f"_redispatch_same_issue: trigger_agent_for_status did not "
