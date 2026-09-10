@@ -1,8 +1,11 @@
 """
 project_checkout_lock_if_shared_async() -- the shared base-clone guard (#140 item 4).
 
-The guard it replaces was copy-pasted near-identically at three call sites
-(claude/claude_integration.py x2, services/auto_commit.py x1):
+The guard it replaces was copy-pasted near-identically at four call sites
+(claude/claude_integration.py x2, services/auto_commit.py x1,
+services/feature_branch_manager.py x1). #140 item 4 counted three -- the
+feature_branch_manager.py copy was added later, by #151/WI-6, which is the
+clearest demonstration of why this belongs in one place:
 
     if workspace_manager.is_base_clone_dir(project, work_dir):
         async with project_checkout_lock_async(project, issue_number):

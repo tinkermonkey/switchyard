@@ -103,7 +103,7 @@ class TestQueueProcessingFailsafe:
             'status': 'waiting',
             'title': 'Test Issue'
         }
-        mock_queue_manager.get_next_waiting_issue.return_value = waiting_issue
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [waiting_issue]
 
         # Setup: Lock acquisition succeeds
         mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
@@ -119,7 +119,7 @@ class TestQueueProcessingFailsafe:
         mock_lock_manager.get_lock.assert_called_once_with('test_project', 'SDLC Execution')
 
         # Verify: Next waiting issue was retrieved
-        mock_queue_manager.get_next_waiting_issue.assert_called_once()
+        mock_queue_manager.get_next_n_waiting_issues.assert_called_once()
 
         # Verify: Lock acquisition was attempted
         mock_lock_manager.try_acquire_lock.assert_called_once_with(
@@ -169,7 +169,7 @@ class TestQueueProcessingFailsafe:
         mock_lock_manager.get_lock.assert_called_once()
 
         # Verify: Did NOT check for waiting issues (skipped early)
-        mock_queue_manager.get_next_waiting_issue.assert_not_called()
+        mock_queue_manager.get_next_n_waiting_issues.assert_not_called()
 
         # Verify: Did NOT trigger agent
         project_monitor.trigger_agent_for_status.assert_not_called()
@@ -184,7 +184,7 @@ class TestQueueProcessingFailsafe:
         mock_lock_manager.get_lock.return_value = None  # No lock = unlocked
 
         # Setup: No waiting issues
-        mock_queue_manager.get_next_waiting_issue.return_value = None
+        mock_queue_manager.get_next_n_waiting_issues.return_value = []
 
         # Patch the manager getters (patching where they're imported FROM, not where they're used)
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_manager), \
@@ -194,7 +194,7 @@ class TestQueueProcessingFailsafe:
             project_monitor._check_and_process_waiting_issues_failsafe()
 
         # Verify: Checked for waiting issues
-        mock_queue_manager.get_next_waiting_issue.assert_called_once()
+        mock_queue_manager.get_next_n_waiting_issues.assert_called_once()
 
         # Verify: Did NOT attempt lock acquisition
         mock_lock_manager.try_acquire_lock.assert_not_called()
@@ -218,7 +218,7 @@ class TestQueueProcessingFailsafe:
             'status': 'waiting',
             'title': 'Test Issue'
         }
-        mock_queue_manager.get_next_waiting_issue.return_value = waiting_issue
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [waiting_issue]
 
         # Setup: Lock acquisition FAILS (another process got it)
         mock_lock_manager.try_acquire_lock.return_value = (False, "locked_by_issue_156")
@@ -254,7 +254,7 @@ class TestQueueProcessingFailsafe:
             'status': 'waiting',
             'title': 'Zombie Issue'
         }
-        mock_queue_manager.get_next_waiting_issue.return_value = waiting_issue
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [waiting_issue]
 
         # Setup: Lock acquisition succeeds
         mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
@@ -322,7 +322,7 @@ class TestQueueProcessingFailsafe:
             'status': 'waiting',
             'title': 'Test Issue'
         }
-        mock_queue_manager.get_next_waiting_issue.return_value = waiting_issue
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [waiting_issue]
 
         # Setup: Lock acquisition succeeds
         mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
@@ -383,7 +383,7 @@ class TestQueueProcessingFailsafe:
         mock_lock_manager.get_lock.return_value = None  # Unlocked
 
         mock_queue_manager = Mock()
-        mock_queue_manager.get_next_waiting_issue.return_value = None  # No waiting issues
+        mock_queue_manager.get_next_n_waiting_issues.return_value = []  # No waiting issues
 
         # Patch the manager getters (patching where they're imported FROM, not where they're used)
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_manager), \
@@ -413,7 +413,7 @@ class TestQueueProcessingFailsafe:
             'status': 'waiting',
             'title': 'Test Issue'
         }
-        mock_queue_manager.get_next_waiting_issue.return_value = waiting_issue
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [waiting_issue]
 
         # Setup: Lock already held by same issue (returns True with "already_holds_lock")
         mock_lock_manager.try_acquire_lock.return_value = (True, "already_holds_lock")
@@ -444,11 +444,11 @@ class TestQueueProcessingFailsafe:
         mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
         mock_lock_manager.release_lock.return_value = True
         mock_queue_manager.mark_issue_active.return_value = '2026-01-01T00:00:00+00:00'
-        mock_queue_manager.get_next_waiting_issue.return_value = {
+        mock_queue_manager.get_next_n_waiting_issues.return_value = [{
             'issue_number': 155,
             'status': 'waiting',
             'title': 'Test Issue',
-        }
+        }]
 
     def _run_failsafe(self, project_monitor, mock_lock_manager, mock_queue_manager,
                       has_active_execution=False):

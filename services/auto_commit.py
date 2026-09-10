@@ -190,8 +190,9 @@ class AutoCommitService:
             # self._commit_and_push(...) call via a nullcontext, so a future
             # argument change cannot be applied to one and missed on the other.
             # #140 item 4 then moved the is_base_clone_dir() decision itself
-            # into the lock module, where the two other copies of this guard
-            # (claude/claude_integration.py) now go too. `is_shared_dir` is the
+            # into the lock module, where the other three copies of this guard
+            # (claude/claude_integration.py x2, and feature_branch_manager's
+            # finalize, migrated in #154/WI-9) now go too. `is_shared_dir` is the
             # yielded value rather than a second is_base_clone_dir() call -- the
             # branch re-read below depends on it being the SAME answer the lock
             # decision was made on.

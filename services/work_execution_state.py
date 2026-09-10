@@ -625,7 +625,14 @@ class WorkExecutionStateTracker:
         # cancelled, or abandoned. 'lock_contention' belongs here for the same reason
         # 'frozen' does: the agent never ran, so the next poll is the retry point
         # (#148) — it just doesn't count toward count_consecutive_failures().
-        if last_execution['outcome'] in ['failure', 'frozen', 'lock_contention', 'cancelled', 'abandoned']:
+        # 'commit_in_flight' (#154/WI-9) belongs here for a third reason: startup
+        # recovery stopped waiting on a repair cycle's auto-commit thread before it
+        # finished, so this pass never learned the outcome. The run was released
+        # rather than marked failed, which is only a retry point if the next poll
+        # re-dispatches — and the repair cycle it re-runs is idempotent (a commit
+        # that did land leaves nothing to commit).
+        if last_execution['outcome'] in ['failure', 'frozen', 'lock_contention',
+                                         'cancelled', 'abandoned', 'commit_in_flight']:
             logger.debug(
                 f"Should execute {agent} on {project_name}/#{issue_number}: "
                 f"retry_after_{last_execution['outcome']}"

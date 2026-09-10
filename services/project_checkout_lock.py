@@ -1353,12 +1353,16 @@ async def project_checkout_lock_if_shared_async(
                 return await do_the_work(...)
         return await do_the_work(...)
 
-    -- was copy-pasted near-identically at three call sites
-    (claude/claude_integration.py x2, services/auto_commit.py x1, the last of
-    which had already collapsed its duplicated body onto a nullcontext in
-    #149 item 23). Every copy is a place a future call site can forget the
-    guard, or apply a change to one branch and miss the other. Centralising it
-    here also puts the decision next to the lock whose contract explains it.
+    -- was copy-pasted near-identically at four call sites
+    (claude/claude_integration.py x2, services/auto_commit.py x1 and
+    services/feature_branch_manager.py x1; the last two had already collapsed
+    their duplicated body onto a nullcontext, in #149 item 23 and #151/WI-6
+    respectively). #140 item 4 counted three -- feature_branch_manager.py's copy
+    post-dates it, and is the demonstration of the problem: a new call site
+    reproduced the pattern rather than reusing it. All four now route through
+    here. Every copy is a place a future call site can forget the guard, or
+    apply a change to one branch and miss the other. Centralising it here also
+    puts the decision next to the lock whose contract explains it.
 
     Why the decision is `is_base_clone_dir()` and not "always lock": epic
     worktrees share their directory with nothing, so locking them would
@@ -1366,6 +1370,19 @@ async def project_checkout_lock_if_shared_async(
     docstring, and note that it fails CLOSED (treats an unresolvable directory
     as the base clone), which is why callers must resolve a real work_dir
     before getting here rather than passing a '.' fallback.
+
+    Failing closed is right for a lock gate but wrong as a precondition, so this
+    deliberately does NOT do an existence check of its own: a caller for which a
+    missing directory is unrecoverable must refuse before calling this, in
+    whatever shape its own failures take, rather than have that decision made
+    for it here. Both of the callers with real git work waiting on the other
+    side keep exactly that pre-guard -- auto_commit.commit_agent_changes()
+    (project_dir.exists() -> CommitResult.FAILED) and
+    feature_branch_manager's finalize (os.path.isdir() -> its error dict) --
+    because otherwise a removed epic worktree would take the project's real
+    base-clone lock, wait behind whatever holds it, and then run git against a
+    directory that isn't there. A caller for which it is not unrecoverable gets
+    the safe direction by default.
 
     Args:
         project: Project name.

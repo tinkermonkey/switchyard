@@ -281,8 +281,12 @@ async def _run_locally_under_checkout_lock(
     Split out of run_claude_code() by #152 item B: gating the dev_container_build
     lock on agent identity gave that branch two exits instead of one, and this
     guard would otherwise have been the fourth near-identical copy of the
-    is_base_clone_dir() pattern #140 item 4 flagged -- now closed: the decision
-    itself lives in project_checkout_lock_if_shared_async().
+    is_base_clone_dir() pattern #140 item 4 flagged. The decision itself now
+    lives in project_checkout_lock_if_shared_async(), which every copy of that
+    pattern routes through (this one, run_claude_code()'s Docker branch,
+    auto_commit.commit_agent_changes() and
+    feature_branch_manager's finalize -- the fourth copy, added after item 4 was
+    written and migrated with the rest in #154/WI-9).
 
     `issue_number` is log attribution only, never the lock's holder identity --
     see project_checkout_lock.py's module docstring.

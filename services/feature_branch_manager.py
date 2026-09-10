@@ -11,7 +11,6 @@ Manages hierarchical branch workflows where:
 import os
 import yaml
 import asyncio
-import contextlib
 import logging
 import time
 from datetime import datetime
@@ -1544,9 +1543,8 @@ git push --force-with-lease
         # a different branch out in this same shared directory while we wait.
         # It ends at the push; the PR/GitHub tail below touches no git and is
         # left outside.
-        from services.project_workspace import workspace_manager
-
-        # Existence guard BEFORE is_base_clone_dir(), mirroring
+        #
+        # Existence guard BEFORE the lock decision, mirroring
         # auto_commit.commit_agent_changes() (code review on #151/WI-6).
         # is_base_clone_dir() fails CLOSED -- a directory that doesn't exist
         # answers True -- which is right for a lock gate but wrong as a
@@ -1567,28 +1565,33 @@ git push --force-with-lease
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
 
-        if workspace_manager.is_base_clone_dir(project, project_dir):
-            from services.project_checkout_lock import project_checkout_lock_async
+        # issue_number is log attribution for the lock, and the key
+        # project_checkout_lock's activity registry publishes this wait under --
+        # which is what keeps pipeline_watchdog from reaping this containerless
+        # run while it waits. Never the lock's holder identity -- see
+        # project_checkout_lock.py's module docstring.
+        #
+        # No explicit timeout_seconds, so the calibrated ~3h default stands,
+        # matching auto_commit.commit_agent_changes() -- the sibling writer of
+        # this same directory (#151/WI-6 review). A shorter budget would be wrong
+        # here in a way it isn't at a resolution call site: after the wait this
+        # method has real work to do (the agent's commit and push), so giving up
+        # early abandons that work rather than deferring it, and the legitimate
+        # holder it waits behind can be an agent container run of up to
+        # agents.yaml's 10800s.
+        #
+        # The is_base_clone_dir()-then-lock-or-not decision itself is
+        # project_checkout_lock_if_shared_async()'s (#140 item 4, #154/WI-9
+        # review): this site was the fourth hand-rolled copy, added by #151/WI-6
+        # after item 4 was written, and left behind when the other three were
+        # centralised. The isdir() pre-guard above stays here -- it is this
+        # method's own precondition (nothing below can run without the
+        # directory), not part of the lock decision.
+        from services.project_checkout_lock import project_checkout_lock_if_shared_async
 
-            # issue_number is log attribution for the lock, and the key
-            # project_checkout_lock's activity registry publishes this wait
-            # under -- which is what keeps pipeline_watchdog from reaping this
-            # containerless run while it waits. Never the lock's holder identity
-            # -- see project_checkout_lock.py's module docstring.
-            #
-            # No explicit timeout_seconds, so the calibrated ~3h default stands,
-            # matching auto_commit.commit_agent_changes() -- the sibling writer
-            # of this same directory (#151/WI-6 review). A shorter budget would
-            # be wrong here in a way it isn't at a resolution call site: after
-            # the wait this method has real work to do (the agent's commit and
-            # push), so giving up early abandons that work rather than deferring
-            # it, and the legitimate holder it waits behind can be an agent
-            # container run of up to agents.yaml's 10800s.
-            lock_cm = project_checkout_lock_async(project, issue_number)
-        else:
-            lock_cm = contextlib.nullcontext()
-
-        async with lock_cm:
+        async with project_checkout_lock_if_shared_async(
+            project, project_dir, issue_number
+        ):
             # Verify the branch BEFORE the prompt-file cleanup, the staging and the
             # PR work below -- both the standalone and the tracked path stage and
             # push whatever is checked out, so this has to sit ahead of the fork.

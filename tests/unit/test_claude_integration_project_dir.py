@@ -53,11 +53,12 @@ class TestRunClaudeCodeProjectDirResolution:
         context = _base_context(task_context={'issue_number': 100})
 
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_shared_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/test-project'))
-            mock_wm.is_base_clone_dir.return_value = True  # this IS the shared base clone (epic_id=None)
+            mock_shared_wm.is_base_clone_dir.return_value = True  # this IS the shared base clone (epic_id=None)
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             result = await run_claude_code('do the thing', context)
@@ -88,10 +89,12 @@ class TestRunClaudeCodeProjectDirResolution:
         })
 
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_shared_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
+             patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/42'))
-            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
+            mock_shared_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
@@ -117,9 +120,11 @@ class TestRunClaudeCodeProjectDirResolution:
         })
 
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_shared_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
+             patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
-            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
+            mock_shared_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
@@ -141,10 +146,12 @@ class TestRunClaudeCodeProjectDirResolution:
         })
 
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_shared_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
+             patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/200'))
-            mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
+            mock_shared_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
@@ -152,3 +159,76 @@ class TestRunClaudeCodeProjectDirResolution:
             mock_wm.get_project_dir_off_loop.assert_called_once_with(
                 'test-project', '200', None, issue_number=200
             )
+
+
+@pytest.mark.asyncio
+class TestTheDockerPathHandsTheGuardTheMountedDirectory:
+    """
+    #154/WI-9 review. Since #140 item 4 centralized the shared-base-clone
+    decision into project_checkout_lock_if_shared_async(), each call site's
+    correctness reduces entirely to WHICH directory it passes -- the helper's
+    own tests pin that it decides on the caller-supplied one. The local path's
+    argument was pinned (test_claude_integration_work_dir_required.py); the
+    Docker path -- the one that actually runs agents -- was not.
+
+    Passing something else there (say context['work_dir'], frequently absent in
+    a Docker context) is silent: is_base_clone_dir() fails CLOSED on a
+    missing/None directory, so every epic-worktree container run would take the
+    shared base-clone lock and serialize a project's sibling epics against each
+    other. No error, no failing test -- just a throughput collapse.
+    """
+
+    async def _run_docker(self, task_context, resolved_dir, is_base_clone,
+                          checkout_lock=None):
+        context = _base_context(task_context=task_context)
+        calls = []
+
+        @asynccontextmanager
+        async def _recording_checkout_lock(project, issue_number=None, **kwargs):
+            calls.append((project, issue_number))
+            yield
+
+        with patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_shared_wm, \
+             patch('claude.claude_integration.docker_runner') as mock_runner, \
+             patch('services.project_checkout_lock.project_checkout_lock_async',
+                   checkout_lock or _recording_checkout_lock), \
+             patch('pathlib.Path.exists', return_value=True):
+            mock_wm.get_project_dir_off_loop = AsyncMock(return_value=resolved_dir)
+            mock_shared_wm.is_base_clone_dir.return_value = is_base_clone
+            mock_runner.run_agent_in_container = AsyncMock(return_value='output')
+
+            await run_claude_code('do the thing', context)
+
+        return mock_shared_wm, mock_runner, calls
+
+    async def test_the_guard_is_asked_about_the_directory_that_gets_mounted(self):
+        """The base-clone case: the directory handed to the guard and the
+        directory handed to run_agent_in_container() must be the same one."""
+        resolved = Path('/workspace/test-project')
+        mock_shared_wm, mock_runner, calls = await self._run_docker(
+            {'issue_number': 100}, resolved, is_base_clone=True
+        )
+
+        guard_args = mock_shared_wm.is_base_clone_dir.call_args.args
+        assert guard_args[0] == 'test-project'
+        assert guard_args[1] == resolved
+        assert mock_runner.run_agent_in_container.call_args.kwargs['project_dir'] == resolved
+        assert calls == [('test-project', 100)]
+
+    async def test_an_epic_worktree_container_run_takes_no_checkout_lock(self):
+        """The worktree case, same property plus the negative: the guard is
+        asked about the mounted worktree, and answers False, so no
+        project_checkout lock is taken and sibling epics do not serialize."""
+        resolved = Path('/workspace/.orchestrator/worktrees/test-project/42')
+        mock_shared_wm, mock_runner, calls = await self._run_docker(
+            {'issue_number': 100, 'epic_id': '42',
+             'branch_name': 'feature/issue-42-shared'},
+            resolved, is_base_clone=False,
+        )
+
+        assert mock_shared_wm.is_base_clone_dir.call_args.args[1] == resolved
+        assert mock_runner.run_agent_in_container.call_args.kwargs['project_dir'] == resolved
+        assert calls == [], (
+            "an epic-worktree container run must take no project_checkout lock"
+        )

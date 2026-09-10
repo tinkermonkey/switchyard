@@ -3,7 +3,8 @@ Unit tests for GitHub issue #100 (sub-issue of #36): batching
 _check_and_process_waiting_issues_failsafe()'s per-board queue-sync
 queries.
 
-Before #100, this failsafe called pipeline_queue.get_next_waiting_issue()
+Before #100, this failsafe called pipeline_queue's n=1 queue fetch
+(get_next_waiting_issue(), since #154/WI-9 the top-N get_next_n_waiting_issues())
 once per (project, active pipeline) every poll cycle - unconditionally,
 NOT gated by #94's per-board adaptive backoff - and each call fetched its
 own board via execute_board_query_cached() (one fresh GraphQL request per
@@ -37,7 +38,7 @@ Covers:
 - Provided: exactly ONE execute_batched_board_queries() call covers every
   board in due_boards_this_cycle (not every active board - only the ones
   the caller says were due), and each board's pre-fetched result is
-  threaded through to the corresponding get_next_waiting_issue() call via
+  threaded through to the corresponding get_next_n_waiting_issues() call via
   its prefetched_board_data parameter.
 - A board NOT in due_boards_this_cycle is skipped by STEP 2 & 3 entirely -
   it must NOT fall back to an individual fetch, which would silently
@@ -46,7 +47,7 @@ Covers:
   batched fetch failed (present in the errors dict, or silently dropped
   before ever reaching a query) still falls back to
   prefetched_board_data=None for that one board only - which makes
-  get_next_waiting_issue() fetch that board itself the normal way. Other
+  get_next_n_waiting_issues() fetch that board itself the normal way. Other
   boards in the same cycle are unaffected.
 
 No live network access - all GitHub API calls are mocked.
@@ -121,7 +122,7 @@ def two_board_setup():
     mock_lock_manager = Mock()
     mock_lock_manager.get_lock.return_value = None  # unlocked
     mock_queue_manager = Mock()
-    mock_queue_manager.get_next_waiting_issue.return_value = None  # nothing to trigger
+    mock_queue_manager.get_next_n_waiting_issues.return_value = []  # nothing to trigger
 
     due1 = _due_board('project1', 'org1', 101, 'Board1')
     due2 = _due_board('project2', 'org2', 202, 'Board2')
@@ -172,9 +173,9 @@ class TestFailsafeBatchedGatheringFlagged:
         called_pairs = set(mock_batched.call_args[0][0])
         assert called_pairs == {two_board_setup['pair1'], two_board_setup['pair2']}
 
-        # Each due board's get_next_waiting_issue() received its own
+        # Each due board's get_next_n_waiting_issues() received its own
         # pre-fetched data via the prefetched_board_data parameter.
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2
         forwarded_values = [c.kwargs['prefetched_board_data'] for c in calls]
         assert data1 in forwarded_values
@@ -224,7 +225,7 @@ class TestFailsafeBatchedGatheringFlagged:
             )
 
         assert mock_batched.call_count == 1
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 1
         assert calls[0].kwargs['prefetched_board_data'] == data1
 
@@ -234,7 +235,7 @@ class TestFailsafeBatchedGatheringFlagged:
         board NOT included in due_boards_this_cycle (i.e. not due, per the
         caller's own per-board backoff) must be excluded from the batch AND
         skipped by STEP 2 & 3 entirely - NOT fall back to an individual
-        get_next_waiting_issue() fetch, which would silently re-check every
+        get_next_n_waiting_issues() fetch, which would silently re-check every
         not-due board every cycle and reproduce the incident (confirmed
         live: execute_batched_board_queries() alone hit 674-736 calls/hour,
         driving the account to 100% of its GraphQL budget).
@@ -267,10 +268,10 @@ class TestFailsafeBatchedGatheringFlagged:
         assert called_pairs == {two_board_setup['pair1']}
 
         # Only the due board was checked at all - the not-due board must NOT
-        # appear in get_next_waiting_issue()'s calls in any form (not even
+        # appear in get_next_n_waiting_issues()'s calls in any form (not even
         # with prefetched_board_data=None), since that would mean it still
         # triggered an individual network fetch.
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 1
         assert calls[0].kwargs['prefetched_board_data'] == data1
 
@@ -300,11 +301,11 @@ class TestFailsafeBatchedGatheringFlagged:
 
         assert mock_batched.call_count == 1
 
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2
         prefetched_values = [c.kwargs['prefetched_board_data'] for c in calls]
         # The failed board still gets checked (it WAS due), falling back to
-        # None (get_next_waiting_issue fetches it itself, the normal
+        # None (get_next_n_waiting_issues fetches it itself, the normal
         # single-board way); the healthy board still got its pre-fetched data.
         assert None in prefetched_values
         assert data2 in prefetched_values
@@ -340,7 +341,7 @@ class TestFailsafeBatchedGatheringFlagged:
                 due_boards_this_cycle=two_board_setup['due_boards']
             )
 
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2
         prefetched_values = [c.kwargs['prefetched_board_data'] for c in calls]
         assert None in prefetched_values  # board1 falls back
@@ -377,7 +378,7 @@ class TestFailsafeBatchedGatheringFlagged:
             )
 
         mock_batched.assert_not_called()
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2
         assert all(c.kwargs['prefetched_board_data'] is None for c in calls)
 
@@ -409,7 +410,7 @@ class TestFailsafeBatchedGatheringFlagged:
                 due_boards_this_cycle=two_board_setup['due_boards']
             )
 
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2  # both boards still processed, not skipped
         assert all(c.kwargs['prefetched_board_data'] is None for c in calls)
 
@@ -445,7 +446,7 @@ class TestFailsafeBatchedGatheringFlagged:
         # back to an individual fetch. If [] were mistaken for None, both
         # boards would show up here with prefetched_board_data=None.
         mock_batched.assert_called_once_with([])
-        assert two_board_setup['queue_manager'].get_next_waiting_issue.call_count == 0
+        assert two_board_setup['queue_manager'].get_next_n_waiting_issues.call_count == 0
 
 
 class TestFailsafeBatchedGatheringUnflagged:
@@ -472,9 +473,9 @@ class TestFailsafeBatchedGatheringUnflagged:
         mock_batched.assert_not_called()
 
         # Every board falls back to the un-prefetched path, exactly as
-        # before #100 - get_next_waiting_issue() always sees
+        # before #100 - get_next_n_waiting_issues() always sees
         # prefetched_board_data=None.
-        calls = two_board_setup['queue_manager'].get_next_waiting_issue.call_args_list
+        calls = two_board_setup['queue_manager'].get_next_n_waiting_issues.call_args_list
         assert len(calls) == 2
         for c in calls:
             assert c.kwargs.get('prefetched_board_data') is None
