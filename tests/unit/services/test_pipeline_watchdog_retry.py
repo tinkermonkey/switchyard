@@ -49,7 +49,17 @@ def watchdog():
         lock_manager=lock_manager,
         project_monitor=project_monitor,
     )
-    return wd
+    # Patched, not left to the real thing: services/cleanup_guard.py builds its
+    # OWN redis.Redis(host='redis') and check_for_zombie_runs() writes
+    # `SET orchestrator:cleanup_guard:proj:<n> zombie_watchdog NX EX 300`
+    # through it. In the orchestrator container that Redis is the running
+    # deployment's, so a second run of this file within five minutes found its
+    # own leftover claim, `continue`d past cleanup, and failed tests that had
+    # passed minutes earlier -- the suite's result depending on whether it had
+    # been run before, which is the class of defect #174 exists to remove.
+    # Nothing these tests assert depends on an external store.
+    with patch("services.cleanup_guard.try_claim_cleanup", return_value=True):
+        yield wd
 
 
 class TestZombieRetryCount:

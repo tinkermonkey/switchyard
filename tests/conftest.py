@@ -6,58 +6,26 @@ This file provides common fixtures and configuration for all tests.
 
 import pytest
 import asyncio
+import logging
 import os
 from pathlib import Path
 from typing import Dict, Any
 
-# Import test utilities
-from tests.mocks.github_mock import MockGitHubApp, MockGitHubIntegration, MockAgentExecutor
-from tests.utils.builders import ReviewCycleStateBuilder, DiscussionBuilder, TaskContextBuilder
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Pytest Configuration
+# Orchestrator container detection
 # ============================================================================
 
-def pytest_configure(config):
-    """Register custom markers and load environment"""
-    # All three have to happen before the first test module is imported: the
-    # two service guards must beat the first client construction, and the
-    # ORCHESTRATOR_ROOT default must beat the first `import
-    # services.dev_container_state`. pytest_configure is the last hook that
-    # runs before collection.
-    _pin_compose_service_hostnames_to_loopback()
-    _bound_service_client_timeouts()
-    _default_orchestrator_root_outside_the_container()
+# What the ~60 container-gated test files test for. Defined up here rather
+# than beside CONTAINER_ONLY_SKIP_REASON below because the #174 guards that
+# follow are the first thing this module does and every one of them asks it.
+ORCHESTRATOR_CONTAINER_MARKER = '/app'
 
-    config.addinivalue_line(
-        "markers", "unit: Unit tests (fast, isolated)"
-    )
-    config.addinivalue_line(
-        "markers", "integration: Integration tests (medium speed, real services)"
-    )
-    config.addinivalue_line(
-        "markers", "e2e: End-to-end tests (slow, full system)"
-    )
-    config.addinivalue_line(
-        "markers", "slow: Slow tests (skip in fast test runs)"
-    )
 
-    # Load environment variables from .env file for integration tests
-    # This ensures API keys and other config are available
-    from config.environment import Environment
-    try:
-        env = Environment()
-        # Export environment variables if they're configured
-        if env.claude_code_oauth_token:
-            os.environ['CLAUDE_CODE_OAUTH_TOKEN'] = env.claude_code_oauth_token.get_secret_value()
-        if env.anthropic_api_key:
-            os.environ['ANTHROPIC_API_KEY'] = env.anthropic_api_key.get_secret_value()
-        if env.github_token:
-            os.environ['GITHUB_TOKEN'] = env.github_token.get_secret_value()
-    except Exception as e:
-        # Don't fail tests if .env is missing - some tests don't need it
-        pass
+def running_in_orchestrator_container():
+    return os.path.isdir(ORCHESTRATOR_CONTAINER_MARKER)
 
 
 # ============================================================================
@@ -66,7 +34,7 @@ def pytest_configure(config):
 
 # The docker-compose service names this codebase connects to by bare hostname.
 # Off-container none of them is a real host, and what that costs is measured in
-# _pin_compose_service_hostnames_to_loopback() below.
+# _refuse_to_resolve_compose_service_hostnames() below.
 COMPOSE_SERVICE_HOSTS = ('redis', 'elasticsearch', 'otel-collector')
 
 # Escape hatch for a runner that DOES provide these as real service containers
@@ -86,11 +54,11 @@ TEST_SERVICE_CONNECT_TIMEOUT = float(os.environ.get('SWITCHYARD_TEST_CONNECT_TIM
 TEST_SERVICE_OP_TIMEOUT = float(os.environ.get('SWITCHYARD_TEST_OP_TIMEOUT', '10'))
 
 
-def _pin_compose_service_hostnames_to_loopback():
+def _refuse_to_resolve_compose_service_hostnames():
     """
-    Off-container, resolve `redis`/`elasticsearch`/`otel-collector` to
-    127.0.0.1 instead of asking the resolver, so a connect to a service that
-    is not running fails immediately (#174).
+    Off-container, make `redis`/`elasticsearch`/`otel-collector` fail to
+    resolve at once instead of asking the resolver, so a connect to a service
+    that is not running fails immediately (#174).
 
     Half of the fix; _bound_service_client_timeouts() below is the other half,
     and neither is what the symptom suggests. On a bare python:3.11-slim runner
@@ -117,12 +85,28 @@ def _pin_compose_service_hostnames_to_loopback():
     enough to pin down from the symptom. (The second cost is redis-py's default
     retry policy; see the other function.)
 
-    Pinning the name removes the resolver from the path entirely: 127.0.0.1
-    with nothing listening is ECONNREFUSED in microseconds, and the code under
-    test sees an ordinary "service is down" error, which is exactly what it
-    should see. Only these three names are affected, and only when /app is
-    absent -- inside the orchestrator container they are real hosts that the
-    suite genuinely uses.
+    Refusing the name rather than re-pointing it (found in review). The first
+    version of this mapped all three to 127.0.0.1, reasoning that loopback with
+    nothing listening is ECONNREFUSED in microseconds. Nothing is listening
+    only if the developer is NOT running the stack: docker-compose.yml
+    publishes redis as "6379:6379" and elasticsearch as "9200:9200", so on the
+    very machine a host run is meant to help, 127.0.0.1:6379 IS the live
+    deployment's Redis. That turned a guaranteed-safe failure into a
+    guaranteed connection to production -- for cleanup_test_data()'s purge
+    below, and for every client in the suite that is constructed rather than
+    injected (services/cancellation.py's _get_redis(), the lock and semaphore
+    managers, the circuit breakers, task_queue).
+
+    socket.gaierror costs the same (no resolver, no connect), cannot collide
+    with whatever the host happens to be running, and is exactly what these
+    names did off-container before any of this existed. It is an OSError, so
+    redis-py surfaces it as redis.ConnectionError and elastic_transport as its
+    own ConnectionError -- an ordinary "service is down" to the code under
+    test, which is what it should see.
+
+    Only these three names are affected, and only when /app is absent --
+    inside the orchestrator container they are real hosts that the suite
+    genuinely uses.
     """
     if running_in_orchestrator_container() or ALLOW_REAL_SERVICE_HOSTS:
         return
@@ -130,16 +114,22 @@ def _pin_compose_service_hostnames_to_loopback():
     import socket
 
     original = socket.getaddrinfo
-    if getattr(original, '_switchyard_pinned', False):
+    if getattr(original, '_switchyard_refuses_service_hosts', False):
         return
 
-    def pinned_getaddrinfo(host, *args, **kwargs):
+    def refusing_getaddrinfo(host, *args, **kwargs):
         if host in COMPOSE_SERVICE_HOSTS:
-            host = '127.0.0.1'
+            raise socket.gaierror(
+                socket.EAI_NONAME,
+                f"switchyard test guard: '{host}' is a docker-compose service name "
+                f"and does not resolve outside the orchestrator container. Set "
+                f"SWITCHYARD_TEST_ALLOW_SERVICE_HOSTS=1 if this runner really does "
+                f"provide it."
+            )
         return original(host, *args, **kwargs)
 
-    pinned_getaddrinfo._switchyard_pinned = True
-    socket.getaddrinfo = pinned_getaddrinfo
+    refusing_getaddrinfo._switchyard_refuses_service_hosts = True
+    socket.getaddrinfo = refusing_getaddrinfo
 
 
 def _bound_service_client_timeouts():
@@ -147,14 +137,15 @@ def _bound_service_client_timeouts():
     Give every Redis and Elasticsearch client built during a test run a bounded
     connect and a no-retry policy (#174).
 
-    The pin above removes the resolver from the path; this removes the retry
+    The guard above removes the resolver from the path; this removes the retry
     loop that sits on top of it. Both are needed and neither is sufficient:
-    with the name pinned and the default retry policy in place, a ping to an
-    absent Redis still cost 4.5 seconds, times however many constructions a run
-    makes (services/cancellation.py's _get_redis() reconnects on every call).
-    This also covers what the pin does not -- a runner whose resolver answers a
-    bare `redis` with a real address, from a wildcard DNS or a matching search
-    domain -- and Elasticsearch's own default of retrying a dead node.
+    with the name resolved instantly and the default retry policy in place, a
+    ping to an absent Redis still cost 4.5 seconds, times however many
+    constructions a run makes (services/cancellation.py's _get_redis()
+    reconnects on every call). This also covers what the name guard does not --
+    a runner that DOES provide these as real service containers, i.e. the
+    SWITCHYARD_TEST_ALLOW_SERVICE_HOSTS=1 case -- and Elasticsearch's own
+    default of retrying a dead node.
 
     Done here rather than at the ~20 call sites that omit these deliberately.
     Their defaults are right for production, where the service genuinely is
@@ -163,7 +154,7 @@ def _bound_service_client_timeouts():
     belongs in the test harness. One hook also covers constructions added later
     and ones made inside libraries, which a call-site sweep cannot.
 
-    Only fills in values the caller did not set, so a test that pins its own
+    Only fills in values the caller did not set, so a test that sets its own
     timeouts keeps them. Applies in the orchestrator container too, where Redis
     and ES are reachable and a connect costs single-digit milliseconds --
     container and host runs stay comparable, which is the point of the exercise.
@@ -179,7 +170,7 @@ def _bound_service_client_timeouts():
         # `retry` is the one that matters, and it is not the one anybody would
         # guess. redis-py 8 defaults a client to Retry(ExponentialWithJitter
         # Backoff(base=1, cap=10), retries=10), so a connect to a host that
-        # refuses instantly is still attempted eleven times with a growing
+        # fails instantly is still attempted eleven times with a growing
         # sleep between them. Measured on the bare runner: ping() against an
         # absent Redis took 4.5s with the resolution itself costing 0.0s, and
         # 0.02s with Retry(NoBackoff(), 0).
@@ -204,8 +195,8 @@ def _bound_service_client_timeouts():
     else:
         # max_retries/retry_on_timeout do the work here: the default is to
         # retry a failed node, which multiplies the wait by the number of
-        # attempts against a host that will never answer, while a refused
-        # connect to a pinned loopback address returns immediately either way.
+        # attempts against a host that will never answer, while a name the
+        # guard above refuses fails immediately either way.
         # request_timeout therefore gets the OPERATION budget, not the connect
         # one -- it bounds the whole request, and a real ES query inside the
         # orchestrator container (conftest's own delete_by_query sweep, for
@@ -260,6 +251,68 @@ def _default_orchestrator_root_outside_the_container():
 
     import tempfile
     os.environ['ORCHESTRATOR_ROOT'] = tempfile.mkdtemp(prefix='switchyard-test-root-')
+
+
+# The three guards above install at IMPORT time, not from pytest_configure,
+# and that ordering is load-bearing (found in review). pytest_configure is a
+# hook on this module, so by the time it fires this module's body has already
+# run -- including the two test-utility imports just below, which reach
+# services.review_cycle, which calls get_observability_manager() at import
+# time and builds both a Redis and an Elasticsearch client. Installed from
+# pytest_configure the guards arrived one full unbounded resolver+retry round
+# trip too late: `import tests.utils.builders` alone measured 5.0s on a host,
+# logging "Failed to connect to Redis for observability: Error -3 connecting
+# to redis:6379" before any guard existed. What they have to beat is this
+# module's own first-party imports, not the first test module.
+_refuse_to_resolve_compose_service_hostnames()
+_bound_service_client_timeouts()
+_default_orchestrator_root_outside_the_container()
+
+
+# Import test utilities
+from tests.mocks.github_mock import MockGitHubApp, MockGitHubIntegration, MockAgentExecutor
+from tests.utils.builders import ReviewCycleStateBuilder, DiscussionBuilder, TaskContextBuilder
+
+
+# ============================================================================
+# Pytest Configuration
+# ============================================================================
+
+def pytest_configure(config):
+    """Register custom markers and load environment.
+
+    Deliberately NOT where the #174 service guards install -- see the comment
+    above this module's own first-party imports for why they cannot wait this
+    long. Marker registration genuinely belongs here.
+    """
+    config.addinivalue_line(
+        "markers", "unit: Unit tests (fast, isolated)"
+    )
+    config.addinivalue_line(
+        "markers", "integration: Integration tests (medium speed, real services)"
+    )
+    config.addinivalue_line(
+        "markers", "e2e: End-to-end tests (slow, full system)"
+    )
+    config.addinivalue_line(
+        "markers", "slow: Slow tests (skip in fast test runs)"
+    )
+
+    # Load environment variables from .env file for integration tests
+    # This ensures API keys and other config are available
+    from config.environment import Environment
+    try:
+        env = Environment()
+        # Export environment variables if they're configured
+        if env.claude_code_oauth_token:
+            os.environ['CLAUDE_CODE_OAUTH_TOKEN'] = env.claude_code_oauth_token.get_secret_value()
+        if env.anthropic_api_key:
+            os.environ['ANTHROPIC_API_KEY'] = env.anthropic_api_key.get_secret_value()
+        if env.github_token:
+            os.environ['GITHUB_TOKEN'] = env.github_token.get_secret_value()
+    except Exception as e:
+        # Don't fail tests if .env is missing - some tests don't need it
+        pass
 
 
 # ============================================================================
@@ -329,6 +382,49 @@ def pytest_collection_finish(session):
     leaked_module_mocks[:] = _first_party_modules_replaced_by_mocks()
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """
+    Catch the same leak inserted at RUN time rather than at import time (#133).
+
+    The snapshot above only sees module-scope assignments, because that is when
+    pytest imports a test file -- and that is not the only shape the workaround
+    took. On main, tests/unit/test_docker_runner_validation.py did the
+    assignment inside a helper method:
+
+        def _get_non_retryable_class(self):
+            if 'services.dev_container_state' not in sys.modules:
+                sys.modules['services.dev_container_state'] = MagicMock()
+
+    which runs long after pytest_collection_finish has taken its sample. A
+    fixture, a setUp or a helper is the natural place for the next one now that
+    the module-scope form is visibly discouraged, and a leak there would be
+    invisible to a test asserting on a list captured before it happened.
+
+    Reported here rather than as a named test failure because there is no test
+    left to fail by this point -- but it still fails the run, because a session
+    that ends with claude.docker_runner's dev_container_state replaced by a
+    MagicMock has not tested what its green line says it did.
+    """
+    late = [
+        name for name in _first_party_modules_replaced_by_mocks()
+        if name not in leaked_module_mocks
+    ]
+    if not late:
+        return
+
+    reporter = session.config.pluginmanager.get_plugin('terminalreporter')
+    if reporter is not None:
+        reporter.write_sep('=', "first-party modules left mocked in sys.modules", red=True)
+        reporter.write_line(
+            f"{late} were replaced by mocks WHILE TESTS RAN and never put back. "
+            "Every test that imported one of them afterwards got the mock, "
+            "whichever file it belongs to -- which is how the same suite produces "
+            "different results depending on how it is chunked. Use a "
+            "fixture-scoped patch, or fix what makes the real import fail."
+        )
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
 # ============================================================================
 # Container-gated test reporting
 # ============================================================================
@@ -336,15 +432,10 @@ def pytest_collection_finish(session):
 # The reason string ~60 test files pass to pytest.skip(..., allow_module_level=True)
 # when /app is absent. They import agents/__init__.py and other modules that
 # genuinely cannot import outside the orchestrator container (see CLAUDE.md,
-# "Docker-only imports"), so the gate itself is correct.
+# "Docker-only imports"), so the gate itself is correct. What they test for is
+# ORCHESTRATOR_CONTAINER_MARKER / running_in_orchestrator_container(), which
+# live at the top of this file because the #174 guards run before anything else.
 CONTAINER_ONLY_SKIP_REASON = "Requires Docker container environment"
-
-# What those files test for.
-ORCHESTRATOR_CONTAINER_MARKER = '/app'
-
-
-def running_in_orchestrator_container():
-    return os.path.isdir(ORCHESTRATOR_CONTAINER_MARKER)
 
 
 def pytest_report_header(config):
@@ -841,6 +932,20 @@ _TEST_ES_INDICES = [
 ]
 
 
+def _may_purge_service_data() -> bool:
+    """True only when the Redis/ES this run can reach are ones it owns.
+
+    Found in review: this used to rely on the services simply being
+    unreachable off-container, which is not a property the suite controls. The
+    developer machine a host run is meant to help is also the one running
+    docker-compose, which publishes 6379 and 9200 on the host — so "the ping
+    succeeded" was never licence to DEL. Inside the orchestrator container the
+    suite genuinely owns both stores, and a runner that deliberately supplied
+    them says so with SWITCHYARD_TEST_ALLOW_SERVICE_HOSTS=1.
+    """
+    return running_in_orchestrator_container() or ALLOW_REAL_SERVICE_HOSTS
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_test_data():
     """
@@ -848,9 +953,13 @@ def cleanup_test_data():
 
     Runs once before and once after the entire test session so leftover data
     from a previous crashed run is also removed. Unit tests that mock ES/Redis
-    are unaffected — both cleanup calls are no-ops when the services are
-    unreachable.
+    are unaffected, and a run that does not own a Redis/ES does not purge at
+    all — see _may_purge_service_data().
     """
+    if not _may_purge_service_data():
+        yield
+        return
+
     _purge_test_data()
     yield
     _purge_test_data()
@@ -878,10 +987,13 @@ def _purge_elasticsearch():
                     ignore_unavailable=True,
                     refresh=True,
                 )
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                # Logged, not swallowed silently (found in review): this issues
+                # delete_by_query, and a purge that fires against something
+                # other than the store it meant to must leave a trace.
+                logger.warning(f"Test-data purge: delete_by_query on {index} failed: {e}")
+    except Exception as e:
+        logger.warning(f"Test-data purge: Elasticsearch cleanup skipped: {e}")
 
 
 def _purge_redis():
@@ -914,7 +1026,7 @@ def _purge_redis():
         try:
             from services.github_api_client import RATE_LIMIT_REDIS_KEYS
             r.delete(*RATE_LIMIT_REDIS_KEYS.values())
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as e:
+            logger.warning(f"Test-data purge: rate-limit key cleanup failed: {e}")
+    except Exception as e:
+        logger.warning(f"Test-data purge: Redis cleanup skipped: {e}")

@@ -25,8 +25,12 @@ involved.
 
 tests/conftest.py now sets ORCHESTRATOR_ROOT to a scratch directory when /app is
 absent, so the real modules import everywhere and the workaround is unnecessary.
-This test is the tripwire for the next file that reaches for it anyway.
+This test is the tripwire for the next file that reaches for it anyway --
+sampled both at collection finish (the module-scope shape) and at session finish
+(the run-time shape test_docker_runner_validation.py used).
 """
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -82,3 +86,76 @@ class TestTheDetectorItself:
 
         assert services.dev_container_state.dev_container_state.state_dir.is_dir()
         assert services.work_execution_state.work_execution_tracker.state_dir.is_dir()
+
+
+class TestALeakInsertedWhileTestsRanIsCaughtToo:
+    """
+    Found in review: the collection-time snapshot covers two of the three files
+    #133 was about and not the third. tests/unit/test_docker_runner_validation.py
+    did the assignment inside a helper method --
+
+        def _get_non_retryable_class(self):
+            if 'services.dev_container_state' not in sys.modules:
+                sys.modules['services.dev_container_state'] = MagicMock()
+
+    -- which runs long after pytest_collection_finish has taken its sample, so
+    the guard written to catch the next file reaching for the workaround would
+    have stayed green through exactly the shape that file used. A fixture or a
+    setUp is the natural place for the next one now that the module-scope form
+    is visibly discouraged.
+    """
+
+    @staticmethod
+    def _session():
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                pluginmanager=SimpleNamespace(get_plugin=lambda name: None)
+            ),
+            exitstatus=pytest.ExitCode.OK,
+        )
+
+    def test_a_module_mocked_after_collection_fails_the_session(self):
+        from unittest.mock import patch
+
+        from tests import conftest
+
+        session = self._session()
+        with patch.object(conftest, 'leaked_module_mocks', []), \
+                patch.object(
+                    conftest, '_first_party_modules_replaced_by_mocks',
+                    return_value=['services.dev_container_state'],
+                ):
+            conftest.pytest_sessionfinish(session, session.exitstatus)
+
+        assert session.exitstatus == pytest.ExitCode.TESTS_FAILED
+
+    def test_a_leak_already_reported_at_collection_is_not_counted_twice(self):
+        """That one already fails test_no_first_party_module_was_replaced_by_a_mock
+        _during_collection by name, which is the better report."""
+        from unittest.mock import patch
+
+        from tests import conftest
+
+        session = self._session()
+        with patch.object(conftest, 'leaked_module_mocks', ['services.dev_container_state']), \
+                patch.object(
+                    conftest, '_first_party_modules_replaced_by_mocks',
+                    return_value=['services.dev_container_state'],
+                ):
+            conftest.pytest_sessionfinish(session, session.exitstatus)
+
+        assert session.exitstatus == pytest.ExitCode.OK
+
+    def test_a_clean_session_is_left_alone(self):
+        from unittest.mock import patch
+
+        from tests import conftest
+
+        session = self._session()
+        with patch.object(conftest, 'leaked_module_mocks', []), \
+                patch.object(
+                    conftest, '_first_party_modules_replaced_by_mocks', return_value=[],
+                ):
+            conftest.pytest_sessionfinish(session, session.exitstatus)
+
+        assert session.exitstatus == pytest.ExitCode.OK

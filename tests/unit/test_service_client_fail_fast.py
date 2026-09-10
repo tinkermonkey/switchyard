@@ -14,7 +14,7 @@ that container says otherwise:
 
     redis.Redis(host='redis', ...).ping()                       -> 5.04s
     redis.Redis(host='redis', ..., socket_connect_timeout=2)    -> 4.16s
-    ...with the name pinned to loopback, still                  -> 4.51s
+    ...with the resolver taken out of the path, still           -> 4.51s
     ...with retry=Retry(NoBackoff(), 0)                         -> 0.02s
 
 Two separate costs, neither of them the connect timeout:
@@ -23,9 +23,11 @@ Two separate costs, neither of them the connect timeout:
     the runner's `search` suffixes is several queries against whatever
     nameservers it was handed, and how long they take to give up is a property
     of that machine -- which is why the same suite took seconds one hour and had
-    not finished in 150 the next. tests/conftest.py resolves the three compose
-    service names to 127.0.0.1 off-container, which takes the resolver out of
-    the path entirely.
+    not finished in 150 the next. tests/conftest.py refuses the three compose
+    service names outright off-container, which takes the resolver out of the
+    path entirely. It refuses rather than re-points them because the machine a
+    host run is meant to help is also the one running docker-compose, which
+    publishes 6379 and 9200 on the host -- see that guard's docstring.
   - redis-py 8's default client retry policy, Retry(ExponentialWithJitter
     Backoff(base=1, cap=10), retries=10). Even a connect refused instantly is
     retried eleven times with a growing sleep between them. tests/conftest.py
@@ -34,6 +36,7 @@ Two separate costs, neither of them the connect timeout:
 Both are needed; the fourth line above is what either one alone leaves behind.
 """
 
+import contextlib
 import os
 import socket
 import time
@@ -47,49 +50,98 @@ from tests.conftest import (
     TEST_SERVICE_OP_TIMEOUT,
     _bound_service_client_timeouts,
     _default_orchestrator_root_outside_the_container,
+    _may_purge_service_data,
     _patch_init_defaults,
-    _pin_compose_service_hostnames_to_loopback,
-    running_in_orchestrator_container,
+    _refuse_to_resolve_compose_service_hostnames,
 )
 
 
-class TestServiceHostnamesResolveWithoutTheResolver:
+@contextlib.contextmanager
+def _guard_installed(in_container=False):
+    """Install the name guard for the duration of a test and take it back out.
+
+    socket.getaddrinfo is process-global, and the guard is deliberately
+    idempotent, so a test that left it behind would silently change what every
+    later test in the session resolves.
+    """
+    original = socket.getaddrinfo
+    with patch('tests.conftest.running_in_orchestrator_container', return_value=in_container):
+        try:
+            _refuse_to_resolve_compose_service_hostnames()
+            yield original
+        finally:
+            socket.getaddrinfo = original
+
+
+class TestServiceHostnamesFailToResolveWithoutTheResolver:
 
     def test_it_names_the_services_this_codebase_connects_to_by_bare_hostname(self):
         for host in ('redis', 'elasticsearch'):
             assert host in COMPOSE_SERVICE_HOSTS
 
-    def test_off_container_a_service_name_resolves_to_loopback(self):
-        original = socket.getaddrinfo
-        with patch('tests.conftest.running_in_orchestrator_container', return_value=False):
-            try:
-                _pin_compose_service_hostnames_to_loopback()
-                addresses = {info[4][0] for info in socket.getaddrinfo('redis', 6379)}
-            finally:
-                socket.getaddrinfo = original
+    def test_off_container_a_service_name_does_not_resolve_at_all(self):
+        with _guard_installed():
+            for host in COMPOSE_SERVICE_HOSTS:
+                with pytest.raises(socket.gaierror):
+                    socket.getaddrinfo(host, 6379)
 
-        assert addresses == {'127.0.0.1'}
+    def test_it_never_hands_back_a_reachable_address(self):
+        """The regression this replaced (found in review): resolving these to
+        127.0.0.1 was safe only while nothing was listening there, and
+        docker-compose.yml publishes redis as "6379:6379" and elasticsearch as
+        "9200:9200" -- so on the machine a host run is meant to help, loopback
+        IS the live deployment. A name that does not resolve cannot reach
+        anything, whatever the developer happens to be running."""
+        with _guard_installed():
+            with pytest.raises(socket.gaierror):
+                socket.getaddrinfo('redis', 6379)
+
+    def test_the_refusal_is_an_oserror_so_clients_see_an_ordinary_outage(self):
+        """redis-py wraps OSError from the connect into redis.ConnectionError
+        and elastic_transport does the same, which is what every caller in this
+        codebase already handles."""
+        with _guard_installed():
+            with pytest.raises(OSError):
+                socket.getaddrinfo('redis', 6379)
 
     def test_it_leaves_every_other_hostname_to_the_real_resolver(self):
-        original = socket.getaddrinfo
-        with patch('tests.conftest.running_in_orchestrator_container', return_value=False):
-            try:
-                _pin_compose_service_hostnames_to_loopback()
-                pinned = socket.getaddrinfo
-                with patch.object(socket, 'getaddrinfo', pinned):
-                    with pytest.raises(socket.gaierror):
-                        socket.getaddrinfo('switchyard-no-such-host.invalid', 80)
-            finally:
-                socket.getaddrinfo = original
+        with _guard_installed():
+            with pytest.raises(socket.gaierror):
+                socket.getaddrinfo('switchyard-no-such-host.invalid', 80)
 
     def test_inside_the_container_the_real_hosts_are_left_alone(self):
         """`redis` and `elasticsearch` ARE real there, and the suite uses
         them -- tests/conftest.py's own test-data purge, for one."""
         original = socket.getaddrinfo
         with patch('tests.conftest.running_in_orchestrator_container', return_value=True):
-            _pin_compose_service_hostnames_to_loopback()
+            _refuse_to_resolve_compose_service_hostnames()
 
         assert socket.getaddrinfo is original
+
+
+class TestTheTestDataPurgeCannotRunAgainstSomebodyElsesStore:
+    """
+    Found in review. The session-autouse cleanup_test_data fixture SCANs and
+    DELs test-project keys, unconditionally deletes the two global
+    github:rate_limit:* keys the live dashboard reads, and issues
+    delete_by_query across five index patterns. Its whole safety argument used
+    to be that off-container the services are unreachable -- which is not a
+    property the suite controls on a machine that is also running the stack.
+    """
+
+    def test_a_host_run_does_not_purge(self):
+        with patch('tests.conftest.running_in_orchestrator_container', return_value=False), \
+                patch('tests.conftest.ALLOW_REAL_SERVICE_HOSTS', False):
+            assert _may_purge_service_data() is False
+
+    def test_the_orchestrator_container_owns_its_stores_and_does_purge(self):
+        with patch('tests.conftest.running_in_orchestrator_container', return_value=True):
+            assert _may_purge_service_data() is True
+
+    def test_a_runner_that_supplied_real_service_containers_does_purge(self):
+        with patch('tests.conftest.running_in_orchestrator_container', return_value=False), \
+                patch('tests.conftest.ALLOW_REAL_SERVICE_HOSTS', True):
+            assert _may_purge_service_data() is True
 
 
 class TestRedisConnectIsBounded:
@@ -124,25 +176,27 @@ class TestRedisConnectIsBounded:
         assert retry._retries == 0
         assert [retry._backoff.compute(n) for n in range(1, 4)] == [0, 0, 0]
 
-    @pytest.mark.skipif(
-        running_in_orchestrator_container(),
-        reason="`redis` is a real, reachable host inside the orchestrator container",
-    )
     def test_a_ping_to_an_absent_service_fails_promptly(self):
         """The end-to-end property, at the boundary the hang happened at.
 
-        One second is far more slack than a refused loopback connect needs and
-        far less than the 4-5s a resolver round trip cost, so this fails if the
-        pin stops working even though the client timeouts alone would still
+        One second is far more slack than a refused name needs and far less
+        than the 4-5s a resolver round trip cost, so this fails if the guard
+        stops working even though the client timeouts alone would still
         eventually return.
+
+        Runs in the container too, which the loopback-pin version could not:
+        it asserts the guard's own behaviour with the guard explicitly
+        installed, rather than asserting that whatever `redis` happens to mean
+        on this machine is unreachable.
         """
         import redis
 
-        client = redis.Redis(host='redis', port=6379, decode_responses=True)
+        with _guard_installed():
+            client = redis.Redis(host='redis', port=6379, decode_responses=True)
 
-        started = time.monotonic()
-        with pytest.raises(Exception):
-            client.ping()
+            started = time.monotonic()
+            with pytest.raises(redis.exceptions.ConnectionError):
+                client.ping()
 
         assert time.monotonic() - started < 1.0
 
