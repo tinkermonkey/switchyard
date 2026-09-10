@@ -1505,9 +1505,14 @@ git push --force-with-lease
                 pushed and the work is still on disk (#151/WI-6). Documented, and
                 deliberately not folded into a {'success': False} dict, for the
                 same reason auto_commit.commit_agent_changes() re-raises it:
-                'failure' routes callers into mark_failed()/failsafe paths that
-                treat contention as a fault, when what it actually needs is
-                services/resource_lock_errors.is_lock_timeout_error() and a retry.
+                'failure' routes callers into failsafe paths that treat contention
+                as a fault, when what it actually needs is
+                services/resource_lock_errors.is_lock_timeout_error() and a
+                deliberate decision about the stranded work. On the agent_executor
+                path that decision is _handle_post_completion_lock_timeout(): the
+                agent has already run and commented by then, so a plain contention
+                retry would duplicate both, and the pipeline is blocked for an
+                operator instead (#151/WI-6 review).
         """
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely

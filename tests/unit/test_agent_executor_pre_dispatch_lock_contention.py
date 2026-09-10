@@ -214,10 +214,17 @@ class TestFinalizationContentionIsNotASuccess:
     """finalize_feature_branch_work() now takes the project_checkout lock for the
     shared base clone, so it can raise. The finalization handler special-cased
     only NonRetryableAgentError and PushFailedError, and everything else fell
-    through to outcome='success'."""
+    through to outcome='success'.
+
+    What it must do instead is BLOCK, not record contention: this handler runs
+    after the agent completed and after its output comment went out, so the
+    contention path's retry would re-run both. That divide is exercised in full by
+    tests/unit/test_agent_executor_post_completion_lock_timeout.py; this test
+    keeps the original 'not a success' regression pinned at the same call site.
+    """
 
     @pytest.mark.asyncio
-    async def test_a_finalize_lock_timeout_records_contention_not_success(self, agent_executor):
+    async def test_a_finalize_lock_timeout_blocks_rather_than_recording_success(self, agent_executor):
         task_context = {
             'issue_number': 905,
             'column': 'Development',
@@ -249,9 +256,16 @@ class TestFinalizationContentionIsNotASuccess:
         agent.run_with_circuit_breaker = AsyncMock(return_value={'status': 'success'})
         agent.agent_config = {}
 
+        run_manager = MagicMock()
+        run_manager.mark_failed.return_value = True
+        github = MagicMock()
+        github.post_comment = AsyncMock()
+
         with patch('services.agent_executor.config_manager') as mock_config, \
              patch('services.work_execution_state.work_execution_tracker', tracker), \
              patch('services.workspace.WorkspaceContextFactory') as mock_factory, \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch('services.github_integration.GitHubIntegration', return_value=github), \
              patch.object(agent_executor.factory, 'create_agent', return_value=agent), \
              patch.object(agent_executor, '_post_agent_output_to_github', new_callable=AsyncMock), \
              patch.object(agent_executor, '_failsafe_commit_check', new_callable=AsyncMock,
@@ -263,7 +277,8 @@ class TestFinalizationContentionIsNotASuccess:
             mock_config.get_project_config.return_value = project_config
             mock_factory.create.return_value = workspace
 
-            with pytest.raises(ProjectCheckoutLockTimeoutError):
+            from agents.non_retryable import NonRetryableAgentError
+            with pytest.raises(NonRetryableAgentError):
                 await agent_executor.execute_agent(
                     agent_name='developer',
                     project_name='test-project',
@@ -275,7 +290,12 @@ class TestFinalizationContentionIsNotASuccess:
             "the issue must not advance as a success with nothing staged, committed "
             "or pushed and the work left uncommitted on disk"
         )
-        assert outcomes == ['lock_contention']
+        # ...and not 'lock_contention' either: the agent has already run and
+        # already commented by this point, so that outcome's retry would launch a
+        # second container and post a second comment (#151/WI-6 review).
+        assert 'lock_contention' not in outcomes
+        run_manager.mark_failed.assert_called_once()
+        github.post_comment.assert_awaited_once()
         # The failsafe is not run either -- its own auto-commit would hit the
-        # same contended lock, and the contention path is what retries.
+        # same contended lock, and blocking is what stops the run.
         mock_failsafe.assert_not_called()

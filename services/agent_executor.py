@@ -1147,19 +1147,28 @@ class AgentExecutor:
                     # "continues execution even if finalization fails" straight into
                     # record_execution_outcome(outcome='success') -- the issue
                     # advances with nothing staged, committed, pushed or PR'd and
-                    # the work left uncommitted on disk. The outer handler's
-                    # is_lock_timeout_error() branch exists precisely to record this
-                    # as 'lock_contention' and let the next poll retry; re-raise so
-                    # it is reached instead of swallowed here.
-                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    # the work left uncommitted on disk.
+                    #
+                    # Blocking rather than re-raising into the outer contention
+                    # path: by the time we are here the agent has already run to
+                    # completion, emit_agent_completed(success=True) has fired and
+                    # the output comment is already on the issue, so the outer
+                    # handler's "the guarded execution never ran" premise is false
+                    # and its outcome='lock_contention' would have the next board
+                    # poll re-dispatch the SAME agent -- a second container against
+                    # a worktree still holding this run's uncommitted changes, and a
+                    # second output comment on the issue. Same shape as the
+                    # PushFailedError branch below, and for the same reason: the
+                    # work is real, it is stranded, and a human has to see it.
+                    from services.resource_lock_errors import is_lock_timeout_error
                     if is_lock_timeout_error(e):
-                        logger.warning(
-                            f"Workspace finalization for {project_name}/#"
-                            f"{task_context.get('issue_number')} could not acquire a "
-                            f"project resource lock — propagating to the contention "
-                            f"path rather than recording a success: {describe_lock_timeout(e)}"
+                        await self._handle_post_completion_lock_timeout(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=pipeline_run_id,
+                            error=e,
+                            phase="workspace finalization",
                         )
-                        raise
 
                     from services.git_workflow_manager import PushFailedError
                     if isinstance(e, PushFailedError):
@@ -1225,10 +1234,19 @@ class AgentExecutor:
                                 raise  # Re-raise into outer PushFailedError handler
                             # Same reasoning as the finalization handler above: the
                             # failsafe never ran, so swallowing this records a
-                            # success over uncommitted work (#151/WI-6 review).
+                            # success over uncommitted work, and the agent has
+                            # already completed and already commented, so a
+                            # contention retry would duplicate both (#151/WI-6
+                            # review).
                             from services.resource_lock_errors import is_lock_timeout_error
                             if is_lock_timeout_error(failsafe_error):
-                                raise  # Re-raise into the outer contention path
+                                await self._handle_post_completion_lock_timeout(
+                                    project_name=project_name,
+                                    task_context=task_context,
+                                    pipeline_run_id=pipeline_run_id,
+                                    error=failsafe_error,
+                                    phase="the failsafe commit check",
+                                )
                             logger.error(
                                 f"❌ Failsafe commit check also failed: {failsafe_error}",
                                 exc_info=True
@@ -1263,12 +1281,31 @@ class AgentExecutor:
                 if execution_type == "repair_test":
                     logger.info("Skipping failsafe commit check for repair_test execution type")
                 elif 'issue_number' in task_context:
-                    refusal = await self._failsafe_commit_check(
-                        project_name=project_name,
-                        agent_name=agent_name,
-                        task_context=task_context,
-                        task_id=task_id
-                    )
+                    try:
+                        refusal = await self._failsafe_commit_check(
+                            project_name=project_name,
+                            agent_name=agent_name,
+                            task_context=task_context,
+                            task_id=task_id
+                        )
+                    except Exception as failsafe_error:
+                        # The third post-completion lock-timeout site (#151/WI-6
+                        # review). This branch has no try of its own, so a timeout
+                        # here fell straight to the outer contention path, which
+                        # records 'lock_contention' and lets the next poll re-run an
+                        # agent that has already completed and already commented.
+                        # Route it the same way the two finalization sites above do;
+                        # everything else keeps propagating exactly as before.
+                        from services.resource_lock_errors import is_lock_timeout_error
+                        if not is_lock_timeout_error(failsafe_error):
+                            raise
+                        await self._handle_post_completion_lock_timeout(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=pipeline_run_id,
+                            error=failsafe_error,
+                            phase="the failsafe commit check",
+                        )
                     # THE highest-frequency ignoring call site: this branch is reached
                     # on every skip_workspace_prep dispatch, i.e. all of
                     # repair_cycle.py's inner agents. A repair_fix container that left
@@ -1382,9 +1419,18 @@ class AgentExecutor:
             )
 
             # Resource-lock timeout: the guarded execution never ran, so this is not
-            # an agent failure and must not be recorded as one (#148). Recording
-            # 'failure' here would feed work_execution_tracker.count_consecutive_
-            # failures(), and project_monitor.py's MAX_CONSECUTIVE_DISPATCH_FAILURES
+            # an agent failure and must not be recorded as one (#148). That premise
+            # holds for everything that reaches HERE because the only timeouts that
+            # could break it — the ones raised by the commit paths that run after
+            # the agent returns, when emit_agent_completed(success=True) and the
+            # output comment have already gone out — are intercepted upstream by
+            # _handle_post_completion_lock_timeout(), which blocks the pipeline
+            # instead of handing them to the retry semantics below (#151/WI-6
+            # review). Anything added to this method after the agent completes has
+            # to route its lock timeouts there too, not fall through here.
+            #
+            # Recording 'failure' here would feed work_execution_tracker.count_
+            # consecutive_failures(), and project_monitor.py's MAX_CONSECUTIVE_DISPATCH_FAILURES
             # check turns three of those into mark_failed() — which durably retains
             # the BOARD's pipeline lock, blocking every sibling issue until a human
             # runs scripts/release_lock.py. That is a strictly wider blast radius
@@ -2070,6 +2116,89 @@ class AgentExecutor:
         except Exception as comment_err:
             logger.error(f"Failed to post the {failure_label} comment: {comment_err}")
 
+    async def _handle_post_completion_lock_timeout(
+        self,
+        project_name: str,
+        task_context: Dict[str, Any],
+        pipeline_run_id: Optional[str],
+        error: Exception,
+        phase: str
+    ):
+        """
+        Escalate a resource-lock timeout raised AFTER the agent already finished,
+        and raise so the run is not recorded as a success.
+
+        'lock_contention' is the right outcome for a timeout raised BEFORE the
+        guarded work runs: nothing ran, nothing is dirty, and the next board poll
+        is the retry point (#148). Every timeout reachable from the commit paths
+        that run once the agent has returned breaks that premise (#151/WI-6
+        review) -- by then execute_agent() has already emitted
+        emit_agent_completed(success=True) and already called
+        _post_agent_output_to_github(). Recording contention there has
+        should_execute_work() answer "retry_after_lock_contention" on the next
+        30s poll, which re-dispatches the SAME agent: a second container against a
+        worktree that still holds the first run's uncommitted changes, and a
+        second output comment on the issue. MAX_CONSECUTIVE_LOCK_CONTENTIONS does
+        eventually escalate, but only after two or three of those have landed.
+
+        So this ends where the PushFailedError and wrong-branch refusals end
+        instead — the other two "the agent did real work and it is stranded"
+        outcomes. mark_failed() retains the board's pipeline lock, so no poll
+        re-dispatches, and the comment tells an operator where the uncommitted
+        work is. Scoped to THIS run: nothing durable is written beyond the lock,
+        and releasing it re-enables the issue once the contention has cleared.
+
+        Always raises NonRetryableAgentError. Raised WITHOUT `from error` on
+        purpose: resource_lock_errors.is_lock_timeout_error() follows __cause__,
+        so chaining the timeout would have execute_agent()'s outer handler
+        classify this as contention after all and undo the whole point.
+        """
+        from services.resource_lock_errors import describe_lock_timeout
+
+        issue_number = task_context.get('issue_number')
+        lock_detail = describe_lock_timeout(error)
+        error_detail = (
+            f"{phase} for {project_name}/#{issue_number} could not acquire a "
+            f"project resource lock: {lock_detail}. The agent's work is still "
+            "uncommitted on disk."
+        )
+        logger.error(f"❌ {error_detail}")
+
+        def _lock_timeout_comment(lock_status_line: str, board_name: str) -> str:
+            return (
+                f"## ❌ Resource Lock Timeout — Pipeline Blocked\n\n"
+                f"The agent completed its work and posted its output above, but "
+                f"{phase} could not acquire this project's resource lock before "
+                f"timing out, so nothing was staged, committed, pushed, or turned "
+                f"into a PR. The changes are still sitting uncommitted on disk.\n\n"
+                f"**Reason:** {lock_detail}\n\n"
+                f"**To recover:**\n"
+                f"1. Inspect the workspace at "
+                f"`{task_context.get('project_dir', '<worktree>')}` "
+                f"(`git status`, `git diff`) and confirm the work is the agent's.\n"
+                f"2. Find what is holding the lock: "
+                f"`python scripts/inspect_task_health.py --project {project_name}`.\n"
+                f"3. Commit and push the work yourself, or `git reset --hard` it and "
+                f"let the pipeline redo it.\n"
+                f"4. Run `python scripts/release_lock.py --project {project_name} "
+                f"--board \"{board_name}\" --issue {issue_number}` to release the "
+                f"pipeline lock once ready to continue — see below for whether it "
+                f"is actually durably retained.\n\n"
+                f"{lock_status_line}"
+            )
+
+        await self._block_pipeline_with_comment(
+            project_name=project_name,
+            task_context=task_context,
+            pipeline_run_id=pipeline_run_id,
+            reason=error_detail,
+            failure_label="a post-completion resource lock timeout",
+            build_comment=_lock_timeout_comment,
+        )
+
+        from agents.non_retryable import NonRetryableAgentError
+        raise NonRetryableAgentError(error_detail)
+
     async def _escalate_failsafe_branch_refusal(
         self,
         project_name: str,
@@ -2366,9 +2495,12 @@ class AgentExecutor:
                 the two exceptions this method's catch-all deliberately does NOT
                 fold into None (#151/WI-6 review). Nothing was checked or
                 committed and the work is still on disk, which is the opposite of
-                what None asserts; callers route it through
+                what None asserts; callers recognise it through
                 services/resource_lock_errors.is_lock_timeout_error(), exactly as
-                they already do for auto_commit.commit_agent_changes().
+                they already do for auto_commit.commit_agent_changes(), and hand
+                it to _handle_post_completion_lock_timeout() — this method only
+                ever runs once the agent has completed and commented, so the
+                ordinary 'lock_contention' retry would duplicate both.
         """
         import subprocess
         import glob
