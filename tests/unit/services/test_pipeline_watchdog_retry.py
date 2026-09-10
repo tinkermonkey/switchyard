@@ -479,7 +479,9 @@ class TestRedispatchPermanentDecline:
         watchdog.project_monitor.trigger_agent_for_status.return_value = (
             DispatchDecline.ISSUE_CLOSED
         )
-        watchdog.lock_manager.get_lock = Mock(return_value=lock_after_dispatch)
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(lock_after_dispatch, True)
+        )
 
         with patch("config.manager.config_manager.get_project_config",
                    return_value=self._fake_project_config()), \
@@ -510,7 +512,7 @@ class TestRedispatchPermanentDecline:
             watchdog, lock_after_dispatch=Mock(locked_by_issue=159)
         ) is False
 
-    def test_an_unreadable_lock_fails_closed(self, watchdog):
+    def test_a_raising_lock_read_fails_closed(self, watchdog):
         """An unreadable lock is not evidence it was released; leaving it
         un-retained is the orphaning the callers' fail-safe exists to stop."""
         from services.project_monitor import DispatchDecline
@@ -519,7 +521,33 @@ class TestRedispatchPermanentDecline:
         watchdog.project_monitor.trigger_agent_for_status.return_value = (
             DispatchDecline.ISSUE_CLOSED
         )
-        watchdog.lock_manager.get_lock = Mock(side_effect=RuntimeError("redis down"))
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            side_effect=RuntimeError("redis down")
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is False
+
+    def test_a_dual_store_read_failure_also_fails_closed(self, watchdog):
+        """The failure mode the fail-closed comment actually names, and the
+        one get_lock() cannot report: _read_redis_lock_only and
+        _read_yaml_lock_only each swallow their own exception and return
+        (None, False), so nothing raises -- get_lock() just hands back None,
+        which is indistinguishable from "confirmed released". Read through
+        get_lock_fail_closed() instead, so reads_healthy=False is treated as
+        "assume still held" rather than silently returning a clean success on
+        a lock that is still durably this issue's."""
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
 
         with patch("config.manager.config_manager.get_project_config",
                    return_value=self._fake_project_config()), \
@@ -582,6 +610,111 @@ class TestAbandonStaleEntriesReason:
         # what matters is it isn't the unqualified default claim).
         assert reason != "Orchestrator restarted without completing this execution."
         assert "self-heal" in reason.lower() or "watchdog" in reason.lower()
+
+
+class TestZombieNonHolderShortCircuitLeavesTheIssueRePickupable:
+    """The non-holder short-circuit returns a clean success without
+    redispatching, on the stated basis that the issue is left to the normal
+    queue/failsafe paths. Two leftovers make that untrue unless the branch
+    clears them itself, and until now only _redispatch_same_issue did:
+
+    - the cancellation signal end_pipeline_run sets for every reason but
+      feedback_loop_ended. _find_stalled_issues_for_pipeline() skips a
+      cancelled issue outright and _check_and_process_waiting_issues_failsafe()
+      skips it after acquiring the lock (purging its queue row), for the
+      signal's full 1-hour TTL.
+    - the dead run's 'in_progress' execution record, which keeps
+      has_active_execution() True -- permanently for a trigger_source='manual'
+      probe, which the stale-probe self-heal deliberately does not age out --
+      and so keeps the issue out of the stalled-issue rescan. The only other
+      caller of abandon_stale_in_progress_entries() runs at startup, so
+      without this the issue would sit stranded until the next restart with
+      not one WARNING emitted.
+    """
+
+    def _cleanup_as_non_holder(self, watchdog, signal=None, tracker=None):
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(Mock(locked_by_issue=170), True)
+        )
+        signal = signal or Mock()
+        tracker = tracker or Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch:
+            cleaned = watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+        return cleaned, signal, tracker, notify, redispatch
+
+    def test_clears_the_cancellation_signal_end_pipeline_run_set(self, watchdog):
+        cleaned, signal, _tracker, notify, redispatch = self._cleanup_as_non_holder(watchdog)
+
+        assert cleaned is True
+        redispatch.assert_not_called()
+        notify.assert_not_called()
+        signal.clear.assert_called_once_with("proj", 42)
+
+    def test_abandons_the_dead_runs_stale_in_progress_entries(self, watchdog):
+        cleaned, _signal, tracker, _notify, _redispatch = self._cleanup_as_non_holder(watchdog)
+
+        assert cleaned is True
+        tracker.abandon_stale_in_progress_entries.assert_called_once()
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["project_name"] == "proj"
+        assert kwargs["issue_number"] == 42
+        # Empty on purpose: no agent container is running for a zombie -- that
+        # is its definition -- so every in_progress entry it has is stale.
+        assert kwargs["active_task_ids"] == set()
+        # The forensic record an operator reads must not claim a restart that
+        # never happened, same as _redispatch_same_issue's own reason text.
+        assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
+        """Best-effort, like the equivalent cleanups on the redispatch path:
+        the run is ended and the lock is some other issue's either way, so a
+        failure here is a WARNING naming what is still blocking re-pickup, not
+        an escalation to manual intervention."""
+        signal = Mock()
+        signal.clear.side_effect = RuntimeError("redis down")
+        tracker = Mock()
+        tracker.abandon_stale_in_progress_entries.side_effect = OSError("state file unreadable")
+
+        cleaned, _signal, _tracker, notify, redispatch = self._cleanup_as_non_holder(
+            watchdog, signal=signal, tracker=tracker
+        )
+
+        assert cleaned is True
+        notify.assert_not_called()
+        redispatch.assert_not_called()
+
+    def test_the_holder_path_still_redispatches_rather_than_short_circuiting(self, watchdog):
+        """Control case: the short-circuit must stay scoped to a non-holder --
+        an issue that DOES hold the lock still goes through clear_retained_
+        reason + redispatch, which does its own abandon/dispatch."""
+        signal = Mock()
+        tracker = Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue", return_value=True) as redispatch:
+            cleaned = watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        assert cleaned is True
+        redispatch.assert_called_once_with("proj", "SDLC Execution", 42)
+        notify.assert_not_called()
+        signal.clear.assert_not_called()
+        tracker.abandon_stale_in_progress_entries.assert_not_called()
 
 
 class TestProductionFallbackDependencies:

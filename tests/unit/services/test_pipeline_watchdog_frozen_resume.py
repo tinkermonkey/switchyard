@@ -101,6 +101,62 @@ def watchdog():
         yield wd
 
 
+class TestActiveResumeNonHolderShortCircuitLeavesTheIssueRePickupable:
+    """Twin of TestZombieNonHolderShortCircuitLeavesTheIssueRePickupable in
+    test_pipeline_watchdog_retry.py, for the frozen-run resume branch: the
+    frozen run is ended and the issue does not hold the lock, so nothing is
+    redispatched -- which means end_pipeline_run's cancellation signal and the
+    frozen run's 'in_progress' execution record are both still in place, and
+    both are consulted by exactly the recovery paths this branch says the
+    issue is being left to.
+    """
+
+    def _resume_as_non_holder(self, watchdog, signal=None, tracker=None):
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(Mock(locked_by_issue=170), True)
+        )
+        signal = signal or Mock()
+        tracker = tracker or Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch:
+            resumed = watchdog._actively_resume_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at=old_timestamp(),
+            )
+        return resumed, signal, tracker, notify, redispatch
+
+    def test_clears_the_cancellation_signal_and_abandons_stale_entries(self, watchdog):
+        resumed, signal, tracker, notify, redispatch = self._resume_as_non_holder(watchdog)
+
+        assert resumed is True
+        redispatch.assert_not_called()
+        notify.assert_not_called()
+        signal.clear.assert_called_once_with("proj", 42)
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["project_name"] == "proj"
+        assert kwargs["issue_number"] == 42
+        assert kwargs["active_task_ids"] == set()
+        assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
+        signal = Mock()
+        signal.clear.side_effect = RuntimeError("redis down")
+        tracker = Mock()
+        tracker.abandon_stale_in_progress_entries.side_effect = OSError("state file unreadable")
+
+        resumed, _signal, _tracker, notify, _redispatch = self._resume_as_non_holder(
+            watchdog, signal=signal, tracker=tracker
+        )
+
+        assert resumed is True
+        notify.assert_not_called()
+
+
 def _active_run_hit(pipeline_run_id, project, issue_number, started_at):
     return {
         "_source": {
