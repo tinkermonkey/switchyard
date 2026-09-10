@@ -19,6 +19,7 @@ import yaml
 from unittest.mock import MagicMock, patch, mock_open
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 
@@ -28,9 +29,41 @@ with tempfile.TemporaryDirectory() as _tmpdir:
         from services.work_execution_state import (
             WorkExecutionStateTracker,
             _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES,
+            _WATCHDOG_UNATTRIBUTABLE_AGENTS,
         )
 
 from config.manager import ProjectConfig
+
+
+# The allowlist, spelled out here rather than imported. Every dispatch path named
+# below was checked by hand against its record_execution_start() call site and its
+# completion path: each one finishes through
+# AgentExecutor._post_agent_output_to_github or
+# docker_runner._complete_agent_execution and therefore posts a comment signed
+# "_Processed by the {agent} agent_".
+#
+#   board_dispatch               services/project_monitor.py (the ordinary dispatch)
+#   task_queue                   agents/orchestrator_integration.py
+#   pipeline_progression         services/pipeline_progression.py
+#   review_cycle                 services/review_cycle.py
+#   pr_review_phase2/4           pipeline/pr_review_stage.py
+#   human_feedback_loop_*        services/human_feedback_loop.py
+#
+# Duplicating it is the point: parametrizing the allowlist's own tests over the
+# frozenset they test made them tautologies, so removing an entry silently deleted
+# a test case instead of failing one. Changing the gate's coverage now requires
+# editing this literal too, which is a reviewed edit rather than a parametrize-count
+# change nobody sees.
+_EXPECTED_ATTRIBUTABLE_TRIGGER_SOURCES = frozenset({
+    'board_dispatch',
+    'task_queue',
+    'pipeline_progression',
+    'review_cycle',
+    'pr_review_phase2',
+    'pr_review_phase4',
+    'human_feedback_loop_initial',
+    'human_feedback_loop_response',
+})
 
 
 # detect_and_retry_empty_successful_executions() only examines a record that sits
@@ -45,6 +78,19 @@ _EXAMINABLE_TIMESTAMP = (datetime.now(timezone.utc) - timedelta(minutes=40)).iso
 
 def _iso(minutes_ago: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def _eligibility_patch(tracker, should_retry):
+    """Stub PROTECTION 4, or let the real one run when `should_retry` is None.
+
+    The real _should_retry_failed_execution() answers Check 1 (the watchdog retry
+    budget) before it touches GitHub, so a test about that budget can run it for
+    real without standing up an issue-state query."""
+    if should_retry is None:
+        return contextlib.nullcontext()
+    return patch.object(
+        tracker, '_should_retry_failed_execution', return_value=should_retry
+    )
 
 
 # The execution start _has_github_output() anchors on throughout
@@ -676,10 +722,13 @@ class TestGitHubOutputVerification:
         """The shape record_execution_start() writes: a start timestamp, a real
         trigger_source, and no completion time at all.
 
-        'task_queue' because that is what the ordinary agent dispatch's last
-        record actually carries -- the task-queue worker records a second start
-        that supersedes project_monitor's 'manual' one -- and because it is one of
-        the dispatch paths whose output this gate can attribute at all.
+        'task_queue' because it is one of the dispatch paths whose output this
+        gate can attribute at all. Note it is NOT what the ordinary board dispatch
+        carries: the task-queue worker's own record_execution_start() is guarded on
+        there being no in_progress entry for this agent/column, so behind
+        project_monitor's probe it never fires and the record the gate sees is that
+        probe, finalized in place. That one carries 'board_dispatch' -- see
+        test_the_ordinary_board_dispatch_is_verified.
         """
         execution = {
             'agent': 'test-agent',
@@ -730,16 +779,25 @@ class TestGitHubOutputVerification:
     @contextlib.contextmanager
     def _gate_environment(
         self, gh_client, workspace_type='issues', discussion_id=None,
-        project_config=None,
+        project_config=None, link_store_readable=True,
     ):
-        """Everything _has_github_output() reaches outside itself."""
+        """Everything _has_github_output() reaches outside itself.
+
+        workspace_type is the _strict resolver's answer, so None here means "the
+        workspace could not be resolved", not "issues" -- that distinction is the
+        whole point of the strict variant (#166), and the tests that run the REAL
+        resolver against a real config live in TestWorkspaceResolutionIsHonest.
+        """
         state_manager = MagicMock()
         state_manager.get_discussion_for_issue.return_value = discussion_id
+        state_manager.get_discussion_for_issue_checked.return_value = (
+            discussion_id, link_store_readable
+        )
 
         with patch('services.github_api_client.get_github_client', return_value=gh_client), \
              patch('config.manager.config_manager.get_project_config') as mock_config, \
              patch(
-                 'claude.docker_runner.resolve_workspace_type_for_column',
+                 'claude.docker_runner.resolve_workspace_type_for_column_strict',
                  return_value=workspace_type
              ), \
              patch('config.state_manager.state_manager', state_manager):
@@ -848,11 +906,15 @@ class TestGitHubOutputVerification:
         gh_client.rest.assert_not_called()
 
     def test_a_manual_dispatch_record_is_never_verified(self, tracker):
-        """project_monitor uses 'manual' for the ordinary board dispatch AND for
-        the two wrapper stages (pr_review_stage, repair cycle), which record an
-        outcome under a name their sub-run does not post under. The ordinary
-        dispatch's own last record is 'task_queue', so declining the ambiguous
-        name costs nothing verifiable."""
+        """'manual' now names only project_monitor's two WRAPPER stages
+        (pr_review_stage, the repair cycle), which record an outcome under a name
+        their sub-run does not post under -- so a missing signed comment says
+        nothing about them.
+
+        It also still names every ordinary board dispatch already on disk, which
+        is why the exclusion stays rather than being retired: the records written
+        before #166 cannot be told apart from the wrappers, and declining them is
+        the conservative direction."""
         gh_client = MagicMock()
         with self._gate_environment(gh_client):
             assert tracker._has_github_output(
@@ -860,6 +922,27 @@ class TestGitHubOutputVerification:
             ) is True
 
         gh_client.rest.assert_not_called()
+
+    def test_the_ordinary_board_dispatch_is_verified(self, tracker):
+        """The gap the 'manual' exclusion used to leave (#166).
+
+        project_monitor's board dispatch writes its probe BEFORE enqueueing, and
+        the task-queue worker declines to write a second start behind it, so
+        record_execution_outcome() finalizes that probe in place -- the last
+        record on the ordinary dispatch path is the probe's own, not a
+        'task_queue' one. While it was spelled 'manual' it was declined along with
+        the two wrapper stages, which cost 6,104 attributable 'success' records
+        (5,914 of them senior_software_engineer) -- the largest single population
+        the gate could otherwise verify. It now has its own name."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(trigger_source='board_dispatch')
+            ) is False
+
+        gh_client.rest.assert_called_once()
 
     def test_an_unrecognised_dispatch_path_is_never_verified(self, tracker):
         """The allowlist is an allowlist so that a dispatch path added later
@@ -873,15 +956,19 @@ class TestGitHubOutputVerification:
 
         gh_client.rest.assert_not_called()
 
-    @pytest.mark.parametrize('trigger_source', sorted(
-        _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES
-    ))
+    @pytest.mark.parametrize('trigger_source', sorted(_EXPECTED_ATTRIBUTABLE_TRIGGER_SOURCES))
     def test_every_attributable_dispatch_path_is_actually_verified(
         self, tracker, trigger_source
     ):
         """The other side of the allowlist: each path on it does reach GitHub and
-        does answer for real, so the list cannot quietly become a way of turning
-        the whole gate back off."""
+        does answer for real.
+
+        Parametrized over the hardcoded _EXPECTED_ATTRIBUTABLE_TRIGGER_SOURCES,
+        NOT over the frozenset under test. Parametrizing over the module's own set
+        asserted only that members of a set are members of that set: removing
+        'task_queue' from it made one case disappear and the suite stayed green
+        while the gate went inert for the most common dispatch path in production.
+        TestTheAllowlistIsPinnedToTheRepo below is what ties the two together."""
         gh_client = MagicMock()
         gh_client.rest.return_value = (True, [])
 
@@ -891,6 +978,82 @@ class TestGitHubOutputVerification:
             ) is False
 
         gh_client.rest.assert_called_once()
+
+    def test_an_agent_that_owns_its_own_posting_is_never_verified(self, tracker):
+        """The per-AGENT axis of the same exclusion (#166).
+
+        work_breakdown_agent sets suppress_github_post (so docker_runner skips
+        _complete_agent_execution) and output_posted (so agent_executor skips
+        _post_agent_output_to_github), and posts its own summary carrying no
+        "_Processed by the ... agent_" marker -- in question mode it posts nothing
+        at all. Its 50 live 'success' records arrive under allowlisted trigger
+        sources, so a trigger-source allowlist alone reads every one of them as
+        "demonstrably produced no output"; the redispatch that follows runs in
+        initial mode and creates the sub-issues a second time."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123,
+                self._execution(
+                    agent='work_breakdown_agent',
+                    column='Work Breakdown',
+                    trigger_source='human_feedback_loop_response',
+                )
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_an_outcome_recovered_from_redis_is_never_verified(self, tracker):
+        """_apply_redis_result()'s shape: a 'success' with a genuine start anchor,
+        a genuine allowlisted trigger_source, and no GitHub post ever attempted.
+
+        docker_runner persists the result payload to Redis BEFORE
+        _complete_agent_execution posts, so a recovered success is precisely the
+        window in which the comment was never written. Answering "no output" there
+        is technically right and operationally wrong: it redispatches a
+        code-writing agent onto a branch it has already pushed commits to."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123,
+                self._execution(outcome_recovered_from_redis=True)
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    # -- where the gate looks ---------------------------------------------
+
+    def test_an_unresolvable_workspace_is_never_verified(self, tracker):
+        """resolve_workspace_type_for_column_strict() answers None when it cannot
+        work out where a column posts -- an 'unknown'/renamed column, a pipeline
+        disabled since the record was written, an unreadable project config.
+
+        The poster's non-strict variant answers 'issues' for all of those, and
+        'issues' is the one value that lets the Discussion scan be skipped
+        entirely: measured against live state, 45 of 165 attributable
+        discussion-workspace records flip from "defer" to "rewrite and
+        redispatch" on that single string."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client, workspace_type=None):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Renamed Column')
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_an_unreadable_link_store_is_never_verified(self, tracker):
+        """get_discussion_for_issue() answers None for "no link recorded" and for
+        "github_state.yaml failed to parse" alike, and save_project_state() is a
+        non-atomic truncate-and-rewrite run from the project-monitor thread -- so
+        a concurrent read really does land on half a file. Reading that as "no
+        discussion" scans only the issue for output that is in a Discussion."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client, link_store_readable=False):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
+
+        gh_client.rest.assert_not_called()
 
     # -- authorship -------------------------------------------------------
 
@@ -918,6 +1081,67 @@ class TestGitHubOutputVerification:
             assert tracker._has_github_output(
                 'test-project', 123, self._execution()
             ) is False
+
+    def test_a_quote_reply_quoting_this_agents_signature_is_not_its_output(self, tracker):
+        """GitHub's "Quote reply" copies the quoted comment verbatim behind '> '
+        prefixes, so a human follow-up that quotes an agent's earlier signed
+        comment carries that agent's signature.
+
+        Read as the agent's own fresh output, it permanently spares a genuinely
+        empty execution: a human_feedback_loop_response that produced nothing, a
+        human quote-reply five minutes later, and the record is never retried
+        until the 24h age gate drops it. services/human_feedback_loop.py already
+        skips signature lines whose stripped form starts with '>' at four sites;
+        the gate now uses the same idiom."""
+        quoted = {
+            'created_at': _iso(minutes_ago=50),
+            'body': (
+                "> # Analysis\n"
+                "> \n"
+                "> ---\n"
+                "> _Processed by the test-agent agent_\n"
+                "\n"
+                "Can you also cover X?"
+            ),
+        }
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [quoted])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, self._execution()) is False
+
+    def test_a_quote_reply_quoting_another_agents_signature_is_not_agent_output(self, tracker):
+        """The same hole on the weaker rung: a quoted signature from some other
+        agent made the scan answer "ambiguous", which also defers forever."""
+        quoted = {
+            'created_at': _iso(minutes_ago=50),
+            'body': "> _Processed by the other-agent agent_\n\nWhat about Y?",
+        }
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [quoted])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, self._execution()) is False
+
+    def test_a_signature_below_a_quoted_block_still_counts(self, tracker):
+        """The line filter must not swallow a real signature that happens to sit
+        in a comment which also quotes something."""
+        comment = {
+            'created_at': _iso(minutes_ago=50),
+            'body': (
+                "> the human asked this\n"
+                "\n"
+                "Answer.\n"
+                "\n"
+                "---\n"
+                "_Processed by the test-agent agent_"
+            ),
+        }
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [comment])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, self._execution()) is True
 
     def test_another_agents_output_is_ambiguous_not_empty(self, tracker):
         """Some agent posted inside this window, just not under this record's
@@ -2015,9 +2239,20 @@ class TestSweepReachesItsProtectionsForReal:
         return record
 
     def _run_sweep(self, tracker, comments):
-        """Run the sweep with only the leaves mocked, on a bounded thread."""
+        """Run the sweep with only the leaves mocked, on a bounded thread.
+
+        The workspace resolution is NOT stubbed here: the real
+        resolve_workspace_type_for_column_strict() runs against this config, which
+        is why the pipeline carries a real workspace and a real workflow template
+        whose columns include the record's own. A config that resolves to nothing
+        makes the strict resolver answer None and the gate decline, which is
+        exactly the behaviour TestWorkspaceResolutionIsHonest pins."""
+        column_cfg = SimpleNamespace(name='In Progress')
+        workflow_template = SimpleNamespace(columns=[column_cfg])
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
+        pipeline_cfg.workflow = 'dev_workflow'
+        pipeline_cfg.workspace = 'issues'
         project_config = ProjectConfig(
             name='test-project',
             description='test',
@@ -2060,6 +2295,7 @@ class TestSweepReachesItsProtectionsForReal:
              patch('services.review_cycle.review_cycle_executor') as mock_rc, \
              patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
             mock_config_manager.get_project_config.return_value = project_config
+            mock_config_manager.get_workflow_template.return_value = workflow_template
             mock_rc._cycle_key.return_value = 'test-project:123'
             mock_rc.active_cycles = {}
             mock_hfl._loop_key.return_value = 'test-project:123'
@@ -2314,9 +2550,12 @@ class TestSweepOnProductionShapedRecords:
         })
         return client
 
+    _REAL_ELIGIBILITY_CHECK = object()
+
     def _run_sweep(
         self, tracker, gh_client, has_github_output=None,
         workspace_type='issues', discussion_id=None,
+        should_retry=(True, 'eligible'),
     ):
         """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed.
 
@@ -2346,6 +2585,7 @@ class TestSweepOnProductionShapedRecords:
 
         state_manager = MagicMock()
         state_manager.get_discussion_for_issue.return_value = discussion_id
+        state_manager.get_discussion_for_issue_checked.return_value = (discussion_id, True)
 
         with patch('config.manager.config_manager') as mock_config_manager, \
              patch('services.github_api_client.get_github_client', return_value=gh_client), \
@@ -2358,13 +2598,11 @@ class TestSweepOnProductionShapedRecords:
                  return_value=queue_manager
              ), \
              patch(
-                 'claude.docker_runner.resolve_workspace_type_for_column',
+                 'claude.docker_runner.resolve_workspace_type_for_column_strict',
                  return_value=workspace_type
              ), \
              patch('config.state_manager.state_manager', state_manager), \
-             patch.object(
-                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
-             ), \
+             _eligibility_patch(tracker, should_retry), \
              patch.object(tracker, '_check_redis_repair_cycle_tracking', return_value=False), \
              patch('services.review_cycle.review_cycle_executor') as mock_rc, \
              patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
@@ -2687,3 +2925,767 @@ class TestReentrantLockErrorReachesTheCaller:
                     {'project_name': 'test-project', 'issue_number': 123,
                      'execution_history': []},
                 )
+
+
+class TestTheAllowlistIsPinnedToTheRepo:
+    """The allowlist and the agent denylist, checked against the code they claim
+    to describe rather than against themselves.
+
+    _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES is the single most dangerous knob in
+    #166: removing an entry turns the gate off for a whole dispatch path, and
+    adding one whose completion path does NOT post a signed comment turns every
+    record from that path into a false "verified empty" and a redispatch -- the
+    83-of-96 repair-cycle failure the change exists to avoid. The tests that used
+    to guard it parametrized over the frozenset itself, so both edits kept the
+    suite green.
+    """
+
+    SOURCE_DIRS_SKIPPED = {
+        'tests', 'node_modules', 'orchestrator_data', 'state', 'venv', '.venv',
+        'htmlcov', 'web-ui',
+    }
+
+    @staticmethod
+    def _repo_root():
+        return Path(__file__).resolve().parents[2]
+
+    @classmethod
+    def _source_files(cls):
+        for path in cls._repo_root().rglob('*.py'):
+            parts = set(path.relative_to(cls._repo_root()).parts)
+            if parts & cls.SOURCE_DIRS_SKIPPED or any(p.startswith('.') for p in parts):
+                continue
+            yield path
+
+    @classmethod
+    def _trigger_source_literals_in_repo(cls):
+        """Every trigger_source string the non-test code can actually record.
+
+        Collected from the two shapes that produce one: a `trigger_source=`
+        keyword argument, and an assignment to a local named `trigger_source`
+        (services/human_feedback_loop.py picks between its two names with a
+        conditional expression, so a keyword-only scan misses both). Only literal
+        values count -- a `.get('trigger_source')` read is a consumer, not a
+        writer, and its key is not a value.
+        """
+        import ast
+
+        literals = set()
+        for path in cls._source_files():
+            try:
+                tree = ast.parse(path.read_text(encoding='utf-8'))
+            except (SyntaxError, UnicodeDecodeError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.keyword) and node.arg == 'trigger_source':
+                    value = node.value
+                elif isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == 'trigger_source'
+                    for t in node.targets
+                ):
+                    value = node.value
+                else:
+                    continue
+
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    literals.add(value.value)
+                elif isinstance(value, ast.IfExp):
+                    for branch in (value.body, value.orelse):
+                        if isinstance(branch, ast.Constant) and isinstance(branch.value, str):
+                            literals.add(branch.value)
+        return literals
+
+    def test_the_allowlist_is_exactly_what_this_suite_expects(self):
+        """Adding or removing a dispatch path has to be a deliberate, reviewed
+        edit in two places, not a parametrize count nobody reads."""
+        assert _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES == _EXPECTED_ATTRIBUTABLE_TRIGGER_SOURCES
+
+    def test_every_allowlisted_source_is_actually_recorded_somewhere(self):
+        """A typo or a stale entry is a silently dead allowlist entry: the gate
+        would decline every record from the path it was meant to cover, and no
+        test would notice."""
+        recorded = self._trigger_source_literals_in_repo()
+
+        assert recorded, "the trigger_source scan found nothing -- it has stopped working"
+        missing = _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES - recorded
+        assert not missing, (
+            f"allowlisted trigger sources that no record_execution_start() call site "
+            f"in this repo writes: {sorted(missing)}"
+        )
+
+    def test_the_repair_cycle_is_still_recorded_and_still_excluded(self):
+        """The measured exclusion, pinned from both ends: the repair cycle really
+        does record these names, and the gate really does still decline them."""
+        recorded = self._trigger_source_literals_in_repo()
+        repair_cycle_sources = {s for s in recorded if s.startswith('repair_cycle')}
+
+        assert repair_cycle_sources, "the repair cycle no longer records a trigger_source"
+        assert not (repair_cycle_sources & _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES)
+
+    def test_every_agent_that_owns_its_own_posting_is_declined(self):
+        """The per-agent axis, derived from the repo rather than from memory.
+
+        An agent that sets suppress_github_post opts out of
+        docker_runner._complete_agent_execution, which is the only thing that
+        posts a comment signed by it -- so a signature scan can never find its
+        output and the gate must decline it. Today that is work_breakdown_agent
+        alone; an agent added later that opts out the same way fails here instead
+        of silently becoming verifiable."""
+        import ast
+
+        suppressing_agents = set()
+        for path in (self._repo_root() / 'agents').glob('*.py'):
+            source = path.read_text(encoding='utf-8')
+            if 'suppress_github_post' not in source:
+                continue
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            # Only a WRITE of the flag opts an agent out; a read of it (which is
+            # what docker_runner does) does not.
+            writes = any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Subscript)
+                    and isinstance(t.slice, ast.Constant)
+                    and t.slice.value == 'suppress_github_post'
+                    for t in node.targets
+                )
+                for node in ast.walk(tree)
+            )
+            if writes:
+                suppressing_agents.add(path.stem)
+
+        assert suppressing_agents, (
+            "no agent writes suppress_github_post any more -- this guard has stopped working"
+        )
+
+        # Module name -> the name execution records are actually written under.
+        # The denylist is matched against execution['agent'], which is an
+        # AGENT_REGISTRY key, so resolving through the registry is what makes this
+        # comparison meaningful rather than a filename coincidence.
+        from agents import AGENT_REGISTRY
+
+        registered = {
+            agent_name
+            for agent_name, agent_cls in AGENT_REGISTRY.items()
+            if agent_cls.__module__.rsplit('.', 1)[-1] in suppressing_agents
+        }
+        assert registered, (
+            f"no registered agent maps to the modules that suppress the signed post "
+            f"({sorted(suppressing_agents)}) -- this guard has stopped working"
+        )
+        assert registered <= _WATCHDOG_UNATTRIBUTABLE_AGENTS, (
+            f"agents that suppress the orchestrator's signed post but are not declined "
+            f"by the empty-output gate: {sorted(registered - _WATCHDOG_UNATTRIBUTABLE_AGENTS)}"
+        )
+
+
+class TestWorkspaceResolutionIsHonest:
+    """resolve_workspace_type_for_column_strict(), run for real.
+
+    Every gate test patches this resolution out, and before #166 there was no
+    direct coverage of it at all -- which is how a function that answered
+    'issues' for "the config could not be read" became the single input deciding
+    whether a missing discussion link means "cannot verify" or "verified empty".
+    """
+
+    @staticmethod
+    def _workflow(*column_names):
+        from config.manager import WorkflowColumn, WorkflowTemplate
+
+        return WorkflowTemplate(
+            name='planning_workflow',
+            description='test',
+            pipeline_mapping='planning_design',
+            columns=[
+                WorkflowColumn(
+                    name=name, stage_mapping=None, agent=None,
+                    description='', automation_rules=[],
+                )
+                for name in column_names
+            ],
+        )
+
+    @staticmethod
+    def _pipeline(workspace, workflow='planning_workflow'):
+        from config.manager import ProjectPipeline
+
+        return ProjectPipeline(
+            template='planning_design',
+            name='planning',
+            board_name='Planning & Design',
+            description='test',
+            workflow=workflow,
+            active=True,
+            workspace=workspace,
+        )
+
+    def _project_config(self, pipelines):
+        return ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=pipelines,
+            pipeline_routing={},
+        )
+
+    @contextlib.contextmanager
+    def _config(self, project_config, workflow_template):
+        with patch('config.manager.config_manager') as mock_config_manager:
+            if isinstance(project_config, Exception):
+                mock_config_manager.get_project_config.side_effect = project_config
+            else:
+                mock_config_manager.get_project_config.return_value = project_config
+            if isinstance(workflow_template, Exception):
+                mock_config_manager.get_workflow_template.side_effect = workflow_template
+            else:
+                mock_config_manager.get_workflow_template.return_value = workflow_template
+            yield
+
+    def test_a_discussion_workspace_column_resolves_to_discussions(self):
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        with self._config(
+            self._project_config([self._pipeline('discussions')]),
+            self._workflow('Requirements', 'Work Breakdown'),
+        ):
+            assert resolve_workspace_type_for_column_strict(
+                'test-project', 'Work Breakdown'
+            ) == 'discussions'
+
+    def test_an_issues_column_resolves_to_issues(self):
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        with self._config(
+            self._project_config([self._pipeline('issues')]),
+            self._workflow('In Development'),
+        ):
+            assert resolve_workspace_type_for_column_strict(
+                'test-project', 'In Development'
+            ) == 'issues'
+
+    def test_a_column_no_workflow_names_is_unresolved(self):
+        """A board rename, or a pipeline disabled since the record was written.
+        The sweep already has a test acknowledging that boards go away
+        (test_a_board_that_is_no_longer_configured_falls_back_to_every_board);
+        columns do too."""
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        with self._config(
+            self._project_config([self._pipeline('discussions')]),
+            self._workflow('Requirements'),
+        ):
+            assert resolve_workspace_type_for_column_strict(
+                'test-project', 'Renamed Column'
+            ) is None
+
+    def test_an_unknown_column_is_unresolved(self):
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        assert resolve_workspace_type_for_column_strict('test-project', 'unknown') is None
+        assert resolve_workspace_type_for_column_strict('test-project', '') is None
+
+    def test_an_unreadable_project_config_is_unresolved_and_logged(self, caplog):
+        """config_manager.get_project_config() raises ConfigurationError for a
+        project whose YAML is momentarily missing or unreadable. That used to be
+        swallowed by `except Exception: pass` into the 'issues' default, with no
+        log line anywhere."""
+        from config.manager import ConfigurationError
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        with self._config(ConfigurationError('boom'), self._workflow('Requirements')):
+            with caplog.at_level(logging.WARNING):
+                assert resolve_workspace_type_for_column_strict(
+                    'test-project', 'Requirements'
+                ) is None
+
+        assert any(
+            'Could not resolve the workspace' in r.message for r in caplog.records
+        ), "a silent flip of where the watchdog looks for output must be visible in the logs"
+
+    def test_a_missing_workflow_template_is_unresolved(self):
+        """get_workflow_template() raises for an unknown template rather than
+        returning None, so the `if not workflow_template: continue` branch never
+        fires -- the raise is the real behaviour and it must not resolve."""
+        from config.manager import ConfigurationError
+        from claude.docker_runner import resolve_workspace_type_for_column_strict
+
+        with self._config(
+            self._project_config([self._pipeline('discussions', workflow='gone')]),
+            ConfigurationError('Workflow template not found: gone'),
+        ):
+            assert resolve_workspace_type_for_column_strict(
+                'test-project', 'Requirements'
+            ) is None
+
+    def test_the_poster_still_gets_its_issues_default(self):
+        """The non-strict variant keeps the fallback: docker_runner has to write
+        the comment somewhere, so a default is the right answer for it. The two
+        callers differ precisely because only one of them can afford a guess."""
+        from config.manager import ConfigurationError
+        from claude.docker_runner import resolve_workspace_type_for_column
+
+        with self._config(ConfigurationError('boom'), self._workflow('Requirements')):
+            assert resolve_workspace_type_for_column('test-project', 'Requirements') == 'issues'
+
+    def test_the_gate_declines_when_the_real_resolver_cannot_answer(self, tmp_path):
+        """The two ends joined, with nothing about the resolution stubbed: a
+        record in a column the config no longer names is left alone rather than
+        rewritten on an 'issues' guess."""
+        tracker = WorkExecutionStateTracker(state_dir=tmp_path)
+        execution = {
+            'agent': 'idea_researcher',
+            'column': 'Research',
+            'outcome': 'success',
+            'timestamp': _ANCHOR,
+            'trigger_source': 'task_queue',
+        }
+
+        gh_client = MagicMock()
+        state_manager = MagicMock()
+        state_manager.get_discussion_for_issue_checked.return_value = (None, True)
+
+        with self._config(
+            self._project_config([self._pipeline('discussions')]),
+            self._workflow('Requirements'),
+        ), patch(
+            'services.github_api_client.get_github_client', return_value=gh_client
+        ), patch('config.state_manager.state_manager', state_manager):
+            assert tracker._has_github_output('test-project', 72, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+
+class TestTheLinkStoreCanSayItCouldNotBeRead:
+    """get_discussion_for_issue_checked(), the reason the gate can tell "no
+    discussion" from "the link table could not be read"."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        from config.state_manager import GitHubStateManager
+
+        return GitHubStateManager(state_root=tmp_path)
+
+    @staticmethod
+    def _write_state_file(manager, body):
+        state_file = manager._get_project_state_file('test-project')
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(body)
+        return state_file
+
+    def test_no_state_file_is_an_honest_absence(self, manager):
+        assert manager.get_discussion_for_issue_checked('test-project', 72) == (None, True)
+
+    def test_a_recorded_link_is_returned(self, manager):
+        self._write_state_file(manager, yaml.dump({
+            'github_state': {
+                'org': 'test-org', 'repo': 'test-repo', 'boards': {},
+                'last_sync': 'now', 'sync_hash': 'abc',
+                'issue_discussion_links': {'72': 'D_191'},
+            }
+        }))
+
+        assert manager.get_discussion_for_issue_checked('test-project', 72) == ('D_191', True)
+
+    def test_an_unparseable_state_file_reports_the_failure(self, manager):
+        """save_project_state() is a non-atomic truncate-and-rewrite with no lock,
+        called from the project-monitor thread while the watchdog reads from its
+        executor thread -- so half a file is a real state, not a hypothetical."""
+        self._write_state_file(manager, 'github_state:\n  org: [unclosed\n')
+
+        discussion_id, readable = manager.get_discussion_for_issue_checked('test-project', 72)
+        assert discussion_id is None
+        assert readable is False
+
+    def test_a_truncated_state_file_reports_the_failure(self, manager):
+        self._write_state_file(manager, '')
+
+        assert manager.get_discussion_for_issue_checked('test-project', 72) == (None, False)
+
+
+class TestTheGateDoesNotRunUnderTheStateFileLock:
+    """The sweep's two-phase shape (#166).
+
+    detect_and_retry_empty_successful_executions() holds each state file's flock
+    for its whole loop body, taken with file_lock()'s default
+    enforce_timeout=False -- blocking, no timeout. Running the GitHub-output gate
+    inside that meant a `gh` REST call (up to 30s of rate-limit sleep, a 30s
+    subprocess timeout and a 2/4/8s retry ladder) with the issue's lock held,
+    which parks every record_execution_start()/record_execution_outcome() for
+    that issue behind it -- including the ones async callers make on the event
+    loop. It cost nothing before activation only because the gate returned before
+    its first network call on every production record.
+    """
+
+    @pytest.fixture
+    def tracker(self, tmp_path):
+        return WorkExecutionStateTracker(state_dir=tmp_path)
+
+    def test_the_gate_is_called_with_the_lock_free_and_the_record_is_still_rewritten(
+        self, tracker
+    ):
+        from utils.file_lock import file_lock
+
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump({
+                'project_name': 'test-project',
+                'issue_number': 123,
+                'execution_history': [{
+                    'column': 'In Progress',
+                    'agent': 'test-agent',
+                    'timestamp': _EXAMINABLE_TIMESTAMP,
+                    'outcome': 'success',
+                    'trigger_source': 'board_dispatch',
+                    'board_name': 'SDLC Execution',
+                }],
+            }, f)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        observed = {}
+
+        def gate(project_name, issue_number, execution):
+            # A second acquire of the same path from the same thread is either a
+            # ReentrantFileLockError (the sweep still holds it) or a timeout (some
+            # other holder). Either way the gate is not running lock-free.
+            try:
+                with file_lock(lock_file, timeout=1, enforce_timeout=True):
+                    observed['lock_free'] = True
+            except Exception as e:
+                observed['lock_free'] = False
+                observed['error'] = repr(e)
+            return False
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project', description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={}, pipelines=[pipeline_cfg], pipeline_routing={},
+        )
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        with patch('config.manager.config_manager') as mock_config_manager, \
+             patch(
+                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                 return_value=lock_manager
+             ), \
+             patch(
+                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                 return_value=queue_manager
+             ), \
+             patch.object(
+                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+             ), \
+             patch.object(tracker, '_has_github_output', side_effect=gate):
+            mock_config_manager.get_project_config.return_value = project_config
+            count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert observed.get('lock_free') is True, (
+            f"the GitHub-output gate ran while the state file's lock was held: "
+            f"{observed.get('error')}"
+        )
+        assert count == 1
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'failure'
+
+    def test_a_record_that_moved_while_being_verified_is_not_rewritten(self, tracker):
+        """The TOCTOU the single-lock shape used to make impossible. The
+        verification now happens with no lock held, so the record it was about can
+        finish, be redispatched, or already have been rewritten before the sweep
+        gets back -- and the answer is then about a state that no longer exists."""
+        state_file = tracker.get_state_file('test-project', 123)
+        verified = {
+            'column': 'In Progress',
+            'agent': 'test-agent',
+            'timestamp': _EXAMINABLE_TIMESTAMP,
+            'outcome': 'success',
+            'trigger_source': 'board_dispatch',
+        }
+        with open(state_file, 'w') as f:
+            yaml.dump({
+                'project_name': 'test-project',
+                'issue_number': 123,
+                # A NEWER record than the one that was verified -- a redispatch
+                # landed in the window the gate spent talking to GitHub.
+                'execution_history': [verified, {
+                    'column': 'In Progress',
+                    'agent': 'test-agent',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'outcome': 'success',
+                    'trigger_source': 'board_dispatch',
+                }],
+            }, f)
+
+        rewritten = tracker._rewrite_verified_empty_execution(
+            state_file,
+            {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
+        )
+
+        assert rewritten is False
+        with open(state_file) as f:
+            history = yaml.safe_load(f)['execution_history']
+        assert [e['outcome'] for e in history] == ['success', 'success']
+
+    def test_work_that_started_while_verifying_is_not_rewritten(self, tracker):
+        """PROTECTION 1, re-run on the way back in: a dispatch can start in the
+        window the gate spent on GitHub."""
+        state_file = tracker.get_state_file('test-project', 123)
+        verified = {
+            'column': 'In Progress',
+            'agent': 'test-agent',
+            'timestamp': _EXAMINABLE_TIMESTAMP,
+            'outcome': 'success',
+            'trigger_source': 'board_dispatch',
+        }
+        with open(state_file, 'w') as f:
+            yaml.dump({
+                'project_name': 'test-project',
+                'issue_number': 123,
+                'execution_history': [
+                    {
+                        'column': 'Review',
+                        'agent': 'other-agent',
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'outcome': 'in_progress',
+                        'trigger_source': 'board_dispatch',
+                        'task_id': 'task-1',
+                    },
+                    verified,
+                ],
+            }, f)
+
+        rewritten = tracker._rewrite_verified_empty_execution(
+            state_file,
+            {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
+        )
+
+        assert rewritten is False
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+
+class TestWatchdogRetryBudgetSurvivesTheRedispatch:
+    """WATCHDOG_MAX_RETRIES, which could not bind before #166.
+
+    The counter is written on the record the sweep rewrites to 'failure', and the
+    sweep never looks at a state file whose last record is not 'success' -- so
+    that record is never read again. The redispatch it invites appends a brand-new
+    entry carrying nothing, which meant the count on any record was only ever 0 or
+    1 and _should_retry_failed_execution()'s `>= 3` was unreachable. What actually
+    stopped a false-positive loop was project_monitor's
+    MAX_CONSECUTIVE_DISPATCH_FAILURES, whose terminal state is mark_failed() with
+    the board's pipeline lock durably retained.
+    """
+
+    @pytest.fixture
+    def tracker(self, tmp_path):
+        return WorkExecutionStateTracker(state_dir=tmp_path)
+
+    @staticmethod
+    def _last(tracker):
+        return tracker.load_state('test-project', 123)['execution_history'][-1]
+
+    def test_the_count_is_carried_across_a_watchdog_redispatch(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1].update({
+            'outcome': 'failure',
+            'watchdog_retry_triggered': True,
+            'watchdog_retry_count': 2,
+        })
+        tracker.save_state('test-project', 123, state)
+
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+
+        assert self._last(tracker)['watchdog_retry_count'] == 2
+
+    def test_an_ordinary_start_does_not_inherit_a_spent_budget(self, tracker):
+        """Only a record the watchdog itself ended carries forward. A redispatch
+        that then posts properly leaves an ordinary 'success' as the last record,
+        and the next start begins at zero."""
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1].update({
+            'outcome': 'success',
+            'watchdog_retry_count': 2,
+        })
+        tracker.save_state('test-project', 123, state)
+
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+
+        assert 'watchdog_retry_count' not in self._last(tracker)
+
+    def test_a_different_agent_or_column_does_not_inherit(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1].update({
+            'outcome': 'failure',
+            'watchdog_retry_triggered': True,
+            'watchdog_retry_count': 3,
+        })
+        tracker.save_state('test-project', 123, state)
+
+        tracker.record_execution_start(
+            issue_number=123, column='Review', agent='other-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+
+        assert 'watchdog_retry_count' not in self._last(tracker)
+
+    def test_three_rewrites_in_a_row_exhaust_the_budget(self, tracker):
+        """The end-to-end guarantee the budget is supposed to give: sweep,
+        redispatch, sweep, redispatch, sweep -- and the fourth sweep refuses."""
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project', description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={}, pipelines=[pipeline_cfg], pipeline_routing={},
+        )
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        state_manager = MagicMock()
+        state_manager.get_discussion_for_issue_checked.return_value = (None, True)
+
+        @contextlib.contextmanager
+        def sweep_environment():
+            with patch('config.manager.config_manager') as mock_config_manager, \
+                 patch(
+                     'services.github_api_client.get_github_client', return_value=gh_client
+                 ), \
+                 patch(
+                     'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                     return_value=lock_manager
+                 ), \
+                 patch(
+                     'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                     return_value=queue_manager
+                 ), \
+                 patch(
+                     'claude.docker_runner.resolve_workspace_type_for_column_strict',
+                     return_value='issues'
+                 ), \
+                 patch('config.state_manager.state_manager', state_manager), \
+                 patch.object(
+                     tracker, '_check_redis_repair_cycle_tracking', return_value=False
+                 ), \
+                 patch('services.review_cycle.review_cycle_executor') as mock_rc, \
+                 patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
+                mock_config_manager.get_project_config.return_value = project_config
+                mock_rc._cycle_key.return_value = 'test-project:123'
+                mock_rc.active_cycles = {}
+                mock_hfl._loop_key.return_value = 'test-project:123'
+                mock_hfl.active_loops = {}
+                yield
+
+        def dispatch_and_succeed():
+            tracker.record_execution_start(
+                issue_number=123, column='In Progress', agent='test-agent',
+                trigger_source='board_dispatch', project_name='test-project',
+                board_name='SDLC Execution',
+            )
+            tracker.record_execution_outcome(
+                issue_number=123, column='In Progress', agent='test-agent',
+                outcome='success', project_name='test-project',
+            )
+
+        dispatch_and_succeed()
+
+        for expected in (1, 2, 3):
+            with sweep_environment():
+                # PROTECTION 4 stubbed only for the rewrites; the final sweep runs
+                # the real check, which is where the budget is enforced.
+                with patch.object(
+                    tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+                ):
+                    assert tracker.detect_and_retry_empty_successful_executions() == 1
+            assert self._last(tracker)['watchdog_retry_count'] == expected
+            dispatch_and_succeed()
+            assert self._last(tracker)['watchdog_retry_count'] == expected
+
+        with sweep_environment():
+            # No stub: _should_retry_failed_execution()'s Check 1 answers before it
+            # touches GitHub, so the budget alone decides this.
+            assert tracker.detect_and_retry_empty_successful_executions() == 0
+
+        assert self._last(tracker)['outcome'] == 'success'
+
+
+class TestRedisRecoveredOutcomesAreMarked:
+    """_apply_redis_result()'s records, the third writer of outcome='success'."""
+
+    @pytest.fixture
+    def tracker(self, tmp_path):
+        return WorkExecutionStateTracker(state_dir=tmp_path)
+
+    def test_a_recovered_success_is_stamped(self, tracker):
+        execution = {
+            'column': 'In Development', 'agent': 'senior_software_engineer',
+            'timestamp': _ANCHOR, 'outcome': 'in_progress',
+            'trigger_source': 'task_queue',
+        }
+        redis_client = MagicMock()
+
+        applied = tracker._apply_redis_result(
+            execution, {'exit_code': 0}, 'agent_result:p:1:t', 'test-project',
+            1, 'senior_software_engineer', 'In Development', redis_client,
+        )
+
+        assert applied is True
+        assert execution['outcome'] == 'success'
+        assert execution['outcome_recovered_from_redis'] is True
+
+    def test_a_recovered_failure_is_stamped_too(self, tracker):
+        execution = {
+            'column': 'In Development', 'agent': 'senior_software_engineer',
+            'timestamp': _ANCHOR, 'outcome': 'in_progress',
+            'trigger_source': 'task_queue',
+        }
+        redis_client = MagicMock()
+
+        tracker._apply_redis_result(
+            execution, {'exit_code': 1, 'output': 'boom'}, 'agent_result:p:1:t',
+            'test-project', 1, 'senior_software_engineer', 'In Development', redis_client,
+        )
+
+        assert execution['outcome'] == 'failure'
+        assert execution['outcome_recovered_from_redis'] is True
+
+    def test_a_payload_with_no_exit_code_stamps_nothing_terminal(self, tracker):
+        execution = {'outcome': 'in_progress'}
+        redis_client = MagicMock()
+
+        applied = tracker._apply_redis_result(
+            execution, {}, 'agent_result:p:1:t', 'test-project', 1,
+            'senior_software_engineer', 'In Development', redis_client,
+        )
+
+        assert applied is False
+        assert execution['outcome'] == 'in_progress'
+        assert 'outcome_recovered_from_redis' not in execution

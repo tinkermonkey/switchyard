@@ -3,7 +3,10 @@ Unit tests for stale in_progress execution history cleanup.
 
 Covers:
 1. Fix 1 — conditional guard in orchestrator_integration.process_task_integrated():
-   a pre-enqueue 'manual' probe prevents a second 'task_queue' probe from being created.
+   a pre-enqueue probe (project_monitor writes one with trigger_source='board_dispatch')
+   prevents a second 'task_queue' probe from being created. The guard matches on
+   agent/column, not on the probe's trigger_source, so these tests exercise it with
+   the name production used to write.
 
 2. Fix 2 — WorkExecutionStateTracker.abandon_stale_in_progress_entries():
    correctly abandons entries with no task_id or a task_id not in active_task_ids,

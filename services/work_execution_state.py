@@ -86,13 +86,22 @@ _OUTPUT_EVIDENCE_RANK = {
 #     posted its summary. That is the 29-of-30 failure mode this gate was split
 #     out of #150 to avoid, and it is 2,053 of 4,566 last-record successes -- so
 #     this exclusion is also the watchdog's largest blind spot, tracked in #188.
-#   * 'manual'. project_monitor uses it for the ordinary board dispatch AND for
-#     the two wrapper stages (pr_review_stage, repair cycle), which record an
-#     outcome under a name their sub-run does not post under. The ordinary
-#     dispatch's own last record is 'task_queue' anyway -- the task-queue worker
-#     records a second start that supersedes the wrapper's -- so nothing
-#     verifiable is lost by declining the ambiguous name.
+#   * 'manual'. project_monitor keeps it for its two WRAPPER stages only
+#     (pr_review_stage at project_monitor.py:~7992, the repair cycle at ~8623),
+#     which record an outcome under a name their sub-run does not post under.
+#     The ordinary board dispatch used to share that name, and the exclusion cost
+#     6,104 attributable 'success' records -- the largest single population the
+#     gate could otherwise verify, 5,914 of them senior_software_engineer -- for
+#     no verifiable gain, because the task-queue worker does NOT write a second
+#     'task_queue' start behind project_monitor's probe (its
+#     record_execution_start is guarded on there being no in_progress entry, see
+#     agents/orchestrator_integration.py) and record_execution_outcome() finalizes
+#     the probe in place. That dispatch now records 'board_dispatch' instead, so
+#     the two are told apart by name rather than declined together (#166).
+#     Records already on disk carry 'manual' and stay declined, which is the
+#     conservative direction.
 _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES = frozenset({
+    'board_dispatch',
     'task_queue',
     'pipeline_progression',
     'review_cycle',
@@ -100,6 +109,30 @@ _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES = frozenset({
     'pr_review_phase4',
     'human_feedback_loop_initial',
     'human_feedback_loop_response',
+})
+
+# Agents that own their own GitHub posting and therefore never emit the signed
+# comment the gate looks for -- a per-AGENT exclusion, because whether a signed
+# comment gets posted is decided by the agent, not by the dispatch path that
+# started it (#166).
+#
+# work_breakdown_agent sets task_context['suppress_github_post'] = True (which
+# makes docker_runner skip _complete_agent_execution) and context['output_posted']
+# = True (which makes agent_executor skip _post_agent_output_to_github), so both
+# AgentCommentFormatter.format_agent_completion call sites are dead for it. Its
+# only output is _post_creation_summary()/_post_error_comment(), whose bodies
+# carry no "_Processed by the ... agent_" marker at all -- and in question mode
+# it posts nothing. Its 50 live 'success' records arrive under allowlisted
+# trigger sources ('human_feedback_loop_initial', 'task_queue'), so without this
+# the gate reads every one of them as "demonstrably produced no output" and
+# redispatches an agent whose redispatch runs in initial mode and creates the
+# sub-issues a second time.
+#
+# test_every_agent_that_owns_its_own_posting_is_declined pins this set against
+# the suppress_github_post literals actually in agents/, so an agent added later
+# that opts out of the signed post cannot quietly become verifiable.
+_WATCHDOG_UNATTRIBUTABLE_AGENTS = frozenset({
+    'work_breakdown_agent',
 })
 
 
@@ -111,6 +144,23 @@ def _agent_output_signature(agent: str) -> str:
 def _stronger_output_evidence(left: str, right: str) -> str:
     """Combine two workspace scans into the answer that leaves the record alone."""
     return left if _OUTPUT_EVIDENCE_RANK[left] >= _OUTPUT_EVIDENCE_RANK[right] else right
+
+
+def _unquoted_body(body: str) -> str:
+    """`body` with GitHub quote-reply lines removed.
+
+    "Quote reply" copies the quoted comment verbatim behind '> ' prefixes, so a
+    human follow-up that quotes an agent's earlier signed comment carries that
+    agent's signature -- and a bare substring test reads it as the agent's own
+    fresh output, which permanently spares a genuinely empty execution from the
+    retry it needs. services/human_feedback_loop.py already skips signature lines
+    whose stripped form starts with '>' for exactly this reason (four sites); this
+    is the same idiom, applied once so both the this-agent and any-agent checks
+    below get it.
+    """
+    return '\n'.join(
+        line for line in body.split('\n') if not line.strip().startswith('>')
+    )
 
 
 def _classify_output_evidence(entries, agent: str, anchor: datetime) -> str:
@@ -137,7 +187,7 @@ def _classify_output_evidence(entries, agent: str, anchor: datetime) -> str:
         if created < anchor:
             continue
 
-        body = body or ''
+        body = _unquoted_body(body or '')
         if signature in body:
             return _OUTPUT_EVIDENCE_AGENT
         if _ANY_AGENT_OUTPUT_SIGNATURE_RE.search(body):
@@ -528,7 +578,35 @@ class WorkExecutionStateTracker:
         if board_name:
             execution['board_name'] = board_name
 
-        state['execution_history'].append(execution)
+        history = state['execution_history']
+
+        # Carry the empty-output watchdog's retry budget across the redispatch it
+        # just invited (#166). detect_and_retry_empty_successful_executions() writes
+        # watchdog_retry_count onto the record it rewrites to 'failure' -- and that
+        # record is then never looked at again, because the sweep only ever examines
+        # a state file whose LAST record is 'success'. Without this the counter on
+        # any record is only ever 0 or 1 and _should_retry_failed_execution()'s
+        # `>= WATCHDOG_MAX_RETRIES` can never bind, so a systematic false "no output"
+        # for one issue loops sweep -> rewrite -> redispatch -> success -> rewrite
+        # every 15 minutes until project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES
+        # fires mark_failed() and durably retains the board lock -- exactly the blast
+        # radius the budget exists to bound.
+        #
+        # Scoped to the IMMEDIATELY preceding record for this same (column, agent),
+        # and only when the watchdog is what ended it: a redispatch that then
+        # genuinely posts leaves an ordinary 'success' as the last record, so the
+        # next unrelated start begins at zero again rather than inheriting a budget
+        # spent months ago.
+        if history:
+            previous = history[-1]
+            if (previous.get('watchdog_retry_triggered')
+                    and previous.get('column') == column
+                    and previous.get('agent') == agent):
+                carried = previous.get('watchdog_retry_count', 0)
+                if carried:
+                    execution['watchdog_retry_count'] = carried
+
+        history.append(execution)
         state['current_status'] = column
 
         self.save_state(project_name, issue_number, state)
@@ -1863,6 +1941,11 @@ class WorkExecutionStateTracker:
         retried_count = 0
         state_files = list(self.state_dir.glob("*.yaml"))
 
+        # Records that survived PROTECTIONS 0-5 and still need the GitHub-output
+        # gate. Collected under each state file's lock and verified after the loop
+        # with no lock held -- see the collection site for why.
+        candidates = []
+
         max_record_age_hours = float(
             os.environ.get('WATCHDOG_MAX_RECORD_AGE_HOURS', _WATCHDOG_MAX_RECORD_AGE_HOURS)
         )
@@ -2304,51 +2387,58 @@ class WorkExecutionStateTracker:
                         except Exception as e:
                             logger.debug(f"Could not parse completed_at timestamp: {e}")
 
-                    # Check if GitHub output exists (fails closed - see the method's
-                    # docstring: True also means "could not verify", which defers
-                    # rather than redispatching)
-                    if self._has_github_output(project_name, issue_number, last_exec):
-                        logger.debug(
-                            f"Watchdog: {project_name}/#{issue_number} has GitHub output "
-                            f"(or it could not be verified) - leaving the record alone"
-                        )
-                        continue
+                    # PROTECTION 6, the GitHub-output gate, is deliberately NOT run
+                    # here -- it is the second pass below, with no lock held.
+                    #
+                    # Everything above this point is local file/lock/queue work. The
+                    # gate makes blocking `gh` subprocess calls: a REST call for the
+                    # issue's comments and, in a discussion workspace, a GraphQL call
+                    # as well, each of which sleeps up to 30s for rate-limit
+                    # throttling, uses a 30s subprocess timeout and retries a
+                    # transient failure three times on a 2/4/8s ladder -- so a single
+                    # record can spend minutes inside it. This loop holds the issue's
+                    # flock for its whole body, taken with file_lock()'s default
+                    # enforce_timeout=False, i.e. blocking with no timeout; every
+                    # record_execution_start()/record_execution_outcome() for the same
+                    # issue goes through that lock, several of them from async callers
+                    # on the event loop (review_cycle, human_feedback_loop,
+                    # pr_review_stage). Verifying under the lock therefore parks the
+                    # monitoring thread -- and the event loop -- behind a GitHub call,
+                    # and surfaces as an unexplained polling stall rather than as an
+                    # error. It cost nothing before #166 only because the gate returned
+                    # before its first network call on every production record.
+                    candidates.append({
+                        'state_file': state_file,
+                        'project_name': project_name,
+                        'issue_number': issue_number,
+                        'execution': last_exec,
+                    })
 
-                    # ALL PROTECTIONS PASSED - Safe to mark for retry
-                    logger.warning(
-                        f"Watchdog: Detected successful execution with no output for "
-                        f"{project_name}/#{issue_number} - marking as failure to trigger retry"
+            except Exception as e:
+                logger.error(f"Watchdog: Error processing {state_file}: {e}", exc_info=True)
+
+        # PROTECTION 6: ask GitHub whether each surviving candidate actually produced
+        # output, with no lock held, then re-take the lock to rewrite -- see
+        # _rewrite_verified_empty_execution() for what the re-read has to re-establish.
+        for candidate in candidates:
+            state_file = candidate['state_file']
+            project_name = candidate['project_name']
+            issue_number = candidate['issue_number']
+
+            try:
+                # Fails closed - see the method's docstring: True also means "could
+                # not verify", which defers rather than redispatching.
+                if self._has_github_output(
+                    project_name, issue_number, candidate['execution']
+                ):
+                    logger.debug(
+                        f"Watchdog: {project_name}/#{issue_number} has GitHub output "
+                        f"(or it could not be verified) - leaving the record alone"
                     )
+                    continue
 
-                    # Mark as failure to trigger retry
-                    last_exec['outcome'] = 'failure'
-                    last_exec['error'] = 'Execution marked as success but produced no visible GitHub output'
-                    last_exec['watchdog_retry_triggered'] = True
-                    last_exec['watchdog_retry_count'] = last_exec.get('watchdog_retry_count', 0) + 1
-                    last_exec['watchdog_last_retry_at'] = datetime.now().isoformat() + 'Z'
-
-                    # Write updated state
-                    with open(state_file, 'w') as f:
-                        yaml.dump(state, f, default_flow_style=False, sort_keys=False)
-
+                if self._rewrite_verified_empty_execution(state_file, candidate):
                     retried_count += 1
-
-                    # Emit observability event
-                    try:
-                        from monitoring.observability import get_observability_manager, EventType
-                        obs = get_observability_manager()
-                        obs.emit(
-                            EventType.RETRY_ATTEMPTED,
-                            agent='watchdog',
-                            project=project_name,
-                            data={
-                                'issue_number': issue_number,
-                                'reason': 'empty_output_on_success',
-                                'retry_count': last_exec['watchdog_retry_count']
-                            }
-                        )
-                    except Exception as e:
-                        logger.debug(f"Could not emit observability event: {e}")
 
             except Exception as e:
                 logger.error(f"Watchdog: Error processing {state_file}: {e}", exc_info=True)
@@ -2357,6 +2447,99 @@ class WorkExecutionStateTracker:
             logger.info(f"Watchdog: Marked {retried_count} executions for retry (empty output)")
 
         return retried_count
+
+    def _rewrite_verified_empty_execution(self, state_file, candidate: dict) -> bool:
+        """Rewrite one verified-empty 'success' record to 'failure', under the lock.
+
+        The second half of the sweep's two-phase shape. The GitHub verification that
+        produced this decision ran with NO lock held (see the collection site), so
+        the record it was about may have moved on: an outcome recorded, a fresh
+        dispatch appended, another sweep's rewrite. The re-read here closes that
+        window -- it re-establishes that the last record is still the same 'success'
+        entry (timestamp + agent + column identify it) and re-runs PROTECTION 1
+        before rewriting. Anything else means the verification answered a question
+        about a state that no longer exists, and the record is left for the next
+        sweep rather than rewritten on a stale answer.
+
+        Returns True only when the record was actually rewritten.
+        """
+        from utils.file_lock import file_lock
+
+        project_name = candidate['project_name']
+        issue_number = candidate['issue_number']
+        verified = candidate['execution']
+
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+        with file_lock(lock_file):
+            if not state_file.exists():  # Check inside lock
+                return False
+            with open(state_file, 'r') as f:
+                state = yaml.safe_load(f)
+
+            if not isinstance(state, dict) or not state.get('execution_history'):
+                return False
+
+            last_exec = state['execution_history'][-1]
+
+            if (last_exec.get('outcome') != 'success'
+                    or last_exec.get('timestamp') != verified.get('timestamp')
+                    or last_exec.get('agent') != verified.get('agent')
+                    or last_exec.get('column') != verified.get('column')):
+                logger.debug(
+                    f"Watchdog: {project_name}/#{issue_number} changed while its GitHub "
+                    f"output was being verified -- leaving it for the next sweep"
+                )
+                return False
+
+            # PROTECTION 1 again, and for the same reason it exists: a dispatch may
+            # have started in the window this sweep spent talking to GitHub.
+            if self.has_active_execution_for_state(
+                state, project_name, issue_number, persist_probe_cleanup=False
+            ):
+                logger.debug(
+                    f"Watchdog: Skipping {project_name}/#{issue_number}: work started "
+                    f"while its GitHub output was being verified"
+                )
+                return False
+
+            # ALL PROTECTIONS PASSED - Safe to mark for retry
+            logger.warning(
+                f"Watchdog: Detected successful execution with no output for "
+                f"{project_name}/#{issue_number} - marking as failure to trigger retry"
+            )
+
+            # Mark as failure to trigger retry
+            last_exec['outcome'] = 'failure'
+            last_exec['error'] = 'Execution marked as success but produced no visible GitHub output'
+            last_exec['watchdog_retry_triggered'] = True
+            last_exec['watchdog_retry_count'] = last_exec.get('watchdog_retry_count', 0) + 1
+            last_exec['watchdog_last_retry_at'] = datetime.now().isoformat() + 'Z'
+
+            # Write updated state
+            with open(state_file, 'w') as f:
+                yaml.dump(state, f, default_flow_style=False, sort_keys=False)
+
+            retry_count = last_exec['watchdog_retry_count']
+
+        # Emit observability event -- outside the lock, because an Elasticsearch
+        # write is not something to hold this issue's flock for.
+        try:
+            from monitoring.observability import get_observability_manager, EventType
+            obs = get_observability_manager()
+            obs.emit(
+                EventType.RETRY_ATTEMPTED,
+                agent='watchdog',
+                project=project_name,
+                data={
+                    'issue_number': issue_number,
+                    'reason': 'empty_output_on_success',
+                    'retry_count': retry_count
+                }
+            )
+        except Exception as e:
+            logger.debug(f"Could not emit observability event: {e}")
+
+        return True
 
     def _has_github_output(self, project_name: str, issue_number: int, execution: dict) -> bool:
         """
@@ -2399,11 +2582,20 @@ class WorkExecutionStateTracker:
             banner or the pipeline watchdog's own "Pipeline Stuck" notice read as
             the agent's work.
           * ...and it has to decline the executions whose output is not a signed
-            agent comment at all. The repair cycle reports through a stage summary
-            of its own, so a signature check reads every repair-cycle record as
-            empty; measured over seven days of live records that was 83 wrong
-            answers out of 96. Those dispatch paths are declined outright -- see
-            _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES.
+            agent comment at all. That is three separate axes, not one, and the
+            class is not closed on any of them -- each has its own guard:
+              - the DISPATCH PATH. The repair cycle reports through a stage summary
+                of its own, so a signature check reads every repair-cycle record as
+                empty; measured over seven days of live records that was 83 wrong
+                answers out of 96. See _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES.
+              - the AGENT. work_breakdown_agent suppresses the orchestrator's post
+                and does its own, unsigned; its 50 live 'success' records arrive
+                under allowlisted trigger sources, and a redispatch of it re-creates
+                the sub-issues. See _WATCHDOG_UNATTRIBUTABLE_AGENTS.
+              - the WRITER of the outcome. _apply_redis_result() marks a record
+                'success' from an exit_code recovered out of Redis, on a path that
+                never posts to GitHub at all; those records are stamped
+                outcome_recovered_from_redis and declined here.
 
         Args:
             project_name: Project name
@@ -2446,6 +2638,34 @@ class WorkExecutionStateTracker:
                 )
                 return True
 
+            if agent in _WATCHDOG_UNATTRIBUTABLE_AGENTS:
+                # The dispatch path posts a signed comment; THIS agent opted out of
+                # it and does its own posting. The allowlist above cannot see that,
+                # because it is a property of the agent -- see the denylist.
+                logger.debug(
+                    f"Watchdog: {project_name}/#{issue_number} ran '{agent}', which owns "
+                    f"its own GitHub posting and emits no signed comment "
+                    f"-- leaving the record alone"
+                )
+                return True
+
+            if execution.get('outcome_recovered_from_redis'):
+                # cleanup_stuck_in_progress_states() -> _apply_redis_result() turned
+                # this in_progress entry into a 'success' from an exit_code it found
+                # in Redis, on a record that keeps its real start timestamp and its
+                # real trigger_source. docker_runner persists that payload BEFORE
+                # _complete_agent_execution posts, so a recovered success is exactly
+                # the window in which the comment may never have been written -- the
+                # gate would answer "no output" correctly and redispatch a
+                # code-writing agent onto a branch it has already pushed commits to.
+                # Declined for the same reason every other "can't tell" is (#166).
+                logger.debug(
+                    f"Watchdog: {project_name}/#{issue_number}'s outcome was recovered from "
+                    f"Redis, so no GitHub post was ever attempted on this path "
+                    f"-- leaving the record alone"
+                )
+                return True
+
             gh = get_github_client()
             # get_project_config() raises rather than returning None for an unknown
             # project, so there is no falsy-config case to test for here -- and a
@@ -2463,13 +2683,49 @@ class WorkExecutionStateTracker:
 
             # Where this column's agent posts. Resolved from the pipeline config by
             # the same helper the poster itself uses (claude/docker_runner.py), so
-            # the gate and the writer cannot drift apart.
-            from claude.docker_runner import resolve_workspace_type_for_column
+            # the gate and the writer cannot drift apart -- the _strict sibling,
+            # which reports "could not resolve" instead of defaulting to the
+            # poster's 'issues'.
+            from claude.docker_runner import resolve_workspace_type_for_column_strict
             from config.state_manager import state_manager
 
             column = execution.get('column') or 'unknown'
-            workspace_type = resolve_workspace_type_for_column(project_name, column)
-            discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+            workspace_type = resolve_workspace_type_for_column_strict(project_name, column)
+
+            if workspace_type is None:
+                # The _strict variant, not the poster's resolve_workspace_type_for_
+                # column(), which answers 'issues' for an 'unknown' column, for a
+                # column no configured workflow names any more, and for any
+                # exception during resolution alike. 'issues' is the one answer
+                # that lets the Discussion scan below be skipped entirely, so that
+                # default reads a failed resolution as a positive claim about where
+                # the agent posted: measured against live state, 45 of 165
+                # attributable discussion-workspace records flip from "defer" to
+                # "rewrite and redispatch" on that single value (#166).
+                logger.debug(
+                    f"Watchdog: could not resolve which workspace {project_name} column "
+                    f"'{column}' posts to -- cannot verify GitHub output, leaving the "
+                    f"record alone"
+                )
+                return True
+
+            discussion_id, link_store_readable = (
+                state_manager.get_discussion_for_issue_checked(project_name, issue_number)
+            )
+            if not link_store_readable:
+                # load_project_state() answers None for "no link" and for "the state
+                # file is there and failed to parse" alike, and save_project_state()
+                # is a non-atomic truncate-and-rewrite called from the
+                # project-monitor thread while this sweep reads from its executor
+                # thread -- so a concurrent read genuinely lands on half a file.
+                # Reading that as "this issue has no discussion" would scan only the
+                # issue for output that is in a Discussion.
+                logger.warning(
+                    f"Watchdog: {project_name}'s issue/discussion link store could not be "
+                    f"read while checking #{issue_number} -- cannot verify GitHub output, "
+                    f"leaving the record alone"
+                )
+                return True
 
             if workspace_type in ('discussions', 'hybrid') and not discussion_id:
                 # post_agent_output() falls back to an issue comment when it has no
@@ -2572,6 +2828,18 @@ class WorkExecutionStateTracker:
         written; the trigger_source fallback covers the ones already on disk,
         which carry no board and no real trigger either ('unknown' is written
         nowhere else).
+
+        There is a THIRD writer of outcome='success', and its anchor is fine while
+        its attribution is not: _apply_redis_result() mutates the live in_progress
+        entry when cleanup_stuck_in_progress_states() recovers an exit_code 0
+        payload from Redis, so the record keeps a genuine start `timestamp` and a
+        genuine (allowlisted) trigger_source. Nothing on that path posts to GitHub
+        -- docker_runner persists the payload BEFORE _complete_agent_execution
+        posts -- so a signature scan is answering a question the path never gave
+        GitHub a chance to answer. Deliberately NOT handled here, because the
+        anchor really is usable; those records are stamped
+        `outcome_recovered_from_redis` where they are written and declined by
+        _has_github_output() alongside the other unattributable shapes.
         """
         if execution.get('start_time_unknown'):
             return None
@@ -2899,6 +3167,15 @@ class WorkExecutionStateTracker:
                 f"cannot determine outcome — skipping recovery"
             )
             return False
+
+        # Stamped on both outcomes: this record's terminal state came out of Redis,
+        # not out of a completion path. docker_runner persists the payload BEFORE
+        # _complete_agent_execution posts the agent's comment, so a record recovered
+        # here is precisely one whose GitHub post may never have been attempted --
+        # the empty-output gate declines it rather than reading "no signed comment"
+        # as "produced nothing" and redispatching an agent that has already run
+        # (#166). Set before the outcome so the two can never be written apart.
+        execution['outcome_recovered_from_redis'] = True
 
         if exit_code == 0:
             execution['outcome'] = 'success'

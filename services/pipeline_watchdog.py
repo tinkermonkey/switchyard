@@ -962,7 +962,7 @@ class PipelineWatchdog:
           'in_progress' (nothing wrote a terminal outcome), which
           _redispatch_same_issue() abandons before dispatching — see its
           docstring. has_active_execution() stays True on such an entry, and
-          permanently so for a trigger_source='manual' probe, which the
+          permanently so for a trigger_source='board_dispatch' probe, which the
           stale-probe self-heal in work_execution_state deliberately does not
           age out; _find_stalled_issues_for_pipeline() then skips the issue on
           that predicate. The only other caller of

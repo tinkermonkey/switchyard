@@ -401,7 +401,8 @@ SWEEPS: Dict[str, SweepSpec] = {
             'but it is a write to a datastore this harness does not checksum',
             'Observability: EventType.RETRY_ATTEMPTED per record that reaches the terminal '
             'decision, into the production event stream and Elasticsearch '
-            '(services/work_execution_state.py, end of the retry branch). Live since #166, '
+            '(services/work_execution_state.py, _rewrite_verified_empty_execution()). '
+            'Live since #166, '
             'so it fires once per record that gets past every protection -- which is exactly '
             'what this harness exists to size before it can happen for real',
             'Redis: the GitHub API client caches its comment reads, so PROTECTION 6 '
