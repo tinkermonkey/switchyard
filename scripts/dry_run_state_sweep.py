@@ -57,14 +57,17 @@ alone does NOT cover both:
 
 External effects — the harness checksums `state/` and nothing else, so anything
 a sweep writes elsewhere is, by construction, something it cannot prove it left
-alone. Both registered sweeps write to production Redis and to the production
-observability stream; the stuck sweep's Redis writes include DELETING a real
-agent's persisted result. Those effects are therefore NEUTRALIZED by default:
-Redis reads still go to the live server (so every guard sees the truth it would
-see in production), Redis WRITES are intercepted and recorded, and observability
-emission is replaced by a recorder. Section 4b of the report lists exactly what
-was intercepted. `--no-neutralize-external-effects` runs them for real, and then
-a sweep with declared writes is refused unless `--allow-external-side-effects`.
+alone. Both registered sweeps write to production Redis, to the production
+observability stream, and -- through get_pipeline_run_manager(), whose __init__
+PUTs an ILM policy and an index template before it does anything else -- to the
+production Elasticsearch cluster; the stuck sweep's Redis writes include
+DELETING a real agent's persisted result. Those effects are therefore
+NEUTRALIZED by default: Redis and Elasticsearch reads still go to the live
+servers (so every guard sees the truth it would see in production), their WRITES
+are intercepted and recorded, and observability emission is replaced by a
+recorder. Section 4b of the report lists exactly what was intercepted.
+`--no-neutralize-external-effects` runs them for real, and then a sweep with
+declared writes is refused unless `--allow-external-side-effects`.
 
 Neutralizing a write can disable a guard that is built on one -- the cleanup
 coordination claim is a SET NX, and a neutralized SET NX always reports a
@@ -79,7 +82,8 @@ Usage:
         --deployment-root /app --keep-scratch --json /tmp/report.json
 
 Exit codes:
-    0  the sweep ran and the live tree is byte-identical
+    0  the sweep ran and no live state file changed (a `<state file>.lock` flock
+       artifact carries no state and is reported, not counted against this)
     1  a hard failure: copy verification failed, a manager resolved to a live
        path, or the sweep's own work showed up in the live tree (a leak)
     2  usage error
@@ -384,8 +388,15 @@ SWEEPS: Dict[str, SweepSpec] = {
         terminal_patterns=(r'marking as failure to trigger retry',),
         external_reads=(
             'GitHub GraphQL/REST (issue comments), once per record that reaches PROTECTION 6',
+            'Elasticsearch: pipeline-runs-* search, per record that reaches PROTECTION 4 '
+            '(get_active_pipeline_run() falls through to ES on a Redis mapping miss; it is '
+            'called with restore_to_redis=False so the hit is not written back)',
         ),
         external_writes=(
+            'Elasticsearch: PipelineRunManager.__init__ PUTs the "pipeline-runs-ilm-policy" '
+            'ILM policy and the "pipeline-runs-template" index template into the production '
+            'cluster the first time PROTECTION 4 calls get_pipeline_run_manager(). Idempotent, '
+            'but it is a write to a datastore this harness does not checksum',
             'Observability: EventType.RETRY_ATTEMPTED per record that reaches the terminal '
             'decision, into the production event stream and Elasticsearch '
             '(services/work_execution_state.py, end of the retry branch). Inert while #166 '
@@ -418,8 +429,16 @@ SWEEPS: Dict[str, SweepSpec] = {
         ),
         candidate_patterns=(r'Found stuck in_progress execution:',),
         loggers=('services.work_execution_state', 'services.cleanup_guard'),
-        external_reads=('docker ps / docker inspect, once per candidate record',),
+        external_reads=(
+            'docker ps / docker inspect, once per candidate record',
+            'Elasticsearch: pipeline-runs-* search, per record reaching the failure branch '
+            '(get_active_pipeline_run(restore_to_redis=False), for an id to stamp on an event)',
+        ),
         external_writes=(
+            'Elasticsearch: PipelineRunManager.__init__ PUTs the "pipeline-runs-ilm-policy" '
+            'ILM policy and the "pipeline-runs-template" index template into the production '
+            'cluster the first time the failure branch calls get_pipeline_run_manager(). '
+            'Idempotent, but it is a write to a datastore this harness does not checksum',
             'Redis: services.cleanup_guard.try_claim_cleanup() sets a claim key per '
             'candidate, in the PRODUCTION Redis, which suppresses the real sweep for the '
             'claim TTL -- and suppresses a SECOND dry run within that TTL, which would then '
@@ -808,14 +827,31 @@ _NEUTRALIZED_REDIS_RETURNS: Dict[str, Any] = {
     'xtrim': 0, 'rename': True, 'flushdb': True,
 }
 
-#  Module globals that cache a Redis client across calls. A client built before
-#  the patch went in would bypass it entirely, and one built DURING the patch
-#  would outlive it, so they are cleared on the way in and reset on the way out
-#  -- see _module_global_discarded() for why the second half matters more than
-#  the first in this process.
-_CACHED_REDIS_CLIENT_GLOBALS: Tuple[Tuple[str, str], ...] = (
+#  Module globals that cache a neutralizable client across calls -- a Redis
+#  client directly, or a get-or-create manager that holds one (and, for the
+#  pipeline run manager, an Elasticsearch client too). A client built before the
+#  patch went in would bypass it entirely, and one built DURING the patch would
+#  outlive it, so they are cleared on the way in and reset on the way out -- see
+#  _module_global_discarded() for why the second half matters more than the
+#  first in this process.
+#
+#  Every entry is a global a REGISTERED sweep actually reaches:
+#    * cleanup_guard._redis_client        -- try_claim_cleanup(), stuck_in_progress
+#    * github_api_client._shared_redis_client / _github_client -- PROTECTION 6 and
+#      _should_retry_failed_execution(); GitHubAPIClient.__init__ builds a
+#      GitHubBreaker, which builds its own redis.Redis
+#    * pipeline_run._pipeline_run_manager -- get_pipeline_run_manager(), reached by
+#      BOTH sweeps (_should_retry_failed_execution() and the stuck sweep's failure
+#      branch); PipelineRunManager.__init__ builds a redis.Redis AND an
+#      Elasticsearch client
+#  services.pipeline_lock_manager._pipeline_lock_manager and its semaphore twin
+#  are the same shape and are discarded by forced_lazy_singletons() instead,
+#  which also asserts their state_dir.
+_CACHED_CLIENT_GLOBALS: Tuple[Tuple[str, str], ...] = (
     ('services.cleanup_guard', '_redis_client'),
     ('services.github_api_client', '_shared_redis_client'),
+    ('services.github_api_client', '_github_client'),
+    ('services.pipeline_run', '_pipeline_run_manager'),
 )
 
 #  Lazy module globals that hold a state-owning manager AND a Redis client, and
@@ -849,12 +885,25 @@ class ExternalEffectRecorder:
     """Everything the sweep tried to do outside state/, and did not get to do."""
 
     redis_writes: List[Dict[str, Any]] = field(default_factory=list)
+    es_writes: List[Dict[str, Any]] = field(default_factory=list)
     observability_events: List[Dict[str, Any]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     def record_redis(self, command: str, args: Tuple[Any, ...]) -> None:
         self.redis_writes.append(
             {'command': command, 'key': str(args[0]) if args else None}
+        )
+
+    def record_es(self, operation: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        #  elasticsearch-py is keyword-only for every call this intercepts, so
+        #  the target is 'index' (a document write) or 'name' (an ILM policy, an
+        #  index template); args is checked anyway so an older positional-style
+        #  call still names something rather than None.
+        target = kwargs.get('index') or kwargs.get('name')
+        if target is None and args:
+            target = args[0]
+        self.es_writes.append(
+            {'operation': operation, 'target': str(target) if target is not None else None}
         )
 
     def record_event(self, event_type: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
@@ -877,6 +926,11 @@ class ExternalEffectRecorder:
                 'total': len(self.redis_writes),
                 'by_command': _tally(self.redis_writes, 'command'),
                 'samples': self.redis_writes[:20],
+            },
+            'es_writes': {
+                'total': len(self.es_writes),
+                'by_operation': _tally(self.es_writes, 'operation'),
+                'samples': self.es_writes[:20],
             },
             'observability_events': {
                 'total': len(self.observability_events),
@@ -913,6 +967,157 @@ def _make_neutralized_redis_class(real_cls, recorder: ExternalEffectRecorder):
     return NeutralizedRedis
 
 
+#  Elasticsearch methods that only READ, on the client itself and on its
+#  namespace sub-clients (es.indices, es.ilm, es.cluster, ...). Same policy as
+#  Redis for the same reason: reads go to the live cluster so every guard sees
+#  the truth it would see in production, and anything not on this list is
+#  intercepted -- an operation nobody thought of is recorded rather than
+#  executed.
+_ES_READ_METHODS = frozenset({
+    'search', 'msearch', 'search_template', 'msearch_template', 'scroll',
+    'clear_scroll', 'get', 'mget', 'get_source', 'exists', 'exists_source',
+    'count', 'ping', 'info', 'explain', 'field_caps', 'termvectors',
+    'mtermvectors', 'rank_eval', 'terms_enum', 'health', 'stats', 'state',
+    'get_lifecycle', 'explain_lifecycle', 'get_index_template', 'get_template',
+    'exists_index_template', 'exists_template', 'exists_alias', 'get_alias',
+    'get_mapping', 'get_field_mapping', 'get_settings', 'get_data_stream',
+    'resolve_index', 'get_pipeline', 'indices', 'aliases', 'nodes', 'shards',
+})
+#  Deliberately NOT on that list: `es.options(...)`, which looks like a read but
+#  returns a fresh REAL client that every subsequent call would go through. It
+#  is intercepted like any other unlisted method, so a caller that starts using
+#  it fails loudly here instead of writing to production quietly. No sweep
+#  reaches it today.
+
+#  What a neutralized Elasticsearch write returns. The ILM/template PUTs and
+#  es.index() are the only ones a registered sweep reaches; the shapes below are
+#  what their callers check, so the sweep proceeds exactly as it would against a
+#  healthy cluster instead of taking an error branch that production would not.
+_NEUTRALIZED_ES_RETURNS: Dict[str, Any] = {
+    'index': {'result': 'created', '_shards': {'failed': 0}},
+    'create': {'result': 'created', '_shards': {'failed': 0}},
+    'update': {'result': 'updated', '_shards': {'failed': 0}},
+    'delete': {'result': 'deleted', '_shards': {'failed': 0}},
+    'bulk': {'errors': False, 'items': []},
+}
+_NEUTRALIZED_ES_DEFAULT: Dict[str, Any] = {'acknowledged': True}
+
+
+def _is_es_namespace(attribute: Any) -> bool:
+    """True for an elasticsearch-py sub-client (es.indices, es.ilm, es.cluster).
+
+    Recognised by type rather than by a hardcoded list of names: a namespace
+    nobody enumerated must still be wrapped, because a namespace returned
+    unwrapped hands the sweep the REAL client for every method on it. Namespace
+    clients are not callable and live under the `elasticsearch` package, which
+    is what separates them from the client's own plain attributes.
+    """
+    return (
+        not callable(attribute)
+        and type(attribute).__module__.split('.')[0] == 'elasticsearch'
+    )
+
+
+class _NeutralizedESNamespace:
+    """es.ilm / es.indices / ... with its writes recorded instead of performed."""
+
+    def __init__(self, namespace: Any, label: str, recorder: ExternalEffectRecorder):
+        self._namespace = namespace
+        self._label = label
+        self._recorder = recorder
+
+    def __getattr__(self, name):
+        attribute = getattr(self._namespace, name)
+        if name in _ES_READ_METHODS or not callable(attribute):
+            return attribute
+
+        def _neutralized(*args, **kwargs):
+            self._recorder.record_es(f'{self._label}.{name}', args, kwargs)
+            return _NEUTRALIZED_ES_RETURNS.get(name, _NEUTRALIZED_ES_DEFAULT)
+
+        return _neutralized
+
+
+def _make_neutralized_elasticsearch_class(real_cls, recorder: ExternalEffectRecorder):
+    """An Elasticsearch client that reads production and writes nowhere.
+
+    A CLASS for the same reason NeutralizedRedis is one: `Elasticsearch` appears
+    in type annotations evaluated at import time (`Optional[Elasticsearch]` in
+    services/pipeline_run.py), and `Optional[<function>]` raises.
+
+    Truthiness matters here and is deliberately left at the default True:
+    PipelineRunManager.__init__ does `if self.es: self._setup_elasticsearch()`,
+    and a falsy stub would skip the very PUTs this wrapper exists to intercept
+    and report -- turning a neutralized write into an invisible one.
+    """
+
+    class NeutralizedElasticsearch:
+        def __init__(self, *args, **kwargs):
+            self._delegate = real_cls(*args, **kwargs)
+
+        def __getattr__(self, name):
+            attribute = getattr(self._delegate, name)
+            if _is_es_namespace(attribute):
+                return _NeutralizedESNamespace(attribute, name, recorder)
+            if name in _ES_READ_METHODS or not callable(attribute):
+                return attribute
+
+            def _neutralized(*args, **kwargs):
+                recorder.record_es(name, args, kwargs)
+                return _NEUTRALIZED_ES_RETURNS.get(name, _NEUTRALIZED_ES_DEFAULT)
+
+            return _neutralized
+
+    return NeutralizedElasticsearch
+
+
+def _elasticsearch_symbol_holders(target_cls) -> List[Tuple[Any, str]]:
+    """Every imported module whose module-scope `Elasticsearch` is `target_cls`.
+
+    Redis is reached as `redis.Redis(...)` everywhere, so patching one package
+    attribute covers every construction site. Elasticsearch is not: every module
+    in this codebase does `from elasticsearch import Elasticsearch`, which copies
+    the class into that module's globals at import time, and a patch on the
+    `elasticsearch` package alone does not reach it.
+
+    Looked up by identity rather than by a list of module names so a module
+    nobody enumerated is still covered, and through __dict__ rather than
+    getattr() so a module-level __getattr__ hook is not triggered by an audit
+    whose whole job is to be side-effect free.
+    """
+    holders: List[Tuple[Any, str]] = []
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, '__dict__', None)
+        if not isinstance(namespace, dict):
+            continue
+        if namespace.get('Elasticsearch') is target_cls:
+            holders.append((module, 'Elasticsearch'))
+    return holders
+
+
+@contextlib.contextmanager
+def _elasticsearch_neutralized(real_cls, wrapper):
+    """Swap the real Elasticsearch class for `wrapper` everywhere, and back again.
+
+    The exit scan is re-run rather than replayed, and that is the half that
+    matters here. `services.pipeline_run` is not in sys.modules when the window
+    opens -- this script has no orchestrator imports at module scope and the
+    sweep imports it mid-run -- so it does `from elasticsearch import
+    Elasticsearch` while the package attribute IS the wrapper and binds the
+    wrapper into its own globals permanently. Restoring only what was patched on
+    the way in would leave that binding behind, pointed at a dead
+    ExternalEffectRecorder: exactly the hazard _module_global_discarded() exists
+    for, one datastore over.
+    """
+    for holder, attribute in _elasticsearch_symbol_holders(real_cls):
+        setattr(holder, attribute, wrapper)
+    try:
+        yield
+    finally:
+        for holder, attribute in _elasticsearch_symbol_holders(wrapper):
+            setattr(holder, attribute, real_cls)
+
+
 class _RecordingObservability:
     """Stands in for ObservabilityManager: records emissions, publishes none."""
 
@@ -936,13 +1141,21 @@ class _RecordingObservability:
 def neutralize_external_effects(enabled: bool):
     """Intercept the writes this harness cannot checksum, for the sweep's run.
 
-    Two independent patches, because the two sweeps reach production two ways:
-    Redis (claim keys, the destructive agent_result delete, repair-cycle keys,
-    container tracking) and the observability manager (decision events and
-    pipeline lifecycle events, into the live stream and Elasticsearch).
+    Three independent patches, because the two sweeps reach production three
+    ways: Redis (claim keys, the destructive agent_result delete, repair-cycle
+    keys, container tracking), the observability manager (decision events and
+    pipeline lifecycle events, into the live stream and Elasticsearch), and a
+    DIRECT Elasticsearch client -- both sweeps call get_pipeline_run_manager(),
+    whose __init__ builds its own Elasticsearch and unconditionally PUTs the
+    'pipeline-runs-ilm-policy' ILM policy and the 'pipeline-runs-template' index
+    template into the live cluster before it has done anything else.
 
     Redis is patched at `redis.Redis`, so every construction site -- all of them
     build their client inline with a hardcoded host -- picks up the wrapper.
+    Elasticsearch cannot be patched the same way: every module here does
+    `from elasticsearch import Elasticsearch`, so the package attribute is
+    patched for modules imported later AND each already-imported module's own
+    copy is patched by identity (see _elasticsearch_symbol_holders).
     Observability is patched twice on purpose: get_observability_manager() so no
     real manager (and no ES client) is built at all, and ObservabilityManager.emit
     so a manager some other module already holds is covered too.
@@ -969,13 +1182,28 @@ def neutralize_external_effects(enabled: bool):
                     _patched(redis, attribute, _make_neutralized_redis_class(real_cls, recorder))
                 )
 
-        for module_name, attribute in _CACHED_REDIS_CLIENT_GLOBALS:
+        try:
+            import elasticsearch
+        except Exception as e:  # pragma: no cover - elasticsearch is a hard dependency in prod
+            recorder.notes.append(
+                f'elasticsearch not importable, no ES writes intercepted: {e}'
+            )
+        else:
+            real_es = getattr(elasticsearch, 'Elasticsearch', None)
+            if real_es is not None:  # pragma: no branch - the package always defines it
+                stack.enter_context(
+                    _elasticsearch_neutralized(
+                        real_es, _make_neutralized_elasticsearch_class(real_es, recorder)
+                    )
+                )
+
+        for module_name, attribute in _CACHED_CLIENT_GLOBALS:
             previous = stack.enter_context(
                 _module_global_discarded(module_name, attribute)
             )
             if previous is not None:
                 recorder.notes.append(
-                    f'{module_name}.{attribute} already held a live Redis client; cleared '
+                    f'{module_name}.{attribute} already held a live client; cleared '
                     f'for the run so it is rebuilt through the interception'
                 )
 
@@ -1442,6 +1670,12 @@ def print_report(report: Dict[str, Any]) -> None:
         _out(f"      {count:>6}  {command}")
     for sample in redis_writes['samples']:
         _out(f"        e.g. {sample['command']} {sample['key']}")
+    es_writes = effects.get('es_writes') or {'total': 0, 'by_operation': {}, 'samples': []}
+    _out(f"  Elasticsearch writes intercepted: {es_writes['total']}")
+    for operation, count in es_writes['by_operation'].items():
+        _out(f"      {count:>6}  {operation}")
+    for sample in es_writes['samples']:
+        _out(f"        e.g. {sample['operation']} {sample['target']}")
     events = effects['observability_events']
     _out(f"  observability events intercepted: {events['total']}")
     for event_type, count in events['by_type'].items():
@@ -1540,10 +1774,24 @@ def print_report(report: Dict[str, Any]) -> None:
     if unreadable:
         _out(f"  {len(unreadable)} file(s) could not be read and are in NEITHER manifest --")
         _out('  no check in this run covers them.')
+    lock_artifacts_only = live['identical'] and live.get('lock_artifacts')
+    if lock_artifacts_only:
+        # `identical` means "no state file changed", which is what the exit code
+        # turns on. Claiming BYTE-IDENTICAL below it would contradict the two
+        # digests printed directly above, so this case gets its own wording and
+        # names the artifacts.
+        _out(f"  {len(live['lock_artifacts'])} flock artifact(s) appeared or changed. They "
+             f"carry no state and are not evidence of anything:")
+        for relpath in live['lock_artifacts'][:100]:
+            _out(f"      {relpath}")
     if live['identical'] and not unreadable:
-        _out('  VERDICT: BYTE-IDENTICAL -- the live state/ tree was not modified')
+        _out(
+            '  VERDICT: NO STATE FILE CHANGED -- only flock artifacts differ'
+            if lock_artifacts_only
+            else '  VERDICT: BYTE-IDENTICAL -- the live state/ tree was not modified'
+        )
     elif live['identical']:
-        _out('  VERDICT: UNVERIFIED -- every readable file is byte-identical, but the '
+        _out('  VERDICT: UNVERIFIED -- every readable state file is unchanged, but the '
              'unreadable ones were never checked')
     else:
         _out('  VERDICT: LIVE TREE CHANGED')
@@ -1901,7 +2149,15 @@ def run_dry_run(
         'before_digest': manifest_digest(live_before),
         'after_count': len(live_after),
         'after_digest': manifest_digest(live_after),
-        'identical': not changed_live,
+        #  changed_live_state, not changed_live: flock artifacts are filtered out
+        #  of every OTHER conclusion in this block (leaked, unattributed_owned),
+        #  and _is_lock_artifact() exists precisely because they are "not
+        #  evidence of anything". Letting them drive this flag drove the exit
+        #  code too, so a run against the live orchestrator -- the harness's
+        #  primary use -- reported UNVERIFIED/exit 3 the moment the orchestrator
+        #  opened one new execution record beside a record this run also read.
+        #  They stay in `lock_artifacts` for display.
+        'identical': not changed_live_state,
         'diff': live_diff,
         'leaked': leaked_sorted,
         'unattributed_owned': unattributed_owned,
@@ -1948,13 +2204,30 @@ def run_dry_run(
             f'do, but the run is partial and proves nothing about the sweep as a whole.'
         )
         report['exit_code'] = 4
-    elif not changed_live:
-        report['verdict'] = 'PASSED: the live state/ tree is byte-identical'
+    elif not changed_live_state:
+        report['verdict'] = (
+            'PASSED: the live state/ tree is byte-identical'
+            if not lock_artifacts
+            else (
+                f'PASSED: no live state file changed. The only difference is '
+                f'{len(lock_artifacts)} flock artifact(s), which carry no state'
+            )
+        )
         report['exit_code'] = 0
     elif allow_concurrent_writes:
         report['verdict'] = (
             'PASSED WITH DRIFT: live state changed outside every subtree this sweep '
             'writes, and no change matches a decision it made (--allow-concurrent-writes)'
+            #  Said explicitly rather than left to the reader: a lock artifact
+            #  INSIDE an owned subtree is filtered out before that claim is
+            #  computed, so without this the sentence asserts something wider
+            #  than what was checked.
+            + (
+                f'. {len(lock_artifacts)} flock artifact(s), which carry no state, are '
+                f'excluded from that claim'
+                if lock_artifacts
+                else ''
+            )
         )
         report['exit_code'] = 0
     else:

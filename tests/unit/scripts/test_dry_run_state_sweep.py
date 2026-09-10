@@ -26,6 +26,7 @@ import pytest
 import yaml
 
 from scripts.dry_run_state_sweep import (
+    _CACHED_CLIENT_GLOBALS,
     _RUNTIME_SINGLETONS,
     ExternalWriteRefused,
     Gate,
@@ -177,6 +178,15 @@ def _restore_process_globals():
         if singleton is not None:
             singletons_saved.append((singleton, path_attr, getattr(singleton, path_attr)))
 
+    # The cached-client globals are the harness's own responsibility to discard
+    # (that is what _module_global_discarded() is for), but a test that asserts
+    # they came back to None must not be the reason a LATER test in this process
+    # inherits whatever this one left behind. Saved and put back either way.
+    cached_globals_saved = [
+        (module_name, attribute, getattr(sys.modules.get(module_name), attribute, None))
+        for module_name, attribute in _CACHED_CLIENT_GLOBALS
+    ]
+
     yield
 
     if previous_root is None:
@@ -189,6 +199,10 @@ def _restore_process_globals():
         setattr(state_manager, attr, value)
     for singleton, path_attr, value in singletons_saved:
         setattr(singleton, path_attr, value)
+    for module_name, attribute, value in cached_globals_saved:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, attribute, value)
 
     restored_root = Path(previous_root) if previous_root else Path('/app')
     for module_name, singleton_name, path_attr, subdir in absent_before:
@@ -646,6 +660,69 @@ class TestLiveTreeProof:
         assert report['exit_code'] == 0
         # And it is not described as a record the sweep would mutate.
         assert report['mutations'] == []
+
+    def test_a_lock_artifact_only_live_change_passes_without_the_drift_flag(
+        self, deployment, tmp_path, capsys
+    ):
+        """REGRESSION: the verdict chain tested the UNFILTERED `changed_live`,
+        so a run that proved isolation exactly reported UNVERIFIED / exit 3 the
+        moment the running orchestrator opened one new execution record and
+        utils.file_lock dropped a `.lock` beside it. Nothing else changed: no
+        leak, nothing under an owned subtree, no unreadable file. Exit 3 means
+        'the run could not be verified', so an operator either re-ran against a
+        stopped orchestrator for nothing or learned to reach for
+        --allow-concurrent-writes reflexively -- which also downgrades genuine
+        non-owned drift. The filtering _is_lock_artifact() already did for
+        `leaked` and `unattributed_owned` now reaches the exit code too."""
+        def _orchestrator_locks_a_new_record(manager):
+            (deployment / 'state' / 'execution_history' / 'gamma_issue_99.yaml.lock').write_text('')
+            return 0
+
+        report = _run(
+            _spec(_orchestrator_locks_a_new_record, owned=('execution_history',)),
+            deployment,
+            tmp_path,
+        )
+
+        assert report['live_check']['leaked'] == []
+        assert report['live_check']['unattributed_owned'] == []
+        assert report['live_check']['lock_artifacts'] == [
+            'execution_history/gamma_issue_99.yaml.lock'
+        ]
+        assert report['live_check']['identical'] is True
+        assert report['exit_code'] == 0
+        assert report['verdict'].startswith('PASSED')
+        # ...and the report does not claim byte-identity when the digests differ.
+        print_report(report)
+        out = capsys.readouterr().out
+        assert 'BYTE-IDENTICAL' not in out
+        assert 'NO STATE FILE CHANGED' in out
+        assert 'gamma_issue_99.yaml.lock' in out
+
+    def test_drift_plus_a_lock_artifact_does_not_overclaim_in_the_drift_verdict(
+        self, deployment, tmp_path
+    ):
+        """PASSED WITH DRIFT says the drift was 'outside every subtree this
+        sweep writes'. A filtered lock artifact INSIDE an owned subtree is
+        excluded before that claim is computed, so the verdict has to say so
+        rather than let the sentence cover it."""
+        (deployment / 'state' / 'orchestrator').mkdir(parents=True, exist_ok=True)
+
+        def _drift_and_a_lock(manager):
+            (deployment / 'state' / 'orchestrator' / 'something_else.yaml').write_text('x')
+            (deployment / 'state' / 'execution_history' / 'alpha_issue_1.yaml.lock').write_text('')
+            return 0
+
+        report = _run(
+            _spec(_drift_and_a_lock, owned=('execution_history',)),
+            deployment,
+            tmp_path,
+            allow_concurrent_writes=True,
+        )
+
+        assert report['exit_code'] == 0
+        assert 'PASSED WITH DRIFT' in report['verdict']
+        assert 'flock artifact' in report['verdict']
 
     def test_a_leak_at_a_different_relpath_is_attributed_by_record_content(
         self, deployment, tmp_path
@@ -1124,6 +1201,19 @@ class TestExternalEffects:
         assert 'agent:container' in stuck
         assert 'emit_error_decision' in stuck or 'PIPELINE_RUN_FAILED' in stuck
 
+    def test_both_registered_sweeps_declare_their_elasticsearch_writes(self):
+        """REGRESSION: Elasticsearch was neither neutralized nor declared. Both
+        sweeps call get_pipeline_run_manager(), and PipelineRunManager.__init__
+        PUTs an ILM policy and an index template into the live cluster before it
+        does anything else — so a run whose banner read 'PASSED: the live state/
+        tree is byte-identical' had just written twice to a production datastore
+        that section 4b did not mention."""
+        for name in ('empty_output_watchdog', 'stuck_in_progress'):
+            writes = ' | '.join(SWEEPS[name].external_writes)
+            assert 'Elasticsearch' in writes, name
+            assert 'pipeline-runs-ilm-policy' in writes, name
+            assert 'pipeline-runs-template' in writes, name
+
     def test_stuck_in_progress_declares_the_guards_that_cannot_fire(self):
         """Both of those guards read an in-memory dict on a singleton owned by
         the RUNNING orchestrator. This is a fresh process, so they see it empty
@@ -1226,6 +1316,83 @@ class TestExternalEffects:
         assert {s['key'] for s in effects['samples']} == {
             'orchestrator:cleanup_guard:p:1', 'agent_result:p:1:task-abc'
         }
+
+    def test_elasticsearch_writes_are_intercepted_and_reported(
+        self, deployment, tmp_path, capsys
+    ):
+        """REGRESSION: neutralize_external_effects() patched redis and the
+        observability module and nothing else, so every ES write a sweep made
+        reached the production cluster while the report claimed the run touched
+        nothing outside state/. Reads still go to the live cluster, for the same
+        reason Redis reads do."""
+        elasticsearch = pytest.importorskip('elasticsearch')
+
+        def _write_es(manager):
+            from elasticsearch import Elasticsearch
+
+            client = Elasticsearch(['http://elasticsearch:9200'])
+            # The two PipelineRunManager.__init__ makes, unconditionally.
+            client.ilm.put_lifecycle(name='pipeline-runs-ilm-policy', body={})
+            client.indices.put_index_template(name='pipeline-runs-template', body={})
+            client.index(index='pipeline-runs-2026-01-01', document={'id': 'x'})
+            return 0
+
+        report = _run(_spec(_write_es), deployment, tmp_path)
+
+        writes = report['external_effects']['es_writes']
+        assert writes['total'] == 3
+        assert writes['by_operation'] == {
+            'ilm.put_lifecycle': 1, 'index': 1, 'indices.put_index_template': 1
+        }
+        assert {sample['target'] for sample in writes['samples']} == {
+            'pipeline-runs-ilm-policy', 'pipeline-runs-template', 'pipeline-runs-2026-01-01'
+        }
+        print_report(report)
+        assert 'Elasticsearch writes intercepted: 3' in capsys.readouterr().out
+        # The real class is back everywhere, including in this test module's own
+        # import above — a wrapper that outlives the window is bound to a dead
+        # recorder.
+        assert elasticsearch.Elasticsearch.__name__ == 'Elasticsearch'
+
+    def test_a_pipeline_run_manager_built_inside_the_window_does_not_outlive_it(
+        self, deployment, tmp_path
+    ):
+        """REGRESSION: services.pipeline_run._pipeline_run_manager is the same
+        get-or-create module global as services.cleanup_guard._redis_client, is
+        reached by BOTH registered sweeps, and was in neither
+        _CACHED_CLIENT_GLOBALS nor _LAZY_SINGLETON_GETTERS. A programmatic caller
+        looping over SWEEPS ran stuck_in_progress first, cached a manager holding
+        a NeutralizedRedis (and a neutralized ES client) bound to run 1's
+        recorder, and every write that manager made for the rest of the process
+        was swallowed and attributed to a recorder nobody would print again.
+
+        It also proves the ES interception covers the module that actually does
+        the writing: services.pipeline_run is imported by the sweep MID-RUN, so
+        its `from elasticsearch import Elasticsearch` has to resolve to the
+        wrapper and must not stay bound to it afterwards."""
+        pytest.importorskip('redis')
+        elasticsearch = pytest.importorskip('elasticsearch')
+
+        def _build_manager(manager):
+            from services.pipeline_run import get_pipeline_run_manager
+
+            get_pipeline_run_manager()
+            return 0
+
+        first = _run(_spec(_build_manager), deployment, tmp_path / 'a')
+        pipeline_run = sys.modules['services.pipeline_run']
+
+        # The two PUTs __init__ makes, intercepted rather than performed.
+        assert first['external_effects']['es_writes']['by_operation'] == {
+            'ilm.put_lifecycle': 1, 'indices.put_index_template': 1
+        }
+        assert pipeline_run._pipeline_run_manager is None
+        assert pipeline_run.Elasticsearch is elasticsearch.Elasticsearch
+
+        # Run 2 builds its own manager and records into its OWN recorder.
+        second = _run(_spec(_build_manager), deployment, tmp_path / 'b')
+        assert second['external_effects']['es_writes']['total'] == 2
+        assert pipeline_run._pipeline_run_manager is None
 
     def test_observability_emission_is_intercepted_and_reported(
         self, deployment, tmp_path
