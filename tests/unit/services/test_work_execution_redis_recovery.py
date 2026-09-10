@@ -767,4 +767,9 @@ class TestDevEnvironmentSetupContext:
             enqueued_task = mock_queue_instance.enqueue.call_args[0][0]
             assert enqueued_task.context['skip_workspace_prep'] is True
             assert enqueued_task.context['use_docker'] is False
-            assert enqueued_task.context['issue_number'] == 0
+            # No issue_number AT ALL, rather than the old placeholder 0: every
+            # "is there an issue?" check downstream is a key-presence check, so
+            # a present 0 read as "yes, issue #0" and the output-posting path
+            # tried (and retried) a comment on an issue that does not exist
+            # (#162). See agent_executor.normalize_issue_scope().
+            assert 'issue_number' not in enqueued_task.context

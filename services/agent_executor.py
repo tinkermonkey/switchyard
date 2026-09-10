@@ -59,6 +59,53 @@ class FailsafeBranchCheck(NamedTuple):
     current_branch: Optional[str] = None
 
 
+def normalize_issue_scope(task_context: Dict[str, Any], agent_name: str = 'agent') -> bool:
+    """Strip the "no GitHub issue" sentinel from a task context.
+
+    Project-scoped dispatches (dev_environment_setup on startup, the auto-
+    trigger in agents/orchestrator_integration.py, scripts/rebuild_project_
+    images.py) run against a PROJECT, not an issue, and expressed that as
+    ``issue_number=0``. Every "is there an issue?" test in this module is a
+    key-presence test (``'issue_number' in task_context``), which reads a
+    present-but-meaningless 0 as "yes, issue #0" -- hence the logs' own
+    ``has_issue_number=True, issue_number=0`` (#162). The output-posting path
+    then tried to comment on issue #0, failed, retried three times and logged
+    an ERROR per attempt, ~3 per affected run.
+
+    The fix #162 asks for is Optional[int]/None so the answer is correct by
+    construction. In this codebase the equivalent -- and the only form that
+    stays correct at every one of the ~25 key-presence tests downstream, which
+    a literal None would flip to a truthy-key "yes" -- is ABSENCE: no issue
+    means no key. Nothing here reads ``task_context['issue_number']`` except
+    under one of those guards, so removing the key cannot KeyError.
+
+    Applied once here, at the single ingestion point every dispatch passes
+    through, rather than at each of those tests: it also covers tasks already
+    sitting in Redis carrying the old sentinel across a deploy.
+
+    The synthetic ``task_context['issue']`` payload is deliberately left
+    alone. It carries a title/body for the agent prompt, not an identity the
+    posting or state paths key on.
+
+    Returns:
+        True if a sentinel was stripped (i.e. this is a project-scoped run).
+    """
+    if 'issue_number' not in task_context:
+        return False
+
+    issue_number = task_context['issue_number']
+    if issue_number is not None and issue_number != 0:
+        return False
+
+    del task_context['issue_number']
+    logger.debug(
+        f"Project-scoped dispatch for {agent_name} in "
+        f"{task_context.get('project', 'unknown')}: no GitHub issue "
+        f"(dropped issue_number={issue_number!r} placeholder)"
+    )
+    return True
+
+
 def _release_lock_instruction(project_name: str, board_name: str, issue_number: int) -> str:
     """Shared recovery-instruction snippet for the GitHub comments below. The
     pipeline lock is durably marked retained-due-to-failure once these paths
@@ -202,6 +249,9 @@ class AgentExecutor:
         """
         # Generate opaque UUID task ID
         task_id = str(uuid.uuid4())
+
+        # Normalize away the "no issue" sentinel before anything reads it.
+        normalize_issue_scope(task_context, agent_name=agent_name)
 
         # Store execution_type in task_context for downstream propagation
         # (Docker labels, observability events, Redis tracking)
@@ -1806,12 +1856,20 @@ class AgentExecutor:
 
         This centralizes GitHub posting logic that was previously duplicated across all agents.
         """
-        # Check if there's an issue to post to
-        if 'issue_number' not in task_context:
-            logger.debug(f"No issue_number in task context, skipping GitHub post for {agent_name}")
+        # Check if there's an issue to post to. Tested by VALUE, not by key
+        # presence: normalize_issue_scope() strips the "no issue" sentinel at
+        # dispatch, but this method is also reached from paths that build a
+        # context of their own, and a 0/None here means the same thing it
+        # means there — there is nothing to comment on. Attempting the post
+        # anyway is what produced three failed GitHub calls and three ERROR
+        # lines per project-scoped agent run (#162).
+        issue_number = task_context.get('issue_number')
+        if not issue_number:
+            logger.debug(
+                f"No issue to post to for {agent_name} (project-scoped run) — "
+                f"skipping GitHub post"
+            )
             return
-
-        issue_number = task_context['issue_number']
         workspace_type = task_context.get('workspace_type', 'issues')
         repository = task_context.get('repository')
         
@@ -2892,7 +2950,6 @@ class AgentExecutor:
                     'body': 'Auto-triggered: Verify Docker image after setup completion',
                     'number': 0
                 }),
-                'issue_number': task_context.get('issue_number', 0),
                 'board': task_context.get('board', 'system'),
                 'column': verifier_column,  # Pass the column so auto-advance works
                 'project': project_name,
@@ -2903,6 +2960,14 @@ class AgentExecutor:
                 'use_docker': False,  # Verifier also runs locally
                 'previous_stage_output': setup_output if setup_output else 'Setup agent output was not captured — its outcome is unknown.'
             }
+            # Carry the setup task's issue only when it HAS one. The default
+            # used to be the literal 0, which re-injected the "no issue"
+            # sentinel normalize_issue_scope() had just stripped from the
+            # setup context — handing the verifier exactly the issue #0 post
+            # attempt (3 failing GitHub calls, 3 ERRORs) that #162 reports.
+            if task_context.get('issue_number'):
+                verifier_context['issue_number'] = task_context['issue_number']
+
             # Propagate pipeline_run_id from setup task so verifier events are
             # visible to the repair cycle's stall-detection query.
             if task_context.get('pipeline_run_id'):

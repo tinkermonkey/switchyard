@@ -13,7 +13,22 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
+from services.github_api_client import is_graphql_rate_limit_error
+
 logger = logging.getLogger(__name__)
+
+# How long to stop issuing App GraphQL requests after GitHub says the App's
+# GraphQL budget is already exhausted, when the response carries no
+# x-ratelimit-reset to be precise about. Short on purpose: the cost of
+# guessing too long is deferring calls that would have worked, and the
+# suppression only exists to stop a burst of certain-to-fail requests, not
+# to replace GitHub's own accounting.
+RATE_LIMIT_HOLD_FALLBACK_SECONDS = 60
+
+# Ceiling on a header-derived hold. GitHub's GraphQL budget resets hourly, so
+# an honest x-ratelimit-reset can legitimately be ~an hour out; this only
+# guards against a malformed/absurd header parking the App offline.
+RATE_LIMIT_HOLD_MAX_SECONDS = 3600
 
 
 class GitHubApp:
@@ -26,6 +41,18 @@ class GitHubApp:
         self.private_key_path = os.environ.get('GITHUB_APP_PRIVATE_KEY_PATH')
         self._installation_token = None
         self._token_expires_at = None
+
+        # Rate-limit hold state for the App's GraphQL budget (#168). Once
+        # GitHub reports the budget exhausted, every further query in that
+        # window is certain to fail, and the observed cost of issuing them
+        # anyway was 484 ERROR lines in three hours - enough to bury the one
+        # genuinely new error an operator is reading the log for. While the
+        # hold is in force graphql_request() returns None WITHOUT a network
+        # call: the same value every caller already handles for a failed
+        # query, so no caller sees new behaviour, just fewer wasted calls.
+        self._graphql_hold_until: Optional[float] = None
+        self._graphql_hold_reset_at: Optional[datetime] = None
+        self._graphql_calls_suppressed = 0
 
         if not all([self.app_id, self.installation_id, self.private_key_path]):
             logger.warning("GitHub App credentials not fully configured - some features may be limited")
@@ -106,17 +133,126 @@ class GitHubApp:
 
         return os.environ.get('GITHUB_TOKEN')
 
+    def _report_call(
+        self,
+        rate_limited: bool = False,
+        failed: bool = False,
+        headers: Optional[Any] = None,
+    ):
+        """Report this call into GitHubAPIClient's shared accounting.
+
+        This module bypasses GitHubAPIClient entirely (different credential,
+        different quota - see GitHubAPIClient.rate_limit_app_graphql), so
+        without this hook none of its traffic or failures appeared in
+        /health's api_call_stats: `failed_requests: 0, rate_limited_requests: 0`
+        across a window with 16 logged RATE_LIMIT errors (#168).
+
+        Best-effort by design - accounting must never be able to fail a real
+        GitHub call.
+        """
+        try:
+            from services.github_api_client import get_github_client
+
+            get_github_client().record_external_call(
+                rate_limited=rate_limited,
+                failed=failed,
+                app_graphql_headers=dict(headers) if headers else None,
+            )
+        except Exception as e:
+            logger.debug(f"Could not record GitHub App call in API accounting: {e}")
+
+    def _graphql_hold_remaining(self) -> Optional[float]:
+        """Seconds left on the App GraphQL rate-limit hold, or None if none is
+        in force. Clears an expired hold (and reports what it suppressed)."""
+        if self._graphql_hold_until is None:
+            return None
+
+        remaining = self._graphql_hold_until - time.monotonic()
+        if remaining > 0:
+            return remaining
+
+        logger.info(
+            f"GitHub App GraphQL rate-limit hold expired "
+            f"({self._graphql_calls_suppressed} request(s) skipped while it was "
+            f"in force) - resuming App GraphQL requests"
+        )
+        self._graphql_hold_until = None
+        self._graphql_hold_reset_at = None
+        self._graphql_calls_suppressed = 0
+        return None
+
+    def _start_graphql_hold(self, headers: Optional[Any], errors: Any):
+        """Begin (or extend) the App GraphQL rate-limit hold after GitHub
+        reported the App's GraphQL budget exhausted.
+
+        Prefers the response's own x-ratelimit-reset over a guess, and logs
+        ONCE per hold at WARNING instead of once per rejected query at ERROR -
+        the same collapse the all-NOT_FOUND branch in graphql_request() already
+        applies, and the reason the raw volume was 484 ERROR lines in three
+        hours (#168).
+        """
+        hold_seconds = RATE_LIMIT_HOLD_FALLBACK_SECONDS
+        reset_at = None
+
+        reset_header = (headers or {}).get('x-ratelimit-reset') if headers else None
+        if reset_header:
+            try:
+                from datetime import timezone
+                reset_at = datetime.fromtimestamp(int(reset_header), tz=timezone.utc)
+                hold_seconds = (reset_at - datetime.now(timezone.utc)).total_seconds()
+                # A reset already in the past means the budget is back; still
+                # hold briefly rather than not at all, since GitHub just told
+                # us this very request was rejected.
+                hold_seconds = max(1.0, min(hold_seconds, RATE_LIMIT_HOLD_MAX_SECONDS))
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Could not parse x-ratelimit-reset from App response: {e}")
+                reset_at = None
+
+        already_held = self._graphql_hold_remaining() is not None
+        self._graphql_hold_until = time.monotonic() + hold_seconds
+        self._graphql_hold_reset_at = reset_at
+
+        if not already_held:
+            logger.warning(
+                f"🔴 GitHub App GraphQL rate limit exhausted - pausing App GraphQL "
+                f"requests for {hold_seconds:.0f}s"
+                + (f" (resets at {reset_at.isoformat()})" if reset_at else " (no reset header)")
+                + f". NOTE: this is the App installation's own budget, which is "
+                f"separate from the PAT budget `gh api rate_limit` reports. "
+                f"GitHub said: {errors}"
+            )
+
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute a GraphQL request using GitHub App authentication (with PAT fallback)"""
+
+        hold_remaining = self._graphql_hold_remaining()
+        if hold_remaining is not None:
+            self._graphql_calls_suppressed += 1
+            logger.debug(
+                f"Skipping App GraphQL request: rate-limit hold has "
+                f"{hold_remaining:.0f}s left "
+                f"({self._graphql_calls_suppressed} skipped so far)"
+            )
+            return None
 
         token = self._get_token()
         if not token:
             logger.error("No installation token or PAT available for GraphQL request")
             return None
 
+        # Which credential this request is actually spending. `_get_token()`
+        # falls back to a PAT when the App is disabled or its token fetch
+        # failed, and the two have SEPARATE quotas, so everything downstream
+        # that attributes a rate-limit reading has to know which one this was.
+        used_app_token = bool(self.enabled and token == self._installation_token)
+
         payload = {'query': query}
         if variables:
             payload['variables'] = variables
+
+        # Set before the try so the exception handlers below can report a
+        # transport failure (which produced no response, hence no headers).
+        app_headers = None
 
         try:
             response = requests.post(
@@ -133,6 +269,7 @@ class GitHubApp:
             if response.status_code == 401 and self.enabled:
                 logger.warning("GraphQL request got 401, refreshing token and retrying")
                 token = self._get_token(force_refresh=True)
+                used_app_token = bool(self.enabled and token == self._installation_token)
                 if token:
                     response = requests.post(
                         'https://api.github.com/graphql',
@@ -148,6 +285,7 @@ class GitHubApp:
                         pat = os.environ.get('GITHUB_TOKEN')
                         if pat and pat != token:
                             logger.warning("GraphQL retry still 401, falling back to PAT")
+                            used_app_token = False
                             response = requests.post(
                                 'https://api.github.com/graphql',
                                 headers={
@@ -161,6 +299,13 @@ class GitHubApp:
                 else:
                     logger.error("Cannot retry GraphQL request, no token available after refresh")
 
+            # Whichever credential the request ended up on decides which
+            # rate-limit bucket these headers describe. Only an installation
+            # token's headers belong to the App bucket; a PAT fallback's
+            # headers describe the same budget `gh` spends and would silently
+            # merge the two quotas this bucket exists to keep apart (#168).
+            app_headers = response.headers if used_app_token else None
+
             response.raise_for_status()
 
             data = response.json()
@@ -170,17 +315,36 @@ class GitHubApp:
                 all_not_found = all(err.get('type') == 'NOT_FOUND' for err in errors)
 
                 if all_not_found:
+                    self._report_call(failed=True, headers=app_headers)
                     logger.debug(f"GraphQL NOT_FOUND errors: {errors}")
-                else:
-                    logger.error(f"GraphQL errors: {errors}")
+                    return None
+
+                # GitHub answers a primary GraphQL rate limit with HTTP 200 and
+                # a RATE_LIMIT error in the body, so raise_for_status() above
+                # never sees it and nothing counted it (#168). Classify it,
+                # count it, and stop issuing queries that cannot succeed until
+                # the budget resets, rather than logging one ERROR per attempt.
+                if is_graphql_rate_limit_error(errors):
+                    self._report_call(rate_limited=True, headers=app_headers)
+                    if used_app_token:
+                        self._start_graphql_hold(response.headers, errors)
+                    else:
+                        logger.error(f"GraphQL rate limit hit on PAT fallback: {errors}")
+                    return None
+
+                self._report_call(failed=True, headers=app_headers)
+                logger.error(f"GraphQL errors: {errors}")
                 return None
 
+            self._report_call(headers=app_headers)
             return data.get('data')
 
         except requests.exceptions.HTTPError as e:
+            self._report_call(failed=True, headers=app_headers)
             logger.error(f"GraphQL request failed: {e}")
             return None
         except Exception as e:
+            self._report_call(failed=True, headers=app_headers)
             logger.error(f"GraphQL request failed (unexpected): {e}", exc_info=True)
             return None
 
@@ -237,12 +401,26 @@ class GitHubApp:
                     logger.error(f"Cannot retry REST request for {method} {path}, no token available after refresh")
 
             response.raise_for_status()
+            self._report_call()
             return response.json() if response.text else {}
 
         except requests.exceptions.HTTPError as e:
+            # Counted for the same reason the GraphQL path is (#168): this
+            # module's traffic never reached the shared accounting, so
+            # /health could not see its failures at all. No App REST bucket
+            # is populated here - GraphQL is the budget #168 observed being
+            # exhausted, and a bucket nothing reads is state without a reader.
+            rest_response = getattr(e, 'response', None)
+            rate_limited = bool(
+                rest_response is not None
+                and rest_response.status_code in (403, 429)
+                and 'rate limit' in (rest_response.text or '').lower()
+            )
+            self._report_call(rate_limited=rate_limited, failed=not rate_limited)
             logger.error(f"REST request failed: {e}")
             return None
         except Exception as e:
+            self._report_call(failed=True)
             logger.error(f"REST request failed (unexpected): {e}", exc_info=True)
             return None
 

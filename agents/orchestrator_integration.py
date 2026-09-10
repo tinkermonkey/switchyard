@@ -316,7 +316,8 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
                 'body': issue_body,
                 'number': 0
             },
-            'issue_number': 0,
+            # NO 'issue_number' key — project-scoped dispatch, no GitHub issue.
+            # See services/agent_executor.py's normalize_issue_scope() (#162).
             'board': 'system',
             'project': project,
             'repository': project,

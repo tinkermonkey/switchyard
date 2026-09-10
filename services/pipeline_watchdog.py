@@ -961,7 +961,25 @@ class PipelineWatchdog:
                 repository=project_config.github['repo'],
                 lock_already_acquired=True,
             )
-            if result is None:
+            # `not result`, not `is None`: trigger_agent_for_status() now also
+            # returns a falsy DispatchDecline for a decline no retry can fix
+            # (#165), and an identity check against None would read that as a
+            # successful dispatch.
+            if not result:
+                from services.project_monitor import is_permanent_decline
+
+                if is_permanent_decline(result):
+                    # Not a redispatch FAILURE — there is nothing here to
+                    # redispatch. Logged at INFO so the watchdog stops
+                    # contributing a recurring, unactionable ERROR for a
+                    # condition that will never change (#177 Phase 1).
+                    logger.info(
+                        f"_redispatch_same_issue: nothing to redispatch for "
+                        f"{project} issue #{issue_number} (column "
+                        f"'{current_column}'): {result.value}"
+                    )
+                    return False
+
                 logger.error(
                     f"_redispatch_same_issue: trigger_agent_for_status did not "
                     f"dispatch anything for {project} issue #{issue_number} "

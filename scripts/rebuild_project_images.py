@@ -315,7 +315,8 @@ def queue_dev_env_setup(project_name: str, task_queue, dry_run: bool = False) ->
                 'body': f'Manual rebuild trigger via rebuild_project_images.py\n\nTimestamp: {datetime.now().isoformat()}',
                 'number': 0
             },
-            'issue_number': 0,
+            # NO 'issue_number' key — project-scoped dispatch, no GitHub issue.
+            # See services/agent_executor.py's normalize_issue_scope() (#162).
             'board': 'Environment Support',  # Use environment support board
             'project': project_name,
             'repository': project_name,

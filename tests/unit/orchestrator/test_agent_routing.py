@@ -92,8 +92,13 @@ class TestAgentRouting:
                 repository='test-repo'
             )
             
-            # Assert: No agent triggered
-            assert result is None
+            # Assert: No agent triggered. The decline is falsy exactly as the
+            # None it replaces was, but now names itself as PERMANENT so the
+            # dispatch rollback stops re-arming the queue entry every sweep
+            # (#165).
+            from services.project_monitor import DispatchDecline
+            assert not result
+            assert result is DispatchDecline.ISSUE_CLOSED
     
     def test_no_agent_for_done_status(
         self,

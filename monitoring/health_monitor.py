@@ -495,6 +495,19 @@ class HealthMonitor:
 
             call_stats_info = client_status['stats']
 
+            # The GitHub App installation's own GraphQL budget, reported
+            # separately from the two buckets above because it is a DIFFERENT
+            # quota spent by a different credential: an operator running
+            # `gh api rate_limit` can read 5000/5000 off the PAT while the App
+            # is fully exhausted, which is exactly the misdiagnosis #168
+            # records. Local to this process (never mirrored to Redis - see
+            # GitHubAPIClient.__init__), which is correct here: the App client
+            # only runs in-process with the orchestrator.
+            # .get(), not [...]: an older/stubbed client status without this
+            # key must not throw the whole block into its except-handler and
+            # blank out the breaker and call stats along with it.
+            rate_limit_app_graphql_info = client_status.get('rate_limit_app_graphql')
+
             # Check if either bucket is critically low (only meaningful
             # once a real reading exists for that bucket - the local
             # fallback above makes this correctly evaluable even during a
@@ -511,6 +524,7 @@ class HealthMonitor:
             rate_limit_info = None
             rate_limit_graphql_info = None
             rate_limit_rest_info = None
+            rate_limit_app_graphql_info = None
             circuit_breaker_info = None
             call_stats_info = None
 
@@ -530,6 +544,7 @@ class HealthMonitor:
             'api_rate_limit': rate_limit_info,
             'api_rate_limit_graphql': rate_limit_graphql_info,
             'api_rate_limit_rest': rate_limit_rest_info,
+            'api_rate_limit_app_graphql': rate_limit_app_graphql_info,
             'circuit_breaker': circuit_breaker_info,
             'api_call_stats': call_stats_info,
         }
