@@ -616,5 +616,5 @@ switchyard/
 - **Agent Output**: Agents should post outputs to GitHub, not create local files (except code agents)
 - **Health Checks**: Monitor the `/health` endpoint after changes
 - **Git Operations**: All git operations happen in isolated managed checkouts under `/workspace/<project>/`
-- **Timeouts**: Keep agent timeouts reasonable (most: 300s, builds: 1800s)
+- **Timeouts**: `config/foundations/agents.yaml` is the source of truth. Today: 3600s for 13 of the 15 agents, 10800s for `senior_software_engineer` (a 3-hour hard limit enforced by the docker wait timeout in `docker_runner`), and 300s for `pipeline_analysis`. The project-scoped resource lock timeouts are calibrated against those and must move with them — `project_checkout` waits 10900s (`services/project_checkout_lock.py`) and `dev_container_build` 3700s (`services/dev_container_build_lock.py`), each one agent timeout plus headroom, so a lock never gives up on a holder that is still legitimately running. Raising an agent timeout without raising the matching lock timeout reintroduces exactly that. Anything sizing an external watchdog should read these files rather than any figure quoted in prose.
 - **Quality Assurance**: Follow maker-checker pattern for quality assurance

@@ -8,6 +8,7 @@ Checks for running Docker containers and attempts to reconnect or clean them up.
 import logging
 import subprocess
 import json
+import time
 import redis
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
@@ -15,6 +16,13 @@ from pathlib import Path
 from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
+
+# Smallest auto-commit join the startup recovery pass will ever perform, even
+# with its shared wait budget (#140 item 11) fully spent -- see
+# _process_completed_repair_cycle(). An epic-worktree commit takes no
+# project_checkout lock and finishes in seconds; a zero-length join threw that
+# free outcome away and pushed the container onto the in-flight path instead.
+_COMMIT_JOIN_FLOOR_SECONDS = 60.0
 
 # ILM Policy for repair cycle recovery metrics (7-day retention)
 REPAIR_CYCLE_RECOVERY_ILM_POLICY = {
@@ -1243,6 +1251,21 @@ class AgentContainerRecovery:
         except Exception:
             _repair_agent_timeout = 10800  # fallback: 3 hours
 
+        # ONE auto-commit wait budget for this whole pass (#140 item 11).
+        # _process_completed_repair_cycle() joins each recovered container's
+        # auto-commit thread, and that join is bounded by the project_checkout
+        # lock's own timeout; with N orphaned containers all resolving to the
+        # same contended shared base clone -- plausible right after the crash
+        # that orphaned them -- a per-call budget made this serial loop block
+        # startup for up to N x that timeout. Sharing one budget caps the whole
+        # pass at a single lock timeout plus _COMMIT_JOIN_FLOOR_SECONDS per
+        # container instead. A commit whose join is cut short is not lost: the
+        # thread runs on and lands the fix, and _process_completed_repair_cycle()
+        # ends that issue's run on its own commit_in_flight branch -- which
+        # deliberately does NOT report it as an uncommitted fix.
+        from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
+        commit_join_deadline = time.monotonic() + _CHECKOUT_LOCK_TIMEOUT + 60
+
         running_containers = self.get_running_repair_cycle_containers()
 
         if not running_containers:
@@ -1283,7 +1306,8 @@ class AgentContainerRecovery:
                     # Process the result now to complete the workflow
                     try:
                         self._process_completed_repair_cycle(
-                            container_name, container_id, project, issue_number, result
+                            container_name, container_id, project, issue_number, result,
+                            commit_join_deadline=commit_join_deadline,
                         )
                         logger.info(f"Successfully processed completed repair cycle for {project}/#{issue_number}")
                         recovered += 1
@@ -1455,7 +1479,8 @@ class AgentContainerRecovery:
                         "exited",  # Container ID (doesn't matter, container is gone)
                         project,
                         issue_number,
-                        result
+                        result,
+                        commit_join_deadline=commit_join_deadline,
                     )
                     recovered += 1
                 except Exception as e:
@@ -1510,7 +1535,8 @@ class AgentContainerRecovery:
         return (recovered, killed, errors)
 
     def _process_completed_repair_cycle(self, container_name: str, container_id: str,
-                                       project: str, issue_number: int, result: Dict) -> None:
+                                       project: str, issue_number: int, result: Dict,
+                                       commit_join_deadline: Optional[float] = None) -> None:
         """
         Process a completed repair cycle that finished while orchestrator was restarting.
 
@@ -1527,6 +1553,13 @@ class AgentContainerRecovery:
             project: Project name
             issue_number: Issue number
             result: Result dict from result.json
+            commit_join_deadline: time.monotonic() value past which this call
+                must stop waiting on its auto-commit thread. Supplied by
+                recover_or_cleanup_repair_cycle_containers() so the whole
+                recovery pass shares ONE wait budget (#140 item 11) instead of
+                each orphaned container getting its own multi-thousand-second
+                one, serially. None (the default, used by tests and any future
+                one-off caller) keeps the full per-call join timeout.
         """
         import asyncio
         import threading
@@ -1715,6 +1748,22 @@ class AgentContainerRecovery:
         # genuine case that branch exists for. commit_agent_changes() re-raises rather
         # than returning False precisely so this is distinguishable at all.
         commit_lock_contention = [False]
+        # Set when the join below returned with the commit thread still running --
+        # normally because this pass's shared wait budget was spent (#154/WI-9).
+        # The commit is genuinely in flight, not failed. Routing it into the
+        # "passed but its fix was not committed" branch below reported work that
+        # lands moments later as a fix that was never committed -- and gave the
+        # cheap-to-wait-on directory no chance to finish first. Retaining this
+        # board's lock is still the right disposition (a live commit is a live
+        # git writer); what this flag buys is an accurate reason and the grace
+        # join below.
+        commit_in_flight = False
+        # Whether that still-running commit is working in the SHARED base clone
+        # or in a per-epic worktree. Both retain this board's lock -- a live commit
+        # is a live git writer either way (see the commit_in_flight branch below) --
+        # so this only picks which directory the retained_reason an operator reads
+        # names, and whether the join above was worth one more bounded wait.
+        commit_in_flight_shared_clone = False
         if overall_success:
             try:
                 logger.info(f"Auto-committing repair cycle changes for issue #{issue_number}")
@@ -1788,6 +1837,22 @@ class AgentContainerRecovery:
                         )
                     )
 
+                # Protect the directory the commit is about to write from
+                # main.py's prune_epic_worktrees(), which runs the moment
+                # recover_or_cleanup_repair_cycle_containers() returns
+                # (#154/WI-9 review). Before the shared join budget this pass
+                # always waited the commit out, so no commit thread was ever live
+                # when that sweep started; now one can be, and the sweep
+                # force-removes an untracked worktree -- mid-`git commit`, losing
+                # the repair cycle's fix. The best-effort re-registration above
+                # covers this only when context.json still carries epic_id AND
+                # branch_name and only when it doesn't raise; this covers it
+                # unconditionally. Cleared in the THREAD's own finally, because
+                # the protection has to last exactly as long as the writer does,
+                # not as long as this frame.
+                from services.project_workspace import workspace_manager as commit_workspace_manager
+                commit_workspace_manager.mark_worktree_path_in_use(repair_cycle_project_dir)
+
                 # Run in separate thread. The lock-timeout capture has to happen HERE,
                 # inside the thread: do_commit() now propagates that exception, and one
                 # raised in a thread never reaches the enclosing try/except below.
@@ -1810,6 +1875,10 @@ class AgentContainerRecovery:
                                 f"Auto-commit for recovered repair cycle on issue "
                                 f"#{issue_number} raised: {commit_err}", exc_info=True
                             )
+                    finally:
+                        commit_workspace_manager.clear_worktree_path_in_use(
+                            repair_cycle_project_dir
+                        )
 
                 thread = threading.Thread(target=commit_thread)
                 thread.start()
@@ -1826,7 +1895,89 @@ class AgentContainerRecovery:
                 # least as long as the lock itself is willing to wait, plus
                 # headroom for the actual git add/commit/push.
                 from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
-                thread.join(timeout=_CHECKOUT_LOCK_TIMEOUT + 60)
+                join_timeout = _CHECKOUT_LOCK_TIMEOUT + 60
+                if commit_join_deadline is not None:
+                    # #140 item 11: N orphaned containers all resolving to the
+                    # same contended shared base clone -- plausible right after
+                    # the crash that orphaned them -- used to make startup
+                    # recovery block up to N x join_timeout, serially, because
+                    # each container's join carried its own full budget. The
+                    # pass shares one budget instead: whoever waits first can
+                    # spend it all, and once it is gone the rest fall back to
+                    # _COMMIT_JOIN_FLOOR_SECONDS each.
+                    #
+                    # The floor is not slack (#154/WI-9): the only commits that
+                    # can consume the budget are the ones waiting on the shared
+                    # base clone's project_checkout lock, and the common case --
+                    # an isolated epic worktree, which that lock does not gate at
+                    # all -- finishes in seconds. Clamping those to 0.0 meant this
+                    # pass never observed an outcome it was about to get for free,
+                    # and every such container took the in-flight path below. N x
+                    # the floor is a bounded, small addition to startup.
+                    #
+                    # A commit that is still running when the join returns is NOT
+                    # a commit that failed -- see commit_in_flight below.
+                    budget_left = commit_join_deadline - time.monotonic()
+                    join_timeout = min(
+                        join_timeout, max(_COMMIT_JOIN_FLOOR_SECONDS, budget_left)
+                    )
+                    if budget_left <= _COMMIT_JOIN_FLOOR_SECONDS:
+                        logger.warning(
+                            f"Repair cycle recovery's shared auto-commit wait budget is "
+                            f"exhausted -- waiting only {join_timeout}s on issue "
+                            f"#{issue_number}'s commit thread; if it hasn't finished by "
+                            "then it continues in the background and its result won't "
+                            "be reflected in this recovery pass"
+                        )
+                thread.join(timeout=join_timeout)
+
+                if thread.is_alive():
+                    # Classify the directory here, BEFORE the outcome chain below
+                    # reads it, because the two cases have different amounts of
+                    # headroom available to them (#154/WI-9 review). A commit in a
+                    # per-epic worktree is not queued behind anything --
+                    # project_checkout_lock_if_shared_async() does not gate that
+                    # directory at all -- so a commit still running in one is a
+                    # slow `git add`/`git push`, and one more bounded wait usually
+                    # observes it. That is strictly better than reaching the
+                    # in-flight branch below, which has to retain this board's
+                    # lock. A commit in the shared base clone may genuinely be
+                    # waiting out the whole project_checkout timeout, which is the
+                    # cost the shared budget exists to stop this pass paying N
+                    # times over, so it gets no grace wait: N x the floor is the
+                    # bounded addition to startup this pass accepts, and this
+                    # keeps the worst case at 2 x that only for the directory
+                    # where waiting is cheap.
+                    try:
+                        from services.project_workspace import workspace_manager
+                        in_shared_clone = workspace_manager.is_base_clone_dir(
+                            project, repair_cycle_project_dir
+                        )
+                    except Exception as dir_err:
+                        # is_base_clone_dir() already fails CLOSED; match it here
+                        # rather than granting a grace wait to a directory we
+                        # could not classify.
+                        logger.warning(
+                            f"Could not classify {repair_cycle_project_dir} for "
+                            f"{project}/#{issue_number} while its commit is still in "
+                            f"flight ({dir_err}) -- assuming the shared base clone"
+                        )
+                        in_shared_clone = True
+
+                    if not in_shared_clone:
+                        logger.info(
+                            f"Auto-commit for repair cycle issue #{issue_number} is still "
+                            f"running in a per-epic worktree, which takes no project "
+                            f"checkout lock -- waiting a further "
+                            f"{_COMMIT_JOIN_FLOOR_SECONDS}s for it rather than retaining "
+                            f"this board's lock over a commit that is not blocked on "
+                            f"anything"
+                        )
+                        thread.join(timeout=_COMMIT_JOIN_FLOOR_SECONDS)
+
+                    if thread.is_alive():
+                        commit_in_flight = True
+                        commit_in_flight_shared_clone = in_shared_clone
 
                 from services.auto_commit import CommitResult
                 if commit_success[0] is CommitResult.COMMITTED:
@@ -1849,20 +2000,27 @@ class AgentContainerRecovery:
                         "project resource-lock timeout -- the fix is still uncommitted in the "
                         "workspace; releasing the run so the next board poll retries"
                     )
-                elif thread.is_alive():
+                elif commit_in_flight:
                     # #57 review: the join itself timed out (thread still
                     # running) -- distinct from "commit_agent_changes()
                     # returned False" (real failure/no-changes/lock-timeout,
                     # already logged with its specific reason by
                     # commit_agent_changes() itself). commit_success[0]'s
                     # initial value (False) is indistinguishable from a real
-                    # False return unless we also check is_alive() here --
-                    # without this, an engineer investigating a stuck repair
-                    # cycle would misread "No changes to commit" as the
-                    # actual outcome when the commit may still be in flight.
+                    # False return unless the still-alive case is captured
+                    # separately -- without that, an engineer investigating a
+                    # stuck repair cycle would misread "No changes to commit"
+                    # as the actual outcome when the commit may still be in
+                    # flight.
+                    #
+                    # #154/WI-9: this is also the signal the end-of-run chain
+                    # below needs. Without it that chain read commit_success[0]
+                    # alone and could not tell "commit_agent_changes() returned
+                    # FAILED" from "we stopped waiting", so a cut-short join was
+                    # reported to operators as an uncommitted fix.
                     logger.warning(
                         f"Auto-commit thread for repair cycle issue #{issue_number} did not "
-                        f"finish within the join timeout ({_CHECKOUT_LOCK_TIMEOUT + 60}s) -- "
+                        f"finish within the join timeout ({join_timeout}s) -- "
                         "still running in the background; its eventual result won't be "
                         "reflected in this recovery pass"
                     )
@@ -2080,6 +2238,90 @@ class AgentContainerRecovery:
                         logger.info(f"Ended pipeline run {pipeline_run_id} for {project}/#{issue_number}")
                     else:
                         logger.warning(f"Pipeline run {pipeline_run_id} was already ended or not found")
+                elif commit_in_flight:
+                    # The join was cut short (#154/WI-9) -- normally by this pass's
+                    # shared auto-commit wait budget. The commit thread is still
+                    # running and, in the ordinary case, lands the fix seconds
+                    # later. That is NOT the "passed but its fix was not committed"
+                    # case below and must not borrow its reason: an operator
+                    # reading "its fix was not committed" about a commit that is
+                    # running (and about to succeed) is being told something
+                    # false. With N orphaned containers contending for the same
+                    # shared base clone -- exactly what the shared budget exists
+                    # for -- every container after the first landed there, so the
+                    # fix for one startup hazard produced a stream of false
+                    # reports.
+                    #
+                    # What it does NOT mean is that the run can be released. A
+                    # commit that is still running is a live git writer in the
+                    # exact directory the next dispatch resolves straight back
+                    # into -- resolve_workspace() keys a per-epic worktree by
+                    # epic_id, and should_execute_work() treats this outcome as a
+                    # retry point -- so releasing here invites the failsafe to
+                    # launch a container bind-mounting that directory while `git
+                    # add -A` / `git commit` / `git push` are mid-flight in it:
+                    # the two collide on .git/index.lock, or the commit stages the
+                    # new run's half-written files and pushes them under this
+                    # issue's message. A per-epic worktree shares nothing with
+                    # SIBLING epics -- which is why project_checkout does not gate
+                    # it -- but it is not isolated from its own re-dispatch, and
+                    # nothing else serializes the two. So both directories retain,
+                    # the shared base clone additionally for the #148 C2 hazard of
+                    # handing a dirty clone to the next issue. The grace join
+                    # above is what keeps that retention rare; when it is not
+                    # enough, an operator running scripts/release_lock.py costs
+                    # less than a lost or corrupted fix.
+                    try:
+                        from services.work_execution_state import work_execution_tracker
+                        agent_name = context.get('agent_name', 'senior_software_engineer')
+                        work_execution_tracker.record_execution_outcome(
+                            issue_number=issue_number,
+                            column=column,
+                            agent=agent_name,
+                            outcome='commit_in_flight',
+                            project_name=project,
+                            error=result.get('error')
+                        )
+                    except Exception as state_err:
+                        logger.error(f"Failed to record commit_in_flight outcome: {state_err}")
+
+                    if commit_in_flight_shared_clone:
+                        where = (
+                            "the fix is uncommitted in the shared project checkout "
+                            f"({context.get('project_dir')})"
+                        )
+                    else:
+                        where = (
+                            "git is still writing the per-epic worktree "
+                            f"({context.get('project_dir')}) that this issue's next "
+                            "dispatch resolves back into"
+                        )
+                    marked_ok = pipeline_run_manager.mark_failed(
+                        project=project,
+                        board=board_name,
+                        issue_number=issue_number,
+                        reason=(
+                            "Repair cycle passed but its auto-commit was still in "
+                            "flight when startup recovery's shared wait budget ran "
+                            f"out; until it lands, {where}"
+                        ),
+                    )
+                    if marked_ok:
+                        logger.warning(
+                            f"RETAINED the pipeline lock for {project}/#{issue_number}: a "
+                            f"recovered repair cycle's auto-commit is still running "
+                            f"against {context.get('project_dir')}. It is expected to "
+                            f"land the fix on its own -- check the log for this issue's "
+                            f"commit result before releasing the lock."
+                        )
+                    else:
+                        logger.critical(
+                            f"Pipeline lock for {project}/#{issue_number} could NOT be "
+                            f"durably marked failed while a repair-cycle auto-commit is "
+                            f"still in flight against {context.get('project_dir')} -- "
+                            f"another run may be dispatched into that directory while "
+                            f"git is still writing it."
+                        )
                 elif overall_success and not commit_success[0]:
                     # Tests passed but the fix was never actually committed (found
                     # in a final whole-PR review pass on #87). Treated the SAME way
@@ -2104,9 +2346,10 @@ class AgentContainerRecovery:
                         logger.error(
                             f"Repair cycle for {project}/#{issue_number} passed but "
                             "its fix was not committed (auto-commit returned "
-                            "CommitResult.FAILED, or its thread never produced a "
-                            "result -- see the specific reason logged above) -- "
-                            "marked the pipeline run "
+                            "CommitResult.FAILED, or never started -- see the "
+                            "specific reason logged above; a commit that is merely "
+                            "still running takes the commit_in_flight branch, not "
+                            "this one) -- marked the pipeline run "
                             "failed and the lock retained (awaiting manual "
                             "intervention) rather than silently ending the run as "
                             "if the fix had landed."

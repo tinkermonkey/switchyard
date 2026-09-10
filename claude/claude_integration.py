@@ -187,30 +187,28 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         # than race it. Epic-worktree-scoped runs are deliberately NOT locked
         # here -- they don't share a directory with anything else, and locking
         # them too would serialize sibling epics for no reason.
-        if workspace_manager.is_base_clone_dir(project, project_dir):
-            from services.project_checkout_lock import project_checkout_lock_async
+        from services.project_checkout_lock import project_checkout_lock_if_shared_async
 
-            # issue_number here is log attribution only, not the lock's holder
-            # identity (every acquisition mints its own -- see
-            # project_checkout_lock.py's module docstring), so it's fine for
-            # this to be None when no real issue is in scope.
-            issue_number_for_lock = task_context_for_dir.get('issue_number') or context.get('issue_number')
-            async with project_checkout_lock_async(project, issue_number_for_lock):
-                return await docker_runner.run_agent_in_container(
-                    prompt=prompt,
-                    context=context,
-                    project_dir=project_dir,
-                    mcp_servers=mcp_servers,
-                    stream_callback=context.get('stream_callback')
-                )
+        # issue_number here is log attribution only, not the lock's holder
+        # identity (every acquisition mints its own -- see
+        # project_checkout_lock.py's module docstring), so it's fine for
+        # this to be None when no real issue is in scope.
+        issue_number_for_lock = task_context_for_dir.get('issue_number') or context.get('issue_number')
 
-        return await docker_runner.run_agent_in_container(
-            prompt=prompt,
-            context=context,
-            project_dir=project_dir,
-            mcp_servers=mcp_servers,
-            stream_callback=context.get('stream_callback')
-        )
+        # #140 item 4: the is_base_clone_dir()-then-lock-or-not guard, and the
+        # duplicated run_agent_in_container() call that used to sit on each of
+        # its branches, are both gone -- the decision lives in the context
+        # manager, and the guarded call exists once.
+        async with project_checkout_lock_if_shared_async(
+            project, project_dir, issue_number_for_lock
+        ):
+            return await docker_runner.run_agent_in_container(
+                prompt=prompt,
+                context=context,
+                project_dir=project_dir,
+                mcp_servers=mcp_servers,
+                stream_callback=context.get('stream_callback')
+            )
 
     # Only reach here if use_docker=False.
     #
@@ -283,18 +281,20 @@ async def _run_locally_under_checkout_lock(
     Split out of run_claude_code() by #152 item B: gating the dev_container_build
     lock on agent identity gave that branch two exits instead of one, and this
     guard would otherwise have been the fourth near-identical copy of the
-    is_base_clone_dir() pattern #140 item 4 already flagged.
+    is_base_clone_dir() pattern #140 item 4 flagged. The decision itself now
+    lives in project_checkout_lock_if_shared_async(), which every copy of that
+    pattern routes through (this one, run_claude_code()'s Docker branch,
+    auto_commit.commit_agent_changes() and
+    feature_branch_manager's finalize -- the fourth copy, added after item 4 was
+    written and migrated with the rest in #154/WI-9).
 
     `issue_number` is log attribution only, never the lock's holder identity --
     see project_checkout_lock.py's module docstring.
     """
-    if workspace_manager.is_base_clone_dir(project, work_dir):
-        from services.project_checkout_lock import project_checkout_lock_async
+    from services.project_checkout_lock import project_checkout_lock_if_shared_async
 
-        async with project_checkout_lock_async(project, issue_number):
-            return await _run_claude_code_locally(prompt, context, agent)
-
-    return await _run_claude_code_locally(prompt, context, agent)
+    async with project_checkout_lock_if_shared_async(project, work_dir, issue_number):
+        return await _run_claude_code_locally(prompt, context, agent)
 
 
 async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: str) -> str:

@@ -69,10 +69,19 @@ def _local_context(agent, **overrides):
     return context
 
 
-async def _run(agent, build_lock, *, is_base_clone=False, **overrides):
+async def _run(agent, build_lock, *, is_base_clone=False, checkout_lock=_noop_lock,
+               **overrides):
+    # is_base_clone_dir() is patched where the LOCK MODULE imports it, not where
+    # claude_integration does (#154/WI-9 review). #140 item 4 moved the decision
+    # into project_checkout_lock_if_shared_async(), which does a function-local
+    # `from services.project_workspace import workspace_manager` to avoid an
+    # import cycle -- so patching claude.claude_integration.workspace_manager
+    # left is_base_clone dead configuration and the real filesystem decided the
+    # branch (and it fails CLOSED, so is_base_clone=False silently ran the
+    # LOCKED branch: the opposite of what the parameter said).
     with patch('services.dev_container_build_lock.dev_container_build_lock_async', build_lock), \
-         patch('services.project_checkout_lock.project_checkout_lock_async', _noop_lock), \
-         patch('claude.claude_integration.workspace_manager') as mock_wm, \
+         patch('services.project_checkout_lock.project_checkout_lock_async', checkout_lock), \
+         patch('services.project_workspace.workspace_manager') as mock_wm, \
          patch('claude.claude_integration._run_claude_code_locally',
                new_callable=AsyncMock, return_value='done') as mock_local:
         mock_wm.is_base_clone_dir.return_value = is_base_clone
@@ -169,7 +178,7 @@ class TestLocalExecutionLockGating:
 
         with patch('services.dev_container_build_lock.dev_container_build_lock_async', build_lock), \
              patch('services.project_checkout_lock.project_checkout_lock_async', _recording_checkout_lock), \
-             patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_wm, \
              patch('claude.claude_integration._run_claude_code_locally',
                    new_callable=AsyncMock, return_value='done') as mock_local:
             mock_wm.is_base_clone_dir.return_value = True
@@ -177,6 +186,36 @@ class TestLocalExecutionLockGating:
 
         assert build_lock.acquired_for == []
         assert checkout_calls == [('test-project', 42)]
+        mock_local.assert_awaited_once()
+
+    async def test_an_epic_worktree_run_takes_neither_lock(self):
+        """
+        The negative half of the decision, and the one nothing pinned at this
+        call site (#154/WI-9 review): an epic-worktree-scoped run must NOT take
+        the project_checkout lock. Without this, regressing
+        project_checkout_lock_if_shared_async() to lock unconditionally left the
+        whole suite green while every sibling epic of a project serialized on
+        the shared base-clone lock -- the exact cross-epic throughput cost the
+        guard exists to avoid, with no error and no failing test.
+        """
+        build_lock = _RecordingLock()
+        checkout_calls = []
+
+        @asynccontextmanager
+        async def _recording_checkout_lock(project, issue_number=None, **kwargs):
+            checkout_calls.append((project, issue_number))
+            yield
+
+        result, mock_local = await _run(
+            'pipeline_analysis', build_lock,
+            is_base_clone=False, checkout_lock=_recording_checkout_lock,
+        )
+
+        assert build_lock.acquired_for == []
+        assert checkout_calls == [], (
+            "an epic-worktree-scoped local run must take no project_checkout lock"
+        )
+        assert result == 'done'
         mock_local.assert_awaited_once()
 
     async def test_a_build_agent_nests_both_locks_in_the_documented_order(self):
@@ -198,7 +237,7 @@ class TestLocalExecutionLockGating:
 
         with patch('services.dev_container_build_lock.dev_container_build_lock_async', _build), \
              patch('services.project_checkout_lock.project_checkout_lock_async', _checkout), \
-             patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_wm, \
              patch('claude.claude_integration._run_claude_code_locally',
                    new_callable=AsyncMock, return_value='done'):
             mock_wm.is_base_clone_dir.return_value = True

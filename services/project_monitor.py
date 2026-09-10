@@ -51,6 +51,29 @@ PENDING_TASK_SUPPRESSION_SECS = 900  # 15 minutes
 # a launch that silently never happened.
 NO_CONTAINER_GRACE_SECONDS = 60
 
+# Dispatch slots the FAILSAFE's per-board loop will try to fill in one pass
+# (Phase 2, issue #57). Hardcoded to 1: PipelineLockManager still enforces
+# exactly one concurrent issue per (project, board), so a second slot could
+# never acquire anyway.
+#
+# Raising it is Phase 3a's job, and it is NOT a one-line change here. Two other
+# things have to move with it:
+#
+#  1. the acquire call in that loop must be swapped for a capacity-aware
+#     primitive -- see pipeline_queue_manager.py's "IMPORTANT for whoever wires
+#     up Phase 3a";
+#  2. _find_stalled_issues_for_pipeline() caps its result at this same constant
+#     ("prevents concurrent launches"), so the stalled path dispatches one issue
+#     per board per cycle no matter how many slots are free. Raising this raises
+#     that cap with it -- deliberate, and the reason the cap reads this constant
+#     rather than a literal 1, but it means the safety argument in that method
+#     has to be re-checked at the same time, not just this line edited.
+#
+# Named rather than inlined so #140 item 27's regression tests can drive that
+# loop at >1 without editing the dispatch code they exist to pin. Production
+# reads this and nothing writes it.
+FAILSAFE_DISPATCH_SLOTS = 1
+
 @dataclass
 class ProjectItem:
     """Represents an item in a GitHub Projects v2 board"""
@@ -2868,27 +2891,40 @@ class ProjectMonitor:
                             f"(no pipeline lock required)"
                         )
                     else:
-                        # CRITICAL: Check if this issue is next in line based on GitHub board order
-                        # This ensures we respect the user's ordering on the GitHub board
+                        # CRITICAL: Check if this issue is within the top N in line based on
+                        # GitHub board order. This ensures we respect the user's ordering on
+                        # the GitHub board.
                         #
-                        # Not migrated to #57's available_slots/get_next_n_waiting_issues()
-                        # pattern (found in #58 review): unlike the 5 "pick N candidates from
-                        # the queue" dispatch sites #57 generalized, this is a binary gate for
-                        # a SPECIFIC issue already in hand -- "is this exact issue allowed to go
-                        # now, or must it wait" -- via equality against the single top-priority
-                        # pick, not a loop over open slots. Harmless today (available_slots=1
-                        # everywhere), but if a future change raises available_slots elsewhere,
-                        # this gate would still only ever let the single top-priority issue
-                        # through, incorrectly blocking an issue that's 2nd (or later) in line
-                        # even when enough slots are free for it too. A real fix means changing
-                        # this check from "equals the top pick" to "is within the top N picks",
-                        # not a mechanical swap -- tracked in #140, not fixed here.
-                        next_issue = pipeline_queue.get_next_waiting_issue()
-                        if next_issue and next_issue['issue_number'] != issue_number:
+                        # #140 item 21: this is the 6th dispatch-gating site, and unlike the
+                        # 5 "pick N candidates from the queue" sites #57 generalized, it is a
+                        # gate for a SPECIFIC issue already in hand -- "is this exact issue
+                        # allowed to go now, or must it wait". It used to ask that as
+                        # `next_issue['issue_number'] != issue_number`: equality against the
+                        # single top-priority pick. That is only the right question while
+                        # exactly one issue can run per board; the moment Phase 3a raises
+                        # available_slots, an issue that is 2nd in line with a free slot for
+                        # it would still be turned away, because the top pick is by
+                        # definition somebody else.
+                        #
+                        # So the gate is now top-N MEMBERSHIP rather than equality. At
+                        # available_slots=1 get_next_n_waiting_issues(1) returns at most the
+                        # same single top pick get_next_waiting_issue() did (it is that
+                        # method's own implementation -- pure delegation), and membership in
+                        # a one-element list is equality, so behavior today is unchanged.
+                        # Raising available_slots here is deliberately left to Phase 3a
+                        # alongside the acquire call below, which is still the strictly
+                        # single-holder PipelineLockManager -- see pipeline_queue_manager.py's
+                        # "IMPORTANT for whoever wires up Phase 3a".
+                        available_slots = 1
+                        top_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+                        if top_issues and issue_number not in {
+                            candidate['issue_number'] for candidate in top_issues
+                        }:
+                            ahead = top_issues[0]
                             logger.info(
                                 f"Issue #{issue_number} waiting in queue: "
-                                f"issue #{next_issue['issue_number']} is ahead in GitHub board order "
-                                f"(position {next_issue.get('position_in_column', '?')})"
+                                f"issue #{ahead['issue_number']} is ahead in GitHub board order "
+                                f"(position {ahead.get('position_in_column', '?')})"
                             )
                             return None  # Wait for higher-priority issues to execute first
 
@@ -10080,7 +10116,8 @@ _Repair cycle initiated by Switchyard_
 
         Returns:
             List of stalled issue dicts with: issue_number, column, last_activity_at
-            Limited to 1 issue per pipeline (safest - prevents concurrent launches)
+            Limited to FAILSAFE_DISPATCH_SLOTS issues per pipeline (safest -
+            prevents concurrent launches), which is 1 in production today.
         """
         from services.pipeline_queue_manager import get_pipeline_queue_manager
         from services.work_execution_state import work_execution_tracker
@@ -10221,11 +10258,19 @@ _Repair cycle initiated by Switchyard_
                             'last_activity_at': datetime.now(timezone.utc).isoformat()
                         })
 
-                        # CRITICAL: Return only 1 stalled issue per pipeline (safest)
-                        if len(stalled_issues) >= 1:
+                        # CRITICAL: Return only FAILSAFE_DISPATCH_SLOTS stalled issues
+                        # per pipeline (safest -- prevents concurrent launches). Reads
+                        # that constant rather than a literal 1 (#154/WI-9 review) so
+                        # the failsafe's slot count is a single knob: while it is 1 this
+                        # is the historical "limited to 1 per pipeline" behaviour, and
+                        # Phase 3a raising it does not silently leave the stalled path
+                        # capped at one candidate while the Development-queue path
+                        # dispatches N. See FAILSAFE_DISPATCH_SLOTS' own comment for the
+                        # rest of what raising it requires.
+                        if len(stalled_issues) >= FAILSAFE_DISPATCH_SLOTS:
                             logger.debug(
                                 f"Found stalled issue #{issue_number} in {project_name}/{board_name}, "
-                                f"limiting to 1 per pipeline"
+                                f"limiting to {FAILSAFE_DISPATCH_SLOTS} per pipeline"
                             )
                             break
 
@@ -10439,8 +10484,33 @@ _Repair cycle initiated by Switchyard_
                     # still enforces exactly one concurrent issue per (project, board) -- so
                     # this evaluates to 1 and the loop below runs its body exactly once,
                     # identical to the pre-#57 single-attempt code. Raising this to a real
-                    # count is Phase 3a's job (out of scope here).
-                    available_slots = 1
+                    # count is Phase 3a's job (out of scope here) -- see
+                    # FAILSAFE_DISPATCH_SLOTS.
+                    available_slots = FAILSAFE_DISPATCH_SLOTS
+                    # Candidates this board's slot loop has already taken a decision on
+                    # (#140 item 27). Two jobs, both invisible at available_slots=1:
+                    #
+                    #  * the stalled-issue scan below is a pure read of cached board
+                    #    items, so without this every slot would re-pick the SAME
+                    #    stalled issue;
+                    #  * a candidate that failed to acquire the lock (or failed
+                    #    mark_issue_active) stays 'waiting' at the same board
+                    #    position, so it is still the head of the queue snapshot
+                    #    below and would be re-picked forever.
+                    #
+                    # The successful paths need no such memory -- mark_issue_active(),
+                    # remove_issue_from_queue() and the lock itself already take their
+                    # issue out of contention -- but the set is maintained for every
+                    # selected candidate anyway so the rule stays "one decision per
+                    # candidate per board per cycle" rather than "one decision per
+                    # candidate, except on the paths that happen to mutate queue state."
+                    attempted_issues = set()
+                    # This board's Development-queue candidates, fetched ONCE for the
+                    # whole slot loop (#140 item 27 / #154/WI-9 review) and lazily --
+                    # the fetch syncs with GitHub, so it must still not happen on a
+                    # board whose slots are all taken by stalled issues, or on a board
+                    # that isn't due this cycle. None means "not fetched yet".
+                    waiting_candidates = None
                     for _dispatch_slot in range(available_slots):
                         try:
                             lock_manager = get_pipeline_lock_manager()
@@ -10451,6 +10521,12 @@ _Repair cycle initiated by Switchyard_
                             # CRITICAL: Check if pipeline is unlocked
                             lock = lock_manager.get_lock(project_name, pipeline.board_name)
                             if lock and lock.lock_status == 'locked':
+                                # BOARD-level abort, so `break` (not `continue`): the
+                                # board itself is at capacity, which no other candidate
+                                # can get around. Re-read every slot rather than hoisted
+                                # above the loop -- a preceding slot's own dispatch is
+                                # exactly what takes the lock, and that must stop the
+                                # remaining slots.
                                 break  # Pipeline busy, skip
 
                             # SCENARIO 1: Check for in-flight issues stranded in mid-pipeline
@@ -10463,9 +10539,20 @@ _Repair cycle initiated by Switchyard_
                                 cached_items=cached
                             )
 
-                            if stalled_issues:
+                            # First stalled issue this board's slot loop has not already
+                            # decided on (#140 item 27). At available_slots=1
+                            # attempted_issues is always empty here, so this is
+                            # stalled_issues[0] -- the historical "limited to 1 per
+                            # pipeline for safety" pick -- unchanged.
+                            stalled_candidate = next(
+                                (s for s in stalled_issues
+                                 if s['issue_number'] not in attempted_issues),
+                                None
+                            )
+
+                            if stalled_candidate:
                                 # Found in-flight issue stranded in a mid-pipeline column
-                                next_issue = stalled_issues[0]  # Limited to 1 per pipeline for safety
+                                next_issue = stalled_candidate
                                 logger.info(
                                     f"⚡ FAILSAFE (STALLED): Found in-flight issue #{next_issue['issue_number']} "
                                     f"in column '{next_issue['column']}' for {project_name}/{pipeline.board_name} "
@@ -10490,12 +10577,14 @@ _Repair cycle initiated by Switchyard_
                                         f"⚡ FAILSAFE: {project_name}/{pipeline.board_name} not due this "
                                         f"cycle, skipping Development queue check"
                                     )
+                                    # BOARD-level abort, so `break`: due-ness is a
+                                    # property of the board, identical for every slot.
                                     break
                                 logger.debug(f"⚡ FAILSAFE: No in-flight issues for {project_name}/{pipeline.board_name}, checking Development queue...")
                                 # Pass this board's batched-prefetched data (issue #100), if
                                 # any - .get() returns None for a board that was due but
                                 # whose batched fetch failed/was ungatherable, in which case
-                                # get_next_waiting_issue() falls back to fetching this one
+                                # get_next_n_waiting_issues() falls back to fetching this one
                                 # board itself (bounded to just that board, not skipped
                                 # above since due_board_keys wouldn't contain it either in
                                 # the ungatherable-state case - see the batch-gathering
@@ -10503,42 +10592,46 @@ _Repair cycle initiated by Switchyard_
                                 # once it's confirmed due, before it's known whether the
                                 # batch fetch for it will succeed).
                                 #
-                                # Deliberately still get_next_waiting_issue() (the n=1
-                                # wrapper), not get_next_n_waiting_issues() directly --
-                                # considered switching during #57 review for API
-                                # consistency with the other 4 dispatch sites, but this
-                                # site has extensive existing test coverage
-                                # (test_project_monitor_failsafe.py,
-                                # test_project_monitor_failsafe_batching.py) asserting
-                                # calls against get_next_waiting_issue() specifically,
-                                # including detailed prefetched_board_data-forwarding and
-                                # batching-call-count assertions; get_next_waiting_issue()
-                                # already IS get_next_n_waiting_issues(1) internally (pure
-                                # delegation, byte-identical behavior), so switching the
-                                # call site here would have been a cosmetic-only change
-                                # with no functional benefit, at the cost of rewriting
-                                # that whole test suite. NOTE for whoever wires up Phase 3a
-                                # here: raising available_slots at this specific site
-                                # would call this whole block N times (N separate
-                                # GitHub-board resyncs via n=1 each), not one batched
-                                # N-candidate fetch like the other 4 sites -- correct, but
-                                # resync-per-slot rather than resync-once; a real
-                                # multi-slot version of this site should restructure to
-                                # fetch get_next_n_waiting_issues(available_slots) ONCE
-                                # before this loop, which the stalled-issue-check
-                                # interleaving here makes more involved than the other
-                                # sites' simpler shape.
-                                next_issue = pipeline_queue.get_next_waiting_issue(
-                                    prefetched_board_data=prefetched_board_data.get(board_key)
-                                )
-                                if next_issue:
-                                    # We have: waiting issue + unlocked pipeline = should be processing!
-                                    logger.info(
-                                        f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
-                                        f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                # ONE top-N fetch for the whole slot loop (#140 item 27),
+                                # the same shape as the five dispatch sites #57
+                                # generalized and the gate item 21 migrated. This site
+                                # used to call the n=1 wrapper once per slot, which made
+                                # every `continue` below unreachable in practice: a
+                                # candidate that fails try_acquire_lock() or
+                                # mark_issue_active() is not dequeued and is not marked
+                                # active, so its status stays 'waiting' at the same
+                                # position_in_column and the next n=1 fetch handed back
+                                # the very same issue -- the already-attempted guard
+                                # below then broke the loop, exactly as the pre-#57
+                                # `break` did. The second candidate was never offered
+                                # the free slot. Fetching the top `available_slots`
+                                # candidates once is what makes those skips real, and
+                                # it costs one GitHub resync per board per cycle instead
+                                # of one per slot.
+                                if waiting_candidates is None:
+                                    waiting_candidates = pipeline_queue.get_next_n_waiting_issues(
+                                        available_slots,
+                                        prefetched_board_data=prefetched_board_data.get(board_key)
                                     )
-                                else:
+
+                                next_issue = next(
+                                    (candidate for candidate in waiting_candidates
+                                     if candidate['issue_number'] not in attempted_issues),
+                                    None
+                                )
+                                if not next_issue:
+                                    # BOARD-level abort, so `break`: either nothing was
+                                    # waiting at all, or this loop has already taken a
+                                    # decision on every candidate the board offered.
+                                    # Both mean no later slot has anything to pick, and
+                                    # `continue` here would spin over the same snapshot.
                                     break  # No in-flight or waiting issues, skip this pipeline
+
+                                # We have: waiting issue + unlocked pipeline = should be processing!
+                                logger.info(
+                                    f"⚡ FAILSAFE (WAITING): Found waiting issue #{next_issue['issue_number']} "
+                                    f"for unlocked pipeline {project_name}/{pipeline.board_name} - attempting to process"
+                                )
 
                             # At this point, next_issue is either a waiting issue or a stalled issue
                             # Process it using the same logic
@@ -10546,6 +10639,7 @@ _Repair cycle initiated by Switchyard_
                             # CRITICAL: Try to acquire lock (atomic operation in Redis)
                             # If another process is processing this issue, acquisition will fail
                             issue_number = next_issue['issue_number']
+                            attempted_issues.add(issue_number)
                             acquired, reason = lock_manager.try_acquire_lock(
                                 project=project_name,
                                 board=pipeline.board_name,
@@ -10558,7 +10652,12 @@ _Repair cycle initiated by Switchyard_
                                     f"#{issue_number}: {reason} "
                                     f"(likely being processed by another path)"
                                 )
-                                break
+                                # CANDIDATE-level skip, so `continue`: this issue is
+                                # spoken for, but the board's slot is not. It stays
+                                # 'waiting' at the same board position, so attempted_issues
+                                # -- not the queue -- is what moves the next slot on to
+                                # the next candidate in the snapshot above.
+                                continue
 
                             # Track if this is a stalled issue (has 'column' key) vs waiting issue
                             is_stalled = 'column' in next_issue
@@ -10579,7 +10678,13 @@ _Repair cycle initiated by Switchyard_
                                     lock_manager.release_lock(
                                         project_name, pipeline.board_name, issue_number
                                     )
-                                    break
+                                    # CANDIDATE-level skip, so `continue` -- the lock was
+                                    # released again, so the board's slot is still open.
+                                    # The queue write did NOT happen, so this issue is
+                                    # still 'waiting' at the same position; attempted_issues
+                                    # is what keeps the next slot from re-picking it out
+                                    # of the snapshot above.
+                                    continue
 
                             # Get current column from GitHub (may have moved since detected)
                             # For stalled issues, we already have the column, but verify it
@@ -10609,7 +10714,10 @@ _Repair cycle initiated by Switchyard_
                                     lock_manager.release_lock(
                                         project_name, pipeline.board_name, issue_number
                                     )
-                                    break
+                                    # CANDIDATE-level skip, so `continue`: one cancelled
+                                    # issue says nothing about the rest of the queue, and
+                                    # the lock it briefly held is already back.
+                                    continue
 
                                 # Skip issues whose pipeline run is in feedback_listening state —
                                 # but only if the loop is actually alive.  A dead loop leaves the
@@ -10634,7 +10742,10 @@ _Repair cycle initiated by Switchyard_
                                             lock_manager.release_lock(
                                                 project_name, pipeline.board_name, issue_number
                                             )
-                                            break
+                                            # CANDIDATE-level skip, so `continue`: a live
+                                            # feedback loop holds no pipeline lock, so the
+                                            # board's slot is genuinely still free.
+                                            continue
 
                                         # Loop is dead but pipeline run is stuck in feedback_listening.
                                         # End the stale run so the trigger path below creates a fresh one.
@@ -10747,6 +10858,10 @@ _Repair cycle initiated by Switchyard_
                             )
                             import traceback
                             logger.error(traceback.format_exc())
+                            # BOARD-level abort, so `break`: an unexpected exception here
+                            # says nothing about which candidate is at fault, and this
+                            # matches the pre-#57 shape, where the same handler skipped
+                            # to the next pipeline in the outer loop.
                             break
 
         except Exception as e:

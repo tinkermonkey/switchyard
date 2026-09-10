@@ -1,0 +1,43 @@
+# Test project configuration -- TEST FIXTURE, NOT A DEPLOYABLE PROJECT.
+#
+# Lives here, tracked, rather than in config/projects/ (#140 items 35/38).
+# config/projects/ is gitignored AS A DIRECTORY, so a copy of this file kept
+# there to make the suite pass was simultaneously live project config that the
+# running orchestrator loaded, reconciled, held stale pipeline locks for, and
+# dispatched real dev_environment_setup/verifier agent runs against -- against a
+# checkout at /workspace/test-project sitting on master, with output addressed
+# to issue #0. See issue #162.
+#
+# tests/conftest.py points ConfigManager.projects_dir at this directory for the
+# whole test session, so the suite reads these and the deployment's
+# config/projects/ contains only real projects.
+
+project:
+  name: "test_project"
+  description: "Minimal test project for integration testing"
+  hidden: true  # Hide from UI and monitoring
+  
+  github:
+    org: "test"
+    repo: "test"
+    repo_url: "https://github.com/test/test.git"
+  
+  tech_stacks:
+    backend: "python"
+    testing: "pytest"
+  
+  # No pipelines needed for test project
+  pipelines:
+    enabled: []
+
+  # Pipeline routing configuration (empty for test project)
+  pipeline_routing:
+    default_pipeline: "test-pipeline"
+    label_routing: {}
+
+  # Agent overrides - use default test_agent config
+  agents: {}
+
+# Orchestrator-specific settings
+orchestrator:
+  polling_interval: 60

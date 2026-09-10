@@ -1366,6 +1366,9 @@ def get_active_pipeline_runs():
         # Add failed runs, sourced from durable locks (see docstring above)
         lock_scan_error = None
         try:
+            from services.project_resource_lock_manager import (
+                describe_lock_board, is_resource_board,
+            )
             for lock in lock_manager.get_all_locks():
                 if not lock.retained_reason:
                     continue
@@ -1373,10 +1376,24 @@ def get_active_pipeline_runs():
                 if (project, lock.board, issue_number) in seen_project_board_issue:
                     continue  # shouldn't happen (failed locks aren't active) but stay safe
 
+                # #140 item 29: get_all_locks() returns project-scoped RESOURCE
+                # locks alongside real board locks, and this loop renders each
+                # one as a failed pipeline run. For a resource lock that is
+                # wrong twice over: `board` would read
+                # "__resource__project_checkout" (the internal namespacing, not
+                # anything an operator has ever seen), and `locked_by_issue` is
+                # a minted holder id, not a GitHub issue -- so the enrichment,
+                # issue_url and board_url below would all be built from a number
+                # that names no issue. Show it with its real resource name and
+                # without the issue-shaped fields it does not have. Not hidden:
+                # a retained resource lock is a genuine operator-facing
+                # condition, and hiding it is how it stays unnoticed.
+                lock_is_resource = is_resource_board(lock.board)
+
                 run_data = {
                     'project': project,
-                    'board': lock.board,
-                    'issue_number': issue_number,
+                    'board': describe_lock_board(lock.board),
+                    'issue_number': None if lock_is_resource else issue_number,
                     'status': 'failed',
                     'outcome': 'failed',
                     'started_at': None,
@@ -1385,6 +1402,21 @@ def get_active_pipeline_runs():
                     'lock_status': 'holding_lock',
                     'lock_holder_issue': issue_number,
                 }
+
+                if lock_is_resource:
+                    # Every field below is keyed on a real GitHub issue number,
+                    # which a resource lock's holder id is not: the enrichment
+                    # would look up a pipeline run that does not exist, and
+                    # board_url/issue_url would be built for a board and an
+                    # issue that do not exist either. Name the holder for what
+                    # it is instead.
+                    run_data['issue_title'] = (
+                        f"{describe_lock_board(lock.board)} held by holder #{issue_number}"
+                    )
+                    run_data['board_url'] = None
+                    run_data['repo_url'] = _get_repo_url(project)
+                    runs.append(run_data)
+                    continue
 
                 # Best-effort enrichment from the (possibly expired) ES/Redis record.
                 # Uses the shared singleton (not a fresh PipelineRunManager()) —

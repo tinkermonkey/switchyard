@@ -43,22 +43,36 @@ def _project_config():
 def _run(manager, projects, initialize_side_effect, dockerfile_projects=()):
     """
     Drive initialize_all_projects() with config_manager and initialize_project()
-    stubbed. `initialize_side_effect` is passed straight to the
-    initialize_project mock (a list of per-project results/exceptions).
-    `dockerfile_projects` names the projects whose base clone has a
-    Dockerfile.agent on disk.
+    stubbed. `initialize_side_effect` is a list of per-project
+    results/exceptions, positionally matching `projects`. `dockerfile_projects`
+    names the projects whose base clone has a Dockerfile.agent on disk.
+
+    The list is bound to project NAMES rather than handed to the mock as a
+    positional side_effect: initialize_all_projects() runs its projects
+    concurrently (#140 item 3), so a positional side_effect would be consumed in
+    whatever order the pool happens to run them and these tests would assert
+    against outcomes assigned to arbitrary projects. Binding by name makes the
+    assertion "this project got this outcome" hold regardless of scheduling.
     """
     for project_name in dockerfile_projects:
         project_dir = manager.workspace_root / project_name
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / 'Dockerfile.agent').write_text("FROM scratch\n")
 
+    outcome_by_project = dict(zip(projects, initialize_side_effect))
+
+    def _initialize_project(project_name, project_config, *args, **kwargs):
+        outcome = outcome_by_project[project_name]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
     with patch('services.project_workspace.config_manager') as mock_config:
         mock_config.list_visible_projects.return_value = list(projects)
         mock_config.get_project_config.side_effect = lambda name: _project_config()
 
         with patch.object(
-            manager, 'initialize_project', side_effect=initialize_side_effect
+            manager, 'initialize_project', side_effect=_initialize_project
         ):
             return manager.initialize_all_projects()
 
@@ -254,3 +268,83 @@ class TestLockTimeoutIsUnknownNotFalse:
             _run(manager, ['alpha'], initialize_side_effect=[True])
 
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class TestProjectsAreInitializedConcurrently:
+    """
+    #140 item 3: the project_checkout lock is per-PROJECT, so no two projects'
+    initializations contend with each other -- but a sequential loop made one
+    project's contention wait every other project's wait too. Bounded to
+    initialize_project()'s own 120s default per project, so the sequential worst
+    case was ~len(projects) x 120s of startup for a stale lock left by a crashed
+    prior process.
+    """
+
+    def test_all_projects_are_in_flight_at_once(self, manager):
+        """
+        A barrier every project must reach before any may return. Sequentially
+        this deadlocks (project 1 waits for a project 2 that has not started) and
+        the barrier's timeout fails the test; concurrently all three arrive and
+        it passes.
+        """
+        import threading
+
+        projects = ['alpha', 'beta', 'gamma']
+        barrier = threading.Barrier(len(projects), timeout=10)
+        arrived = []
+        arrival_lock = threading.Lock()
+
+        def _initialize_project(project_name, project_config, *args, **kwargs):
+            with arrival_lock:
+                arrived.append(project_name)
+            barrier.wait()
+            return False
+
+        with patch('services.project_workspace.config_manager') as mock_config:
+            mock_config.list_visible_projects.return_value = list(projects)
+            mock_config.get_project_config.side_effect = lambda name: _project_config()
+
+            with patch.object(
+                manager, 'initialize_project', side_effect=_initialize_project
+            ):
+                result = manager.initialize_all_projects()
+
+        assert sorted(arrived) == sorted(projects)
+        assert result == {p: SetupStatus.NEEDED for p in projects}
+
+    def test_results_stay_keyed_to_the_right_project(self, manager):
+        """Concurrency must not scramble which project got which answer -- the
+        outcome for each is decided inside that project's own worker."""
+        projects = ['alpha', 'beta', 'gamma']
+
+        def _initialize_project(project_name, project_config, *args, **kwargs):
+            if project_name == 'beta':
+                raise ProjectCheckoutLockTimeoutError("busy")
+            return False
+
+        for project_name in ('gamma',):
+            project_dir = manager.workspace_root / project_name
+            project_dir.mkdir(parents=True, exist_ok=True)
+            (project_dir / 'Dockerfile.agent').write_text("FROM scratch\n")
+
+        with patch('services.project_workspace.config_manager') as mock_config:
+            mock_config.list_visible_projects.return_value = list(projects)
+            mock_config.get_project_config.side_effect = lambda name: _project_config()
+
+            with patch.object(
+                manager, 'initialize_project', side_effect=_initialize_project
+            ):
+                result = manager.initialize_all_projects()
+
+        assert result == {
+            'alpha': SetupStatus.NEEDED,       # no Dockerfile.agent
+            'beta': SetupStatus.UNKNOWN,       # lock timeout
+            'gamma': SetupStatus.NOT_NEEDED,   # existing + Dockerfile.agent
+        }
+
+    def test_no_projects_configured_does_not_blow_up_the_pool(self, manager):
+        """ThreadPoolExecutor(max_workers=0) raises; an empty project list must
+        still return an empty result rather than take startup down."""
+        with patch('services.project_workspace.config_manager') as mock_config:
+            mock_config.list_visible_projects.return_value = []
+            assert manager.initialize_all_projects() == {}

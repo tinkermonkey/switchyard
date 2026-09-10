@@ -716,6 +716,61 @@ class TestPruneEpicWorktrees:
         assert tracked.exists()
         assert not untracked.exists()
 
+    def test_prune_skips_a_worktree_a_git_writer_marked_in_use(self, manager, tmp_path):
+        """(#154/WI-9 review) main.py runs this sweep the moment startup's
+        repair-cycle recovery returns, and since that pass's auto-commit join
+        became bounded by a shared budget it can return with commit threads still
+        running. Those threads are git WRITERS with no worktree resolution behind
+        them, so neither _epic_worktrees nor _epic_worktrees_pending names their
+        directory -- the sweep would force-remove it mid-`git commit` and lose the
+        repair cycle's fix."""
+        _make_base_clone(tmp_path, "my-project")
+        in_use = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '953'
+        in_use.mkdir(parents=True)
+        (in_use / "fix.py").write_text("the repair cycle's fix, mid-commit")
+
+        manager.mark_worktree_path_in_use(str(in_use))
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert in_use.exists()
+        assert (in_use / "fix.py").exists()
+
+    def test_prune_removes_the_worktree_once_the_writer_clears_its_mark(self, manager, tmp_path):
+        """The mark is held for the writer's life, not forever -- a permanent
+        hold would make every later startup's sweep a no-op for that directory."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '954'
+        worktree.mkdir(parents=True)
+
+        manager.mark_worktree_path_in_use(str(worktree))
+        manager.clear_worktree_path_in_use(str(worktree))
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert not worktree.exists()
+
+    def test_two_writers_on_one_worktree_do_not_clear_each_other(self, manager, tmp_path):
+        """Reference-counted: the first writer finishing must not expose a
+        directory the second is still writing."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '955'
+        worktree.mkdir(parents=True)
+
+        manager.mark_worktree_path_in_use(str(worktree))
+        manager.mark_worktree_path_in_use(str(worktree))
+        manager.clear_worktree_path_in_use(str(worktree))
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            mock_run.return_value = _ok()
+            manager.prune_epic_worktrees()
+
+        assert worktree.exists()
+
     def test_prune_removes_orphaned_worktree_dir(self, manager, tmp_path):
         _make_base_clone(tmp_path, "my-project")
         orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'

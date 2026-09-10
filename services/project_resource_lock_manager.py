@@ -107,6 +107,50 @@ class InvalidResourceNameError(ValueError):
     """Raised when a resource_name would corrupt the namespaced board value."""
 
 
+def is_resource_board(board: Optional[str]) -> bool:
+    """
+    True when `board` is a namespaced resource lock's internal board value
+    rather than a real GitHub pipeline board.
+
+    #140 item 29: PipelineLockManager.get_all_locks() returns both kinds in one
+    list, and its operator-facing consumers (services/observability_server.py's
+    /active-pipeline-runs, scripts/list_failed_pipeline_runs.py) rendered
+    PipelineLock.board straight through -- so a retained resource lock would
+    show an operator `"board": "__resource__project_checkout"` and, worse, a
+    `locked_by_issue` that is a MINTED HOLDER ID, not a GitHub issue number
+    (see project_checkout_lock.py's "Why every acquisition gets its own unique
+    holder id"). Consumers that render locks to a human use this to tell the
+    two apart.
+    """
+    return isinstance(board, str) and board.startswith(RESOURCE_BOARD_PREFIX)
+
+
+def resource_name_from_board(board: Optional[str]) -> Optional[str]:
+    """
+    The resource_name a namespaced board value was built from, or None when
+    `board` is an ordinary pipeline board. Inverse of
+    ProjectResourceLockManager._resource_board().
+    """
+    if not is_resource_board(board):
+        return None
+    return board[len(RESOURCE_BOARD_PREFIX):]
+
+
+def describe_lock_board(board: Optional[str]) -> Optional[str]:
+    """
+    A lock's board as it should be shown to an operator: `resource:<name>` for
+    a project-scoped resource lock, the board name unchanged for a real
+    pipeline board.
+
+    A display helper, never a value to feed back into PipelineLockManager --
+    the internal `__resource__`-prefixed string is what addresses the lock, and
+    translating it in the accessors themselves would break every caller that
+    round-trips a PipelineLock into a release.
+    """
+    resource_name = resource_name_from_board(board)
+    return f"resource:{resource_name}" if resource_name is not None else board
+
+
 class ProjectResourceLockManager:
     """
     Project-scoped exclusive resource locking.

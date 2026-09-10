@@ -316,9 +316,7 @@ reversing this order would risk a deadlock/mutual-timeout between two
 concurrent operations.
 """
 
-import asyncio
 import logging
-import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
@@ -328,11 +326,11 @@ from services.project_checkout_lock import (
     _default_facade_off_loop,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
-    _log_busy,
     _mint_unique_holder_id,
+    _poll_until_acquired_async,
+    _poll_until_acquired_sync,
     _release_and_warn,
     _release_and_warn_async,
-    _timeout_error,
     _tracked_resource_activity,
 )
 from services.project_resource_lock_manager import ProjectResourceLockManager
@@ -401,14 +399,20 @@ def agent_holds_build_window(agent: Optional[str]) -> bool:
     return agent in BUILD_WINDOW_AGENTS
 
 
-# _timeout_error()/_log_busy()/_release_and_warn() are shared with
-# services/project_checkout_lock.py (imported above) rather than duplicated
-# here -- both modules are the same poll/timeout/release shape over the same
-# ProjectResourceLockManager facade, differing only in resource_name and
-# exception type (both passed explicitly to the shared helpers below). Found
+# _poll_until_acquired_{async,sync}()/_release_and_warn()/_held_with_heartbeat_*()
+# are shared with services/project_checkout_lock.py (imported above) rather than
+# duplicated here -- both modules are the same poll/timeout/release shape over
+# the same ProjectResourceLockManager facade, differing only in resource_name
+# and exception type (both passed explicitly to the shared helpers below). Found
 # in review (#56): keeping two independently-maintained copies risked a fix
 # to one (e.g. #54's own holder-id-uniqueness bug, or its later
 # DEFAULT_TIMEOUT_SECONDS correction) silently not reaching the other.
+#
+# #140 items 5 and 22 closed the last of that duplication: the acquire/poll/
+# timeout loop itself, which survived as four near-identical copies across the
+# two modules (async + sync, here + there) even after the helpers above were
+# shared. _timeout_error()/_log_busy() are now reached only through those
+# shared loops, so this module no longer imports them directly.
 
 
 @asynccontextmanager
@@ -453,7 +457,6 @@ async def dev_container_build_lock_async(
     """
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
-    deadline = time.monotonic() + timeout_seconds
     # Publishes the wait AND the hold to project_checkout_lock's in-process
     # registry so the zombie watchdog can tell a dispatch that is legitimately
     # blocked here from one that has genuinely died -- see that registry's
@@ -469,16 +472,11 @@ async def dev_container_build_lock_async(
     with _tracked_resource_activity(
         RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
     ) as activity:
-        while True:
-            can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
-                facade, RESOURCE_NAME, project, holder_id, issue_number
-            )
-            if can_execute:
-                break
-            if time.monotonic() >= deadline:
-                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
-            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-            await asyncio.sleep(poll_interval_seconds)
+        heartbeat = await _poll_until_acquired_async(
+            facade, RESOURCE_NAME, project, holder_id, issue_number,
+            timeout_seconds, poll_interval_seconds,
+            error_cls=DevContainerBuildLockTimeoutError,
+        )
 
         if activity is not None:
             activity.mark_held()
@@ -518,18 +516,14 @@ def dev_container_build_lock_sync(
     """
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
-    deadline = time.monotonic() + timeout_seconds
     with _tracked_resource_activity(
         RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
     ) as activity:
-        while True:
-            can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
-            if can_execute:
-                break
-            if time.monotonic() >= deadline:
-                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
-            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-            time.sleep(poll_interval_seconds)
+        _poll_until_acquired_sync(
+            facade, RESOURCE_NAME, project, holder_id, issue_number,
+            timeout_seconds, poll_interval_seconds,
+            error_cls=DevContainerBuildLockTimeoutError,
+        )
 
         if activity is not None:
             activity.mark_held()

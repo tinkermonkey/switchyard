@@ -1041,6 +1041,92 @@ async def _acquire_and_start_heartbeat_off_loop(
         raise
 
 
+async def _poll_until_acquired_async(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    issue_number: Optional[int],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    error_cls: type = ProjectCheckoutLockTimeoutError,
+) -> Optional[Tuple[threading.Event, threading.Thread]]:
+    """
+    Poll for `resource_name` until acquired or `timeout_seconds` elapses, and
+    return the heartbeat handle for the hold it won.
+
+    The acquire/poll/timeout loop shared by every polling context manager built
+    on this pattern -- this module's project_checkout_lock_async() and
+    services/dev_container_build_lock.py's dev_container_build_lock_async()
+    (#140 items 5 and 22: four near-identical copies of these thirteen lines
+    across two files, differing only in which sleep primitive they use and
+    which exception type they raise, even after both modules already shared
+    _timeout_error/_log_busy/_release_and_warn/_held_with_heartbeat_*).
+
+    Deliberately NOT folded together with the sync variant below on some
+    "sleep primitive" parameter: the two no longer differ only in that. This
+    one acquires through _acquire_and_start_heartbeat_off_loop() -- a worker
+    thread that also starts the heartbeat, with the shield()/orphan-release
+    contract that goes with it -- and so has a heartbeat handle to return; the
+    sync one calls acquire_resource() directly and has none.
+
+    Raises:
+        error_cls: not acquired within timeout_seconds. Each lock passes its
+            own type -- see _timeout_error().
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+            facade, resource_name, project, holder_id, issue_number
+        )
+        if can_execute:
+            return heartbeat
+        if time.monotonic() >= deadline:
+            raise _timeout_error(
+                resource_name, project, issue_number, timeout_seconds, reason,
+                error_cls=error_cls,
+            )
+        _log_busy(resource_name, project, issue_number, reason, poll_interval_seconds)
+        await asyncio.sleep(poll_interval_seconds)
+
+
+def _poll_until_acquired_sync(
+    facade: ProjectResourceLockManager,
+    resource_name: str,
+    project: str,
+    holder_id: int,
+    issue_number: Optional[int],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    error_cls: type = ProjectCheckoutLockTimeoutError,
+) -> None:
+    """
+    Synchronous counterpart of _poll_until_acquired_async(), for the sync
+    context managers. Uses time.sleep() between polls -- MUST NOT be called
+    from a coroutine running on an asyncio event loop; see
+    project_checkout_lock_sync() for why that is more than a "blocks the loop"
+    caveat here.
+
+    Returns nothing: the sync path starts its heartbeat later, inside
+    _held_with_heartbeat_sync().
+
+    Raises:
+        error_cls: not acquired within timeout_seconds.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        can_execute, reason = facade.acquire_resource(project, resource_name, holder_id)
+        if can_execute:
+            return
+        if time.monotonic() >= deadline:
+            raise _timeout_error(
+                resource_name, project, issue_number, timeout_seconds, reason,
+                error_cls=error_cls,
+            )
+        _log_busy(resource_name, project, issue_number, reason, poll_interval_seconds)
+        time.sleep(poll_interval_seconds)
+
+
 def _stop_heartbeat_and_release(
     facade: ProjectResourceLockManager,
     resource_name: str,
@@ -1155,7 +1241,6 @@ async def project_checkout_lock_async(
     """
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
-    deadline = time.monotonic() + timeout_seconds
     # Spans the wait AND the hold -- see the registry's own comment above for
     # why the watchdog needs both halves published, not just the wait.
     #
@@ -1174,16 +1259,10 @@ async def project_checkout_lock_async(
     with _tracked_resource_activity(
         RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
     ) as activity:
-        while True:
-            can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
-                facade, RESOURCE_NAME, project, holder_id, issue_number
-            )
-            if can_execute:
-                break
-            if time.monotonic() >= deadline:
-                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
-            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-            await asyncio.sleep(poll_interval_seconds)
+        heartbeat = await _poll_until_acquired_async(
+            facade, RESOURCE_NAME, project, holder_id, issue_number,
+            timeout_seconds, poll_interval_seconds,
+        )
 
         if activity is not None:
             activity.mark_held()
@@ -1237,18 +1316,13 @@ def project_checkout_lock_sync(
     """
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
-    deadline = time.monotonic() + timeout_seconds
     with _tracked_resource_activity(
         RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
     ) as activity:
-        while True:
-            can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
-            if can_execute:
-                break
-            if time.monotonic() >= deadline:
-                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
-            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-            time.sleep(poll_interval_seconds)
+        _poll_until_acquired_sync(
+            facade, RESOURCE_NAME, project, holder_id, issue_number,
+            timeout_seconds, poll_interval_seconds,
+        )
 
         if activity is not None:
             activity.mark_held()
@@ -1258,3 +1332,86 @@ def project_checkout_lock_sync(
                 yield
         finally:
             _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+
+
+@asynccontextmanager
+async def project_checkout_lock_if_shared_async(
+    project: str,
+    work_dir,
+    issue_number: Optional[int] = None,
+    **lock_kwargs,
+):
+    """
+    Async context manager holding the project_checkout lock for the duration of
+    the `with` block IFF `work_dir` genuinely IS `project`'s shared base clone,
+    and yielding which of the two happened.
+
+    The single choke point for #140 item 4. The guard it replaces --
+
+        if workspace_manager.is_base_clone_dir(project, work_dir):
+            async with project_checkout_lock_async(project, issue_number):
+                return await do_the_work(...)
+        return await do_the_work(...)
+
+    -- was copy-pasted near-identically at four call sites
+    (claude/claude_integration.py x2, services/auto_commit.py x1 and
+    services/feature_branch_manager.py x1; the last two had already collapsed
+    their duplicated body onto a nullcontext, in #149 item 23 and #151/WI-6
+    respectively). #140 item 4 counted three -- feature_branch_manager.py's copy
+    post-dates it, and is the demonstration of the problem: a new call site
+    reproduced the pattern rather than reusing it. All four now route through
+    here. Every copy is a place a future call site can forget the guard, or
+    apply a change to one branch and miss the other. Centralising it here also
+    puts the decision next to the lock whose contract explains it.
+
+    Why the decision is `is_base_clone_dir()` and not "always lock": epic
+    worktrees share their directory with nothing, so locking them would
+    serialize sibling epics for no reason -- see is_base_clone_dir()'s own
+    docstring, and note that it fails CLOSED (treats an unresolvable directory
+    as the base clone), which is why callers must resolve a real work_dir
+    before getting here rather than passing a '.' fallback.
+
+    Failing closed is right for a lock gate but wrong as a precondition, so this
+    deliberately does NOT do an existence check of its own: a caller for which a
+    missing directory is unrecoverable must refuse before calling this, in
+    whatever shape its own failures take, rather than have that decision made
+    for it here. Both of the callers with real git work waiting on the other
+    side keep exactly that pre-guard -- auto_commit.commit_agent_changes()
+    (project_dir.exists() -> CommitResult.FAILED) and
+    feature_branch_manager's finalize (os.path.isdir() -> its error dict) --
+    because otherwise a removed epic worktree would take the project's real
+    base-clone lock, wait behind whatever holds it, and then run git against a
+    directory that isn't there. A caller for which it is not unrecoverable gets
+    the safe direction by default.
+
+    Args:
+        project: Project name.
+        work_dir: The directory the guarded operation will actually work in.
+        issue_number: log attribution only, never the lock's holder identity --
+            see this module's docstring.
+        **lock_kwargs: forwarded to project_checkout_lock_async() (timeout_seconds
+            / poll_interval_seconds / facade), for tests.
+
+    Yields:
+        True inside the hold, False having taken nothing. Callers that behave
+        differently in the shared clone (auto_commit re-reads the branch after
+        the wait, because another board can have moved HEAD while it waited)
+        read this rather than calling is_base_clone_dir() a second time.
+
+    Raises:
+        ProjectCheckoutLockTimeoutError: the directory IS the shared base clone
+            and the lock was not acquired within its timeout. Callers must not
+            fall through to the unlocked path on this -- see the module
+            docstring and services/resource_lock_errors.py.
+    """
+    # Function-local, matching auto_commit.py's own import of it:
+    # services/project_workspace.py imports this module, so a module-level
+    # import here would close the cycle.
+    from services.project_workspace import workspace_manager
+
+    if not workspace_manager.is_base_clone_dir(project, work_dir):
+        yield False
+        return
+
+    async with project_checkout_lock_async(project, issue_number, **lock_kwargs):
+        yield True
