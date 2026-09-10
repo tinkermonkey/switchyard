@@ -657,14 +657,29 @@ class PipelineQueueManager:
 
             self.save_queue(updated_queue)
 
-    def remove_issue_from_queue(self, issue_number: int):
-        """Remove issue from queue entirely"""
+    def remove_issue_from_queue(self, issue_number: int) -> bool:
+        """Remove issue from queue entirely.
+
+        Returns True when an entry was actually removed. Callers that ignore
+        the return value are unaffected; it exists so a caller that removes
+        speculatively (see ProjectMonitor.trigger_agent_for_status()'s
+        closed-issue branch, which now runs on every dispatch attempt for a
+        closed issue) can report only when something really changed, rather
+        than logging "Removed issue #N" on every no-op pass.
+        """
         with self._queue_lock():
             queue = self.load_queue()
-            queue = [issue for issue in queue if issue['issue_number'] != issue_number]
-            self.save_queue(queue)
+            remaining = [issue for issue in queue if issue['issue_number'] != issue_number]
+            removed = len(remaining) != len(queue)
+
+            if not removed:
+                logger.debug(f"Issue #{issue_number} not in pipeline queue - nothing to remove")
+                return False
+
+            self.save_queue(remaining)
 
             logger.info(f"Removed issue #{issue_number} from pipeline queue")
+            return True
 
     def force_sync_with_github(self):
         """

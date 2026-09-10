@@ -260,6 +260,149 @@ class TestAbandonStaleInProgressEntries:
         count = tracker.abandon_stale_in_progress_entries('proj', 999, active_task_ids=set())
         assert count == 0
 
+    # ------------------------------------------------------------------
+    # Board scoping — for callers whose decision was made about ONE board
+    # ------------------------------------------------------------------
+
+    def _two_board_history(self):
+        """One issue, two of its project's boards, both in_progress.
+
+        A project can have several enabled pipelines, and the same issue can be
+        an item on each of their boards at once -- which is why
+        record_execution_start() stamps board_name (#144) in the first place.
+        """
+        return [
+            # The dead run the watchdog is cleaning up.
+            {'column': 'In Development', 'agent': 'eng', 'outcome': 'in_progress',
+             'timestamp': '2026-01-01T00:00:00+00:00', 'trigger_source': 'manual',
+             'board_name': 'SDLC Execution'},
+            # A live dispatch on the OTHER board, recorded before its enqueue --
+            # no task_id stamped yet, by design.
+            {'column': 'Refinement', 'agent': 'planner', 'outcome': 'in_progress',
+             'timestamp': '2026-01-01T02:00:00+00:00', 'trigger_source': 'manual',
+             'board_name': 'Planning & Design'},
+        ]
+
+    def test_board_scoped_sweep_leaves_another_boards_live_entry_alone(self, tmp_path):
+        """REGRESSION: the watchdog's non-holder self-heal decides one thing --
+        that this issue does not hold ONE board's lock -- and must not write
+        past it. active_task_ids cannot protect the other board's entry: it is
+        empty for that caller, and a pre-enqueue probe has no task_id anyway.
+        Abandoning it drops has_active_execution() to False for a task still
+        pending in Redis, disarming should_execute_work()'s
+        'work_already_in_progress' guard with no dispatch behind the write."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 42, self._two_board_history())
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 42, active_task_ids=set(),
+            board_name='SDLC Execution',
+            started_before='2026-01-01T00:00:00+00:00',
+        )
+
+        assert count == 1
+        hist = tracker.load_state('proj', 42)['execution_history']
+        assert hist[0]['outcome'] == 'abandoned'
+        assert hist[1]['outcome'] == 'in_progress'
+
+    def test_an_unscoped_sweep_still_takes_every_board(self, tmp_path):
+        """Control case: the restart-recovery caller passes no board_name and
+        its authority genuinely IS project-wide -- the orchestrator has just
+        come up, so no execution of this issue on any board can still be
+        live. That behavior must be unchanged."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 43, self._two_board_history())
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 43, active_task_ids=set()
+        )
+
+        assert count == 2
+
+    def test_unattributed_entries_older_than_the_run_are_still_swept(self, tmp_path):
+        """A record with no board_name at all (pre-#144, or a path with no
+        board in scope) cannot be attributed, but one that predates the dead
+        run cannot be a dispatch that started after it either -- and leaving it
+        is what keeps has_active_execution() stuck True on exactly the records
+        this sweep exists to clear."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 44, [
+            {'column': 'In Development', 'agent': 'eng', 'outcome': 'in_progress',
+             'timestamp': '2025-12-31T00:00:00+00:00', 'trigger_source': 'manual'},
+        ])
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 44, active_task_ids=set(),
+            board_name='SDLC Execution',
+            started_before='2026-01-01T00:00:00+00:00',
+        )
+
+        assert count == 1
+
+    def test_unattributed_entries_newer_than_the_run_are_left_alone(self, tmp_path):
+        """The half of the cutoff that does the protecting: an unattributed
+        record written AFTER the dead run started may belong to a dispatch that
+        is still live, and there is nothing else here to tell."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 45, [
+            {'column': 'In Development', 'agent': 'eng', 'outcome': 'in_progress',
+             'timestamp': '2026-01-01T02:00:00+00:00', 'trigger_source': 'manual'},
+        ])
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 45, active_task_ids=set(),
+            board_name='SDLC Execution',
+            started_before='2026-01-01T00:00:00+00:00',
+        )
+
+        assert count == 0
+        hist = tracker.load_state('proj', 45)['execution_history']
+        assert hist[0]['outcome'] == 'in_progress'
+
+    def test_a_z_suffixed_cutoff_is_comparable(self, tmp_path):
+        """The watchdog passes a pipeline run's started_at straight through,
+        and those are written 'Z'-suffixed -- a naive comparison against the
+        module's own '+00:00' timestamps would raise and take the whole sweep
+        with it."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 46, [
+            {'column': 'In Development', 'agent': 'eng', 'outcome': 'in_progress',
+             'timestamp': '2025-12-31T00:00:00+00:00', 'trigger_source': 'manual'},
+        ])
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 46, active_task_ids=set(),
+            board_name='SDLC Execution',
+            started_before='2026-01-01T00:00:00Z',
+        )
+
+        assert count == 1
+
+    def test_an_unparsable_cutoff_leaves_unattributed_entries_alone(self, tmp_path):
+        """Without a usable cutoff there is no basis for the unattributed
+        decision, so the conservative half of the scoping applies -- not a
+        silent fall back to the project-wide sweep. The board-attributed entry
+        is still swept, since it never needed the cutoff."""
+        tracker = self._make_tracker(tmp_path)
+        self._seed_state(tracker, 'proj', 47, [
+            {'column': 'In Development', 'agent': 'eng', 'outcome': 'in_progress',
+             'timestamp': '2025-12-31T00:00:00+00:00', 'trigger_source': 'manual',
+             'board_name': 'SDLC Execution'},
+            {'column': 'Refinement', 'agent': 'planner', 'outcome': 'in_progress',
+             'timestamp': '2025-12-31T00:00:00+00:00', 'trigger_source': 'manual'},
+        ])
+
+        count = tracker.abandon_stale_in_progress_entries(
+            'proj', 47, active_task_ids=set(),
+            board_name='SDLC Execution',
+            started_before='not-a-timestamp',
+        )
+
+        assert count == 1
+        hist = tracker.load_state('proj', 47)['execution_history']
+        assert hist[0]['outcome'] == 'abandoned'
+        assert hist[1]['outcome'] == 'in_progress'
+
 
 # ===========================================================================
 # Fix 3 — AgentContainerRecovery.cleanup_orphaned_execution_history()

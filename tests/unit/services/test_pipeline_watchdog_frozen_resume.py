@@ -43,6 +43,34 @@ class FakeRedis:
     def expire(self, key, ttl):
         pass
 
+class _IssueUnderTest:
+    """A locked_by_issue that matches whichever issue a test passes.
+
+    _cleanup_zombie_run/_actively_resume_run now confirm the issue actually
+    holds the board lock before clearing its retained mark and redispatching:
+    a non-holder has nothing to self-heal (see _self_heal_still_holds_lock).
+    Every test here exercises the holder case and the issue numbers vary per
+    test, so report the lock as held by whichever one is asked about rather
+    than pinning a number in the fixture -- and report it explicitly, so these
+    tests reach the self-heal path deliberately instead of by way of that
+    method's unreadable-lock fail-safe.
+    """
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return 0
+
+    def __repr__(self):
+        return "<issue under test>"
+
+
+def _lock_held_by_issue_under_test():
+    lock = Mock()
+    lock.locked_by_issue = _IssueUnderTest()
+    return lock
+
 
 @pytest.fixture
 def watchdog():
@@ -51,6 +79,9 @@ def watchdog():
     pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
     lock_manager = Mock()
     lock_manager.clear_retained_reason = Mock(return_value=True)
+    lock_manager.get_lock_fail_closed = Mock(
+        return_value=(_lock_held_by_issue_under_test(), True)
+    )
     wd = PipelineWatchdog(
         es_client=Mock(),
         pipeline_run_manager=pipeline_run_manager,
@@ -68,6 +99,82 @@ def watchdog():
     # Nothing these tests assert depends on an external store.
     with patch("services.cleanup_guard.try_claim_cleanup", return_value=True):
         yield wd
+
+
+class TestActiveResumeNonHolderShortCircuitLeavesTheIssueRePickupable:
+    """Twin of TestZombieNonHolderShortCircuitLeavesTheIssueRePickupable in
+    test_pipeline_watchdog_retry.py, for the frozen-run resume branch: the
+    frozen run is ended and the issue does not hold the lock, so nothing is
+    redispatched -- which means end_pipeline_run's cancellation signal and the
+    frozen run's 'in_progress' execution record are both still in place, and
+    both are consulted by exactly the recovery paths this branch says the
+    issue is being left to.
+    """
+
+    def _resume_as_non_holder(self, watchdog, signal=None, tracker=None,
+                              started_at=None):
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(Mock(locked_by_issue=170), True)
+        )
+        signal = signal or Mock()
+        tracker = tracker or Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch:
+            resumed = watchdog._actively_resume_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at=started_at or old_timestamp(),
+            )
+        return resumed, signal, tracker, notify, redispatch
+
+    def test_clears_the_cancellation_signal_and_abandons_stale_entries(self, watchdog):
+        resumed, signal, tracker, notify, redispatch = self._resume_as_non_holder(watchdog)
+
+        assert resumed is True
+        redispatch.assert_not_called()
+        notify.assert_not_called()
+        signal.clear.assert_called_once_with("proj", 42)
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["project_name"] == "proj"
+        assert kwargs["issue_number"] == 42
+        assert kwargs["active_task_ids"] == set()
+        assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_the_abandon_is_scoped_to_the_board_the_decision_was_made_about(
+        self, watchdog
+    ):
+        """REGRESSION: _self_heal_still_holds_lock only established that this
+        issue does not hold THIS board's lock, so the abandon must not reach
+        past it. An issue can sit on several of a project's Projects v2 boards
+        at once, active_task_ids is empty here, and a just-dispatched entry has
+        no task_id stamped yet -- so an unscoped sweep would rewrite another
+        board's live pre-enqueue probe to 'abandoned' and drop
+        has_active_execution() to False for a task still pending in Redis."""
+        frozen_at = "2026-08-10T10:07:24Z"
+        _resumed, _signal, tracker, _notify, _redispatch = self._resume_as_non_holder(
+            watchdog, started_at=frozen_at
+        )
+
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["board_name"] == "SDLC Execution"
+        assert kwargs["started_before"] == frozen_at
+
+    def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
+        signal = Mock()
+        signal.clear.side_effect = RuntimeError("redis down")
+        tracker = Mock()
+        tracker.abandon_stale_in_progress_entries.side_effect = OSError("state file unreadable")
+
+        resumed, _signal, _tracker, notify, _redispatch = self._resume_as_non_holder(
+            watchdog, signal=signal, tracker=tracker
+        )
+
+        assert resumed is True
+        notify.assert_not_called()
 
 
 def _active_run_hit(pipeline_run_id, project, issue_number, started_at):

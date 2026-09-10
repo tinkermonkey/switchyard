@@ -570,7 +570,12 @@ async def main():
                     'body': 'Automated setup of development environment, Dockerfile.agent generation, and validation',
                     'number': 0  # No GitHub issue for automated setup
                 },
-                'issue_number': 0,
+                # NO 'issue_number' key: this is a project-scoped dispatch with
+                # no GitHub issue behind it. The placeholder 0 that used to sit
+                # here read as "yes, issue #0" to every key-presence check
+                # downstream, so the output-posting path tried, failed and
+                # retried a comment on issue #0 three times per run, at ERROR
+                # (#162). See agent_executor.normalize_issue_scope().
                 'board': 'system',  # System-initiated task
                 'project': project_name,
                 'repository': project_name,

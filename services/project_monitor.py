@@ -9,8 +9,9 @@ import logging
 import uuid
 import inspect
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 from dataclasses import dataclass
+from enum import Enum
 from monitoring.timestamp_utils import utc_isoformat
 from task_queue.task_manager import TaskQueue, Task, TaskPriority
 from config.manager import ConfigManager
@@ -74,6 +75,45 @@ NO_CONTAINER_GRACE_SECONDS = 60
 # reads this and nothing writes it.
 FAILSAFE_DISPATCH_SLOTS = 1
 
+
+class DispatchDecline(Enum):
+    """Why trigger_agent_for_status() declined to dispatch, when the reason is
+    PERMANENT -- i.e. no amount of retrying will change the answer.
+
+    trigger_agent_for_status() returns the dispatched agent's name or None, and
+    a bare None collapsed two genuinely different situations: "this attempt
+    failed, try again" and "there is nothing here to dispatch, ever". The
+    dispatch-rollback helper could only assume the former, so it returned the
+    queue entry to 'waiting' -- making it a valid dispatch candidate again on
+    the very next sweep, for an issue that is closed (#165). One ERROR line,
+    one `gh issue view`, one lock acquire/release pair and one queue write per
+    affected issue per sweep, indefinitely.
+
+    __bool__ is defined so every existing truthiness caller
+    (`if dispatched_agent:`) keeps its original meaning -- a decline is falsy,
+    exactly as the None it replaces was. Mirrors ResetResult
+    (services/pipeline_queue_manager.py) and TouchResult
+    (services/pipeline_lock_manager.py), introduced for the same reason.
+
+    Deliberately narrow: only ISSUE_CLOSED is returned today, because that is
+    the decline that was observed looping. The other declines
+    trigger_agent_for_status() makes (a duplicate pending task, a review cycle
+    already running, a retained lock) are transient by nature and must keep
+    returning None so the rollback still undoes the acquisition for them.
+    """
+
+    ISSUE_CLOSED = "issue_closed"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+def is_permanent_decline(dispatch_result) -> bool:
+    """Whether trigger_agent_for_status() declined for a reason that retrying
+    cannot fix. See DispatchDecline."""
+    return isinstance(dispatch_result, DispatchDecline)
+
+
 @dataclass
 class ProjectItem:
     """Represents an item in a GitHub Projects v2 board"""
@@ -84,6 +124,14 @@ class ProjectItem:
     status: str
     repository: str
     last_updated: str
+    # GitHub's issue state ('OPEN'/'CLOSED'). Already selected by every board
+    # query (see github_owner_utils._project_v2_fields) and previously thrown
+    # away during parsing, which is why the failsafe kept re-detecting CLOSED
+    # issues as stalled in-flight work and re-dispatching them forever (#165).
+    # Defaulted so the many positional constructions in tests stay valid, and
+    # so an unparseable/absent state is treated as OPEN — the pre-#165
+    # behaviour — rather than silently dropping an issue from the sweep.
+    state: str = 'OPEN'
 
 
 def _save_repair_cycle_context(
@@ -1152,7 +1200,9 @@ class ProjectMonitor:
                 title=content['title'],
                 status=status,
                 repository=content['repository']['name'],
-                last_updated=content['updatedAt']
+                last_updated=content['updatedAt'],
+                # Already in the response — see ProjectItem.state (#165).
+                state=(content.get('state') or 'OPEN').upper(),
             )
             items.append(item)
         return items
@@ -2680,7 +2730,7 @@ class ProjectMonitor:
         lock_already_acquired: bool = False,
         raise_on_error: bool = False,
         already_activated_at: Optional[str] = None
-    ) -> Optional[str]:
+    ) -> Union[str, 'DispatchDecline', None]:
         """
         Determine which agent should handle this status and create a task or review cycle
 
@@ -2710,7 +2760,20 @@ class ProjectMonitor:
 
         Returns:
             The agent name when work was actually dispatched (a task enqueued or a
-            conversational loop started), None otherwise.
+            conversational loop started).
+
+            A falsy DispatchDecline when the dispatch was declined for a reason
+            no retry can fix (today: the issue is closed). Test for it with
+            is_permanent_decline(), NEVER with `is None` — a DispatchDecline is
+            falsy but is not None, so `if result is None:` reads it as a
+            successful dispatch and skips the rollback, leaving the lock held
+            and the queue entry stuck at 'active' (the #142/#147 end state).
+            `if not result:` is the safe truthiness test.
+
+            None for every other non-dispatch: a transient decline (a duplicate
+            pending task, a review cycle already running, a retained lock) or,
+            unless raise_on_error is set, an internal failure. These are the
+            outcomes a caller SHOULD roll back and may retry.
         """
         try:
             # Get workflow template for this board
@@ -2736,12 +2799,12 @@ class ProjectMonitor:
 
             if issue_state == 'CLOSED':
                 logger.info(f"Issue #{issue_number} is CLOSED - checking if lock needs release")
-                
+
                 # Check if lock is held and release it
                 from services.pipeline_lock_manager import get_pipeline_lock_manager
                 lock_manager = get_pipeline_lock_manager()
                 lock = lock_manager.get_lock(project_name, board_name)
-                
+
                 if lock and lock.locked_by_issue == issue_number:
                     logger.info(f"Releasing pipeline lock for closed issue #{issue_number}")
                     self._release_pipeline_lock_and_process_next(
@@ -2749,8 +2812,30 @@ class ProjectMonitor:
                         repository, workflow_template,
                         keep_cancelled=True
                     )
-                
-                return None
+
+                # Releasing the lock is not enough: nothing removed the closed
+                # issue from the pipeline queue, so it stayed a dispatch
+                # candidate and this whole branch re-ran on every sweep (#165).
+                # A closed issue is never coming back through the pipeline —
+                # reopening it re-enqueues it through the normal board paths —
+                # so drop the entry rather than leaving it ahead of real work
+                # in get_next_n_waiting_issues().
+                try:
+                    from services.pipeline_queue_manager import get_pipeline_queue_manager
+                    pipeline_queue = get_pipeline_queue_manager(project_name, board_name)
+                    pipeline_queue.remove_issue_from_queue(issue_number)
+                except Exception as dequeue_error:
+                    # Best-effort: the DispatchDecline returned below already
+                    # stops the caller from re-arming this issue, so a failed
+                    # dequeue costs a stale entry, not another retry loop.
+                    logger.warning(
+                        f"Could not remove closed issue #{issue_number} from the "
+                        f"{project_name}/{board_name} pipeline queue: {dequeue_error}"
+                    )
+
+                # Falsy, exactly like the None it replaces, but distinguishable
+                # from a transient failure by the dispatch-rollback helper.
+                return DispatchDecline.ISSUE_CLOSED
 
             # Find the column that matches this status
             agent = None
@@ -4147,9 +4232,17 @@ class ProjectMonitor:
                 issue. None for conversational dispatch, which runs without one.
 
         Returns:
-            True if an agent was dispatched, False if the acquisition was rolled back.
+            True if an agent was dispatched, False if the acquisition was rolled
+            back. False covers two distinguishable cases internally, and the
+            difference decides what happens to the QUEUE entry (the lock comes
+            back either way): a transient decline returns the entry to 'waiting'
+            so it is retried, while a permanent DispatchDecline deliberately
+            leaves it out — re-arming a closed issue is what turned a one-time
+            decline into a per-sweep retry loop (#165). See the
+            is_permanent_decline() branch below.
         """
         dispatched_agent = None
+        permanent_decline = False
         try:
             dispatched_agent = self.trigger_agent_for_status(
                 project_name, board_name, issue_number, current_column, repository,
@@ -4167,73 +4260,95 @@ class ProjectMonitor:
             if dispatched_agent:
                 return True
 
-            # No exception, but nothing dispatched either. trigger_agent_for_status()
-            # declines for legitimate reasons too (a duplicate pending task, a
-            # review/repair cycle already running), so confirm nothing is actually
-            # alive before undoing anything — the same canonical predicate the
-            # stranded-'active' sweep uses. It fails closed internally, and any
-            # error here is treated as "something might be running".
-            try:
-                from services.work_execution_state import work_execution_tracker
-                if work_execution_tracker.has_active_execution(project_name, issue_number):
-                    logger.debug(
-                        f"Next queued issue #{issue_number} did not dispatch a new agent "
-                        f"but has active work — leaving the lock and queue entry alone"
+            if is_permanent_decline(dispatched_agent):
+                # trigger_agent_for_status() declined for a reason retrying
+                # cannot fix (the issue is closed). The lock still has to come
+                # back — this method's caller acquired it — but the queue entry
+                # must NOT be returned to 'waiting': that is precisely what
+                # made this issue a dispatch candidate again on the next sweep
+                # and turned a one-time decline into a permanent retry loop
+                # (#165). The closed-issue branch has already removed the entry
+                # outright; skipping the reset here is what stops the loop even
+                # if that removal was missed or failed.
+                #
+                # INFO, not ERROR: "started nothing" is accurate but reads as a
+                # fault, and this one is a resting state, not a fault. A
+                # recurring, unactionable ERROR is what trains operators to
+                # stop reading the log (#177 Phase 1).
+                logger.info(
+                    f"Dispatch of queued issue #{issue_number} in '{current_column}' "
+                    f"declined permanently ({dispatched_agent.value}); releasing the "
+                    f"lock and leaving the queue entry out rather than re-arming it"
+                )
+                permanent_decline = True
+            else:
+                # No exception, but nothing dispatched either. trigger_agent_for_status()
+                # declines for legitimate reasons too (a duplicate pending task, a
+                # review/repair cycle already running), so confirm nothing is actually
+                # alive before undoing anything — the same canonical predicate the
+                # stranded-'active' sweep uses. It fails closed internally, and any
+                # error here is treated as "something might be running".
+                try:
+                    from services.work_execution_state import work_execution_tracker
+                    if work_execution_tracker.has_active_execution(project_name, issue_number):
+                        logger.debug(
+                            f"Next queued issue #{issue_number} did not dispatch a new agent "
+                            f"but has active work — leaving the lock and queue entry alone"
+                        )
+                        return False
+                except Exception as liveness_error:
+                    logger.warning(
+                        f"Could not confirm whether work is running for #{issue_number} after "
+                        f"a no-op dispatch — leaving the lock and queue entry alone: "
+                        f"{liveness_error}"
                     )
                     return False
-            except Exception as liveness_error:
-                logger.warning(
-                    f"Could not confirm whether work is running for #{issue_number} after "
-                    f"a no-op dispatch — leaving the lock and queue entry alone: "
-                    f"{liveness_error}"
-                )
-                return False
 
-            # has_active_execution() covers work that has STARTED, and every
-            # enqueue site calls record_execution_start() BEFORE enqueuing, so it
-            # already covers "enqueued but not yet picked up" for almost every
-            # pending task. The narrow gap it does NOT cover is a pipeline_progression
-            # probe whose in_progress record has aged past _STALE_ENQUEUE_PROBE_SECS
-            # with no task_id stamp: has_active_execution() clears that probe as
-            # stale while the Redis task may still be pending. That gap, plus
-            # trigger_agent_for_status()'s "Task already exists for {agent} on
-            # issue #N - skipping duplicate" branch, is what this check is for.
-            #
-            # BOUNDED on purpose (#147 review): an unbounded, agent-agnostic "any
-            # pending task for #N" check reproduces the exact end state #147 fixes.
-            # One ORPHANED pending task for #N — one no worker will ever run —
-            # would suppress this rollback forever, the lock would never be
-            # released, and _reset_stranded_active_issues() skips the lock holder
-            # by design, so nothing recovers it. Matching the agent (exactly as the
-            # duplicate-task branch does) and ignoring tasks older than the
-            # suppression window keeps the guard useful without making it a trap.
-            expected_agent = None
-            try:
-                expected_agent = self._get_agent_for_status(
-                    project_name, board_name, current_column
-                )
-            except Exception as agent_lookup_error:
-                logger.debug(
-                    f"Could not resolve the expected agent for #{issue_number} in "
-                    f"'{current_column}' — checking pending tasks across all agents: "
-                    f"{agent_lookup_error}"
-                )
+                # has_active_execution() covers work that has STARTED, and every
+                # enqueue site calls record_execution_start() BEFORE enqueuing, so it
+                # already covers "enqueued but not yet picked up" for almost every
+                # pending task. The narrow gap it does NOT cover is a pipeline_progression
+                # probe whose in_progress record has aged past _STALE_ENQUEUE_PROBE_SECS
+                # with no task_id stamp: has_active_execution() clears that probe as
+                # stale while the Redis task may still be pending. That gap, plus
+                # trigger_agent_for_status()'s "Task already exists for {agent} on
+                # issue #N - skipping duplicate" branch, is what this check is for.
+                #
+                # BOUNDED on purpose (#147 review): an unbounded, agent-agnostic "any
+                # pending task for #N" check reproduces the exact end state #147 fixes.
+                # One ORPHANED pending task for #N — one no worker will ever run —
+                # would suppress this rollback forever, the lock would never be
+                # released, and _reset_stranded_active_issues() skips the lock holder
+                # by design, so nothing recovers it. Matching the agent (exactly as the
+                # duplicate-task branch does) and ignoring tasks older than the
+                # suppression window keeps the guard useful without making it a trap.
+                expected_agent = None
+                try:
+                    expected_agent = self._get_agent_for_status(
+                        project_name, board_name, current_column
+                    )
+                except Exception as agent_lookup_error:
+                    logger.debug(
+                        f"Could not resolve the expected agent for #{issue_number} in "
+                        f"'{current_column}' — checking pending tasks across all agents: "
+                        f"{agent_lookup_error}"
+                    )
 
-            if self._has_pending_task_for_issue(
-                project_name, board_name, issue_number, agent=expected_agent
-            ):
-                logger.debug(
-                    f"Next queued issue #{issue_number} did not dispatch a new agent "
-                    f"but already has a recent pending task — leaving the lock and "
-                    f"queue entry alone"
-                )
-                return False
+                if self._has_pending_task_for_issue(
+                    project_name, board_name, issue_number, agent=expected_agent
+                ):
+                    logger.debug(
+                        f"Next queued issue #{issue_number} did not dispatch a new agent "
+                        f"but already has a recent pending task — leaving the lock and "
+                        f"queue entry alone"
+                    )
+                    return False
 
-            logger.error(
-                f"Dispatch of next queued issue #{issue_number} in '{current_column}' "
-                f"started nothing and nothing is running for it, rolling back lock "
-                f"acquisition and queue status to prevent deadlock"
-            )
+                logger.error(
+                    f"Dispatch of next queued issue #{issue_number} in '{current_column}' "
+                    f"started nothing and nothing is running for it, rolling back lock "
+                    f"acquisition and queue status to prevent deadlock"
+                )
 
         if lock_manager is not None:
             # NOT an unconditional release, despite what this helper's docstring
@@ -4288,7 +4403,12 @@ class ProjectMonitor:
         # is deliberately not holder-scoped), and if it belongs to this one, the
         # mark_failed path already reset the entry, so this is a benign no-op that
         # reports itself as NOT_ACTIVE.
-        if activated_at is not None:
+        #
+        # It is NOT reset after a permanent decline, though: returning a closed
+        # issue's entry to 'waiting' is what re-arms it for the next sweep and
+        # makes the decline recur forever (#165). The entry has already been
+        # removed outright by the branch that declined.
+        if activated_at is not None and not permanent_decline:
             from services.pipeline_queue_manager import describe_rollback_reset
             try:
                 reset_result = pipeline_queue.reset_issue_to_waiting(
@@ -9765,6 +9885,38 @@ _Repair cycle initiated by Switchyard_
                         if not column_config:
                             continue
 
+                        # Skip CLOSED issues, for the same reason
+                        # _find_stalled_issues_for_pipeline() does (#165):
+                        # Projects v2 items stay on the board after closing, so
+                        # a closed issue parked in an agent-bearing column looks
+                        # exactly like work that never got dispatched. This scan
+                        # then spends a `gh issue view` on its existing-output
+                        # check, a lock read and a queue write per closed issue,
+                        # calls trigger_agent_for_status(), and hits that
+                        # method's closed-issue branch — every restart, forever,
+                        # for a condition no retry resolves. On a board holding
+                        # the four closed code-wrapper issues #165 was filed
+                        # against that is four wasted GitHub calls in the
+                        # startup-reconciliation window #168 measured as the
+                        # budget-exhaustion burst.
+                        #
+                        # Checked BEFORE _check_and_create_discussion too: a
+                        # closed issue has no pipeline left to run, so opening a
+                        # discussion for it is another GitHub call spent on
+                        # work that will never happen. Reopening re-enqueues the
+                        # issue through the normal board paths.
+                        #
+                        # Defaults to OPEN when state is missing so an
+                        # unparseable state keeps the pre-#165 behaviour rather
+                        # than silently dropping an issue from the scan.
+                        if (getattr(item, 'state', None) or 'OPEN').upper() == 'CLOSED':
+                            logger.debug(
+                                f"Rescan skipping closed issue #{item.issue_number} in "
+                                f"'{item.status}' for {project_name}/{pipeline.board_name} "
+                                f"— closed issues are not stalled work"
+                            )
+                            continue
+
                         # Check for missing discussions (e.g. Backlog items added while offline)
                         self._check_and_create_discussion(
                             project_name,
@@ -10148,6 +10300,54 @@ _Repair cycle initiated by Switchyard_
             )
             return None, 'query_failed'
 
+    def _end_orphaned_run_for_closed_issue(self, project_name: str, board_name: str,
+                                           issue_number: int, column: str) -> bool:
+        """End a closed issue's still-active pipeline run, if it has one.
+
+        Restores the cleanup side effect the closed-issue skip in
+        _find_stalled_issues_for_pipeline() removed (#165 review). A closed
+        issue is never coming back through the pipeline — reopening it
+        re-enqueues it through the normal board paths — so an active run for
+        one is orphaned by definition.
+
+        Returns:
+            True if an active run was found and ended, False otherwise
+            (including on error — this is best-effort cleanup and must never
+            be able to break the stalled-issue scan around it).
+        """
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+
+            pipeline_run_manager = get_pipeline_run_manager()
+            pipeline_run = pipeline_run_manager.get_active_pipeline_run(
+                project=project_name,
+                issue_number=issue_number,
+                board=board_name
+            )
+            if not pipeline_run:
+                return False
+
+            ended = pipeline_run_manager.end_pipeline_run(
+                project=project_name,
+                issue_number=issue_number,
+                reason=f"Issue closed while in column '{column}'",
+                retain_lock=False,
+                board=board_name
+            )
+            if ended:
+                logger.info(
+                    f"Ended orphaned pipeline run {pipeline_run.id[:8]}... for "
+                    f"closed issue #{issue_number} in "
+                    f"{project_name}/{board_name}"
+                )
+            return ended
+        except Exception as e:
+            logger.warning(
+                f"Could not end the orphaned pipeline run for closed issue "
+                f"#{issue_number} in {project_name}/{board_name}: {e}"
+            )
+            return False
+
     def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str,
                                             cached_items: List[ProjectItem] = None):
         """
@@ -10240,6 +10440,56 @@ _Repair cycle initiated by Switchyard_
 
                     # Skip exit columns (Done, Staged, etc.)
                     if column in exit_columns:
+                        continue
+
+                    # Skip CLOSED issues. A closed issue left sitting in a
+                    # mid-pipeline column (In Review, Code Review, ...) looked
+                    # exactly like stalled in-flight work here, so every sweep
+                    # selected it, acquired the board lock, called
+                    # trigger_agent_for_status(), hit its closed-issue check,
+                    # dispatched nothing, and rolled the acquisition back —
+                    # one `gh issue view`, one lock acquire/release pair and
+                    # one ERROR line per closed issue per sweep, forever, for
+                    # a condition no retry can resolve (#165).
+                    #
+                    # `state` costs nothing: it is already in the board query
+                    # response every caller of this method has in hand. This
+                    # check deliberately lives HERE rather than in
+                    # get_project_items(), which many other paths rely on to
+                    # still see closed issues (exit-column processing, column
+                    # change detection).
+                    if (item.state or 'OPEN').upper() == 'CLOSED':
+                        logger.debug(
+                            f"Skipping closed issue #{issue_number} in "
+                            f"'{column}' for {project_name}/{board_name} — "
+                            f"closed issues are not stalled work"
+                        )
+                        # Skipping the dispatch is not the whole of what the
+                        # old behaviour did. Selecting a closed issue here was
+                        # also the only thing that ever ENDED its orphaned
+                        # pipeline run: the failsafe acquired the lock for it,
+                        # trigger_agent_for_status() hit its CLOSED branch and
+                        # _release_pipeline_lock_and_process_next() called
+                        # end_pipeline_run(). This method selects on a STALE
+                        # active run as well as on no run at all (see the
+                        # decision-event heartbeat check below), so a closed
+                        # issue can genuinely have one — and with nothing
+                        # ending it, it would survive to become a zombie the
+                        # watchdog then tries to self-heal by clearing a
+                        # retained lock this issue never held. Do the cleanup
+                        # here instead, where it is cheap and quiet.
+                        #
+                        # get_active_pipeline_run() first so the steady state
+                        # (closed issue, no run) costs one Redis read per
+                        # sweep and no writes — the point of #165 was to stop
+                        # spending work on closed issues, not to move it.
+                        # retain_lock=False mirrors the pre-change teardown:
+                        # end_pipeline_run() only releases when this issue
+                        # actually holds the lock, so a lock held by a
+                        # different issue is left alone.
+                        self._end_orphaned_run_for_closed_issue(
+                            project_name, board_name, issue_number, column
+                        )
                         continue
 
                     # Skip issues in waiting queue (handled by main failsafe)

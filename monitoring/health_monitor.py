@@ -495,15 +495,78 @@ class HealthMonitor:
 
             call_stats_info = client_status['stats']
 
-            # Check if either bucket is critically low (only meaningful
+            # The GitHub App installation's own GraphQL budget, reported
+            # separately from the two buckets above because it is a DIFFERENT
+            # quota spent by a different credential: an operator running
+            # `gh api rate_limit` can read 5000/5000 off the PAT while the App
+            # is fully exhausted, which is exactly the misdiagnosis #168
+            # records. Local to this process (never mirrored to Redis - see
+            # GitHubAPIClient.__init__), which is correct here: the App client
+            # only runs in-process with the orchestrator.
+            # .get(), not [...]: an older/stubbed client status without this
+            # key must not throw the whole block into its except-handler and
+            # blank out the breaker and call stats along with it.
+            rate_limit_app_graphql_info = client_status.get('rate_limit_app_graphql')
+
+            # The GraphQL rate-limit holds services/github_app.py applies per
+            # credential. Reported here because the hold, not either bucket,
+            # is what actually decides whether that module's GraphQL works:
+            # while one is in force every graphql_request() on that credential
+            # returns None with no network call, and its direct consumers
+            # (project_monitor's previous-stage-context read, review_cycle's,
+            # the human-feedback-loop paths) have no PAT fallback - they log
+            # an ERROR and hand the agent an empty context. Before this the
+            # entire hold window was visible only in the single WARNING
+            # _start_graphql_hold() emits when it opens the hold, which can be
+            # an hour old by the time an operator looks.
+            #
+            # An active hold degrades on its own, independent of any
+            # percentage. It has to: a hold on the PAT leg (which is what a
+            # deployment without App credentials gets - graphql_request()
+            # never checks self.enabled) updates NO bucket at all, because
+            # only an installation token's response headers are attributed
+            # (see graphql_request's `app_headers`). A purely
+            # percentage-based test is structurally blind to that case.
+            #
+            # Best-effort, and the derived flag is computed INSIDE the same
+            # try: an older/stubbed GitHubApp without this method must degrade
+            # to "no hold information", not take the whole rate-limit section
+            # into its except-handler and blank out the buckets, the breaker
+            # and the call stats along with it.
+            app_graphql_hold_info = None
+            graphql_hold_active = False
+            try:
+                app_graphql_hold_info = github_app.get_graphql_hold_status()
+                graphql_hold_active = any(
+                    hold.get('active') for hold in (app_graphql_hold_info or {}).values()
+                )
+            except Exception as hold_error:
+                logger.debug(f"Could not read GitHub App GraphQL hold status: {hold_error}")
+                app_graphql_hold_info = None
+                graphql_hold_active = False
+
+            # Check if any bucket is critically low (only meaningful
             # once a real reading exists for that bucket - the local
             # fallback above makes this correctly evaluable even during a
             # shared-view outage, as long as this process has its own
             # reading), or if the shared view is down AND this process has
             # no local reading either - a real loss of visibility into
             # quota status is itself a degraded condition, not silence.
+            #
+            # The App bucket is gated on ever_updated rather than read like
+            # the other two: it is populated ONLY by real App-credential
+            # responses (never mirrored to Redis, no local fallback), so on a
+            # PAT-only deployment it sits at its 5000/5000 constructor
+            # defaults forever. Reading percentage_used off that would be
+            # reading a placeholder, not a measurement.
+            app_pct = 0
+            if rate_limit_app_graphql_info and rate_limit_app_graphql_info.get('ever_updated'):
+                app_pct = rate_limit_app_graphql_info.get('percentage_used') or 0
+
             if ((rate_limit_graphql_info['percentage_used'] or 0) > 95
                     or (rate_limit_rest_info['percentage_used'] or 0) > 95
+                    or app_pct > 95
+                    or graphql_hold_active
                     or lost_visibility):
                 degraded = True
         except Exception as e:
@@ -511,6 +574,8 @@ class HealthMonitor:
             rate_limit_info = None
             rate_limit_graphql_info = None
             rate_limit_rest_info = None
+            rate_limit_app_graphql_info = None
+            app_graphql_hold_info = None
             circuit_breaker_info = None
             call_stats_info = None
 
@@ -530,6 +595,8 @@ class HealthMonitor:
             'api_rate_limit': rate_limit_info,
             'api_rate_limit_graphql': rate_limit_graphql_info,
             'api_rate_limit_rest': rate_limit_rest_info,
+            'api_rate_limit_app_graphql': rate_limit_app_graphql_info,
+            'github_app_graphql_holds': app_graphql_hold_info,
             'circuit_breaker': circuit_breaker_info,
             'api_call_stats': call_stats_info,
         }

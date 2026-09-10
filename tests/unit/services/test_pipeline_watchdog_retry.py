@@ -29,6 +29,34 @@ class FakeRedis:
     def expire(self, key, ttl):
         self.expiries[key] = ttl
 
+class _IssueUnderTest:
+    """A locked_by_issue that matches whichever issue a test passes.
+
+    _cleanup_zombie_run/_actively_resume_run now confirm the issue actually
+    holds the board lock before clearing its retained mark and redispatching:
+    a non-holder has nothing to self-heal (see _self_heal_still_holds_lock).
+    Every test here exercises the holder case and the issue numbers vary per
+    test, so report the lock as held by whichever one is asked about rather
+    than pinning a number in the fixture -- and report it explicitly, so these
+    tests reach the self-heal path deliberately instead of by way of that
+    method's unreadable-lock fail-safe.
+    """
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return 0
+
+    def __repr__(self):
+        return "<issue under test>"
+
+
+def _lock_held_by_issue_under_test():
+    lock = Mock()
+    lock.locked_by_issue = _IssueUnderTest()
+    return lock
+
 
 @pytest.fixture
 def watchdog():
@@ -37,6 +65,15 @@ def watchdog():
     pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
     lock_manager = Mock()
     lock_manager.clear_retained_reason = Mock(return_value=True)
+    lock_manager.get_lock_fail_closed = Mock(
+        return_value=(_lock_held_by_issue_under_test(), True)
+    )
+    # Explicitly False, not left to a bare Mock's truthy auto-attribute: this
+    # is the "Redis positively answered no-lock" confirmation the permanent-
+    # decline branch consults when a read comes back unhealthy, and a truthy
+    # default would silently flip every fail-closed test in this file into the
+    # released branch without anyone asking for it.
+    lock_manager.redis_lock_is_missing = Mock(return_value=False)
     project_monitor = Mock()
     # Default to an open issue -- a bare Mock()'s auto-generated attributes
     # are truthy and .upper()-able, which would silently NOT match 'CLOSED'
@@ -419,6 +456,194 @@ class TestRedispatchSameIssue:
             assert watchdog._redispatch_same_issue("proj", "SDLC Execution", 159) is False
         watchdog.project_monitor.trigger_agent_for_status.assert_not_called()
 
+
+class TestRedispatchPermanentDecline:
+    """The race-window twin of the explicit closed-issue check: the issue was
+    OPEN when _redispatch_same_issue read it and CLOSED by the time
+    trigger_agent_for_status read it again, so the outcome comes back as a
+    DispatchDecline instead.
+
+    It is the SAME outcome -- closed, lock released, nothing to retry -- and
+    must be reported the same way. Returning False here would send both callers
+    down the redispatch-failure path: mark_lock_failed() to durably re-retain
+    the board lock, an ERROR, a CRITICAL when that mark fails (which it does,
+    because the lock is no longer this issue's), and a manual-intervention
+    comment posted on a closed issue. That is the recurring unactionable
+    ERROR this branch exists to remove, plus a board blocked until someone
+    runs scripts/release_lock.py.
+    """
+
+    def _fake_project_config(self):
+        cfg = Mock()
+        cfg.github = {"org": "the-org", "repo": "the-repo"}
+        return cfg
+
+    def _decline(self, watchdog, lock_after_dispatch):
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(lock_after_dispatch, True)
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            return watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+    def test_a_released_lock_makes_the_decline_a_clean_self_heal(self, watchdog):
+        """trigger_agent_for_status' closed branch released the lock (and may
+        have handed it straight to the next queued issue), so there is nothing
+        left to re-retain and nothing to escalate."""
+        assert self._decline(watchdog, lock_after_dispatch=None) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_the_lock_having_moved_on_is_also_a_clean_self_heal(self, watchdog):
+        """_release_pipeline_lock_and_process_next() can dispatch the next
+        queued issue onto the freed lock. Re-retaining THAT issue's lock is
+        the specific harm -- it blocks a board on behalf of a closed issue."""
+        next_holder = Mock(locked_by_issue=170)
+
+        assert self._decline(watchdog, lock_after_dispatch=next_holder) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_a_lock_still_held_by_this_issue_is_a_real_failure(self, watchdog):
+        """Confirmed, not assumed: if the lock did NOT come back, the self-heal
+        genuinely did not complete and False -- with the caller's re-retain --
+        is the correct answer."""
+        assert self._decline(
+            watchdog, lock_after_dispatch=Mock(locked_by_issue=159)
+        ) is False
+
+    def test_a_raising_lock_read_fails_closed(self, watchdog):
+        """An unreadable lock is not evidence it was released; leaving it
+        un-retained is the orphaning the callers' fail-safe exists to stop."""
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            side_effect=RuntimeError("redis down")
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is False
+
+    def _decline_with_unhealthy_read(self, watchdog, redis_lock_is_missing):
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(
+            return_value=redis_lock_is_missing
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            return watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+    def test_a_dual_store_read_failure_also_fails_closed(self, watchdog):
+        """The failure mode the fail-closed comment actually names, and the
+        one get_lock() cannot report: _read_redis_lock_only and
+        _read_yaml_lock_only each swallow their own exception and return
+        (None, False), so nothing raises -- get_lock() just hands back None,
+        which is indistinguishable from "confirmed released". Read through
+        get_lock_fail_closed() instead, so reads_healthy=False is treated as
+        "assume still held" rather than silently returning a clean success on
+        a lock that is still durably this issue's.
+
+        redis_lock_is_missing() is False here because it is False whenever the
+        Redis read itself failed -- which is what "both stores failed" means.
+        Nothing about this read confirms a release."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=False
+        ) is False
+
+    def test_a_yaml_only_read_failure_after_a_confirmed_release_does_not_page(
+        self, watchdog
+    ):
+        """REGRESSION: reads_healthy=False does NOT mean "both stores raised".
+        get_lock_fail_closed() is also unhealthy when the YAML leg alone failed
+        and Redis holds no entry (_get_lock_fail_closed_detail's asymmetric
+        case) -- and on THIS path "Redis holds no entry" is the expected steady
+        state, because trigger_agent_for_status()'s closed-issue branch just
+        released the lock itself. reads_healthy therefore collapses to "did the
+        contended '<state>.yaml.lock' read beat its 20s timeout", and treating
+        that lone file-lock timeout as "still held" re-arms exactly the outcome
+        this branch exists to remove: mark_lock_failed() on a lock that is no
+        longer this issue's, a CRITICAL, and a "Pipeline Stuck - Manual
+        Intervention Required" comment on a CLOSED issue about a board nobody
+        is blocking."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=True
+        ) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_the_yaml_only_allowance_is_scoped_to_this_call_site(self, watchdog):
+        """The allowance is only defensible where a release was just triggered.
+        The zombie/resume branches ask the same question at a point where
+        nothing has released anything, so they must keep failing closed on the
+        same unhealthy read."""
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(return_value=True)
+
+        assert watchdog._self_heal_still_holds_lock(
+            watchdog.lock_manager, "proj", "SDLC Execution", 159, "Zombie self-heal"
+        ) is True
+        watchdog.lock_manager.redis_lock_is_missing.assert_not_called()
+
+    def test_a_redisless_deployment_still_fails_closed(self, watchdog):
+        """redis_lock_is_missing() is False when no Redis is configured at all,
+        so a YAML-only deployment whose state file could not be read gets the
+        conservative answer rather than a confirmation nothing actually made."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=False
+        ) is False
+
+    def test_a_raising_redis_confirmation_fails_closed(self, watchdog):
+        """An unanswered question is not an answer."""
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(
+            side_effect=RuntimeError("redis down")
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            result = watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
+        assert result is False
+
+    def test_a_clean_decline_logs_no_error(self, watchdog, caplog):
+        """The whole point of the branch: no recurring unactionable ERROR for a
+        condition that will never change (#177 Phase 1)."""
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="services.pipeline_watchdog"):
+            self._decline(watchdog, lock_after_dispatch=None)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors == [], [r.getMessage() for r in errors]
+
     def test_continues_dispatch_when_abandon_stale_entries_raises(self, watchdog):
         """abandon_stale_in_progress_entries is a best-effort call — if it
         raises, the redispatch attempt must still proceed (it's more useful
@@ -464,6 +689,133 @@ class TestAbandonStaleEntriesReason:
         assert "self-heal" in reason.lower() or "watchdog" in reason.lower()
 
 
+class TestZombieNonHolderShortCircuitLeavesTheIssueRePickupable:
+    """The non-holder short-circuit returns a clean success without
+    redispatching, on the stated basis that the issue is left to the normal
+    queue/failsafe paths. Two leftovers make that untrue unless the branch
+    clears them itself, and until now only _redispatch_same_issue did:
+
+    - the cancellation signal end_pipeline_run sets for every reason but
+      feedback_loop_ended. _find_stalled_issues_for_pipeline() skips a
+      cancelled issue outright and _check_and_process_waiting_issues_failsafe()
+      skips it after acquiring the lock (purging its queue row), for the
+      signal's full 1-hour TTL.
+    - the dead run's 'in_progress' execution record, which keeps
+      has_active_execution() True -- permanently for a trigger_source='manual'
+      probe, which the stale-probe self-heal deliberately does not age out --
+      and so keeps the issue out of the stalled-issue rescan. The only other
+      caller of abandon_stale_in_progress_entries() runs at startup, so
+      without this the issue would sit stranded until the next restart with
+      not one WARNING emitted.
+    """
+
+    def _cleanup_as_non_holder(self, watchdog, signal=None, tracker=None):
+        watchdog.lock_manager.get_lock_fail_closed = Mock(
+            return_value=(Mock(locked_by_issue=170), True)
+        )
+        signal = signal or Mock()
+        tracker = tracker or Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue") as redispatch:
+            cleaned = watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+        return cleaned, signal, tracker, notify, redispatch
+
+    def test_clears_the_cancellation_signal_end_pipeline_run_set(self, watchdog):
+        cleaned, signal, _tracker, notify, redispatch = self._cleanup_as_non_holder(watchdog)
+
+        assert cleaned is True
+        redispatch.assert_not_called()
+        notify.assert_not_called()
+        signal.clear.assert_called_once_with("proj", 42)
+
+    def test_abandons_the_dead_runs_stale_in_progress_entries(self, watchdog):
+        cleaned, _signal, tracker, _notify, _redispatch = self._cleanup_as_non_holder(watchdog)
+
+        assert cleaned is True
+        tracker.abandon_stale_in_progress_entries.assert_called_once()
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["project_name"] == "proj"
+        assert kwargs["issue_number"] == 42
+        # Empty on purpose: no agent container is running for a zombie -- that
+        # is its definition -- so every in_progress entry it has is stale.
+        assert kwargs["active_task_ids"] == set()
+        # The forensic record an operator reads must not claim a restart that
+        # never happened, same as _redispatch_same_issue's own reason text.
+        assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_the_abandon_is_scoped_to_the_board_the_decision_was_made_about(
+        self, watchdog
+    ):
+        """REGRESSION: the decision authorising this write is board-scoped --
+        _self_heal_still_holds_lock only established that #42 does not hold
+        THIS board's lock -- so the write must be too. An issue can sit on
+        several of a project's Projects v2 boards at once (see
+        _redispatch_same_issue's board-aware column lookup), active_task_ids is
+        empty here, and record_execution_start() runs BEFORE the Redis enqueue
+        so a just-dispatched entry has no task_id to protect it. An unscoped
+        sweep therefore rewrites another board's live pre-enqueue probe to
+        'abandoned', dropping has_active_execution() to False for a task still
+        pending in Redis -- with no dispatch behind it, unlike the redispatch
+        path."""
+        _cleaned, _signal, tracker, _notify, _redispatch = self._cleanup_as_non_holder(
+            watchdog
+        )
+
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["board_name"] == "SDLC Execution"
+        assert kwargs["started_before"] == "2026-08-10T10:07:24Z"
+
+    def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
+        """Best-effort, like the equivalent cleanups on the redispatch path:
+        the run is ended and the lock is some other issue's either way, so a
+        failure here is a WARNING naming what is still blocking re-pickup, not
+        an escalation to manual intervention."""
+        signal = Mock()
+        signal.clear.side_effect = RuntimeError("redis down")
+        tracker = Mock()
+        tracker.abandon_stale_in_progress_entries.side_effect = OSError("state file unreadable")
+
+        cleaned, _signal, _tracker, notify, redispatch = self._cleanup_as_non_holder(
+            watchdog, signal=signal, tracker=tracker
+        )
+
+        assert cleaned is True
+        notify.assert_not_called()
+        redispatch.assert_not_called()
+
+    def test_the_holder_path_still_redispatches_rather_than_short_circuiting(self, watchdog):
+        """Control case: the short-circuit must stay scoped to a non-holder --
+        an issue that DOES hold the lock still goes through clear_retained_
+        reason + redispatch, which does its own abandon/dispatch."""
+        signal = Mock()
+        tracker = Mock()
+        with patch("services.cancellation.get_cancellation_signal", return_value=signal), \
+             patch("services.work_execution_state.work_execution_tracker", tracker), \
+             patch.object(watchdog, "_notify_lock_stuck") as notify, \
+             patch.object(watchdog, "_redispatch_same_issue", return_value=True) as redispatch:
+            cleaned = watchdog._cleanup_zombie_run(
+                pipeline_run_id="run-1",
+                project="proj",
+                board="SDLC Execution",
+                issue_number=42,
+                started_at="2026-08-10T10:07:24Z",
+            )
+
+        assert cleaned is True
+        redispatch.assert_called_once_with("proj", "SDLC Execution", 42)
+        notify.assert_not_called()
+        signal.clear.assert_not_called()
+        tracker.abandon_stale_in_progress_entries.assert_not_called()
+
+
 class TestProductionFallbackDependencies:
     """
     PipelineWatchdog.lock_manager and .project_monitor are both optional,
@@ -490,6 +842,9 @@ class TestProductionFallbackDependencies:
         wd = self._watchdog_without_injected_deps()
         global_lock_mgr = Mock()
         global_lock_mgr.clear_retained_reason.return_value = True
+        global_lock_mgr.get_lock_fail_closed.return_value = (
+            _lock_held_by_issue_under_test(), True
+        )
 
         with patch(
             "services.pipeline_lock_manager.get_pipeline_lock_manager",

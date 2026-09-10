@@ -124,6 +124,34 @@ def _parse_utc_isoformat(iso_string: Optional[str]) -> Optional[datetime]:
     return dt
 
 
+def is_graphql_rate_limit_error(errors: Any) -> bool:
+    """Whether a GraphQL response's `errors` array is (entirely) rate limiting.
+
+    GitHub does NOT return a 4xx for a primary GraphQL rate limit - it
+    answers HTTP 200 with `{"errors": [{"type": "RATE_LIMIT", "code":
+    "graphql_rate_limit", "message": "API rate limit already exceeded..."}]}`.
+    Every caller that only inspected status codes or process exit codes was
+    therefore blind to it, which is how /health could report
+    rate_limited_requests: 0 across a window containing 16 logged RATE_LIMIT
+    errors (#168).
+
+    Requires EVERY error to be a rate limit, mirroring the existing
+    all-NOT_FOUND check in services/github_app.py: a response that is
+    partly rate-limited and partly something else still has a real error
+    in it that must not be reclassified as routine throttling.
+    """
+    if not errors:
+        return False
+    try:
+        return all(
+            (err.get('type') == 'RATE_LIMIT' or err.get('code') == 'graphql_rate_limit')
+            for err in errors
+        )
+    except AttributeError:
+        # A non-dict entry in the array - not something this can classify.
+        return False
+
+
 class GitHubRateLimitStatus:
     """Track GitHub API rate limit status and remaining quota."""
     
@@ -144,6 +172,18 @@ class GitHubRateLimitStatus:
     def update_from_response_headers(self, headers: Dict[str, str]):
         """Update rate limit info from GitHub API response headers."""
         try:
+            # Normalised here rather than trusted from the caller. GitHub
+            # sends `X-RateLimit-Remaining`; `requests` hands that back in a
+            # CaseInsensitiveDict where these lowercase lookups work, but a
+            # plain dict() copy of one keeps GitHub's casing and every lookup
+            # below silently misses - leaving the bucket at its 5000/5000
+            # constructor defaults while still stamping ever_updated, i.e.
+            # reporting a healthy budget for an exhausted one. This method is
+            # now reachable with a plain dict from more than one direction
+            # (see record_external_call), so it normalises rather than
+            # assuming (#168).
+            headers = {str(k).lower(): v for k, v in headers.items()}
+
             if 'x-ratelimit-limit' in headers:
                 self.limit = int(headers['x-ratelimit-limit'])
             if 'x-ratelimit-remaining' in headers:
@@ -332,6 +372,19 @@ class GitHubAPIClient:
         self.rate_limit_rest = GitHubRateLimitStatus()
         self.rate_limit_rest.resource_type = "rest"
         self.rate_limit = self.rate_limit_graphql  # backward-compat alias
+
+        # A THIRD bucket, deliberately not merged into rate_limit_graphql:
+        # services/github_app.py authenticates as the GitHub App installation,
+        # whose 5000/hr GraphQL budget is entirely separate from the PAT budget
+        # every `gh`-CLI call in this client spends. Conflating them is the
+        # exact confusion #168 records - `gh api rate_limit` from a shell reads
+        # 5000/5000 off the PAT while the App is fully exhausted - so the App's
+        # readings get their own bucket and their own /health field. Not
+        # mirrored to Redis: the App client only runs in-process with the
+        # orchestrator (github_discussions, human_feedback_loop, review_cycle,
+        # pr_review_stage), so there is no other process to publish it for.
+        self.rate_limit_app_graphql = GitHubRateLimitStatus()
+        self.rate_limit_app_graphql.resource_type = "graphql_app"
         self.breaker = GitHubBreaker()
         self.lock = Lock()
         
@@ -523,6 +576,16 @@ class GitHubAPIClient:
 
                 # Check for GraphQL errors
                 if 'errors' in response:
+                    # These are body-level errors on an otherwise well-formed
+                    # response, and GitHub reports GraphQL rate limiting here
+                    # (type: RATE_LIMIT) rather than as a `gh` non-zero exit -
+                    # so the returncode==1 branch above never saw them and
+                    # NEITHER counter was incremented. /health's api_call_stats
+                    # consequently read failed_requests: 0 through windows that
+                    # contained real rate-limit failures (#168). Count them.
+                    if is_graphql_rate_limit_error(response['errors']):
+                        self.rate_limited_requests += 1
+                    self.failed_requests += 1
                     logger.error(f"GraphQL errors: {response['errors']}")
                     return False, response
 
@@ -1011,6 +1074,60 @@ class GitHubAPIClient:
                 headers[key.strip().lower()] = value.strip()
         return headers, body
     
+    def record_external_call(
+        self,
+        *,
+        rate_limited: bool = False,
+        failed: bool = False,
+        app_graphql_headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Report a GitHub call made OUTSIDE this client into its accounting.
+
+        services/github_app.py talks to api.github.com directly with the
+        GitHub App's installation token instead of going through this
+        client, so none of its traffic - including its rate-limit failures -
+        ever reached these counters. /health's api_call_stats reported
+        `failed_requests: 0, rate_limited_requests: 0` through a window that
+        contained 16 logged RATE_LIMIT errors (#168), which means the
+        circuit breaker and every rate-based alert were structurally blind
+        to that failure mode.
+
+        Deliberately a REPORTING hook, not a routing change: the App's calls
+        must keep using the App credential (a different quota - see
+        rate_limit_app_graphql), and they must not be made to depend on this
+        client's breaker or its throttling sleeps, which would put a new
+        blocking condition on paths that never had one.
+
+        Args:
+            rate_limited: The call failed specifically on a rate limit.
+                Implies `failed` - a rate-limited call is a failed call, and
+                counting it in only one place is what made the two numbers
+                disagree in the first place.
+            failed: The call failed for any other reason.
+            app_graphql_headers: Response headers from an App GraphQL call,
+                used to refresh the App's own GraphQL bucket. Absent on a
+                transport failure that produced no response at all.
+        """
+        self.total_requests += 1
+        self._record_request('github_app', not (failed or rate_limited))
+
+        if rate_limited:
+            self.rate_limited_requests += 1
+        if rate_limited or failed:
+            self.failed_requests += 1
+
+        if app_graphql_headers:
+            # update_from_response_headers() rather than
+            # _update_rate_limit_from_headers(): the App bucket is
+            # deliberately not mirrored to Redis (see __init__), and this
+            # path must stay non-blocking.
+            self.rate_limit_app_graphql.update_from_response_headers(app_graphql_headers)
+            # Stamped explicitly, exactly as _update_rate_limit_from_headers()
+            # does, because GitHub reports its own label in
+            # x-ratelimit-resource ("graphql") and that would erase the
+            # distinction from the PAT bucket this field exists to preserve.
+            self.rate_limit_app_graphql.resource_type = "graphql_app"
+
     def get_status(self) -> dict:
         """Get current API client status."""
         return {
@@ -1020,6 +1137,9 @@ class GitHubAPIClient:
             'rate_limit': self.rate_limit.to_dict(),
             'rate_limit_graphql': self.rate_limit_graphql.to_dict(),
             'rate_limit_rest': self.rate_limit_rest.to_dict(),
+            # The GitHub App installation's OWN GraphQL budget, which is not
+            # the PAT budget the two fields above describe (#168).
+            'rate_limit_app_graphql': self.rate_limit_app_graphql.to_dict(),
             'breaker': {
                 'state': self.breaker.state,
                 'is_open': self.breaker.is_open(),

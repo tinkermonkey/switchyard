@@ -704,6 +704,29 @@ class PipelineWatchdog:
                         "manually rather than assumed safe."
                     )
                 manual_intervention_reason = fallback_reason
+            elif self_heal and not self._self_heal_still_holds_lock(
+                lock_mgr, project, board, issue_number, "Zombie self-heal"
+            ):
+                # Non-holder: nothing left to self-heal — see the helper's
+                # docstring. Deliberately does NOT set
+                # requires_manual_intervention: the previous behaviour read
+                # clear_retained_reason()'s False as a failed clear, logged an
+                # ERROR, and posted a "the pipeline lock is retained, run
+                # scripts/release_lock.py" comment naming a lock this issue
+                # does not hold — on a closed issue, every time one aged past
+                # zombie_threshold_minutes.
+                #
+                # Nothing was redispatched, so the two blocks a redispatch
+                # would have lifted are still in place — clear them here, or
+                # "leaving it to the normal queue/failsafe paths" is not
+                # actually what happens.
+                self._clear_non_holder_reentry_blocks(
+                    project, board, issue_number, started_at, "Zombie self-heal"
+                )
+                logger.info(
+                    f"Zombie self-heal: issue #{issue_number} in {project} "
+                    f"needed no redispatch (run ended, lock not held by it)"
+                )
             elif self_heal:
                 cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
                 redispatched = cleared and self._redispatch_same_issue(project, board, issue_number)
@@ -795,6 +818,210 @@ class PipelineWatchdog:
 
         return not requires_manual_intervention
 
+    def _self_heal_still_holds_lock(self, lock_mgr, project: str, board: str,
+                                    issue_number: int, context: str,
+                                    redis_absence_confirms_release: bool = False) -> bool:
+        """
+        Whether `issue_number` still holds the (project, board) pipeline lock.
+
+        Both self-heal branches open with `clear_retained_reason() and
+        _redispatch_same_issue()`, and clear_retained_reason() returns False
+        for two situations the caller then cannot tell apart: a durable write
+        that failed (a real problem) and a lock this issue simply does not
+        hold (nothing to clear). The second was being reported as the first —
+        an ERROR, a mark_lock_failed() that correctly refuses for a
+        non-holder, and a "run scripts/release_lock.py" comment naming a lock
+        nobody holds. A closed issue that ages into the zombie sweep hits that
+        path every time, which is exactly the recurring unactionable ERROR
+        this branch exists to remove.
+
+        A self-heal has nothing left to do for a non-holder: the run has
+        already been ended by the caller, and _redispatch_same_issue() could
+        not run anyway — it calls trigger_agent_for_status() with
+        lock_already_acquired=True, which is only true for the holder. The
+        issue re-enters through the normal queue/failsafe paths once the lock
+        frees, exactly as any other issue waiting on a busy board does.
+
+        _redispatch_same_issue()'s permanent-decline branch asks the same
+        question (did trigger_agent_for_status()'s closed-issue path actually
+        release the lock?) and calls this rather than reading the lock itself,
+        so there is exactly one implementation of it with one fail-closed
+        policy.
+
+        Reads fail CLOSED: when lock state is genuinely unknown this returns
+        True so the pre-existing clear/redispatch path still runs and reports
+        its own failure, rather than this method quietly deciding a self-heal
+        was unnecessary.
+
+        "Unknown" is get_lock_fail_closed()'s definition, which is broader
+        than "both stores raised" and it matters here: it is ALSO unhealthy
+        when the YAML leg alone failed and Redis holds no entry, because YAML
+        is the only non-expiring copy of retained_reason and an absent Redis
+        key cannot tell "genuinely unlocked" from "TTL'd out on a retained
+        lock" (see _get_lock_fail_closed_detail). On the zombie/resume
+        branches that is the right call either way. On
+        _redispatch_same_issue's permanent-decline branch it is not: that
+        branch runs immediately after trigger_agent_for_status() released a
+        closed issue's lock itself, so "Redis has no entry" is the expected
+        post-release state and reads_healthy would collapse to "did the YAML
+        read succeed" — one contended '<state>.yaml.lock' timeout away from
+        paging a human about a closed issue and a lock nobody holds, which is
+        precisely the ERROR this branch exists to remove. That caller passes
+        redis_absence_confirms_release=True: when Redis definitively answers
+        "no lock" (its read SUCCEEDED and found nothing — redis_lock_is_
+        missing(), which is False for both a failed Redis read and a
+        Redis-less deployment), a just-triggered release is confirmed enough
+        to treat as released, and only the durable retained_reason copy went
+        unread. Every other caller stays fail-closed for both cases.
+        """
+        try:
+            lock, reads_healthy = lock_mgr.get_lock_fail_closed(project, board)
+        except Exception as e:
+            logger.warning(
+                f"{context}: could not read the {project}/{board} pipeline lock "
+                f"while checking issue #{issue_number} (assuming it is still "
+                f"held, so the normal self-heal path runs): {e}"
+            )
+            return True
+
+        if not reads_healthy:
+            if redis_absence_confirms_release and self._redis_confirms_no_lock(
+                lock_mgr, project, board
+            ):
+                logger.warning(
+                    f"{context}: the durable YAML copy of the {project}/{board} "
+                    f"lock could not be read, but Redis confirms no lock is held "
+                    f"— treating issue #{issue_number}'s lock as released by the "
+                    f"dispatch path that just released it, rather than paging a "
+                    f"human about a lock nobody holds"
+                )
+                return False
+
+            logger.warning(
+                f"{context}: lock state for {project}/{board} is unknown (both "
+                f"stores failed, or YAML failed with no Redis entry to fall "
+                f"back on) — assuming issue #{issue_number} still holds it"
+            )
+            return True
+
+        holder = lock.locked_by_issue if lock else None
+        if holder == issue_number:
+            return True
+
+        logger.info(
+            f"{context}: issue #{issue_number} in {project} does not hold the "
+            f"'{board}' pipeline lock (current holder: "
+            f"{holder if holder is not None else 'none'}) — its run has been "
+            f"ended and there is nothing to redispatch under a lock it never "
+            f"acquired; leaving it to the normal queue/failsafe paths"
+        )
+        return False
+
+    def _redis_confirms_no_lock(self, lock_mgr, project: str, board: str) -> bool:
+        """
+        Whether Redis positively answered "nothing holds this board" — its read
+        SUCCEEDED and found no 'locked' record.
+
+        Deliberately routed through PipelineLockManager.redis_lock_is_missing()
+        rather than re-deriving it: that method is already False both when the
+        Redis read failed and when no Redis is configured at all, so neither can
+        be mistaken here for a definitive "no lock". Any exception is False too
+        — an unanswered question is not an answer.
+        """
+        try:
+            return bool(lock_mgr.redis_lock_is_missing(project, board))
+        except Exception as e:
+            logger.warning(
+                f"Could not confirm from Redis whether the {project}/{board} "
+                f"lock is gone: {e}"
+            )
+            return False
+
+    def _clear_non_holder_reentry_blocks(self, project: str, board: str,
+                                         issue_number: int, started_at: str,
+                                         context: str) -> None:
+        """
+        Undo the two leftovers that would otherwise keep a non-holder issue
+        invisible to every automatic recovery path after its run was ended.
+
+        Both self-heal branches short-circuit to a clean success for an issue
+        that does not hold the lock, on the stated basis that it is free to be
+        picked up again through the normal paths. That is only true once these
+        two are cleared, and nothing else clears either of them at runtime:
+
+        - end_pipeline_run() sets the (project, issue) cancellation signal for
+          every reason but feedback_loop_ended (see its suppress_cancellation
+          docs in services/pipeline_run.py). On the redispatch path the signal
+          is transient — creating the next pipeline run clears it again —
+          but nothing redispatches here, so it would sit for its full 1-hour
+          TTL while _find_stalled_issues_for_pipeline() skips a cancelled
+          issue outright and _check_and_process_waiting_issues_failsafe()
+          skips it after acquiring the lock, purging its queue row.
+
+        - the dead run's last execution record is almost always still
+          'in_progress' (nothing wrote a terminal outcome), which
+          _redispatch_same_issue() abandons before dispatching — see its
+          docstring. has_active_execution() stays True on such an entry, and
+          permanently so for a trigger_source='manual' probe, which the
+          stale-probe self-heal in work_execution_state deliberately does not
+          age out; _find_stalled_issues_for_pipeline() then skips the issue on
+          that predicate. The only other caller of
+          abandon_stale_in_progress_entries() is agent_container_recovery's
+          startup sweep, so without this the issue stays stranded until the
+          next orchestrator restart.
+
+        The abandon is scoped to `board` and to entries predating this run's
+        own started_at, because the decision authorising it is: the only thing
+        _self_heal_still_holds_lock() established is that this issue does not
+        hold THIS board's lock. active_task_ids cannot do that scoping — it is
+        empty here (zombie/frozen means no container is running for this issue,
+        so no task_id can be protected by it), and a just-dispatched entry has
+        no task_id stamped yet in any case, since record_execution_start() runs
+        BEFORE the Redis enqueue precisely so that window is covered by the
+        in_progress probe. An unscoped sweep would therefore rewrite a live
+        dispatch on ANOTHER board of the same project — an issue can sit on
+        several Projects v2 boards at once (see _redispatch_same_issue's
+        board-aware column lookup) — clearing has_active_execution() for a task
+        still pending in Redis, with no dispatch behind it to justify the write
+        the way there is on the redispatch path.
+
+        Best-effort, like the equivalent cleanups on the redispatch path — a
+        failure here is logged at WARNING naming what is still blocking
+        re-pickup rather than escalated to manual intervention, since the run
+        is ended and the lock is some other issue's either way.
+        """
+        try:
+            from services.cancellation import get_cancellation_signal
+            get_cancellation_signal().clear(project, issue_number)
+        except Exception as e:
+            logger.warning(
+                f"{context}: could not clear the cancellation signal for "
+                f"{project} issue #{issue_number} — automatic re-pickup stays "
+                f"blocked until the signal's 1h TTL expires: {e}"
+            )
+
+        try:
+            from services.work_execution_state import work_execution_tracker
+            work_execution_tracker.abandon_stale_in_progress_entries(
+                project_name=project,
+                issue_number=issue_number,
+                active_task_ids=set(),
+                board_name=board,
+                started_before=started_at,
+                reason=(
+                    "Abandoned by the pipeline watchdog's zombie/frozen-run "
+                    "self-heal — the run was ended and this issue does not "
+                    "hold the board lock, so nothing was redispatched (not an "
+                    "orchestrator restart)."
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                f"{context}: could not abandon stale in_progress entries for "
+                f"{project} issue #{issue_number} — has_active_execution() may "
+                f"stay True and keep it out of the stalled-issue rescan: {e}"
+            )
+
     def _redispatch_same_issue(self, project: str, board: str, issue_number: int) -> bool:
         """
         Directly re-dispatch the agent for (project, issue_number) at its
@@ -840,16 +1067,27 @@ class PipelineWatchdog:
         makes "closed, nothing to retry" its own clean, correctly-labeled
         outcome instead of an indistinguishable dispatch failure.
 
+        That upfront check cannot be the ONLY one, though: it reads the
+        issue state seconds before trigger_agent_for_status() reads it
+        again, and an issue closed inside that window arrives back here as
+        a DispatchDecline.ISSUE_CLOSED instead. That is the same "closed,
+        nothing to retry" outcome, reached by a race rather than by the
+        explicit check, and it is handled the same way — see the
+        is_permanent_decline() branch below.
+
         Returns:
             True if either a real dispatch happened (trigger_agent_for_
-            status() returned non-None — see incident e42ca133's follow-up
-            investigation: that method has over a dozen legitimate internal
-            branches that dispatch nothing and return None, several silent
-            by design; treating "no exception raised" as success let the
-            self-heal report success while nothing actually ran), OR the
+            status() returned an agent name — see incident e42ca133's
+            follow-up investigation: that method has over a dozen legitimate
+            internal branches that dispatch nothing and return None, several
+            silent by design; treating "no exception raised" as success let
+            the self-heal report success while nothing actually ran), OR the
             issue turned out to be closed and its lock was cleanly released
-            (nothing to retry). False for every other outcome — callers must
-            treat False as "the retry did not actually happen."
+            (nothing to retry) — whether that was found by the explicit
+            check below or reported back as a permanent DispatchDecline.
+            False for every other outcome — callers must treat False as "the
+            retry did not actually happen", because they respond to it by
+            durably re-retaining the lock and paging a human.
         """
         try:
             from config.manager import config_manager
@@ -961,7 +1199,93 @@ class PipelineWatchdog:
                 repository=project_config.github['repo'],
                 lock_already_acquired=True,
             )
-            if result is None:
+            # `not result`, not `is None`: trigger_agent_for_status() now also
+            # returns a falsy DispatchDecline for a decline no retry can fix
+            # (#165), and an identity check against None would read that as a
+            # successful dispatch.
+            if not result:
+                from services.project_monitor import is_permanent_decline
+
+                if is_permanent_decline(result):
+                    # The race-window twin of the explicit closed-issue check
+                    # above: the issue was OPEN when this method read it and
+                    # CLOSED by the time trigger_agent_for_status() read it
+                    # again, so the decline arrives here instead. Same
+                    # outcome, and it must be reported the same way — True.
+                    #
+                    # Returning False here would be actively harmful, not
+                    # merely mislabelled: both callers treat False as "the
+                    # retry did not actually happen" and respond by calling
+                    # mark_lock_failed() to durably re-retain the board lock,
+                    # logging an ERROR (plus a CRITICAL when the mark fails,
+                    # which it does when the lock is no longer this issue's)
+                    # and posting a manual-intervention comment on a closed
+                    # issue. That is the recurring unactionable ERROR this
+                    # branch exists to remove, and a board blocked until
+                    # someone runs scripts/release_lock.py.
+                    #
+                    # Confirmed, not assumed: trigger_agent_for_status()'s
+                    # closed branch releases the lock itself (and may hand it
+                    # straight to the next queued issue), but only when it
+                    # was held by THIS issue. If it is still held here, the
+                    # self-heal genuinely did not complete and False — with
+                    # the caller's re-retain — is the correct answer.
+                    lock_mgr = self.lock_manager
+                    if lock_mgr is None:
+                        from services.pipeline_lock_manager import get_pipeline_lock_manager
+                        lock_mgr = get_pipeline_lock_manager()
+                    # The same helper, and so the same single fail-closed
+                    # policy, the zombie/resume branches use for this exact
+                    # question. get_lock() will not do: it reports an
+                    # unreadable lock as None — _read_redis_lock_only and
+                    # _read_yaml_lock_only each swallow their own exception
+                    # and return (None, False), and get_lock() discards that
+                    # health flag — so "both stores failed" would arrive here
+                    # indistinguishable from "confirmed released", and an
+                    # except-handler wrapped around it could never fire for
+                    # the one failure mode it was written for.
+                    #
+                    # redis_absence_confirms_release is set only here, and only
+                    # because of where "here" is: trigger_agent_for_status()
+                    # has just released this closed issue's lock, so an absent
+                    # Redis entry is the expected result of a write that leg
+                    # made moments ago, not an ambiguous silence. Without it,
+                    # get_lock_fail_closed()'s "YAML failed AND Redis holds no
+                    # entry" case makes reads_healthy on this path mean nothing
+                    # but "did the '<state>.yaml.lock' read beat its 20s
+                    # timeout" — a single contended file lock away from
+                    # re-retaining a released lock and paging a human about a
+                    # closed issue. Fail-closed still applies to every other
+                    # unhealthy shape, including a Redis read that itself
+                    # failed.
+                    if self._self_heal_still_holds_lock(
+                        lock_mgr, project, board, issue_number,
+                        "_redispatch_same_issue",
+                        redis_absence_confirms_release=True,
+                    ):
+                        logger.error(
+                            f"_redispatch_same_issue: {project} issue "
+                            f"#{issue_number} declined permanently "
+                            f"({result.value}) but still holds the "
+                            f"'{board}' lock (or its state could not be "
+                            f"read) — treating as a redispatch failure so "
+                            f"it gets re-retained"
+                        )
+                        return False
+
+                    # Not a redispatch FAILURE — there is nothing here to
+                    # redispatch, and the lock is already gone. Logged at
+                    # INFO so the watchdog stops contributing a recurring,
+                    # unactionable ERROR for a condition that will never
+                    # change (#177 Phase 1).
+                    logger.info(
+                        f"_redispatch_same_issue: nothing to redispatch for "
+                        f"{project} issue #{issue_number} (column "
+                        f"'{current_column}'): {result.value} — its lock was "
+                        f"already released, self-heal complete"
+                    )
+                    return True
+
                 logger.error(
                     f"_redispatch_same_issue: trigger_agent_for_status did not "
                     f"dispatch anything for {project} issue #{issue_number} "
@@ -996,7 +1320,8 @@ class PipelineWatchdog:
         and is now eligible to continue (breaker closed, no container running).
 
         Returns True only if the resume was a genuine clean success
-        (redispatched, or a closed issue's lock cleanly released) — False for
+        (redispatched, a closed issue's lock cleanly released, or the issue
+        did not hold the lock so there was nothing to redispatch) — False for
         every other outcome, including when self.pipeline_run_manager is not
         configured at all. Callers must not count a False return as success.
 
@@ -1111,6 +1436,24 @@ class PipelineWatchdog:
                 self._notify_lock_stuck(
                     project, board, issue_number, pipeline_run_id, retry_count=0,
                     reason=fallback_reason,
+                )
+            elif not self._self_heal_still_holds_lock(
+                lock_mgr, project, board, issue_number, "Active resume"
+            ):
+                # Non-holder: nothing left to resume — same reasoning as
+                # _cleanup_zombie_run's matching branch. A clean outcome, not
+                # a manual-intervention one: the frozen run is ended and, once
+                # _clear_non_holder_reentry_blocks() has lifted what
+                # end_pipeline_run and the dead run left behind, the issue is
+                # genuinely free to be picked up again through the normal
+                # paths.
+                self._clear_non_holder_reentry_blocks(
+                    project, board, issue_number, started_at, "Active resume"
+                )
+                resume_succeeded = True
+                logger.info(
+                    f"Active resume: issue #{issue_number} in {project} needed "
+                    f"no redispatch (frozen run ended, lock not held by it)"
                 )
             else:
                 cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
