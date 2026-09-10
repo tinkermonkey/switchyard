@@ -423,6 +423,7 @@ class TestReporting:
                 'name': 'PROTECTION 1',
                 'why': 'work in progress',
                 'degradation': False,
+                'inert': '',
                 'count': 2,
             }
         ]
@@ -1047,11 +1048,59 @@ class TestRegisteredSweepPatterns:
         assert classified['gate_records']['PROTECTION 4 (retry eligibility)'] == ['proj/#3']
         assert classified['unclassified'] == []
 
+    def test_a_live_container_is_a_named_gate_not_an_undecided_candidate(self):
+        """REGRESSION: the sweep's strongest and, on a busy orchestrator, most
+        common protection — `if not has_running_container: ... else: 'Agent
+        container still running'` — matched no gate. Such a record hit every
+        named gate, matched none, reached no terminal pattern and landed in
+        `undecided_candidates`, whose printed explanation offered a cleanup
+        claim as the example cause. Three protected records read as three
+        records mysteriously left undecided by a claim that, under
+        neutralization, cannot be taken."""
+        spec = SWEEPS['stuck_in_progress']
+        classified = classify_records(spec, [
+            ('services.work_execution_state', 'INFO',
+             'Found stuck in_progress execution: proj/#3 senior_software_engineer in Dev from t'),
+            ('services.work_execution_state', 'INFO',
+             'Agent container still running for proj/#3, keeping in_progress state'),
+        ])
+
+        assert classified['gate_records']['GUARD: container still running'] == ['proj/#3']
+        assert classified['undecided_candidates'] == []
+        assert classified['unclassified'] == []
+
+    def test_a_deferred_dev_container_reconciliation_is_a_named_gate(self):
+        """The other real disposition with no gate: a stuck dev_environment_*
+        record whose dev container state could not be reconciled is left
+        in_progress on purpose for the next pass. It is a decision, so it
+        belongs in the accounting."""
+        spec = SWEEPS['stuck_in_progress']
+        classified = classify_records(spec, [
+            ('services.work_execution_state', 'WARNING',
+             'Leaving stuck dev_environment_verifier execution proj/#8 as in_progress — its '
+             'dev container state could not be reconciled yet; the next cleanup pass will retry'),
+        ])
+
+        assert classified['gate_records'][
+            'DEFERRED: dev container state not reconcilable yet'
+        ] == ['proj/#8']
+        assert classified['unclassified'] == []
+
     def test_every_registered_sweep_declares_the_subtrees_it_writes(self):
         """Leak attribution turns on this list, so a spec added later without
         one is silently the weakest possible check."""
         for name, spec in SWEEPS.items():
             assert spec.owned_state_subtrees, f'{name} declares no owned state subtrees'
+
+    def test_stuck_in_progress_owns_the_pipeline_lock_subtree_it_writes(self):
+        """REGRESSION: the sweep declared execution_history and dev_containers
+        but also writes state/pipeline_locks/ — _transition_dev_container_state()
+        takes the dev_container_build resource lock, which is a
+        PipelineLockManager grant whose YAML copy lands there, and under
+        neutralization the Redis grant path cannot run so it ALWAYS falls
+        through to _create_lock_yaml_only(). Undeclared, a real escape into a
+        production lock file was downgradable to 'PASSED WITH DRIFT', exit 0."""
+        assert 'pipeline_locks' in SWEEPS['stuck_in_progress'].owned_state_subtrees
 
 
 class TestExternalEffects:
@@ -1084,6 +1133,76 @@ class TestExternalEffects:
         inert = ' | '.join(SWEEPS['stuck_in_progress'].inert_guards)
         assert 'review cycle' in inert
         assert 'feedback loop' in inert
+        # REGRESSION: the third one, and the one immediately upstream of the
+        # destructive agent_result delete. _NEUTRALIZED_REDIS_RETURNS maps 'set'
+        # to True so the claim always looks taken by this run, which makes
+        # try_claim_cleanup()'s "already claimed by" line unreachable — the gate
+        # was registered while being impossible to fire, and was not declared.
+        assert 'claim' in inert
+
+    def test_the_claim_gate_says_its_zero_is_not_a_measurement(self):
+        """A gate that cannot fire must carry that on the gate, not only in the
+        prose of section 3b: section 5 prints 'skipped 0 GUARD: cleanup already
+        claimed' right next to gates whose 0 IS a measurement."""
+        by_name = {gate.name: gate for gate in SWEEPS['stuck_in_progress'].gates}
+
+        assert by_name['GUARD: cleanup already claimed'].inert_when_neutralized
+        assert not by_name['GUARD: holds the pipeline lock'].inert_when_neutralized
+
+    def test_an_inert_gate_is_marked_in_the_report_only_while_neutralized(
+        self, deployment, tmp_path, capsys
+    ):
+        spec = _spec(
+            lambda m: 0,
+            gates=(
+                Gate('GUARD: synthetic claim', 'another mechanism holds it',
+                     (r'already claimed by',),
+                     inert_when_neutralized='the SET NX is neutralized to True'),
+            ),
+        )
+
+        neutralized = _run(spec, deployment, tmp_path / 'a')
+        assert neutralized['gates'][0]['inert'] == 'the SET NX is neutralized to True'
+        print_report(neutralized)
+        assert 'CANNOT FIRE IN THIS RUN' in capsys.readouterr().out
+
+        for_real = _run(
+            spec, deployment, tmp_path / 'b',
+            neutralize_external_effects_enabled=False,
+        )
+        assert for_real['gates'][0]['inert'] == ''
+        print_report(for_real)
+        assert 'CANNOT FIRE IN THIS RUN' not in capsys.readouterr().out
+
+    def test_a_redis_client_built_inside_the_window_does_not_outlive_it(
+        self, deployment, tmp_path
+    ):
+        """REGRESSION: the cached-client globals were only cleared when they were
+        ALREADY non-None, and this script has no orchestrator imports at module
+        scope — so services.cleanup_guard was absent from sys.modules when the
+        loop ran, the sweep imported it moments later, and _get_redis() cached a
+        NeutralizedRedis bound to run 1's recorder. Run 2's Redis writes were
+        then recorded into run 1's dead recorder and reported as 0, and
+        try_claim_cleanup()'s SET NX answered True forever for the rest of the
+        process."""
+        pytest.importorskip('redis')
+
+        import services.cleanup_guard as cleanup_guard
+
+        cleanup_guard._redis_client = None
+
+        def _claim(manager):
+            from services.cleanup_guard import try_claim_cleanup
+            assert try_claim_cleanup('alpha', 1, 'stuck_state_cleanup') is True
+            return 0
+
+        first = _run(_spec(_claim), deployment, tmp_path / 'a')
+        assert first['external_effects']['redis_writes']['total'] == 1
+        assert cleanup_guard._redis_client is None
+
+        second = _run(_spec(_claim), deployment, tmp_path / 'b')
+        assert second['external_effects']['redis_writes']['total'] == 1
+        assert cleanup_guard._redis_client is None
 
     def test_redis_writes_are_intercepted_and_reported(self, deployment, tmp_path):
         """A neutralized client still READS production — a guard reading an
@@ -1181,6 +1300,47 @@ class TestSweepFailure:
         assert report['live_check']['leaked'] == ['execution_history/alpha_issue_1.yaml']
         assert report['exit_code'] == 1
 
+    def test_a_raise_does_not_mask_unverifiable_drift_in_an_owned_subtree(
+        self, deployment, tmp_path
+    ):
+        """REGRESSION: the verdict chain ranked `sweep_error` above
+        `unattributed_owned`, so a sweep that raised part-way through a run that
+        ALSO drifted inside a subtree it writes reported 'SWEEP RAISED ... No
+        leak was detected', exit 4 — downgrading, from an unrelated branch, the
+        one verdict the module docstring, the owned_state_subtrees comment and
+        --allow-concurrent-writes' help text all promise is never downgraded.
+        The same masking applied to `unreadable`, whose whole point is that
+        those files are covered by no check at all."""
+        def _write_copy_drift_live_then_boom(manager):
+            copied = manager.state_dir / 'alpha_issue_1.yaml'
+            state = yaml.safe_load(copied.read_text())
+            state['execution_history'][-1]['outcome'] = 'failure'
+            copied.write_text(yaml.dump(state))
+
+            drifted = deployment / 'state' / 'execution_history' / 'alpha_issue_2.yaml'
+            other = yaml.safe_load(drifted.read_text())
+            other['execution_history'][-1]['outcome'] = 'failure'
+            drifted.write_text(yaml.dump(other))
+
+            raise RuntimeError('docker inspect timed out')
+
+        report = _run(
+            _spec(_write_copy_drift_live_then_boom, owned=('execution_history',)),
+            deployment,
+            tmp_path,
+            allow_concurrent_writes=True,
+        )
+
+        assert report['sweep_error']
+        assert report['live_check']['leaked'] == []
+        assert report['live_check']['unattributed_owned'] == [
+            'execution_history/alpha_issue_2.yaml'
+        ]
+        assert report['exit_code'] == 3
+        assert 'SWEEP RAISED' in report['verdict']
+        assert 'UNVERIFIED' in report['verdict']
+        assert 'No leak was detected' not in report['verdict']
+
 
 class TestUnreadableFiles:
     def test_a_file_that_cannot_be_read_downgrades_the_verdict(
@@ -1267,9 +1427,10 @@ class TestRuntimeSingletonBinding:
         self, tmp_path, monkeypatch
     ):
         """The lock/semaphore managers are module globals that are None until a
-        getter runs. Nothing to repoint, and forcing construction would create
-        state directories the sweep may never touch — but the report still has
-        to say the path was considered."""
+        getter runs, so at this point there is nothing to repoint — but the
+        report still has to say the path was considered. The real path lands in
+        the same map a step later, from forced_lazy_singletons(); see
+        test_the_lazy_lock_singleton_is_constructed_and_asserted_by_a_run."""
         import types
 
         module = types.ModuleType('fake_lazy_module')
@@ -1286,6 +1447,39 @@ class TestRuntimeSingletonBinding:
         assert resolved['fake_lazy_module.lazy_singleton.state_dir'].startswith(
             'not constructed'
         )
+
+    def test_the_lazy_lock_singleton_is_constructed_and_asserted_by_a_run(
+        self, deployment, tmp_path
+    ):
+        """REGRESSION: state/pipeline_locks/ is the one subtree the stuck sweep
+        writes that NO isolation assertion covered. bind_runtime_singletons()
+        reported _pipeline_lock_manager as 'not constructed', run_dry_run()
+        skips any such path, and the manager is built later — inside the sweep.
+        forced_lazy_singletons() now builds it early, INSIDE the neutralization
+        window (so its Redis client is the intercepting wrapper, not a live one)
+        and its resolved state_dir is asserted like every other manager's."""
+        report = _run(_spec(lambda m: 0), deployment, tmp_path)
+
+        label = 'services.pipeline_lock_manager._pipeline_lock_manager.state_dir'
+        resolved = report['isolation'][label]
+
+        assert not resolved.startswith('not constructed')
+        assert is_under(Path(resolved), tmp_path / 'scratch')
+
+    def test_a_lazy_singleton_built_inside_the_run_does_not_outlive_it(
+        self, deployment, tmp_path
+    ):
+        """Same hazard as the cached Redis clients: a manager built inside the
+        window holds a NeutralizedRedis bound to that run's recorder and a
+        state_dir under a scratch directory about to be deleted. It must not be
+        what the next caller in this process takes a lock through."""
+        import services.pipeline_lock_manager as plm
+
+        before = plm._pipeline_lock_manager
+
+        _run(_spec(lambda m: 0), deployment, tmp_path)
+
+        assert plm._pipeline_lock_manager is before
 
     def test_step_one_a_run_binds_the_real_tracker_to_its_scratch_root(
         self, deployment, tmp_path

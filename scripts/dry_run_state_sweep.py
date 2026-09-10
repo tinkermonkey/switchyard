@@ -66,6 +66,12 @@ emission is replaced by a recorder. Section 4b of the report lists exactly what
 was intercepted. `--no-neutralize-external-effects` runs them for real, and then
 a sweep with declared writes is refused unless `--allow-external-side-effects`.
 
+Neutralizing a write can disable a guard that is built on one -- the cleanup
+coordination claim is a SET NX, and a neutralized SET NX always reports a
+successful claim. Such a guard is declared in the spec's `inert_guards` and its
+row in section 5 is marked as structurally unreachable, so its `0` is never read
+as a measurement.
+
 Usage:
     python scripts/dry_run_state_sweep.py --list
     python scripts/dry_run_state_sweep.py --sweep empty_output_watchdog
@@ -146,6 +152,12 @@ class Gate:
     #  they are not dispositions, they are missing safety on a record some
     #  other bucket already owns.
     degradation: bool = False
+    #  Why this gate cannot fire while external effects are neutralized. A gate
+    #  whose count is structurally 0 must say so on its own row: '0' next to a
+    #  named protection reads as a MEASUREMENT ("no record needed it"), and the
+    #  wrong-but-plausible reassurance is exactly what this harness exists to
+    #  prevent. Empty for every gate that really is measured.
+    inert_when_neutralized: str = ''
 
 
 @dataclass(frozen=True)
@@ -282,6 +294,11 @@ _STUCK_IN_PROGRESS_GATES: Tuple[Gate, ...] = (
         name='GUARD: cleanup already claimed',
         why='another cleanup mechanism holds the coordination claim for this issue',
         patterns=(r'Cleanup for \S+/#\d+ already claimed by',),
+        inert_when_neutralized=(
+            "try_claim_cleanup()'s SET NX is neutralized to return True, so the claim "
+            'always looks taken by THIS run and the "already claimed by" line is '
+            'unreachable -- this count is 0 by construction, not by measurement'
+        ),
     ),
     Gate(
         name='GUARD: already in pipeline queue',
@@ -312,6 +329,28 @@ _STUCK_IN_PROGRESS_GATES: Tuple[Gate, ...] = (
         patterns=(
             r'Failed to check (pipeline lock|review cycle state|feedback loop state) for',
         ),
+    ),
+    #  The last two dispositions in the chain, and on a busy orchestrator the
+    #  most common ones. Both are logged AFTER every named guard, so a record
+    #  that reaches either has been individually considered and left alone --
+    #  without a gate of its own each landed in `undecided_candidates`, whose
+    #  printed explanation names a cleanup claim it cannot have been.
+    Gate(
+        name='GUARD: container still running',
+        why=(
+            "docker ps found a live container for the issue, so the record is not stuck -- "
+            "the sweep's strongest protection, and the last one in the chain"
+        ),
+        patterns=(r'Agent container still running for \S+/#\d+',),
+    ),
+    Gate(
+        name='DEFERRED: dev container state not reconcilable yet',
+        why=(
+            'a stuck dev_environment_setup/verifier record whose dev container state '
+            'could not be reconciled under the dev_container_build lock -- left '
+            'in_progress on purpose for the next pass rather than consumed'
+        ),
+        patterns=(r'Leaving stuck \S+ execution \S+/#\d+ as in_progress',),
     ),
     Gate(
         name='DEGRADED: a guard could not be evaluated',
@@ -397,12 +436,25 @@ SWEEPS: Dict[str, SweepSpec] = {
             '(ExecutionContainerLost) / PIPELINE_RUN_FAILED, into the production decision and '
             'lifecycle indices, which the web UI and pattern detection consume as real',
         ),
-        owned_state_subtrees=('execution_history', 'dev_containers'),
+        #  pipeline_locks is written, not merely read: the dev-container
+        #  reconciliation this sweep performs for a stuck dev_environment_setup/
+        #  verifier record takes the dev_container_build RESOURCE lock, which is
+        #  a PipelineLockManager grant and lands as
+        #  state/pipeline_locks/<project>___resource__dev_container_build.yaml.
+        #  Under neutralization the Redis grant path cannot run (pipeline() is
+        #  not a read command, so it is intercepted and `with None as pipe`
+        #  raises) and it always falls through to _create_lock_yaml_only().
+        owned_state_subtrees=('execution_history', 'dev_containers', 'pipeline_locks'),
         inert_guards=(
             'active review cycle (review_cycle_executor.active_cycles is an in-memory dict '
             'on the running orchestrator; empty in this process, so the guard cannot fire)',
             'active human feedback loop (human_feedback_loop_executor.active_loops, same '
             'shape, same consequence)',
+            'cleanup coordination claim, while neutralization is on (the default): '
+            "try_claim_cleanup()'s SET NX is intercepted and reports a successful claim, so "
+            'no candidate is ever seen as claimed by another mechanism. Production skips '
+            'those records at the FIRST guard in the chain; this run walks every one of '
+            'them on into the destructive agent_result branch',
         ),
     ),
 }
@@ -689,9 +741,11 @@ def bind_runtime_singletons(scratch_root: Path) -> Tuple[Dict[str, str], List[Tu
 
         singleton = getattr(module, singleton_name, None)
         if singleton is None:
-            # A lazy getter's cache that nothing has populated. Nothing to
-            # repoint, and forcing construction here would create state
-            # directories a sweep may never touch.
+            # A lazy getter's cache that nothing has populated: nothing to
+            # repoint yet. It is NOT left unasserted -- forced_lazy_singletons()
+            # constructs it a step later, inside the neutralization window
+            # (which is where it has to be built, see that function), and its
+            # real path replaces this placeholder in the same map.
             resolved[label] = 'not constructed (lazy singleton, unset in this process)'
             continue
 
@@ -755,11 +809,38 @@ _NEUTRALIZED_REDIS_RETURNS: Dict[str, Any] = {
 }
 
 #  Module globals that cache a Redis client across calls. A client built before
-#  the patch went in would bypass it entirely, so they are cleared for the
-#  duration of the sweep and restored afterwards.
+#  the patch went in would bypass it entirely, and one built DURING the patch
+#  would outlive it, so they are cleared on the way in and reset on the way out
+#  -- see _module_global_discarded() for why the second half matters more than
+#  the first in this process.
 _CACHED_REDIS_CLIENT_GLOBALS: Tuple[Tuple[str, str], ...] = (
     ('services.cleanup_guard', '_redis_client'),
     ('services.github_api_client', '_shared_redis_client'),
+)
+
+#  Lazy module globals that hold a state-owning manager AND a Redis client, and
+#  are None until their getter runs. Nothing imports them at module scope here,
+#  so the sweep constructs them itself, mid-run: they are therefore built inside
+#  the neutralization window (which is what keeps their Redis writes
+#  intercepted) and must be discarded with it. They are also the only
+#  state_dir the isolation assertion could not cover, because bind_runtime_
+#  singletons() runs before anything has constructed them -- forced_lazy_
+#  singletons() builds them early, inside the window, so their paths are
+#  asserted like every other manager's.
+#  (module, getter, module global it caches, path attribute)
+_LAZY_SINGLETON_GETTERS: Tuple[Tuple[str, str, str, str], ...] = (
+    (
+        'services.pipeline_lock_manager',
+        'get_pipeline_lock_manager',
+        '_pipeline_lock_manager',
+        'state_dir',
+    ),
+    (
+        'services.pipeline_semaphore_manager',
+        'get_pipeline_semaphore_manager',
+        '_pipeline_semaphore_manager',
+        'state_dir',
+    ),
 )
 
 
@@ -889,13 +970,14 @@ def neutralize_external_effects(enabled: bool):
                 )
 
         for module_name, attribute in _CACHED_REDIS_CLIENT_GLOBALS:
-            module = sys.modules.get(module_name)
-            if module is not None and getattr(module, attribute, None) is not None:
+            previous = stack.enter_context(
+                _module_global_discarded(module_name, attribute)
+            )
+            if previous is not None:
                 recorder.notes.append(
                     f'{module_name}.{attribute} already held a live Redis client; cleared '
                     f'for the run so it is rebuilt through the interception'
                 )
-                stack.enter_context(_patched(module, attribute, None))
 
         try:
             from monitoring import observability as observability_module
@@ -934,6 +1016,96 @@ def _patched(target: Any, attribute: str, replacement: Any):
             delattr(target, attribute)
         else:
             setattr(target, attribute, previous)
+
+
+@contextlib.contextmanager
+def _module_global_discarded(module_name: str, attribute: str):
+    """Clear a cached module global for the block, and reset it on the way out.
+
+    Unlike _patched(), the module is looked up in sys.modules TWICE -- once on
+    the way in and again on the way out -- because the normal case here is that
+    it is not imported yet when the block opens. This script has no orchestrator
+    imports at module scope, so `services.cleanup_guard` is absent from
+    sys.modules when neutralization starts and is imported by the sweep moments
+    later; its `_get_redis()` then builds a client while `redis.Redis` is patched
+    and caches it. Restoring "whatever was there" on the way out therefore means
+    restoring None, which DISCARDS that client.
+
+    That second half is the point. A NeutralizedRedis that outlives the window is
+    bound to a dead ExternalEffectRecorder: a second run in the same process
+    records its Redis writes into run 1's recorder and reports "Redis writes
+    intercepted: 0" for a sweep that attempted them, and try_claim_cleanup()'s
+    SET NX answers True forever, so the cross-mechanism cleanup guard is dead for
+    the rest of the process.
+
+    Yields whatever the global held on entry (None when the module was not
+    imported yet), so the caller can tell "already had a live client" from
+    "nothing there".
+    """
+    module = sys.modules.get(module_name)
+    previous = getattr(module, attribute, None) if module is not None else None
+    if module is not None:
+        setattr(module, attribute, None)
+    try:
+        yield previous
+    finally:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, attribute, previous)
+
+
+@contextlib.contextmanager
+def forced_lazy_singletons(scratch_root: Path):
+    """Build the lazy lock/semaphore singletons for the sweep's window only.
+
+    bind_runtime_singletons() reports these as 'not constructed', and
+    run_dry_run() skips any such path when it asserts isolation -- so
+    `state/pipeline_locks/` was the one subtree a sweep writes that NO assertion
+    covered, precisely because it is built later, inside the sweep. The stuck
+    sweep reaches it through _transition_dev_container_state() -> the
+    dev_container_build resource lock -> PipelineLockManager, whose YAML fallback
+    writes `<project>___resource__dev_container_build.yaml`.
+
+    Constructing them HERE rather than in bind_runtime_singletons() is
+    deliberate and is the whole reason this is a context manager: this runs
+    inside neutralize_external_effects(), so each manager's Redis client is the
+    intercepting wrapper the sweep needs it to be. Built one step earlier they
+    would hold a live client and their lock grants would reach production Redis
+    -- trading an unasserted path for a real external write.
+
+    They are discarded on exit for the same reason the cached Redis clients are:
+    a manager holding a neutralized client, pointed at a scratch directory that
+    is about to be deleted, must not be what the next caller in this process
+    takes a lock through.
+
+    Yields (resolved, unbound) in bind_runtime_singletons()'s shape, keyed by the
+    same labels so the ISOLATION section shows one entry per singleton.
+    """
+    import importlib
+
+    resolved: Dict[str, str] = {}
+    unbound: List[Tuple[str, str]] = []
+
+    with contextlib.ExitStack() as stack:
+        for module_name, getter_name, global_name, path_attr in _LAZY_SINGLETON_GETTERS:
+            label = f'{module_name}.{global_name}.{path_attr}'
+            try:
+                module = importlib.import_module(module_name)
+            except Exception as e:  # pragma: no cover - optional dependency chain
+                unbound.append((label, f'import failed: {e}'))
+                continue
+
+            # Cleared first, then rebuilt: a singleton some earlier import
+            # constructed holds both the wrong state_dir and a live Redis
+            # client, and repointing only the path would leave the client.
+            stack.enter_context(_module_global_discarded(module_name, global_name))
+            try:
+                singleton = getattr(module, getter_name)()
+                resolved[label] = str(Path(getattr(singleton, path_attr)))
+            except Exception as e:  # pragma: no cover - construction is cheap
+                unbound.append((label, f'could not be constructed: {e}'))
+
+        yield resolved, unbound
 
 
 # ---------------------------------------------------------------------------
@@ -1239,10 +1411,11 @@ def print_report(report: Dict[str, Any]) -> None:
     inert = report.get('inert_guards') or []
     if inert:
         _rule('3b. GUARDS THAT CANNOT FIRE IN THIS PROCESS')
-        _out('  These guards read in-memory state owned by the RUNNING orchestrator. This')
-        _out('  is a fresh process, so they see it empty and can never fire. For any record')
-        _out('  they would have protected, THIS DRY RUN IS LESS PROTECTED THAN PRODUCTION:')
-        _out('  it walks past that record and on into the sweep\'s decision path.')
+        _out('  These guards cannot answer here the way they answer in production -- either')
+        _out('  they read in-memory state owned by the RUNNING orchestrator (a fresh process')
+        _out('  sees it empty), or neutralization makes their answer unconditional. For any')
+        _out('  record they would have protected, THIS DRY RUN IS LESS PROTECTED THAN')
+        _out('  PRODUCTION: it walks past that record and on into the sweep\'s decision path.')
         for note in inert:
             _out(f"    - {note}")
 
@@ -1296,12 +1469,16 @@ def print_report(report: Dict[str, Any]) -> None:
             _out(f"           {'':>6}  (an annotation, not a disposition -- these records are")
             _out(f"           {'':>6}   also counted under whichever gate actually skipped them,")
             _out(f"           {'':>6}   and are never summed into the accounting below)")
+        if gate.get('inert'):
+            _out(f"           {'':>6}  !! CANNOT FIRE IN THIS RUN, so the count above is not a")
+            _out(f"           {'':>6}     measurement: {gate['inert']}")
     _out()
     undecided = classification.get('undecided_candidates') or []
     if undecided:
         _out(f"  {len(undecided):>6}  entered the guard chain and left it with no named gate and no")
-        _out(f"          terminal decision -- a bare `continue` somewhere in the chain (e.g. a")
-        _out(f"          cleanup claim taken by another mechanism). NOT 'never a candidate'.")
+        _out(f"          terminal decision -- a bare `continue` somewhere in the chain, or a")
+        _out(f"          disposition this harness has no gate for yet. Read the unclassified")
+        _out(f"          lines below before concluding anything. NOT 'never a candidate'.")
     unaccounted = report.get('unaccounted')
     if unaccounted is not None:
         _out(f"  {unaccounted:>6}  dropped before the first named gate by the sweep's own "
@@ -1442,6 +1619,27 @@ def _aborted_report(report: Dict[str, Any], live_before, copy_manifest, mismatch
     return report
 
 
+def _assert_resolved_paths_isolated(resolved: Dict[str, str], scratch_root: Path) -> None:
+    """Every state-owning path in `resolved` must be under the scratch root."""
+    for label, path in resolved.items():
+        if label == 'ORCHESTRATOR_ROOT' or label.startswith('ConfigManager.'):
+            continue
+        if path.startswith('not constructed'):
+            continue
+        assert_under(Path(path), scratch_root, label)
+
+
+def _isolation_verdict(unbound: List[Tuple[str, str]]) -> str:
+    return (
+        'every state-owning path resolved inside the scratch root'
+        if not unbound
+        else (
+            f'{len(unbound)} state-owning path(s) could NOT be bound and are therefore '
+            f'NOT covered by this assertion -- see NOT BOUND above'
+        )
+    )
+
+
 def run_dry_run(
     spec: SweepSpec,
     deployment_root: Path,
@@ -1527,25 +1725,13 @@ def run_dry_run(
     report['isolation'] = resolved
     report['isolation_unbound'] = unbound
 
-    for label, path in resolved.items():
-        if label == 'ORCHESTRATOR_ROOT' or label.startswith('ConfigManager.'):
-            continue
-        if path.startswith('not constructed'):
-            continue
-        assert_under(Path(path), scratch_root, label)
+    _assert_resolved_paths_isolated(resolved, scratch_root)
     # The config root is the one path that must deliberately NOT be scratch: the
     # sweep has to see the deployment's real project set. It is read-only for
     # every sweep registered here, and the live-tree check below covers state/.
     if not Path(config_root).is_dir():
         raise IsolationError(f'config root {config_root} does not exist')
-    report['isolation_verdict'] = (
-        'every state-owning path resolved inside the scratch root'
-        if not unbound
-        else (
-            f'{len(unbound)} state-owning path(s) could NOT be bound and are therefore '
-            f'NOT covered by this assertion -- see NOT BOUND above'
-        )
-    )
+    report['isolation_verdict'] = _isolation_verdict(unbound)
 
     # --- 4. run the real sweep -------------------------------------------
     handler = _CapturingHandler(spec.loggers)
@@ -1562,21 +1748,33 @@ def run_dry_run(
     recorder = ExternalEffectRecorder()
     try:
         with neutralize_external_effects(neutralize_external_effects_enabled) as recorder:
-            try:
-                # Some writers build their path from the CWD rather than any
-                # root (services/review_cycle.py joins a relative 'state/...'),
-                # so the CWD has to be inside the scratch root too.
-                os.chdir(scratch_root)
-                sweep_return = spec.run(manager)
-            except Exception as e:
-                # Deliberately not re-raised. A sweep that raises has already
-                # done some of its work, and "did the partial run leak?" is the
-                # question this harness exists to answer -- skipping steps 5-7
-                # to print a traceback answers it with an exit code that means
-                # something else entirely.
-                sweep_error = f'{type(e).__name__}: {e}'
-                logger.error(f'The sweep raised; continuing to the live-tree proof: {e}',
-                             exc_info=True)
+            # Inside the neutralization window on purpose -- see
+            # forced_lazy_singletons(). Their paths join the ISOLATION section
+            # and are asserted exactly like the import-time singletons', which
+            # is what closes the one subtree ('pipeline_locks') that nothing
+            # asserted because the sweep constructs its manager mid-run.
+            with forced_lazy_singletons(scratch_root) as (lazy_resolved, lazy_unbound):
+                resolved.update(lazy_resolved)
+                unbound = unbound + lazy_unbound
+                report['isolation'] = resolved
+                report['isolation_unbound'] = unbound
+                report['isolation_verdict'] = _isolation_verdict(unbound)
+                _assert_resolved_paths_isolated(lazy_resolved, scratch_root)
+                try:
+                    # Some writers build their path from the CWD rather than any
+                    # root (services/review_cycle.py joins a relative 'state/...'),
+                    # so the CWD has to be inside the scratch root too.
+                    os.chdir(scratch_root)
+                    sweep_return = spec.run(manager)
+                except Exception as e:
+                    # Deliberately not re-raised. A sweep that raises has already
+                    # done some of its work, and "did the partial run leak?" is the
+                    # question this harness exists to answer -- skipping steps 5-7
+                    # to print a traceback answers it with an exit code that means
+                    # something else entirely.
+                    sweep_error = f'{type(e).__name__}: {e}'
+                    logger.error(f'The sweep raised; continuing to the live-tree proof: {e}',
+                                 exc_info=True)
     finally:
         os.chdir(previous_cwd)
         root_logger.removeHandler(handler)
@@ -1602,6 +1800,14 @@ def run_dry_run(
             'name': gate.name,
             'why': gate.why,
             'degradation': gate.degradation,
+            # Only reported as inert when neutralization is actually on: with
+            # --no-neutralize-external-effects the real SET NX runs and the
+            # count IS a measurement.
+            'inert': (
+                gate.inert_when_neutralized
+                if gate.inert_when_neutralized and neutralize_external_effects_enabled
+                else ''
+            ),
             'count': len(classification['gate_records'].get(gate.name, [])),
         }
         for gate in spec.gates
@@ -1702,31 +1908,46 @@ def run_dry_run(
         'lock_artifacts': lock_artifacts,
     }
 
+    # Ordering note (and why sweep_error does NOT come second): "the sweep
+    # raised" and "this run could not be verified" are independent facts, and a
+    # raise is the WEAKER of the two. Ranked above them, exit 4's "No leak was
+    # detected" was asserting the one sentence an operator reads over the top of
+    # an UNVERIFIABLE owned-subtree change -- the one thing the docstring, the
+    # owned_state_subtrees comment and --allow-concurrent-writes' help text all
+    # promise is never downgraded. Both unverifiable branches now outrank it and
+    # compose with it, so a partial run that also drifted says both.
+    unverifiable: List[str] = []
+    if unattributed_owned:
+        unverifiable.append(
+            f'{len(unattributed_owned)} live path(s) changed inside a subtree this sweep '
+            f'writes. A sweep that escapes isolation writes only the live path, so this '
+            f'cannot be told apart from a leak. (--allow-concurrent-writes does not '
+            f'downgrade this.)'
+        )
+    if report['unreadable']:
+        unverifiable.append(
+            f"{len(report['unreadable'])} file(s) under state/ could not be read, so they "
+            f'are in neither manifest and no check in this run covers them.'
+        )
+    raised_prefix = f'SWEEP RAISED: {sweep_error}. The run is partial. ' if sweep_error else ''
+
     if leaked_sorted:
         report['verdict'] = (
             'FAILED: the sweep mutated live state -- the run was not isolated'
         )
         report['exit_code'] = 1
+    elif unverifiable:
+        report['verdict'] = (
+            f'{raised_prefix}UNVERIFIED: ' + ' '.join(unverifiable)
+            + ' Re-run against a stopped orchestrator.'
+        )
+        report['exit_code'] = 3
     elif sweep_error:
         report['verdict'] = (
             f'SWEEP RAISED: {sweep_error}. No leak was detected in what it managed to '
             f'do, but the run is partial and proves nothing about the sweep as a whole.'
         )
         report['exit_code'] = 4
-    elif unattributed_owned:
-        report['verdict'] = (
-            f'UNVERIFIED: {len(unattributed_owned)} live path(s) changed inside a subtree '
-            f'this sweep writes. A sweep that escapes isolation writes only the live path, '
-            f'so this cannot be told apart from a leak. Re-run against a stopped '
-            f'orchestrator. (--allow-concurrent-writes does not downgrade this.)'
-        )
-        report['exit_code'] = 3
-    elif report['unreadable']:
-        report['verdict'] = (
-            f"UNVERIFIED: {len(report['unreadable'])} file(s) under state/ could not be "
-            f'read, so they are in neither manifest and no check in this run covers them.'
-        )
-        report['exit_code'] = 3
     elif not changed_live:
         report['verdict'] = 'PASSED: the live state/ tree is byte-identical'
         report['exit_code'] = 0
