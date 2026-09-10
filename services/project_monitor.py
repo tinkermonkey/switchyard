@@ -6043,7 +6043,7 @@ class ProjectMonitor:
             # multiple issues from working on the same board simultaneously
             from services.pipeline_lock_manager import (
                 get_pipeline_lock_manager,
-                refusal_leaves_caller_holding_lock,
+                refusal_must_not_end_caller_run,
             )
             lock_manager = get_pipeline_lock_manager()
 
@@ -6055,20 +6055,24 @@ class ProjectMonitor:
 
             if not can_execute:
                 # NOT every refusal means this issue lost/never had the lock
-                # (#139 review round). refusal_leaves_caller_holding_lock() is
-                # true when the acquisition failed while this issue is still
-                # the recorded holder — a durable-mirror write failure on a
-                # lock it already holds. end_pipeline_run() below would find
-                # locked_by_issue == issue_number and RELEASE it, ending a live
-                # run and handing the board to the next queued issue. Wait for
-                # the next poll instead: the run and the lock both stay put and
-                # the mirror write is retried.
-                if refusal_leaves_caller_holding_lock(reason):
+                # (#139 and #174 review rounds). end_pipeline_run() below reads
+                # the lock's holder rather than asking who called it, so on a
+                # refusal that leaves this issue the recorded holder — a
+                # durable-mirror write failure on a lock it already holds, or an
+                # acquire-guard refusal that never reached a store at all — it
+                # would find locked_by_issue == issue_number and RELEASE it,
+                # ending a live run and handing the board to the next queued
+                # issue. Wait for the next poll instead: the run and the lock
+                # both stay put and the acquisition is retried.
+                still_holding = refusal_must_not_end_caller_run(
+                    reason, lock_manager, project_name, board_name, issue_number
+                )
+                if still_holding:
                     logger.error(
-                        f"Cannot start review cycle for issue #{issue_number}: {reason}. "
-                        f"Issue #{issue_number} still holds the pipeline lock for "
-                        f"{project_name}/{board_name}, so its run is left in place and "
-                        f"the lock is NOT released — retrying on a later poll cycle."
+                        f"Cannot start review cycle for issue #{issue_number} on "
+                        f"{project_name}/{board_name}: {reason}. {still_holding}, so its "
+                        f"run is left in place and the lock is NOT released — retrying "
+                        f"on a later poll cycle."
                     )
                     return None
                 logger.warning(
@@ -8361,7 +8365,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             # checks already cover it for this normal acquire path.
             from services.pipeline_lock_manager import (
                 get_pipeline_lock_manager,
-                refusal_leaves_caller_holding_lock,
+                refusal_must_not_end_caller_run,
             )
             lock_manager = get_pipeline_lock_manager()
 
@@ -8403,27 +8407,32 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"— waiting for it to free up rather than evicting the "
                         f"current holder; will retry on a later poll cycle"
                     )
-                # For every refusal EXCEPT the ones below, try_acquire_lock()
-                # failed outright, so this issue never actually holds the lock —
-                # end_pipeline_run() will correctly no-op its lock-release logic
-                # (locked_by_issue won't match). Full end_pipeline_run(), not
-                # _end_owned_run_if_pending(): pipeline_run is real by this
-                # point, not a phantom (see this method's docstring).
+                # For every refusal EXCEPT the ones refusal_must_not_end_caller_run()
+                # catches, try_acquire_lock() failed outright, so this issue never
+                # actually holds the lock — end_pipeline_run() will correctly no-op
+                # its lock-release logic (locked_by_issue won't match). Full
+                # end_pipeline_run(), not _end_owned_run_if_pending(): pipeline_run
+                # is real by this point, not a phantom (see this method's docstring).
                 #
-                # refusal_leaves_caller_holding_lock() marks the exception
-                # (#139 review round): a durable-mirror write failure on a lock
-                # this issue ALREADY holds still refuses, but leaves it the
-                # recorded holder — so end_pipeline_run() would match
-                # locked_by_issue and RELEASE the lock out from under this
-                # issue's own live run, freeing the board for the next queued
-                # issue. Leave both alone and retry on a later poll cycle.
-                if refusal_leaves_caller_holding_lock(reason):
+                # The exceptions (#139 and #174 review rounds): a durable-mirror
+                # write failure on a lock this issue ALREADY holds, and an
+                # acquire-guard refusal that never reached a store at all, both
+                # refuse while leaving this issue the recorded holder — so
+                # end_pipeline_run() would match locked_by_issue and RELEASE the
+                # lock out from under this issue's own live run, freeing the board
+                # for the next queued issue. This gate is reached by an issue that
+                # may well hold the lock already (see the "may have held it from
+                # Development stage" branch below), so that is not a corner case.
+                # Leave both alone and retry on a later poll cycle.
+                still_holding = refusal_must_not_end_caller_run(
+                    reason, lock_manager, project_name, board_name, issue_number
+                )
+                if still_holding:
                     logger.error(
                         f"Repair cycle for issue #{issue_number} could not refresh the "
                         f"pipeline lock for {project_name}/{board_name} ({reason}) — "
-                        f"issue #{issue_number} still holds it, so its run is left in "
-                        f"place and the lock is NOT released; will retry on a later "
-                        f"poll cycle"
+                        f"{still_holding}, so its run is left in place and the lock is "
+                        f"NOT released; will retry on a later poll cycle"
                     )
                     return None
                 if _owned_is_real_run and _owned_run_id and not _settled:

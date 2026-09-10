@@ -1,27 +1,36 @@
 """
-Call-site coverage for the ONE try_acquire_lock() refusal that leaves the
-caller still holding the lock (#139 review round).
+Call-site coverage for the try_acquire_lock() refusals that leave the caller
+still holding the lock (#139 and #174 review rounds).
 
-Every other False try_acquire_lock() returns means "you do not hold this lock",
-and the two dispatch gates that tear a pipeline run down on a refusal were
-written directly against that reading — services/project_monitor.py's
-review-cycle gate says so in a log line ("Another issue is currently working on
-this board") and its repair-cycle gate said so in a comment ("this issue never
-actually holds the lock — end_pipeline_run() will correctly no-op its
-lock-release logic").
+MOST False try_acquire_lock() returns mean "you do not hold this lock", and the
+two dispatch gates that tear a pipeline run down on a refusal were written
+directly against that reading — services/project_monitor.py's review-cycle gate
+says so in a log line ("Another issue is currently working on this board") and
+its repair-cycle gate said so in a comment ("this issue never actually holds the
+lock — end_pipeline_run() will correctly no-op its lock-release logic").
 
-_refuse_unmirrored_redis_grant()'s "already_holds_lock" branch broke that
-reading: it refuses an acquisition whose durable YAML mirror did not land, but
-deliberately does NOT roll the Redis key back, because that key belongs to a
-live holder and deleting it would release a lock out from under a running
-pipeline. The caller is therefore refused while remaining the recorded holder —
-and end_pipeline_run() releases the lock whenever it finds the run's own issue
-recorded as the holder (TestEndPipelineRunReleasesWhatItFinds below pins that),
-so the teardown those gates ran ended a live run and handed the board to the
-next queued issue, on the stated belief that no lock was ever taken.
+Two things break that reading, and end_pipeline_run() releases the lock whenever
+it finds the run's own issue recorded as the holder
+(TestEndPipelineRunReleasesWhatItFinds below pins that), so on either one the
+teardown those gates ran ended a live run and handed the board to the next
+queued issue, on the stated belief that no lock was ever taken:
 
-refusal_leaves_caller_holding_lock() is what tells the two apart, and these
-tests pin both gates honoring it.
+  * "lock_mirror_write_failed_while_held" (#139):
+    _refuse_unmirrored_redis_grant()'s "already_holds_lock" branch refuses an
+    acquisition whose durable YAML mirror did not land, but deliberately does
+    NOT roll the Redis key back, because that key belongs to a live holder and
+    deleting it would release a lock out from under a running pipeline. The
+    caller is refused while remaining the recorded holder, provably.
+
+  * "lock_acquire_serialization_timeout" / "..._unavailable" (#174): the
+    acquire guard refuses before either store is read or written, so whoever
+    held the lock still holds it — which, at these two gates, is quite often the
+    caller itself (both are reached by an issue that may have carried the lock
+    in from an earlier stage). These decide nothing on their own, so the holder
+    has to actually be read.
+
+refusal_must_not_end_caller_run() is what tells the two apart, covering both
+cases, and these tests pin both gates honoring it.
 """
 
 import json
@@ -37,6 +46,7 @@ from config.manager import ConfigManager
 from services.pipeline_lock_manager import (
     PipelineLockManager,
     refusal_leaves_caller_holding_lock,
+    refusal_must_not_end_caller_run,
 )
 from services.project_monitor import ProjectMonitor
 
@@ -85,14 +95,23 @@ def _pipeline_config():
     return pipeline_config
 
 
-def _drive_review_cycle_gate(project_monitor, acquire_result):
+def _drive_review_cycle_gate(project_monitor, acquire_result, holder_read=None):
     """
     Run _start_review_cycle_for_issue as far as its pipeline-lock gate, with
     try_acquire_lock() reporting `acquire_result`, and return the mocked lock
     manager so callers can assert on what the gate did with it.
+
+    `holder_read` is what get_lock_holder_fail_closed() reports — a
+    (holder_issue, reads_healthy) tuple, or an exception instance to raise. Only
+    the acquire-guard refusals consult it; every other reason answers the
+    question on the reason string alone.
     """
     mock_lock_manager = Mock()
     mock_lock_manager.try_acquire_lock.return_value = acquire_result
+    if isinstance(holder_read, BaseException):
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = holder_read
+    else:
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = holder_read
 
     with patch.object(project_monitor, 'get_issue_details',
                       return_value={'title': 'T', 'url': 'u'}), \
@@ -149,11 +168,16 @@ class TestReviewCycleGateDoesNotTearDownALiveHolder:
         assert "locked_by_issue_999" in kwargs['reason']
 
     def test_every_other_degraded_refusal_still_ends_the_run(self, project_monitor):
-        """The other refusals that can already reach this gate on main. None of
-        them asserts the caller IS the holder, so none of them is exempt."""
+        """The other refusals that can already reach this gate on main. Each one
+        either left the caller demonstrably not-the-holder or left no lock a
+        release could match, so none is exempt.
+
+        Deliberately NOT in this list: the two acquire-guard refusals, which
+        touch no store at all and so leave the previous holder in place — see
+        TestAcquireGuardRefusalsConsultTheHolder.
+        """
         for reason in (
             "lock_state_unknown_failing_closed",
-            "lock_acquire_serialization_timeout",
             "lock_write_failed",
             "lock_mirror_write_failed",
         ):
@@ -163,6 +187,154 @@ class TestReviewCycleGateDoesNotTearDownALiveHolder:
             _drive_review_cycle_gate(project_monitor, (False, reason))
 
             project_monitor.pipeline_run_manager.end_pipeline_run.assert_called_once()
+
+
+GUARD_REFUSALS = (
+    "lock_acquire_serialization_timeout",
+    "lock_acquire_serialization_unavailable",
+)
+
+
+class TestAcquireGuardRefusalsConsultTheHolder:
+    """
+    #174 review round. try_acquire_lock() takes its acquire guard with the
+    default 10s file-lock timeout and refuses on contention
+    ("lock_acquire_serialization_timeout") or on a guard file it cannot open
+    ("lock_acquire_serialization_unavailable") — in both cases before reading or
+    writing either store, so the recorded holder is untouched. release_lock()
+    deliberately waits far longer for that same guard
+    (RELEASE_GUARD_TIMEOUT_SECONDS then RELEASE_GUARD_RETRY_TIMEOUT_SECONDS), so
+    a guard contended past 10s refuses the acquire and then GRANTS the release:
+    the teardown here would end issue #159's live run, release its lock, and
+    hand the board to the next queued issue.
+
+    The reason string cannot tell holder from contender on its own, so the gate
+    has to read the holder.
+    """
+
+    def test_the_gate_leaves_a_run_alone_when_this_issue_still_holds_the_lock(
+        self, project_monitor
+    ):
+        for reason in GUARD_REFUSALS:
+            project_monitor.pipeline_run_manager.reset_mock()
+
+            result, mock_lock_manager = _drive_review_cycle_gate(
+                project_monitor, (False, reason), holder_read=(159, True)
+            )
+
+            assert result is None
+            project_monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+            mock_lock_manager.release_lock.assert_not_called()
+            mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with(
+                'rounds', 'SDLC Execution'
+            )
+
+    def test_the_gate_still_ends_the_run_when_another_issue_holds_the_lock(
+        self, project_monitor
+    ):
+        """Control: a guard refusal on a board genuinely held by someone else is
+        ordinary contention, and the run this gate created must still be cleaned
+        up or it leaks until the zombie watchdog's hourly sweep."""
+        for reason in GUARD_REFUSALS:
+            project_monitor.pipeline_run_manager.reset_mock()
+
+            _drive_review_cycle_gate(
+                project_monitor, (False, reason), holder_read=(999, True)
+            )
+
+            project_monitor.pipeline_run_manager.end_pipeline_run.assert_called_once()
+
+    def test_the_gate_still_ends_the_run_when_the_board_is_free(self, project_monitor):
+        """The other control: nobody holds the lock, so there is nothing for
+        end_pipeline_run() to release and the run must not leak."""
+        _drive_review_cycle_gate(
+            project_monitor, (False, GUARD_REFUSALS[0]), holder_read=(None, True)
+        )
+
+        project_monitor.pipeline_run_manager.end_pipeline_run.assert_called_once()
+
+    def test_an_unreadable_holder_fails_closed(self, project_monitor):
+        """Both stores unreadable: the gate cannot tell whether this issue is
+        the holder, and being wrong in the tear-down direction releases a live
+        pipeline's board, while being wrong the other way leaks one run until
+        the watchdog sweeps it. Leave it alone."""
+        result, mock_lock_manager = _drive_review_cycle_gate(
+            project_monitor, (False, GUARD_REFUSALS[0]), holder_read=(None, False)
+        )
+
+        assert result is None
+        project_monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+        mock_lock_manager.release_lock.assert_not_called()
+
+    def test_a_raising_holder_read_fails_closed(self, project_monitor):
+        """Same posture when the holder read raises outright."""
+        result, mock_lock_manager = _drive_review_cycle_gate(
+            project_monitor,
+            (False, GUARD_REFUSALS[0]),
+            holder_read=ConnectionError("Redis unreachable"),
+        )
+
+        assert result is None
+        project_monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+        mock_lock_manager.release_lock.assert_not_called()
+
+
+class TestRefusalMustNotEndCallerRun:
+    """The predicate itself, independent of either gate."""
+
+    def _manager(self, holder_read):
+        manager = Mock()
+        if isinstance(holder_read, BaseException):
+            manager.get_lock_holder_fail_closed.side_effect = holder_read
+        else:
+            manager.get_lock_holder_fail_closed.return_value = holder_read
+        return manager
+
+    def test_the_held_mirror_failure_needs_no_holder_read(self):
+        manager = self._manager((999, True))
+
+        assert refusal_must_not_end_caller_run(
+            HELD_REFUSAL, manager, "proj", "board", 159
+        )
+        # It PROVES the caller is the holder; reading the stores could only
+        # weaken that with a stale answer.
+        manager.get_lock_holder_fail_closed.assert_not_called()
+
+    def test_a_guard_refusal_defers_to_the_recorded_holder(self):
+        for reason in GUARD_REFUSALS:
+            assert refusal_must_not_end_caller_run(
+                reason, self._manager((159, True)), "proj", "board", 159
+            )
+            assert refusal_must_not_end_caller_run(
+                reason, self._manager((999, True)), "proj", "board", 159
+            ) is None
+
+    def test_ordinary_refusals_are_decided_on_the_reason_alone(self):
+        manager = self._manager((159, True))
+
+        for reason in (
+            "locked_by_issue_999",
+            "locked_by_issue_159_failed",
+            "lock_state_unknown_failing_closed",
+            "lock_write_failed",
+            "lock_mirror_write_failed",
+            None,
+        ):
+            assert refusal_must_not_end_caller_run(
+                reason, manager, "proj", "board", 159
+            ) is None
+
+        manager.get_lock_holder_fail_closed.assert_not_called()
+
+    def test_it_returns_a_log_ready_explanation(self):
+        """The gates interpolate the return value straight into their log line,
+        so it has to read as a clause, not as a bare True."""
+        explanation = refusal_must_not_end_caller_run(
+            GUARD_REFUSALS[0], self._manager((159, True)), "proj", "board", 159
+        )
+
+        assert isinstance(explanation, str)
+        assert "#159" in explanation
 
 
 class TestEndPipelineRunReleasesWhatItFinds(unittest.TestCase):

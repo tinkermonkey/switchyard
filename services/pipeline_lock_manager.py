@@ -190,20 +190,50 @@ def owner_process_role(owner_process: Optional[str]) -> Optional[str]:
 # try_acquire_lock() reasons that refuse the acquisition WITHOUT the caller
 # having stopped being the recorded holder.
 #
-# Every other False try_acquire_lock() returns means "you do not hold this
-# lock" -- contention, a retained failure, an unreadable store, a write that
-# landed nowhere -- and several call sites are written directly against that
-# reading: services/project_monitor.py's review-cycle and repair-cycle gates
-# tear the pipeline run down on a refusal, and end_pipeline_run() RELEASES the
-# lock whenever it finds the run's own issue recorded as the holder. Found in
-# the #139 review round: _refuse_unmirrored_redis_grant()'s "already_holds_lock"
+# Most False try_acquire_lock() returns mean "you do not hold this lock" --
+# contention, a retained failure, an unreadable store, a write that landed
+# nowhere -- and several call sites are written directly against that reading:
+# services/project_monitor.py's review-cycle and repair-cycle gates tear the
+# pipeline run down on a refusal, and end_pipeline_run() RELEASES the lock
+# whenever it finds the run's own issue recorded as the holder. Found in the
+# #139 review round: _refuse_unmirrored_redis_grant()'s "already_holds_lock"
 # branch deliberately leaves a live holder's Redis key alone (rolling it back
 # would release a lock out from under a running pipeline), which made that
 # reading false for the first time -- so those teardowns released the very lock
-# the refusal was written to protect. This set is what lets a caller tell the
-# two apart; see refusal_leaves_caller_holding_lock().
+# the refusal was written to protect.
+#
+# This set holds only the reasons that PROVE, from the reason string alone, that
+# the caller is still the holder; the reasons that decide nothing either way
+# live in LOCK_REFUSAL_REASONS_HOLDER_UNDECIDED below. A teardown call site has
+# to honor both, which is what refusal_must_not_end_caller_run() is for -- do
+# not reach for this set on its own.
 LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS = frozenset({
     "lock_mirror_write_failed_while_held",
+})
+
+
+# try_acquire_lock() reasons that decide NOTHING about who holds the lock: both
+# are raised by the acquire guard itself, before either store is read or
+# written, so whoever was the recorded holder still is -- and on the two
+# project_monitor gates above, whose whole premise is an issue that may already
+# hold this lock from an earlier stage, that is quite often the caller itself.
+#
+# Found in the #174 review round. The acquire/release asymmetry makes it the
+# likely outcome rather than a race: the acquire guard is taken with the
+# default 10s file-lock timeout, while release_lock() deliberately waits
+# RELEASE_GUARD_TIMEOUT_SECONDS then RELEASE_GUARD_RETRY_TIMEOUT_SECONDS for
+# the same guard (see release_lock()) -- so a guard contended past 10s refuses
+# the acquire and then grants the release, and a gate that treats the refusal
+# as "someone else has this board" ends its own live run, releases its own
+# lock, and hands the board to the next queued issue.
+#
+# Unlike the set above, these reasons cannot answer the question on their own --
+# the caller may be the holder or may be a genuine contender. Deciding requires
+# actually reading the holder, which is what refusal_must_not_end_caller_run()
+# does.
+LOCK_REFUSAL_REASONS_HOLDER_UNDECIDED = frozenset({
+    "lock_acquire_serialization_timeout",
+    "lock_acquire_serialization_unavailable",
 })
 
 
@@ -213,10 +243,71 @@ def refusal_leaves_caller_holding_lock(reason: Optional[str]) -> bool:
     refresh failed, but you are still the recorded holder" rather than "you do
     not hold this lock".
 
-    Callers that respond to a refusal by ending the run and/or releasing the
-    lock MUST check this first -- see LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS.
+    Only proves the positive case -- a False here is NOT proof the caller lost
+    the lock, see LOCK_REFUSAL_REASONS_HOLDER_UNDECIDED. Callers that respond to
+    a refusal by ending the run and/or releasing the lock want
+    refusal_must_not_end_caller_run(), which covers both sets.
     """
     return reason in LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS
+
+
+def refusal_must_not_end_caller_run(
+    reason: Optional[str],
+    lock_manager: 'PipelineLockManager',
+    project: str,
+    board: str,
+    issue_number: int,
+) -> Optional[str]:
+    """
+    The question a dispatch gate actually has after a False try_acquire_lock():
+    "is it safe to end this issue's pipeline run on this refusal?"
+
+    It is not safe whenever the refusal leaves this issue the recorded holder,
+    because end_pipeline_run() reads the holder rather than asking who called
+    it -- finding this issue there, it releases the lock, cancels the issue for
+    an hour and dispatches the board to the next queued issue, all out from
+    under a pipeline that is still running.
+
+    Returns a log-ready explanation when the run MUST be left in place (retry on
+    a later poll instead), or None when the refusal is a genuine "you do not
+    hold this lock" the caller is free to clean up after.
+
+    Fails closed on the undecided refusals: an unreadable or raising holder
+    lookup is reported as "leave it alone" -- the cost of being wrong that way
+    is a pipeline run that lingers until the zombie watchdog sweeps it, against
+    a live pipeline losing its board the other way.
+    """
+    if refusal_leaves_caller_holding_lock(reason):
+        return (
+            f"issue #{issue_number} is still the recorded holder ({reason} refuses "
+            f"the refresh without giving the lock up)"
+        )
+
+    if reason not in LOCK_REFUSAL_REASONS_HOLDER_UNDECIDED:
+        return None
+
+    try:
+        holder, reads_healthy = lock_manager.get_lock_holder_fail_closed(project, board)
+    except Exception as e:
+        return (
+            f"{reason} decided nothing about who holds the lock and the holder could "
+            f"not be read to find out ({e}) — assuming issue #{issue_number} may still "
+            f"hold it"
+        )
+
+    if not reads_healthy:
+        return (
+            f"{reason} decided nothing about who holds the lock and neither store could "
+            f"be read to find out — assuming issue #{issue_number} may still hold it"
+        )
+
+    if holder == issue_number:
+        return (
+            f"issue #{issue_number} is still the recorded holder ({reason} was refused "
+            f"by the acquire guard before either store was touched)"
+        )
+
+    return None
 
 
 class TouchResult(Enum):

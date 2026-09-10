@@ -26,6 +26,7 @@ from services.pipeline_lock_manager import (
     STATE_LOCK_TIMEOUT_SECONDS,
     TouchResult,
     refusal_leaves_caller_holding_lock,
+    refusal_must_not_end_caller_run,
 )
 from tests.utils.fake_redis import ThreadSafeFakeRedis
 
@@ -978,6 +979,49 @@ class TestYamlFallbackAcquisitionIsSerialized(unittest.TestCase):
         self.assertEqual(reason, "lock_acquire_serialization_timeout")
         self.assertIsNone(self.manager.get_lock("proj", "board"))
 
+    def test_a_guard_refusal_leaves_the_existing_holder_exactly_as_it_was(self):
+        """#174 review round: the guard is taken BEFORE either store is read or
+        written, so this refusal decides nothing about who holds the lock -- the
+        previous holder is still the recorded one, and at project_monitor's two
+        dispatch gates (both reached by an issue that may have carried the lock
+        in from an earlier stage) that is often the refused caller itself.
+
+        The asymmetry makes it the likely outcome rather than a race: the
+        acquire gives the guard utils.file_lock's 10s default while
+        release_lock() waits RELEASE_GUARD_TIMEOUT_SECONDS then
+        RELEASE_GUARD_RETRY_TIMEOUT_SECONDS for the same file, so a guard
+        contended past 10s refuses the acquire and then grants the release that
+        end_pipeline_run() issues on the back of it.
+
+        refusal_must_not_end_caller_run() is what a teardown call site has to
+        ask, because the reason string cannot tell holder from contender --
+        refusal_leaves_caller_holding_lock() deliberately still says False here.
+        """
+        from utils.file_lock import file_lock as _real_file_lock
+
+        def _guard_is_busy(path, *args, **kwargs):
+            if str(path).endswith('.acquire.lock'):
+                raise TimeoutError("guard busy")
+            return _real_file_lock(path, *args, **kwargs)
+
+        self.assertEqual(
+            self.manager.try_acquire_lock("proj", "board", 159), (True, "lock_acquired")
+        )
+
+        with patch('utils.file_lock.file_lock', side_effect=_guard_is_busy):
+            success, reason = self.manager.try_acquire_lock("proj", "board", 159)
+
+        self.assertEqual((success, reason), (False, "lock_acquire_serialization_timeout"))
+        self.assertEqual(self.manager.get_lock_holder("proj", "board"), 159)
+        self.assertFalse(refusal_leaves_caller_holding_lock(reason))
+        self.assertTrue(
+            refusal_must_not_end_caller_run(reason, self.manager, "proj", "board", 159)
+        )
+        self.assertIsNone(
+            refusal_must_not_end_caller_run(reason, self.manager, "proj", "board", 999),
+            "a genuine contender must still be free to end its own run",
+        )
+
 
 class TestReleaseIsNotAbandonedByGuardContention(unittest.TestCase):
     """
@@ -1714,9 +1758,11 @@ class TestAGrantIsOnlyReportedWhenItsDurableCopyLanded(unittest.TestCase):
         lock out from under a running pipeline, so it is refused in place.
 
         The reason is DISTINCT from the new-grant refusal (#139 review round):
-        this is the one refusal after which the caller is still the recorded
-        holder, and its teardown call sites branch on exactly that -- see
-        refusal_leaves_caller_holding_lock().
+        this is the one refusal that PROVES the caller is still the recorded
+        holder on the reason string alone, and its teardown call sites branch on
+        exactly that -- see refusal_leaves_caller_holding_lock(), and
+        refusal_must_not_end_caller_run() for the acquire-guard refusals, which
+        leave the holder in place too but have to be read to find out.
         """
         self.assertEqual(
             self.manager.try_acquire_lock("proj", "board", 123), (True, "lock_acquired")
