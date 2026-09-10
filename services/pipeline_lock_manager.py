@@ -1903,7 +1903,7 @@ class PipelineLockManager:
         until the LOCK_TTL_SECONDS Redis TTL or the 4-hour staleness heuristic
         -- blocking every dispatch for that (project, board) meanwhile, and
         with no automatic re-attempt at the site that matters most
-        (pipeline_progression._release_lock_and_process_next fires only on the
+        (pipeline_progression._release_lock_on_exit_column fires only on the
         move INTO an exit column, so it never re-fires). So the guard gets a
         second, much longer bounded attempt (RELEASE_GUARD_RETRY_TIMEOUT_SECONDS),
         and only a release that exhausts that too is reported -- distinctly, as
