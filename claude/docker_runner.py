@@ -102,6 +102,39 @@ except ImportError:
         pass
 
 
+def resolve_workspace_type_for_column(project: str, column: str) -> str:
+    """
+    Derive workspace_type from pipeline config using project and column name.
+
+    workspace_type is a property of the pipeline template (e.g. 'issues' for
+    sdlc_execution, 'discussions' for planning_design). Given the column the
+    agent was executing in, we can find the owning pipeline and return its
+    workspace. Falls back to 'issues' if the column is unknown or unmatched.
+
+    Module-level rather than a DockerAgentRunner method because the empty-output
+    watchdog needs the same answer (#166): services/work_execution_state.py has to
+    look for an agent's comment in the workspace the completion path posted it to,
+    and instantiating a container runner is not what a state sweep should do to
+    find out.
+    """
+    if column == 'unknown':
+        return 'issues'
+    try:
+        from config.manager import config_manager
+        project_config = config_manager.get_project_config(project)
+        if not project_config:
+            return 'issues'
+        for pipeline in project_config.pipelines:
+            workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+            if not workflow_template:
+                continue
+            if any(c.name == column for c in workflow_template.columns):
+                return getattr(pipeline, 'workspace', 'issues')
+    except Exception:
+        pass
+    return 'issues'
+
+
 class DockerAgentRunner:
     """Runs Claude Code agents in isolated Docker containers"""
 
@@ -3398,30 +3431,15 @@ class DockerAgentRunner:
         }
 
     def _get_workspace_type_from_column(self, project: str, column: str) -> str:
-        """
-        Derive workspace_type from pipeline config using project and column name.
+        """Derive workspace_type from pipeline config using project and column name.
 
-        workspace_type is a property of the pipeline template (e.g. 'issues' for
-        sdlc_execution, 'discussions' for planning_design). Given the column the
-        agent was executing in, we can find the owning pipeline and return its
-        workspace. Falls back to 'issues' if the column is unknown or unmatched.
+        Delegates to the module-level resolve_workspace_type_for_column(), which is
+        shared with the empty-output watchdog's GitHub-output gate (#166) -- that
+        gate has to look for the agent's comment in the same workspace this method
+        told the poster to write it to, and a second copy of this resolution is how
+        the two would come to disagree.
         """
-        if column == 'unknown':
-            return 'issues'
-        try:
-            from config.manager import config_manager
-            project_config = config_manager.get_project_config(project)
-            if not project_config:
-                return 'issues'
-            for pipeline in project_config.pipelines:
-                workflow_template = config_manager.get_workflow_template(pipeline.workflow)
-                if not workflow_template:
-                    continue
-                if any(c.name == column for c in workflow_template.columns):
-                    return getattr(pipeline, 'workspace', 'issues')
-        except Exception:
-            pass
-        return 'issues'
+        return resolve_workspace_type_for_column(project, column)
 
     async def _complete_agent_execution(
         self,

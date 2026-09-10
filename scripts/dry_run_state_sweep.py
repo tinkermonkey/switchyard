@@ -377,8 +377,10 @@ SWEEPS: Dict[str, SweepSpec] = {
         description=(
             "WorkExecutionStateTracker.detect_and_retry_empty_successful_executions() "
             "-- rewrites a 'success' record to 'failure' when the agent produced no "
-            "visible GitHub output, which redispatches the agent. Inert today: its "
-            "last gate requires completed_at, which nothing writes (#166)."
+            "visible GitHub output, which redispatches the agent. LIVE since #166: "
+            "its last gate anchors on the execution's start timestamp, checks the "
+            "issue's Discussion as well as its comments, and attributes output by "
+            "the agent's own signature."
         ),
         build=_build_execution_tracker,
         resolved_dirs=_execution_tracker_dirs,
@@ -387,7 +389,7 @@ SWEEPS: Dict[str, SweepSpec] = {
         examined_patterns=(r'Watchdog: Checking (\d+) execution state files',),
         terminal_patterns=(r'marking as failure to trigger retry',),
         external_reads=(
-            'GitHub GraphQL/REST (issue comments), once per record that reaches PROTECTION 6',
+            'GitHub REST (issue comments, bounded by per_page + since) once per record that reaches PROTECTION 6, plus one GraphQL query for the issue Discussion when the issue has one',
             'Elasticsearch: pipeline-runs-* search, per record that reaches PROTECTION 4 '
             '(get_active_pipeline_run() falls through to ES on a Redis mapping miss; it is '
             'called with restore_to_redis=False so the hit is not written back)',
@@ -399,10 +401,10 @@ SWEEPS: Dict[str, SweepSpec] = {
             'but it is a write to a datastore this harness does not checksum',
             'Observability: EventType.RETRY_ATTEMPTED per record that reaches the terminal '
             'decision, into the production event stream and Elasticsearch '
-            '(services/work_execution_state.py, end of the retry branch). Inert while #166 '
-            'keeps the last gate closed -- and fired once per candidate on the very run that '
-            'dry-runs the FIXED sweep, which is what this harness is for',
-            'Redis: the GitHub API client caches its issue-comment reads, so PROTECTION 6 '
+            '(services/work_execution_state.py, end of the retry branch). Live since #166, '
+            'so it fires once per record that gets past every protection -- which is exactly '
+            'what this harness exists to size before it can happen for real',
+            'Redis: the GitHub API client caches its comment reads, so PROTECTION 6 '
             'writes cache entries in the production Redis',
         ),
         owned_state_subtrees=('execution_history',),

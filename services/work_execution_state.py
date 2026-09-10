@@ -10,6 +10,7 @@ Tracks execution history, outcomes, and status changes to enable:
 
 import yaml
 import logging
+import re
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone
@@ -32,6 +33,144 @@ _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp a
 # record it found, so none of that cost was ever paid and none of it was visible.
 # Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
 _WATCHDOG_MAX_RECORD_AGE_HOURS = 24
+
+# How much of a workspace the empty-output gate reads before it gives up and
+# declines the record (#166). `gh api` is called with no --paginate, so a page is
+# all this gate ever sees: the issue endpoint is bounded with per_page + since,
+# and the Discussion query with last:. A page that could have been clipped inside
+# the execution's window is reported as unverifiable, never as "no output".
+_WATCHDOG_COMMENT_PAGE_SIZE = 100
+_WATCHDOG_DISCUSSION_REPLY_PAGE_SIZE = 50
+
+# Every agent comment this orchestrator posts ends with this marker -- see
+# AgentCommentFormatter.format_agent_completion() in services/github_integration.py,
+# which both real completion paths (docker_runner._complete_agent_execution and
+# agent_executor._post_agent_output_to_github) format their output with.
+# project_monitor, review_cycle, pr_review_stage and human_feedback_loop already
+# attribute comments to agents with exactly this string; the watchdog reuses it
+# rather than inventing a second spelling of the same convention.
+_ANY_AGENT_OUTPUT_SIGNATURE_RE = re.compile(r'_Processed by the \S[^\n]*? agent_')
+
+# What one scan of one workspace concluded.
+_OUTPUT_EVIDENCE_NONE = 'none'                    # nothing agentic in the window
+_OUTPUT_EVIDENCE_OTHER_AGENT = 'other_agent_output'  # agent output, but not this agent's
+_OUTPUT_EVIDENCE_AGENT = 'agent_output'           # this agent's own signed output
+_OUTPUT_EVIDENCE_UNVERIFIABLE = 'unverifiable'    # the scan could not answer
+
+# Increasing order of "leave the record alone": _NONE is the only one that lets
+# the sweep rewrite anything.
+_OUTPUT_EVIDENCE_RANK = {
+    _OUTPUT_EVIDENCE_NONE: 0,
+    _OUTPUT_EVIDENCE_OTHER_AGENT: 1,
+    _OUTPUT_EVIDENCE_AGENT: 2,
+    _OUTPUT_EVIDENCE_UNVERIFIABLE: 3,
+}
+
+
+# The dispatch paths whose output the empty-output gate can actually attribute --
+# i.e. the ones that finish through AgentExecutor._post_agent_output_to_github or
+# docker_runner._complete_agent_execution and therefore post a comment signed
+# "_Processed by the {agent} agent_". An allowlist rather than a denylist on
+# purpose: a dispatch path added later defaults to "cannot verify", which defers,
+# instead of to "verified empty", which redispatches.
+#
+# Two exclusions are load-bearing and both were measured, not reasoned:
+#
+#   * The repair cycle ('repair_cycle_test' / '_fix' / '_warning_review'). Its
+#     agent calls run inside the repair-cycle container and post nothing
+#     individually -- documentation_robotics #909 recorded 23 agent calls and not
+#     one signed comment; the only output is the stage's own summary, signed
+#     "_Repair cycle executed by Switchyard (containerized)_". Evaluating the
+#     activated gate over seven days of live records answered "no output" for 83
+#     of them, every one a repair-cycle record whose cycle had demonstrably
+#     posted its summary. That is the 29-of-30 failure mode this gate was split
+#     out of #150 to avoid, and it is 2,053 of 4,566 last-record successes -- so
+#     this exclusion is also the watchdog's largest blind spot, tracked in #188.
+#   * 'manual'. project_monitor uses it for the ordinary board dispatch AND for
+#     the two wrapper stages (pr_review_stage, repair cycle), which record an
+#     outcome under a name their sub-run does not post under. The ordinary
+#     dispatch's own last record is 'task_queue' anyway -- the task-queue worker
+#     records a second start that supersedes the wrapper's -- so nothing
+#     verifiable is lost by declining the ambiguous name.
+_WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES = frozenset({
+    'task_queue',
+    'pipeline_progression',
+    'review_cycle',
+    'pr_review_phase2',
+    'pr_review_phase4',
+    'human_feedback_loop_initial',
+    'human_feedback_loop_response',
+})
+
+
+def _agent_output_signature(agent: str) -> str:
+    """The marker `agent`'s own output comments carry."""
+    return f"_Processed by the {agent} agent_"
+
+
+def _stronger_output_evidence(left: str, right: str) -> str:
+    """Combine two workspace scans into the answer that leaves the record alone."""
+    return left if _OUTPUT_EVIDENCE_RANK[left] >= _OUTPUT_EVIDENCE_RANK[right] else right
+
+
+def _classify_output_evidence(entries, agent: str, anchor: datetime) -> str:
+    """Classify (created_at, body) pairs against one execution's start time.
+
+    entries may be a generator; it is consumed once. A pair this cannot date is
+    fatal to the whole scan rather than skipped -- "assume it fell outside the
+    window" is the assumption that redispatches an agent whose comment is sitting
+    right there.
+    """
+    signature = _agent_output_signature(agent)
+    evidence = _OUTPUT_EVIDENCE_NONE
+
+    for created_at, body in entries:
+        try:
+            created = _parse_iso_timestamp(created_at)
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.warning(
+                f"Watchdog: Could not date a comment ({created_at!r}) while looking for "
+                f"{agent} output -- cannot verify, leaving the record alone: {e}"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        if created < anchor:
+            continue
+
+        body = body or ''
+        if signature in body:
+            return _OUTPUT_EVIDENCE_AGENT
+        if _ANY_AGENT_OUTPUT_SIGNATURE_RE.search(body):
+            evidence = _OUTPUT_EVIDENCE_OTHER_AGENT
+
+    return evidence
+
+
+def _newest_page_covers_window(total_count, nodes, anchor: datetime) -> bool:
+    """Does a `last: N` GraphQL page provably hold every node created since `anchor`?
+
+    GitHub orders connections oldest-first, so `last` returns the tail: anything
+    dropped is older than nodes[0]. The page therefore covers the window when
+    nothing was dropped at all, or when its own oldest node already predates the
+    anchor. Anything this cannot establish -- an absent totalCount, an undatable
+    first node -- is answered False, which the caller turns into "leaving the
+    record alone".
+    """
+    try:
+        dropped = int(total_count) > len(nodes)
+    except (TypeError, ValueError):
+        return False
+
+    if not dropped:
+        return True
+    if not nodes:
+        return False
+
+    try:
+        return _parse_iso_timestamp(nodes[0].get('createdAt')) <= anchor
+    except (ValueError, TypeError, AttributeError):
+        return False
+
 
 
 def _transition_dev_container_state(
@@ -174,6 +313,11 @@ class ExecutionRecord:
     # detect_and_retry_empty_successful_executions()'s PROTECTION 2, which falls
     # back to checking every board of the project when it's missing.
     board_name: Optional[str] = None
+    # True only on the record record_execution_outcome() synthesises when it finds
+    # no matching in_progress entry (#166): its `timestamp` is stamped at
+    # outcome-recording time, so it is a finish time wearing a start time's name.
+    # The empty-output gate declines any record carrying this.
+    start_time_unknown: bool = False
 
 
 @dataclass
@@ -462,14 +606,17 @@ class WorkExecutionStateTracker:
                 if not found_primary:
                     # Most recent in_progress: the real execution entry.
                     #
-                    # Deliberately does NOT stamp completed_at. Nothing in
-                    # production writes that field, which is what keeps
-                    # _has_github_output() a "cannot verify" no-op on every record
-                    # -- and that gate is not yet safe to activate (it never checks
-                    # Discussions, and the crash-recovery record below has no real
-                    # start time to anchor against). Stamping it here is the single
-                    # line that turns the empty-output watchdog live across 54k+
-                    # 'success' records, so it belongs with the rest of that work.
+                    # Still deliberately does NOT stamp completed_at, now for the
+                    # opposite reason to #150's. The empty-output gate is live
+                    # (#166), but it anchors on `timestamp` -- the START, written by
+                    # record_execution_start() before the task is even enqueued --
+                    # precisely because both completion paths post the agent's
+                    # comment BEFORE reaching this call. A completion anchor
+                    # post-dates the comment that proves output, which is what a
+                    # dry run measured as 29 wrong answers in 30 real successes.
+                    # The one remaining consumer of the field, PROTECTION 5's
+                    # 5-minute recency window, therefore stays inert; giving it an
+                    # anchor is its own change, not a side effect of this one.
                     if error:
                         execution['error'] = error
                     if claude_session_id:
@@ -520,15 +667,21 @@ class WorkExecutionStateTracker:
         # No board_name and no trigger_source: this record is synthesised from
         # what the caller knows now, not from the lost dispatch. See the docstring.
         # `timestamp` is therefore a stand-in -- the real start time went with the
-        # lost dispatch -- which is one of the reasons the empty-output gate is not
-        # activated on this branch: a record whose "start" is really its finish
-        # cannot anchor a "has anything been posted since?" question.
+        # lost dispatch, and this one is stamped AFTER the agent has already
+        # posted -- so `start_time_unknown` says so outright rather than leaving
+        # the empty-output gate to infer it (#166). Without the flag the gate would
+        # ask "has anything been posted since?" of an instant that is really the
+        # finish, and answer "no output" for an execution that posted perfectly
+        # well: 8,692 of 54,594 live 'success' records have this shape.
+        # _output_anchor_for_record() also declines trigger_source 'unknown', which
+        # is what covers every record of this shape already on disk.
         execution = {
             'column': column,
             'agent': agent,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'outcome': outcome,
-            'trigger_source': 'unknown'
+            'trigger_source': 'unknown',
+            'start_time_unknown': True
         }
 
         if error:
@@ -2133,11 +2286,12 @@ class WorkExecutionStateTracker:
                     # (could be starting but not yet marked as in_progress)
                     #
                     # Still gated on completed_at, which no production code path
-                    # writes -- so like _has_github_output() below this is a
-                    # "cannot verify" no-op today. Both come alive together, with
-                    # the same design work and the same review; giving this one an
-                    # anchor on its own would only shift the window earlier by the
-                    # execution's whole duration, which is narrower, not safer.
+                    # writes, so this stays a no-op -- and #166 deliberately left
+                    # it one. The gate below came alive on the START timestamp
+                    # instead, because the agent's comment is posted before the
+                    # outcome is recorded; stamping a completion here to wake this
+                    # window is a separate decision with its own blast radius, not
+                    # a free side effect of activating the gate.
                     if last_exec.get('completed_at'):
                         try:
                             completed_at = _parse_iso_timestamp(last_exec['completed_at'])
@@ -2206,19 +2360,8 @@ class WorkExecutionStateTracker:
 
     def _has_github_output(self, project_name: str, issue_number: int, execution: dict) -> bool:
         """
-        Check if execution resulted in GitHub output (comment post).
-
-        NOT CURRENTLY LIVE, deliberately. The gate requires completed_at and no
-        production code path writes that field, so this returns True ("cannot
-        verify") for every record on the live orchestrator and the sweep never
-        rewrites one. Activating it is tracked as #166, because the gate is still
-        wrong in two ways confirmed against live data: it queries only the
-        issue-comments endpoint, so the six
-        planning_design columns whose workspace is "discussions" post their output
-        somewhere it never looks, and it counts ANY comment in the window as the
-        agent's, including the pipeline watchdog's own "Pipeline Stuck" notice.
-        Both produce a false "no output" on 54k+ 'success' records, and a false
-        "no output" rewrites the record to 'failure' and redispatches the agent.
+        Check if this execution produced GitHub output -- an agent comment on the
+        issue, or on the issue's Discussion.
 
         This is the LAST gate before an execution is rewritten to 'failure' and
         redispatched, so every "can't verify" path deliberately fails CLOSED
@@ -2228,6 +2371,39 @@ class WorkExecutionStateTracker:
         wrong "has output" answer only defers -- the record stays 'success', no
         retry budget is consumed, and the next sweep re-examines it. That is the
         same posture PROTECTION 2's fail-closed lock read takes.
+
+        Live as of #166. Four things had to be true first, and every one of them
+        was a confirmed false "no output" against real production records:
+
+          * It has to look where the output actually goes. `planning_design`
+            carries workspace: "discussions", so Requirements / Research / Design
+            / Work Breakdown / In Development / In Review post to a Discussion, in
+            all 17 projects -- 3,266 of 54,594 'success' records. Querying only
+            repos/{org}/{repo}/issues/{n}/comments answered "demonstrably produced
+            no output" for every one of them; phone-home #72's idea_researcher
+            report went to Discussion #191.
+          * It has to anchor on a real START time. Both completion paths post the
+            comment BEFORE recording the outcome (docker_runner's
+            _complete_agent_execution, agent_executor's finalization), so any
+            completion anchor post-dates the very comment that proves output --
+            the inversion that would have rewritten 29 of 30 genuine successes.
+            The anchor is `timestamp`, written by record_execution_start() before
+            the task is even enqueued; the crash-recovery record has no such start
+            and is declined (see _output_anchor_for_record).
+          * It has to tell THIS agent's output from anyone else's. Every agent
+            comment the orchestrator posts carries
+            "_Processed by the {agent} agent_" (AgentCommentFormatter.
+            format_agent_completion), which is the marker project_monitor,
+            review_cycle and pr_review_stage already attribute comments with.
+            Counting any comment in the window made a human reply, a review-cycle
+            banner or the pipeline watchdog's own "Pipeline Stuck" notice read as
+            the agent's work.
+          * ...and it has to decline the executions whose output is not a signed
+            agent comment at all. The repair cycle reports through a stage summary
+            of its own, so a signature check reads every repair-cycle record as
+            empty; measured over seven days of live records that was 83 wrong
+            answers out of 96. Those dispatch paths are declined outright -- see
+            _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES.
 
         Args:
             project_name: Project name
@@ -2242,80 +2418,121 @@ class WorkExecutionStateTracker:
             from services.github_api_client import get_github_client
             from config.manager import config_manager
 
-            gh = get_github_client()
-            # get_project_config() raises rather than returning None for an unknown
-            # project, so there is no falsy-config case to test for here -- and a
-            # ProjectConfig dataclass instance is always truthy anyway.
-            project_config = config_manager.get_project_config(project_name)
-
             agent = execution.get('agent')
-            completed_at = execution.get('completed_at')
-
-            if not agent or not completed_at:
-                # The permanent case in production: nothing writes completed_at, so
-                # "after what?" has no answer and there is no comparison to make.
-                # Unverifiable, not verified-empty -- and until the gate is
-                # correct for discussion-workspace columns and can tell the agent's
-                # comment from anyone else's, unverifiable is where it should stay.
+            if not agent:
                 logger.debug(
-                    f"Watchdog: No completion timestamp for {project_name}/#{issue_number} "
+                    f"Watchdog: No agent on the record for {project_name}/#{issue_number} "
+                    f"-- cannot attribute output, leaving the record alone"
+                )
+                return True
+
+            anchor = self._output_anchor_for_record(execution)
+            if anchor is None:
+                logger.debug(
+                    f"Watchdog: No usable start time for {project_name}/#{issue_number} "
                     f"-- cannot verify GitHub output, leaving the record alone"
                 )
                 return True
 
-            # Parse the completion timestamp
-            completed_dt = _parse_iso_timestamp(completed_at)
+            trigger_source = execution.get('trigger_source')
+            if trigger_source not in _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES:
+                # This execution's output does not arrive as a comment signed by
+                # this agent, so "no signed comment" says nothing about whether it
+                # produced anything. See the allowlist for what was measured.
+                logger.debug(
+                    f"Watchdog: {project_name}/#{issue_number} was dispatched by "
+                    f"'{trigger_source}', whose output this gate cannot attribute "
+                    f"-- leaving the record alone"
+                )
+                return True
 
-            # Check for comments after completion time.
+            gh = get_github_client()
+            # get_project_config() raises rather than returning None for an unknown
+            # project, so there is no falsy-config case to test for here -- and a
+            # ProjectConfig dataclass instance is always truthy anyway.
             #
             # Attribute access, not subscription (#150): ProjectConfig is a plain
             # dataclass with no __getitem__, so project_config['github'] raised
             # TypeError on EVERY call, was swallowed by the broad handler below and
             # returned False -- making this gate unconditionally "no output" for
             # every project. Same defect class as the .get()-on-a-dataclass bugs
-            # #57/#58 fixed in PROTECTION 2/3; _should_retry_failed_execution()
-            # above has always used the correct form.
+            # #57/#58 fixed in PROTECTION 2/3.
+            project_config = config_manager.get_project_config(project_name)
             org = project_config.github['org']
             repo = project_config.github['repo']
-            endpoint = f'repos/{org}/{repo}/issues/{issue_number}/comments'
 
-            success, comments = gh.rest('GET', endpoint)
+            # Where this column's agent posts. Resolved from the pipeline config by
+            # the same helper the poster itself uses (claude/docker_runner.py), so
+            # the gate and the writer cannot drift apart.
+            from claude.docker_runner import resolve_workspace_type_for_column
+            from config.state_manager import state_manager
 
-            if not success:
-                logger.warning(
-                    f"Watchdog: Failed to fetch comments for {project_name}/#{issue_number} "
+            column = execution.get('column') or 'unknown'
+            workspace_type = resolve_workspace_type_for_column(project_name, column)
+            discussion_id = state_manager.get_discussion_for_issue(project_name, issue_number)
+
+            if workspace_type in ('discussions', 'hybrid') and not discussion_id:
+                # post_agent_output() falls back to an issue comment when it has no
+                # discussion id, so the issue scan below would be the right place to
+                # look -- but only if the link was ALSO missing when the agent
+                # posted. unlink_issue_discussion() exists, and a link removed since
+                # would leave the output in a Discussion this gate can no longer
+                # find. Not worth a redispatch to find out.
+                logger.debug(
+                    f"Watchdog: {project_name}/#{issue_number} is in a '{workspace_type}' "
+                    f"workspace column ('{column}') with no recorded discussion "
                     f"-- cannot verify GitHub output, leaving the record alone"
-                )
-                return True  # Can't verify - defer rather than redispatch blind
-
-            if not isinstance(comments, list):
-                # rest() hands back whatever the response body decoded to. A dict
-                # (an error envelope) or a string iterates into something the loop
-                # below silently skips, ending in a confident "no output" derived
-                # from a body that was never a comment list.
-                logger.warning(
-                    f"Watchdog: Comments response for {project_name}/#{issue_number} was "
-                    f"{type(comments).__name__}, not a list -- cannot verify GitHub "
-                    f"output, leaving the record alone"
                 )
                 return True
 
-            # Check if any comment was created after completion
-            for comment in comments:
-                try:
-                    created_at = _parse_iso_timestamp(comment['created_at'])
-                    if created_at > completed_dt:
-                        # Found a comment after execution - assume it's the output
-                        logger.debug(
-                            f"Found GitHub comment after execution completion for "
-                            f"{project_name}/#{issue_number}"
-                        )
-                        return True
-                except Exception as e:
-                    logger.debug(f"Error parsing comment timestamp: {e}")
-                    continue
+            # Both workspaces are scanned whenever the issue has a discussion at
+            # all, not just the one workspace_type names. The two are independent
+            # (an issue can carry a discussion for context in an 'issues' column),
+            # and post_agent_output() itself routes on discussion_id presence
+            # before it consults workspace_type.
+            evidence = self._scan_issue_comments_for_agent_output(
+                gh, org, repo, project_name, issue_number, agent, anchor
+            )
+            if evidence == _OUTPUT_EVIDENCE_UNVERIFIABLE:
+                return True
 
-            logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {completed_dt}")
+            if discussion_id and evidence != _OUTPUT_EVIDENCE_AGENT:
+                discussion_evidence = self._scan_discussion_comments_for_agent_output(
+                    gh, discussion_id, project_name, issue_number, agent, anchor
+                )
+                if discussion_evidence == _OUTPUT_EVIDENCE_UNVERIFIABLE:
+                    return True
+                evidence = _stronger_output_evidence(evidence, discussion_evidence)
+
+            if evidence == _OUTPUT_EVIDENCE_AGENT:
+                logger.debug(
+                    f"Watchdog: Found {agent} output posted after {anchor.isoformat()} "
+                    f"for {project_name}/#{issue_number}"
+                )
+                return True
+
+            if evidence == _OUTPUT_EVIDENCE_OTHER_AGENT:
+                # Some agent posted here inside this execution's window, just not
+                # under this record's agent name. The wrapper stages record an
+                # outcome under a name their sub-run does not post under (the
+                # repair cycle's summary is signed "Repair cycle executed by
+                # Switchyard", not by an agent), so an unattributed agent comment
+                # is as likely to be this execution's output under another name as
+                # it is to be an unrelated stage's. Reported at INFO because it is
+                # the one answer here that is a genuine "don't know" rather than a
+                # measurement.
+                logger.info(
+                    f"Watchdog: {project_name}/#{issue_number} has agent output posted "
+                    f"after {anchor.isoformat()} but none signed by '{agent}' "
+                    f"-- ambiguous, leaving the record alone"
+                )
+                return True
+
+            logger.debug(
+                f"No GitHub output found for {project_name}/#{issue_number} from "
+                f"'{agent}' after {anchor.isoformat()} "
+                f"(workspace: {workspace_type}, discussion: {discussion_id or 'none'})"
+            )
             return False
 
         except (AttributeError, TypeError, KeyError) as e:
@@ -2337,6 +2554,204 @@ class WorkExecutionStateTracker:
                 f"-- cannot verify, leaving the record alone: {e}"
             )
             return True  # Can't verify - defer rather than redispatch blind
+
+    def _output_anchor_for_record(self, execution: dict) -> Optional[datetime]:
+        """The instant this execution's output must have been posted after, or None.
+
+        `timestamp` is that instant for every record record_execution_start()
+        wrote: it is stamped before the task is even enqueued, so anything the
+        agent posts necessarily follows it. It is NOT that instant for the record
+        record_execution_outcome() synthesises when it finds no matching
+        in_progress entry (an orchestrator restart lost the dispatch) -- there
+        `timestamp` is stamped at outcome-recording time, i.e. AFTER the agent
+        already posted, so anchoring on it reports "nothing posted since" for an
+        execution that posted perfectly well. 8,692 of 54,594 live 'success'
+        records have that shape.
+
+        Those records are marked `start_time_unknown` at the point they are
+        written; the trigger_source fallback covers the ones already on disk,
+        which carry no board and no real trigger either ('unknown' is written
+        nowhere else).
+        """
+        if execution.get('start_time_unknown'):
+            return None
+
+        trigger_source = execution.get('trigger_source')
+        if not trigger_source or trigger_source == 'unknown':
+            return None
+
+        started_at = execution.get('timestamp')
+        if not started_at:
+            return None
+
+        try:
+            return _parse_iso_timestamp(started_at)
+        except (ValueError, TypeError, AttributeError) as e:
+            logger.debug(f"Watchdog: Could not parse execution start {started_at!r}: {e}")
+            return None
+
+    def _scan_issue_comments_for_agent_output(
+        self, gh, org: str, repo: str, project_name: str, issue_number: int,
+        agent: str, anchor: datetime
+    ) -> str:
+        """Classify the issue's comments posted at or after `anchor`.
+
+        Bounded server-side (#166). `gh api` is called with no --paginate, and the
+        list-comments endpoint defaults to per_page=30 sorted created/ascending --
+        so the unbounded form returned the OLDEST 30 comments, every one of which
+        predates the execution on any issue with a history (context-studio has
+        several past 170). `since` filters on updated_at, which a comment created
+        after the anchor always satisfies, so the window is never clipped by it.
+        """
+        since = anchor.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        endpoint = (
+            f'repos/{org}/{repo}/issues/{issue_number}/comments'
+            f'?per_page={_WATCHDOG_COMMENT_PAGE_SIZE}&since={since}'
+        )
+
+        success, comments = gh.rest('GET', endpoint)
+
+        if not success:
+            logger.warning(
+                f"Watchdog: Failed to fetch comments for {project_name}/#{issue_number} "
+                f"-- cannot verify GitHub output, leaving the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        if not isinstance(comments, list):
+            # rest() hands back whatever the response body decoded to. A dict
+            # (an error envelope) or a string iterates into something the scan
+            # below silently skips, ending in a confident "no output" derived
+            # from a body that was never a comment list.
+            logger.warning(
+                f"Watchdog: Comments response for {project_name}/#{issue_number} was "
+                f"{type(comments).__name__}, not a list -- cannot verify GitHub "
+                f"output, leaving the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        if len(comments) >= _WATCHDOG_COMMENT_PAGE_SIZE:
+            # A full page is indistinguishable from a clipped one, and the page is
+            # the OLDEST comments in the window -- the agent's could be past it.
+            logger.warning(
+                f"Watchdog: {project_name}/#{issue_number} returned a full page of "
+                f"{len(comments)} comments since {since} -- the window may be clipped, "
+                f"leaving the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        return _classify_output_evidence(
+            ((c.get('created_at'), c.get('body')) for c in comments if isinstance(c, dict)),
+            agent, anchor
+        )
+
+    def _scan_discussion_comments_for_agent_output(
+        self, gh, discussion_id: str, project_name: str, issue_number: int,
+        agent: str, anchor: datetime
+    ) -> str:
+        """Classify a Discussion's comments and threaded replies posted at or after `anchor`.
+
+        Uses the REST/GraphQL client directly rather than
+        GitHubDiscussions.get_discussion_comments(), which returns [] for both "no
+        comments" and "the query failed" -- the one distinction this gate cannot
+        afford to lose.
+
+        `last:` rather than `first:` because the question is about a recent window;
+        GitHub orders connections oldest-first, so `last` returns the tail and
+        anything dropped is older than the page's own first node.
+        """
+        query = """
+        query($discussionId: ID!, $comments: Int!, $replies: Int!) {
+          node(id: $discussionId) {
+            ... on Discussion {
+              comments(last: $comments) {
+                totalCount
+                nodes {
+                  createdAt
+                  body
+                  replies(last: $replies) {
+                    totalCount
+                    nodes {
+                      createdAt
+                      body
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        success, data = gh.graphql(query, {
+            'discussionId': discussion_id,
+            'comments': _WATCHDOG_COMMENT_PAGE_SIZE,
+            'replies': _WATCHDOG_DISCUSSION_REPLY_PAGE_SIZE,
+        })
+
+        if not success:
+            logger.warning(
+                f"Watchdog: Failed to fetch discussion {discussion_id} for "
+                f"{project_name}/#{issue_number} -- cannot verify GitHub output, "
+                f"leaving the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        comments = ((data or {}).get('node') or {}).get('comments') or {}
+        nodes = comments.get('nodes')
+        if not isinstance(nodes, list):
+            logger.warning(
+                f"Watchdog: Discussion {discussion_id} for {project_name}/#{issue_number} "
+                f"returned no comment list -- cannot verify GitHub output, leaving "
+                f"the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        if not _newest_page_covers_window(comments.get('totalCount'), nodes, anchor):
+            logger.warning(
+                f"Watchdog: Discussion {discussion_id} for {project_name}/#{issue_number} "
+                f"has more comments than one page and the page does not reach back to "
+                f"{anchor.isoformat()} -- leaving the record alone"
+            )
+            return _OUTPUT_EVIDENCE_UNVERIFIABLE
+
+        entries = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                logger.warning(
+                    f"Watchdog: Discussion {discussion_id} for {project_name}/#{issue_number} "
+                    f"returned a {type(node).__name__} where a comment was expected "
+                    f"-- leaving the record alone"
+                )
+                return _OUTPUT_EVIDENCE_UNVERIFIABLE
+            entries.append((node.get('createdAt'), node.get('body')))
+
+            # A threaded reply is where a human_feedback_loop response lands
+            # (post_agent_output passes reply_to_comment_id through to
+            # addDiscussionComment), so replies are agent output too and are
+            # bounded the same way as the comments carrying them.
+            replies = node.get('replies') or {}
+            reply_nodes = replies.get('nodes')
+            if not isinstance(reply_nodes, list) or not _newest_page_covers_window(
+                replies.get('totalCount'), reply_nodes, anchor
+            ):
+                logger.warning(
+                    f"Watchdog: A comment thread on discussion {discussion_id} for "
+                    f"{project_name}/#{issue_number} could not be read back to "
+                    f"{anchor.isoformat()} -- leaving the record alone"
+                )
+                return _OUTPUT_EVIDENCE_UNVERIFIABLE
+            for reply in reply_nodes:
+                if not isinstance(reply, dict):
+                    logger.warning(
+                        f"Watchdog: Discussion {discussion_id} for {project_name}/#{issue_number} "
+                        f"returned a {type(reply).__name__} where a reply was expected "
+                        f"-- leaving the record alone"
+                    )
+                    return _OUTPUT_EVIDENCE_UNVERIFIABLE
+                entries.append((reply.get('createdAt'), reply.get('body')))
+
+        return _classify_output_evidence(entries, agent, anchor)
 
     def _try_recover_result_from_redis(self, project_name, issue_number, agent, column, execution):
         """

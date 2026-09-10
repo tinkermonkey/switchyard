@@ -8,6 +8,7 @@ Tests:
 - GitHub output verification
 """
 
+import contextlib
 import logging
 import os
 import pytest
@@ -24,7 +25,10 @@ import threading
 # Mock ORCHESTRATOR_ROOT before importing work_execution_state to avoid /app permission errors
 with tempfile.TemporaryDirectory() as _tmpdir:
     with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
-        from services.work_execution_state import WorkExecutionStateTracker
+        from services.work_execution_state import (
+            WorkExecutionStateTracker,
+            _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES,
+        )
 
 from config.manager import ProjectConfig
 
@@ -37,6 +41,17 @@ from config.manager import ProjectConfig
 # dated relative to now.
 _EXAMINABLE_COMPLETED_AT = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
 _EXAMINABLE_TIMESTAMP = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()
+
+
+def _iso(minutes_ago: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+# The execution start _has_github_output() anchors on throughout
+# TestGitHubOutputVerification, and the `since=` bound the gate derives from it
+# (seconds precision, UTC, no '+' -- a '+' in a query string decodes to a space).
+_ANCHOR = _iso(minutes_ago=60)
+_ANCHOR_SINCE = datetime.fromisoformat(_ANCHOR).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 class TestEmptyOutputDetection:
@@ -623,7 +638,8 @@ class TestRetryEligibility:
 
 
 class TestGitHubOutputVerification:
-    """Test GitHub output verification.
+    """_has_github_output(), the last gate before a 'success' record is rewritten
+    to 'failure' and its agent redispatched.
 
     These tests build a REAL ProjectConfig rather than a dict (#150). The dict
     stand-in they used before is what let _has_github_output() ship a
@@ -631,6 +647,12 @@ class TestGitHubOutputVerification:
     __getitem__: production raised TypeError on every single call, the broad
     handler swallowed it, and the gate answered "no output" unconditionally --
     with a green test suite the whole time.
+
+    The gate went live in #166, so every case below is now a real answer rather
+    than the "cannot verify" the whole class used to collapse to. The three
+    defects that had to close first each have their own section: it never looked
+    at Discussions, it had no honest start time to anchor against, and it counted
+    any comment in the window as the agent's own work.
     """
 
     @pytest.fixture
@@ -649,55 +671,476 @@ class TestGitHubOutputVerification:
             pipeline_routing={},
         )
 
-    def test_has_github_output_comment_found(self, tracker):
-        """Test detects GitHub comment after execution"""
+    @staticmethod
+    def _execution(**overrides):
+        """The shape record_execution_start() writes: a start timestamp, a real
+        trigger_source, and no completion time at all.
+
+        'task_queue' because that is what the ordinary agent dispatch's last
+        record actually carries -- the task-queue worker records a second start
+        that supersedes project_monitor's 'manual' one -- and because it is one of
+        the dispatch paths whose output this gate can attribute at all.
+        """
         execution = {
             'agent': 'test-agent',
-            'completed_at': '2025-01-01T12:00:00Z'
+            'column': 'In Progress',
+            'outcome': 'success',
+            'timestamp': _ANCHOR,
+            'trigger_source': 'task_queue',
+        }
+        execution.update(overrides)
+        return execution
+
+    @staticmethod
+    def _agent_comment(created_at, agent='test-agent'):
+        return {
+            'created_at': created_at,
+            'body': f"# Analysis\n\nbody\n\n---\n_Processed by the {agent} agent_",
         }
 
-        # Mock GitHub client to return comment after execution
-        mock_gh_client = MagicMock()
-        mock_comments = [
-            {
-                'created_at': '2025-01-01T12:05:00Z',  # After execution
-                'body': 'Agent output'
+    @staticmethod
+    def _discussion_payload(comments):
+        """A GraphQL `data` payload for the gate's Discussion query.
+
+        `comments` is a list of (created_at, body, replies) triples, oldest first
+        -- the order GitHub returns a `last:` page in.
+        """
+        return {
+            'node': {
+                'comments': {
+                    'totalCount': len(comments),
+                    'nodes': [
+                        {
+                            'createdAt': created_at,
+                            'body': body,
+                            'replies': {
+                                'totalCount': len(replies),
+                                'nodes': [
+                                    {'createdAt': r_created, 'body': r_body}
+                                    for r_created, r_body in replies
+                                ],
+                            },
+                        }
+                        for created_at, body, replies in comments
+                    ],
+                }
             }
-        ]
-        mock_gh_client.rest.return_value = (True, mock_comments)
-
-        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = self._project_config()
-
-                has_output = tracker._has_github_output('test-project', 123, execution)
-
-                assert has_output is True
-
-    def test_has_github_output_no_comment_found(self, tracker):
-        """Test no GitHub comment after execution"""
-        execution = {
-            'agent': 'test-agent',
-            'completed_at': '2025-01-01T12:00:00Z'
         }
 
-        # Mock GitHub client to return no comments after execution
-        mock_gh_client = MagicMock()
-        mock_comments = [
-            {
-                'created_at': '2025-01-01T11:00:00Z',  # Before execution
-                'body': 'Old comment'
-            }
-        ]
-        mock_gh_client.rest.return_value = (True, mock_comments)
+    @contextlib.contextmanager
+    def _gate_environment(
+        self, gh_client, workspace_type='issues', discussion_id=None,
+        project_config=None,
+    ):
+        """Everything _has_github_output() reaches outside itself."""
+        state_manager = MagicMock()
+        state_manager.get_discussion_for_issue.return_value = discussion_id
 
-        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = self._project_config()
+        with patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch('config.manager.config_manager.get_project_config') as mock_config, \
+             patch(
+                 'claude.docker_runner.resolve_workspace_type_for_column',
+                 return_value=workspace_type
+             ), \
+             patch('config.state_manager.state_manager', state_manager):
+            mock_config.return_value = (
+                self._project_config() if project_config is None else project_config
+            )
+            yield state_manager
 
-                has_output = tracker._has_github_output('test-project', 123, execution)
+    # -- the anchor -------------------------------------------------------
 
-                assert has_output is False
+    def test_the_anchor_is_the_start_not_the_completion(self, tracker):
+        """The 29-of-30 bug. Both completion paths post the agent's comment BEFORE
+        calling record_execution_outcome(), so a comment that proves output sits
+        BETWEEN the start and the completion. Anchoring on the completion answers
+        "nothing posted since" for exactly the executions that worked."""
+        posted_at = _iso(minutes_ago=50)  # after the start, before the completion
+        execution = self._execution(completed_at=_iso(minutes_ago=40))
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [self._agent_comment(posted_at)])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        (_, endpoint), _ = gh_client.rest.call_args
+        assert f"since={_ANCHOR_SINCE}" in endpoint, (
+            "the gate filtered from a time other than the execution's start"
+        )
+
+    def test_a_crash_recovery_record_is_never_verified(self, tracker):
+        """record_execution_outcome() stamps `timestamp` at outcome-recording time
+        when it finds no in_progress entry, i.e. AFTER the agent already posted.
+        That record has no start to anchor against and must stay unverifiable --
+        8,692 of 54,594 live 'success' records have this shape."""
+        execution = self._execution(trigger_source='unknown', start_time_unknown=True)
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_a_legacy_crash_recovery_record_is_never_verified(self, tracker):
+        """The same shape as it exists on disk today: written before
+        start_time_unknown was stamped, so trigger_source is the only marker."""
+        execution = self._execution(trigger_source='unknown')
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_a_record_with_no_trigger_source_is_never_verified(self, tracker):
+        """A record that names no dispatch path names no start either."""
+        execution = self._execution()
+        del execution['trigger_source']
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_an_undatable_start_is_never_verified(self, tracker):
+        execution = self._execution(timestamp='not a timestamp')
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_a_record_with_no_agent_is_never_verified(self, tracker):
+        execution = self._execution(agent=None)
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    # -- attributable dispatch paths --------------------------------------
+
+    @pytest.mark.parametrize('trigger_source', [
+        'repair_cycle_test', 'repair_cycle_fix', 'repair_cycle_warning_review',
+    ])
+    def test_a_repair_cycle_record_is_never_verified(self, tracker, trigger_source):
+        """The measured false-positive class (#166). A repair cycle's agent calls
+        run inside the repair-cycle container and post nothing individually --
+        documentation_robotics #909 recorded 23 agent calls and not one signed
+        comment -- so the cycle's own summary, signed "_Repair cycle executed by
+        Switchyard (containerized)_", is the whole of its GitHub output.
+
+        Evaluating the activated gate over seven days of live records without this
+        exclusion answered "no output" for 83 of 96, every one of them a repair
+        cycle that had demonstrably posted its summary. That is 2,053 of 4,566
+        last-record successes, and it is the same shape of wrong answer that got
+        activation split out of #150 in the first place."""
+        execution = self._execution(trigger_source=trigger_source, column='Testing')
+
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_a_manual_dispatch_record_is_never_verified(self, tracker):
+        """project_monitor uses 'manual' for the ordinary board dispatch AND for
+        the two wrapper stages (pr_review_stage, repair cycle), which record an
+        outcome under a name their sub-run does not post under. The ordinary
+        dispatch's own last record is 'task_queue', so declining the ambiguous
+        name costs nothing verifiable."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(trigger_source='manual')
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_an_unrecognised_dispatch_path_is_never_verified(self, tracker):
+        """The allowlist is an allowlist so that a dispatch path added later
+        defaults to "cannot verify" -- which defers -- rather than to "verified
+        empty", which redispatches."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(trigger_source='some_new_path')
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    @pytest.mark.parametrize('trigger_source', sorted(
+        _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES
+    ))
+    def test_every_attributable_dispatch_path_is_actually_verified(
+        self, tracker, trigger_source
+    ):
+        """The other side of the allowlist: each path on it does reach GitHub and
+        does answer for real, so the list cannot quietly become a way of turning
+        the whole gate back off."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(trigger_source=trigger_source)
+            ) is False
+
+        gh_client.rest.assert_called_once()
+
+    # -- authorship -------------------------------------------------------
+
+    def test_the_agents_own_comment_is_output(self, tracker):
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [self._agent_comment(_iso(minutes_ago=50))])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
+
+    def test_a_comment_that_is_not_agent_output_does_not_count(self, tracker):
+        """The gate used to count ANY comment in the window as the agent's, which
+        made the pipeline watchdog's own "Pipeline Stuck" notice -- posted onto
+        precisely the stuck issues this sweep exists to un-stick -- read as proof
+        the agent had worked."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [
+            {'created_at': _iso(minutes_ago=50), 'body': '## Pipeline Stuck\n\nNo activity.'},
+            {'created_at': _iso(minutes_ago=45), 'body': 'Any update on this?'},
+        ])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is False
+
+    def test_another_agents_output_is_ambiguous_not_empty(self, tracker):
+        """Some agent posted inside this window, just not under this record's
+        name. The wrapper stages record an outcome under a name their sub-run does
+        not post under, so this is a genuine "don't know" -- and a "don't know"
+        leaves the record alone."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [
+            self._agent_comment(_iso(minutes_ago=50), agent='some-other-agent')
+        ])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
+
+    def test_the_agents_own_comment_from_before_the_start_does_not_count(self, tracker):
+        """A previous run of the same agent in the same column is not this
+        execution's output."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [
+            self._agent_comment(_iso(minutes_ago=600))
+        ])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is False
+
+    def test_no_comments_at_all_is_verified_empty(self, tracker):
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is False
+
+    # -- Discussions ------------------------------------------------------
+
+    def test_output_posted_to_a_discussion_is_output(self, tracker):
+        """The confirmed live false positive: phone-home #72, agent
+        idea_researcher, column Research. Its report went to Discussion #191 three
+        minutes after the execution started, and a gate that only queried
+        repos/{org}/{repo}/issues/72/comments answered "demonstrably produced no
+        output" -- which rewrites the record and redispatches the agent. 3,266 of
+        54,594 'success' records sit in discussion-workspace columns."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])  # nothing on the issue itself
+        gh_client.graphql.return_value = (True, self._discussion_payload([
+            (
+                _iso(minutes_ago=50),
+                '# Idea Research\n\n---\n_Processed by the test-agent agent_',
+                [],
+            ),
+        ]))
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+        assert gh_client.graphql.called
+
+    def test_output_posted_as_a_threaded_discussion_reply_is_output(self, tracker):
+        """A human_feedback_loop response is posted with reply_to_comment_id, so
+        it lands as a reply rather than a top-level discussion comment."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, self._discussion_payload([
+            (
+                _iso(minutes_ago=600),
+                'A human question',
+                [(
+                    _iso(minutes_ago=50),
+                    '# Idea Research\n\n---\n_Processed by the test-agent agent_',
+                )],
+            ),
+        ]))
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+    def test_an_empty_discussion_and_an_empty_issue_is_verified_empty(self, tracker):
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, self._discussion_payload([]))
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is False
+
+    def test_a_discussion_workspace_with_no_recorded_discussion_is_unverifiable(
+        self, tracker
+    ):
+        """post_agent_output() falls back to an issue comment when it has no
+        discussion id -- but only if the link was also missing when the agent
+        posted. unlink_issue_discussion() exists, so a link removed since would
+        leave the output somewhere this gate can no longer look."""
+        gh_client = MagicMock()
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id=None
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_a_failed_discussion_query_fails_closed(self, tracker):
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (False, {'error': 'rate_limited'})
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+    def test_a_discussion_is_checked_even_in_an_issues_column(self, tracker):
+        """workspace_type and discussion_id are independent, and
+        post_agent_output() routes on discussion_id presence BEFORE it consults
+        workspace_type. Checking only the workspace the column names would miss
+        exactly the mismatch that routing order creates."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, self._discussion_payload([
+            (_iso(minutes_ago=50), '_Processed by the test-agent agent_', []),
+        ]))
+
+        with self._gate_environment(
+            gh_client, workspace_type='issues', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
+
+    def test_a_truncated_discussion_page_is_unverifiable(self, tracker):
+        """`last: 100` drops the OLDEST comments, so the page covers the window
+        only when its own first node already predates the anchor. A page whose
+        oldest node is newer than the anchor may have dropped the agent's."""
+        payload = self._discussion_payload([
+            (_iso(minutes_ago=50), 'a later human comment', []),
+        ])
+        payload['node']['comments']['totalCount'] = 500
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, payload)
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+    def test_a_discussion_page_that_reaches_past_the_anchor_is_enough(self, tracker):
+        """The same truncation, but the page's oldest node predates the execution
+        -- everything dropped is older still, so nothing in the window is missing
+        and the gate may answer for real."""
+        payload = self._discussion_payload([
+            (_iso(minutes_ago=600), 'an older human comment', []),
+        ])
+        payload['node']['comments']['totalCount'] = 500
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, payload)
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is False
+
+    # -- the bounded fetch ------------------------------------------------
+
+    def test_the_issue_comment_fetch_is_bounded_and_anchored(self, tracker):
+        """`gh api` is called with no --paginate and the list-comments endpoint
+        defaults to per_page=30 sorted created/ascending, so the bare path
+        returned the OLDEST 30 comments -- every one of which predates the
+        execution on an issue with any history at all."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+
+        with self._gate_environment(gh_client):
+            tracker._has_github_output('test-project', 123, self._execution())
+
+        (method, endpoint), _ = gh_client.rest.call_args
+        assert method == 'GET'
+        assert endpoint.startswith('repos/test-org/test-repo/issues/123/comments?')
+        assert 'per_page=100' in endpoint
+        assert f"since={_ANCHOR_SINCE}" in endpoint
+
+    def test_a_full_page_of_comments_is_unverifiable(self, tracker):
+        """A full page is indistinguishable from a clipped one, and the page holds
+        the OLDEST comments in the window -- the agent's could be past it."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [
+            {'created_at': _iso(minutes_ago=50), 'body': 'chatter'}
+            for _ in range(100)
+        ])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
+
+    # -- fail-closed on everything it cannot answer ------------------------
 
     def test_has_github_output_api_failure(self, tracker):
         """An unverifiable answer must fail CLOSED (#150).
@@ -708,21 +1151,40 @@ class TestGitHubOutputVerification:
         its comment, while a spurious "has output" only defers -- the record
         stays 'success', no retry budget is spent, and the next sweep looks
         again. It used to return False here."""
-        execution = {
-            'agent': 'test-agent',
-            'completed_at': '2025-01-01T12:00:00Z'
-        }
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (False, None)  # API failure
 
-        mock_gh_client = MagicMock()
-        mock_gh_client.rest.return_value = (False, None)  # API failure
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
 
-        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = self._project_config()
+    def test_has_github_output_non_list_response_fails_closed(self, tracker):
+        """rest() hands back whatever the body decoded to. A dict (an error
+        envelope) or a string iterates into something the comment scan silently
+        skips, ending in a confident "no output" derived from a body that was
+        never a comment list."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, {'message': 'Not Found'})
 
-                has_output = tracker._has_github_output('test-project', 123, execution)
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
 
-                assert has_output is True
+    def test_an_undatable_comment_fails_closed(self, tracker):
+        """Skipping a comment this cannot place relative to the anchor is the
+        assumption that redispatches an agent whose output is sitting right
+        there."""
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [
+            {'created_at': None, 'body': 'something'}
+        ])
+
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution()
+            ) is True
 
     def test_has_github_output_programming_error_fails_closed_and_logs_loudly(
         self, tracker, caplog
@@ -730,70 +1192,18 @@ class TestGitHubOutputVerification:
         """A dataclass/dict mixup -- the exact defect that made this gate a
         permanent "no output" -- must surface at ERROR with a traceback rather
         than becoming another quiet return value, and must not redispatch."""
-        execution = {
-            'agent': 'test-agent',
-            'completed_at': '2025-01-01T12:00:00Z'
-        }
-
         broken_config = object()  # no .github at all
 
-        with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = broken_config
-
-                with caplog.at_level(logging.ERROR, logger='services.work_execution_state'):
-                    has_output = tracker._has_github_output('test-project', 123, execution)
+        with self._gate_environment(MagicMock(), project_config=broken_config):
+            with caplog.at_level(logging.ERROR, logger='services.work_execution_state'):
+                has_output = tracker._has_github_output(
+                    'test-project', 123, self._execution()
+                )
 
         assert has_output is True
         assert any(
             'programming error' in record.message for record in caplog.records
         ), caplog.text
-
-    def test_has_github_output_without_completed_at_fails_closed(self, tracker):
-        """The production shape, and the reason this gate is inert (#150).
-
-        No production code path writes completed_at -- record_execution_outcome()
-        deliberately does not stamp it on this branch -- so "was there a comment
-        AFTER completion?" has no anchor and every real record answers
-        "cannot verify". That keeps the sweep from rewriting any of the 54k+
-        'success' records while the gate is still wrong in ways confirmed against
-        live data (it never looks at Discussions, and it counts any comment in the
-        window as the agent's). Activating it is tracked as #166.
-
-        Note this is the shape record_execution_start() actually writes: a start
-        timestamp and nothing else."""
-        execution = {
-            'agent': 'test-agent',
-            'timestamp': '2025-01-01T12:00:00Z',  # start only -- no completed_at
-        }
-
-        gh_client = MagicMock()
-        with patch('services.github_api_client.get_github_client', return_value=gh_client):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = self._project_config()
-
-                assert tracker._has_github_output('test-project', 123, execution) is True
-
-        gh_client.rest.assert_not_called()
-
-    def test_has_github_output_non_list_response_fails_closed(self, tracker):
-        """rest() hands back whatever the body decoded to. A dict (an error
-        envelope) or a string iterates into something the comment loop silently
-        skips, ending in a confident "no output" derived from a body that was
-        never a comment list."""
-        execution = {
-            'agent': 'test-agent',
-            'completed_at': '2025-01-01T12:00:00Z'
-        }
-
-        mock_gh_client = MagicMock()
-        mock_gh_client.rest.return_value = (True, {'message': 'Not Found'})
-
-        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
-            with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = self._project_config()
-
-                assert tracker._has_github_output('test-project', 123, execution) is True
 
 
 class TestWatchdogIncrementsRetryCount:
@@ -1581,22 +1991,24 @@ class TestSweepReachesItsProtectionsForReal:
 
     @staticmethod
     def _success_record(**overrides):
-        """A record carrying a synthetic completed_at.
+        """A record in exactly the shape record_execution_start() writes.
 
-        Deliberately NOT the production shape: no production code path writes
-        completed_at, so a real record makes _has_github_output() answer "cannot
-        verify" and the sweep stops one gate short of the retry marking -- which
-        is the point of TestSweepOnProductionShapedRecords, but would make these
-        reachability tests unable to tell "the sweep ran to completion" from "the
-        sweep wedged". Stamping the field here is what lets them assert the sweep
-        reaches its last gate and past it.
+        It used to carry a synthetic completed_at, because the gate keyed off a
+        field no production writer stamps and these tests could not otherwise
+        tell "the sweep ran to completion" from "the sweep wedged". Since #166 the
+        gate anchors on `timestamp` -- the start -- so the real shape reaches the
+        last gate and past it, and the fixture no longer has to invent anything.
         """
         record = {
             'agent': 'test-agent',
             'column': 'In Progress',
             'board_name': 'SDLC Execution',
             'outcome': 'success',
-            'completed_at': _EXAMINABLE_COMPLETED_AT,
+            # One of the dispatch paths whose output the gate can attribute --
+            # see _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES. A record the gate
+            # declines outright never reaches the last gate at all, which is what
+            # these reachability tests exist to measure.
+            'trigger_source': 'task_queue',
             'timestamp': _EXAMINABLE_TIMESTAMP,
         }
         record.update(overrides)
@@ -1677,7 +2089,7 @@ class TestSweepReachesItsProtectionsForReal:
         assert count == 1
         (method, endpoint), _ = gh_client.rest.call_args
         assert method == 'GET'
-        assert endpoint == 'repos/test-org/test-repo/issues/123/comments'
+        assert endpoint.startswith('repos/test-org/test-repo/issues/123/comments?')
 
         with open(state_file) as f:
             updated = yaml.safe_load(f)
@@ -1697,7 +2109,10 @@ class TestSweepReachesItsProtectionsForReal:
         posted_at = (datetime.now(timezone.utc) - timedelta(minutes=29)).isoformat()
         count, _ = self._run_sweep(
             tracker,
-            comments=[{'created_at': posted_at, 'body': 'Agent output'}],
+            comments=[{
+                'created_at': posted_at,
+                'body': 'Agent output\n\n---\n_Processed by the test-agent agent_',
+            }],
         )
 
         assert count == 0
@@ -1733,22 +2148,21 @@ class TestSweepReachesItsProtectionsForReal:
         assert updated['execution_history'][-1]['outcome'] == 'success'
 
 
-class TestCompletedAtIsNotStampedYet:
-    """No production writer stamps completed_at, and that is load-bearing (#150).
+class TestCompletedAtIsNotStampedTheAnchorIsTheStart:
+    """No production writer stamps completed_at, and that stayed true through #166.
 
-    _has_github_output() is the last gate before an execution is rewritten to
-    'failure' and the issue is redispatched, and it keys off completed_at. Absent
-    the field the gate answers "cannot verify" and the sweep leaves the record
-    alone -- which is the only thing keeping it off 54,594 'success' records
-    while the gate is still wrong in two ways confirmed against live data: it
-    queries only the issue-comments endpoint, so the six planning_design columns
-    whose workspace is "discussions" post where it never looks, and the
-    crash-recovery record below carries a `timestamp` that is really its finish
-    time, so it has no start to anchor against either.
+    It was load-bearing for a different reason before: the gate keyed off
+    completed_at, so its absence was the only thing keeping the watchdog off
+    54,594 'success' records. #166 activated the gate on the START timestamp
+    instead -- because both completion paths post the agent's comment BEFORE
+    recording the outcome, so a completion anchor post-dates the very comment
+    that proves output, which is what a dry run measured as 29 wrong answers in
+    30 real successes.
 
-    Stamping the field is a one-line change in each of these three writers, which
-    is exactly why it needs a test: it activates the watchdog across production
-    the moment anyone adds it. Activation is tracked as #166.
+    So the field stays unwritten, and these tests keep pinning that, now guarding
+    the one consumer left: PROTECTION 5's 5-minute recency window. Stamping it is
+    a one-line change in each of these three writers and would wake that window
+    across production the moment anyone made it.
     """
 
     @pytest.fixture
@@ -1770,18 +2184,26 @@ class TestCompletedAtIsNotStampedYet:
         last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
         assert last_exec['outcome'] == 'success'
         assert 'completed_at' not in last_exec, (
-            "stamping completed_at makes _has_github_output() live across every "
-            "'success' record in production -- see the class docstring; that "
-            "belongs with the Discussions support, not here"
+            "stamping completed_at wakes PROTECTION 5's recency window across "
+            "every 'success' record in production -- see the class docstring"
         )
+        # The record the gate DOES anchor on: a start time, and a trigger_source
+        # that says the start is real.
+        assert last_exec['timestamp']
+        assert last_exec['trigger_source'] == 'manual_move'
+        assert 'start_time_unknown' not in last_exec
 
-    def test_the_crash_recovery_record_does_not_stamp_completed_at(self, tracker):
+    def test_the_crash_recovery_record_declares_it_has_no_start_time(self, tracker):
         """The synthesised record (no matching in_progress entry) is the one path
         that appends rather than mutating, and the one whose `timestamp` is not a
         real start time at all -- it is stamped at outcome-recording time, after
-        the agent has already posted. Giving it a completed_at would convert
-        "cannot verify" into "verified empty" for the 15.9% of live records that
-        have this shape."""
+        the agent has already posted. Anchoring the empty-output gate on it asks
+        "has anything been posted since?" of an instant that is really the finish,
+        and answers "no output" for an execution that posted perfectly well:
+        8,692 of 54,594 live 'success' records (15.9%) have this shape.
+
+        The record therefore says so outright (#166) rather than leaving the gate
+        to infer it from a trigger_source that means something else."""
         tracker.record_execution_outcome(
             issue_number=123, column='In Progress', agent='test-agent',
             outcome='success', project_name='test-project',
@@ -1789,7 +2211,13 @@ class TestCompletedAtIsNotStampedYet:
 
         last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
         assert last_exec['trigger_source'] == 'unknown'
+        assert last_exec['start_time_unknown'] is True, (
+            "the crash-recovery record's timestamp is its finish time -- without "
+            "this flag the empty-output gate treats it as a start and redispatches "
+            "agents that already posted"
+        )
         assert 'completed_at' not in last_exec
+        assert tracker._output_anchor_for_record(last_exec) is None
 
     def test_apply_redis_result_does_not_stamp_completed_at(self, tracker):
         """The Redis recovery path finalises a record too, so it is the third
@@ -1814,20 +2242,17 @@ class TestCompletedAtIsNotStampedYet:
 class TestSweepOnProductionShapedRecords:
     """The sweep against records shaped exactly like the ones on disk.
 
-    Everything else in this file feeds the sweep a 'completed_at' no real record
-    has -- either as a fixture field or by patching _has_github_output() to a
-    constant. That is fine for unit-testing the protections, but it hides the
-    single most important property of this branch: against a record with the
-    field set production actually writes, the sweep runs every protection and
-    then declines to rewrite anything, because _has_github_output() has no anchor
-    and answers "cannot verify".
+    Most of this file patches _has_github_output() to a constant, which is fine
+    for unit-testing the protections in front of it and useless for the question
+    that actually decides whether this watchdog is safe to run: what does the
+    whole chain do to a record with the field set production really writes?
 
-    That is deliberate, not an oversight. The gate is still wrong in two ways
-    confirmed against live data (it never queries Discussions, where six
-    planning_design columns post their output; and the crash-recovery record's
-    `timestamp` is really its finish time), and a wrong "no output" rewrites the
-    record to 'failure' and redispatches the agent. Activation is tracked as
-    #166.
+    Before #166 the answer was "nothing, ever" -- the gate keyed off a
+    completed_at no writer stamps, so all 54,594 'success' records answered
+    "cannot verify". These tests now pin the activated behaviour end to end: a
+    record whose agent genuinely posted nothing is rewritten, and every shape the
+    gate cannot honestly settle -- a Discussion carrying the output, a
+    crash-recovery record with no real start time -- is still left alone.
     """
 
     @pytest.fixture
@@ -1869,17 +2294,39 @@ class TestSweepOnProductionShapedRecords:
         return state_file
 
     @staticmethod
-    def _gh_client(comments):
+    def _gh_client(comments, discussion_comments=None):
         client = MagicMock()
         client.rest.return_value = (True, comments)
+        client.graphql.return_value = (True, {
+            'node': {
+                'comments': {
+                    'totalCount': len(discussion_comments or []),
+                    'nodes': [
+                        {
+                            'createdAt': created_at,
+                            'body': body,
+                            'replies': {'totalCount': 0, 'nodes': []},
+                        }
+                        for created_at, body in (discussion_comments or [])
+                    ],
+                }
+            }
+        })
         return client
 
-    def _run_sweep(self, tracker, gh_client, has_github_output=None):
+    def _run_sweep(
+        self, tracker, gh_client, has_github_output=None,
+        workspace_type='issues', discussion_id=None,
+    ):
         """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed.
 
         has_github_output stays None -- the REAL gate -- unless a test is about a
         protection that sits in front of it and needs the sweep to be able to
         reach the retry marking at all.
+
+        workspace_type/discussion_id are the two inputs the gate resolves from the
+        pipeline config and the GitHub state file; they are stubbed here for the
+        same reason the lock and queue managers are.
         """
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
@@ -1897,6 +2344,9 @@ class TestSweepOnProductionShapedRecords:
         queue_manager = MagicMock()
         queue_manager.get_issue_status.return_value = None
 
+        state_manager = MagicMock()
+        state_manager.get_discussion_for_issue.return_value = discussion_id
+
         with patch('config.manager.config_manager') as mock_config_manager, \
              patch('services.github_api_client.get_github_client', return_value=gh_client), \
              patch(
@@ -1907,6 +2357,11 @@ class TestSweepOnProductionShapedRecords:
                  'services.pipeline_queue_manager.get_pipeline_queue_manager',
                  return_value=queue_manager
              ), \
+             patch(
+                 'claude.docker_runner.resolve_workspace_type_for_column',
+                 return_value=workspace_type
+             ), \
+             patch('config.state_manager.state_manager', state_manager), \
              patch.object(
                  tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
              ), \
@@ -1926,32 +2381,71 @@ class TestSweepOnProductionShapedRecords:
             ):
                 return tracker.detect_and_retry_empty_successful_executions()
 
-    def test_a_production_shaped_record_is_never_rewritten(self, tracker):
-        """The property this branch has to hold: with the real gate and a record
-        shaped exactly like the 54,594 'success' records on the live
-        orchestrator, the sweep runs all five protections and rewrites nothing.
-
-        It bails at _has_github_output(), which finds no completed_at and reports
-        "cannot verify" rather than "verified empty" -- the same gate main stops
-        at, with the safe answer instead of main's unsafe one. Making it answer
-        for real needs Discussions support and a crash-recovery record shape that
-        does not claim a start time it lacks; both are tracked as #166.
-        """
+    def test_a_production_shaped_record_with_no_output_is_rewritten(self, tracker):
+        """The activation itself (#166): with the real gate and a record shaped
+        exactly like the ones on the live orchestrator, an execution that posted
+        nothing anywhere is rewritten to 'failure' so project_monitor redispatches
+        it. Before #166 this answered "cannot verify" for every record that has
+        ever existed."""
         state_file = self._write_state(tracker, [self._production_record()])
         gh_client = self._gh_client([])
 
         count = self._run_sweep(tracker, gh_client)
 
-        assert count == 0, (
-            "the sweep rewrote a production-shaped record -- the empty-output "
-            "gate has been activated without the Discussions support it needs"
-        )
-        # The gate answered from the record alone; it never even asked GitHub.
-        gh_client.rest.assert_not_called()
+        assert count == 1
+        (method, endpoint), _ = gh_client.rest.call_args
+        assert method == 'GET'
+        assert 'per_page=100' in endpoint and 'since=' in endpoint
+        with open(state_file) as f:
+            last_exec = yaml.safe_load(f)['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_production_shaped_record_with_its_comment_is_left_alone(self, tracker):
+        """The other half of the same activation, and the one that matters: an
+        agent that did post must not be redispatched onto its own work."""
+        state_file = self._write_state(tracker, [self._production_record()])
+        gh_client = self._gh_client([{
+            'created_at': (datetime.now(timezone.utc) - timedelta(minutes=80)).isoformat(),
+            'body': '# Implementation\n\n---\n_Processed by the test-agent agent_',
+        }])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
         with open(state_file) as f:
             last_exec = yaml.safe_load(f)['execution_history'][-1]
         assert last_exec['outcome'] == 'success'
         assert 'watchdog_retry_triggered' not in last_exec
+
+    def test_a_record_whose_output_went_to_a_discussion_is_left_alone(self, tracker):
+        """The confirmed live false positive, end to end: phone-home #72's
+        idea_researcher posted its report to Discussion #191 and the pre-#166 gate
+        -- which queried only the issue-comments endpoint -- answered
+        "demonstrably produced no output". 3,266 of 54,594 'success' records sit
+        in discussion-workspace columns, so this is 6% of the corpus, not an edge
+        case."""
+        state_file = self._write_state(tracker, [
+            self._production_record(column='Research', agent='idea_researcher')
+        ])
+        gh_client = self._gh_client(
+            comments=[],
+            discussion_comments=[(
+                (datetime.now(timezone.utc) - timedelta(minutes=85)).isoformat(),
+                '# Idea Research\n\n---\n_Processed by the idea_researcher agent_',
+            )],
+        )
+
+        count = self._run_sweep(
+            tracker, gh_client, workspace_type='discussions', discussion_id='D_kwDO191'
+        )
+
+        assert count == 0, (
+            "the sweep rewrote a record whose agent posted its report to the "
+            "issue's Discussion -- the gate is only looking at issue comments again"
+        )
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
 
     def test_the_crash_recovery_shape_is_never_rewritten(self, tracker):
         """15.9% of live 'success' records (8,692 of 54,594) are the
