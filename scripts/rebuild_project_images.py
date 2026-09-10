@@ -39,6 +39,7 @@ import os
 import subprocess
 import sys
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -171,7 +172,8 @@ def regenerate_project_agents(project_name: str, dry_run: bool = False) -> bool:
 def rebuild_project_image(
     project_name: str,
     dry_run: bool = False,
-    update_state: bool = False
+    update_state: bool = False,
+    lock_held_by_caller: bool = False
 ) -> bool:
     """
     Rebuild Docker image for a project
@@ -180,6 +182,17 @@ def rebuild_project_image(
         project_name: Name of the project
         dry_run: If True, show what would be done without executing
         update_state: If True, update dev container state to VERIFIED on success
+        lock_held_by_caller: Set True ONLY when the caller is already inside a
+            dev_container_build_lock for this project and wants its own wider
+            sequence (e.g. an IN_PROGRESS mark before, a BLOCKED mark after)
+            covered by the same hold. Every acquisition of that lock mints its
+            own holder id and is therefore NOT reentrant (see
+            services/dev_container_build_lock.py's module docstring), so a
+            caller that holds it and leaves this False self-blocks for the
+            lock's full timeout. Added for
+            services/observability_server.py's rebuild-image endpoint (#152
+            item A); the caller is responsible for holding the lock, this flag
+            only asserts that it does.
 
     Returns:
         True if rebuild succeeded, False otherwise
@@ -217,8 +230,11 @@ def rebuild_project_image(
     # (claude/claude_integration.py) around the whole build-then-state-update
     # sequence below serializes this operator-triggered rebuild against any
     # in-flight dev_environment_setup/verifier run for the same project.
+    #
+    # nullcontext when the caller already holds it -- see lock_held_by_caller.
+    lock_ctx = nullcontext() if lock_held_by_caller else dev_container_build_lock_sync(project_name)
     try:
-        with dev_container_build_lock_sync(project_name):
+        with lock_ctx:
             # Execute build
             logger.info(f"Building {image_name}...")
             try:

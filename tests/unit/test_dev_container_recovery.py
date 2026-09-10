@@ -8,7 +8,7 @@ when a task is blocked by dev container validation.
 
 import os
 import pytest
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import MagicMock, Mock, AsyncMock, patch
 
 # agents module requires Docker container environment
 if not os.path.exists('/app/state/dev_containers'):
@@ -48,13 +48,15 @@ class TestQueueDevEnvironmentSetup:
 
     @pytest.mark.asyncio
     async def test_skips_when_already_in_progress(self, mock_logger):
-        """When status is IN_PROGRESS, should skip queuing entirely."""
+        """When status is a RECENT IN_PROGRESS, should skip queuing entirely."""
+        from datetime import datetime
         from services.dev_container_state import DevContainerStatus
 
         with patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
 
             mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = datetime.now()
             mock_queue_instance = Mock()
             MockTaskQueue.return_value = mock_queue_instance
 
@@ -194,6 +196,7 @@ class TestQueueDevEnvironmentSetup:
     @pytest.mark.asyncio
     async def test_consecutive_calls_only_queue_once(self, mock_logger):
         """First call sets IN_PROGRESS and queues; second call sees IN_PROGRESS and skips."""
+        from datetime import datetime
         from services.dev_container_state import DevContainerStatus
 
         with patch('services.dev_container_state.dev_container_state') as mock_state, \
@@ -209,11 +212,219 @@ class TestQueueDevEnvironmentSetup:
             await queue_dev_environment_setup("test-project", mock_logger)
             assert mock_queue_instance.enqueue.call_count == 1
 
-            # Second call: now IN_PROGRESS -> skips
+            # Second call: now IN_PROGRESS (and fresh) -> skips
             mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = datetime.now()
             await queue_dev_environment_setup("test-project", mock_logger)
             # Still only 1 enqueue total
             assert mock_queue_instance.enqueue.call_count == 1
+
+    @staticmethod
+    def _no_live_setup():
+        """
+        Patch out the three liveness probes _dev_setup_in_flight_reason() makes,
+        so a test can exercise the genuinely-dead case: nothing queued, nothing
+        running, no build holding the lock. Each is patched at its own source so
+        neither the real task queue, the real execution-state directory nor the
+        real Redis lock store is touched.
+        """
+        tracker = MagicMock()
+        tracker.load_state.return_value = {'execution_history': []}
+        facade = MagicMock()
+        facade.get_resource_lock.return_value = None
+        return (
+            patch('services.work_execution_state.work_execution_tracker', tracker),
+            patch('services.project_resource_lock_manager.ProjectResourceLockManager', return_value=facade),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stale_in_progress_with_no_live_run_is_requeued(self, mock_logger):
+        """#152 review: this guard and validate_task_can_run()'s staleness check
+        disagreed, silently. Past STALE_IN_PROGRESS_MINUTES validation returns
+        needs_dev_setup=True, its caller calls this function, this function saw
+        IN_PROGRESS and returned having queued nothing, and the status was never
+        written -- so the next task repeated it, forever, emitting a 'Recovery
+        successful' decision event each pass."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        patch_tracker, patch_facade = self._no_live_setup()
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
+             patch_tracker, patch_facade:
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = (
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1)
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.return_value = []
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            assert mock_queue_instance.enqueue.call_count == 1
+            assert mock_state.set_status.call_args.args[1] == DevContainerStatus.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_a_stale_in_progress_is_not_requeued_while_a_task_is_still_queued(self, mock_logger):
+        """#152 review: the staleness window measures the age of the last status
+        WRITE, and nothing refreshes it while a setup sits in the queue. With
+        ORCHESTRATOR_WORKERS defaulting to 1, a queued setup routinely waits past
+        20 minutes, and re-queuing then is a duplicate hour-scale agent run, not
+        a recovery."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        queued = Mock()
+        queued.project = "test-project"
+        queued.id = "queued-task-id"
+
+        patch_tracker, patch_facade = self._no_live_setup()
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
+             patch_tracker, patch_facade:
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = (
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1)
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.return_value = [queued]
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            mock_queue_instance.enqueue.assert_not_called()
+            mock_state.set_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_in_progress_is_not_requeued_while_an_execution_is_running(self, mock_logger):
+        """A dequeued setup that is mid-build refreshes nothing either -- its
+        agent timeout is 3600s precisely because builds run long."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        tracker = MagicMock()
+        tracker.load_state.return_value = {
+            'execution_history': [
+                {'agent': 'dev_environment_setup', 'outcome': 'in_progress', 'timestamp': 'now'}
+            ]
+        }
+        facade = MagicMock()
+        facade.get_resource_lock.return_value = None
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
+             patch('services.work_execution_state.work_execution_tracker', tracker), \
+             patch('services.project_resource_lock_manager.ProjectResourceLockManager', return_value=facade):
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = (
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1)
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.return_value = []
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            mock_queue_instance.enqueue.assert_not_called()
+            mock_state.set_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_stale_in_progress_is_not_requeued_while_the_build_lock_is_held(self, mock_logger):
+        """A held dev_container_build lock means a build genuinely IS running,
+        whoever started it -- the one signal that outlasts the staleness window
+        most often."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        held = Mock()
+        held.retained_reason = None
+        held.lock_acquired_at = '2026-01-01T00:00:00+00:00'
+
+        tracker = MagicMock()
+        tracker.load_state.return_value = {'execution_history': []}
+        facade = MagicMock()
+        facade.get_resource_lock.return_value = held
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue, \
+             patch('services.work_execution_state.work_execution_tracker', tracker), \
+             patch('services.project_resource_lock_manager.ProjectResourceLockManager', return_value=facade):
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = (
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1)
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.return_value = []
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            mock_queue_instance.enqueue.assert_not_called()
+            mock_state.set_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_raises_keeps_the_duplicate_guard(self, mock_logger):
+        """Re-queuing wrongly costs an hour-scale redundant agent run; skipping
+        wrongly costs one 30-second sweep. An unreadable probe takes the cheap
+        side."""
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_IN_PROGRESS_MINUTES
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = (
+                datetime.now() - timedelta(minutes=STALE_IN_PROGRESS_MINUTES + 1)
+            )
+            mock_queue_instance = Mock()
+            mock_queue_instance.get_pending_tasks.side_effect = RuntimeError("redis down")
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            mock_queue_instance.enqueue.assert_not_called()
+            mock_state.set_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_timestamp_keeps_the_duplicate_guard(self, mock_logger):
+        """No timestamp is not evidence of staleness -- fall back to skipping,
+        the behaviour that has always been safe against a duplicate queue."""
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('task_queue.task_manager.TaskQueue') as MockTaskQueue:
+
+            mock_state.get_status.return_value = DevContainerStatus.IN_PROGRESS
+            mock_state.get_status_updated_at.return_value = None
+            mock_queue_instance = Mock()
+            MockTaskQueue.return_value = mock_queue_instance
+
+            from agents.orchestrator_integration import queue_dev_environment_setup
+
+            await queue_dev_environment_setup("test-project", mock_logger)
+
+            mock_queue_instance.enqueue.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rolls_back_status_on_enqueue_failure(self, mock_logger):
@@ -334,3 +545,76 @@ class TestProcessTaskIntegratedValidation:
         err = NonRetryableAgentError("test")
         assert isinstance(err, NonRetryableAgentError)
         assert isinstance(err, RuntimeError)
+
+
+class TestChangesNeededHasAStalenessEscape:
+    """
+    #152 review: CHANGES_NEEDED deliberately returns needs_dev_setup=False
+    because the repair cycle's env-rebuild sub-cycle owns retrying it. It is
+    therefore the ONE status whose retry has a single owner, so any path that
+    stops that sub-cycle without completing its terminal CHANGES_NEEDED ->
+    BLOCKED transition (a crash, or a dev_container_build lock it could not
+    take) left the project refusing every future task forever, with the
+    operator-facing reason still claiming a retry was under way.
+    """
+
+    def _task(self):
+        task = Mock()
+        task.id = "t-1"
+        task.agent = "senior_software_engineer"
+        task.project = "test-project"
+        return task
+
+    async def _validate(self, mock_logger, updated_at):
+        from services.dev_container_state import DevContainerStatus
+
+        with patch('config.manager.config_manager') as mock_config, \
+             patch('services.dev_container_state.dev_container_state') as mock_state:
+
+            mock_config.get_project_agent_config.return_value = Mock(requires_dev_container=True)
+            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+            mock_state.get_status_updated_at.return_value = updated_at
+
+            from agents.orchestrator_integration import validate_task_can_run
+            return await validate_task_can_run(self._task(), mock_logger)
+
+    @pytest.mark.asyncio
+    async def test_a_live_sub_cycle_is_still_left_to_own_the_retry(self, mock_logger):
+        """A healthy sub-cycle polls every 30s and resets to UNVERIFIED at the
+        top of its next attempt, so a recent CHANGES_NEEDED must NOT trigger a
+        second, redundant queue_dev_environment_setup() racing it."""
+        from datetime import datetime
+
+        result = await self._validate(mock_logger, datetime.now())
+
+        assert result['can_run'] is False
+        assert result['needs_dev_setup'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_stale_changes_needed_re_triggers_setup(self, mock_logger):
+        from datetime import datetime, timedelta
+        from agents.orchestrator_integration import STALE_CHANGES_NEEDED_MINUTES
+
+        result = await self._validate(
+            mock_logger,
+            datetime.now() - timedelta(minutes=STALE_CHANGES_NEEDED_MINUTES + 1),
+        )
+
+        assert result['can_run'] is False
+        assert result['needs_dev_setup'] is True
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_timestamp_keeps_the_sub_cycle_as_owner(self, mock_logger):
+        result = await self._validate(mock_logger, None)
+
+        assert result['needs_dev_setup'] is False
+
+    @pytest.mark.asyncio
+    async def test_the_window_is_wider_than_a_healthy_sub_cycle_poll(self, mock_logger):
+        """The escape must not fire on a sub-cycle that is simply between polls."""
+        from agents.orchestrator_integration import (
+            STALE_CHANGES_NEEDED_MINUTES,
+            STALE_IN_PROGRESS_MINUTES,
+        )
+
+        assert STALE_CHANGES_NEEDED_MINUTES >= STALE_IN_PROGRESS_MINUTES

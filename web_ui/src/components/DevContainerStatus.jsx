@@ -75,9 +75,31 @@ export default function DevContainerStatus({ devContainer }) {
           Updated: {formatTimestamp(devContainer.updated_at)}
         </p>
       )}
+      {devContainer?.pending_operation && (
+        // The status badge above is the IMAGE's state and does not move while a
+        // requested operation waits for the dev_container_build lock, so the wait
+        // needs its own line -- otherwise a queued rebuild is indistinguishable
+        // from one that already finished.
+        <p className="text-xs text-blue-500 mt-2">
+          {devContainer.pending_operation} queued since{' '}
+          {formatTimestamp(devContainer.pending_operation_at)}
+        </p>
+      )}
       {devContainer?.error_message && (
         <p className="text-xs text-red-500 mt-2">
           {devContainer.error_message}
+        </p>
+      )}
+      {devContainer?.last_operation_error && (
+        // A requested operation that never ran at all. Not a verdict on the image
+        // (the badge above is), so it is reported separately rather than as a
+        // status. Dated like the queued line above: the record survives until
+        // something writes a new status, so an operator has to be able to tell
+        // whether it predates the badge.
+        <p className="text-xs text-orange-500 mt-2">
+          {devContainer.last_operation_error}
+          {devContainer.last_operation_error_at &&
+            ` (${formatTimestamp(devContainer.last_operation_error_at)})`}
         </p>
       )}
     </div>

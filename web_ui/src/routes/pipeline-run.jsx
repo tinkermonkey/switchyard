@@ -27,6 +27,15 @@ function PipelineAnalysisReport({ analysis }) {
   return (
     <div className="flex-1 overflow-auto px-1">
       <div className="space-y-5 py-1">
+        {analysis.error && (
+          <div className="text-xs border rounded px-3 py-2 text-red-500 border-red-700/40 bg-gh-canvas-subtle">
+            <div className="font-semibold mb-0.5">Analysis failed</div>
+            <div className="font-mono text-[10px] break-words">{analysis.error}</div>
+            {analysis.attemptedAt && (
+              <div className="opacity-60 text-[10px] mt-1">Attempted {analysis.attemptedAt}</div>
+            )}
+          </div>
+        )}
         {analysis.summary && (
           <div className="prose prose-invert prose-sm max-w-none text-gh-fg-muted text-xs leading-relaxed
             [&_h1]:text-gh-fg [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mb-1
@@ -484,11 +493,20 @@ function PipelineRunView() {
         setTriggeringAnalysis(false)
         return
       }
+      // Anything already on the document when the retry was requested describes
+      // the PREVIOUS attempt, not this one. The service clears the old
+      // analysis_error as soon as the new attempt starts, but the first poll can
+      // land in the gap before that write; without this the stale "Analysis
+      // failed" would stop the poll seconds after the operator asked for a retry
+      // and the eventual success would never be shown (#152 review).
+      const triggeredAt = Date.now()
+      const isStalePayload = (a) =>
+        Boolean(a.error) && a.attemptedAt && Date.parse(a.attemptedAt) < triggeredAt
       const poll = setInterval(async () => {
         try {
           const r = await fetch(`/api/pipeline-run/${selectedRunId}/analysis`)
           const d = await r.json()
-          if (d.success && d.analysis) {
+          if (d.success && d.analysis && !isStalePayload(d.analysis)) {
             setAnalysis(d.analysis)
             setTriggeringAnalysis(false)
             clearInterval(analysisPollRef.current.interval)

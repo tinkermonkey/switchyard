@@ -264,24 +264,135 @@ def kill_agent(container_name):
             'container_name': container_name
         }), 500
 
+# How long the operator-triggered rebuild endpoint waits for the
+# dev_container_build lock. Deliberately far short of the module default
+# (DEFAULT_TIMEOUT_SECONDS, 3700s), which is calibrated to outlast an agent's own
+# build window: this path is an interactive request whose only feedback channel
+# is the project's state file, and an hour of waiting before recording anything
+# is indistinguishable from the rebuild having silently never happened.
+REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS = 900.0
+
+
 @app.route('/api/projects/<project>/rebuild-image', methods=['POST'])
 def rebuild_image(project):
     """Trigger a background rebuild of a project's agent Docker image."""
     from scripts.rebuild_project_images import rebuild_project_image
+    from services.dev_container_build_lock import (
+        dev_container_build_lock_sync,
+        DevContainerBuildLockTimeoutError,
+    )
     from services.dev_container_state import dev_container_state, DevContainerStatus
 
-    dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
-
     def _run():
+        # dev_container_build lock (#152 item A): this endpoint is the third
+        # operator-triggered build alongside the two admin scripts #56 wired up,
+        # and was the only one still writing dev_container_state unlocked -- the
+        # IN_PROGRESS mark ran before rebuild_project_image() took the lock, and
+        # both BLOCKED marks ran after it released. Holding the lock across the
+        # whole sequence puts every one of those writes inside the same window
+        # as the build they describe. rebuild_project_image() is told the lock
+        # is already held: that lock is not reentrant (see its module
+        # docstring), so letting it acquire again would self-block.
+        #
+        # IN_PROGRESS is marked INSIDE the lock, not before spawning this
+        # thread: a rebuild that never gets the lock never runs, and must not
+        # leave the project's status claiming a build is under way. The wait
+        # itself is represented by the pending-operation marker the request
+        # handler set (see set_pending_operation) rather than by leaving the
+        # pre-existing status to speak for it.
         try:
-            ok = rebuild_project_image(project, update_state=True)
-            if not ok:
-                dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
-        except Exception as e:
-            dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+            try:
+                with dev_container_build_lock_sync(
+                    project, timeout_seconds=REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS
+                ):
+                    dev_container_state.clear_pending_operation(project)
+                    # An earlier request's "never started" record no longer
+                    # describes anything: this one has the lock and is about to
+                    # write a real verdict.
+                    dev_container_state.clear_last_operation_error(project)
+                    dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
+                    try:
+                        ok = rebuild_project_image(project, update_state=True, lock_held_by_caller=True)
+                        if not ok:
+                            dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message="build failed (see server logs)")
+                    except Exception as e:
+                        dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
+            except DevContainerBuildLockTimeoutError as e:
+                # Contention, not a build failure -- nothing ran. But this endpoint
+                # already answered {"success": true, "triggered": true} and its only
+                # feedback channel is the state file every caller polls (mcp/server.py's
+                # get_image_build_status reads it directly), so a bare log line here
+                # left that caller reading the project's PRE-EXISTING status -- commonly
+                # 'verified' -- and concluding the rebuild had finished (#152 review).
+                # Record the drop instead.
+                #
+                # As last_operation_error, NOT as a status. Two reasons, both from
+                # the #152 review:
+                #
+                #   * No status can honestly say this. BLOCKED is terminal --
+                #     validate_task_can_run gives the terminal statuses no staleness
+                #     escape -- so writing it over VERIFIED or IN_PROGRESS buries a
+                #     real verdict, and writing it over UNVERIFIED or CHANGES_NEEDED
+                #     converts a self-healing state (both re-queue setup on their own)
+                #     into one that refuses every task for the project until a human
+                #     runs a rebuild or set_dev_container_verified.py. Lock contention
+                #     is not a verdict on the image, so it does not get to overwrite
+                #     one.
+                #   * Not being `status` is also what makes this reachable. The
+                #     previous version wrote BLOCKED under a single non-blocking
+                #     acquire, attempted milliseconds after the blocking one gave up
+                #     -- and dev_container_build_lock_sync raises on the same loop
+                #     iteration as a FAILED acquire, so the lock was busy microseconds
+                #     earlier and is overwhelmingly likely still busy. In the most
+                #     likely instance of this path (a setup agent holding the lock for
+                #     its full 3600s timeout) that write never happened at all, and the
+                #     drop stayed invisible to every state-file consumer -- exactly the
+                #     symptom the record was added to remove. A non-`status` field
+                #     cannot clobber a live holder's verdict, so it needs no lock and
+                #     always lands.
+                logger.error(f"Rebuild of {project} never started: {e}")
+                try:
+                    dev_container_state.set_last_operation_error(
+                        project,
+                        (
+                            f"rebuild never started: the dev_container_build lock was held "
+                            f"for the whole {REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS:.0f}s wait"
+                        ),
+                    )
+                except Exception as record_error:
+                    logger.error(
+                        f"Could not record the dropped rebuild of {project}: {record_error}",
+                        exc_info=True,
+                    )
+        finally:
+            # The marker describes a REQUEST that has not started yet, so it must
+            # not outlive this thread by any exit path -- including the lock
+            # timeout above and an unexpected raise. Clearing it twice on the happy
+            # path is harmless.
+            #
+            # This runs AFTER the dev_container_build lock has been released, i.e.
+            # at the moment the next waiter is acquiring it and writing IN_PROGRESS.
+            # Safe only because _merge_state() takes the state file's own lock
+            # across its read-modify-write, so this clear cannot carry that
+            # waiter's status write backwards (#152 review).
+            try:
+                dev_container_state.clear_pending_operation(project)
+            except Exception as clear_error:
+                logger.error(
+                    f"Could not clear the pending-rebuild marker for {project}: {clear_error}",
+                    exc_info=True,
+                )
+
+    # Set BEFORE the thread starts, so it is already visible to the first poll a
+    # caller makes after this endpoint answers -- the thread may sit in the lock
+    # wait for up to REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS before writing anything.
+    try:
+        dev_container_state.set_pending_operation(project, 'rebuild')
+    except Exception as e:
+        logger.error(f"Could not mark the rebuild of {project} as pending: {e}", exc_info=True)
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"success": True, "triggered": True, "project": project})
+    return jsonify({"success": True, "triggered": True, "project": project, "status": "queued"})
 
 def get_claude_token_usage():
     """
@@ -2339,7 +2450,16 @@ def get_pipeline_run_analysis(pipeline_run_id):
             index='pipeline-runs-*',
             body={
                 'query': {'term': {'id': pipeline_run_id}},
-                '_source': ['summary', 'orchestratorRecommendations', 'projectRecommendations', 'outcome'],
+                '_source': [
+                    'summary', 'orchestratorRecommendations', 'projectRecommendations', 'outcome',
+                    # A failed attempt records these and deliberately never writes
+                    # `summary` (that is what keeps the run re-analysable -- see
+                    # PipelineRunAnalysisService._record_analysis_failure). Without
+                    # them in the projection an attempted-and-failed analysis was
+                    # indistinguishable from one that never ran, which is the exact
+                    # "silent drop" #152 item B set out to fix (#152 review).
+                    'analysis_error', 'analysis_attempted_at',
+                ],
                 'size': 1,
             }
         )
@@ -2348,8 +2468,24 @@ def get_pipeline_run_analysis(pipeline_run_id):
             return jsonify({'success': True, 'analysis': None})
         source = hits[0]['_source']
         summary = source.get('summary', '')
+        analysis_error = source.get('analysis_error')
         if not summary or not summary.strip():
-            return jsonify({'success': True, 'analysis': None})
+            if not analysis_error:
+                return jsonify({'success': True, 'analysis': None})
+            # No summary but a recorded failure: return an analysis payload
+            # carrying the error so the UI renders why, rather than collapsing to
+            # `analysis: null` and showing "No analysis available for this run."
+            return jsonify({
+                'success': True,
+                'analysis': {
+                    'summary': '',
+                    'outcome': source.get('outcome'),
+                    'orchestratorRecommendations': [],
+                    'projectRecommendations': [],
+                    'error': analysis_error,
+                    'attemptedAt': source.get('analysis_attempted_at'),
+                }
+            })
         return jsonify({
             'success': True,
             'analysis': {
@@ -4085,14 +4221,14 @@ def get_projects():
                 # Get dev container status
                 container_status = dev_container_state.get_status(project_name)
                 image_name = dev_container_state.get_image_name(project_name)
+                pending_operation = dev_container_state.get_pending_operation(project_name)
+                last_operation_error = dev_container_state.get_last_operation_error(project_name)
 
-                # Read state file for more details
-                state_file = dev_container_state.get_state_file(project_name)
-                state_details = {}
-                if state_file.exists():
-                    import yaml
-                    with open(state_file, 'r') as f:
-                        state_details = yaml.safe_load(f) or {}
+                # Read state file for more details. Through the manager rather
+                # than a bare yaml.safe_load so the read is taken under the state
+                # file's own lock and never lands on the truncated file a
+                # concurrent write is producing.
+                state_details = dev_container_state.get_state(project_name)
 
                 # Check if project directory exists
                 workspace_path = Path(f"/workspace/{project_name}")
@@ -4151,7 +4287,21 @@ def get_projects():
                         'status': container_status.value,
                         'image_name': image_name,
                         'updated_at': state_details.get('updated_at'),
-                        'error_message': state_details.get('error_message')
+                        'error_message': state_details.get('error_message'),
+                        # A rebuild that has been requested but is still waiting for
+                        # the dev_container_build lock. 'status' above is the image's
+                        # own state and does NOT move while that wait is on -- see
+                        # DevContainerStateManager.set_pending_operation. Read through
+                        # get_pending_operation() rather than off the raw dict so an
+                        # abandoned marker ages out here too, instead of this endpoint
+                        # reporting a rebuild that will never start (#152 review).
+                        'pending_operation': (pending_operation or {}).get('operation'),
+                        'pending_operation_at': (pending_operation or {}).get('requested_at'),
+                        # A requested operation that could not be carried out at all
+                        # (e.g. a rebuild that never got the lock). Deliberately not a
+                        # status -- see set_last_operation_error.
+                        'last_operation_error': (last_operation_error or {}).get('error'),
+                        'last_operation_error_at': (last_operation_error or {}).get('at')
                     }
                 })
 
@@ -4816,6 +4966,37 @@ def redis_subscriber_thread():
 
 def start_observability_server(host='0.0.0.0', port=5001):
     """Start the observability WebSocket server"""
+    # Release dev_container_build locks left behind by THIS server's own dead
+    # predecessor. The mirror image of main.py's call: /api/projects/<p>/rebuild-image
+    # holds that lock for the whole duration of an operator-triggered build, so a
+    # crash mid-build leaves it parked until the 4-hour staleness heuristic or the
+    # 7200s Redis TTL, and the orchestrator's own recovery now (correctly) refuses
+    # to touch a lock stamped with this process's kind. Each process kind reclaims
+    # its own -- see recover_orphaned_resource_locks().
+    try:
+        from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
+        from services.project_resource_lock_manager import ProjectResourceLockManager
+        released = ProjectResourceLockManager().recover_orphaned_resource_locks(
+            DEV_CONTAINER_BUILD_RESOURCE
+        )
+        logger.info(f"Orphaned dev_container_build lock recovery: {released} released")
+    except Exception as e:
+        logger.error(f"Could not recover orphaned dev_container_build locks: {e}", exc_info=True)
+
+    # Same recovery, other marker. /api/projects/<p>/rebuild-image's worker is a
+    # DAEMON thread, so a SIGTERM or restart during its up-to-900s lock wait kills
+    # it outright and its pending-rebuild marker is left on disk with nobody coming
+    # back to clear it -- and mcp/server.py's get_image_build_status then masks the
+    # project's real image state with "queued" (#152 review). This process is that
+    # marker's only writer and is a docker-compose singleton, so any stale one
+    # present here is its own dead predecessor's.
+    try:
+        from services.dev_container_state import dev_container_state
+        cleared = dev_container_state.clear_stale_pending_operations()
+        logger.info(f"Abandoned dev container pending-operation markers cleared: {cleared}")
+    except Exception as e:
+        logger.error(f"Could not clear abandoned pending-operation markers: {e}", exc_info=True)
+
     # Start Redis subscriber in background thread
     subscriber = threading.Thread(target=redis_subscriber_thread, daemon=True)
     subscriber.start()

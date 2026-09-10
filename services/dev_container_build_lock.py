@@ -46,11 +46,11 @@ dev_environment_setup and dev_environment_verifier -- its own inline comment
 calls dev_environment_setup the "ONLY agent allowed to run outside Docker,"
 but that comment is itself stale: a third agent, pipeline_analysis, also
 sets `requires_docker: false` (found in PR #138 review,
-/pr-review-toolkit:review-pr -- see #140 for the resulting lock-acquisition
-gap: pipeline_analysis unconditionally acquires THIS lock too, scoped to a
-hardcoded project="switchyard" regardless of which project actually ran,
-via services/pipeline_run_analysis.py). claude/claude_integration.py's
-run_claude_code() acts on the `use_docker` flag alone, not agent identity:
+/pr-review-toolkit:review-pr -- see #140 items 20/26, closed by #152: that
+agent used to acquire THIS lock too, scoped to a hardcoded
+project="switchyard" regardless of which project actually ran, via
+services/pipeline_run_analysis.py). claude/claude_integration.py's
+run_claude_code() routes on the `use_docker` flag alone, not agent identity:
 for any of these three agents it does NOT hand off to
 docker_runner.run_agent_in_container() (which is what wraps a normal agent's
 Claude Code session in its own nested container) -- it calls
@@ -63,37 +63,108 @@ orchestrator's own docker socket mount) -- there is no separate, monitorable
 Claude Code session". So the real orchestrator-side hook around the
 build+verify window is exactly the hook #54 already uses for these agents'
 local-execution path: run_claude_code()'s _run_claude_code_locally() call
-site. This module's lock is acquired there, gated on the same `use_docker`
-flag (see claude/claude_integration.py) that also lets pipeline_analysis
-reach it, mirroring the existing is_base_clone_dir()-gated
-project_checkout_lock acquisition immediately above it in the same
-function.
+site. This module's lock is acquired there, gated on AGENT IDENTITY
+(BUILD_WINDOW_AGENTS / agent_holds_build_window() below), mirroring the
+existing is_base_clone_dir()-gated project_checkout_lock acquisition
+immediately above it in the same function.
 
-Why dev_container_state.set_status() itself is deliberately left unlocked
----------------------------------------------------------------------------
-#56's own issue text flags set_status()'s blind read-modify-write as
-"already flagged as a Phase 0 item (don't re-scope the locking fix itself
-here, just confirm it as this issue's acquire-target once the project-level
-lock exists)". Investigation confirms locking set_status() itself would be
-actively wrong here, not just out of scope: dev_environment_verifier's own
-prompt (Step 5, prompts/content/agents/dev_environment_verifier/
-review_task.md) instructs its live Claude Code session to run inline Python
-that imports dev_container_state and calls set_status() directly, via that
-session's own Bash tool -- WHILE the session is running inside the very
-window this module's lock holds around the whole local execution (see
-claude/claude_integration.py). If set_status() also tried to acquire this
-same resource lock internally, that in-session call would be strictly
-serialized behind the very session it is part of -- the session can't finish
-without that call returning, and that call can't return until the session
-(which holds the lock) finishes. Every acquisition here mints its own unique
-holder id (see below), so this is NOT rescued by PipelineLockManager's
-same-issue-number reentrancy check -- it is a genuine self-block, bounded
-only by this module's own timeout, not a legitimate resolution. So
-set_status() stays exactly as unlocked as it was before this issue;
-protection instead comes from every caller that owns a build/verify
-execution window (claude_integration.py's agent-gated wrap, and each admin
-script's own wrap around its build+state-update sequence) acquiring this
-lock around that whole window before calling set_status() at all.
+Why the gate is agent identity and not the `use_docker` flag (#152, item B)
+------------------------------------------------------------------------------
+It originally was the flag -- "only dev_environment_setup/verifier ever reach
+the local-execution branch" -- and that assumption was simply false. The
+branch is reached by every caller that hands run_claude_code() a context with
+requires_docker/use_docker false, which today is five more callers than the
+two this lock exists for:
+
+  - pipeline_analysis, via services/pipeline_run_analysis.py's post-run
+    analysis. It queries Elasticsearch and never builds or inspects anything,
+    yet it took this lock -- and, because that module hardcoded the project
+    name, it took the *switchyard*-scoped one for every project's analysis, so
+    an unrelated project's post-run analysis contended head-on with a real
+    switchyard dev-container build. Its own timeout was then caught by a bare
+    `except Exception` that dropped the analysis output entirely.
+  - scripts/analyze_codebase.py (x3 discovery passes),
+    scripts/generate_strategy.py and scripts/generate_artifacts.py, which pass
+    `use_docker: False` with no agent_config at all. An ad hoc analysis or
+    strategy run for a project could block for the full
+    DEFAULT_TIMEOUT_SECONDS behind that project's real dev_environment_setup /
+    verifier build.
+
+None of those seven call sites builds an image, so none of them has anything
+to serialize against; each was paying (up to) a ~1h wait for it. Keying the
+gate on the agent whose session genuinely IS the build window fixes all of
+them at once, and -- unlike the flag -- a new requires_docker: false agent
+now defaults to NOT taking a build lock it has no use for, rather than
+silently inheriting one. The corresponding risk (a future agent that DOES
+build images and is not added to the set) is why the gate lives here, next to
+the lock and its docstring, rather than as an inline literal at the call
+site.
+
+Two locks, and which one guards what (#152, item A)
+------------------------------------------------------
+The state file this lock exists for has TWO locks over it, and they are not
+alternatives:
+
+  * THIS lock (dev_container_build, Redis/YAML via
+    ProjectResourceLockManager) guards the whole build/verify EXECUTION
+    WINDOW -- the minutes-to-an-hour during which a `docker build` runs and
+    the resulting verdict is decided. Every caller that owns such a window
+    takes it: claude_integration.py's agent-gated wrap around the local
+    Claude Code session, each admin script's wrap around its build +
+    state-update sequence, and the rebuild endpoint's wrap around its
+    IN_PROGRESS -> build -> BLOCKED sequence.
+  * The state file's OWN lock (state/dev_containers/<project>.yaml.lock,
+    fcntl via utils.file_lock) guards each individual read-modify-write of
+    that YAML, inside DevContainerStateManager._merge_state()/_read_state().
+    #56's issue text deferred set_status()'s blind read-modify-write as a
+    Phase 0 item; #152 closed it here, because "every writer is inside the
+    dev_container_build lock" was never true of this file and cannot be made
+    true -- the pending-operation marker is deliberately written from the
+    rebuild endpoint's REQUEST thread, before the lock wait even starts,
+    precisely so the first poll can see it. Without a lock of its own, that
+    unlocked writer's whole-file rewrite could land on top of a set_status()
+    another container made in between and silently revert it. It is
+    cross-process for the same reason: the observability server and the
+    orchestrator are separate containers.
+
+Ordering is fixed: build lock OUTERMOST, state-file lock INNERMOST, and the
+state-file critical section never calls out -- it does one YAML
+read-modify-write and returns. So there is no lock-order cycle to deadlock
+on.
+
+The verifier's in-session set_status() does not self-block on either
+--------------------------------------------------------------------------
+dev_environment_verifier's own prompt (Step 5,
+prompts/content/agents/dev_environment_verifier/review_task.md) has its live
+Claude Code session run inline Python that imports dev_container_state and
+calls set_status() directly, via that session's own Bash tool -- WHILE the
+session is running inside the very window this module's lock holds around
+the whole local execution (see claude/claude_integration.py). That is why
+set_status() must never acquire THIS lock internally: the call would be
+serialized behind the session it is part of (the session can't finish
+without the call returning; the call can't return until the session, which
+holds the lock, finishes), and since every acquisition here mints its own
+unique holder id (see below), PipelineLockManager's same-issue-number
+reentrancy check does not rescue it -- it is a genuine self-block bounded
+only by this module's timeout.
+
+The state file's own lock does NOT reintroduce that: that in-session call
+runs in a separate subprocess (the Claude Code CLI's Bash tool), so its
+flock is on a different open file description from anything the orchestrator
+thread holds, and the orchestrator thread is not holding the state-file lock
+across the session anyway -- it holds it only for the microseconds of one
+read-modify-write. What the state-file lock DOES do for that call is make it
+safe: the in-session write and the orchestrator-side writes bracketing the
+session no longer interleave mid-file.
+
+The trap that replaces it: utils.file_lock is not re-entrant and raises
+ReentrantFileLockError on a nested same-thread acquire, which both
+_merge_state() and _read_state() swallow via `except Exception`, degrading
+silently to False / {} -- get_status() would report UNVERIFIED for a VERIFIED
+project. Nothing nests today, and the critical sections are kept to the one
+YAML read-modify-write so nothing has cause to: anyone needing another field
+inside one has to read it off the dict already loaded there rather than
+calling back into DevContainerStateManager.
 
 Known, deliberately accepted gaps in coverage
 ------------------------------------------------
@@ -125,7 +196,99 @@ risk to every other agent) was judged out of scope for a surgical fix here.
 The residual exposure is narrow -- at most a few Python statements running
 immediately adjacent to the locked window, never the actual docker build or
 the multi-minute verification session -- and is a state-file bookkeeping
-race, not the Docker-daemon-level race #56 exists to close.
+race, not the Docker-daemon-level race #56 exists to close. Since #152 each
+of those statements is at least atomic in itself: the state file's own lock
+(see "Two locks" above) makes every one of them a serialized
+read-modify-write, so what is still unguarded here is WHICH verdict wins, not
+whether the file survives two of them landing together.
+
+Bookkeeping writers, and why they get a NON-BLOCKING variant (#152, item A)
+-----------------------------------------------------------------------------
+#152 turned up three more writers of the state file that own no build window
+at all, and are therefore a different shape from every caller above:
+
+  - services/observability_server.py's /api/projects/<project>/rebuild-image
+    endpoint. This one IS a build owner -- it calls the same
+    scripts/rebuild_project_images.rebuild_project_image() an operator would
+    run from a shell -- and gets the ordinary blocking
+    dev_container_build_lock_sync() around its whole IN_PROGRESS -> build ->
+    BLOCKED sequence, exactly like the two admin scripts. Because
+    rebuild_project_image() takes this same lock itself and every acquisition
+    mints its own holder id (no reentrancy -- see below), it is called with
+    lock_held_by_caller=True from inside that wrap; nesting the two would be a
+    genuine self-block, not a reentrant hold. It passes a shorter timeout than
+    the default and, on a timeout, records the drop in the state file rather
+    than only logging it -- that file is the only feedback channel it has once
+    it has answered the request (see its own comment).
+
+  - services/work_execution_state.py's cleanup_stuck_in_progress_states(),
+    which reconciles a dev_environment_setup/verifier execution that died
+    mid-flight -- five read-then-write points, all reached right after a
+    crash/restart.
+
+That last one is an OBSERVER doing single-statement bookkeeping, and giving
+it the blocking context manager would have been the wrong tool twice over. It
+sits on a path that must not stall: the reconciliation runs during
+orchestrator startup (from main.py, and from inside that project's execution
+state file lock), and a blocking acquire there would hold that file lock for
+the whole wait. So it takes dev_container_build_lock_if_free_sync(): a SINGLE
+non-blocking attempt that yields True when the lock was taken and False when
+it was not. On False the caller skips its write entirely. That is deliberately
+not the "never proceed unlocked" rule being bent -- the guarded write does not
+happen at all, which is the safe direction here (a live holder's own status
+write wins).
+
+What that skip is NOT is self-healing on its own, and two review rounds on
+#152 were both about writers that assumed it was:
+
+  - A busy acquire does not imply a LIVE holder. Right after a restart the
+    previous process's lock is routinely still in Redis under its own TTL
+    (PipelineLockManager only reclaims it after its 4-hour staleness heuristic
+    or the 7200s TTL), and a dead holder writes nothing, ever. That is exactly
+    the crash-during-build case the reconciliation exists for, so the skip was
+    not occasional there -- it was deterministic. main.py now recovers the
+    orphaned locks of THIS process's own dead predecessor at startup, BEFORE
+    cleanup_stuck_in_progress_states() runs, so the acquire succeeds (see
+    ProjectResourceLockManager.recover_orphaned_resource_locks -- it is
+    deliberately not a blanket release, since observability-server runs as its
+    own container and legitimately holds this lock across an orchestrator
+    restart); and when the acquire still does not succeed, that reconciliation
+    leaves its execution record `in_progress` for the next sweep to retry
+    rather than consuming it.
+  - "Not acquired" is not always contention at all. try_acquire_lock() also
+    fails CLOSED on unknown/degraded lock state (both stores unreadable, the
+    YAML-fallback acquire guard unavailable) and refuses a retained lock from
+    a failed run. In none of those is anyone holding a build window, so
+    acquire_failure_is_contention() below classifies the reason and
+    _log_skipped() reports a degraded outcome at ERROR with the real reason
+    rather than narrating a holder that does not exist.
+
+pipeline/repair_cycle.py's _finalize_unconfirmed_changes_needed() was the
+third writer wired to the non-blocking variant, and is now on the BLOCKING one
+with a bounded timeout instead. It forces the terminal CHANGES_NEEDED ->
+BLOCKED transition when the env rebuild sub-cycle stops driving it, and unlike
+the writers above it holds no file lock, is not on a startup path, and its
+whole purpose is that CHANGES_NEEDED has no other owner -- so a skipped write
+there is a project no scheduler will ever touch again, not a bookkeeping blip.
+It also has the one interleaving that makes a busy lock most likely: the
+verifier writes CHANGES_NEEDED from INSIDE its own Claude Code session (see
+prompts/content/agents/dev_environment_verifier/review_task.md Step 5), i.e.
+while this lock is still held for the rest of that session, so the sub-cycle's
+30s poll routinely observes CHANGES_NEEDED inside the holder's window. A
+bounded wait outlasts that tail; a single non-blocking attempt did not.
+
+Holding the lock is also what makes those writers' check-then-act atomic
+rather than merely serialized: each re-reads get_status() INSIDE the lock and
+re-decides there, so a status that changed while the caller was deciding
+(e.g. an operator rebuild that just succeeded) is seen rather than clobbered.
+Locking the write alone would not have fixed that -- the decision was already
+stale by the time the write ran.
+
+These do not register with project_checkout_lock's watchdog activity registry
+the way the blocking variants do: that registry exists to stop the zombie
+reaper redispatching a run parked in a poll loop, and there is no poll loop
+here -- the guarded body is a single state-file write, never work the reaper
+could mistake for a hung container.
 
 Why this reuses project_checkout_lock's holder id minting
 -------------------------------------------------------------
@@ -161,6 +324,7 @@ from typing import Optional
 
 from services.project_checkout_lock import (
     _acquire_and_start_heartbeat_off_loop,
+    _attribution,
     _default_facade_off_loop,
     _held_with_heartbeat_async,
     _held_with_heartbeat_sync,
@@ -178,6 +342,21 @@ logger = logging.getLogger(__name__)
 # (services/project_checkout_lock.py) and from any real board name (see
 # RESOURCE_BOARD_PREFIX in project_resource_lock_manager.py).
 RESOURCE_NAME = "dev_container_build"
+
+# The agents whose local (non-Docker) Claude Code session IS this project's
+# dev-container build/verify window, and therefore the only agents
+# claude/claude_integration.py wraps in this lock. See the module docstring
+# ("Why the gate is agent identity and not the `use_docker` flag") -- keying on
+# `use_docker` instead swept in pipeline_analysis and four scripts/ entry
+# points that never build anything.
+#
+# Kept next to the lock rather than inline at the call site so a future agent
+# that genuinely does build images has one obvious place to be added; nothing
+# derives this from config/foundations/agents.yaml, because no field there
+# expresses "this agent's session issues the project's docker build" (both
+# requires_docker and tools_enabled: docker_operations are true of agents that
+# have nothing to do with this resource).
+BUILD_WINDOW_AGENTS = frozenset({"dev_environment_setup", "dev_environment_verifier"})
 
 # Generous enough to outlast the longest legitimate holder of this lock.
 # config/foundations/agents.yaml sets timeout: 3600 for BOTH
@@ -204,6 +383,21 @@ class DevContainerBuildLockTimeoutError(RuntimeError):
     acquired within the configured timeout -- surfaced loudly rather than
     silently skipping (or silently running unlocked) the guarded build/verify
     operation or admin-script mutation."""
+
+
+def agent_holds_build_window(agent: Optional[str]) -> bool:
+    """
+    True when `agent`'s local Claude Code session is this project's
+    dev-container build/verify window, and so must be serialized by this lock.
+
+    The gate claude/claude_integration.py's local-execution branch uses. False
+    for every other agent (and for a missing/unknown agent name): an agent this
+    module has never heard of does not build images, and making it wait out one
+    that does is the exact defect #152 item B exists to fix. A new
+    image-building agent belongs in BUILD_WINDOW_AGENTS above -- there is no
+    safe way to infer membership, so this deliberately does not guess.
+    """
+    return agent in BUILD_WINDOW_AGENTS
 
 
 # _timeout_error()/_log_busy()/_release_and_warn() are shared with
@@ -342,3 +536,143 @@ def dev_container_build_lock_sync(
                 yield
         finally:
             _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+
+
+# try_acquire_lock() returns False for reasons that are NOT "a live holder has
+# this right now", and treating all of them as contention was a defect found in
+# review of #152: every one of these means nobody is inside a build window and
+# nobody is going to write a fresher status, so a caller that skips its write on
+# one of them is dropping it for good, while the log line narrates a holder that
+# does not exist.
+#
+#   - lock_state_unknown_failing_closed        (both Redis and YAML reads failed)
+#   - lock_acquire_serialization_timeout       (YAML-fallback acquire guard)
+#   - lock_acquire_serialization_unavailable   (   "        "        "        )
+#   - locked_by_issue_<n>_failed               (retained after a failed run --
+#                                               a durable marker, not a holder)
+#
+# See PipelineLockManager.try_acquire_lock() for each one's own comment.
+_DEGRADED_ACQUIRE_REASONS = frozenset({
+    "lock_state_unknown_failing_closed",
+    "lock_acquire_serialization_timeout",
+    "lock_acquire_serialization_unavailable",
+})
+
+
+def acquire_failure_is_contention(reason: Optional[str]) -> bool:
+    """
+    True when a False from acquire_resource() means a live holder currently owns
+    the build window, rather than a degraded/fail-closed or retained outcome.
+
+    Only `locked_by_issue_<n>` (without the `_failed` retained suffix) is genuine
+    contention. Everything else -- including a reason this module has never seen,
+    which is deliberately NOT assumed to be a holder -- is reported as degraded so
+    the caller and the operator both see the real reason.
+    """
+    if not isinstance(reason, str) or not reason.startswith("locked_by_issue_"):
+        return False
+    return not reason.endswith("_failed")
+
+
+def _log_skipped(project: str, issue_number: Optional[int], reason: str) -> None:
+    if acquire_failure_is_contention(reason):
+        logger.warning(
+            f"'{RESOURCE_NAME}' lock for project {project!r} ({_attribution(issue_number)}) "
+            f"is busy ({reason}) -- skipping this bookkeeping write of the dev container "
+            f"state rather than waiting out a build for it or clobbering the holder's own "
+            f"status. See services/dev_container_build_lock.py's module docstring "
+            f"(\"Bookkeeping writers\")."
+        )
+        return
+    logger.error(
+        f"'{RESOURCE_NAME}' lock for project {project!r} ({_attribution(issue_number)}) "
+        f"could not be taken ({reason}) -- this is NOT contention: no build/verify holds "
+        f"this project's container state and nothing else is going to write a fresher "
+        f"status. The bookkeeping write was still skipped (this module never writes "
+        f"unlocked), so this project's dev container state may now be stale. See "
+        f"services/dev_container_build_lock.py's module docstring (\"Bookkeeping writers\")."
+    )
+
+
+@asynccontextmanager
+async def dev_container_build_lock_if_free_async(
+    project: str,
+    issue_number: Optional[int] = None,
+    facade: Optional[ProjectResourceLockManager] = None,
+):
+    """
+    Async context manager making ONE non-blocking attempt at `project`'s
+    dev_container_build lock, and yielding whether it got it.
+
+    For bookkeeping writers of dev_container_state that own no build window --
+    see this module's docstring ("Bookkeeping writers, and why they get a
+    NON-BLOCKING variant") for why waiting would be both harmful and useless
+    for them. Yields True inside the hold (release and heartbeat handled
+    exactly as dev_container_build_lock_async() does), or False having taken
+    nothing, in which case the caller MUST skip its write rather than perform
+    it unlocked.
+
+    Never raises DevContainerBuildLockTimeoutError: contention is the ordinary,
+    expected outcome here rather than a failure, and manufacturing a lock
+    timeout for a caller that deliberately did not wait would misreport it to
+    every consumer of services/resource_lock_errors.is_lock_timeout_error().
+
+    Args:
+        project: Project name.
+        issue_number: log attribution only -- see
+            dev_container_build_lock_async().
+        facade: injected ProjectResourceLockManager -- for tests only.
+    """
+    facade = facade if facade is not None else await _default_facade_off_loop()
+    holder_id = _mint_unique_holder_id()
+    # Off the event loop for the same reason the polling variant is: this is a
+    # Redis transaction plus (on the fallback path) a YAML read/write. See
+    # project_checkout_lock.py's "no synchronous lock I/O runs on the
+    # event-loop thread" rule and _acquire_and_start_heartbeat_off_loop()'s
+    # own shield/orphan-release contract.
+    can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+        facade, RESOURCE_NAME, project, holder_id, issue_number
+    )
+    if not can_execute:
+        _log_skipped(project, issue_number, reason)
+        yield False
+        return
+
+    try:
+        async with _held_with_heartbeat_async(
+            facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
+        ):
+            yield True
+    finally:
+        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+
+
+@contextmanager
+def dev_container_build_lock_if_free_sync(
+    project: str,
+    issue_number: Optional[int] = None,
+    facade: Optional[ProjectResourceLockManager] = None,
+):
+    """
+    Synchronous counterpart of dev_container_build_lock_if_free_async(), for
+    callers with no asyncio event loop guaranteed to be running -- namely
+    services/work_execution_state.py's post-restart reconciliation, reached
+    from main.py's startup path.
+
+    Identical semantics otherwise; see that function for the full contract.
+    Unlike dev_container_build_lock_sync() this never sleeps, so it is safe on
+    startup and inside another file lock.
+    """
+    facade = facade if facade is not None else ProjectResourceLockManager()
+    holder_id = _mint_unique_holder_id()
+    can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
+    if not can_execute:
+        _log_skipped(project, issue_number, reason)
+        yield False
+        return
+
+    try:
+        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
+            yield True
+    finally:
+        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)

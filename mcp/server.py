@@ -1098,7 +1098,9 @@ async def rebuild_agent_image(project: str) -> dict:
     Trigger a rebuild of a project's agent Docker image (docker build from
     <project>/Dockerfile.agent). Fire-and-forget — builds can take up to 30
     minutes, so this returns as soon as the rebuild is triggered, not when it
-    completes. Poll get_image_build_status(project) to check progress.
+    completes. Poll get_image_build_status(project) to check progress: it
+    reports "queued" until the build actually starts (the rebuild waits for the
+    dev_container_build lock first), then "in_progress", then a terminal status.
 
     Args:
         project: Project name (matches the directory name under /workspace).
@@ -1114,7 +1116,24 @@ async def rebuild_agent_image(project: str) -> dict:
 def get_image_build_status(project: str) -> dict:
     """
     Read a project's agent Docker image build status directly from the shared
-    state file (no HTTP call) — one of unverified/in_progress/verified/blocked.
+    state file (no HTTP call).
+
+    "status" is one of queued/unverified/in_progress/verified/blocked. "queued"
+    means a rebuild has been requested but has not started yet — it is waiting
+    for the dev_container_build lock, which another build or verification may
+    hold for a long time. The image's own state during that wait is reported
+    separately as "image_status", and is normally still whatever it was before
+    the request: a rebuild that is only queued has changed nothing yet, so
+    treating a "verified" there as "the rebuild finished" is wrong.
+
+    "last_operation_error" is set when a requested operation could not be
+    carried out at all — most often a rebuild that waited out its whole lock
+    window and never started. It is reported separately from "status" because
+    it is not a verdict on the image: the image is still whatever it was, and
+    the rebuild simply has to be requested again. It carries its own "at"
+    timestamp, and is dropped the moment anything writes a new status for the
+    project, so a record that is present always post-dates the "image_status"
+    alongside it rather than describing a rebuild that has since happened.
 
     Args:
         project: Project name.
@@ -1123,7 +1142,15 @@ def get_image_build_status(project: str) -> dict:
     project = _resolve_project_name(project)
     status = dev_container_state.get_status(project)
     image_name = dev_container_state.get_image_name(project)
-    return {"project": project, "status": status.value, "image_name": image_name}
+    pending = dev_container_state.get_pending_operation(project)
+    return {
+        "project": project,
+        "status": "queued" if pending else status.value,
+        "image_status": status.value,
+        "pending_operation": pending,
+        "last_operation_error": dev_container_state.get_last_operation_error(project),
+        "image_name": image_name,
+    }
 
 
 @mcp.tool()

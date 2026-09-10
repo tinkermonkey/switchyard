@@ -98,12 +98,16 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
         logger.info(f"Agent {agent}: agent_config type={type(agent_config)}, has requires_docker={hasattr(agent_config, 'requires_docker')}")
 
     # CRITICAL: Agent's requires_docker setting takes precedence over context
-    # Only dev_environment_setup should have requires_docker=False
+    # requires_docker=False is not exclusive to dev_environment_setup: see
+    # config/foundations/agents.yaml (also dev_environment_verifier and
+    # pipeline_analysis) and the scripts/ entry points that pass use_docker
+    # directly. Only the two BUILD_WINDOW_AGENTS take the dev_container_build
+    # lock below (#152 item B).
     if agent_config and hasattr(agent_config, 'requires_docker'):
         use_docker = agent_config.requires_docker
         logger.info(f"Agent {agent}: Using agent_config.requires_docker={use_docker}")
         if not use_docker:
-            logger.warning(f"Agent {agent} is configured to run LOCALLY (requires_docker=False) - this should ONLY be dev_environment_setup!")
+            logger.info(f"Agent {agent} is configured to run LOCALLY (requires_docker=False)")
     else:
         # Fallback to context, but default to True for security
         use_docker = context.get('use_docker', True)
@@ -208,7 +212,7 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             stream_callback=context.get('stream_callback')
         )
 
-    # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
+    # Only reach here if use_docker=False.
     #
     # dev_container_build lock (#56): for dev_environment_setup/verifier,
     # this local execution IS this project's dev-container build/verify
@@ -217,14 +221,16 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     # against the orchestrator's own docker socket. There is no other
     # orchestrator-side hook around that work (see
     # services/dev_container_build_lock.py's module docstring for the full
-    # investigation), so this call is where the lock is acquired --
-    # unconditionally for every agent that reaches this branch, gated only
-    # on the `use_docker` flag, not agent identity. A third agent,
-    # pipeline_analysis, also has requires_docker: false and reaches here
-    # too (found in PR #138 review, /pr-review-toolkit:review-pr -- see
-    # #140), acquiring this same lock even though it never builds/inspects
-    # anything -- a known, tracked gap, not a correctness issue for
-    # dev_environment_setup/verifier themselves.
+    # investigation), so this call is where the lock is acquired.
+    #
+    # Gated on AGENT IDENTITY, not on the `use_docker` flag (#152 item B,
+    # covering #140 items 20/26). The flag is reached by seven call sites, only
+    # two of which build anything: pipeline_analysis (which used to contend for
+    # a hardcoded "switchyard"-scoped lock on every project's post-run
+    # analysis) and the four scripts/ analysis/strategy/artifact entry points
+    # took a build lock they had no use for and could block ~1h behind a real
+    # build. See agent_holds_build_window() for why a new image-building agent
+    # must be added there explicitly.
     task_context_for_dev_lock = context.get('context', {}) or {}
     issue_number_for_dev_lock = task_context_for_dev_lock.get('issue_number') or context.get('issue_number')
 
@@ -234,33 +240,69 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     # _require_work_dir() for why this must not fall back to '.'.
     work_dir_for_lock = _require_work_dir(context, agent)
 
-    from services.dev_container_build_lock import dev_container_build_lock_async
+    from services.dev_container_build_lock import (
+        agent_holds_build_window,
+        dev_container_build_lock_async,
+    )
 
-    async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
-        # project_checkout lock (#54): dev_environment_setup/verifier's cwd is
-        # normally an isolated epic worktree (its own issue number, resolved
-        # unconditionally for 'issues'/'hybrid' workspace types -- see
-        # agent_executor.py's epic-resolution block) and does NOT need this lock.
-        # Only lock when work_dir genuinely IS the shared base clone (e.g. a
-        # workspace-resolution fallback) -- see is_base_clone_dir()'s docstring
-        # for why locking epic-worktree-scoped runs too would be wrong. Distinct
-        # resource from dev_container_build above, so nesting the two here is
-        # safe -- neither lock is ever acquired twice for the same resource.
-        if workspace_manager.is_base_clone_dir(project, work_dir_for_lock):
-            from services.project_checkout_lock import project_checkout_lock_async
+    if agent_holds_build_window(agent):
+        async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
+            return await _run_locally_under_checkout_lock(
+                prompt, context, agent, project, work_dir_for_lock, issue_number_for_dev_lock
+            )
 
-            # issue_number here is log attribution only -- see the comment at the
-            # Docker-branch call site above.
-            async with project_checkout_lock_async(project, issue_number_for_dev_lock):
-                return await _run_claude_code_locally(prompt, context, agent)
+    return await _run_locally_under_checkout_lock(
+        prompt, context, agent, project, work_dir_for_lock, issue_number_for_dev_lock
+    )
 
-        return await _run_claude_code_locally(prompt, context, agent)
+
+async def _run_locally_under_checkout_lock(
+    prompt: str,
+    context: Dict[str, Any],
+    agent: str,
+    project: str,
+    work_dir: Path,
+    issue_number: Any,
+) -> str:
+    """
+    Run the local (non-Docker) Claude Code session, holding the project_checkout
+    lock only when `work_dir` genuinely IS the project's shared base clone.
+
+    project_checkout lock (#54): dev_environment_setup/verifier's cwd is
+    normally an isolated epic worktree (its own issue number, resolved
+    unconditionally for 'issues'/'hybrid' workspace types -- see
+    agent_executor.py's epic-resolution block) and does NOT need this lock.
+    Only lock when work_dir genuinely IS the shared base clone (e.g. a
+    workspace-resolution fallback) -- see is_base_clone_dir()'s docstring for
+    why locking epic-worktree-scoped runs too would be wrong. Distinct resource
+    from dev_container_build, so nesting the two at the caller is safe --
+    neither lock is ever acquired twice for the same resource, and
+    dev_container_build is always the OUTER one (see both lock modules'
+    "Acquisition order" sections).
+
+    Split out of run_claude_code() by #152 item B: gating the dev_container_build
+    lock on agent identity gave that branch two exits instead of one, and this
+    guard would otherwise have been the fourth near-identical copy of the
+    is_base_clone_dir() pattern #140 item 4 already flagged.
+
+    `issue_number` is log attribution only, never the lock's holder identity --
+    see project_checkout_lock.py's module docstring.
+    """
+    if workspace_manager.is_base_clone_dir(project, work_dir):
+        from services.project_checkout_lock import project_checkout_lock_async
+
+        async with project_checkout_lock_async(project, issue_number):
+            return await _run_claude_code_locally(prompt, context, agent)
+
+    return await _run_claude_code_locally(prompt, context, agent)
 
 
 async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: str) -> str:
     """
-    Execute Claude Code locally (non-Docker) for agents with requires_docker=False
-    (dev_environment_setup, dev_environment_verifier only).
+    Execute Claude Code locally (non-Docker) for callers with
+    requires_docker=False -- dev_environment_setup and dev_environment_verifier
+    (whose sessions ARE the dev-container build/verify window), pipeline_analysis,
+    and the scripts/ analysis/strategy/artifact entry points.
 
     Split out of run_claude_code() (#54) purely so the project_checkout lock
     decision above it can wrap this entire local execution in one
@@ -277,8 +319,9 @@ async def _run_claude_code_locally(prompt: str, context: Dict[str, Any], agent: 
     project = context.get('project', 'unknown')
     mcp_servers = context.get('mcp_servers', [])
 
-    # Only reach here if use_docker=False (dev_environment_setup and dev_environment_verifier only)
-    logger.warning(f"Running agent {agent} locally (not in Docker) - this should ONLY be dev_environment_setup or dev_environment_verifier!")
+    # Only reach here if use_docker=False -- see this function's docstring for
+    # the full list of callers that legitimately do.
+    logger.info(f"Running agent {agent} locally (not in Docker)")
 
     # Prepare working directory. Refuses a missing work_dir rather than running
     # the agent in the orchestrator's own cwd -- see _require_work_dir(). In

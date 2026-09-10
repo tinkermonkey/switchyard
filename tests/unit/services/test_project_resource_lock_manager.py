@@ -29,9 +29,15 @@ from datetime import datetime, timezone, timedelta
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
-from services.pipeline_lock_manager import PipelineLockManager, PipelineLock
+from services.pipeline_lock_manager import (
+    PipelineLockManager,
+    PipelineLock,
+    PROCESS_OWNER_ID,
+    owner_process_role,
+)
 from services.project_resource_lock_manager import (
     ProjectResourceLockManager,
+    FOREIGN_OWNER_LIVENESS_GRACE_SECONDS,
     RESOURCE_BOARD_PREFIX,
     InvalidResourceNameError,
 )
@@ -619,3 +625,221 @@ class TestTouchResource(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRecoverOrphanedResourceLocks(unittest.TestCase):
+    """
+    #152 review: a resource lock held by the process that died survives the
+    restart (PipelineLockManager reclaims it only after its 4-hour staleness
+    heuristic or the 7200s Redis TTL), and main.py's startup lock recovery
+    iterates configured pipeline BOARDS, so it never sees a lock parked under
+    the reserved `__resource__*` board. That made
+    services/work_execution_state.py's post-restart dev-container
+    reconciliation a guaranteed no-op in exactly the case it exists for: the
+    orphaned lock exists if and only if a setup/verifier session was in flight,
+    which is the same condition that produces the stuck record.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        # YAML-only path -- the recovery is a get_all_locks() scan plus releases,
+        # neither of which needs a hand-mocked Redis transaction.
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_releases_the_dead_holders_lock_so_the_next_acquire_succeeds(self):
+        self.facade.acquire_resource("proj", "dev_container_build", -12345)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+        can_execute, _ = self.facade.acquire_resource("proj", "dev_container_build", -999)
+        self.assertTrue(can_execute)
+
+    def test_recovers_every_project_not_just_one(self):
+        for project in ("alpha", "beta", "gamma"):
+            self.facade.acquire_resource(project, "dev_container_build", -1)
+
+        self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 3)
+        for project in ("alpha", "beta", "gamma"):
+            self.assertIsNone(self.facade.get_resource_lock(project, "dev_container_build"))
+
+    def test_leaves_other_resources_and_real_board_locks_alone(self):
+        """Scoped by resource name: recovering one resource must not free a
+        different resource's lock, nor any pipeline board lock."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        self.facade.acquire_resource("proj", "project_checkout", -2)
+        self.lock_manager._create_lock("proj", "dev_workflow", 111)
+
+        self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "project_checkout"))
+        self.assertEqual(self.lock_manager.get_lock("proj", "dev_workflow").locked_by_issue, 111)
+
+    def test_leaves_a_retained_lock_in_place(self):
+        """A lock retained after a failed run is a durable marker for deliberate
+        human recovery -- only scripts/release_lock.py may clear it."""
+        self.facade.acquire_resource("proj", "dev_container_build", -7)
+        self.facade.mark_resource_failed("proj", "dev_container_build", -7, "build blew up")
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 0)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def test_is_a_no_op_when_nothing_is_held(self):
+        self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)
+
+    def test_an_unreadable_lock_store_does_not_break_startup(self):
+        with patch.object(self.lock_manager, 'get_all_locks', side_effect=RuntimeError("redis down")):
+            self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)
+
+    def test_leaves_a_live_cross_process_holders_lock_alone(self):
+        """
+        #152 review (findings 1 and 4): this recovery used to release EVERY
+        non-retained holder, on the stated premise that "every holder of a
+        resource lock is an in-process operation of the orchestrator that took
+        it". docker-compose.yml runs observability-server as its OWN container,
+        and #152 WI-7 made its /api/projects/<p>/rebuild-image handler hold this
+        very lock for the whole duration of an operator-triggered docker build.
+        An orchestrator restart inside that window dispossessed a live holder,
+        silently -- touch_resource() returns NOT_HELD rather than re-acquiring,
+        and the heartbeat only ticks every REDIS_LOCK_TTL_SECONDS/4.
+        """
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        self._restamp_owner("proj", "dev_container_build", "observability_server.py#abc123def456")
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 0)
+        lock = self.facade.get_resource_lock("proj", "dev_container_build")
+        self.assertIsNotNone(lock)
+        self.assertEqual(lock.locked_by_issue, -1)
+
+    def test_releases_a_cross_process_holder_that_has_stopped_heartbeating(self):
+        """The other side of that test: a foreign owner is only left alone while
+        it is plausibly alive. Every held-with-heartbeat context manager in this
+        codebase touches its lock several times inside
+        FOREIGN_OWNER_LIVENESS_GRACE_SECONDS, so one that has gone quiet for
+        longer is dead and its lock is reclaimable."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        long_ago = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=FOREIGN_OWNER_LIVENESS_GRACE_SECONDS + 60)
+        ).isoformat()
+        self._restamp_owner(
+            "proj", "dev_container_build", "observability_server.py#abc123def456",
+            lock_acquired_at=long_ago,
+        )
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def test_releases_a_lock_left_by_this_process_kinds_dead_predecessor(self):
+        """Every process kind is a docker-compose singleton and this runs at
+        startup, before anything has been acquired -- so a lock stamped with MY
+        role belongs to a previous incarnation of me, whatever its instance id."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        my_role = owner_process_role(PROCESS_OWNER_ID)
+        self._restamp_owner("proj", "dev_container_build", f"{my_role}#deadbeefcafe")
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def test_releases_a_lock_written_before_the_owner_stamp_existed(self):
+        """Pre-upgrade rows carry no owner. They cannot belong to a process
+        running now, and releasing them preserves the pre-stamp behaviour for the
+        one deploy in which they can still exist."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        self._restamp_owner("proj", "dev_container_build", None)
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def test_an_unparseable_acquired_at_never_dispossesses_a_foreign_owner(self):
+        """This decides whether to take a lock away from someone, so the unknown
+        case fails closed."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        self._restamp_owner(
+            "proj", "dev_container_build", "observability_server.py#abc123def456",
+            lock_acquired_at="not-a-timestamp",
+        )
+
+        self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def _restamp_owner(self, project, resource_name, owner_process, lock_acquired_at=None):
+        """Rewrite an already-acquired lock's owner (and optionally its liveness
+        timestamp) on disk, standing in for a lock that a DIFFERENT process
+        acquired -- which a single-process test cannot produce directly."""
+        board = f"{RESOURCE_BOARD_PREFIX}{resource_name}"
+        lock = self.lock_manager.get_lock(project, board)
+        lock.owner_process = owner_process
+        if lock_acquired_at is not None:
+            lock.lock_acquired_at = lock_acquired_at
+        self.lock_manager._save_lock_to_yaml(lock)
+
+
+class TestAcquisitionStampsTheOwningProcess(unittest.TestCase):
+    """The stamp TestRecoverOrphanedResourceLocks' ownership decisions read."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_an_acquired_lock_records_this_process(self):
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+
+        lock = self.facade.get_resource_lock("proj", "dev_container_build")
+
+        self.assertEqual(lock.owner_process, PROCESS_OWNER_ID)
+
+    def test_a_touch_does_not_re_attribute_the_lock(self):
+        """A touch always runs in the holding process today, but re-stamping
+        would let a touch from anywhere else make a live foreign holder look like
+        this process's own dead predecessor to the recovery above."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        board = f"{RESOURCE_BOARD_PREFIX}dev_container_build"
+        lock = self.lock_manager.get_lock("proj", board)
+        lock.owner_process = "observability_server.py#abc123def456"
+        self.lock_manager._save_lock_to_yaml(lock)
+
+        self.facade.touch_resource("proj", "dev_container_build", -1)
+
+        refreshed = self.facade.get_resource_lock("proj", "dev_container_build")
+        self.assertEqual(refreshed.owner_process, "observability_server.py#abc123def456")
+
+    def test_a_lock_file_written_before_the_field_existed_still_loads(self):
+        """owner_process defaults to None, not to the reading process -- an old
+        YAML file must read back as 'owner unknown'."""
+        import yaml as _yaml
+
+        state_file = Path(self.test_dir) / f"proj_{RESOURCE_BOARD_PREFIX}dev_container_build.yaml"
+        state_file.write_text(_yaml.dump({
+            'project': 'proj',
+            'board': f"{RESOURCE_BOARD_PREFIX}dev_container_build",
+            'locked_by_issue': -1,
+            'lock_acquired_at': datetime.now(timezone.utc).isoformat(),
+            'lock_status': 'locked',
+        }))
+
+        lock = self.facade.get_resource_lock("proj", "dev_container_build")
+
+        self.assertIsNotNone(lock)
+        self.assertIsNone(lock.owner_process)
