@@ -1,3 +1,6 @@
+import contextlib
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch, call
 import sys
@@ -58,6 +61,44 @@ def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=Non
 
     _side_effect.calls = calls
     return _side_effect
+
+
+class _FileLockSpy:
+    """
+    Records the ORDER in which utils.file_lock.file_lock() contexts are entered
+    and exited, while still taking the real locks.
+
+    Both facts these tests need are otherwise invisible: which of the two lock
+    files is OUTER (an ordering cycle between them would deadlock), and whether
+    a read and the write that depends on it happen inside ONE held
+    '<state>.yaml.lock' (a release_lock() landing in a gap between two separate
+    acquisitions is exactly what re-created a lock that had just been released).
+    """
+
+    def __init__(self):
+        self.events = []
+
+    @property
+    def paths(self):
+        return [path for kind, path in self.events if kind == 'enter']
+
+    def note(self, label):
+        self.events.append(('note', label))
+
+    def patch(self):
+        import utils.file_lock as file_lock_module
+        real_file_lock = file_lock_module.file_lock
+
+        @contextlib.contextmanager
+        def spy(path, *args, **kwargs):
+            self.events.append(('enter', str(path)))
+            try:
+                with real_file_lock(path, *args, **kwargs):
+                    yield
+            finally:
+                self.events.append(('exit', str(path)))
+
+        return patch('utils.file_lock.file_lock', side_effect=spy)
 
 
 def _redis_lock_hash(issue_number, acquired_at=None):
@@ -474,7 +515,7 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 456)
 
-    def test_yaml_leg_reports_failure_rather_than_writing_unguarded(self):
+    def test_reports_failure_rather_than_refreshing_unguarded(self):
         """Fail closed exactly like try_acquire_lock()'s own guarded path: a
         guard that cannot be taken means the read-modify-write below it is not
         atomic, so it must not happen at all."""
@@ -483,7 +524,24 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
         original = self.manager.get_lock("proj", "board")
 
         with patch('utils.file_lock.file_lock', side_effect=TimeoutError("guard busy")):
-            result, _ = self.manager._touch_lock_yaml(
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertEqual(
+            self.manager.get_lock("proj", "board").lock_acquired_at,
+            original.lock_acquired_at,
+        )
+
+    def test_the_yaml_leg_reports_failure_when_the_state_lock_cannot_be_taken(self):
+        """Its read and its write must share ONE held '<state>.yaml.lock' (a
+        release landing in the gap is what re-created a released lock), so
+        failing to take that lock means the leg cannot run at all."""
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+
+        with patch('utils.file_lock.file_lock', side_effect=TimeoutError("state lock busy")):
+            result, _ = self.manager._touch_lock_yaml_unguarded(
                 "proj", "board", 123, original, allow_reestablish=False
             )
 
@@ -493,37 +551,26 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
             original.lock_acquired_at,
         )
 
-    def test_yaml_leg_nests_the_acquire_guard_outside_the_state_file_lock(self):
+    def test_the_acquire_guard_is_taken_outside_the_state_file_lock(self):
         """
         The two lock files must stay distinct (fcntl.flock() conflicts between
         two descriptors of the same file even in one process) and must always
         be taken in this order -- '.acquire.lock' outer, '<state>.yaml.lock'
-        inner -- which is the order try_acquire_lock()'s guarded path already
-        establishes. Taking them the other way round anywhere would be an
-        ordering cycle.
+        inner -- which is the order try_acquire_lock()'s guarded path and
+        release_lock() also establish. Taking them the other way round
+        anywhere would be an ordering cycle.
         """
-        import utils.file_lock as file_lock_module
-
         self.manager.redis_client = None
         self.manager._create_lock("proj", "board", 123)
-        original = self.manager.get_lock("proj", "board")
+        taken = _FileLockSpy()
 
-        real_file_lock = file_lock_module.file_lock
-        taken = []
-
-        def spy(path, *args, **kwargs):
-            taken.append(str(path))
-            return real_file_lock(path, *args, **kwargs)
-
-        with patch('utils.file_lock.file_lock', side_effect=spy):
-            result, _ = self.manager._touch_lock_yaml(
-                "proj", "board", 123, original, allow_reestablish=False
-            )
+        with taken.patch():
+            result = self.manager.touch_lock("proj", "board", 123)
 
         self.assertIs(result, TouchResult.REFRESHED)
         state_file = self.manager._get_state_file("proj", "board")
-        self.assertEqual(taken[0], str(state_file) + '.acquire.lock')
-        self.assertIn(str(state_file) + '.lock', taken[1:])
+        self.assertEqual(taken.paths[0], str(state_file) + '.acquire.lock')
+        self.assertIn(str(state_file) + '.lock', taken.paths[1:])
 
 
 class TestTouchLockDoesNotResurrectAReleasedLock(unittest.TestCase):
@@ -607,29 +654,206 @@ class TestTouchLockDoesNotResurrectAReleasedLock(unittest.TestCase):
         self.assertTrue(state_file.exists())
         self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 123)
 
-    def test_create_if_missing_false_refuses_an_absent_key_outright(self):
+    def test_a_lock_gone_from_both_stores_stays_gone(self):
         """
-        What the board-lock sweep passes. Board locks are released and
-        re-acquired constantly from worker threads with no coupling to that
-        sweep, and the sweep refreshes them every 1800s against a 7200s TTL --
-        so an absent key there is far more likely to be a completed release
-        than a lapse, and re-establishing it would wedge the board.
+        What a completed release_lock() leaves behind, seen by a touch that
+        started after it. Neither leg may re-create anything from
+        touch_lock()'s opening snapshot.
         """
-        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
         self.manager._create_lock("proj", "board", 123)
-        original = self.manager.get_lock("proj", "board")
+        stale_view = self.manager.get_lock("proj", "board")
+        self.manager._get_state_file("proj", "board").unlink()
         side_effect = _touch_transaction_side_effect({})
         self.mock_redis.transaction.side_effect = side_effect
 
-        result = self.manager.touch_lock("proj", "board", 123, create_if_missing=False)
+        with patch.object(self.manager, 'get_lock_fail_closed', return_value=(stale_view, True)):
+            result = self.manager.touch_lock("proj", "board", 123)
 
         self.assertIs(result, TouchResult.NOT_HELD)
         self.assertEqual(side_effect.calls, [])
-        # The YAML leg is not reached either -- nothing is rewritten anywhere.
-        self.assertEqual(
-            self.manager.get_lock("proj", "board").lock_acquired_at,
-            original.lock_acquired_at,
+        self.assertFalse(self.manager._get_state_file("proj", "board").exists())
+
+
+class TestTouchAndReleaseCannotInterleave(unittest.TestCase):
+    """
+    Found in the WI-8 review round. touch_lock() and release_lock() are both
+    two-store read-modify-writes over the same lock, and nothing serialized
+    them: the '<state>.yaml.acquire.lock' guard was taken only by
+    try_acquire_lock()'s YAML fallback and by touch_lock()'s YAML leg, while
+    release_lock() took only the inner '<state>.yaml.lock'. Two interleavings
+    put a released lock back, both ending in a durable 'locked' record naming
+    an issue whose run had ended, with the 4h staleness clock reset:
+
+      - inside the YAML leg: its read and its write each took and released the
+        inner lock separately, so a release could unlink the state file in the
+        gap and the write re-created it -- `allow_reestablish` did not gate
+        this at all, because `existing` was present at read time; and
+      - across the two legs: the Redis leg refreshed the key, the release then
+        deleted the key AND unlinked the state file, and the YAML leg re-created
+        the durable record because redis_ok said Redis still named this holder.
+
+    Nothing reclaims such a lock at runtime (_reconcile_active_runs() is
+    startup-only, pipeline_watchdog reaps runs rather than locks), so the board
+    stops dispatching until an operator intervenes -- and every get_lock()-based
+    probe reports a phantom holder in the meantime.
+
+    Both are closed the same way: touch_lock() and release_lock() take the
+    acquire guard for the WHOLE of their two-store work, and the YAML leg's
+    read and write share one held inner lock.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.state_file = self.manager._get_state_file("proj", "board")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_a_release_landing_mid_refresh_wins_and_the_lock_stays_released(self):
+        """
+        The reviewer's repro, as the concurrency it actually models: a real
+        release_lock() on another thread, landing between the YAML leg's read
+        and its write. It must block on the guard rather than interleave, and
+        the lock must be gone once both have finished -- a release that
+        completes cannot leave a 'locked' record behind it.
+        """
+        self.manager._create_lock("proj", "board", 123)
+        released = []
+        workers = []
+        real_refreshed_from = self.manager._refreshed_from
+
+        def release_from_another_thread(*args, **kwargs):
+            worker = threading.Thread(
+                target=lambda: released.append(
+                    self.manager.release_lock("proj", "board", 123)
+                )
+            )
+            workers.append(worker)
+            worker.start()
+            # Long enough for the release to reach (and block on) the guard.
+            time.sleep(0.3)
+            return real_refreshed_from(*args, **kwargs)
+
+        with patch.object(self.manager, '_refreshed_from', side_effect=release_from_another_thread):
+            self.manager.touch_lock("proj", "board", 123)
+
+        for worker in workers:
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(released, [True])
+        self.assertFalse(self.state_file.exists())
+        self.assertIsNone(self.manager.get_lock("proj", "board"))
+
+    def test_the_yaml_leg_holds_the_state_lock_across_its_read_and_its_write(self):
+        """
+        The structural half of the same fix. release_lock() takes
+        '<state>.yaml.lock' to verify ownership and unlink, so the leg's read
+        and its write must happen inside ONE held instance of that lock -- two
+        separate acquisitions leave a gap a release fits through, and the write
+        that follows re-creates what it deleted.
+        """
+        self.manager._create_lock("proj", "board", 123)
+        spy = _FileLockSpy()
+        real_read = self.manager._read_yaml_lock_only_unlocked
+        real_write = self.manager._save_lock_to_yaml_unlocked
+
+        def noted_read(*args, **kwargs):
+            spy.note('read')
+            return real_read(*args, **kwargs)
+
+        def noted_write(*args, **kwargs):
+            spy.note('write')
+            return real_write(*args, **kwargs)
+
+        with spy.patch(), \
+                patch.object(self.manager, '_read_yaml_lock_only_unlocked', side_effect=noted_read), \
+                patch.object(self.manager, '_save_lock_to_yaml_unlocked', side_effect=noted_write):
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        state_lock = str(self.state_file) + '.lock'
+        self.assertIn(
+            [('enter', state_lock), ('note', 'read'), ('note', 'write'), ('exit', state_lock)],
+            [spy.events[i:i + 4] for i in range(len(spy.events) - 3)],
         )
+
+    def test_release_lock_takes_the_acquire_guard_around_its_whole_delete(self):
+        """Deleting the Redis key and unlinking the state file are two writes;
+        without the guard, touch_lock() could read one store before and the
+        other after."""
+        self.manager._create_lock("proj", "board", 123)
+        spy = _FileLockSpy()
+
+        with spy.patch():
+            self.assertTrue(self.manager.release_lock("proj", "board", 123))
+
+        self.assertEqual(spy.paths[0], str(self.state_file) + '.acquire.lock')
+        self.assertEqual(spy.events[-1], ('exit', str(self.state_file) + '.acquire.lock'))
+        self.assertIn(str(self.state_file) + '.lock', spy.paths[1:])
+
+    def test_the_stale_lock_recovery_path_does_not_deadlock_on_its_own_guard(self):
+        """
+        try_acquire_lock()'s YAML fallback auto-releases a >4h lock from INSIDE
+        the acquire guard, so it must go through _release_lock_unguarded():
+        utils.file_lock refuses a re-entrant acquire (ReentrantFileLockError)
+        rather than hanging on it, which would have turned every stale-lock
+        recovery into a hard failure.
+        """
+        stale = PipelineLock(
+            project="proj",
+            board="board",
+            locked_by_issue=123,
+            lock_acquired_at=(datetime.now(timezone.utc) - timedelta(hours=5)).isoformat(),
+            lock_status='locked',
+        )
+        self.manager._save_lock_to_yaml(stale)
+
+        acquired, reason = self.manager.try_acquire_lock("proj", "board", 456)
+
+        self.assertTrue(acquired)
+        self.assertEqual(reason, "stale_lock_recovered")
+        self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 456)
+
+
+class TestTouchLockGuardsBothLegs(unittest.TestCase):
+    """
+    The cross-leg half of the interleaving above: the guard has to be held
+    across the REDIS leg too, not just the YAML one. Held only around the YAML
+    leg, a release could complete in full between the two -- Redis refreshed,
+    then key deleted and state file unlinked -- and the YAML leg would re-create
+    the durable record because the Redis leg had already reported REFRESHED.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_the_redis_leg_runs_inside_the_acquire_guard(self):
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.manager._create_lock("proj", "board", 123)
+        spy = _FileLockSpy()
+
+        def noted_transaction(*args, **kwargs):
+            spy.note('redis_transaction')
+            return _touch_transaction_side_effect(_redis_lock_hash(123))(*args, **kwargs)
+
+        self.mock_redis.transaction.side_effect = noted_transaction
+
+        with spy.patch():
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        guard = str(self.manager._get_acquire_guard_file("proj", "board"))
+        opened = spy.events.index(('enter', guard))
+        closed = spy.events.index(('exit', guard))
+        transacted = spy.events.index(('note', 'redis_transaction'))
+        self.assertLess(opened, transacted)
+        self.assertLess(transacted, closed)
 
 
 class TestTouchLockSurfacesAYamlConfirmedLoss(unittest.TestCase):

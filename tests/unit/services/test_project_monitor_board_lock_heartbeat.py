@@ -31,7 +31,10 @@ from unittest.mock import Mock, MagicMock, patch
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
 from services.pipeline_lock_manager import PipelineLock, TouchResult
-from services.project_checkout_lock import HEARTBEAT_INTERVAL_SECONDS
+from services.project_checkout_lock import (
+    DEFAULT_TIMEOUT_SECONDS as CHECKOUT_LOCK_WAIT_BUDGET_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS,
+)
 from services.project_monitor import ProjectMonitor
 
 
@@ -68,7 +71,9 @@ class BoardLockHeartbeatTestBase(unittest.TestCase):
         )
         # No decision-event heartbeat available (what an unreachable
         # Elasticsearch returns) unless a test says otherwise.
-        self.monitor._get_last_pipeline_run_event_time = Mock(return_value=None)
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'es_unavailable')
+        )
 
         self.lock_manager = MagicMock()
         self.lock_manager.touch_lock.return_value = TouchResult.REFRESHED
@@ -91,7 +96,7 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
         self.sweep()
 
         self.lock_manager.touch_lock.assert_called_once_with(
-            "proj", "board", 123, create_if_missing=False
+            "proj", "board", 123
         )
 
     def test_the_liveness_lookup_is_board_scoped_and_read_only(self):
@@ -133,7 +138,7 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
 
         self.lock_manager.touch_lock.assert_not_called()
 
-    def test_stops_refreshing_a_run_that_has_gone_silent_longer_than_any_agent_may_run(self):
+    def test_stops_refreshing_a_run_that_has_gone_silent_longer_than_any_holder_may_be(self):
         """
         The bound on pinning. A run that dies without ever being marked ended
         keeps reading 'active' in Elasticsearch, and refreshing it forever
@@ -145,8 +150,14 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
         """
         self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
         self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
-        self.monitor._get_last_pipeline_run_event_time = Mock(
-            return_value=datetime.now(timezone.utc) - timedelta(seconds=3600 + HEARTBEAT_INTERVAL_SECONDS + 60)
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(
+                datetime.now(timezone.utc) - timedelta(
+                    seconds=3600 + CHECKOUT_LOCK_WAIT_BUDGET_SECONDS
+                    + HEARTBEAT_INTERVAL_SECONDS + 60
+                ),
+                'ok',
+            )
         )
 
         self.sweep()
@@ -159,15 +170,38 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
         re-open the double-dispatch the sweep exists to prevent."""
         self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
         self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
-        self.monitor._get_last_pipeline_run_event_time = Mock(
-            return_value=datetime.now(timezone.utc) - timedelta(seconds=3600 - 60)
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(datetime.now(timezone.utc) - timedelta(seconds=3600 - 60), 'ok')
         )
 
         self.sweep()
 
         self.lock_manager.touch_lock.assert_called_once_with(
-            "proj", "board", 123, create_if_missing=False
+            "proj", "board", 123
         )
+
+    def test_the_silence_bound_covers_the_project_checkout_lock_wait_too(self):
+        """
+        Found in the WI-8 review round: the bound was the agent timeout alone
+        (3.5h with the margin), but a board-lock holder's real silence is the
+        checkout-lock wait PLUS the agent run. claude_integration.py wraps
+        run_agent_in_container() in project_checkout_lock_async(), and that
+        wait runs with the board lock already held and emits no decision
+        events at all (_log_busy() only logs and sleeps). Sized at the shorter
+        bound, this stopped refreshing a live holder's lock roughly 3.5h in --
+        and its Redis key then expired under a running agent, which is the
+        double-dispatch the sweep exists to prevent.
+        """
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=10800)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        # Silent for 5h: past the agent-only bound, inside the real one.
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(datetime.now(timezone.utc) - timedelta(hours=5), 'ok')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
 
     def test_does_not_refresh_a_lock_younger_than_the_heartbeat_interval(self):
         """Aged against the lock's OWN lock_acquired_at (which touch_lock
@@ -229,6 +263,176 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
         self.lock_manager.get_lock_fail_closed.assert_not_called()
 
 
+class TestNoEventTimeIsNotOneState(BoardLockHeartbeatTestBase):
+    """
+    Found in the WI-8 review round. `last_event_at is None` was read as "still
+    progressing" unconditionally, justified by a bound that only covers ONE of
+    the three ways _get_last_pipeline_run_event_time() produces it. The other
+    two happen with Elasticsearch UP, where get_active_pipeline_run() keeps
+    resolving the run from the pipeline-runs-* search for as long as its doc
+    reads 'active' -- so the "the Redis run blob expires within the hour"
+    bound does not apply to them at all, and a run that never emitted a
+    decision event was refreshed every sweep forever.
+    """
+
+    def test_es_being_unavailable_still_counts_as_progressing(self):
+        """Refusing here would re-open the double-dispatch this sweep exists
+        to prevent for the whole of every ES outage. Bounded from the other
+        side: without ES, get_active_pipeline_run() resolves from the Redis run
+        blob, which a dead run stops refreshing."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active',
+            started_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'es_unavailable')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_failed_events_query_still_counts_as_progressing(self):
+        """ES up but not answering is just as unknown as ES being down. What
+        changes is that the failure is logged at WARNING rather than swallowed
+        at DEBUG -- see _get_last_pipeline_run_event_time_with_reason()."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active',
+            started_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'query_failed')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_run_that_never_wrote_an_event_is_bounded_by_its_started_at(self):
+        """
+        The reachable wedge: a run created by get_or_create_pipeline_run()
+        whose dispatch died before any emitter wrote a decision event carrying
+        its id (or whose decision-events-* daily index has rolled off while its
+        pipeline-runs-* doc still reads 'active'). ES answers, with zero hits.
+        Same started_at fallback _find_stalled_issues_for_pipeline() already
+        applies to this identical ambiguity.
+        """
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active',
+            started_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'no_events')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_a_young_run_that_has_not_written_an_event_yet_is_left_alone(self):
+        """Dispatch legitimately precedes the first decision event, and the
+        checkout-lock wait can precede it by hours -- so "no events yet" only
+        becomes evidence of death once started_at clears the same bound."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active',
+            started_at=(datetime.now(timezone.utc) - timedelta(minutes=45)).isoformat(),
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'no_events')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_run_with_no_usable_started_at_is_left_alone(self):
+        """Nothing to bound it with; do not un-pin a lock on no evidence."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active', started_at=None,
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'no_events')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+
+class TestEventTimeReasonsAreDistinguished(unittest.TestCase):
+    """
+    _get_last_pipeline_run_event_time_with_reason() is what makes the three
+    None cases above distinguishable at all; the plain
+    _get_last_pipeline_run_event_time() keeps its original signature for
+    _find_stalled_issues_for_pipeline().
+    """
+
+    def setUp(self):
+        config_manager = Mock()
+        config_manager.list_projects.return_value = []
+        self.monitor = ProjectMonitor(Mock(), config_manager)
+
+    def _with_obs(self, obs):
+        return patch('monitoring.observability.get_observability_manager', return_value=obs)
+
+    def test_no_elasticsearch_client_reports_es_unavailable(self):
+        obs = Mock()
+        obs.es = None
+
+        with self._with_obs(obs):
+            self.assertEqual(
+                self.monitor._get_last_pipeline_run_event_time_with_reason("run-1"),
+                (None, 'es_unavailable'),
+            )
+
+    def test_a_raising_search_reports_query_failed_and_is_logged_above_debug(self):
+        """The whole point: a persistently failing liveness probe used to leave
+        no trace at all (logger.debug), while every caller read its failure as
+        'still alive'."""
+        obs = Mock()
+        obs.es.search.side_effect = Exception("search_phase_execution_exception")
+
+        with self._with_obs(obs):
+            with self.assertLogs('services.project_monitor', level='WARNING'):
+                result = self.monitor._get_last_pipeline_run_event_time_with_reason("run-1")
+
+        self.assertEqual(result, (None, 'query_failed'))
+
+    def test_zero_hits_reports_no_events(self):
+        obs = Mock()
+        obs.es.search.return_value = {'hits': {'hits': []}}
+
+        with self._with_obs(obs):
+            self.assertEqual(
+                self.monitor._get_last_pipeline_run_event_time_with_reason("run-1"),
+                (None, 'no_events'),
+            )
+
+    def test_a_hit_reports_ok_and_the_plain_helper_still_returns_the_timestamp(self):
+        obs = Mock()
+        obs.es.search.return_value = {
+            'hits': {'hits': [{'_source': {'timestamp': '2026-01-01T00:00:00+00:00'}}]}
+        }
+
+        with self._with_obs(obs):
+            ts, reason = self.monitor._get_last_pipeline_run_event_time_with_reason("run-1")
+            plain = self.monitor._get_last_pipeline_run_event_time("run-1")
+
+        self.assertEqual(reason, 'ok')
+        self.assertEqual(ts, datetime(2026, 1, 1, tzinfo=timezone.utc))
+        self.assertEqual(plain, ts)
+
+
 class TestSweepIsResilientAndRateLimited(BoardLockHeartbeatTestBase):
 
     def test_one_boards_failure_does_not_stop_the_others(self):
@@ -246,7 +450,7 @@ class TestSweepIsResilientAndRateLimited(BoardLockHeartbeatTestBase):
         self.sweep()
 
         self.lock_manager.touch_lock.assert_called_once_with(
-            "proj", "board2", 123, create_if_missing=False
+            "proj", "board2", 123
         )
 
     def test_a_project_whose_config_cannot_be_loaded_is_skipped(self):

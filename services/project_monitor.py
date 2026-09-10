@@ -8899,8 +8899,10 @@ _Repair cycle initiated by Switchyard_
         'feedback_listening', which is the status the human-feedback loop sets
         precisely to tell the zombie watchdog it is NOT working (that wait can
         legitimately last days, and its lock protection must come from the run
-        state, not from being heartbeated); and a run whose last decision event
-        is older than any agent could legitimately be silent for. Without those
+        state, not from being heartbeated); and a run silent for longer than a
+        board-lock holder legitimately can be — the project-checkout wait that
+        follows dispatch PLUS the agent run, both of which happen with the lock
+        already held (see _board_lock_holder_is_still_progressing). Without those
         three, the two recovery paths that DO run continuously for board locks
         (the 7200s Redis TTL and try_acquire_lock()'s 4-hour age heuristic)
         would be disabled indefinitely for a run that had already died.
@@ -9039,15 +9041,33 @@ _Repair cycle initiated by Switchyard_
         ):
             return
 
-        # create_if_missing=False: an absent Redis key on THIS path is far more
-        # likely to be a release that has just completed than a lapsed TTL —
-        # board locks are released and re-acquired constantly, from worker
-        # threads with no coupling to this sweep, and this sweep refreshes the
-        # key every HEARTBEAT_INTERVAL_SECONDS against a 7200s TTL. Letting
-        # touch_lock() re-establish it would undo that release and wedge the
-        # board behind an issue whose run has already ended.
+        # An absent Redis key here IS re-established, from touch_lock()'s own
+        # guarded re-read of the durable YAML record (found in the WI-8 review
+        # round; this call used to pass create_if_missing=False). The states
+        # that can actually reach this line are narrower than "it might be a
+        # release that just completed":
+        #
+        #   - A completed release_lock() removes BOTH stores, so
+        #     get_lock_fail_closed() above returns None and this method has
+        #     already returned at its `if not lock` check.
+        #   - A release that is only PARTWAY through — Redis key deleted, state
+        #     file not yet unlinked — is no longer observable at all:
+        #     release_lock() and touch_lock() now take the same
+        #     '<state>.yaml.acquire.lock' guard for the whole of their
+        #     two-store writes, so they cannot interleave.
+        #
+        # What is left is Redis having LOST the key under a live hold (restart
+        # without persistence, FLUSHDB, eviction) — the case this sweep exists
+        # for. Refusing to re-establish it there left the board unguarded while
+        # its holder's agent kept running: nothing else re-establishes the key
+        # (sync_yaml_locks_to_redis() is not on this path), and
+        # try_acquire_lock()'s Redis transaction reads the absent key back as
+        # an empty dict and grants the board to the next queued issue. That is
+        # the double-dispatch this sweep is here to prevent, and by this line
+        # the holder's run is already confirmed board-scoped, 'active' and
+        # still writing decision events.
         result = lock_manager.touch_lock(
-            project_name, board_name, lock.locked_by_issue, create_if_missing=False
+            project_name, board_name, lock.locked_by_issue
         )
         if result:
             logger.debug(
@@ -9063,8 +9083,9 @@ _Repair cycle initiated by Switchyard_
                 f"Board lock on {project_name}/{board_name} is no longer held by issue "
                 f"#{lock.locked_by_issue} even though its pipeline run {pipeline_run.id} "
                 f"is still active — it was released, or changed hands, between this "
-                f"sweep's read and its refresh. Nothing was re-created for it: if the "
-                f"run really is still working, it is now unguarded on this board"
+                f"sweep's read and its refresh. Nothing was re-created for it: a lock "
+                f"gone from BOTH stores is a completed release, and re-creating it "
+                f"would wedge the board behind an issue whose run has ended"
             )
         else:
             logger.warning(
@@ -9110,35 +9131,104 @@ _Repair cycle initiated by Switchyard_
         Uses the same authoritative activity heartbeat _find_stalled_issues_for_pipeline()
         uses: the most recent decision event for the run. Every phase
         transition, agent dispatch and sub-issue creation writes one, so
-        silence longer than the longest an agent may run (see
-        _max_agent_timeout_seconds(), plus one heartbeat interval of margin)
+        silence longer than a board-lock holder's longest legitimate silence
         means nothing is going to write one again.
 
-        Returns True when there is no answer to be had — _get_last_pipeline_run_event_time()
-        returns None whenever Elasticsearch is unavailable, and refusing to
-        refresh then would re-open the double-dispatch this sweep exists to
-        prevent for every ES outage. That case is bounded from the other side
-        instead: without ES, get_active_pipeline_run() resolves entirely from
-        the run blob in Redis, which a dead run stops refreshing and which
-        expires on its own within the hour.
-        """
-        from services.project_checkout_lock import HEARTBEAT_INTERVAL_SECONDS
+        That silence bound is BOTH halves of what a holder does after dispatch,
+        not just the agent run (found in the WI-8 review round, where it was
+        the agent timeout alone). claude_integration.py wraps
+        run_agent_in_container() in project_checkout_lock_async(), and that wait
+        happens with the board lock already held and emits no decision events
+        at all — _log_busy() only logs and sleeps. So a perfectly healthy
+        holder can be silent for the checkout-lock wait budget
+        (project_checkout_lock.DEFAULT_TIMEOUT_SECONDS) plus the agent's own
+        timeout. Sized at the shorter agent-only bound, this predicate stopped
+        refreshing a live holder's lock roughly 3.5h in — and its key then
+        expired under a running agent, which is the double-dispatch the sweep
+        exists to prevent. pipeline_watchdog.py already treats this same wait
+        as legitimate silence (describe_active_resource_lock_activity()); this
+        is the same carve-out, expressed as a bound.
 
-        last_event_at = self._get_last_pipeline_run_event_time(pipeline_run.id)
+        `last_event_at is None` is NOT one state but three, and they are
+        bounded differently (also found in that round):
+
+          - Elasticsearch unavailable: no answer to be had, and refusing to
+            refresh then would re-open the double-dispatch for every ES
+            outage. Bounded from the other side instead — without ES,
+            get_active_pipeline_run() resolves entirely from the run blob in
+            Redis, which a dead run stops refreshing and which expires on its
+            own within the hour. Treated as progressing.
+          - The events query FAILED with ES up: genuinely unknown, same
+            reasoning, treated as progressing — but logged at WARNING by
+            _get_last_pipeline_run_event_time_with_reason() rather than
+            swallowed at DEBUG, so "the board-lock heartbeat is pinning every
+            lock because its liveness probe is failing" is visible somewhere.
+          - ES answered with NO events for this run: that is an answer. With ES
+            up, get_active_pipeline_run() keeps returning the run from the
+            pipeline-runs-* search for as long as its doc reads 'active', so
+            the Redis-TTL bound above does not apply at all. A run whose
+            dispatch died before any emitter wrote a decision event for it (or
+            whose decision-events-* daily index has rolled off while its
+            pipeline-runs-* doc still reads 'active') would otherwise be
+            refreshed every sweep, forever. Bounded by the run's own started_at
+            — the same fallback _find_stalled_issues_for_pipeline() applies to
+            this identical ambiguity.
+        """
+        from services.project_checkout_lock import (
+            DEFAULT_TIMEOUT_SECONDS as CHECKOUT_LOCK_WAIT_BUDGET_SECONDS,
+            HEARTBEAT_INTERVAL_SECONDS,
+        )
+
+        # Imported, not restated: both halves are constants owned elsewhere and
+        # calibrated against real timeouts (agents.yaml's ceiling, and the
+        # checkout lock's own wait budget), which is the drift #146 WI-1
+        # removed everywhere else in this mechanism.
+        max_silence = (
+            self._max_agent_timeout_seconds()
+            + CHECKOUT_LOCK_WAIT_BUDGET_SECONDS
+            + HEARTBEAT_INTERVAL_SECONDS
+        )
+
+        last_event_at, reason = self._get_last_pipeline_run_event_time_with_reason(
+            pipeline_run.id
+        )
         if last_event_at is None:
-            return True
+            if reason != 'no_events':
+                # ES unavailable, or its query failed — see the docstring.
+                return True
+            started_at_str = getattr(pipeline_run, 'started_at', None)
+            if not started_at_str:
+                return True
+            try:
+                started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+            except (ValueError, TypeError, AttributeError):
+                return True
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            silence_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+            if silence_seconds <= max_silence:
+                return True
+            logger.warning(
+                f"Board lock on {project_name}/{board_name} is held by issue #{issue_number} "
+                f"whose run {pipeline_run.id} still reads '{pipeline_run.status}' but has "
+                f"NEVER written a decision event, {silence_seconds / 3600:.1f} hours after "
+                f"it started — no longer refreshing its liveness, so the board's own TTL "
+                f"and staleness recovery can reclaim it"
+            )
+            return False
+
         if last_event_at.tzinfo is None:
             last_event_at = last_event_at.replace(tzinfo=timezone.utc)
         silence_seconds = (datetime.now(timezone.utc) - last_event_at).total_seconds()
-        max_silence = self._max_agent_timeout_seconds() + HEARTBEAT_INTERVAL_SECONDS
         if silence_seconds <= max_silence:
             return True
         logger.warning(
             f"Board lock on {project_name}/{board_name} is held by issue #{issue_number} "
             f"whose run {pipeline_run.id} still reads '{pipeline_run.status}' but has "
             f"written no decision event for {silence_seconds / 3600:.1f} hours (longer "
-            f"than any agent may run) — no longer refreshing its liveness, so the "
-            f"board's own TTL and staleness recovery can reclaim it"
+            f"than any agent may run, even behind a full project-checkout lock wait) — "
+            f"no longer refreshing its liveness, so the board's own TTL and staleness "
+            f"recovery can reclaim it"
         )
         return False
 
@@ -9772,13 +9862,36 @@ _Repair cycle initiated by Switchyard_
         progress — even during in-process post-processing that has no active agent.
 
         Returns a timezone-aware datetime, or None if ES is unavailable or no events found.
+        Callers that need to tell those two apart (the board-lock heartbeat
+        pins a lock on the answer) should use
+        _get_last_pipeline_run_event_time_with_reason() instead.
+        """
+        return self._get_last_pipeline_run_event_time_with_reason(pipeline_run_id)[0]
+
+    def _get_last_pipeline_run_event_time_with_reason(self, pipeline_run_id: str):
+        """
+        _get_last_pipeline_run_event_time(), plus WHY it has no timestamp.
+
+        Added for _board_lock_holder_is_still_progressing(), which pins a board
+        lock on this answer and so cannot treat all three None cases alike (see
+        its docstring). Returns (timestamp_or_None, reason) where reason is:
+
+            'ok'              a timestamp is being returned
+            'es_unavailable'  no Elasticsearch client configured/connected
+            'query_failed'    the search raised — ES is up but did not answer
+            'no_events'       ES answered, and this run has no decision events
+
+        'query_failed' is logged at WARNING rather than DEBUG: it is the case
+        where a liveness probe is silently failing while its callers keep
+        reading the failure as "still alive", and a DEBUG line left that
+        invisible in production.
         """
         try:
             from monitoring.observability import get_observability_manager
             from datetime import datetime, timezone
             obs = get_observability_manager()
             if not obs or not getattr(obs, 'es', None):
-                return None
+                return None, 'es_unavailable'
             result = obs.es.search(
                 index="decision-events-*",
                 body={
@@ -9792,10 +9905,15 @@ _Repair cycle initiated by Switchyard_
             if hits:
                 ts = hits[0].get('_source', {}).get('timestamp')
                 if ts:
-                    return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    return datetime.fromisoformat(ts.replace('Z', '+00:00')), 'ok'
+            return None, 'no_events'
         except Exception as e:
-            logger.debug(f"Failed to get last event time for pipeline run {pipeline_run_id}: {e}")
-        return None
+            logger.warning(
+                f"Failed to get last event time for pipeline run {pipeline_run_id}: {e} — "
+                f"callers that use this as a liveness probe (stall detection, the "
+                f"board-lock heartbeat) cannot tell whether this run is progressing"
+            )
+            return None, 'query_failed'
 
     def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str,
                                             cached_items: List[ProjectItem] = None):
