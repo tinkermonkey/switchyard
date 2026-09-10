@@ -1375,10 +1375,10 @@ class TestAnUnserializableReleaseIsNotMisreportedAsARefusal(unittest.TestCase):
     then mapped to NOT_RELEASED.
 
     NOT_RELEASED means the release was CONSIDERED and correctly declined -- and
-    pipeline_progression._release_lock_and_process_next() acts on it by logging
+    pipeline_progression._release_lock_on_exit_column() acts on it by logging
     "it is held by this issue but likely retained due to a failed run ... Use
     scripts/release_lock.py to investigate" and returning without ending the
-    run or dispatching the next queued issue. That site fires only on the move
+    run. That site fires only on the move
     INTO an exit column, so it never re-fires: the board wedges until a human
     chases a durable failure record that does not exist.
     """
