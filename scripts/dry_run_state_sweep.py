@@ -22,11 +22,12 @@ What a run does, in order:
   3. Repoints every state-owning singleton at the copy (see "Repointing" below)
      and ASSERTS each one's resolved directory is under the scratch root. A
      mistake here fails loudly instead of running the sweep against production.
-  4. Runs the REAL sweep method — not a reimplementation of it — with its log
+  4. Neutralizes the effects it cannot checksum (see "External effects"), then
+     runs the REAL sweep method — not a reimplementation of it — with its log
      output captured.
-  5. Reports, per gate: records examined, how many each protection skipped and
-     why, how many reached the terminal decision, and exactly which records
-     would be mutated, named by project/issue/agent.
+  5. Reports, per RECORD: how many the sweep examined, how many each protection
+     skipped and why, how many reached the terminal decision, and exactly which
+     records would be mutated, named by project/issue/agent.
   6. Diffs the copy before/after and reports every changed file.
   7. Re-snapshots the live tree and asserts it is byte-identical, printing the
      proof (file count + aggregate manifest digest, before and after).
@@ -50,6 +51,20 @@ alone does NOT cover both:
     silently reduces a 17-project sweep to zero configured projects and makes
     every lock/queue protection degrade to "could not load project config".
     --config-root repoints it at the deployment's config by default.
+  * Some writers build a path relative to the process CWD rather than any root
+    at all (`services/review_cycle.py` does `os.path.join('state', ...)`), so
+    the sweep runs with the CWD set to the scratch root.
+
+External effects — the harness checksums `state/` and nothing else, so anything
+a sweep writes elsewhere is, by construction, something it cannot prove it left
+alone. Both registered sweeps write to production Redis and to the production
+observability stream; the stuck sweep's Redis writes include DELETING a real
+agent's persisted result. Those effects are therefore NEUTRALIZED by default:
+Redis reads still go to the live server (so every guard sees the truth it would
+see in production), Redis WRITES are intercepted and recorded, and observability
+emission is replaced by a recorder. Section 4b of the report lists exactly what
+was intercepted. `--no-neutralize-external-effects` runs them for real, and then
+a sweep with declared writes is refused unless `--allow-external-side-effects`.
 
 Usage:
     python scripts/dry_run_state_sweep.py --list
@@ -60,14 +75,19 @@ Usage:
 Exit codes:
     0  the sweep ran and the live tree is byte-identical
     1  a hard failure: copy verification failed, a manager resolved to a live
-       path, or a file the sweep mutated in the copy ALSO changed live (a leak)
+       path, or the sweep's own work showed up in the live tree (a leak)
     2  usage error
-    3  the live tree drifted in ways not attributable to this run (the
-       orchestrator is running and writing its own state). Pass
-       --allow-concurrent-writes to treat that as success; it is still printed.
+    3  the run could not be verified: the live tree drifted in ways not
+       attributable to this run (the orchestrator is running and writing its own
+       state), or a file could not be read. Pass --allow-concurrent-writes to
+       treat drift OUTSIDE the sweep's own subtrees as success; drift INSIDE
+       them cannot be distinguished from a leak by path and is never downgraded.
+    4  the sweep itself raised. Steps 5-7 still ran and are printed, so the
+       live-tree proof for the partial run is still available.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
@@ -76,7 +96,7 @@ import re
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -91,6 +111,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # inside a function, after the repoint.
 
 _HASH_CHUNK = 1024 * 1024
+
+#  Every sweep message that names a record names it the same way. Attributing
+#  log lines to RECORDS rather than counting lines is what keeps the per-gate
+#  table and the residual arithmetic honest: several protections log an
+#  annotation and then fall through to a later gate, so one record legitimately
+#  produces two or three lines.
+_RECORD_KEY_RE = re.compile(r'([A-Za-z0-9_.\-]+)/#(\d+)')
 
 logger = logging.getLogger('dry_run_state_sweep')
 
@@ -114,8 +141,10 @@ class Gate:
     why: str
     patterns: Tuple[str, ...]
     #  Some lines report that a protection did not run at all (a degraded
-    #  lock/queue read). Those are counted separately: they are not skips, they
-    #  are missing safety.
+    #  lock/queue read) or annotate a record another gate goes on to skip.
+    #  Those are counted separately and are NEVER summed into the accounting:
+    #  they are not dispositions, they are missing safety on a record some
+    #  other bucket already owns.
     degradation: bool = False
 
 
@@ -135,15 +164,33 @@ class SweepSpec:
     gates: Tuple[Gate, ...]
     # Regexes with one numeric group naming how many records the sweep examined.
     examined_patterns: Tuple[str, ...]
-    # Regexes marking a record reaching the sweep's terminal decision.
+    # Regexes marking a record reaching the sweep's terminal decision. These
+    # MUST match a line the sweep logs AFTER every guard -- a pre-guard line
+    # reports candidates entering the chain, not decisions, and counting it here
+    # inflates the one number an operator uses to size the blast radius.
     terminal_patterns: Tuple[str, ...]
+    # Regexes marking a record ENTERING the guard chain. Reported separately, so
+    # a candidate that leaves the chain through a bare `continue` shows up as
+    # "entered and left undecided" rather than as "never a candidate".
+    candidate_patterns: Tuple[str, ...] = ()
     loggers: Tuple[str, ...] = ('services.work_execution_state',)
-    # Effects outside state/ that a run has. Reads are informational; writes
-    # require --allow-external-side-effects, because a harness whose whole
-    # purpose is "prove nothing was touched" must not quietly touch something
-    # it does not checksum.
+    # Effects outside state/ that a run has. Reads are informational; writes are
+    # neutralized by default (see the module docstring) and, when neutralization
+    # is turned off, require --allow-external-side-effects, because a harness
+    # whose whole purpose is "prove nothing was touched" must not quietly touch
+    # something it does not checksum.
     external_reads: Tuple[str, ...] = ()
     external_writes: Tuple[str, ...] = ()
+    # Subdirectories of state/ this sweep writes. ANY live change under one of
+    # these is treated as unverifiable rather than as third-party drift: a sweep
+    # that escapes its isolation writes ONLY the live path and never the copy,
+    # so a path-intersection leak test cannot see it.
+    owned_state_subtrees: Tuple[str, ...] = ()
+    # Guards that read in-process state owned by the RUNNING orchestrator (an
+    # in-memory dict on a singleton). A fresh harness process sees them empty by
+    # construction, so they can never fire here and the dry run is strictly LESS
+    # protected than production for the records they would have skipped.
+    inert_guards: Tuple[str, ...] = ()
 
 
 def _build_execution_tracker(scratch_state_root: Path):
@@ -232,6 +279,11 @@ _EMPTY_OUTPUT_GATES: Tuple[Gate, ...] = (
 
 _STUCK_IN_PROGRESS_GATES: Tuple[Gate, ...] = (
     Gate(
+        name='GUARD: cleanup already claimed',
+        why='another cleanup mechanism holds the coordination claim for this issue',
+        patterns=(r'Cleanup for \S+/#\d+ already claimed by',),
+    ),
+    Gate(
         name='GUARD: already in pipeline queue',
         why='the issue is queued, so the in_progress entry is not orphaned',
         patterns=(r'is in pipeline queue, skipping stuck state cleanup',),
@@ -247,11 +299,29 @@ _STUCK_IN_PROGRESS_GATES: Tuple[Gate, ...] = (
         patterns=(r'has active review cycle .* skipping stuck state cleanup',),
     ),
     Gate(
+        name='GUARD: active feedback loop',
+        why='a running human feedback loop owns this execution',
+        patterns=(r'has active feedback loop - skipping stuck state cleanup',),
+    ),
+    Gate(
+        name='GUARD: a guard raised, record skipped (fail-safe)',
+        why=(
+            'the lock / review-cycle / feedback-loop guard could not be evaluated, so the '
+            'record was SKIPPED rather than cleaned up -- the safest outcome, not a degradation'
+        ),
+        patterns=(
+            r'Failed to check (pipeline lock|review cycle state|feedback loop state) for',
+        ),
+    ),
+    Gate(
         name='DEGRADED: a guard could not be evaluated',
-        why='the guard raised and the sweep continued WITHOUT it',
+        why=(
+            'the queue check or the cleanup claim raised and the sweep continued WITHOUT '
+            'that protection -- these two fall through rather than skipping'
+        ),
         patterns=(
             r'Cleanup guard unavailable, proceeding without coordination',
-            r'Failed to check (pipeline queue|pipeline lock|review cycle state)',
+            r'Failed to check pipeline queue',
         ),
         degradation=True,
     ),
@@ -276,6 +346,16 @@ SWEEPS: Dict[str, SweepSpec] = {
         external_reads=(
             'GitHub GraphQL/REST (issue comments), once per record that reaches PROTECTION 6',
         ),
+        external_writes=(
+            'Observability: EventType.RETRY_ATTEMPTED per record that reaches the terminal '
+            'decision, into the production event stream and Elasticsearch '
+            '(services/work_execution_state.py, end of the retry branch). Inert while #166 '
+            'keeps the last gate closed -- and fired once per candidate on the very run that '
+            'dry-runs the FIXED sweep, which is what this harness is for',
+            'Redis: the GitHub API client caches its issue-comment reads, so PROTECTION 6 '
+            'writes cache entries in the production Redis',
+        ),
+        owned_state_subtrees=('execution_history',),
     ),
     'stuck_in_progress': SweepSpec(
         name='stuck_in_progress',
@@ -288,12 +368,41 @@ SWEEPS: Dict[str, SweepSpec] = {
         run=lambda m: m.cleanup_stuck_in_progress_states(),
         gates=_STUCK_IN_PROGRESS_GATES,
         examined_patterns=(r'Checking (\d+) execution state files for stuck in_progress',),
-        terminal_patterns=(r'Found stuck in_progress execution:',),
-        external_reads=('docker ps, once per candidate record',),
+        # Both terminal lines are logged only after every guard has passed. The
+        # 'Found stuck in_progress execution:' line is logged BEFORE the claim
+        # and before all five guards, so it is a candidate marker, not a
+        # decision -- counting it as terminal reported every skipped record as
+        # one the sweep would rewrite.
+        terminal_patterns=(
+            r'Marked stuck execution as failed:',
+            r'Reconciled successful execution from Redis:',
+        ),
+        candidate_patterns=(r'Found stuck in_progress execution:',),
+        loggers=('services.work_execution_state', 'services.cleanup_guard'),
+        external_reads=('docker ps / docker inspect, once per candidate record',),
         external_writes=(
             'Redis: services.cleanup_guard.try_claim_cleanup() sets a claim key per '
-            'candidate, in the PRODUCTION Redis, which suppresses the real sweep for '
-            'the claim TTL',
+            'candidate, in the PRODUCTION Redis, which suppresses the real sweep for the '
+            'claim TTL -- and suppresses a SECOND dry run within that TTL, which would then '
+            'report the sweep as inert',
+            'Redis: DELETES agent_result:{project}:{issue}:{task_id} after applying a '
+            'recovered result (_apply_redis_result). Destructive and irreversible: the dry '
+            'run consumes a real agent outcome, and the real sweep then finds nothing and '
+            "marks that execution 'failure', losing a successful run's recorded outcome",
+            'Redis: DELETES repair_cycle:container:{project}:{issue} on the orphaned-tracking '
+            'branch',
+            "Redis: _repair_missing_redis_tracking() re-registers agent:container:{name} "
+            "with hset (repaired='true', started_at reset to now) against a live container",
+            'Observability: emit_execution_state_reconciled / emit_error_decision '
+            '(ExecutionContainerLost) / PIPELINE_RUN_FAILED, into the production decision and '
+            'lifecycle indices, which the web UI and pattern detection consume as real',
+        ),
+        owned_state_subtrees=('execution_history', 'dev_containers'),
+        inert_guards=(
+            'active review cycle (review_cycle_executor.active_cycles is an in-memory dict '
+            'on the running orchestrator; empty in this process, so the guard cannot fire)',
+            'active human feedback loop (human_feedback_loop_executor.active_loops, same '
+            'shape, same consequence)',
         ),
     ),
 }
@@ -313,13 +422,21 @@ def file_digest(path: Path) -> str:
     return h.hexdigest()
 
 
-def snapshot_tree(root: Path) -> Dict[str, Tuple[int, str]]:
+def snapshot_tree(root: Path, unreadable: Optional[List[str]] = None) -> Dict[str, Tuple[int, str]]:
     """Map every regular file under `root` to (size, sha256), keyed by relpath.
 
     Symlinks are followed only when they resolve to a regular file inside the
     tree; anything else (sockets, dangling links) is skipped rather than made
     fatal -- state/ is a bind-mounted host directory and this must not become
     the reason a dry run cannot be attempted.
+
+    A file that VANISHES mid-walk is a concurrent write by the running
+    orchestrator and is dropped silently; the before/after comparison reports it
+    as removed. A file that cannot be READ is a different thing entirely -- a
+    root-owned file in the bind mount, an ACL, an EIO -- and it is appended to
+    `unreadable` rather than dropped, because a file absent from BOTH the before
+    and the after manifest is invisible to every check in this harness while the
+    verdict still says the tree is byte-identical.
     """
     manifest: Dict[str, Tuple[int, str]] = {}
     root = Path(root)
@@ -328,10 +445,20 @@ def snapshot_tree(root: Path) -> Dict[str, Tuple[int, str]]:
             if not path.is_file():
                 continue
             manifest[str(path.relative_to(root))] = (path.stat().st_size, file_digest(path))
-        except (FileNotFoundError, PermissionError, OSError):
-            # A file that vanished mid-walk is a concurrent write by the running
-            # orchestrator; recorded as absent, and the before/after comparison
-            # reports it as such.
+        except FileNotFoundError:
+            # Vanished mid-walk: a concurrent write by the running orchestrator.
+            continue
+        except (PermissionError, OSError) as e:
+            try:
+                relpath = str(path.relative_to(root))
+            except ValueError:  # pragma: no cover - rglob always yields children
+                relpath = str(path)
+            logger.warning(
+                f'Could not read {path} while snapshotting {root} -- it is in NEITHER '
+                f'the before nor the after manifest, so no check in this run covers it: {e}'
+            )
+            if unreadable is not None:
+                unreadable.append(relpath)
             continue
     return manifest
 
@@ -427,6 +554,14 @@ class IsolationError(RuntimeError):
     """
 
 
+class ExternalWriteRefused(RuntimeError):
+    """The sweep writes outside state/ and nothing was going to stop it.
+
+    Raised from run_dry_run() rather than only checked in main(), so a
+    programmatic caller cannot get past the gate the CLI enforces.
+    """
+
+
 def is_under(path: Path, root: Path) -> bool:
     """True when `path` is `root` or lives inside it."""
     try:
@@ -497,13 +632,32 @@ def repoint_runtime(scratch_root: Path, config_root: Path) -> Dict[str, str]:
 
 
 #  (module, singleton attribute, path attribute, subdirectory of state/)
+#
+#  The first three bind at IMPORT time. The last two are lazy module globals
+#  that are None until something calls their getter -- which is harmless in a
+#  fresh process (the getter reads ORCHESTRATOR_ROOT, already repointed by
+#  then), and is exactly the hazard this list exists for in a process that
+#  called the getter before run_dry_run().
 _RUNTIME_SINGLETONS: Tuple[Tuple[str, str, str, str], ...] = (
     ('services.work_execution_state', 'work_execution_tracker', 'state_dir', 'execution_history'),
     ('services.dev_container_state', 'dev_container_state', 'state_dir', 'dev_containers'),
+    (
+        'services.conversational_session_state',
+        'conversational_session_state',
+        'state_dir',
+        'conversational_sessions',
+    ),
+    ('services.pipeline_lock_manager', '_pipeline_lock_manager', 'state_dir', 'pipeline_locks'),
+    (
+        'services.pipeline_semaphore_manager',
+        '_pipeline_semaphore_manager',
+        'state_dir',
+        'pipeline_semaphores',
+    ),
 )
 
 
-def bind_runtime_singletons(scratch_root: Path) -> Dict[str, str]:
+def bind_runtime_singletons(scratch_root: Path) -> Tuple[Dict[str, str], List[Tuple[str, str]]]:
     """Point the import-time singletons at the copy, forcing any that predate it.
 
     These bind ORCHESTRATOR_ROOT the moment their module is imported, so in this
@@ -514,21 +668,39 @@ def bind_runtime_singletons(scratch_root: Path) -> Dict[str, str]:
     live tree for anything running inside the orchestrator container. Those are
     rewritten in place rather than merely reported: an isolation check that a
     caller can defeat by importing a module in the wrong order is not a check.
+
+    Returns (resolved, unbound). A singleton whose module will not import is
+    reported in `unbound` rather than swallowed at DEBUG -- an isolation section
+    that quietly omits a path is the wrong-but-plausible reassurance this
+    harness exists to make impossible.
     """
     import importlib
 
     resolved: Dict[str, str] = {}
+    unbound: List[Tuple[str, str]] = []
 
     for module_name, singleton_name, path_attr, subdir in _RUNTIME_SINGLETONS:
+        label = f'{module_name}.{singleton_name}.{path_attr}'
         try:
             module = importlib.import_module(module_name)
-            singleton = getattr(module, singleton_name)
         except Exception as e:  # pragma: no cover - optional dependency chain
-            logger.debug(f"{module_name}.{singleton_name} not importable, not bound: {e}")
+            unbound.append((label, f'import failed: {e}'))
             continue
 
-        label = f'{module_name}.{singleton_name}.{path_attr}'
-        current = Path(getattr(singleton, path_attr))
+        singleton = getattr(module, singleton_name, None)
+        if singleton is None:
+            # A lazy getter's cache that nothing has populated. Nothing to
+            # repoint, and forcing construction here would create state
+            # directories a sweep may never touch.
+            resolved[label] = 'not constructed (lazy singleton, unset in this process)'
+            continue
+
+        try:
+            current = Path(getattr(singleton, path_attr))
+        except (AttributeError, TypeError) as e:
+            unbound.append((label, f'no usable {path_attr}: {e}'))
+            continue
+
         if not is_under(current, scratch_root):
             forced = scratch_root / 'state' / subdir
             forced.mkdir(parents=True, exist_ok=True)
@@ -544,7 +716,224 @@ def bind_runtime_singletons(scratch_root: Path) -> Dict[str, str]:
 
     resolved['config.state_manager.state_manager.state_root'] = str(state_manager.state_root)
 
-    return resolved
+    return resolved, unbound
+
+
+# ---------------------------------------------------------------------------
+# External-effect neutralization
+# ---------------------------------------------------------------------------
+
+
+#  Redis commands that only READ. Everything else is neutralized, so a command
+#  nobody thought of is intercepted rather than executed -- the fail-safe
+#  direction for a harness whose claim is "nothing outside state/ was written".
+#  Reads still go to the live server on purpose: a guard that reads an empty
+#  scratch Redis answers "no lock, not queued, no tracking", which makes the dry
+#  run strictly LESS protected than production, which is the opposite of useful.
+_REDIS_READ_COMMANDS = frozenset({
+    'get', 'mget', 'exists', 'keys', 'scan', 'scan_iter', 'type', 'ttl', 'pttl',
+    'strlen', 'getrange', 'randomkey', 'dbsize', 'ping', 'info', 'config_get',
+    'hget', 'hgetall', 'hkeys', 'hvals', 'hexists', 'hlen', 'hmget', 'hscan',
+    'hscan_iter', 'hrandfield',
+    'lrange', 'llen', 'lindex', 'lpos',
+    'smembers', 'sismember', 'scard', 'sscan', 'sscan_iter', 'srandmember',
+    'zrange', 'zrevrange', 'zrangebyscore', 'zscore', 'zcard', 'zcount', 'zscan',
+    'xrange', 'xrevrange', 'xlen', 'xinfo_stream',
+    'memory_usage', 'object', 'client_getname', 'connection_pool',
+})
+
+#  What a neutralized write returns. Chosen so the sweep proceeds exactly as it
+#  would on a first real run -- try_claim_cleanup()'s SET NX must look like it
+#  claimed, or every candidate would be reported as skipped-by-claim.
+_NEUTRALIZED_REDIS_RETURNS: Dict[str, Any] = {
+    'set': True, 'setex': True, 'setnx': True, 'mset': True, 'getset': None,
+    'delete': 0, 'unlink': 0, 'expire': True, 'pexpire': True, 'persist': True,
+    'hset': 0, 'hmset': True, 'hdel': 0, 'hincrby': 0, 'incr': 0, 'decr': 0,
+    'lpush': 0, 'rpush': 0, 'lpop': None, 'rpop': None, 'ltrim': True, 'lrem': 0,
+    'sadd': 0, 'srem': 0, 'zadd': 0, 'zrem': 0, 'publish': 0, 'xadd': '0-0',
+    'xtrim': 0, 'rename': True, 'flushdb': True,
+}
+
+#  Module globals that cache a Redis client across calls. A client built before
+#  the patch went in would bypass it entirely, so they are cleared for the
+#  duration of the sweep and restored afterwards.
+_CACHED_REDIS_CLIENT_GLOBALS: Tuple[Tuple[str, str], ...] = (
+    ('services.cleanup_guard', '_redis_client'),
+    ('services.github_api_client', '_shared_redis_client'),
+)
+
+
+@dataclass
+class ExternalEffectRecorder:
+    """Everything the sweep tried to do outside state/, and did not get to do."""
+
+    redis_writes: List[Dict[str, Any]] = field(default_factory=list)
+    observability_events: List[Dict[str, Any]] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    def record_redis(self, command: str, args: Tuple[Any, ...]) -> None:
+        self.redis_writes.append(
+            {'command': command, 'key': str(args[0]) if args else None}
+        )
+
+    def record_event(self, event_type: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+        self.observability_events.append(
+            {
+                'event_type': getattr(event_type, 'value', str(event_type)),
+                'project': kwargs.get('project') or (args[2] if len(args) > 2 else None),
+            }
+        )
+
+    def summary(self) -> Dict[str, Any]:
+        def _tally(rows: List[Dict[str, Any]], key: str) -> Dict[str, int]:
+            counts: Dict[str, int] = {}
+            for row in rows:
+                counts[str(row.get(key))] = counts.get(str(row.get(key)), 0) + 1
+            return dict(sorted(counts.items()))
+
+        return {
+            'redis_writes': {
+                'total': len(self.redis_writes),
+                'by_command': _tally(self.redis_writes, 'command'),
+                'samples': self.redis_writes[:20],
+            },
+            'observability_events': {
+                'total': len(self.observability_events),
+                'by_type': _tally(self.observability_events, 'event_type'),
+                'samples': self.observability_events[:20],
+            },
+            'notes': list(self.notes),
+        }
+
+
+def _make_neutralized_redis_class(real_cls, recorder: ExternalEffectRecorder):
+    """A redis client that reads production and writes nowhere.
+
+    Deliberately a CLASS, not a factory function: `redis.Redis` appears in type
+    annotations evaluated at import time (`Optional[redis.Redis]` in
+    services/pipeline_run.py and friends), and `Optional[<function>]` raises.
+    """
+
+    class NeutralizedRedis:
+        def __init__(self, *args, **kwargs):
+            self._delegate = real_cls(*args, **kwargs)
+
+        def __getattr__(self, name):
+            attribute = getattr(self._delegate, name)
+            if name in _REDIS_READ_COMMANDS or not callable(attribute):
+                return attribute
+
+            def _neutralized(*args, **kwargs):
+                recorder.record_redis(name, args)
+                return _NEUTRALIZED_REDIS_RETURNS.get(name)
+
+            return _neutralized
+
+    return NeutralizedRedis
+
+
+class _RecordingObservability:
+    """Stands in for ObservabilityManager: records emissions, publishes none."""
+
+    def __init__(self, recorder: ExternalEffectRecorder):
+        self._recorder = recorder
+        self.es = None
+        self.redis = None
+
+    def emit(self, event_type, *args, **kwargs):
+        self._recorder.record_event(event_type, args, kwargs)
+
+    def __getattr__(self, name):
+        def _noop(*args, **kwargs):
+            self._recorder.notes.append(f'observability.{name}() called and suppressed')
+            return None
+
+        return _noop
+
+
+@contextlib.contextmanager
+def neutralize_external_effects(enabled: bool):
+    """Intercept the writes this harness cannot checksum, for the sweep's run.
+
+    Two independent patches, because the two sweeps reach production two ways:
+    Redis (claim keys, the destructive agent_result delete, repair-cycle keys,
+    container tracking) and the observability manager (decision events and
+    pipeline lifecycle events, into the live stream and Elasticsearch).
+
+    Redis is patched at `redis.Redis`, so every construction site -- all of them
+    build their client inline with a hardcoded host -- picks up the wrapper.
+    Observability is patched twice on purpose: get_observability_manager() so no
+    real manager (and no ES client) is built at all, and ObservabilityManager.emit
+    so a manager some other module already holds is covered too.
+    """
+    recorder = ExternalEffectRecorder()
+    if not enabled:
+        recorder.notes.append(
+            'NEUTRALIZATION OFF -- every effect below reached production for real'
+        )
+        yield recorder
+        return
+
+    with contextlib.ExitStack() as stack:
+        try:
+            import redis
+        except Exception as e:  # pragma: no cover - redis is a hard dependency in prod
+            recorder.notes.append(f'redis not importable, no Redis writes intercepted: {e}')
+        else:
+            for attribute in ('Redis', 'StrictRedis'):
+                real_cls = getattr(redis, attribute, None)
+                if real_cls is None:  # pragma: no cover - both exist in redis-py
+                    continue
+                stack.enter_context(
+                    _patched(redis, attribute, _make_neutralized_redis_class(real_cls, recorder))
+                )
+
+        for module_name, attribute in _CACHED_REDIS_CLIENT_GLOBALS:
+            module = sys.modules.get(module_name)
+            if module is not None and getattr(module, attribute, None) is not None:
+                recorder.notes.append(
+                    f'{module_name}.{attribute} already held a live Redis client; cleared '
+                    f'for the run so it is rebuilt through the interception'
+                )
+                stack.enter_context(_patched(module, attribute, None))
+
+        try:
+            from monitoring import observability as observability_module
+        except Exception as e:  # pragma: no cover - optional dependency chain
+            recorder.notes.append(
+                f'monitoring.observability not importable, no events intercepted: {e}'
+            )
+        else:
+            stub = _RecordingObservability(recorder)
+            stack.enter_context(
+                _patched(observability_module, 'get_observability_manager', lambda: stub)
+            )
+            stack.enter_context(
+                _patched(
+                    observability_module.ObservabilityManager,
+                    'emit',
+                    lambda _self, event_type, *args, **kwargs: recorder.record_event(
+                        event_type, args, kwargs
+                    ),
+                )
+            )
+
+        yield recorder
+
+
+@contextlib.contextmanager
+def _patched(target: Any, attribute: str, replacement: Any):
+    """setattr for the duration of the block, restoring what was there."""
+    sentinel = object()
+    previous = getattr(target, attribute, sentinel)
+    setattr(target, attribute, replacement)
+    try:
+        yield
+    finally:
+        if previous is sentinel:  # pragma: no cover - every patched attr exists
+            delattr(target, attribute)
+        else:
+            setattr(target, attribute, previous)
 
 
 # ---------------------------------------------------------------------------
@@ -573,23 +962,50 @@ class _CapturingHandler(logging.Handler):
         self.records.append((record.name, record.levelname, message))
 
 
+def _record_key(message: str, line_index: int) -> str:
+    """The <project>/#<issue> a message names, or a unique stand-in.
+
+    A message with no record in it (the per-state-file "could not load project
+    config" warning is the live example) gets a key nothing else can collide
+    with, so it counts as exactly one unit and never merges with another line.
+    """
+    match = _RECORD_KEY_RE.search(message)
+    if match:
+        return f'{match.group(1)}/#{match.group(2)}'
+    return f'<unattributed line {line_index}>'
+
+
 def classify_records(
     spec: SweepSpec, records: List[Tuple[str, str, str]]
 ) -> Dict[str, Any]:
-    """Bucket captured log lines by gate, and pull out the sweep's own counts."""
+    """Bucket the sweep's log lines by gate, attributing them to RECORDS.
+
+    Counting lines instead of records is what made the residual arithmetic
+    nonsense: several protections log an annotation ("could not date this one",
+    "project config unavailable", "PROTECTION 2 failed") and then fall THROUGH
+    to a later gate, so a single record legitimately produces two or three
+    lines. Each record is counted once, against the first non-degradation gate
+    it hits; degradations are an overlay that is reported and never summed.
+    """
     compiled = [
         (gate, tuple(re.compile(p) for p in gate.patterns)) for gate in spec.gates
     ]
     examined_res = [re.compile(p) for p in spec.examined_patterns]
     terminal_res = [re.compile(p) for p in spec.terminal_patterns]
+    candidate_res = [re.compile(p) for p in spec.candidate_patterns]
 
     gate_hits: Dict[str, List[str]] = {gate.name: [] for gate in spec.gates}
+    gate_records: Dict[str, set] = {gate.name: set() for gate in spec.gates}
+    attributed: Dict[str, str] = {}
+    multi_gate: Dict[str, List[str]] = {}
     examined: Optional[int] = None
     terminal: List[str] = []
+    terminal_records: set = set()
+    candidate_records: set = set()
     errors: List[str] = []
     unclassified: List[str] = []
 
-    for _name, level, message in records:
+    for index, (_name, level, message) in enumerate(records):
         if examined is None:
             match = next(
                 (m for m in (p.search(message) for p in examined_res) if m), None
@@ -598,13 +1014,30 @@ def classify_records(
                 examined = int(match.group(1))
                 continue
 
+        key = _record_key(message, index)
+
+        if any(pattern.search(message) for pattern in candidate_res):
+            candidate_records.add(key)
+            continue
+
         if any(pattern.search(message) for pattern in terminal_res):
             terminal.append(message)
+            terminal_records.add(key)
             continue
 
         for gate, patterns in compiled:
             if any(pattern.search(message) for pattern in patterns):
                 gate_hits[gate.name].append(message)
+                if gate.degradation:
+                    gate_records[gate.name].add(key)
+                elif key in attributed and attributed[key] != gate.name:
+                    # Two skip gates for one record: only one of them decided
+                    # its fate, and summing both is how the residual went
+                    # negative. Counted once, surfaced as an anomaly.
+                    multi_gate.setdefault(key, [attributed[key]]).append(gate.name)
+                else:
+                    attributed[key] = gate.name
+                    gate_records[gate.name].add(key)
                 break
         else:
             if level in ('ERROR', 'CRITICAL'):
@@ -617,7 +1050,14 @@ def classify_records(
     return {
         'examined': examined,
         'gate_hits': gate_hits,
+        'gate_records': {name: sorted(keys) for name, keys in gate_records.items()},
         'terminal': terminal,
+        'terminal_records': sorted(terminal_records),
+        'candidate_records': sorted(candidate_records),
+        'undecided_candidates': sorted(
+            candidate_records - terminal_records - set(attributed)
+        ),
+        'multi_gate_records': {key: gates for key, gates in sorted(multi_gate.items())},
         'errors': errors,
         'unclassified': unclassified,
     }
@@ -697,6 +1137,54 @@ def describe_execution_record_changes(
     return described
 
 
+def _mutation_fingerprints(entries: List[Dict[str, Any]]) -> set:
+    """(project, issue, agent, index, changed fields) for every described change.
+
+    A leak that lands at a DIFFERENT relpath than the copy's is invisible to a
+    path intersection, so attribution falls back to content: a live record whose
+    delta is the same decision the sweep made in the copy is this run's work,
+    wherever it was written.
+    """
+    fingerprints = set()
+    for entry in entries:
+        for change in entry.get('record_changes') or []:
+            fields = tuple(
+                (key, repr(delta.get('before')), repr(delta.get('after')))
+                for key, delta in sorted((change.get('fields') or {}).items())
+            )
+            if not fields:
+                continue
+            fingerprints.add(
+                (
+                    entry.get('project'),
+                    entry.get('issue_number'),
+                    change.get('agent'),
+                    change.get('index'),
+                    fields,
+                )
+            )
+    return fingerprints
+
+
+def _is_under_subtree(relpath: str, subtrees: Tuple[str, ...]) -> bool:
+    return any(relpath == s or relpath.startswith(s + '/') for s in subtrees)
+
+
+def _is_lock_artifact(relpath: str) -> bool:
+    """A `<state file>.lock` flock target, not state.
+
+    utils.file_lock creates one beside every state file it locks and leaves it
+    there, so the copy grows a set of them on every run and the live tree grows
+    the same set whenever the orchestrator touches the same records. They carry
+    no work, they collide by relpath by construction, and counting a collision
+    as a leak would make exit 1 the routine outcome of the harness's primary use
+    -- an operator who learns to ignore exit 1 has lost the whole check. They
+    stay in the manifests (so the digests still cover every byte) and are listed
+    separately in the report; they are just not evidence of anything.
+    """
+    return relpath.endswith('.lock')
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -734,45 +1222,114 @@ def print_report(report: Dict[str, Any]) -> None:
         _out(f"UNSTABLE mid-copy (never hashed the same twice): {len(copy_info['unstable'])}")
         for relpath in copy_info['unstable'][:20]:
             _out(f"    - {relpath}")
+    unreadable = report.get('unreadable') or []
+    if unreadable:
+        _out(f"UNREADABLE, in no manifest and covered by no check: {len(unreadable)}")
+        for relpath in unreadable[:20]:
+            _out(f"    - {relpath}")
     _out(f"VERDICT: {copy_info['verdict']}")
 
     _rule('3. ISOLATION')
     for label, path in sorted(report['isolation'].items()):
         _out(f"  {label} = {path}")
+    for label, reason in report.get('isolation_unbound') or []:
+        _out(f"  {label} = NOT BOUND ({reason})")
     _out(f"VERDICT: {report['isolation_verdict']}")
 
-    _rule('4-5. SWEEP RESULT, PER GATE')
+    inert = report.get('inert_guards') or []
+    if inert:
+        _rule('3b. GUARDS THAT CANNOT FIRE IN THIS PROCESS')
+        _out('  These guards read in-memory state owned by the RUNNING orchestrator. This')
+        _out('  is a fresh process, so they see it empty and can never fire. For any record')
+        _out('  they would have protected, THIS DRY RUN IS LESS PROTECTED THAN PRODUCTION:')
+        _out('  it walks past that record and on into the sweep\'s decision path.')
+        for note in inert:
+            _out(f"    - {note}")
+
+    _rule('4. SWEEP EXECUTION')
     _out(f"sweep return value          : {report['sweep_return']!r}")
     _out(f"state files present in copy : {report['state_files_in_copy']}")
-    examined = report['classification']['examined']
+    if report.get('sweep_error'):
+        _out()
+        _out(f"  !! THE SWEEP RAISED: {report['sweep_error']}")
+        _out('  The run is partial. Steps 5-7 below still ran, so the live-tree proof')
+        _out('  covers whatever the sweep managed to do before it raised.')
+
+    _rule('4b. EXTERNAL EFFECTS (outside state/, not checksummed)')
+    effects = report['external_effects']
+    _out(f"  neutralized by this run : {effects['neutralized']}")
+    for note in effects['declared_reads']:
+        _out(f"  reads  : {note}")
+    for note in effects['declared_writes']:
+        _out(f"  WRITES : {note}")
+    _out()
+    redis_writes = effects['redis_writes']
+    _out(f"  Redis writes intercepted        : {redis_writes['total']}")
+    for command, count in redis_writes['by_command'].items():
+        _out(f"      {count:>6}  {command}")
+    for sample in redis_writes['samples']:
+        _out(f"        e.g. {sample['command']} {sample['key']}")
+    events = effects['observability_events']
+    _out(f"  observability events intercepted: {events['total']}")
+    for event_type, count in events['by_type'].items():
+        _out(f"      {count:>6}  {event_type}")
+    for note in effects['notes']:
+        _out(f"  note: {note}")
+
+    _rule('5. SWEEP RESULT, PER RECORD')
+    classification = report['classification']
+    examined = classification['examined']
     _out(f"records examined (sweep's own count) : "
          f"{examined if examined is not None else 'not reported by this sweep'}")
+    if classification.get('candidate_records'):
+        _out(f"records that entered the guard chain : "
+             f"{len(classification['candidate_records'])}")
+    _out()
+    _out('  counts below are DISTINCT RECORDS, not log lines: a record is counted once,')
+    _out('  against the first protection that skipped it.')
     _out()
     for gate in report['gates']:
-        marker = 'DEGRADED' if gate['degradation'] else 'skipped '
+        marker = 'annot.  ' if gate['degradation'] else 'skipped '
         _out(f"  {marker} {gate['count']:>6}  {gate['name']}")
         _out(f"           {'':>6}  why: {gate['why']}")
+        if gate['degradation']:
+            _out(f"           {'':>6}  (an annotation, not a disposition -- these records are")
+            _out(f"           {'':>6}   also counted under whichever gate actually skipped them,")
+            _out(f"           {'':>6}   and are never summed into the accounting below)")
     _out()
+    undecided = classification.get('undecided_candidates') or []
+    if undecided:
+        _out(f"  {len(undecided):>6}  entered the guard chain and left it with no named gate and no")
+        _out(f"          terminal decision -- a bare `continue` somewhere in the chain (e.g. a")
+        _out(f"          cleanup claim taken by another mechanism). NOT 'never a candidate'.")
     unaccounted = report.get('unaccounted')
     if unaccounted is not None:
         _out(f"  {unaccounted:>6}  dropped before the first named gate by the sweep's own "
              f"pre-gate filters (e.g. 'last execution is not a success') -- NOT protected, "
              f"just never a candidate")
+    if report.get('accounting_anomaly'):
+        _out(f"  !! ACCOUNTING ANOMALY: {report['accounting_anomaly']}")
+    if classification.get('multi_gate_records'):
+        _out(f"  !! {len(classification['multi_gate_records'])} record(s) matched more than one "
+             f"skip gate; each is counted once, against the first:")
+        for key, gates in list(classification['multi_gate_records'].items())[:20]:
+            _out(f"      {key}: {' , '.join(gates)}")
     _out()
-    _out(f"  reached terminal decision: {len(report['classification']['terminal'])}")
-    for message in report['classification']['terminal'][:50]:
+    _out(f"  reached terminal decision: {len(classification['terminal_records'])} record(s), "
+         f"{len(classification['terminal'])} log line(s)")
+    for message in classification['terminal'][:50]:
         _out(f"      * {message}")
-    if report['classification']['errors']:
+    if classification['errors']:
         _out()
-        _out(f"  ERRORS raised inside the sweep: {len(report['classification']['errors'])}")
-        for message in report['classification']['errors'][:20]:
+        _out(f"  ERRORS raised inside the sweep: {len(classification['errors'])}")
+        for message in classification['errors'][:20]:
             _out(f"      ! {message}")
-    if report['classification']['unclassified']:
+    if classification['unclassified']:
         _out()
         _out(f"  unclassified sweep log lines: "
-             f"{len(report['classification']['unclassified'])} (shown verbatim so "
+             f"{len(classification['unclassified'])} (shown verbatim so "
              f"nothing hides in a bucket that does not exist yet)")
-        for message in report['classification']['unclassified'][:20]:
+        for message in classification['unclassified'][:20]:
             _out(f"      ? {message}")
 
     _rule('5b. RECORDS THIS SWEEP WOULD MUTATE')
@@ -799,12 +1356,18 @@ def print_report(report: Dict[str, Any]) -> None:
         for relpath in copy_diff[kind][:100]:
             _out(f"      {relpath}")
 
-    _rule('7. PROOF THE LIVE TREE WAS NOT TOUCHED')
+    _rule('7. PROOF THE state/ TREE WAS NOT TOUCHED')
     live = report['live_check']
     _out(f"  before : {live['before_count']} files, digest {live['before_digest']}")
     _out(f"  after  : {live['after_count']} files, digest {live['after_digest']}")
-    if live['identical']:
-        _out('  VERDICT: BYTE-IDENTICAL -- production state was not modified')
+    if unreadable:
+        _out(f"  {len(unreadable)} file(s) could not be read and are in NEITHER manifest --")
+        _out('  no check in this run covers them.')
+    if live['identical'] and not unreadable:
+        _out('  VERDICT: BYTE-IDENTICAL -- the live state/ tree was not modified')
+    elif live['identical']:
+        _out('  VERDICT: UNVERIFIED -- every readable file is byte-identical, but the '
+             'unreadable ones were never checked')
     else:
         _out('  VERDICT: LIVE TREE CHANGED')
         for kind in ('added', 'removed', 'changed'):
@@ -812,14 +1375,24 @@ def print_report(report: Dict[str, Any]) -> None:
             if paths:
                 _out(f"    {kind}: {len(paths)}")
                 for relpath in paths[:100]:
-                    leak = ' <-- ALSO MUTATED IN THE COPY: ATTRIBUTABLE TO THIS RUN' \
-                        if relpath in live['leaked'] else ''
-                    _out(f"        {relpath}{leak}")
+                    if relpath in live['leaked']:
+                        marker = '  <-- ATTRIBUTABLE TO THIS RUN: LEAK'
+                    elif relpath in live['unattributed_owned']:
+                        marker = "  <-- inside a subtree this sweep OWNS: indistinguishable from a leak"
+                    elif relpath in live.get('lock_artifacts', []):
+                        marker = '  (flock artifact, carries no state -- not evidence)'
+                    else:
+                        marker = ''
+                    _out(f"        {relpath}{marker}")
         if live['leaked']:
-            _out('  ** LEAK: the sweep mutated these paths live. This run was NOT isolated. **')
+            _out('  ** LEAK: the sweep\'s own work is in the live tree. This run was NOT isolated. **')
+        elif live['unattributed_owned']:
+            _out('  ** UNVERIFIABLE: the live tree changed inside a subtree this sweep writes.')
+            _out('     A sweep that escapes isolation writes ONLY the live path, so drift there')
+            _out('     cannot be told apart from a leak. Re-run against a stopped orchestrator. **')
         else:
-            _out('  (no changed path was one this sweep mutated in the copy -- consistent '
-                 'with concurrent writes by the running orchestrator, but NOT proof)')
+            _out('  (no changed path is one this sweep owns or mutated -- consistent with '
+                 'concurrent writes by the running orchestrator, but NOT proof)')
 
     _rule('VERDICT')
     _out(f"  {report['verdict']}  (exit {report['exit_code']})")
@@ -831,16 +1404,70 @@ def print_report(report: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _aborted_report(report: Dict[str, Any], live_before, copy_manifest, mismatch) -> Dict[str, Any]:
+    """Fill in the shape print_report() expects when step 2 refused to continue."""
+    report['copy']['mismatch'] = mismatch
+    report['isolation'] = {}
+    report['isolation_unbound'] = []
+    report['isolation_verdict'] = 'not evaluated -- copy verification failed'
+    report['verdict'] = 'ABORTED: the scratch copy is not a faithful copy of live state'
+    report['exit_code'] = 1
+    report['gates'] = []
+    report['classification'] = {
+        'examined': None, 'gate_hits': {}, 'gate_records': {}, 'terminal': [],
+        'terminal_records': [], 'candidate_records': [], 'undecided_candidates': [],
+        'multi_gate_records': {}, 'errors': [], 'unclassified': []
+    }
+    report['mutations'] = []
+    report['copy_diff'] = {'added': [], 'removed': [], 'changed': []}
+    report['sweep_return'] = None
+    report['sweep_error'] = None
+    report['external_effects'] = ExternalEffectRecorder().summary()
+    report['external_effects'].update(
+        {'neutralized': False, 'declared_reads': [], 'declared_writes': []}
+    )
+    report['state_files_in_copy'] = len(copy_manifest)
+    report['unaccounted'] = None
+    report['live_check'] = {
+        'before_count': len(live_before),
+        'before_digest': report['copy']['live_manifest_digest'],
+        'after_count': len(live_before),
+        'after_digest': report['copy']['live_manifest_digest'],
+        'identical': True,
+        'diff': {'added': [], 'removed': [], 'changed': []},
+        'leaked': [],
+        'unattributed_owned': [],
+        'lock_artifacts': [],
+    }
+    return report
+
+
 def run_dry_run(
     spec: SweepSpec,
     deployment_root: Path,
     scratch_root: Path,
     config_root: Path,
     allow_concurrent_writes: bool = False,
+    neutralize_external_effects_enabled: bool = True,
+    allow_external_side_effects: bool = False,
 ) -> Dict[str, Any]:
     """Execute the seven steps. Returns the report dict; prints nothing."""
     live_state_root = deployment_root / 'state'
     scratch_state_root = scratch_root / 'state'
+
+    # The refusal gate lives here, not only in main(): a programmatic caller
+    # that skipped the CLI must not be able to run a sweep's real production
+    # writes just by not passing a flag it never saw.
+    if (
+        spec.external_writes
+        and not neutralize_external_effects_enabled
+        and not allow_external_side_effects
+    ):
+        raise ExternalWriteRefused(
+            f"{spec.name} writes outside state/, which this harness does not checksum "
+            f"and cannot prove it left alone:\n"
+            + '\n'.join(f'    - {note}' for note in spec.external_writes)
+        )
 
     report: Dict[str, Any] = {
         'sweep': spec.name,
@@ -849,10 +1476,13 @@ def run_dry_run(
         'live_state_root': str(live_state_root),
         'scratch_root': str(scratch_root),
         'config_root': str(config_root),
+        'inert_guards': list(spec.inert_guards),
     }
 
+    unreadable: List[str] = []
+
     # --- 1. snapshot live -------------------------------------------------
-    live_before = snapshot_tree(live_state_root)
+    live_before = snapshot_tree(live_state_root, unreadable)
 
     # --- 2. copy and verify ----------------------------------------------
     scratch_state_root.mkdir(parents=True, exist_ok=True)
@@ -871,36 +1501,17 @@ def run_dry_run(
         'unstable': unstable,
         'verdict': 'copy verified byte-for-byte' if copy_ok else 'COPY VERIFICATION FAILED',
     }
+    report['unreadable'] = sorted(set(unreadable))
     if not copy_ok:
-        mismatch = diff_manifests(live_before, copy_manifest)
-        report['copy']['mismatch'] = mismatch
-        report['isolation'] = {}
-        report['isolation_verdict'] = 'not evaluated -- copy verification failed'
-        report['verdict'] = 'ABORTED: the scratch copy is not a faithful copy of live state'
-        report['exit_code'] = 1
-        report['gates'] = []
-        report['classification'] = {
-            'examined': None, 'gate_hits': {}, 'terminal': [], 'errors': [], 'unclassified': []
-        }
-        report['mutations'] = []
-        report['copy_diff'] = {'added': [], 'removed': [], 'changed': []}
-        report['sweep_return'] = None
-        report['state_files_in_copy'] = len(copy_manifest)
-        report['live_check'] = {
-            'before_count': len(live_before),
-            'before_digest': report['copy']['live_manifest_digest'],
-            'after_count': len(live_before),
-            'after_digest': report['copy']['live_manifest_digest'],
-            'identical': True,
-            'diff': {'added': [], 'removed': [], 'changed': []},
-            'leaked': [],
-        }
-        return report
+        return _aborted_report(
+            report, live_before, copy_manifest, diff_manifests(live_before, copy_manifest)
+        )
 
     # A pristine second copy, kept aside, so step 5b can diff record CONTENT
     # rather than only file hashes. The sweep is about to rewrite the copy in
     # place, and "which records changed and how" is the answer the whole run
-    # exists to produce.
+    # exists to produce. It doubles as the baseline for the live tree, which is
+    # how a leak at a DIFFERENT relpath is caught in step 7.
     pristine_root = scratch_root / 'pristine'
     pristine_root.mkdir(parents=True, exist_ok=True)
     copy_tree_from_manifest(scratch_state_root, pristine_root, dict(copy_manifest))
@@ -911,11 +1522,15 @@ def run_dry_run(
     resolved.update(
         {label: str(path) for label, path in spec.resolved_dirs(manager).items()}
     )
-    resolved.update(bind_runtime_singletons(scratch_root))
+    bound, unbound = bind_runtime_singletons(scratch_root)
+    resolved.update(bound)
     report['isolation'] = resolved
+    report['isolation_unbound'] = unbound
 
     for label, path in resolved.items():
         if label == 'ORCHESTRATOR_ROOT' or label.startswith('ConfigManager.'):
+            continue
+        if path.startswith('not constructed'):
             continue
         assert_under(Path(path), scratch_root, label)
     # The config root is the one path that must deliberately NOT be scratch: the
@@ -925,26 +1540,61 @@ def run_dry_run(
         raise IsolationError(f'config root {config_root} does not exist')
     report['isolation_verdict'] = (
         'every state-owning path resolved inside the scratch root'
+        if not unbound
+        else (
+            f'{len(unbound)} state-owning path(s) could NOT be bound and are therefore '
+            f'NOT covered by this assertion -- see NOT BOUND above'
+        )
     )
 
     # --- 4. run the real sweep -------------------------------------------
     handler = _CapturingHandler(spec.loggers)
     root_logger = logging.getLogger()
     previous_level = root_logger.level
+    previous_cwd = os.getcwd()
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.DEBUG)
     for name in spec.loggers:
         logging.getLogger(name).setLevel(logging.DEBUG)
+
+    sweep_return: Any = None
+    sweep_error: Optional[str] = None
+    recorder = ExternalEffectRecorder()
     try:
-        sweep_return = spec.run(manager)
+        with neutralize_external_effects(neutralize_external_effects_enabled) as recorder:
+            try:
+                # Some writers build their path from the CWD rather than any
+                # root (services/review_cycle.py joins a relative 'state/...'),
+                # so the CWD has to be inside the scratch root too.
+                os.chdir(scratch_root)
+                sweep_return = spec.run(manager)
+            except Exception as e:
+                # Deliberately not re-raised. A sweep that raises has already
+                # done some of its work, and "did the partial run leak?" is the
+                # question this harness exists to answer -- skipping steps 5-7
+                # to print a traceback answers it with an exit code that means
+                # something else entirely.
+                sweep_error = f'{type(e).__name__}: {e}'
+                logger.error(f'The sweep raised; continuing to the live-tree proof: {e}',
+                             exc_info=True)
     finally:
+        os.chdir(previous_cwd)
         root_logger.removeHandler(handler)
         root_logger.setLevel(previous_level)
 
     report['sweep_return'] = sweep_return
+    report['sweep_error'] = sweep_error
     report['state_files_in_copy'] = len(copy_manifest)
+    report['external_effects'] = recorder.summary()
+    report['external_effects'].update(
+        {
+            'neutralized': neutralize_external_effects_enabled,
+            'declared_reads': list(spec.external_reads),
+            'declared_writes': list(spec.external_writes),
+        }
+    )
 
-    # --- 5. per-gate accounting ------------------------------------------
+    # --- 5. per-record accounting ----------------------------------------
     classification = classify_records(spec, handler.records)
     report['classification'] = classification
     report['gates'] = [
@@ -952,7 +1602,7 @@ def run_dry_run(
             'name': gate.name,
             'why': gate.why,
             'degradation': gate.degradation,
-            'count': len(classification['gate_hits'].get(gate.name, [])),
+            'count': len(classification['gate_records'].get(gate.name, [])),
         }
         for gate in spec.gates
     ]
@@ -963,11 +1613,27 @@ def run_dry_run(
     # invisible in a per-gate table. Reporting the residual explicitly is what
     # stops "0 reached the terminal decision" from being read as "every record
     # was individually considered and protected".
+    #
+    # Degradation gates are excluded on purpose: they annotate a record some
+    # other gate also accounts for, so summing them double-counts and drives the
+    # residual negative -- printing a negative under a sentence that claims a
+    # specific safety meaning is worse than printing nothing.
+    report['accounting_anomaly'] = None
     if classification['examined'] is not None:
-        accounted = sum(gate['count'] for gate in report['gates']) + len(
-            classification['terminal']
+        accounted = (
+            sum(gate['count'] for gate in report['gates'] if not gate['degradation'])
+            + len(classification['terminal_records'])
+            + len(classification['undecided_candidates'])
         )
-        report['unaccounted'] = classification['examined'] - accounted
+        residual = classification['examined'] - accounted
+        report['unaccounted'] = max(0, residual)
+        if residual < 0:
+            report['accounting_anomaly'] = (
+                f'the sweep accounted for {accounted} records but reported examining only '
+                f'{classification["examined"]}; the residual would be {residual}. Either a '
+                f'gate pattern matches a line it should not, or the examined count is not '
+                f'what it claims -- this is a harness defect, not a property of the sweep.'
+            )
     else:
         report['unaccounted'] = None
 
@@ -976,15 +1642,53 @@ def run_dry_run(
     copy_diff = diff_manifests(copy_manifest, copy_after)
     report['copy_diff'] = copy_diff
     report['mutations'] = describe_execution_record_changes(
-        pristine_root, scratch_state_root, copy_diff['changed'] + copy_diff['added']
+        pristine_root,
+        scratch_state_root,
+        [
+            relpath for relpath in copy_diff['changed'] + copy_diff['added']
+            if not _is_lock_artifact(relpath)
+        ],
     )
 
     # --- 7. prove the live tree is untouched ------------------------------
-    live_after = snapshot_tree(live_state_root)
+    unreadable_after: List[str] = []
+    live_after = snapshot_tree(live_state_root, unreadable_after)
+    report['unreadable'] = sorted(set(unreadable) | set(unreadable_after))
     live_diff = diff_manifests(live_before, live_after)
     changed_live = set(live_diff['added']) | set(live_diff['removed']) | set(live_diff['changed'])
-    mutated_in_copy = set(copy_diff['changed']) | set(copy_diff['added']) | set(copy_diff['removed'])
-    leaked = sorted(changed_live & mutated_in_copy)
+    lock_artifacts = sorted(p for p in changed_live if _is_lock_artifact(p))
+    changed_live_state = changed_live - set(lock_artifacts)
+    mutated_in_copy = {
+        p for p in set(copy_diff['changed']) | set(copy_diff['added']) | set(copy_diff['removed'])
+        if not _is_lock_artifact(p)
+    }
+
+    # Same relpath in both trees: the classic escape, and the only one a path
+    # intersection can see.
+    leaked = set(changed_live_state & mutated_in_copy)
+
+    # A sweep that escaped isolation writes ONLY the live path -- the copy's
+    # version of that relpath is untouched, so the intersection above is empty
+    # by construction for exactly the failure mode this harness exists to catch.
+    # Two further checks close that hole:
+    #   (a) content attribution -- a live record whose delta is a decision this
+    #       sweep made is this run's work, whatever path it landed at;
+    #   (b) subtree ownership -- any other change under a subtree this sweep
+    #       writes is indistinguishable from a leak and is never downgraded to
+    #       "concurrent writes".
+    owned_live_changes = sorted(
+        p for p in changed_live_state if _is_under_subtree(p, spec.owned_state_subtrees)
+    )
+    if owned_live_changes:
+        live_deltas = describe_execution_record_changes(
+            pristine_root, live_state_root, owned_live_changes
+        )
+        decided = _mutation_fingerprints(report['mutations'])
+        for entry in live_deltas:
+            if _mutation_fingerprints([entry]) & decided:
+                leaked.add(entry['file'])
+    leaked_sorted = sorted(leaked)
+    unattributed_owned = sorted(set(owned_live_changes) - leaked)
 
     report['live_check'] = {
         'before_count': len(live_before),
@@ -993,28 +1697,50 @@ def run_dry_run(
         'after_digest': manifest_digest(live_after),
         'identical': not changed_live,
         'diff': live_diff,
-        'leaked': leaked,
+        'leaked': leaked_sorted,
+        'unattributed_owned': unattributed_owned,
+        'lock_artifacts': lock_artifacts,
     }
 
-    if leaked:
+    if leaked_sorted:
         report['verdict'] = (
             'FAILED: the sweep mutated live state -- the run was not isolated'
         )
         report['exit_code'] = 1
+    elif sweep_error:
+        report['verdict'] = (
+            f'SWEEP RAISED: {sweep_error}. No leak was detected in what it managed to '
+            f'do, but the run is partial and proves nothing about the sweep as a whole.'
+        )
+        report['exit_code'] = 4
+    elif unattributed_owned:
+        report['verdict'] = (
+            f'UNVERIFIED: {len(unattributed_owned)} live path(s) changed inside a subtree '
+            f'this sweep writes. A sweep that escapes isolation writes only the live path, '
+            f'so this cannot be told apart from a leak. Re-run against a stopped '
+            f'orchestrator. (--allow-concurrent-writes does not downgrade this.)'
+        )
+        report['exit_code'] = 3
+    elif report['unreadable']:
+        report['verdict'] = (
+            f"UNVERIFIED: {len(report['unreadable'])} file(s) under state/ could not be "
+            f'read, so they are in neither manifest and no check in this run covers them.'
+        )
+        report['exit_code'] = 3
     elif not changed_live:
-        report['verdict'] = 'PASSED: live state is byte-identical'
+        report['verdict'] = 'PASSED: the live state/ tree is byte-identical'
         report['exit_code'] = 0
     elif allow_concurrent_writes:
         report['verdict'] = (
-            'PASSED WITH DRIFT: live state changed, but no changed path is one this '
-            'sweep mutated (--allow-concurrent-writes)'
+            'PASSED WITH DRIFT: live state changed outside every subtree this sweep '
+            'writes, and no change matches a decision it made (--allow-concurrent-writes)'
         )
         report['exit_code'] = 0
     else:
         report['verdict'] = (
             'UNVERIFIED: live state changed. No changed path is one this sweep '
-            'mutated, so this is consistent with the running orchestrator writing '
-            'its own state -- but it is not proof. Re-run against a stopped '
+            'owns or mutated, so this is consistent with the running orchestrator '
+            'writing its own state -- but it is not proof. Re-run against a stopped '
             'orchestrator, or pass --allow-concurrent-writes.'
         )
         report['exit_code'] = 3
@@ -1063,24 +1789,48 @@ def main(argv: Optional[List[str]] = None) -> int:
             'which from a worktree usually has no projects/ at all.'
         ),
     )
-    parser.add_argument('--scratch', help='Scratch directory (default: a fresh temp dir)')
+    parser.add_argument(
+        '--scratch',
+        help=(
+            'Scratch directory (default: a fresh temp dir). Must not already exist '
+            'with contents -- see --keep-scratch.'
+        ),
+    )
     parser.add_argument(
         '--keep-scratch',
         action='store_true',
-        help='Keep the scratch copy after the run (it holds the mutated records)',
+        help=(
+            'Keep the scratch copy after the run (it holds the mutated records). '
+            'Without this, a scratch directory THIS RUN CREATED is deleted; one that '
+            'already existed is never deleted.'
+        ),
     )
     parser.add_argument(
         '--allow-concurrent-writes',
         action='store_true',
         help=(
             'Treat live-tree drift that is NOT attributable to this run as success. '
-            'A leak -- a live path the sweep also mutated in the copy -- still fails.'
+            'Drift inside a subtree the sweep writes is never downgraded -- there it '
+            'cannot be told apart from a leak.'
+        ),
+    )
+    parser.add_argument(
+        '--no-neutralize-external-effects',
+        dest='neutralize_external_effects',
+        action='store_false',
+        help=(
+            "Let the sweep's Redis writes and observability events reach production "
+            'instead of being intercepted and reported. Requires '
+            '--allow-external-side-effects for a sweep that declares writes.'
         ),
     )
     parser.add_argument(
         '--allow-external-side-effects',
         action='store_true',
-        help='Required for sweeps that write outside state/ (e.g. Redis claim keys)',
+        help=(
+            'Required with --no-neutralize-external-effects for sweeps that write '
+            'outside state/ (Redis keys, observability events)'
+        ),
     )
     parser.add_argument('--json', dest='json_path', help='Also write the report as JSON here')
     args = parser.parse_args(argv)
@@ -1096,7 +1846,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             for note in spec.external_reads:
                 _out(f'    reads outside state/: {note}')
             for note in spec.external_writes:
-                _out(f'    WRITES outside state/: {note}')
+                _out(f'    WRITES outside state/ (neutralized unless '
+                     f'--no-neutralize-external-effects): {note}')
+            for note in spec.inert_guards:
+                _out(f'    guard that cannot fire out-of-process: {note}')
         return 0
 
     if not args.sweep:
@@ -1108,14 +1861,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"unknown sweep {args.sweep!r}; known: {', '.join(sorted(SWEEPS))}"
         )
 
-    if spec.external_writes and not args.allow_external_side_effects:
-        _out(f"REFUSING to run {spec.name}: it writes outside state/, which this "
-             f"harness does not checksum and cannot prove it left alone:")
-        for note in spec.external_writes:
-            _out(f'    - {note}')
-        _out('Pass --allow-external-side-effects if that is acceptable.')
-        return 2
-
     deployment_root = _resolve_deployment_root(args.deployment_root)
     if not (deployment_root / 'state').is_dir():
         _out(f'No state/ directory under deployment root {deployment_root}')
@@ -1124,10 +1869,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_root = Path(args.config_root).resolve() if args.config_root \
         else deployment_root / 'config'
 
-    scratch_root = Path(args.scratch).resolve() if args.scratch else Path(
-        tempfile.mkdtemp(prefix='switchyard-dry-run-')
-    )
-    scratch_root.mkdir(parents=True, exist_ok=True)
+    # A scratch directory this run did not create is never deleted. The teardown
+    # below is a recursive delete on an operator-supplied path, and "--scratch
+    # /workspace" on a tool whose entire premise is "prove nothing was
+    # destroyed" must not be the way a working directory disappears.
+    harness_created_scratch = False
+    if args.scratch:
+        scratch_root = Path(args.scratch).resolve()
+        if scratch_root.exists():
+            if not scratch_root.is_dir():
+                _out(f'--scratch {scratch_root} exists and is not a directory')
+                return 2
+            if any(scratch_root.iterdir()):
+                _out(f'--scratch {scratch_root} already exists and is not empty. Refusing '
+                     f'to use it: the harness writes a state/ copy into the scratch '
+                     f'directory and would then have to decide what of yours to delete. '
+                     f'Name an empty or non-existent directory.')
+                return 2
+        else:
+            harness_created_scratch = True
+        scratch_root.mkdir(parents=True, exist_ok=True)
+    else:
+        scratch_root = Path(tempfile.mkdtemp(prefix='switchyard-dry-run-'))
+        harness_created_scratch = True
 
     try:
         report = run_dry_run(
@@ -1136,7 +1900,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             scratch_root=scratch_root,
             config_root=config_root,
             allow_concurrent_writes=args.allow_concurrent_writes,
+            neutralize_external_effects_enabled=args.neutralize_external_effects,
+            allow_external_side_effects=args.allow_external_side_effects,
         )
+    except ExternalWriteRefused as e:
+        _out(f'REFUSING to run {spec.name} with --no-neutralize-external-effects:')
+        _out(str(e))
+        _out('Pass --allow-external-side-effects if that is acceptable, or drop '
+             '--no-neutralize-external-effects and let the harness intercept them.')
+        return 2
     except IsolationError as e:
         _out()
         _out('!! ISOLATION CHECK FAILED -- the sweep was NOT run !!')
@@ -1149,10 +1921,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         Path(args.json_path).write_text(json.dumps(report, indent=2, default=str))
         _out(f'JSON report written to {args.json_path}')
 
-    if args.keep_scratch:
+    if args.keep_scratch or not harness_created_scratch:
         _out(f'Scratch copy kept at {scratch_root}')
     else:
-        shutil.rmtree(scratch_root, ignore_errors=True)
+        try:
+            shutil.rmtree(scratch_root)
+        except OSError as e:
+            # Not ignore_errors=True: a cleanup that failed leaves a full copy of
+            # production state on disk, which the operator has to know about.
+            _out(f'WARNING: could not remove the scratch copy at {scratch_root}: {e}')
 
     return report['exit_code']
 
