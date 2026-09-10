@@ -749,17 +749,47 @@ class TestGitHubOutputVerification:
             'programming error' in record.message for record in caplog.records
         ), caplog.text
 
-    def test_has_github_output_with_no_timestamp_at_all_fails_closed(self, tracker):
-        """"Was there a comment AFTER completion?" has no answer without a
-        timestamp, so it is unverifiable, not verified-empty.
+    def test_has_github_output_without_completed_at_fails_closed(self, tracker):
+        """The production shape, and the reason this gate is inert (#150).
 
-        Note the record must carry NEITHER completed_at NOR timestamp: a record
-        with only the start timestamp is the normal on-disk shape and is
-        answerable (see _execution_output_anchor_time). Gating on completed_at
-        alone is what made this return True for every record in production."""
-        execution = {'agent': 'test-agent'}  # no completed_at, no timestamp
+        No production code path writes completed_at -- record_execution_outcome()
+        deliberately does not stamp it on this branch -- so "was there a comment
+        AFTER completion?" has no anchor and every real record answers
+        "cannot verify". That keeps the sweep from rewriting any of the 54k+
+        'success' records while the gate is still wrong in ways confirmed against
+        live data (it never looks at Discussions, and it counts any comment in the
+        window as the agent's). Activating it is tracked as #166.
 
-        with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
+        Note this is the shape record_execution_start() actually writes: a start
+        timestamp and nothing else."""
+        execution = {
+            'agent': 'test-agent',
+            'timestamp': '2025-01-01T12:00:00Z',  # start only -- no completed_at
+        }
+
+        gh_client = MagicMock()
+        with patch('services.github_api_client.get_github_client', return_value=gh_client):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = self._project_config()
+
+                assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_has_github_output_non_list_response_fails_closed(self, tracker):
+        """rest() hands back whatever the body decoded to. A dict (an error
+        envelope) or a string iterates into something the comment loop silently
+        skips, ending in a confident "no output" derived from a body that was
+        never a comment list."""
+        execution = {
+            'agent': 'test-agent',
+            'completed_at': '2025-01-01T12:00:00Z'
+        }
+
+        mock_gh_client = MagicMock()
+        mock_gh_client.rest.return_value = (True, {'message': 'Not Found'})
+
+        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
                 mock_config.return_value = self._project_config()
 
@@ -1390,18 +1420,18 @@ class TestRecordExecutionStartBoardName:
         return WorkExecutionStateTracker(state_dir=temp_state_dir)
 
     @staticmethod
-    def _age_out_of_the_recency_window(tracker, issue_number):
-        """Backdate the record past PROTECTION 5's 5-minute window.
+    def _backdate_the_record(tracker, issue_number):
+        """Backdate the record written by the real writers a little.
 
-        record_execution_outcome() now stamps completed_at with the real clock
-        (#150), so a record written a millisecond ago is by definition "too
-        recent" and the sweep defers it. These tests are about board scoping, not
-        about the clock.
+        Keeps the on-disk shape production actually has -- a start timestamp and
+        no completed_at -- while putting the record far enough in the past that
+        nothing time-based interferes with what these tests are about, which is
+        board scoping.
         """
         state = tracker.load_state('test-project', issue_number)
-        stamped = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        state['execution_history'][-1]['timestamp'] = stamped
-        state['execution_history'][-1]['completed_at'] = stamped
+        state['execution_history'][-1]['timestamp'] = (
+            datetime.now(timezone.utc) - timedelta(minutes=30)
+        ).isoformat()
         tracker.save_state('test-project', issue_number, state)
 
     def test_board_name_is_persisted_on_the_execution_record(self, tracker):
@@ -1444,7 +1474,7 @@ class TestRecordExecutionStartBoardName:
         assert last_exec['outcome'] == 'success'
         assert last_exec['board_name'] == 'SDLC Execution'
 
-        self._age_out_of_the_recency_window(tracker, 123)
+        self._backdate_the_record(tracker, 123)
 
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
@@ -1475,7 +1505,7 @@ class TestRecordExecutionStartBoardName:
         assert last_exec['trigger_source'] == 'unknown'
         assert 'board_name' not in last_exec
 
-        self._age_out_of_the_recency_window(tracker, 123)
+        self._backdate_the_record(tracker, 123)
 
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
@@ -1551,6 +1581,16 @@ class TestSweepReachesItsProtectionsForReal:
 
     @staticmethod
     def _success_record(**overrides):
+        """A record carrying a synthetic completed_at.
+
+        Deliberately NOT the production shape: no production code path writes
+        completed_at, so a real record makes _has_github_output() answer "cannot
+        verify" and the sweep stops one gate short of the retry marking -- which
+        is the point of TestSweepOnProductionShapedRecords, but would make these
+        reachability tests unable to tell "the sweep ran to completion" from "the
+        sweep wedged". Stamping the field here is what lets them assert the sweep
+        reaches its last gate and past it.
+        """
         record = {
             'agent': 'test-agent',
             'column': 'In Progress',
@@ -1637,8 +1677,7 @@ class TestSweepReachesItsProtectionsForReal:
         assert count == 1
         (method, endpoint), _ = gh_client.rest.call_args
         assert method == 'GET'
-        assert endpoint.startswith('repos/test-org/test-repo/issues/123/comments?')
-        assert 'since=' in endpoint
+        assert endpoint == 'repos/test-org/test-repo/issues/123/comments'
 
         with open(state_file) as f:
             updated = yaml.safe_load(f)
@@ -1694,14 +1733,22 @@ class TestSweepReachesItsProtectionsForReal:
         assert updated['execution_history'][-1]['outcome'] == 'success'
 
 
-class TestCompletedAtIsActuallyRecorded:
-    """completed_at has to exist on real records, not just on fixtures (#150).
+class TestCompletedAtIsNotStampedYet:
+    """No production writer stamps completed_at, and that is load-bearing (#150).
 
-    PROTECTION 5's recency window asks "how long ago did this execution end?" and
-    keys off completed_at, and nothing in production ever wrote it: 0 of the 4721
-    state files on the live orchestrator carried the field. Every sweep-level
-    test in this file fabricated it, so the drift between fixture shape and
-    on-disk shape was invisible. These tests use the real writers.
+    _has_github_output() is the last gate before an execution is rewritten to
+    'failure' and the issue is redispatched, and it keys off completed_at. Absent
+    the field the gate answers "cannot verify" and the sweep leaves the record
+    alone -- which is the only thing keeping it off 54,594 'success' records
+    while the gate is still wrong in two ways confirmed against live data: it
+    queries only the issue-comments endpoint, so the six planning_design columns
+    whose workspace is "discussions" post where it never looks, and the
+    crash-recovery record below carries a `timestamp` that is really its finish
+    time, so it has no start to anchor against either.
+
+    Stamping the field is a one-line change in each of these three writers, which
+    is exactly why it needs a test: it activates the watchdog across production
+    the moment anyone adds it. Activation is tracked as #166.
     """
 
     @pytest.fixture
@@ -1709,7 +1756,7 @@ class TestCompletedAtIsActuallyRecorded:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
 
-    def test_the_normal_path_stamps_completed_at(self, tracker):
+    def test_the_normal_path_does_not_stamp_completed_at(self, tracker):
         tracker.record_execution_start(
             issue_number=123, column='In Progress', agent='test-agent',
             trigger_source='manual_move', project_name='test-project',
@@ -1722,19 +1769,19 @@ class TestCompletedAtIsActuallyRecorded:
 
         last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
         assert last_exec['outcome'] == 'success'
-        assert 'completed_at' in last_exec, (
-            "record_execution_outcome() must stamp completed_at -- without it "
-            "_has_github_output() returns 'cannot verify' for every record ever "
-            "written and the whole sweep is a no-op"
+        assert 'completed_at' not in last_exec, (
+            "stamping completed_at makes _has_github_output() live across every "
+            "'success' record in production -- see the class docstring; that "
+            "belongs with the Discussions support, not here"
         )
-        # Parseable by the same helper the watchdog uses, and after the start.
-        completed = datetime.fromisoformat(last_exec['completed_at'])
-        started = datetime.fromisoformat(last_exec['timestamp'])
-        assert completed >= started
 
-    def test_the_crash_recovery_record_carries_completed_at(self, tracker):
+    def test_the_crash_recovery_record_does_not_stamp_completed_at(self, tracker):
         """The synthesised record (no matching in_progress entry) is the one path
-        that appends rather than mutating, so it needs its own stamp."""
+        that appends rather than mutating, and the one whose `timestamp` is not a
+        real start time at all -- it is stamped at outcome-recording time, after
+        the agent has already posted. Giving it a completed_at would convert
+        "cannot verify" into "verified empty" for the 15.9% of live records that
+        have this shape."""
         tracker.record_execution_outcome(
             issue_number=123, column='In Progress', agent='test-agent',
             outcome='success', project_name='test-project',
@@ -1742,12 +1789,11 @@ class TestCompletedAtIsActuallyRecorded:
 
         last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
         assert last_exec['trigger_source'] == 'unknown'
-        assert last_exec['completed_at'] == last_exec['timestamp']
+        assert 'completed_at' not in last_exec
 
-    def test_apply_redis_result_carries_the_blobs_completed_at(self, tracker):
-        """The Redis recovery path finalises a record too, so it must leave the
-        same anchor behind -- otherwise every recovered execution is one the
-        watchdog can never verify."""
+    def test_apply_redis_result_does_not_stamp_completed_at(self, tracker):
+        """The Redis recovery path finalises a record too, so it is the third
+        place a stamp would leak in."""
         execution = {
             'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'in_progress',
             'timestamp': '2025-01-01T11:00:00+00:00',
@@ -1762,37 +1808,26 @@ class TestCompletedAtIsActuallyRecorded:
 
         assert applied is True
         assert execution['outcome'] == 'success'
-        assert execution['completed_at'] == '2025-01-01T12:00:00+00:00'
-
-    def test_apply_redis_result_falls_back_when_the_blob_has_no_completed_at(self, tracker):
-        execution = {
-            'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'in_progress',
-            'timestamp': '2025-01-01T11:00:00+00:00',
-        }
-
-        tracker._apply_redis_result(
-            execution, {'exit_code': 1, 'output': 'boom'},
-            'agent_result:test-project:123:task-1', 'test-project', 123,
-            'test-agent', 'In Progress', MagicMock(),
-        )
-
-        assert execution['outcome'] == 'failure'
-        # A real timestamp, not a missing key -- the whole point of the fallback.
-        datetime.fromisoformat(execution['completed_at'])
+        assert 'completed_at' not in execution
 
 
 class TestSweepOnProductionShapedRecords:
     """The sweep against records shaped exactly like the ones on disk.
 
-    Everything else in this file patches _has_github_output() to a constant and
-    feeds it a 'completed_at' no real record has. That is what let the gate ship
-    returning True unconditionally for production data -- the sweep reached its
-    last gate for the first time (PROTECTION 1's flock wedge having been fixed)
-    and that gate declined every single record. These tests use the REAL gate
-    against BOTH shapes that reach it: the LEGACY shape (_legacy_record) the 4721
-    files on disk have, and the shape every future record will have
-    (_production_record), written by actually calling record_execution_start()
-    and record_execution_outcome().
+    Everything else in this file feeds the sweep a 'completed_at' no real record
+    has -- either as a fixture field or by patching _has_github_output() to a
+    constant. That is fine for unit-testing the protections, but it hides the
+    single most important property of this branch: against a record with the
+    field set production actually writes, the sweep runs every protection and
+    then declines to rewrite anything, because _has_github_output() has no anchor
+    and answers "cannot verify".
+
+    That is deliberate, not an oversight. The gate is still wrong in two ways
+    confirmed against live data (it never queries Discussions, where six
+    planning_design columns post their output; and the crash-recovery record's
+    `timestamp` is really its finish time), and a wrong "no output" rewrites the
+    record to 'failure' and redispatches the agent. Activation is tracked as
+    #166.
     """
 
     @pytest.fixture
@@ -1805,14 +1840,9 @@ class TestSweepOnProductionShapedRecords:
         return WorkExecutionStateTracker(state_dir=temp_state_dir)
 
     @staticmethod
-    def _legacy_record(**overrides):
+    def _production_record(**overrides):
         """A record with the exact field set state/execution_history/*.yaml holds:
-        no completed_at, no watchdog_* keys, start timestamp only.
-
-        Dated well past _WATCHDOG_LEGACY_RECENCY_WINDOW: with no completed_at,
-        PROTECTION 5 has only the start time to go on and cannot tell a long run
-        that just finished from an old one, so it holds records off for the
-        longest agent timeout plus the usual five minutes."""
+        no completed_at, no watchdog_* keys, start timestamp only."""
         record = {
             'column': 'In Progress',
             'agent': 'test-agent',
@@ -1823,35 +1853,6 @@ class TestSweepOnProductionShapedRecords:
         }
         record.update(overrides)
         return record
-
-    @staticmethod
-    def _production_record(tracker, duration_minutes=20, finished_minutes_ago=40):
-        """A record written by the REAL writers, then aged.
-
-        record_execution_start() + record_execution_outcome() is the pair every
-        production execution goes through, so what lands on disk carries the
-        exact field set -- completed_at included -- that every future record will
-        have. Only the two timestamps are then shifted, by a fixed end time and a
-        real duration; nothing about the shape is fabricated. Returns the aged
-        record.
-        """
-        tracker.record_execution_start(
-            issue_number=123, column='In Progress', agent='test-agent',
-            trigger_source='pipeline_progression', project_name='test-project',
-            board_name='SDLC Execution',
-        )
-        tracker.record_execution_outcome(
-            issue_number=123, column='In Progress', agent='test-agent',
-            outcome='success', project_name='test-project',
-        )
-
-        state = tracker.load_state('test-project', 123)
-        last_exec = state['execution_history'][-1]
-        completed = datetime.now(timezone.utc) - timedelta(minutes=finished_minutes_ago)
-        last_exec['timestamp'] = (completed - timedelta(minutes=duration_minutes)).isoformat()
-        last_exec['completed_at'] = completed.isoformat()
-        tracker.save_state('test-project', 123, state)
-        return last_exec
 
     @staticmethod
     def _write_state(tracker, history):
@@ -1868,42 +1869,18 @@ class TestSweepOnProductionShapedRecords:
         return state_file
 
     @staticmethod
-    def _paging_gh_client(comments):
-        """A gh client that reproduces the real endpoint's paging defaults.
-
-        GitHubAPIClient.rest() shells out to `gh api <path>` with no --paginate
-        and no per_page, and GitHub's list-issue-comments endpoint defaults to
-        per_page=30 sorted created/asc. So a caller asking for the bare path gets
-        the OLDEST 30 comments -- which on a long-lived issue is 30 comments from
-        months before the execution it is asking about.
-        """
-        import urllib.parse
-
-        def rest(method, endpoint, *args, **kwargs):
-            params = dict(urllib.parse.parse_qsl(endpoint.partition('?')[2]))
-            page = comments
-            if params.get('since'):
-                since_dt = datetime.fromisoformat(params['since'].replace('Z', '+00:00'))
-                page = [
-                    c for c in page
-                    if datetime.fromisoformat(c['created_at'].replace('Z', '+00:00')) >= since_dt
-                ]
-            return True, page[:int(params.get('per_page', 30))]
-
+    def _gh_client(comments):
         client = MagicMock()
-        client.rest.side_effect = rest
+        client.rest.return_value = (True, comments)
         return client
 
-    @staticmethod
-    def _since_from(endpoint):
-        """The ?since= bound the gate actually asked GitHub for."""
-        import urllib.parse
+    def _run_sweep(self, tracker, gh_client, has_github_output=None):
+        """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed.
 
-        params = dict(urllib.parse.parse_qsl(endpoint.partition('?')[2]))
-        return datetime.fromisoformat(params['since'].replace('Z', '+00:00'))
-
-    def _run_sweep(self, tracker, gh_client):
-        """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed."""
+        has_github_output stays None -- the REAL gate -- unless a test is about a
+        protection that sits in front of it and needs the sweep to be able to
+        reach the retry marking at all.
+        """
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
         project_config = ProjectConfig(
@@ -1942,215 +1919,133 @@ class TestSweepOnProductionShapedRecords:
             mock_hfl._loop_key.return_value = 'test-project:123'
             mock_hfl.active_loops = {}
 
-            return tracker.detect_and_retry_empty_successful_executions()
+            if has_github_output is None:
+                return tracker.detect_and_retry_empty_successful_executions()
+            with patch.object(
+                tracker, '_has_github_output', return_value=has_github_output
+            ):
+                return tracker.detect_and_retry_empty_successful_executions()
 
-    def test_a_record_with_no_completed_at_is_still_swept(self, tracker):
-        """The headline regression: with the real gate and a real-shaped record,
-        the sweep must reach the retry marking. It used to bail at
-        _has_github_output(), which read completed_at, found None, and returned
-        True ("cannot verify") for every record on disk, on every pass, forever."""
-        state_file = self._write_state(tracker, [self._legacy_record()])
+    def test_a_production_shaped_record_is_never_rewritten(self, tracker):
+        """The property this branch has to hold: with the real gate and a record
+        shaped exactly like the 54,594 'success' records on the live
+        orchestrator, the sweep runs all five protections and rewrites nothing.
 
-        count = self._run_sweep(tracker, self._paging_gh_client([]))
+        It bails at _has_github_output(), which finds no completed_at and reports
+        "cannot verify" rather than "verified empty" -- the same gate main stops
+        at, with the safe answer instead of main's unsafe one. Making it answer
+        for real needs Discussions support and a crash-recovery record shape that
+        does not claim a start time it lacks; both are tracked as #166.
+        """
+        state_file = self._write_state(tracker, [self._production_record()])
+        gh_client = self._gh_client([])
 
-        assert count == 1, (
-            "the sweep declined a record shaped exactly like the 4721 on disk -- "
-            "_has_github_output() has no anchor to compare against"
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0, (
+            "the sweep rewrote a production-shaped record -- the empty-output "
+            "gate has been activated without the Discussions support it needs"
         )
+        # The gate answered from the record alone; it never even asked GitHub.
+        gh_client.rest.assert_not_called()
         with open(state_file) as f:
             last_exec = yaml.safe_load(f)['execution_history'][-1]
-        assert last_exec['outcome'] == 'failure'
-        assert last_exec['watchdog_retry_triggered'] is True
+        assert last_exec['outcome'] == 'success'
+        assert 'watchdog_retry_triggered' not in last_exec
 
-    def test_a_start_timestamp_inside_the_recency_window_defers(self, tracker):
-        """PROTECTION 5's window gated on completed_at alone, so it never fired
-        for any record on disk. With the start timestamp as its fallback anchor,
-        an execution that started 30 seconds ago defers."""
-        state_file = self._write_state(tracker, [
-            self._legacy_record(
-                timestamp=(datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-            )
-        ])
-        gh_client = self._paging_gh_client([])
+    def test_the_crash_recovery_shape_is_never_rewritten(self, tracker):
+        """15.9% of live 'success' records (8,692 of 54,594) are the
+        trigger_source: 'unknown' shape record_execution_outcome() synthesises
+        when it finds no matching in_progress entry. Its `timestamp` is stamped
+        at outcome-recording time, i.e. AFTER the agent posted, so it is not a
+        start time and cannot anchor a "has anything been posted since?"
+        question. It must stay unverifiable too."""
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1]['timestamp'] = (
+            datetime.now(timezone.utc) - timedelta(minutes=90)
+        ).isoformat()
+        tracker.save_state('test-project', 123, state)
 
+        gh_client = self._gh_client([])
         count = self._run_sweep(tracker, gh_client)
 
         assert count == 0
         gh_client.rest.assert_not_called()
-        with open(state_file) as f:
-            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
-
-    def test_a_long_running_legacy_record_still_defers(self, tracker):
-        """PROTECTION 5 with the START time as its anchor and the SAME five-minute
-        window is not conservative -- it shifts the window earlier by the whole
-        execution duration instead of widening it, so for any run longer than five
-        minutes the window has already closed by the time the record is finalised
-        and the guard can never fire. Per CLAUDE.md most agent timeouts are 300s
-        and builds are 1800s, so that is the normal case, not the edge one.
-
-        A 20-minute agent run with no completed_at that ended seconds ago, with a
-        redispatch already in flight but not yet marked in_progress, is exactly
-        the race PROTECTION 5 exists to prevent."""
-        state_file = self._write_state(tracker, [
-            self._legacy_record(
-                timestamp=(datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
-            )
-        ])
-        gh_client = self._paging_gh_client([])
-
-        count = self._run_sweep(tracker, gh_client)
-
-        assert count == 0, (
-            "PROTECTION 5 let a 20-minute legacy execution through -- a fixed "
-            "five-minute window measured from the START time can never fire for "
-            "a run longer than five minutes"
-        )
-        gh_client.rest.assert_not_called()
-        with open(state_file) as f:
-            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
-
-    def test_a_comment_posted_before_completed_at_still_counts_as_output(self, tracker):
-        """The headline regression for the shape every future record will have.
-
-        Both real completion paths post the agent's comment to GitHub BEFORE
-        record_execution_outcome() stamps completed_at -- docker_runner.py's
-        _complete_agent_execution posts then records, agent_executor.py's
-        finalisation does the same -- so the comment that PROVES the execution
-        produced output is always a second or two OLDER than completed_at.
-        Anchoring the gate there filtered that comment out server-side (?since=)
-        and answered a confident "no output" for every genuine success, rewriting
-        it to 'failure' and redispatching the same agent into the same column."""
-        last_exec = self._production_record(tracker)
-        state_file = tracker.get_state_file('test-project', 123)
-        posted_at = (
-            datetime.fromisoformat(last_exec['completed_at']) - timedelta(seconds=2)
-        )
-        gh_client = self._paging_gh_client([
-            {'created_at': posted_at.isoformat(), 'body': 'Agent output'}
-        ])
-
-        count = self._run_sweep(tracker, gh_client)
-
-        assert count == 0, (
-            "the gate anchored on completed_at, which is stamped AFTER the agent's "
-            "own comment is posted -- so every genuine success reads as 'no output'"
-        )
-        # The bounded query has to start at the execution, not at its completion,
-        # or GitHub itself drops the comment before the loop can see it.
-        since = self._since_from(gh_client.rest.call_args[0][1])
-        assert since <= posted_at
-        assert abs(
-            since - datetime.fromisoformat(last_exec['timestamp'])
-        ) < timedelta(seconds=1), (
-            f"?since= was not anchored on the execution's start ({since})"
-        )
-        with open(state_file) as f:
-            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
-
-    def test_a_production_shaped_record_with_no_comments_is_still_swept(self, tracker):
-        """The other half of the pair: anchoring on the start time must not turn
-        the gate into a permanent "has output". An execution that genuinely posted
-        nothing still gets marked for retry."""
-        self._production_record(tracker)
-        state_file = tracker.get_state_file('test-project', 123)
-        gh_client = self._paging_gh_client([])
-
-        count = self._run_sweep(tracker, gh_client)
-
-        assert count == 1
-        with open(state_file) as f:
-            last_exec = yaml.safe_load(f)['execution_history'][-1]
-        assert last_exec['outcome'] == 'failure'
-        assert last_exec['watchdog_retry_triggered'] is True
 
     def test_a_completed_at_inside_the_recency_window_defers(self, tracker):
-        """PROTECTION 5 on the shape that has a real completion time: five minutes
-        is measured from the end of the execution, not from its start."""
-        self._production_record(tracker, duration_minutes=20, finished_minutes_ago=1)
-        state_file = tracker.get_state_file('test-project', 123)
-        gh_client = self._paging_gh_client([])
+        """PROTECTION 5 still guards a record that does carry a completion time:
+        five minutes is measured from the end of the execution. Nothing in
+        production writes the field today, so this is the gate's behaviour on the
+        shape it will have once the watchdog is activated, pinned now."""
+        finished = datetime.now(timezone.utc) - timedelta(minutes=1)
+        state_file = self._write_state(tracker, [
+            self._production_record(
+                timestamp=(finished - timedelta(minutes=20)).isoformat(),
+                completed_at=finished.isoformat(),
+            )
+        ])
+        gh_client = self._gh_client([])
 
         count = self._run_sweep(tracker, gh_client)
 
         assert count == 0
         gh_client.rest.assert_not_called()
-        with open(state_file) as f:
-            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
-
-    def test_a_comment_beyond_the_first_page_still_counts_as_output(self, tracker):
-        """The truncation regression: an issue with 178 comments whose agent
-        posted #179 successfully. Asking for the bare endpoint returns comments
-        1-30 -- all months old -- and the gate answers a confident "no output",
-        rewriting a finished execution to 'failure' and redispatching a container
-        onto an issue that already has its comment."""
-        anchor = datetime.now(timezone.utc) - timedelta(minutes=90)
-        old = datetime.now(timezone.utc) - timedelta(days=60)
-        comments = [
-            {'created_at': (old + timedelta(minutes=i)).isoformat(), 'body': 'chatter'}
-            for i in range(178)
-        ]
-        comments.append({
-            'created_at': (anchor + timedelta(seconds=5)).isoformat(),
-            'body': 'Agent output',
-        })
-
-        state_file = self._write_state(
-            tracker, [self._legacy_record(timestamp=anchor.isoformat())]
-        )
-        gh_client = self._paging_gh_client(comments)
-
-        count = self._run_sweep(tracker, gh_client)
-
-        assert count == 0, (
-            "the gate only saw the oldest page of comments and declared the "
-            "execution output-less"
-        )
-        endpoint = gh_client.rest.call_args[0][1]
-        assert 'since=' in endpoint and 'per_page=100' in endpoint
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
 
     def test_a_record_older_than_the_age_gate_costs_nothing(self, tracker):
         """PROTECTION 0. 4570 of the 4721 live state files end in 'success' and
-        97% of them are months old; before this gate every one of them reached
-        PROTECTION 4's GitHub query on every 15-minute sweep."""
+        97% of them are months old; without this gate every one of them reaches
+        PROTECTION 4's GitHub query on every 15-minute sweep -- ~18k GraphQL
+        queries an hour against a 5000/hour budget.
+
+        _has_github_output() is stubbed to False so that "the sweep declined" can
+        only mean the age gate; with the real gate every record declines and the
+        test would pass whether or not PROTECTION 0 exists.
+        """
         state_file = self._write_state(tracker, [
-            self._legacy_record(
+            self._production_record(
                 timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
             )
         ])
-        gh_client = self._paging_gh_client([])
+        gh_client = self._gh_client([])
 
-        count = self._run_sweep(tracker, gh_client)
+        count = self._run_sweep(tracker, gh_client, has_github_output=False)
 
         assert count == 0
-        gh_client.rest.assert_not_called()
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
 
     def test_the_age_gate_cutoff_is_configurable(self, tracker):
         """An operator investigating a long-stuck issue can widen the window
-        without a code change."""
+        without a code change. Same stub as above, for the same reason."""
         self._write_state(tracker, [
-            self._legacy_record(
+            self._production_record(
                 timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
             )
         ])
 
         with patch.dict(os.environ, {'WATCHDOG_MAX_RECORD_AGE_HOURS': '2400'}):
-            count = self._run_sweep(tracker, self._paging_gh_client([]))
+            count = self._run_sweep(
+                tracker, self._gh_client([]), has_github_output=False
+            )
 
         assert count == 1
 
 
-class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
-    """_should_retry_failed_execution() used to issue its GraphQL query before
-    any cheap check could reject the record (#150). The sweep calls it once per
-    'success' state file, so on the live orchestrator that was up to 4570
-    queries per 15-minute sweep -- ~18k/hour against GitHub's 5000/hour budget,
-    which would starve board polling and comment posting for the rest of the
-    hour. The "is there an active pipeline run?" check rejects almost all of them
-    and spends no GitHub budget, so it has to come first -- read-only, though:
+class TestRetryEligibilityLookups:
+    """_should_retry_failed_execution()'s own I/O.
+
+    Its "is there an active pipeline run?" check keeps its position after the
+    GitHub issue-state query, where it has always been. Moving it ahead was part
+    of the empty-output activation -- it only mattered once PROTECTION 1 stopped
+    wedging and the sweep started reaching this method for every 'success'
+    record -- and it puts an Elasticsearch fallback that WRITES back to Redis on
+    records that never used to reach it. The read-only flag stays regardless:
     see test_the_run_lookup_is_read_only.
     """
 
@@ -2159,39 +2054,45 @@ class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
 
-    def test_no_active_pipeline_run_costs_no_github_query(self, tracker):
+    @staticmethod
+    def _project_config():
+        return ProjectConfig(
+            name='test-project', description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={}, pipelines=[], pipeline_routing={},
+        )
+
+    def test_the_run_lookup_is_read_only(self, tracker):
+        """get_active_pipeline_run() is not the plain hash lookup it looks like:
+        on a mapping miss -- the normal case once end_pipeline_run() has deleted
+        the mapping -- it searches Elasticsearch and, on a hit, writes the run
+        back with a fresh TTL under the board-less legacy issue key. A periodic
+        sweep must not do that: a crashed run whose ES doc still reads 'active'
+        would be resurrected on every pass, and the legacy key it lands under can
+        shadow a later board-scoped lookup."""
         github_client = MagicMock()
+        github_client.graphql.return_value = (True, {
+            'repository': {
+                'issue': {
+                    'state': 'OPEN',
+                    'projectItems': {'nodes': [
+                        {'fieldValueByName': {'name': 'In Progress'}}
+                    ]},
+                }
+            }
+        })
         run_manager = MagicMock()
         run_manager.get_active_pipeline_run.return_value = None
 
         with patch('services.github_api_client.get_github_client', return_value=github_client), \
              patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager):
             should_retry, reason = tracker._should_retry_failed_execution(
-                'test-project', 123, 'test-agent', 'In Progress', {}
+                'test-project', 123, 'test-agent', 'In Progress', {},
+                project_config=self._project_config(),
             )
 
         assert should_retry is False
         assert reason == 'no_active_pipeline_run'
-        github_client.graphql.assert_not_called()
-
-    def test_the_run_lookup_is_read_only(self, tracker):
-        """Moving the run check ahead of the GitHub query put it on records that
-        previously never reached it -- closed issues, issues moved off the column.
-        get_active_pipeline_run() is not the plain hash lookup it looks like: on a
-        mapping miss it searches Elasticsearch and, on a hit, writes the run back
-        with a fresh TTL under the board-less legacy key. A crashed run whose ES
-        doc still reads 'active' would be resurrected by every 15-minute sweep for
-        as long as the age gate lets the record through."""
-        github_client = MagicMock()
-        run_manager = MagicMock()
-        run_manager.get_active_pipeline_run.return_value = None
-
-        with patch('services.github_api_client.get_github_client', return_value=github_client), \
-             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager):
-            tracker._should_retry_failed_execution(
-                'test-project', 123, 'test-agent', 'In Progress', {}
-            )
-
         assert run_manager.get_active_pipeline_run.call_args.kwargs.get(
             'restore_to_redis'
         ) is False
@@ -2199,11 +2100,6 @@ class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
     def test_a_passed_in_project_config_is_not_re_read_from_disk(self, tracker):
         """get_project_config() re-reads and re-parses the project's YAML on every
         call, and the sweep already caches it per project."""
-        project_config = ProjectConfig(
-            name='test-project', description='test',
-            github={'org': 'test-org', 'repo': 'test-repo'},
-            tech_stacks={}, pipelines=[], pipeline_routing={},
-        )
         github_client = MagicMock()
         github_client.graphql.return_value = (True, {
             'repository': {'issue': {'state': 'OPEN', 'projectItems': {'nodes': []}}}
@@ -2216,7 +2112,7 @@ class TestRetryEligibilityDoesNotSpendGitHubBudgetFirst:
              patch('config.manager.config_manager') as mock_config_manager:
             tracker._should_retry_failed_execution(
                 'test-project', 123, 'test-agent', 'In Progress', {},
-                project_config=project_config,
+                project_config=self._project_config(),
             )
 
         mock_config_manager.get_project_config.assert_not_called()
