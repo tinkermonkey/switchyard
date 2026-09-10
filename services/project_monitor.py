@@ -945,6 +945,18 @@ class ProjectMonitor:
         self._max_poll_interval = 60
         self._idle_backoff_threshold = 4  # Start backoff after this many idle cycles
 
+        # Board-lock heartbeat (#153 WI-8) — when _refresh_held_board_locks()
+        # last swept, as time.monotonic(). None means "never, sweep now".
+        self._last_board_lock_heartbeat_at: Optional[float] = None
+        # How often that sweep may read each board's lock. Independent of the
+        # poll interval above, because the sweep runs ABOVE the two
+        # circuit-breaker `continue`s in monitor_projects() — where the loop
+        # spins on a 5s sleep — and a lock read per board every 5s would be
+        # pointless I/O. Far below the refresh interval itself
+        # (project_checkout_lock.HEARTBEAT_INTERVAL_SECONDS, 1800s) and above
+        # _max_poll_interval, so no board can miss its refresh window.
+        self._board_lock_sweep_interval_seconds = 60.0
+
         # --- Batched board queries + per-board adaptive backoff (issue #94) ---
         # Feature-gated: OFF by default so today's behavior (one sequential
         # get_project_items() call per board every cycle, and the single
@@ -8813,6 +8825,182 @@ _Repair cycle initiated by Switchyard_
                 logger.error(f"Failed to record execution failure after repair cycle error: {cleanup_e}")
             return None
 
+    def _refresh_held_board_locks(self):
+        """
+        Keep a board lock alive while the run holding it is genuinely still
+        running — the board-dispatch side of the heartbeat mechanism #56 built
+        for project_checkout/dev_container_build (#153 WI-8, from #140 item 19).
+
+        The gap this closes is bigger than "#140 item 19" describes. That item
+        says the dispatch path re-acquires the lock via try_acquire_lock() on
+        every poll and that its "already_holds_lock" branch refreshes only the
+        Redis TTL and never lock_acquired_at, leaving a >4h hold exposed to the
+        staleness heuristic. Reading every one of the nine try_acquire_lock()
+        call sites, that re-acquire does not actually happen: each one is a
+        dispatch attempt for a DIFFERENT issue than the current holder, and the
+        two sites an issue could re-enter through while it holds the lock skip
+        the call entirely (trigger_agent_for_status's `already_has_lock` branch,
+        and the PR-review path's `_lock_held_by_us` check). So a board lock's
+        Redis TTL is never refreshed at all, and the real exposure is
+        LOCK_TTL_SECONDS (7200s), not the 4-hour staleness threshold: once the
+        key lapses, try_acquire_lock()'s Redis transaction reads it back as an
+        empty dict, which is falsy, and grants the board to the next waiting
+        issue without ever consulting the still-'locked' YAML copy — while the
+        original agent (config/foundations/agents.yaml allows up to 10800s) is
+        still running.
+
+        Why this is a sweep on the monitor thread and NOT a heartbeat thread
+        per hold, the shape services/project_checkout_lock.py uses:
+
+          - The board lock has no `with` block to hang a thread's lifetime on.
+            It is acquired at nine call sites and released at others entirely
+            (end_pipeline_run, pipeline_progression, review-cycle teardown, the
+            failsafe, _reconcile_active_runs), so adopting that shape would mean
+            restructuring board dispatch itself across the two files this
+            repo's history explicitly flags as risky to modify.
+          - One OS thread per held board lock, each parked for the agent's full
+            runtime (up to 10800s), grows with the number of active boards and
+            duplicates work this loop already does. #151/WI-6 is the standing
+            warning here: threads parked for hours on lock work are what
+            deadlocked the default executor.
+
+        This loop already runs on its own thread (never the event loop), already
+        visits every active board every cycle, and already does synchronous lock
+        I/O per board. Refreshing here costs zero new threads and no new
+        blocking condition — just one lock read per board per sweep, and one
+        touch_lock() per held board per HEARTBEAT_INTERVAL_SECONDS.
+
+        Only refreshes a lock whose holder has an active pipeline run. That is
+        deliberately the SAME predicate _reconcile_active_runs()'s stale-lock
+        watchdog uses to decide a lock is abandoned and release it, so the two
+        cannot disagree: a lock this keeps alive is exactly a lock that watchdog
+        would not have taken away. Refreshing unconditionally would instead
+        pin an abandoned lock forever and disable both recovery paths (TTL and
+        the 4-hour age heuristic) that exist for a crashed holder.
+
+        Retained locks are skipped explicitly. release_lock()'s "not_found is
+        the normal steady state for a lock retained more than two hours"
+        reasoning depends on nothing re-touching a retained lock's Redis copy,
+        and their protection comes from retained_reason rather than from
+        liveness anyway.
+        """
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+        # Imported, not restated: project_checkout_lock calibrated this against
+        # PipelineLockManager.LOCK_TTL_SECONDS (comfortably under half of it, so
+        # at least one refresh lands before the key expires even under jitter)
+        # for the same Redis key with the same TTL. A local copy of the same
+        # arithmetic is exactly the drift #146 WI-1 removed when it stopped
+        # restating that TTL.
+        from services.project_checkout_lock import HEARTBEAT_INTERVAL_SECONDS
+
+        now = time.monotonic()
+        if (self._last_board_lock_heartbeat_at is not None and
+                now - self._last_board_lock_heartbeat_at < self._board_lock_sweep_interval_seconds):
+            return
+        self._last_board_lock_heartbeat_at = now
+
+        lock_manager = get_pipeline_lock_manager()
+
+        for project_name in self.config_manager.list_visible_projects():
+            try:
+                project_config = self.config_manager.get_project_config(project_name)
+            except Exception as e:
+                logger.debug(f"Board-lock heartbeat: could not load config for {project_name}: {e}")
+                continue
+
+            for pipeline in project_config.pipelines:
+                if not pipeline.active:
+                    continue
+                try:
+                    self._refresh_held_board_lock(
+                        lock_manager, project_name, pipeline.board_name,
+                        HEARTBEAT_INTERVAL_SECONDS
+                    )
+                except Exception as e:
+                    # One board's failure must never stop the sweep, and must
+                    # never take down the monitor cycle this runs at the top of.
+                    logger.warning(
+                        f"Board-lock heartbeat failed for {project_name}/"
+                        f"{pipeline.board_name}: {e}"
+                    )
+
+    def _refresh_held_board_lock(
+        self, lock_manager, project_name: str, board_name: str, heartbeat_interval_seconds: float
+    ):
+        """One board's share of _refresh_held_board_locks() — see its docstring."""
+        lock, reads_healthy = lock_manager.get_lock_fail_closed(project_name, board_name)
+        if not reads_healthy:
+            # Same posture as every other fail-closed read site: an unknown
+            # state is not a licence to write. Re-evaluated next sweep.
+            logger.warning(
+                f"Board-lock heartbeat: could not determine lock state for "
+                f"{project_name}/{board_name} (both Redis and YAML reads failed) — "
+                f"skipping this sweep"
+            )
+            return
+        if not lock or lock.lock_status != 'locked':
+            return
+        if lock.retained_reason:
+            return
+
+        # Age against the lock's own recorded acquisition time rather than a
+        # per-board timer in this process: touch_lock() resets that field, so
+        # the next refresh naturally falls due one interval later, and the
+        # decision stays correct across a restart with no state to carry.
+        try:
+            acquired_at = datetime.fromisoformat(lock.lock_acquired_at)
+            if acquired_at.tzinfo is None:
+                acquired_at = acquired_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - acquired_at).total_seconds()
+        except Exception as e:
+            logger.warning(
+                f"Board-lock heartbeat: unreadable lock_acquired_at "
+                f"({lock.lock_acquired_at!r}) on {project_name}/{board_name}: {e}"
+            )
+            return
+        if age_seconds < heartbeat_interval_seconds:
+            return
+
+        pipeline_run = self.pipeline_run_manager.get_active_pipeline_run(
+            project_name, lock.locked_by_issue
+        )
+        if not pipeline_run:
+            # No active run: either genuinely abandoned (leave it for the
+            # staleness/TTL recovery and the stale-lock watchdog) or a lookup
+            # that could not tell (get_active_pipeline_run returns None for
+            # both). Not refreshing is the safe answer for either.
+            logger.info(
+                f"Board lock on {project_name}/{board_name} held by issue "
+                f"#{lock.locked_by_issue} is {age_seconds / 60:.0f} minutes old with no "
+                f"active pipeline run — not refreshing its liveness"
+            )
+            return
+
+        result = lock_manager.touch_lock(project_name, board_name, lock.locked_by_issue)
+        if result:
+            logger.debug(
+                f"Refreshed board lock liveness for {project_name}/{board_name} "
+                f"(issue #{lock.locked_by_issue}, run {pipeline_run.id}, age "
+                f"{age_seconds / 60:.0f} minutes)"
+            )
+            return
+
+        from services.pipeline_lock_manager import LOCK_TTL_SECONDS, TouchResult
+        if result is TouchResult.NOT_HELD:
+            logger.warning(
+                f"Board lock on {project_name}/{board_name} is no longer held by issue "
+                f"#{lock.locked_by_issue} even though its pipeline run {pipeline_run.id} "
+                f"is still active — it changed hands between this sweep's read and its "
+                f"refresh, so that run may now be racing a different holder"
+            )
+        else:
+            logger.warning(
+                f"Could not refresh board lock liveness for {project_name}/{board_name} "
+                f"(issue #{lock.locked_by_issue}): the lock's durable stores could not "
+                f"extend it. The {LOCK_TTL_SECONDS}s Redis TTL is still running "
+                f"down under a live holder"
+            )
+
     def _reconcile_active_runs(self):
         """
         Reconcile active pipeline runs with current board state.
@@ -10308,6 +10496,19 @@ _Repair cycle initiated by Switchyard_
 
         while True:
             try:
+                # Board-lock heartbeat (#153 WI-8). Deliberately the first thing
+                # in the cycle, ABOVE both circuit-breaker `continue`s below: it
+                # touches only local Redis/YAML, never GitHub or Claude, and an
+                # agent that was already running when a breaker opened keeps
+                # running and keeps holding its board lock. Placing it after the
+                # breaker checks would stop refreshing exactly the locks whose
+                # dispatch paths are still live (pipeline_progression's and
+                # review_cycle's release-and-dispatch-next both run from worker
+                # threads regardless of the monitor's own pause). Rate-limited
+                # internally to _board_lock_sweep_interval_seconds, so the 5s
+                # breaker spin below doesn't turn it into a busy loop.
+                self._refresh_held_board_locks()
+
                 # Check Claude Code circuit breaker - if open, skip all monitoring
                 from monitoring.claude_code_breaker import get_breaker
                 from monitoring.claude_token_scheduler import get_scheduler

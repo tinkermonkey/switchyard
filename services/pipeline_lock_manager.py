@@ -741,10 +741,21 @@ class PipelineLockManager:
         Callers must already know they hold this lock (e.g. a heartbeat loop
         started immediately after a successful try_acquire_lock() for this
         exact issue_number) -- this does NOT acquire on behalf of a new
-        holder and is not atomic with respect to a concurrent acquire/release
-        for the same lock (acceptable here: it's a periodic liveness refresh
-        for a lock this same process already holds, not the acquisition path
-        itself, which is what needs the atomic transaction).
+        holder.
+
+        Each store's write is a COMPARE-AND-SET against that store's own
+        current record, not a blind overwrite (#153 WI-8, from #140 item 15).
+        The read below stays as a cheap upfront rejection, but it is no longer
+        what authorizes the write: the Redis leg re-reads and writes inside a
+        WATCH/MULTI transaction (the same shape try_acquire_lock() already
+        uses), and the YAML leg re-reads and writes under try_acquire_lock()'s
+        own '<state>.yaml.acquire.lock' guard. Before that, a heartbeat that
+        was very late -- late enough for its own holder to have been judged
+        stale (7200s Redis TTL, then the 4-hour age heuristic) and the lock
+        handed to a SECOND caller in the meantime -- could still land its
+        refresh on top of that second caller's record and silently take the
+        lock back from a live holder. See _touch_lock_redis()/_touch_lock_yaml()
+        for each leg.
 
         Returns:
             TouchResult.REFRESHED if the lock was found (held by
@@ -788,40 +799,26 @@ class PipelineLockManager:
         if not lock or lock.locked_by_issue != issue_number:
             return TouchResult.NOT_HELD
 
-        refreshed = PipelineLock(
-            project=project,
-            board=board,
-            locked_by_issue=issue_number,
-            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
-            lock_status='locked',
-            # Preserve retained state rather than silently clearing it --
-            # mirrors _create_lock_yaml_only()'s own defensive preservation.
-            # In practice this lock should never be retained while something
-            # is still successfully heartbeating it (mark_lock_failed() is
-            # for a run that has already ended), but this stays defensive
-            # against that edge case rather than relying on a single layer
-            # of protection.
-            retained_reason=lock.retained_reason,
-            retained_at=lock.retained_at,
-            # Preserved, not re-stamped: a heartbeat always runs in the holding
-            # process, so re-stamping would normally be a no-op -- but a touch
-            # that ever ran anywhere else must not silently re-attribute the
-            # lock and make a live foreign holder look like this process's own
-            # dead predecessor to recover_orphaned_resource_locks().
-            owner_process=lock.owner_process,
-        )
-
         redis_ok = False
         if self.redis_client:
-            try:
-                lock_key = self._get_lock_key(project, board)
-                self.redis_client.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
-                self.redis_client.expire(lock_key, LOCK_TTL_SECONDS)
-                redis_ok = True
-            except Exception as e:
-                logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+            redis_result = self._touch_lock_redis(project, board, issue_number, lock)
+            # Redis is the primary store AND the only expiring one, so its
+            # compare-and-set losing is a definitive "this lock is somebody
+            # else's now" -- return without touching YAML, which would
+            # otherwise write a record contradicting Redis.
+            if redis_result is TouchResult.NOT_HELD:
+                return TouchResult.NOT_HELD
+            redis_ok = redis_result is TouchResult.REFRESHED
 
-        yaml_ok = self._save_lock_to_yaml(refreshed)
+        yaml_result = self._touch_lock_yaml(project, board, issue_number, lock)
+        if yaml_result is TouchResult.NOT_HELD and not self.redis_client:
+            # With no Redis client configured, the YAML file is the only store
+            # there is, so its compare-and-set is the whole answer. When Redis
+            # IS configured it already answered above, and a disagreeing YAML
+            # record is reported as a failed YAML leg (logged in
+            # _touch_lock_yaml) rather than overriding it.
+            return TouchResult.NOT_HELD
+        yaml_ok = yaml_result is TouchResult.REFRESHED
 
         if not redis_ok and not yaml_ok:
             logger.error(
@@ -856,6 +853,169 @@ class PipelineLockManager:
             return TouchResult.REFRESH_FAILED
 
         return TouchResult.REFRESHED
+
+    def _refreshed_from(self, project: str, board: str, issue_number: int, current: PipelineLock) -> PipelineLock:
+        """
+        The record touch_lock() writes: `current` with lock_acquired_at reset
+        to now. Shared by both legs so they can never drift in which fields a
+        refresh is allowed to change.
+
+        retained_reason/retained_at are preserved rather than silently cleared
+        -- mirrors _create_lock_yaml_only()'s own defensive preservation. In
+        practice this lock should never be retained while something is still
+        successfully heartbeating it (mark_lock_failed() is for a run that has
+        already ended), but this stays defensive against that edge case rather
+        than relying on a single layer of protection.
+
+        owner_process is preserved, not re-stamped: a heartbeat normally runs
+        in the holding process, so re-stamping would be a no-op -- but a touch
+        that ever ran anywhere else must not silently re-attribute the lock and
+        make a live foreign holder look like this process's own dead
+        predecessor to recover_orphaned_resource_locks().
+        """
+        return PipelineLock(
+            project=project,
+            board=board,
+            locked_by_issue=issue_number,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked',
+            retained_reason=current.retained_reason,
+            retained_at=current.retained_at,
+            owner_process=current.owner_process,
+        )
+
+    def _touch_lock_redis(
+        self, project: str, board: str, issue_number: int, fallback_lock: PipelineLock
+    ) -> TouchResult:
+        """
+        touch_lock()'s Redis leg, as a WATCH/MULTI compare-and-set (#153 WI-8).
+
+        Reads the lock key and writes the refreshed record inside one
+        transaction watching that key, so an acquire or release that lands
+        between the two aborts and retries this whole callable (redis-py's
+        Redis.transaction() loops on WatchError) -- at which point the re-read
+        sees the new holder and returns NOT_HELD instead of overwriting it.
+        That is the entire point: the previous blind hset could land a very
+        late heartbeat on top of a second caller's freshly-won record.
+
+        The key being ABSENT is deliberately still a refresh, not a NOT_HELD:
+        that is the TTL having lapsed under a hold the non-expiring YAML copy
+        (fallback_lock) still records as this holder's, and re-establishing it
+        is the self-heal the heartbeat exists to provide -- made safe here by
+        the same WATCH, which aborts if anyone creates the key underneath us.
+
+        Returns REFRESHED (written), NOT_HELD (confirmed somebody else's, or
+        released), or REFRESH_FAILED (the transaction itself raised -- a
+        connection drop, or a write refused by OOM/MISCONF/READONLY, both of
+        which surface out of the transaction's own execute()).
+        """
+        lock_key = self._get_lock_key(project, board)
+
+        def touch_lock_tx(pipe):
+            lock_data = pipe.hgetall(lock_key)
+            if lock_data:
+                if lock_data.get('lock_status') != 'locked':
+                    return "not_held"
+                if int(lock_data.get('locked_by_issue', 0)) != issue_number:
+                    return "not_held"
+                current = self._lock_from_redis_data(lock_data)
+            else:
+                current = fallback_lock
+
+            refreshed = self._refreshed_from(project, board, issue_number, current)
+            pipe.multi()
+            pipe.hset(lock_key, mapping=self._lock_to_redis_mapping(refreshed))
+            pipe.expire(lock_key, LOCK_TTL_SECONDS)
+            return "refreshed"
+
+        try:
+            result = self.redis_client.transaction(
+                touch_lock_tx, lock_key, value_from_callable=True
+            )
+        except Exception as e:
+            logger.warning(f"touch_lock: failed to refresh Redis for {project}/{board}: {e}")
+            return TouchResult.REFRESH_FAILED
+
+        if result == "not_held":
+            logger.warning(
+                f"touch_lock: {project}/{board} is no longer held by issue "
+                f"#{issue_number} in Redis -- refusing to overwrite the current "
+                f"holder's record with this refresh"
+            )
+            return TouchResult.NOT_HELD
+        return TouchResult.REFRESHED
+
+    def _touch_lock_yaml(
+        self, project: str, board: str, issue_number: int, fallback_lock: PipelineLock
+    ) -> TouchResult:
+        """
+        touch_lock()'s YAML leg, serialized against try_acquire_lock()'s
+        YAML-fallback read-modify-write (#153 WI-8).
+
+        Takes the SAME '<state>.yaml.acquire.lock' guard file that
+        try_acquire_lock() takes around _try_acquire_lock_yaml_unguarded(), for
+        the same reason: everything here is a read-modify-write (read the
+        current record, verify it is still ours, rewrite it) with nothing else
+        making it atomic, and that guard is the one thing in this class that
+        serializes such a sequence against a concurrent grant -- across threads
+        AND across processes (scripts/release_lock.py, the observability
+        server). Without it, this leg could still blindly overwrite a record a
+        YAML-fallback acquire had just written for a different issue, which is
+        exactly the race the Redis leg's transaction closes on the other side.
+
+        The two lock files nest, and always in this order: '.acquire.lock'
+        OUTER, '<state>.yaml.lock' INNER (taken internally by
+        _read_yaml_lock_only()/_save_lock_to_yaml()). That is the same order
+        try_acquire_lock()'s guarded path already establishes, and nothing in
+        this class ever takes '.acquire.lock' while holding '<state>.yaml.lock',
+        so there is no ordering cycle to deadlock on. They must stay separate
+        files because fcntl.flock() conflicts between two descriptors of the
+        same file even within one process -- see try_acquire_lock()'s own
+        comment.
+
+        Returns REFRESHED (written), NOT_HELD (the YAML record names a
+        different holder), or REFRESH_FAILED (the guard could not be taken, the
+        read failed, or the write failed).
+        """
+        from utils.file_lock import file_lock
+
+        state_file = self._get_state_file(project, board)
+        acquire_guard = state_file.with_suffix(state_file.suffix + '.acquire.lock')
+        try:
+            with file_lock(acquire_guard, enforce_timeout=True):
+                existing, read_ok = self._read_yaml_lock_only(project, board)
+                if not read_ok:
+                    return TouchResult.REFRESH_FAILED
+                if existing is not None and existing.locked_by_issue != issue_number:
+                    logger.warning(
+                        f"touch_lock: the YAML lock record for {project}/{board} names "
+                        f"issue #{existing.locked_by_issue}, not #{issue_number} -- "
+                        f"refusing to overwrite it with this refresh"
+                    )
+                    return TouchResult.NOT_HELD
+                # existing is None when the YAML record is missing or reads as
+                # unlocked while the caller's own fail-closed read said this
+                # holder still owns the lock (Redis is authoritative there):
+                # rewrite it from fallback_lock, exactly as this leg did before
+                # it was guarded.
+                current = existing if existing is not None else fallback_lock
+                refreshed = self._refreshed_from(project, board, issue_number, current)
+                if not self._save_lock_to_yaml(refreshed):
+                    return TouchResult.REFRESH_FAILED
+                return TouchResult.REFRESHED
+        except TimeoutError as e:
+            logger.warning(
+                f"touch_lock: could not serialize the YAML refresh for {project}/{board} "
+                f"(issue #{issue_number}): {e} -- reporting the YAML leg as failed rather "
+                f"than performing an unguarded read-modify-write"
+            )
+            return TouchResult.REFRESH_FAILED
+        except OSError as e:
+            logger.warning(
+                f"touch_lock: could not take the YAML refresh guard for {project}/{board} "
+                f"(issue #{issue_number}): {e}"
+            )
+            return TouchResult.REFRESH_FAILED
 
     def release_lock(self, project: str, board: str, issue_number: int, force: bool = False) -> bool:
         """

@@ -12,6 +12,45 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.
 
 from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, TouchResult
 
+
+def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=None):
+    """
+    Stand in for redis-py's Redis.transaction(func, *watches,
+    value_from_callable=True), which touch_lock()'s Redis leg now goes through
+    (#153 WI-8 made that leg a WATCH/MULTI compare-and-set instead of a blind
+    hset on the client).
+
+    `hgetall_result` is what the transaction's own re-read sees INSIDE the
+    watch -- which is what makes the "a second caller won the lock between the
+    upfront read and the write" race expressible in a test at all. hset/expire
+    failures are raised at call time rather than at execute(); either way the
+    exception leaves transaction(), which is the boundary touch_lock() catches.
+    """
+    def _side_effect(func, *keys, **kwargs):
+        mock_pipe = MagicMock()
+        mock_pipe.hgetall.return_value = hgetall_result
+        if hset_exc is not None:
+            mock_pipe.hset.side_effect = hset_exc
+        if expire_exc is not None:
+            mock_pipe.expire.side_effect = expire_exc
+        return func(mock_pipe)
+    return _side_effect
+
+
+def _redis_lock_hash(issue_number, acquired_at=None):
+    """A redis hgetall() result for a lock held by issue_number."""
+    return {
+        'project': 'proj',
+        'board': 'board',
+        'locked_by_issue': str(issue_number),
+        'lock_acquired_at': acquired_at or datetime.now(timezone.utc).isoformat(),
+        'lock_status': 'locked',
+        'retained_reason': '',
+        'retained_at': '',
+        'owner_process': 'main.py#deadbeef',
+    }
+
+
 class TestPipelineLockManager(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
@@ -223,7 +262,9 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
     def test_returns_refresh_failed_when_both_refresh_writes_fail(self):
         self.mock_redis.hgetall.return_value = {}  # healthy read, "not locked in Redis"
         self.manager._create_lock("proj", "board", 123)
-        self.mock_redis.hset.side_effect = Exception("redis down")
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            {}, hset_exc=Exception("redis down")
+        )
 
         with patch.object(self.manager, '_save_lock_to_yaml', return_value=False):
             result = self.manager.touch_lock("proj", "board", 123)
@@ -244,7 +285,9 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
         """
         self.mock_redis.hgetall.return_value = {}  # healthy read, "not locked in Redis"
         self.manager._create_lock("proj", "board", 123)
-        self.mock_redis.hset.side_effect = Exception("OOM command not allowed")
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            {}, hset_exc=Exception("OOM command not allowed")
+        )
 
         # YAML write deliberately left working -- that's the whole point.
         result = self.manager.touch_lock("proj", "board", 123)
@@ -258,7 +301,9 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
         down."""
         self.mock_redis.hgetall.return_value = {}
         self.manager._create_lock("proj", "board", 123)
-        self.mock_redis.expire.side_effect = Exception("READONLY You can't write against a read only replica")
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            {}, expire_exc=Exception("READONLY You can't write against a read only replica")
+        )
 
         result = self.manager.touch_lock("proj", "board", 123)
 
@@ -285,11 +330,132 @@ class TestTouchLockFailsClosedOnUnhealthyReads(unittest.TestCase):
         permanently wedge the method once reads recover."""
         self.mock_redis.hgetall.return_value = {}  # empty dict: healthy, "not locked in Redis"
         self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect({})
 
         result = self.manager.touch_lock("proj", "board", 123)
 
         self.assertIs(result, TouchResult.REFRESHED)
         self.assertTrue(result)
+
+
+class TestTouchLockIsACompareAndSet(unittest.TestCase):
+    """
+    #153 WI-8 (from #140 item 15): touch_lock() used to read the lock through
+    get_lock_fail_closed() and then BLINDLY overwrite both stores. That read
+    does not authorize the write -- a heartbeat late enough for its own holder
+    to have been judged stale (7200s Redis TTL, then the 4-hour age heuristic)
+    and the lock handed to a second caller in the meantime could still land its
+    refresh on top of that second caller's record, silently taking the lock
+    back from a live holder. Each store's write is now a compare-and-set
+    against that store's own current record: Redis inside a WATCH/MULTI
+    transaction (the shape try_acquire_lock() already uses), YAML under
+    try_acquire_lock()'s own '<state>.yaml.acquire.lock' guard.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_redis_leg_refuses_a_holder_that_changed_between_the_read_and_the_write(self):
+        """The exact item-15 race: the upfront read still sees this holder,
+        but by the time the write happens the lock is somebody else's."""
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            _redis_lock_hash(456)
+        )
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(result)
+        # Nothing was written anywhere -- in particular the YAML leg is not
+        # reached once Redis has given a definitive "somebody else's now".
+        self.mock_redis.hset.assert_not_called()
+        self.assertFalse(self.manager._get_state_file("proj", "board").exists())
+
+    def test_redis_leg_still_re_establishes_a_key_whose_ttl_lapsed(self):
+        """An ABSENT key is the TTL having lapsed under a hold the
+        non-expiring YAML copy still records as ours -- re-establishing it is
+        the self-heal the heartbeat exists for, and WATCH is what makes it safe
+        (it aborts if anyone creates the key underneath us)."""
+        self.mock_redis.hgetall.return_value = {}
+        self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect({})
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+
+    def test_yaml_leg_refuses_a_holder_that_changed_between_the_read_and_the_write(self):
+        """Same race on the YAML side, which try_acquire_lock()'s YAML fallback
+        can grant to a different issue whenever Redis is down."""
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 456)  # what is actually on disk
+        stale_view = PipelineLock(
+            project="proj",
+            board="board",
+            locked_by_issue=123,
+            lock_acquired_at=datetime.now(timezone.utc).isoformat(),
+            lock_status='locked',
+        )
+
+        with patch.object(self.manager, 'get_lock_fail_closed', return_value=(stale_view, True)):
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(result)
+        self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 456)
+
+    def test_yaml_leg_reports_failure_rather_than_writing_unguarded(self):
+        """Fail closed exactly like try_acquire_lock()'s own guarded path: a
+        guard that cannot be taken means the read-modify-write below it is not
+        atomic, so it must not happen at all."""
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+
+        with patch('utils.file_lock.file_lock', side_effect=TimeoutError("guard busy")):
+            result = self.manager._touch_lock_yaml("proj", "board", 123, original)
+
+        self.assertIs(result, TouchResult.REFRESH_FAILED)
+        self.assertEqual(
+            self.manager.get_lock("proj", "board").lock_acquired_at,
+            original.lock_acquired_at,
+        )
+
+    def test_yaml_leg_nests_the_acquire_guard_outside_the_state_file_lock(self):
+        """
+        The two lock files must stay distinct (fcntl.flock() conflicts between
+        two descriptors of the same file even in one process) and must always
+        be taken in this order -- '.acquire.lock' outer, '<state>.yaml.lock'
+        inner -- which is the order try_acquire_lock()'s guarded path already
+        establishes. Taking them the other way round anywhere would be an
+        ordering cycle.
+        """
+        import utils.file_lock as file_lock_module
+
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+
+        real_file_lock = file_lock_module.file_lock
+        taken = []
+
+        def spy(path, *args, **kwargs):
+            taken.append(str(path))
+            return real_file_lock(path, *args, **kwargs)
+
+        with patch('utils.file_lock.file_lock', side_effect=spy):
+            result = self.manager._touch_lock_yaml("proj", "board", 123, original)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        state_file = self.manager._get_state_file("proj", "board")
+        self.assertEqual(taken[0], str(state_file) + '.acquire.lock')
+        self.assertIn(str(state_file) + '.lock', taken[1:])
 
 
 class TestYamlFallbackAcquisitionIsSerialized(unittest.TestCase):
