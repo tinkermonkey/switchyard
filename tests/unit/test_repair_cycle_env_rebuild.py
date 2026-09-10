@@ -28,6 +28,29 @@ from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
 from services.dev_container_state import DevContainerStatus
 
 
+def _queued(side_effect=None):
+    """Stand-in for queue_dev_environment_setup() that says it QUEUED (#169
+    review).
+
+    That function returns a DevSetupQueueOutcome, and the sub-cycle branches on
+    it: an outcome that did not queue skips the poll for a terminal status,
+    because with nothing enqueued nobody is going to write one. A bare
+    AsyncMock() returns a MagicMock whose `.queued` is truthy by accident, which
+    is the same "the stub does not match the contract, and passes anyway" trap
+    the ..._if_free_async patches fell into -- so every test here states the
+    outcome it means.
+    """
+    from agents.orchestrator_integration import DevSetupQueueOutcome
+
+    if side_effect is not None:
+        async def _wrapped(*args, **kwargs):
+            await side_effect(*args, **kwargs)
+            return DevSetupQueueOutcome.QUEUED
+
+        return AsyncMock(side_effect=_wrapped)
+    return AsyncMock(return_value=DevSetupQueueOutcome.QUEUED)
+
+
 def _lock(granted: bool, calls: list = None):
     """Stand-in for dev_container_build_lock_async (#152 item A).
 
@@ -90,7 +113,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
         and must return the passing test result from the successful attempt."""
         stage = _stage()
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -115,7 +138,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
         unlike CHANGES_NEEDED — this behavior must not change."""
         stage = _stage()
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -150,7 +173,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
             warning_list=[], raw_output="", timestamp="2026-01-01T00:00:00",
         )
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -186,7 +209,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
             # the circuit breaker trips at the top of the *next* attempt.
             stage._agent_call_count = stage.max_total_agent_calls
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock(side_effect=_queue_side_effect)) as mock_queue, \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued(_queue_side_effect)) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -217,7 +240,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
         forever. Regression guard for that exact incident."""
         stage = _stage()
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -266,7 +289,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
         stage = _stage()
         calls = []
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True, calls)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -294,7 +317,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
         context = _context()
         context['observability'] = obs
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(False)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -325,7 +348,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
         lock-contention dispatch outcome by services/resource_lock_errors."""
         stage = _stage()
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(False)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -348,7 +371,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
 
         statuses = [DevContainerStatus.CHANGES_NEEDED] * MAX_SYSTEMIC_SUB_CYCLES
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
@@ -372,7 +395,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
         owns retrying CHANGES_NEEDED once the sub-cycle stops."""
         stage = _stage()
 
-        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=_queued()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
              patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \

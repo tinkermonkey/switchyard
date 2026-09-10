@@ -185,6 +185,7 @@ import functools
 import itertools
 import logging
 import os
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -226,6 +227,135 @@ RESOURCE_NAME = "project_checkout"
 # proceeding unlocked.
 DEFAULT_TIMEOUT_SECONDS = 10900.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+
+# How long `docker ps` gets to answer the survivor probe below. Matches the
+# budget services/cancellation.py gives the same query.
+_CONTAINER_PROBE_TIMEOUT_SECONDS = 10
+
+# The label every managed container carries recording whether its working
+# directory IS the project's shared base clone -- the one directory this lock
+# protects -- or an isolated epic worktree, which shares nothing with it.
+# Stamped by claude/docker_runner.py's _build_docker_command() from the same
+# is_base_clone_dir() predicate claude_integration.py uses to decide whether to
+# take this lock at all, and unconditionally 'true' by
+# services/project_monitor.py's repair-cycle launch (that container mounts the
+# base clone at its conventional path regardless of where its own work
+# happens). Read by the survivor probe below -- see there for why a MISSING
+# value counts as base-clone-scoped.
+BASE_CLONE_LABEL = 'org.switchyard.base_clone'
+
+# Separator between the two fields the probe's `docker ps --format` asks for.
+# Legal in neither a container name (docker restricts those to
+# [a-zA-Z0-9][a-zA-Z0-9_.-]*) nor in the label's own 'true'/'false' values.
+_PROBE_FIELD_SEPARATOR = '|'
+
+
+def project_has_live_agent_container(project: str) -> bool:
+    """
+    True when a container launched for `project` that could be working IN ITS
+    SHARED BASE CLONE is still running -- the probe main.py hands
+    recover_orphaned_resource_locks() so that startup does not release a
+    project_checkout lock whose guarded work survived the restart (#169 review).
+
+    A dead holding PROCESS does not mean dead guarded WORK for this resource:
+    claude/claude_integration.py holds this lock across
+    docker_runner.run_agent_in_container() for a base-clone-scoped run, and
+    services/agent_container_recovery.py exists because those containers outlive
+    an orchestrator restart and are adopted rather than killed. Releasing under
+    one of them lets initialize_project()'s `git fetch` / `git pull --ff-only`
+    and prune_epic_worktrees()'s .git/worktrees rewrite run in the same
+    directory the adopted agent is working in.
+
+    Asked of Docker rather than of Redis: the `agent:container:*` tracking hash
+    is the very thing a crash can leave incomplete, and every managed container
+    carries org.switchyard.project regardless of naming convention -- the same
+    label query services/pipeline_watchdog.py, services/cancellation.py and
+    services/agent_container_recovery.py already route through. Deliberately NOT
+    narrowed to agent containers: a repair-cycle container works in the same
+    checkout, and this is a "leave it alone" test, not an attribution.
+
+    Narrowed to the base clone, though (#171 review). Those sibling queries all
+    add org.switchyard.issue_number, because they ask about ONE dispatch's
+    containers; this one cannot -- project_checkout mints a synthetic unique
+    holder id rather than storing a real issue number (see this module's
+    docstring), so lock.locked_by_issue names nothing to filter on. Left at
+    org.switchyard.project alone, the question it answered was "is ANY managed
+    container running for this project", and the overwhelmingly common such
+    container is an epic-worktree-scoped agent run, which
+    project_checkout_lock_if_shared_async() deliberately never locks and which
+    touches no directory this lock protects. A True for one of those re-created
+    exactly the no-op this sweep exists to remove: initialize_project() would
+    burn its 120s checkout wait, prune_epic_worktrees() would skip the project,
+    and every base-clone-scoped dispatch would poll a dead row until the
+    7200s-14400s TTL/staleness window lapsed -- and a surviving container is the
+    NORMAL restart shape (it is why agent_container_recovery.py exists at all).
+    So the answer is narrowed by BASE_CLONE_LABEL to containers that can
+    actually be inside the base clone.
+
+    Fails CLOSED (True) in both directions that matter, because the caller uses
+    this to decide whether to dispossess a lock holder:
+
+      - Docker cannot be reached, or answers non-zero: a socket that is not
+        answering says nothing about what is running behind it.
+      - A container carries no BASE_CLONE_LABEL at all: it was started by a
+        process from before that label existed (i.e. by exactly the crashed
+        predecessor whose locks this sweep is reading), so its working
+        directory is unknown and must be assumed shared. Only an explicit
+        'false' -- a container this build stamped as worktree-scoped -- is
+        treated as unable to touch the base clone.
+    """
+    try:
+        result = subprocess.run(
+            [
+                'docker', 'ps',
+                '--filter', f'label=org.switchyard.project={project}',
+                '--format',
+                '{{.Names}}' + _PROBE_FIELD_SEPARATOR + '{{.Label "' + BASE_CLONE_LABEL + '"}}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_CONTAINER_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not ask Docker whether {project!r} still has a running container: {e} "
+            f"- assuming one may be, rather than releasing a '{RESOURCE_NAME}' lock out "
+            f"from under it"
+        )
+        return True
+
+    if result.returncode != 0:
+        logger.warning(
+            f"docker ps failed while checking for running {project!r} containers "
+            f"(exit {result.returncode}): {result.stderr.strip()} - assuming one may be "
+            f"running, rather than releasing a '{RESOURCE_NAME}' lock out from under it"
+        )
+        return True
+
+    base_clone_containers: List[str] = []
+    worktree_containers: List[str] = []
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        name, _, base_clone = line.partition(_PROBE_FIELD_SEPARATOR)
+        if base_clone.strip().lower() == 'false':
+            worktree_containers.append(name)
+        else:
+            base_clone_containers.append(name)
+
+    if worktree_containers:
+        logger.info(
+            f"Ignoring {len(worktree_containers)} surviving {project!r} container(s) working "
+            f"in an isolated epic worktree, which the '{RESOURCE_NAME}' lock does not protect: "
+            f"{', '.join(worktree_containers)}"
+        )
+    if base_clone_containers:
+        logger.info(
+            f"Project {project!r} still has {len(base_clone_containers)} container(s) running "
+            f"from before this process started that may be working in its shared base clone: "
+            f"{', '.join(base_clone_containers)}"
+        )
+    return bool(base_clone_containers)
 
 # Seeds _mint_unique_holder_id()'s counter so it differs across process
 # restarts, not just within one process's lifetime. Found in code review: a
@@ -499,6 +629,49 @@ def _log_busy(resource_name: str, project: str, issue_number: Optional[int], rea
         f"'{resource_name}' lock busy for project {project!r} ({_attribution(issue_number)}): "
         f"{reason} -- waiting {poll_interval_seconds}s before retrying"
     )
+
+
+# Reasons acquire_resource() returns that are NOT a live holder: the
+# fail-closed/degraded outcomes try_acquire_lock() produces when it cannot
+# establish the lock's state at all. Enumerated for documentation --
+# acquire_failure_is_contention() below deliberately classifies by what IS
+# contention rather than by membership here, so a reason neither list has
+# seen reports as degraded rather than being assumed to be a holder.
+_DEGRADED_ACQUIRE_REASONS = frozenset({
+    "lock_state_unknown_failing_closed",
+    "lock_acquire_serialization_timeout",
+    "lock_acquire_serialization_unavailable",
+    "lock_mirror_write_failed",
+    "lock_mirror_write_failed_while_held",
+    "lock_write_failed",
+})
+
+
+def acquire_failure_is_contention(reason: Optional[str]) -> bool:
+    """
+    True when a False from acquire_resource() means a live holder currently owns
+    the resource, rather than a degraded/fail-closed or retained outcome.
+
+    Only `locked_by_issue_<n>` (without the `_failed` retained suffix) is genuine
+    contention. Everything else -- including a reason this module has never seen,
+    which is deliberately NOT assumed to be a holder -- is reported as degraded so
+    the caller and the operator both see the real reason.
+
+    Shared by every project-scoped resource lock built on this module's
+    poll/timeout/release shape: services/dev_container_build_lock.py re-exports
+    it under its own name, both for its bookkeeping writers' skip logging and
+    for agents/orchestrator_integration.py's queue_dev_environment_setup(),
+    which has to tell "someone is in this critical section right now" (defer,
+    the winner is queuing anyway) from "the lock store is degraded" (fall back
+    unserialized) -- see dev_container_build_lock_attempt_async().
+
+    It lives here rather than there because the reasons it classifies come from
+    the shared ProjectResourceLockManager facade, not from anything specific to
+    either lock.
+    """
+    if not isinstance(reason, str) or not reason.startswith("locked_by_issue_"):
+        return False
+    return not reason.endswith("_failed")
 
 
 def _release_and_warn(

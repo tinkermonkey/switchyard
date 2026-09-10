@@ -56,7 +56,7 @@ not wired into any call site by this issue -- that is a follow-up (#54).
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 # TouchResult is imported (and re-exported) so callers of this facade --
 # services/project_checkout_lock.py's heartbeat -- can interpret
@@ -286,15 +286,24 @@ class ProjectResourceLockManager:
             project, self._resource_board(resource_name), issue_number, force=force
         )
 
-    def _foreign_owner_is_plausibly_alive(self, lock: PipelineLock) -> bool:
+    def holder_liveness_is_fresh(self, lock: PipelineLock) -> bool:
         """
-        True when `lock` is stamped with a different process KIND's owner id and
-        its liveness has been refreshed recently enough that that process is
-        plausibly still running -- see FOREIGN_OWNER_LIVENESS_GRACE_SECONDS and
-        recover_orphaned_resource_locks().
+        True when `lock`'s liveness has been refreshed recently enough that its
+        holder is plausibly still running -- see
+        FOREIGN_OWNER_LIVENESS_GRACE_SECONDS.
 
-        An unparseable/missing lock_acquired_at counts as alive: this decides
-        whether to DISPOSSESS a holder, so the unknown case must fail closed.
+        An unparseable/missing lock_acquired_at counts as alive: every caller
+        uses this to decide whether to act as though a recorded holder is NOT
+        there (dispossess it, or stop deferring to it), so the unknown case must
+        fail closed.
+
+        Public because a recorded holder that stopped heartbeating is not only
+        recover_orphaned_resource_locks()'s problem: a release that could not be
+        serialized leaves a row behind with nobody coming back for it (see
+        services/project_checkout_lock.py's _release_and_warn), and every reader
+        that treats "there is a row" as "a live holder owns this" then defers to
+        a run that is not happening until the TTL lapses -- see
+        agents/orchestrator_integration.py's _live_build_lock_reason().
         """
         try:
             acquired_at = datetime.fromisoformat(lock.lock_acquired_at.replace('Z', '+00:00'))
@@ -305,7 +314,11 @@ class ProjectResourceLockManager:
         age_seconds = (datetime.now(timezone.utc) - acquired_at).total_seconds()
         return age_seconds < FOREIGN_OWNER_LIVENESS_GRACE_SECONDS
 
-    def recover_orphaned_resource_locks(self, resource_name: str) -> int:
+    def recover_orphaned_resource_locks(
+        self,
+        resource_name: str,
+        guarded_work_is_alive: Optional[Callable[[str], bool]] = None,
+    ) -> int:
         """
         Release the locks for `resource_name`, across all projects, that belong
         to a DEAD incarnation of the calling process. STARTUP ONLY -- see the
@@ -363,6 +376,34 @@ class ProjectResourceLockManager:
         refuses it without force, and force is reserved for
         scripts/release_lock.py's explicit confirmation flow.
 
+        When the GUARDED OPERATION can outlive the process (#169 review)
+        -----------------------------------------------------------------
+        Everything above establishes that the HOLDING PROCESS is dead. For
+        dev_container_build that settles it: its holders are in-process code
+        paths and local subprocesses, which die with the process that started
+        them. It does not settle it for project_checkout, whose holders include
+        claude/claude_integration.py's wrap around a base-clone-scoped agent
+        CONTAINER run -- and services/agent_container_recovery.py exists
+        precisely because those containers survive an orchestrator restart and
+        are adopted rather than killed. Releasing there hands the base clone to
+        initialize_project()'s `git fetch`/`git pull --ff-only` and to
+        prune_epic_worktrees()'s .git/worktrees rewrite while an adopted agent is
+        still working in it -- reopening exactly the mutual exclusion the lock
+        exists to provide, in the crash-restart case it was written for.
+
+        `guarded_work_is_alive` is how a caller supplies that second question:
+        given a project name, is the work this lock guards still running,
+        whatever happened to the process that took the lock? A True leaves the
+        lock strictly alone -- the same branch a live foreign owner already
+        takes. Callers whose guarded work cannot outlive them pass nothing.
+
+        Args:
+            resource_name: the resource whose locks to sweep.
+            guarded_work_is_alive: optional per-project probe for work that
+                survives this process, e.g. an agent container still running for
+                that project. Must fail CLOSED (return True when it cannot
+                tell): a False here dispossesses a holder.
+
         Returns:
             Number of locks released.
         """
@@ -386,9 +427,24 @@ class ProjectResourceLockManager:
                 )
                 continue
 
+            # Asked BEFORE the owner-kind rules below, because it answers a
+            # different question than any of them: they establish that the
+            # process which took the lock is gone, this establishes whether the
+            # work it guards went with it (#169 review).
+            if guarded_work_is_alive is not None and guarded_work_is_alive(lock.project):
+                logger.warning(
+                    f"Leaving '{resource_name}' lock for {lock.project} in place "
+                    f"(holder #{lock.locked_by_issue}, owner "
+                    f"{lock.owner_process or 'unknown (pre-stamp)'}) -- whatever became "
+                    f"of the process that took it, the work it guards is still running "
+                    f"and would be raced by this startup's own use of that resource. It "
+                    f"will be reclaimed by the TTL/staleness path once that work ends"
+                )
+                continue
+
             owner_role = owner_process_role(lock.owner_process)
             if owner_role is not None and owner_role != my_role:
-                if self._foreign_owner_is_plausibly_alive(lock):
+                if self.holder_liveness_is_fresh(lock):
                     logger.info(
                         f"Leaving '{resource_name}' lock for {lock.project} in place "
                         f"(holder #{lock.locked_by_issue}, owner {lock.owner_process}) -- "

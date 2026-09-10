@@ -212,6 +212,51 @@ async def main():
     from services.pipeline_lock_manager import get_pipeline_lock_manager as _warm_pipeline_lock_manager
     await asyncio.to_thread(_warm_pipeline_lock_manager)
 
+    # Release project_checkout locks left behind by THIS process's own dead
+    # predecessor, BEFORE anything below waits on one (#169 review). Same
+    # mechanism, same owner-kind/liveness rules and the same reason as the
+    # dev_container_build recovery further down -- see
+    # recover_orphaned_resource_locks(): nothing else frees a resource lock,
+    # because the board-scoped stale-lock recovery iterates configured pipeline
+    # boards and a resource lock lives under the reserved
+    # `__resource__project_checkout` board, leaving PipelineLockManager's 7200s
+    # Redis TTL / 14400s YAML staleness window as the only way out.
+    #
+    # Both callers immediately below take that lock per project and both are
+    # bounded (initialize_project()'s 120s, prune_epic_worktrees()'s shared
+    # budget), so a lock stamped by the crashed prior process turned each of
+    # them into a guaranteed no-op in exactly the case they exist for: the
+    # restart after a crash. Runs here rather than next to the
+    # dev_container_build recovery because that one runs ~50 lines too late to
+    # help these two.
+    #
+    # UNLIKE the dev_container_build one, this passes a survivor probe (#169
+    # review). A dead holding process does not mean dead guarded work here:
+    # claude_integration.py holds this lock across a base-clone-scoped agent
+    # CONTAINER run, and recover_or_cleanup_containers() below exists precisely
+    # because those containers survive a restart and get adopted. Releasing
+    # under one of them would hand the base clone to initialize_project()'s
+    # `git pull --ff-only` and to prune_epic_worktrees()'s .git/worktrees
+    # rewrite while the adopted agent is still working in it -- and both of
+    # those run BEFORE anything here has enumerated which containers survived.
+    # That probe asks only about survivors that could be inside the BASE CLONE
+    # (org.switchyard.base_clone) -- an epic-worktree-scoped survivor, which is
+    # the common one, never held this lock and shares no directory with it, so
+    # counting it would restore the very no-op described above. See
+    # project_has_live_agent_container().
+    logger.info("Recovering orphaned project_checkout resource locks")
+    from services.project_checkout_lock import (
+        RESOURCE_NAME as PROJECT_CHECKOUT_RESOURCE,
+        project_has_live_agent_container,
+    )
+    from services.project_resource_lock_manager import ProjectResourceLockManager
+    checkout_locks_released = await asyncio.to_thread(
+        ProjectResourceLockManager().recover_orphaned_resource_locks,
+        PROJECT_CHECKOUT_RESOURCE,
+        project_has_live_agent_container,
+    )
+    logger.info(f"Orphaned project_checkout lock recovery: {checkout_locks_released} released")
+
     # Initialize all project workspaces on startup
     #
     # Run off the event loop (#54 follow-up): initialize_all_projects() ->
@@ -274,8 +319,17 @@ async def main():
 
     # Prune any per-epic worktrees left behind by a previous crash (sibling namespace
     # to the reference-repo worktrees above — see ProjectWorkspaceManager.prune_epic_worktrees)
+    #
+    # Run off the event loop, for the same reason initialize_all_projects() and
+    # recover_or_cleanup_repair_cycle_containers() above are (#169 review): the
+    # sweep now takes each project's project_checkout lock with a bounded WAIT,
+    # and project_checkout_lock_sync() polls with time.sleep() and releases
+    # through a guard that can itself sleep for two guard budgets when Redis is
+    # down. None of that may run on this loop — and off it, the wait is also
+    # able to succeed, because the in-process holders it waits behind release
+    # from coroutines on the loop this hop keeps free.
     logger.info("Pruning stale epic worktrees")
-    workspace_manager.prune_epic_worktrees()
+    await asyncio.to_thread(workspace_manager.prune_epic_worktrees)
     logger.info("Epic worktree prune complete")
 
     # Release dev_container_build locks left behind by THIS process's own dead
@@ -293,7 +347,8 @@ async def main():
     # `__resource__dev_container_build` board, not a configured pipeline board.
     logger.info("Recovering orphaned dev_container_build resource locks")
     from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
-    from services.project_resource_lock_manager import ProjectResourceLockManager
+    # ProjectResourceLockManager is already imported above, by the
+    # project_checkout recovery this one mirrors.
     resource_locks_released = ProjectResourceLockManager().recover_orphaned_resource_locks(
         DEV_CONTAINER_BUILD_RESOURCE
     )

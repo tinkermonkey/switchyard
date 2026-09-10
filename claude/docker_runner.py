@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 FINAL_OUTPUT_START = '<<<FINAL_OUTPUT>>>'
 FINAL_OUTPUT_END = '<<<END_FINAL_OUTPUT>>>'
 
+# TTL on the `agent:container:<name>` hash _register_active_container() writes.
+#
+# MUST outlast the longest agent a container can be running, because that hash
+# is the only thing that gives POST /agents/kill/<container> a project and an
+# issue number to cancel work for -- without it the endpoint falls through to a
+# bare `docker rm -f`, setting no cancellation signal, and the resulting exit
+# 137 reaches agent_executor as an ordinary non-retryable failure that counts
+# toward MAX_CONSECUTIVE_DISPATCH_FAILURES (#160 review). This was 7200s while
+# config/foundations/agents.yaml gives senior_software_engineer a timeout of
+# 10800s, so the key expired under a live container after two hours -- the exact
+# state an operator reaches for the kill switch in.
+#
+# 12600s = 10800s (the longest configured agent timeout) + 1800s of margin for
+# the container teardown, result persistence and GitHub posting that follow it.
+# The key is deleted explicitly when a run ends (see cleanup paths and
+# cleanup_orphaned_redis_keys()); the TTL is only the backstop for a crash.
+ACTIVE_CONTAINER_TRACKING_TTL_SECONDS = 12600
+
 
 def _extract_marked_output(turn_text: str) -> Optional[str]:
     """Extract a <<<FINAL_OUTPUT>>>...<<<END_FINAL_OUTPUT>>> block from one turn's
@@ -1312,6 +1330,34 @@ class DockerAgentRunner:
             return f'{host_workspace}/switchyard/{container_path[len("/app/"):]}'
         return container_path
 
+    @staticmethod
+    def _is_base_clone_label(context: Dict[str, Any], project_dir: Path) -> str:
+        """'true'/'false' for the org.switchyard.base_clone label -- does this
+        container's mounted working directory IS the project's shared base clone,
+        rather than one of the isolated epic worktrees that share nothing with it?
+
+        Fails CLOSED ('true') on anything it cannot answer, matching
+        is_base_clone_dir()'s own fail-closed contract and for the same reason
+        one level up: the only consumer (project_checkout_lock's startup survivor
+        probe) uses a 'false' to decide that a surviving container cannot be
+        holding the base clone, so an unknown must never read as 'false'.
+
+        Function-local import, matching the module's other project_workspace
+        imports: services/project_workspace.py imports this module's package.
+        """
+        try:
+            from services.project_workspace import workspace_manager
+            project = context.get('project')
+            if not project:
+                return 'true'
+            return 'true' if workspace_manager.is_base_clone_dir(project, project_dir) else 'false'
+        except Exception as e:
+            logger.warning(
+                f"Could not determine whether {project_dir} is the shared base clone: {e} "
+                "- labelling the container org.switchyard.base_clone=true (fail closed)"
+            )
+            return 'true'
+
     def _build_docker_command(
         self,
         container_name: str,
@@ -1400,7 +1446,19 @@ class DockerAgentRunner:
             '--label', f'org.switchyard.agent={agent}',
             '--label', f'org.switchyard.task_id={context.get("task_id", "unknown")}',
             '--label', f'org.switchyard.execution_type={execution_type_label}',
-            '--label', 'org.switchyard.managed=true'
+            '--label', 'org.switchyard.managed=true',
+            # Whether this run's mounted working directory IS the project's
+            # shared base clone or an isolated epic worktree (#171 review).
+            # Read at startup by project_checkout_lock's survivor probe, which
+            # must decide whether a container that outlived the previous
+            # orchestrator process could still be working inside the directory a
+            # surviving project_checkout lock protects -- without it, every
+            # worktree-scoped survivor (the common case) pinned that project's
+            # base clone for a whole TTL window. Derived from the same
+            # is_base_clone_dir() predicate claude_integration.py uses to decide
+            # whether to take that lock around this very call, on the same
+            # project_dir, so label and lock cannot disagree.
+            '--label', f'org.switchyard.base_clone={self._is_base_clone_label(context, project_dir)}',
         ])
 
         # Add optional labels if available
@@ -2328,8 +2386,27 @@ class DockerAgentRunner:
                         f"end_turn; killing stalled background processes..."
                     )
                     try:
-                        subprocess.run(['docker', 'kill', container_name], capture_output=True, timeout=30)
-                        _orchestrator_killed = True
+                        kill_result = subprocess.run(
+                            ['docker', 'kill', container_name], capture_output=True, timeout=30
+                        )
+                        # Only a kill that actually landed makes this container's exit
+                        # OURS. subprocess.run without check=True does not raise on a
+                        # non-zero return, so this flag used to be set even when the
+                        # kill did nothing ("No such container", "is not running", a
+                        # transient daemon error) -- and since _raise_for_failed_exit_
+                        # code() now reads it to decide RETRYABILITY, a kill that lost
+                        # the race to the OOM killer would have relabelled that OOM as
+                        # "nothing external terminated it" and sent the same workload
+                        # back for two more retries (#160 review).
+                        if kill_result.returncode == 0:
+                            _orchestrator_killed = True
+                        else:
+                            logger.warning(
+                                f"docker kill returned {kill_result.returncode} for "
+                                f"{container_name}: "
+                                f"{kill_result.stderr.decode(errors='replace').strip()!r} — "
+                                f"not attributing the container's exit to the orchestrator"
+                            )
                     except Exception as kill_err:
                         logger.warning(f"docker kill failed for {container_name}: {kill_err}")
                     if not container_exited.wait(timeout=10):
@@ -2409,6 +2486,10 @@ class DockerAgentRunner:
             elif _orchestrator_killed:
                 # Killed after a non-clean end (stuck/error result, or no result text):
                 # do NOT promote to success — let the failure stand so the cycle retries.
+                # The retry is the caller's ordinary retry loop (agent_executor's,
+                # worker_pool's, repair_cycle's), which only sees this as retryable
+                # because _raise_for_failed_exit_code() is told the kill was ours —
+                # every other 137 is non-retryable by design (#160). See that method.
                 logger.info(
                     f"Container {container_name} killed by orchestrator after a non-clean turn "
                     f"(stop_reason={stream_final_result.get('stop_reason') or 'none'}, "
@@ -2729,7 +2810,9 @@ class DockerAgentRunner:
                     except Exception as outcome_error:
                         logger.error(f"Failed to record outcome in docker_runner: {outcome_error}", exc_info=True)
 
-                self._raise_for_failed_exit_code(exit_code, stderr_excerpt)
+                self._raise_for_failed_exit_code(
+                    exit_code, stderr_excerpt, orchestrator_killed=_orchestrator_killed
+                )
 
         except Exception as e:
             logger.error(f"Agent execution error: {e}")
@@ -2793,7 +2876,9 @@ class DockerAgentRunner:
                     raise ConnectionError("Redis unavailable")
 
                 redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
-                redis_client.expire(f'agent:container:{container_name}', 7200)
+                redis_client.expire(
+                    f'agent:container:{container_name}', ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
+                )
 
                 logger.info(f"Registered active container: {container_name} (agent={agent}, project={project}, id={container_id})")
                 return
@@ -2852,13 +2937,45 @@ class DockerAgentRunner:
         except Exception as e:
             logger.warning(f"Failed to cleanup prompt file {prompt_path}{suffix}: {e}")
 
-    def _raise_for_failed_exit_code(self, exit_code: int, stderr_excerpt: str):
+    def _raise_for_failed_exit_code(
+        self, exit_code: int, stderr_excerpt: str, orchestrator_killed: bool = False
+    ):
         """Raise appropriate exception for a non-zero exit code.
 
         SIGKILL (137) and SIGTERM (143) raise NonRetryableAgentError since the
-        container was deliberately terminated (e.g., user killed via Web UI or
-        OOM killer) and retrying will not help.
+        container was deliberately terminated by something OUTSIDE this run
+        (the OOM killer, or an operator via POST /agents/kill/<container>) and
+        retrying will not help.
+
+        `orchestrator_killed` is the one 137 that is NOT external: the
+        grace-period kill this method's own caller issues when Claude emitted
+        end_turn but the container outlived _CLEANUP_GRACE_SECONDS because a
+        background process is holding it open. When that kill lands after a
+        non-clean turn the code deliberately leaves exit_code at 137 so "the
+        cycle retries" -- and since #160 stopped the agent wrappers re-wrapping
+        NonRetryableAgentError, raising that type here would have made the
+        retry the comment promises impossible, everywhere at once
+        (agent_executor's loop, worker_pool's, and repair_cycle's `_run_tests`).
+        An ordinary agent that left a monitoring loop running is not the
+        "reproduces on every run" class #160's rationale is about: a re-launched
+        container very plausibly succeeds. So it raises a plain, retryable
+        Exception instead, and says why.
+
+        SCOPED to 137/143, because that is the only claim the flag supports: a
+        SIGKILL this process sent. Ungated it also spoke for exit codes the
+        orchestrator's kill cannot produce -- the container had already exited
+        on its own with some other code, the kill merely arrived afterwards --
+        and reported them with the grace-period narrative and the wrong
+        retryability. See the kill site for the other half of this: the flag is
+        set only when `docker kill` actually returned 0 (#160 review).
         """
+        if orchestrator_killed and exit_code in (137, 143):
+            raise Exception(
+                f"Agent execution failed (exit_code={exit_code}): the orchestrator killed "
+                f"this container after end_turn because background processes kept it "
+                f"alive past the cleanup grace period, and the captured turn was not "
+                f"clean. Retryable -- nothing external terminated it: {stderr_excerpt}"
+            )
         if exit_code in (137, 143):
             from agents.non_retryable import NonRetryableAgentError
             raise NonRetryableAgentError(

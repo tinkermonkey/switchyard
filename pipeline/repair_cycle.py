@@ -39,6 +39,7 @@ import json
 import logging
 import asyncio
 import re
+import time
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -71,6 +72,24 @@ MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
 # own timeout is 3600s); a timeout past it is reported loudly rather than
 # skipped silently, because CHANGES_NEEDED has no other owner.
 FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS = 300.0
+
+# How long the env-rebuild sub-cycle will poll for a terminal dev container
+# status when its own attempt queued NOTHING -- queue_dev_environment_setup()
+# deferred to a run it believes is already under way, or could not write its
+# IN_PROGRESS mark (#169 review).
+#
+# The poll below is deliberately untimed for the case it was written for: we
+# queued a real setup, and image builds legitimately outlast any test-type
+# timeout. That reasoning does not survive a deferral. Some holders it defers to
+# do end in a terminal status (a setup/verifier session, the observability
+# rebuild endpoint); the short bookkeeping ones do not
+# (dev_container_build_lock_if_free_sync in work_execution_state,
+# _finalize_unconfirmed_changes_needed), and neither does any holder that dies
+# inside its window -- so an untimed poll there waits for a write nobody will
+# make, and the only escape is the pipeline watchdog reaping the run as a
+# containerless zombie half an hour later. Ten minutes outlasts the deferrals
+# that do resolve while still leaving the sub-cycle its remaining attempts.
+DEFERRED_ENV_REBUILD_POLL_SECONDS = 600.0
 
 # "__infrastructure__" failures constructed directly by _run_tests()'s own retry-
 # exhaustion paths (JSON parsing never found a result, or the execution call itself
@@ -1365,6 +1384,26 @@ class RepairCycleStage(PipelineStage):
                     )
                     raise
 
+                # A deliberately terminated test container: don't retry (#160).
+                # claude/docker_runner.py raises NonRetryableAgentError for exit
+                # 137/143 — the OOM killer, or an operator's kill switch. Neither
+                # changes on a second attempt: an OOM reproduces on every run of
+                # the same suite, and re-launching a container an operator just
+                # killed is the opposite of what they asked for. Exhausting the
+                # retries here is worse than not retrying, because it fabricates a
+                # RepairTestResult carrying an "__infrastructure__" failure that
+                # the cycle then dispatches fix agents against — a Claude-driven
+                # "fix" for a container that was killed, not for a broken test.
+                # Propagated with its type intact, the same way the lock-timeout
+                # clause above and the ClaudeCodeRateLimitError clause earlier do.
+                from agents.non_retryable import NonRetryableAgentError
+                if isinstance(e, NonRetryableAgentError):
+                    logger.warning(
+                        f"Test execution container was terminated (not a test failure) — "
+                        f"not retrying: {e}"
+                    )
+                    raise
+
                 # Other execution failure (timeout, container failure, etc.)
                 logger.error(f"Test execution failed (attempt {attempt + 1}/{max_retries + 1}): {e}", exc_info=True)
                 
@@ -2458,12 +2497,22 @@ class RepairCycleStage(PipelineStage):
                     ),
                 )
                 from agents.orchestrator_integration import queue_dev_environment_setup
-                await queue_dev_environment_setup(
+                queue_outcome = await queue_dev_environment_setup(
                     project, logger,
                     change_description=analysis.env_issue_description,
                     pipeline_run_id=pipeline_run_id,
                     cycle_stack=_env_rebuild_stack,
                 )
+                if not queue_outcome.queued:
+                    # Returning without raising does NOT mean a setup is coming
+                    # (#169 review). See DEFERRED_ENV_REBUILD_POLL_SECONDS for
+                    # why the poll below has to be bounded in this case.
+                    logger.warning(
+                        f"Env rebuild attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES} for "
+                        f"{project} queued no setup ({queue_outcome.value}); polling at most "
+                        f"{DEFERRED_ENV_REBUILD_POLL_SECONDS:.0f}s for whatever run it "
+                        f"deferred to before retrying"
+                    )
 
             except CancellationError:
                 raise
@@ -2503,9 +2552,18 @@ class RepairCycleStage(PipelineStage):
             # here — the overall 1-hour stall check in _monitor_repair_cycle_container
             # handles runaway cases, and image builds can legitimately take longer
             # than any test-type timeout.
+            #
+            # ...as long as this attempt actually queued one. When it did not, the
+            # thing being waited for may not exist, and that stall check does not
+            # cover this poll anyway — it lives in services/project_monitor.py and
+            # watches a repair-cycle CONTAINER, not an in-process loop. Bound it.
             poll_interval = 30
             elapsed = 0
             final_status = None
+            poll_deadline = (
+                None if queue_outcome.queued
+                else time.monotonic() + DEFERRED_ENV_REBUILD_POLL_SECONDS
+            )
 
             while True:
                 await asyncio.sleep(poll_interval)
@@ -2533,6 +2591,44 @@ class RepairCycleStage(PipelineStage):
                 ):
                     final_status = status
                     break
+                if poll_deadline is not None and time.monotonic() >= poll_deadline:
+                    # Only reachable on the queued-nothing path; leaves final_status
+                    # None, which the check below turns into another attempt.
+                    break
+
+            if final_status is None:
+                # Nothing was queued and the run this attempt deferred to never
+                # produced a verdict. Retry the attempt rather than keep waiting —
+                # the next `for attempt` iteration resets the container to
+                # UNVERIFIED and re-queues, and the loop's own bound
+                # (MAX_SYSTEMIC_SUB_CYCLES, plus the circuit breaker above) is what
+                # stops this from spinning.
+                logger.warning(
+                    f"Env rebuild attempt {attempts_made}/{MAX_SYSTEMIC_SUB_CYCLES} for "
+                    f"{project} saw no terminal dev container status within "
+                    f"{elapsed}s of queuing nothing ({queue_outcome.value})"
+                    + (
+                        ", retrying"
+                        if attempts_made < MAX_SYSTEMIC_SUB_CYCLES
+                        else ", attempts exhausted"
+                    )
+                )
+                if obs:
+                    obs.emit(
+                        EventType.ERROR_ENCOUNTERED,
+                        "repair_cycle",
+                        task_id,
+                        project,
+                        {
+                            "test_type": config.test_type,
+                            "error_type": "env_rebuild_nothing_queued",
+                            "queue_outcome": queue_outcome.value,
+                            "elapsed_seconds": elapsed,
+                            "attempt": attempts_made,
+                        },
+                        pipeline_run_id=pipeline_run_id,
+                    )
+                continue
 
             if final_status == DevContainerStatus.VERIFIED:
                 # Rebuild succeeded; run tests to see if the env fix resolved failures

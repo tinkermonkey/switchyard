@@ -46,11 +46,15 @@ def _fail(stderr: str = "error") -> Mock:
 @pytest.fixture(autouse=True)
 def _no_op_checkout_lock():
     """Neutralize the project_checkout lock get_or_create_epic_worktree()'s
-    creation path now takes (#151/WI-6 item 1).
+    creation path (#151/WI-6 item 1) and cleanup_epic_worktree()/
+    prune_epic_worktrees()'s teardown paths (#169) now take.
 
     These tests are about worktree mechanics, not locking -- without this they
     would each build a real ProjectResourceLockManager (Redis / on-disk YAML lock
-    state) as a side effect. The lock's own behavior on this path is covered by
+    state) as a side effect. Worse for the prune sweep specifically: several of
+    those tests patch Path.is_dir/iterdir/exists with fixed side-effect
+    sequences, and a real acquire's own Path calls would consume them. The
+    locks' own behavior on these paths is covered by
     tests/unit/services/test_epic_worktree_checkout_lock.py.
     """
     @contextmanager

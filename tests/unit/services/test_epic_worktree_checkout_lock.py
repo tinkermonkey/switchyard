@@ -12,10 +12,14 @@ the base clone. So creating an epic worktree could run concurrently with the
 startup clone/update, a base-clone-scoped container run, or auto_commit's
 add/commit/push against that same .git.
 
-This closes the CREATION side only. Epic-worktree TEARDOWN --
-cleanup_epic_worktree() and prune_epic_worktrees(), both of which run `git -C
-<base clone> worktree remove --force` against that same .git/worktrees/ -- is
-still an unlocked base-clone writer, tracked in #169.
+Epic-worktree TEARDOWN -- cleanup_epic_worktree() and prune_epic_worktrees(),
+both of which run `git -C <base clone> worktree remove --force` and `git
+worktree prune` against that same .git/worktrees/ -- was the symmetric gap, and
+is covered here too since #169. Both teardown paths take the same bounded wait
+the creation path uses; the sweep's is budgeted per project out of a ceiling
+shared across the whole sweep, and main.py hops the sweep off the event loop so
+the wait neither freezes startup nor starves the in-process holder it is waiting
+behind. That budget measures WAITING only -- see the two tests named for it.
 
 Covers:
 - the lock is acquired BEFORE any git command touches the base clone and released
@@ -30,7 +34,12 @@ Covers:
   (ProjectCheckoutLockTimeoutError) with no git run and nothing tracked, rather
   than proceeding unlocked;
 - one epic's contended creation does not block another epic's (or another
-  project's) resolution.
+  project's) resolution;
+- teardown (#169): cleanup_epic_worktree() brackets its push/remove/prune in the
+  lock and fails loud rather than proceeding unlocked when it can't get it; the
+  prune sweep takes it per PROJECT with a bounded wait, charges only that wait
+  to the sweep's shared budget, skips only the busy project, and still covers
+  the trailing `worktree prune` and staging-dir removal.
 
 All git operations are mocked (subprocess.run) -- no real git commands run.
 """
@@ -54,7 +63,11 @@ from services.project_checkout_lock import (
     ProjectCheckoutLockTimeoutError,
     RESOURCE_NAME,
 )
-from services.project_workspace import UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS
+from services.project_workspace import (
+    PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+    PRUNE_SWEEP_LOCK_BUDGET_SECONDS,
+    UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS,
+)
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_workspace import ProjectWorkspaceManager
 
@@ -610,9 +623,20 @@ class TestPruneDoesNotDeleteAnInFlightWorktree:
     restart, silently defeating #48's own fix").
 
     _epic_worktrees_pending restores the skip decision without restoring the
-    blocking: prune runs on the event-loop thread at startup, so taking the
-    per-key lock here would freeze the loop for the creation's whole budget.
+    blocking: taking the per-key lock here would park the startup sweep for the
+    creation's whole ~3h budget.
     """
+
+    @pytest.fixture(autouse=True)
+    def _checkout_lock_free(self):
+        """The sweep's own per-project project_checkout acquire (#169), stubbed
+        as free. This class is about the pending-map skip decision, not about
+        the lock; a real acquire here would depend on whatever else in the test
+        environment happens to hold that project's lock. The acquire itself is
+        covered by TestPruneTakesTheCheckoutLockPerProject below."""
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   _RecordingLock([])):
+            yield
 
     def _quiet_prune_environment(self, manager):
         """prune's own side calls, stubbed: the docker liveness probe (no
@@ -933,3 +957,471 @@ class TestBlockingWaitsGetTheirOwnExecutor:
         mock_get.assert_called_once_with(
             "my-project", "921", "feature/issue-921", issue_number=922
         )
+
+
+class TestCleanupTakesTheLock:
+    """#169, teardown half. cleanup_epic_worktree() runs `git worktree remove
+    --force`, `git worktree prune` and a pre-removal push -- all writes to the
+    BASE CLONE's own .git (its worktrees/ registration and its remote-tracking
+    refs) -- and took no project_checkout lock at all."""
+
+    def test_the_lock_brackets_every_base_clone_command(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '700'
+        worktree_path.mkdir(parents=True)
+        manager._epic_worktrees[("my-project", "700")] = str(worktree_path)
+
+        events = []
+        recording = _RecordingLock(events)
+
+        def _record_git(cmd, *args, **kwargs):
+            events.append(' '.join(str(part) for part in cmd[:4]))
+            return _ok()
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', recording), \
+             patch('services.project_workspace.subprocess.run', side_effect=_record_git):
+            removed = manager.cleanup_epic_worktree("my-project", "700", issue_number=701)
+
+        assert removed is True
+        assert events[0] == 'lock_acquired', f"git ran before the lock: {events!r}"
+        assert events[-1] == 'lock_released', f"git ran after the lock: {events!r}"
+        # The pre-removal push probe is inside the hold too -- it updates the
+        # base clone's remote-tracking refs, so splitting it out would leave a
+        # gap between it and the removal.
+        assert any('rev-parse' in e for e in events[1:-1])
+        assert any('worktree remove' in e.replace('  ', ' ') or 'worktree' in e for e in events[1:-1])
+        assert recording.calls == [
+            {'project': 'my-project', 'issue_number': 701,
+             'timeout_seconds': project_checkout_lock.DEFAULT_TIMEOUT_SECONDS}
+        ]
+
+    def test_a_contended_base_clone_makes_cleanup_fail_loud_and_change_nothing(
+        self, manager, tmp_path
+    ):
+        """Through the REAL lock. Proceeding unlocked here would force-remove a
+        worktree registration out from under whoever holds the clone."""
+        test_dir = tempfile.mkdtemp()
+        try:
+            facade = _yaml_only_facade(test_dir)
+            _make_base_clone(tmp_path, "my-project")
+            worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '702'
+            worktree_path.mkdir(parents=True)
+            manager._epic_worktrees[("my-project", "702")] = str(worktree_path)
+
+            can_execute, _reason = facade.acquire_resource("my-project", RESOURCE_NAME, -999)
+            assert can_execute, "test setup: the other holder should have won the lock"
+
+            with patch('services.project_checkout_lock.ProjectResourceLockManager',
+                       return_value=facade), \
+                 patch('services.project_workspace.subprocess.run') as mock_run:
+                with pytest.raises(ProjectCheckoutLockTimeoutError):
+                    manager.cleanup_epic_worktree(
+                        "my-project", "702", checkout_lock_timeout_seconds=0.0
+                    )
+
+            mock_run.assert_not_called()
+            assert worktree_path.exists()
+            # Still tracked: nothing was removed, so dropping the reference would
+            # strand a worktree that is still on disk.
+            assert manager._epic_worktrees[("my-project", "702")] == str(worktree_path)
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_an_untracked_epic_returns_false_without_taking_the_lock(self, manager, tmp_path):
+        """The early-out has nothing to guard -- taking a base-clone lock to
+        discover there is no worktree would serialize real work behind a no-op."""
+        _make_base_clone(tmp_path, "my-project")
+        recording = _RecordingLock([])
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', recording), \
+             patch('services.project_workspace.subprocess.run') as mock_run:
+            removed = manager.cleanup_epic_worktree("my-project", "703")
+
+        assert removed is False
+        assert recording.calls == []
+        mock_run.assert_not_called()
+
+
+
+class TestPruneTakesTheCheckoutLockPerProject:
+    """#169, sweep half. Every removal in prune_epic_worktrees() rewrites the
+    base clone's .git/worktrees/, and main.py runs it at startup immediately
+    after container recovery -- whose auto-commit work can still be holding
+    this exact project's project_checkout lock on a background thread.
+
+    The lock is taken with a BOUNDED WAIT, not a single non-blocking attempt
+    (#169 review). main.py now hops the whole sweep off the event loop, the way
+    it already did for initialize_all_projects(), so the wait neither freezes
+    the loop nor starves the in-process holder it is waiting behind."""
+
+    def _stub_lock(self, free_projects, calls):
+        """Stand-in for project_checkout_lock_sync recording which projects it
+        was asked for (and with what budget), granting only `free_projects` and
+        raising the real timeout type for the rest."""
+        from contextlib import contextmanager as _cm
+
+        @_cm
+        def _lock(project, issue_number=None, **kwargs):
+            calls.append({'project': project, **kwargs})
+            if project not in free_projects:
+                raise ProjectCheckoutLockTimeoutError(
+                    f"'{RESOURCE_NAME}' lock for project {project!r} held by someone else"
+                )
+            yield None
+
+        return _lock
+
+    def _quiet(self, manager):
+        return (
+            patch.object(manager, '_get_running_container_mount_sources', return_value=set()),
+            patch('services.project_workspace.subprocess.run', return_value=_ok()),
+        )
+
+    def test_the_sweep_waits_rather_than_making_one_attempt(self, manager, tmp_path):
+        """THE #169-review regression. A single non-blocking attempt loses to
+        container recovery's auto-commit thread -- which main.py starts seconds
+        earlier and which finishes on its own -- and skipped the whole project
+        for it."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '710' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'my-project'}, calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['project'] for c in calls] == ['my-project']
+        assert calls[0]['timeout_seconds'] > 0, "the sweep must be willing to wait"
+        assert calls[0]['timeout_seconds'] <= PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS
+
+    def test_the_wait_is_bounded_well_under_the_module_default(self, manager, tmp_path):
+        """Startup blocks on this. project_checkout_lock's own ~3h
+        DEFAULT_TIMEOUT_SECONDS here would stall the monitor loop over one
+        project's cleanup -- the same reasoning initialize_project()'s 120s
+        default rests on."""
+        assert PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS <= 300
+        assert PRUNE_SWEEP_LOCK_BUDGET_SECONDS >= PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS
+
+    def test_the_lock_is_taken_once_per_project_not_once_per_worktree(self, manager, tmp_path):
+        """Per-worktree would pay an acquire per directory for no isolation gain
+        (they all target the same .git) AND leave the trailing `worktree prune`
+        outside every hold."""
+        _make_base_clone(tmp_path, "my-project")
+        for epic in ('711', '712', '713'):
+            (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / epic / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'my-project'}, calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['project'] for c in calls] == ['my-project']
+
+    def test_a_busy_project_is_skipped_whole_and_its_worktrees_survive(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "busy-project")
+        worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'busy-project' / '714'
+        (worktree_path / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock(set(), calls)), \
+             patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             liveness, subproc as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert [c['project'] for c in calls] == ['busy-project']
+        # No push, no removal, and no trailing `worktree prune` either -- the
+        # whole per-project unit is inside the hold.
+        mock_push.assert_not_called()
+        mock_run.assert_not_called()
+        assert worktree_path.exists()
+        assert (tmp_path / '.orchestrator' / 'worktrees' / 'busy-project').is_dir()
+
+    def test_one_busy_project_does_not_stop_another_projects_sweep(self, manager, tmp_path):
+        """Why the lock is per project and not once per sweep -- and why the
+        timeout is caught per project rather than by the method's outer
+        try/except."""
+        _make_base_clone(tmp_path, "busy-project")
+        _make_base_clone(tmp_path, "free-project")
+        busy_worktree = tmp_path / '.orchestrator' / 'worktrees' / 'busy-project' / '715'
+        free_worktree = tmp_path / '.orchestrator' / 'worktrees' / 'free-project' / '716'
+        (busy_worktree / '.git').mkdir(parents=True)
+        (free_worktree / '.git').mkdir(parents=True)
+
+        calls = []
+        removed = []
+
+        def _record_git(cmd, *args, **kwargs):
+            if 'remove' in cmd:
+                removed.append(str(cmd[-1]))
+            return _ok()
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'free-project'}, calls)), \
+             patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', side_effect=_record_git):
+            manager.prune_epic_worktrees()
+
+        assert sorted(c['project'] for c in calls) == ['busy-project', 'free-project']
+        assert removed == [str(free_worktree)]
+        assert busy_worktree.exists()
+
+    def test_a_lock_failure_never_takes_down_startup(self, manager, tmp_path):
+        """prune_epic_worktrees() runs unguarded at every orchestrator startup."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '717' / '.git').mkdir(parents=True)
+
+        def _explode(*args, **kwargs):
+            raise RuntimeError("lock store unreachable")
+
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _explode), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()  # must not raise
+
+    def test_a_non_lock_failure_in_one_project_still_sweeps_the_rest(self, manager, tmp_path):
+        """The per-project except is not a lock-timeout-only handler: a broken
+        base clone must not cost every other project its cleanup either."""
+        _make_base_clone(tmp_path, "broken-project")
+        _make_base_clone(tmp_path, "free-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'broken-project' / '718' / '.git').mkdir(parents=True)
+        free_worktree = tmp_path / '.orchestrator' / 'worktrees' / 'free-project' / '719'
+        (free_worktree / '.git').mkdir(parents=True)
+
+        swept = []
+        real_prune = ProjectWorkspaceManager._prune_project_staging
+
+        def _explode_for_broken(self_inner, project_staging, running_mount_sources):
+            if project_staging.name == 'broken-project':
+                raise OSError("staging directory vanished")
+            swept.append(project_staging.name)
+            return real_prune(self_inner, project_staging, running_mount_sources)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'broken-project', 'free-project'}, calls)), \
+             patch.object(ProjectWorkspaceManager, '_prune_project_staging',
+                          _explode_for_broken), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert swept == ['free-project']
+
+    def test_the_sweep_budget_degrades_to_a_single_attempt_once_spent(self, manager, tmp_path):
+        """Without a shared ceiling the worst case is len(projects) x the
+        per-project timeout of blocked startup. Once the budget is gone the
+        remaining projects get timeout 0.0 -- one attempt, then skipped."""
+        for project in ('a-project', 'b-project'):
+            _make_base_clone(tmp_path, project)
+            (tmp_path / '.orchestrator' / 'worktrees' / project / '720' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_workspace.PRUNE_SWEEP_LOCK_BUDGET_SECONDS', 0.0), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'a-project', 'b-project'}, calls)), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['timeout_seconds'] for c in calls] == [0.0, 0.0]
+
+    def test_the_budget_is_charged_for_waiting_not_for_the_sweeps_own_work(
+        self, manager, tmp_path
+    ):
+        """THE #169-second-pass regression. The budget was a `sweep_deadline =
+        now + BUDGET` computed once, so every second the sweep spent doing its
+        OWN git work was charged to it. One crashed project's worth of stale
+        worktrees -- each a rev-parse (10s cap), a rev-list (10s), a push (30s)
+        and a `worktree remove` (15s) against a slow remote -- spends the whole
+        300s on SUCCESSFUL cleanup, and every project after it gets timeout 0.0:
+        the single non-blocking attempt review of #169 rejected, reached with no
+        contention having occurred anywhere.
+
+        Here the first project burns 400s of pure work with the lock granted
+        instantly. The projects behind it must still get their full allowance."""
+        for project in ('a-project', 'b-project', 'c-project'):
+            _make_base_clone(tmp_path, project)
+            (tmp_path / '.orchestrator' / 'worktrees' / project / '721' / '.git').mkdir(parents=True)
+
+        clock = {'now': 1000.0}
+
+        def _slow_prune(self_inner, project_staging, running_mount_sources):
+            clock['now'] += 400.0
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_workspace.time.monotonic', lambda: clock['now']), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock({'a-project', 'b-project', 'c-project'}, calls)), \
+             patch.object(ProjectWorkspaceManager, '_prune_project_staging', _slow_prune), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['timeout_seconds'] for c in calls] == [
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS
+        ] * 3
+
+    def test_waiting_does_spend_the_budget_and_the_ceiling_still_bites(
+        self, manager, tmp_path
+    ):
+        """The other half: real WAITING is still charged, and the shared ceiling
+        still stops N projects becoming N x the per-project timeout of blocked
+        startup. Two contended projects wait out their full allowance each, so
+        the third gets only what is left of the sweep's budget."""
+        for project in ('a-project', 'b-project', 'c-project'):
+            _make_base_clone(tmp_path, project)
+            (tmp_path / '.orchestrator' / 'worktrees' / project / '722' / '.git').mkdir(parents=True)
+
+        from contextlib import contextmanager as _cm
+
+        clock = {'now': 1000.0}
+        calls = []
+
+        @_cm
+        def _lock(project, issue_number=None, **kwargs):
+            calls.append({'project': project, **kwargs})
+            # First two acquires are contended: they block for the whole budget
+            # they were given, then time out. Keyed on call order rather than
+            # project name because staging_root.iterdir() has no defined order.
+            if len(calls) <= 2:
+                clock['now'] += kwargs['timeout_seconds']
+                raise ProjectCheckoutLockTimeoutError(
+                    f"'{RESOURCE_NAME}' lock for project {project!r} held by someone else"
+                )
+            yield None
+
+        liveness, subproc = self._quiet(manager)
+        with patch('services.project_workspace.time.monotonic', lambda: clock['now']), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync', _lock), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert [c['timeout_seconds'] for c in calls] == [
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+            PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+            PRUNE_SWEEP_LOCK_BUDGET_SECONDS - 2 * PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS,
+        ]
+
+    def test_a_budget_exhausted_skip_says_so_rather_than_blaming_contention(
+        self, manager, tmp_path, caplog
+    ):
+        """"stayed held for the whole 0s budget" reads as contention against a
+        real wait and gives an operator no way to tell the two apart. A skip at
+        timeout 0.0 has to name the budget as the cause (#169 review)."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '723' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+             patch('services.project_workspace.PRUNE_SWEEP_LOCK_BUDGET_SECONDS', 0.0), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock(set(), calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert "shared" in caplog.text and "budget was already spent" in caplog.text
+        assert "stayed held for the whole 0s" not in caplog.text
+
+    def test_a_genuinely_contended_skip_still_reports_the_wait_it_made(
+        self, manager, tmp_path, caplog
+    ):
+        """And the other diagnosis keeps its own wording: this project did get a
+        real allowance and waited it out."""
+        _make_base_clone(tmp_path, "my-project")
+        (tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '724' / '.git').mkdir(parents=True)
+
+        calls = []
+        liveness, subproc = self._quiet(manager)
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+             patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   self._stub_lock(set(), calls)), \
+             liveness, subproc:
+            manager.prune_epic_worktrees()
+
+        assert (
+            f"stayed held for the whole {PRUNE_PROJECT_LOCK_TIMEOUT_SECONDS:.0f}s "
+            f"this project was allowed to wait"
+        ) in caplog.text
+        assert "budget was already spent" not in caplog.text
+
+
+class TestPruneAgainstTheRealCheckoutLock:
+    """The post-crash state this sweep is most likely to meet, driven through
+    the REAL facade rather than a stub (#169 review): a project_checkout lock
+    left behind by a holder that is no longer running.
+
+    Nothing else in the process frees a resource lock -- the board-scoped stale
+    lock recovery iterates configured pipeline boards and a resource lock lives
+    under the reserved `__resource__project_checkout` board -- so main.py now
+    calls recover_orphaned_resource_locks() for this resource at startup,
+    BEFORE the sweep. What is left here is a genuinely live foreign holder,
+    which the sweep must wait for and then skip rather than sweep unlocked."""
+
+    def test_a_contended_base_clone_leaves_its_worktrees_alone(self, manager, tmp_path, caplog):
+        test_dir = tempfile.mkdtemp()
+        try:
+            facade = _yaml_only_facade(test_dir)
+            _make_base_clone(tmp_path, "my-project")
+            worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '730'
+            (worktree_path / '.git').mkdir(parents=True)
+
+            can_execute, _reason = facade.acquire_resource("my-project", RESOURCE_NAME, -999)
+            assert can_execute, "test setup: the other holder should have won the lock"
+
+            with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+                 patch('services.project_workspace.PRUNE_SWEEP_LOCK_BUDGET_SECONDS', 0.0), \
+                 patch('services.project_checkout_lock.ProjectResourceLockManager',
+                       return_value=facade), \
+                 patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+                 patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+                 patch('services.project_workspace.subprocess.run') as mock_run:
+                manager.prune_epic_worktrees()
+
+            mock_push.assert_not_called()
+            mock_run.assert_not_called()
+            assert worktree_path.exists()
+            assert "Skipping the epic-worktree prune sweep for my-project" in caplog.text
+            # Nothing stolen, nothing released out from under the holder.
+            assert facade.get_resource_lock("my-project", RESOURCE_NAME).locked_by_issue == -999
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_a_free_base_clone_is_swept_through_the_real_lock(self, manager, tmp_path):
+        """The other half: with nobody holding it the sweep takes the lock,
+        does its work, and gives it back."""
+        test_dir = tempfile.mkdtemp()
+        try:
+            facade = _yaml_only_facade(test_dir)
+            _make_base_clone(tmp_path, "my-project")
+            worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '731'
+            (worktree_path / '.git').mkdir(parents=True)
+
+            removed = []
+
+            def _record_git(cmd, *args, **kwargs):
+                if 'remove' in cmd:
+                    removed.append(str(cmd[-1]))
+                return _ok()
+
+            with patch('services.project_checkout_lock.ProjectResourceLockManager',
+                       return_value=facade), \
+                 patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+                 patch.object(manager, '_push_local_commits_if_any'), \
+                 patch('services.project_workspace.subprocess.run', side_effect=_record_git):
+                manager.prune_epic_worktrees()
+
+            assert removed == [str(worktree_path)]
+            assert facade.get_resource_lock("my-project", RESOURCE_NAME) is None
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)

@@ -51,6 +51,7 @@ import services.project_checkout_lock as project_checkout_lock
 from services.pipeline_lock_manager import LOCK_TTL_SECONDS, PipelineLockManager, TouchResult
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services.project_checkout_lock import (
+    acquire_failure_is_contention,
     project_checkout_lock_async,
     project_checkout_lock_sync,
     _acquire_and_start_heartbeat_off_loop,
@@ -1902,6 +1903,154 @@ class TestReleaseAndWarnReportsWhyTheReleaseFailed(unittest.TestCase):
 
         warn.assert_not_called()
         err.assert_not_called()
+
+
+class TestAcquireFailureIsContention(unittest.TestCase):
+    """Moved here from dev_container_build_lock (#169): the reasons it
+    classifies come from the shared ProjectResourceLockManager facade, not from
+    either lock. Re-exported there, so
+    `from services.dev_container_build_lock import acquire_failure_is_contention`
+    still resolves."""
+
+    def test_a_live_holder_is_contention(self):
+        self.assertTrue(acquire_failure_is_contention("locked_by_issue_42"))
+
+    def test_a_retained_failed_lock_is_not_contention(self):
+        self.assertFalse(acquire_failure_is_contention("locked_by_issue_42_failed"))
+
+    def test_an_unrecognized_reason_is_not_assumed_to_be_a_holder(self):
+        self.assertFalse(acquire_failure_is_contention("something_new"))
+        self.assertFalse(acquire_failure_is_contention(None))
+
+    def test_the_re_export_is_the_same_function(self):
+        from services.dev_container_build_lock import (
+            acquire_failure_is_contention as re_exported,
+        )
+        self.assertIs(re_exported, acquire_failure_is_contention)
+
+
+class TestProjectHasLiveAgentContainer(unittest.TestCase):
+    """#169 review. Startup releases a project_checkout lock whose owner_process
+    names this process's own role, on the premise that such a lock belongs to a
+    dead predecessor. The premise is about the PROCESS, and for this resource the
+    guarded WORK can outlive it: claude_integration.py holds the lock across a
+    base-clone-scoped agent CONTAINER run, and agent_container_recovery exists
+    precisely because those containers survive a restart and get adopted.
+    Releasing under one hands the base clone to initialize_project()'s
+    `git pull --ff-only` and prune_epic_worktrees()'s .git/worktrees rewrite
+    while the adopted agent is still working in it."""
+
+    def _docker_ps(self, returncode=0, stdout="", stderr=""):
+        result = MagicMock()
+        result.returncode = returncode
+        result.stdout = stdout
+        result.stderr = stderr
+        return result
+
+    def test_a_surviving_base_clone_container_reports_the_work_as_alive(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|true\n"),
+        ) as run:
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+        args = run.call_args[0][0]
+        self.assertIn('label=org.switchyard.project=proj', args)
+
+    def test_no_containers_means_the_work_went_with_the_process(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run', return_value=self._docker_ps(stdout="\n")
+        ):
+            self.assertFalse(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_a_docker_ps_failure_fails_closed(self):
+        """This decides whether to dispossess a lock holder, so a docker socket
+        that is not answering must not read as 'nothing is running'."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(returncode=1, stderr="cannot connect"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_a_raising_probe_fails_closed_too(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run', side_effect=OSError("no docker binary")
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_it_is_scoped_to_the_project_asked_about(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run', return_value=self._docker_ps(stdout="")
+        ) as run:
+            project_checkout_lock.project_has_live_agent_container("other-project")
+
+        args = run.call_args[0][0]
+        self.assertIn('label=org.switchyard.project=other-project', args)
+        self.assertNotIn('label=org.switchyard.project=proj', args)
+
+    def test_it_asks_docker_for_the_base_clone_label(self):
+        """#171 review: the answer has to distinguish a survivor that could be
+        inside the base clone from one that provably cannot, so the query must
+        bring that label back alongside the name."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run', return_value=self._docker_ps(stdout="")
+        ) as run:
+            project_checkout_lock.project_has_live_agent_container("proj")
+
+        args = run.call_args[0][0]
+        fmt = args[args.index('--format') + 1]
+        self.assertIn('{{.Names}}', fmt)
+        self.assertIn(project_checkout_lock.BASE_CLONE_LABEL, fmt)
+        self.assertIn(project_checkout_lock._PROBE_FIELD_SEPARATOR, fmt)
+
+    def test_a_worktree_scoped_survivor_does_not_hold_the_base_clone(self):
+        """#171 review, the finding this narrowing exists for. An epic-worktree
+        agent run never took this lock (project_checkout_lock_if_shared_async()
+        skips it) and shares no directory with the base clone, so counting it
+        would leave a dead lock row in place for the whole 7200s-14400s
+        TTL/staleness window -- turning initialize_project()'s 120s wait and
+        prune_epic_worktrees()'s bounded wait back into the guaranteed no-op
+        this sweep exists to remove, in the ordinary restart shape."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(
+                stdout="claude-agent-proj-task1|false\nclaude-agent-proj-task2|false\n"
+            ),
+        ):
+            self.assertFalse(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_one_base_clone_survivor_among_worktree_ones_still_holds_it(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(
+                stdout="claude-agent-proj-task1|false\nclaude-agent-proj-task2|true\n"
+            ),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_an_unlabelled_survivor_fails_closed(self):
+        """A container started before this label existed -- i.e. by exactly the
+        crashed predecessor whose locks this sweep reads -- has an unknown
+        working directory, and only an explicit 'false' may dispossess a
+        holder."""
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
+
+    def test_an_unrecognized_label_value_fails_closed(self):
+        with patch.object(
+            project_checkout_lock.subprocess, 'run',
+            return_value=self._docker_ps(stdout="claude-agent-proj-task1|maybe\n"),
+        ):
+            self.assertTrue(project_checkout_lock.project_has_live_agent_container("proj"))
 
 
 if __name__ == '__main__':

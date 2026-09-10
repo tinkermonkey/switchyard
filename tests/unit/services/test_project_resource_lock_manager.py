@@ -788,6 +788,84 @@ class TestRecoverOrphanedResourceLocks(unittest.TestCase):
         self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)
         self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
 
+    def test_leaves_a_lock_alone_when_the_work_it_guards_survived_the_process(self):
+        """#169 review. Every rule above establishes that the holding PROCESS is
+        dead; for project_checkout that does not establish that the guarded work
+        is. claude_integration.py holds this lock across a base-clone-scoped
+        agent CONTAINER run, and those containers are adopted rather than killed
+        after a restart -- so releasing hands the base clone to
+        initialize_project()'s `git pull --ff-only` and prune_epic_worktrees()'s
+        .git/worktrees rewrite while the adopted agent is still working in it."""
+        self.facade.acquire_resource("proj", "project_checkout", -1)
+        my_role = owner_process_role(PROCESS_OWNER_ID)
+        self._restamp_owner("proj", "project_checkout", f"{my_role}#deadbeefcafe")
+
+        released = self.facade.recover_orphaned_resource_locks(
+            "project_checkout", guarded_work_is_alive=lambda project: True
+        )
+
+        self.assertEqual(released, 0)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "project_checkout"))
+
+    def test_releases_it_when_the_guarded_work_died_with_the_process(self):
+        """The other side: nothing survived, so the lock is the dead
+        predecessor's and the startup steps that wait on it are unblocked."""
+        self.facade.acquire_resource("proj", "project_checkout", -1)
+
+        released = self.facade.recover_orphaned_resource_locks(
+            "project_checkout", guarded_work_is_alive=lambda project: False
+        )
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "project_checkout"))
+
+    def test_the_probe_is_asked_about_the_locks_own_project(self):
+        for project in ("alpha", "beta"):
+            self.facade.acquire_resource(project, "project_checkout", -1)
+        asked = []
+
+        self.facade.recover_orphaned_resource_locks(
+            "project_checkout", guarded_work_is_alive=lambda project: asked.append(project) or False
+        )
+
+        self.assertEqual(sorted(asked), ["alpha", "beta"])
+
+    def test_the_probe_decides_per_project_not_for_the_whole_sweep(self):
+        for project in ("busy", "idle"):
+            self.facade.acquire_resource(project, "project_checkout", -1)
+
+        released = self.facade.recover_orphaned_resource_locks(
+            "project_checkout", guarded_work_is_alive=lambda project: project == "busy"
+        )
+
+        self.assertEqual(released, 1)
+        self.assertIsNotNone(self.facade.get_resource_lock("busy", "project_checkout"))
+        self.assertIsNone(self.facade.get_resource_lock("idle", "project_checkout"))
+
+    def test_a_retained_lock_is_still_left_alone_without_asking_the_probe(self):
+        """The retained marker outranks everything -- and there is no point
+        shelling out to Docker for a lock this sweep may not touch anyway."""
+        self.facade.acquire_resource("proj", "project_checkout", -7)
+        self.facade.mark_resource_failed("proj", "project_checkout", -7, "clone blew up")
+        asked = []
+
+        released = self.facade.recover_orphaned_resource_locks(
+            "project_checkout", guarded_work_is_alive=lambda project: asked.append(project) or False
+        )
+
+        self.assertEqual(released, 0)
+        self.assertEqual(asked, [])
+
+    def test_no_probe_keeps_the_behaviour_dev_container_build_relies_on(self):
+        """Its holders are in-process code paths and local subprocesses, which
+        die with the process -- so it passes nothing and nothing changes."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+
+        self.assertEqual(
+            self.facade.recover_orphaned_resource_locks("dev_container_build"), 1
+        )
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
     def _restamp_owner(self, project, resource_name, owner_process, lock_acquired_at=None):
         """Rewrite an already-acquired lock's owner (and optionally its liveness
         timestamp) on disk, standing in for a lock that a DIFFERENT process

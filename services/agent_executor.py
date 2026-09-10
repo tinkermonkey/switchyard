@@ -966,10 +966,51 @@ class AgentExecutor:
 
                 except Exception as e:
                     # CancellationError: deliberate stop — never retry, never trip circuit breaker
-                    from services.cancellation import CancellationError
+                    from services.cancellation import CancellationError, get_cancellation_signal
                     if isinstance(e, CancellationError):
                         logger.info(f"Agent {agent_name} cancelled: {e}")
                         raise
+
+                    # Cancelled work that surfaced as something else (#160). The
+                    # operator kill switch (POST /agents/kill/<container>) sets the
+                    # cancellation signal FIRST and only then kills the container,
+                    # so the failure this handler sees is whatever the kill
+                    # produced -- for a Docker-executed agent, docker_runner's
+                    # NonRetryableAgentError for exit 137/143. That is a deliberate
+                    # stop, not an agent failure, and the outer handler records it
+                    # as 'failure' otherwise: three kills of the same issue reach
+                    # MAX_CONSECUTIVE_DISPATCH_FAILURES, mark_failed() and a
+                    # durably retained board lock that needs
+                    # scripts/release_lock.py.
+                    #
+                    # This used to be covered by accident: the agent wrappers
+                    # re-wrapped NonRetryableAgentError into a plain Exception, so
+                    # the attempt was retried and the NEXT iteration's
+                    # cancellation check (above, at the top of the loop) converted
+                    # it. #160 stopped that re-wrap -- correctly, since retrying a
+                    # killed or OOM'd container just relaunches it -- which is
+                    # exactly why the conversion has to become explicit here
+                    # instead. Checked BEFORE the type-specific clauses below so it
+                    # applies whatever shape the kill arrives in, and gated on
+                    # key-presence the same way the top-of-loop check is (a
+                    # project-scoped dispatch has no issue_number key at all --
+                    # see normalize_issue_scope()).
+                    if 'issue_number' in task_context:
+                        if get_cancellation_signal().is_cancelled(
+                            project_name, task_context['issue_number']
+                        ):
+                            logger.info(
+                                f"Agent {agent_name} failed while "
+                                f"{project_name}/#{task_context['issue_number']} is "
+                                f"cancelled ({type(e).__name__}: {e}) — treating this as "
+                                f"the cancellation rather than as an agent failure, so "
+                                f"it neither retries nor counts toward "
+                                f"MAX_CONSECUTIVE_DISPATCH_FAILURES"
+                            )
+                            raise CancellationError(
+                                f"Work cancelled for {project_name}/"
+                                f"#{task_context['issue_number']}"
+                            ) from e
 
                     # NonRetryableAgentError: permanent failure — skip retries
                     from agents.non_retryable import NonRetryableAgentError

@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext
+from agents.non_retryable import NonRetryableAgentError
 from services.cancellation import CancellationError
 from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 import logging
@@ -162,7 +163,7 @@ class MakerAgent(PipelineStage, ABC):
             ]
             return context
 
-        except (CancellationError, ClaudeCodeRateLimitError):
+        except (CancellationError, ClaudeCodeRateLimitError, NonRetryableAgentError):
             # Never re-wrap these: agent_executor.py's retry loop does isinstance()
             # checks on them ("never retry cancellations", "systemic token limit,
             # not an agent failure — don't retry, don't count against the agent's
@@ -170,6 +171,25 @@ class MakerAgent(PipelineStage, ABC):
             # survives unchanged. Wrapping in a generic Exception below erases that
             # type and silently defeats both checks (see repair_cycle.py's
             # equivalent fix for the same underlying pattern).
+            #
+            # NonRetryableAgentError is the same rule for the same reason (#160):
+            # claude/docker_runner.py raises it for container exit codes 137/143,
+            # i.e. a container deliberately terminated (OOM killer, or an operator
+            # via POST /agents/kill/<container>). Re-wrapping it made both
+            # isinstance() exemptions go False, so a killed container was retried
+            # twice more — each attempt launching another container to be killed
+            # again, and an OOM kill in particular reproducing on every one.
+            #
+            # An OPERATOR kill must not become three strikes toward
+            # MAX_CONSECUTIVE_DISPATCH_FAILURES on the strength of this: it is a
+            # deliberate stop, not an agent failure. The re-wrap used to hide that
+            # by accident (the exception reached agent_executor.py as a plain
+            # Exception, whose retry then re-entered the loop and hit the
+            # cancellation check at the top). agent_executor.py's handler now makes
+            # that explicit, converting any failure raised while a cancellation
+            # signal is set for the issue into CancellationError — see the
+            # "Cancelled work" clause there. Without it this line would be a
+            # regression for the kill switch, not just a saved retry.
             raise
         except Exception as exc:
             # Same rule, one more family (#148): run_claude_code()

@@ -2,6 +2,7 @@ from typing import Dict, Any
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
+from agents.non_retryable import NonRetryableAgentError
 from services.cancellation import CancellationError
 from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 import logging
@@ -96,10 +97,13 @@ class CodeReviewerAgent(PipelineStage):
             logger.info("Code review completed, output length: %d", len(markdown_output))
             return context
 
-        except (CancellationError, ClaudeCodeRateLimitError):
+        except (CancellationError, ClaudeCodeRateLimitError, NonRetryableAgentError):
             # Never re-wrap: agent_executor.py's retry loop does isinstance() checks
             # on these ("never retry cancellations", "systemic token limit, not an
             # agent failure") that only work if the original exception type survives.
+            # NonRetryableAgentError joined them in #160 -- see the long note in
+            # agents/base_maker_agent.py for what docker_runner raises it for, and
+            # for why agent_executor.py's cancellation re-check has to land with it.
             raise
         except Exception as exc:
             # Resource-lock timeouts survive too — same rule, spelled the same way as

@@ -1416,9 +1416,19 @@ class WorkExecutionStateTracker:
                 }
 
                 import redis
+                # Same TTL invariant as the original registration (#160 review):
+                # this hash is what gives POST /agents/kill/<c> a project and an
+                # issue number, so it MUST outlast the longest agent a container
+                # can be running. A hardcoded 7200 was the defect this whole
+                # repair path then had to clean up after, restated -- the key
+                # expired again two hours later, under the same live container.
+                from claude.docker_runner import ACTIVE_CONTAINER_TRACKING_TTL_SECONDS
                 redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
                 redis_client.hset(f'agent:container:{container_name}', mapping=container_info)
-                redis_client.expire(f'agent:container:{container_name}', 7200)
+                redis_client.expire(
+                    f'agent:container:{container_name}',
+                    ACTIVE_CONTAINER_TRACKING_TTL_SECONDS,
+                )
 
                 logger.info(
                     f"REPAIRED Redis tracking for container {container_name} "
