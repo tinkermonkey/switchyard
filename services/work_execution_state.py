@@ -627,10 +627,13 @@ class WorkExecutionStateTracker:
         # (#148) — it just doesn't count toward count_consecutive_failures().
         # 'commit_in_flight' (#154/WI-9) belongs here for a third reason: startup
         # recovery stopped waiting on a repair cycle's auto-commit thread before it
-        # finished, so this pass never learned the outcome. The run was released
-        # rather than marked failed, which is only a retry point if the next poll
-        # re-dispatches — and the repair cycle it re-runs is idempotent (a commit
-        # that did land leaves nothing to commit).
+        # finished, so that pass never learned the outcome. It marks the run failed
+        # and retains the board's lock while the thread is still writing that
+        # directory (agent_container_recovery's commit_in_flight branch), so this
+        # predicate only starts to matter once an operator has released the lock —
+        # at which point the commit has long since resolved and the repair cycle is
+        # re-runnable and idempotent (a commit that did land leaves nothing to
+        # commit).
         if last_execution['outcome'] in ['failure', 'frozen', 'lock_contention',
                                          'cancelled', 'abandoned', 'commit_in_flight']:
             logger.debug(

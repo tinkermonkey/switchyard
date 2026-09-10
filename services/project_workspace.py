@@ -244,7 +244,21 @@ class ProjectWorkspaceManager:
         # as long as the creation it is waiting on. A marker prune can READ gets
         # the same skip decision without anyone blocking.
         self._epic_worktrees_pending: Dict[Tuple[str, str], str] = {}
-        # MAP guard only: held for dict reads/writes on the three maps above
+        # Directories a git WRITER is working in RIGHT NOW, keyed by path rather
+        # than by (project_name, epic_id) and reference-counted (#154/WI-9
+        # review). Same job as _epic_worktrees_pending -- a marker
+        # prune_epic_worktrees() can read without blocking -- for the one writer
+        # that is not a worktree resolution: startup recovery's auto-commit
+        # thread. Its join is bounded by a shared budget now, so
+        # recover_or_cleanup_repair_cycle_containers() can return with commit
+        # threads still running, and main.py runs the prune sweep the moment it
+        # does. That sweep's existing cover for this case is the best-effort
+        # get_or_create_epic_worktree() re-registration recovery does first,
+        # which only applies when context.json still carries epic_id AND
+        # branch_name and only when it doesn't raise; this marker applies
+        # unconditionally, for exactly as long as the commit thread lives.
+        self._worktree_paths_in_use: Dict[str, int] = {}
+        # MAP guard only: held for dict reads/writes on the maps above
         # (and on _epic_worktree_key_locks), never across git work or a lock wait.
         # Code review on #151/WI-6: this used to be the whole serializer for
         # get_or_create_epic_worktree()/cleanup_epic_worktree(), which meant one
@@ -1902,6 +1916,34 @@ class ProjectWorkspaceManager:
             logger.warning(f"Failed to check running-container mount sources: {e}")
             return set()
 
+    def mark_worktree_path_in_use(self, worktree_path) -> None:
+        """Protect `worktree_path` from prune_epic_worktrees() until a matching
+        clear_worktree_path_in_use().
+
+        For a git writer that is NOT a worktree resolution -- currently only
+        startup recovery's auto-commit thread, which can outlive the recovery
+        pass that started it (#154/WI-9 review). Reference-counted so two writers
+        on one directory cannot clear each other's protection, and cheap enough
+        to take unconditionally.
+
+        Callers must pair it in a `finally` scoped to the WRITER's lifetime (the
+        thread's, not the calling frame's) -- protecting only as far as the frame
+        that started the thread is the gap this exists to close.
+        """
+        key = str(worktree_path)
+        with self._epic_worktree_lock:
+            self._worktree_paths_in_use[key] = self._worktree_paths_in_use.get(key, 0) + 1
+
+    def clear_worktree_path_in_use(self, worktree_path) -> None:
+        """Drop one mark_worktree_path_in_use() reference on `worktree_path`."""
+        key = str(worktree_path)
+        with self._epic_worktree_lock:
+            remaining = self._worktree_paths_in_use.get(key, 0) - 1
+            if remaining > 0:
+                self._worktree_paths_in_use[key] = remaining
+            else:
+                self._worktree_paths_in_use.pop(key, None)
+
     def prune_epic_worktrees(self) -> None:
         """Remove all staged epic worktrees and prune git metadata.
 
@@ -1932,7 +1974,11 @@ class ProjectWorkspaceManager:
         that has started its git work but not yet registered -- see the per-worktree
         check below and _epic_worktrees_pending's own comment in __init__ for why
         the tracked map alone stopped covering that case once #151/WI-6 split the
-        per-epic serializer out of the map guard).
+        per-epic serializer out of the map guard) OR marked via
+        mark_worktree_path_in_use() (a git writer that is not a worktree
+        resolution at all -- startup recovery's auto-commit thread, which since
+        #154/WI-9's shared join budget can still be running when main.py calls
+        this).
 
         Also skips any worktree currently bind-mounted into a live, running
         switchyard-managed container (e.g. a repair-cycle container that survived
@@ -2018,12 +2064,14 @@ class ProjectWorkspaceManager:
                         currently_tracked = (
                             str(worktree_path) in self._epic_worktrees.values()
                             or str(worktree_path) in self._epic_worktrees_pending.values()
+                            or str(worktree_path) in self._worktree_paths_in_use
                         )
                     if currently_tracked:
                         logger.debug(
                             f"Skipping prune of {worktree_path} -- currently tracked in "
-                            "_epic_worktrees (adopted or created earlier this process) "
-                            "or being adopted/created right now on another thread"
+                            "_epic_worktrees (adopted or created earlier this process), "
+                            "being adopted/created right now on another thread, or "
+                            "currently being written by a git writer that marked it in use"
                         )
                         continue
 

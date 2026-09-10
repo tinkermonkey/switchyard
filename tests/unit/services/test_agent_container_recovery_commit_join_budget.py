@@ -16,9 +16,19 @@ CommitResult.FAILED. Every such container therefore reached
 mark_failed("Repair cycle passed but its fix was not committed"), which durably
 retains the board's pipeline lock: no issue dispatched onto that board until an
 operator runs scripts/release_lock.py, over a commit that was still running and
-usually landed seconds later. commit_in_flight is now its own outcome, and what
-it does depends on the directory -- release an isolated epic worktree (shares
-nothing), retain the shared base clone (holds the uncommitted fix, #148 C2).
+usually landed seconds later. commit_in_flight is now its own outcome, with an
+accurate reason.
+
+#154/WI-9 second review -- releasing the run for a per-epic worktree ("shares
+nothing") gave away a guarantee the pre-budget code accidentally provided. It
+shares nothing with SIBLING epics, which is why project_checkout does not gate
+it; it is not isolated from its OWN re-dispatch, which is precisely what a
+release invites (should_execute_work() retries this outcome, resolve_workspace()
+hands back the same directory) while `git add -A`/`commit`/`push` are still
+running in it. Both directories now retain, a bounded grace join for the
+worktree case (nothing gates it, so one more short wait usually observes it)
+keeps that retention rare, and the directory is marked in use for the commit
+thread's whole life so main.py's prune sweep cannot remove it mid-commit.
 
 Item 32 -- do_commit() runs on a background thread, and an exception raised
 there (rather than inside commit_agent_changes()'s own try/except) would go to
@@ -72,14 +82,20 @@ def _recovery():
 
 
 def _process(commit_agent_changes, commit_join_deadline=None,
-             is_base_clone=True, join_floor=TEST_JOIN_FLOOR):
+             is_base_clone=True, join_floor=TEST_JOIN_FLOOR,
+             thread_class=None, workspace_manager=None):
     """
     Drive _process_completed_repair_cycle() on a successful repair cycle, with
     `commit_agent_changes` as the auto-commit coroutine function.
 
     `is_base_clone` is what workspace_manager.is_base_clone_dir() answers for
-    the context's project_dir -- the shared-clone / epic-worktree fork the
-    commit_in_flight branch takes its decision on.
+    the context's project_dir -- the shared-clone / per-epic-worktree fork the
+    in-flight path takes its grace-join decision on.
+
+    `thread_class` stands in for threading.Thread (imported inside the method
+    under test, so it can only be patched at its source), letting a test watch
+    the joins -- see _commit_join_spy. `workspace_manager` lets a caller keep
+    the mock and assert on it after the call.
 
     Returns (run_manager, progression).
     """
@@ -100,10 +116,12 @@ def _process(commit_agent_changes, commit_join_deadline=None,
     auto_commit_service = MagicMock()
     auto_commit_service.commit_agent_changes = commit_agent_changes
 
-    workspace_manager = MagicMock()
+    if workspace_manager is None:
+        workspace_manager = MagicMock()
     workspace_manager.is_base_clone_dir.return_value = is_base_clone
 
     with patch.object(recovery_module, '_COMMIT_JOIN_FLOOR_SECONDS', join_floor), \
+         patch('threading.Thread', thread_class or threading.Thread), \
          patch('pathlib.Path.exists', return_value=True), \
          patch('builtins.open', mock_open(read_data=json.dumps(CONTEXT))), \
          patch('services.pipeline_run.PipelineRunManager', return_value=run_manager), \
@@ -127,6 +145,44 @@ def _process(commit_agent_changes, commit_join_deadline=None,
         )
 
     return run_manager, progression
+
+
+def _commit_join_spy(release_after_first_join=None):
+    """
+    A stand-in for the `threading` module agent_container_recovery builds its
+    threads from, recording every join() timeout the AUTO-COMMIT wait passes.
+
+    Filtered to the commit thread by its target's name: the same method also
+    joins a GitHub-comment thread earlier on, and mixing the two would make the
+    recorded sequence meaningless. If commit_thread() is ever renamed this spy
+    records nothing and its assertions fail loudly, which is the intended
+    failure mode.
+
+    `release_after_first_join` is set once the FIRST commit join returns, which
+    is how a test lands a commit inside the grace join deterministically rather
+    than by racing a sleep against it.
+
+    Returns (thread_class, joins).
+    """
+    joins = []
+
+    class SpyThread(threading.Thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            target = kwargs.get('target')
+            self._is_commit_thread = getattr(target, '__name__', '') == 'commit_thread'
+
+        def join(self, timeout=None):
+            if not self._is_commit_thread:
+                return super().join(timeout)
+            first = not joins
+            joins.append(timeout)
+            result = super().join(timeout)
+            if first and release_after_first_join is not None:
+                release_after_first_join.set()
+            return result
+
+    return SpyThread, joins
 
 
 def _blocking_commit():
@@ -310,16 +366,22 @@ class TestACutShortJoinIsNotAFailedCommit:
         # assert_not_called() passed unconditionally -- the test could not fail.
         progression.move_issue_to_column.assert_not_called()
 
-    def test_an_unwaited_worktree_commit_releases_rather_than_marking_failed(self):
+    def test_an_unwaited_worktree_commit_retains_rather_than_releasing(self):
         """
-        THE regression. An isolated epic worktree shares its directory with
-        nothing, so a commit still running in it leaves nothing dirty for the
-        next issue: the run is released (retain_lock=False) and the next board
-        poll retries. It must NOT be marked failed -- mark_failed() durably sets
-        retained_reason on the board's pipeline lock, blocking every issue on
-        that board until an operator runs scripts/release_lock.py, and its
-        reason ("its fix was not committed") is false while the commit is in
-        flight.
+        THE second-review regression (#154/WI-9). A commit still running in a
+        per-epic worktree is a live git writer in the directory this issue's own
+        next dispatch resolves straight back into: should_execute_work() treats
+        'commit_in_flight' as a retry point, and resolve_workspace() keys the
+        worktree by epic_id. Nothing serializes the two --
+        project_checkout_lock_if_shared_async() deliberately does not gate a
+        worktree -- so releasing the run hands the directory to a container that
+        starts editing files while `git add -A`/`commit`/`push` are mid-flight
+        in it: .git/index.lock contention, or the new run's half-written files
+        staged and pushed under this issue's commit message.
+
+        "Shares nothing" is true of SIBLING epics, not of the re-dispatch the
+        release itself triggers, so this retains exactly as the shared base
+        clone does -- with a reason that names the worktree.
         """
         commit_agent_changes, release = _blocking_commit()
 
@@ -332,19 +394,18 @@ class TestACutShortJoinIsNotAFailedCommit:
         finally:
             release.set()
 
-        run_manager.mark_failed.assert_not_called()
-        run_manager.end_pipeline_run.assert_called_once()
-        kwargs = run_manager.end_pipeline_run.call_args.kwargs
-        assert kwargs['retain_lock'] is False
-        assert kwargs['suppress_cancellation'] is True
-        assert 'in flight' in kwargs['reason']
+        run_manager.end_pipeline_run.assert_not_called()
+        run_manager.mark_failed.assert_called_once()
+        reason = run_manager.mark_failed.call_args.kwargs['reason']
+        assert 'still in flight' in reason, reason
+        assert 'worktree' in reason, reason
 
     def test_an_unwaited_shared_clone_commit_retains_with_an_accurate_reason(self):
         """
         The shared base clone genuinely does hold an uncommitted fix until the
         thread lands it, and handing that dirty clone to the next issue is the
-        #148 C2 hazard -- so this one still retains. What must not survive is
-        the reason: an operator reading "its fix was not committed" for a commit
+        #148 C2 hazard -- so this one retains too. What must not survive is the
+        reason: an operator reading "its fix was not committed" for a commit
         that is running (and about to succeed) is being told something false.
         """
         commit_agent_changes, release = _blocking_commit()
@@ -413,3 +474,147 @@ class TestCommitThreadExceptionsReachTheLogger:
         _, progression = _process(commit_agent_changes)
 
         progression.move_issue_to_column.assert_not_called()
+
+
+class TestTheWorktreeGraceJoin:
+    """
+    #154/WI-9 second review. Retaining the board's lock on a still-running
+    commit is correct but expensive (an operator has to run
+    scripts/release_lock.py), so the case where waiting is cheap gets one more
+    bounded wait first: a commit in a per-epic worktree takes no
+    project_checkout lock at all, so it is not queued behind anything -- it is a
+    slow `git push`, and a second short join usually observes it. The shared base
+    clone, whose commit may be waiting out the whole lock timeout, gets none:
+    that is the N x cost the shared budget exists to remove.
+    """
+
+    def test_a_worktree_commit_gets_a_second_bounded_wait(self):
+        commit_agent_changes, release = _blocking_commit()
+        thread_class, joins = _commit_join_spy()
+
+        try:
+            _process(
+                commit_agent_changes,
+                commit_join_deadline=time.monotonic() - 1,
+                is_base_clone=False,
+                join_floor=TEST_JOIN_FLOOR,
+                thread_class=thread_class,
+            )
+        finally:
+            release.set()
+
+        assert joins == [TEST_JOIN_FLOOR, TEST_JOIN_FLOOR], (
+            f"expected a floor-sized join followed by a floor-sized grace join, got {joins}"
+        )
+
+    def test_a_shared_clone_commit_gets_no_second_wait(self):
+        """The grace join must not become a blanket doubling of the pass's worst
+        case: a shared-clone commit can legitimately be waiting out the whole
+        project_checkout timeout, and waiting on it N times is the exact cost
+        #140 item 11 removed."""
+        commit_agent_changes, release = _blocking_commit()
+        thread_class, joins = _commit_join_spy()
+
+        try:
+            _process(
+                commit_agent_changes,
+                commit_join_deadline=time.monotonic() - 1,
+                is_base_clone=True,
+                thread_class=thread_class,
+            )
+        finally:
+            release.set()
+
+        assert joins == [TEST_JOIN_FLOOR], (
+            f"the shared base clone must get exactly one join, got {joins}"
+        )
+
+    def test_a_worktree_commit_that_lands_in_the_grace_join_is_observed(self):
+        """
+        The point of the grace join: a commit that finishes during it is a
+        NORMAL success -- the run ends, no lock is retained, no operator is
+        involved. Deterministic rather than timing-based: the commit is released
+        by the spy the instant the first join returns, so it can only land
+        inside the second one.
+        """
+        commit_agent_changes, release = _blocking_commit()
+        thread_class, joins = _commit_join_spy(release_after_first_join=release)
+
+        run_manager, _ = _process(
+            commit_agent_changes,
+            commit_join_deadline=time.monotonic() - 1,
+            is_base_clone=False,
+            thread_class=thread_class,
+        )
+
+        assert len(joins) == 2, f"the commit must have survived the first join: {joins}"
+        run_manager.mark_failed.assert_not_called()
+        run_manager.end_pipeline_run.assert_called_once()
+        assert run_manager.end_pipeline_run.call_args.kwargs['reason'] == (
+            "Repair cycle completed successfully"
+        )
+
+
+class TestTheCommitDirectoryIsHeldAgainstThePruneSweep:
+    """
+    #154/WI-9 second review, the secondary window. main.py runs
+    workspace_manager.prune_epic_worktrees() the moment
+    recover_or_cleanup_repair_cycle_containers() returns. Before the shared join
+    budget that pass always waited the commit out, so no commit thread was ever
+    live when the sweep started; now one can be, and the sweep force-removes an
+    untracked worktree -- mid-`git commit`, losing the repair cycle's fix. The
+    pre-existing get_or_create_epic_worktree() re-registration covers this only
+    when context.json still carries epic_id AND branch_name (this suite's context
+    carries neither) and only when it does not raise.
+    """
+
+    def test_an_in_flight_commit_holds_its_directory_for_the_whole_pass(self):
+        commit_agent_changes, release = _blocking_commit()
+        workspace_manager = MagicMock()
+
+        try:
+            _process(
+                commit_agent_changes,
+                commit_join_deadline=time.monotonic() - 1,
+                is_base_clone=False,
+                workspace_manager=workspace_manager,
+            )
+            # Still blocked, i.e. exactly the state main.py's prune sweep would
+            # find the directory in.
+            workspace_manager.mark_worktree_path_in_use.assert_called_once_with(
+                CONTEXT['project_dir']
+            )
+            workspace_manager.clear_worktree_path_in_use.assert_not_called()
+        finally:
+            release.set()
+
+    def test_the_hold_is_released_once_the_commit_thread_finishes(self):
+        """Held for the WRITER's life, not forever -- a permanent hold would make
+        every subsequent startup's prune sweep a no-op for that directory."""
+        async def commit_agent_changes(**kwargs):
+            return CommitResult.COMMITTED
+
+        workspace_manager = MagicMock()
+        _process(
+            commit_agent_changes,
+            is_base_clone=False,
+            workspace_manager=workspace_manager,
+        )
+
+        workspace_manager.mark_worktree_path_in_use.assert_called_once_with(
+            CONTEXT['project_dir']
+        )
+        workspace_manager.clear_worktree_path_in_use.assert_called_once_with(
+            CONTEXT['project_dir']
+        )
+
+    def test_the_hold_is_released_even_when_the_commit_raises(self):
+        async def commit_agent_changes(**kwargs):
+            raise RuntimeError("git index.lock is held")
+
+        workspace_manager = MagicMock()
+        _process(commit_agent_changes, workspace_manager=workspace_manager)
+
+        workspace_manager.clear_worktree_path_in_use.assert_called_once_with(
+            CONTEXT['project_dir']
+        )

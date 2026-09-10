@@ -128,11 +128,47 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 FIXTURE_PROJECTS_DIR = Path(__file__).parent / 'fixtures' / 'config' / 'projects'
 
 
-@pytest.fixture(scope="session", autouse=True)
-def isolated_project_configs():
+def build_project_config_overlay(overlay_dir: Path, fixture_dir: Path,
+                                 deployment_dir: Path) -> Path:
     """
-    Point the process-wide ConfigManager at tests/fixtures/config/projects/ for
-    the whole session (#140 items 35/38).
+    Populate `overlay_dir` with a symlink per project config: every fixture in
+    `fixture_dir` first, then every real config in `deployment_dir` that a
+    fixture has not already claimed by name.
+
+    ADDITIVE, deliberately (#154/WI-9 review). Replacing projects_dir outright
+    made the fixture a silent, global, opt-out-less redirect: any test that asks
+    ConfigManager for a real deployment project by name -- e.g.
+    tests/integration/test_readonly_filesystem.py's
+    get_project_agent_config('context-studio', ...) -- got a FileNotFoundError
+    naming a path under tests/fixtures/, with nothing to suggest a session
+    fixture had moved the directory out from under it. Overlaying keeps the
+    fixtures reachable without taking the real ones away.
+
+    Fixtures shadow same-named deployment files rather than the reverse: a stray
+    config/projects/test_project.yaml left behind in a deployment (exactly what
+    #162 is about) must not be what the suite reads.
+
+    Snapshot, not a live view: a config written into `deployment_dir` after this
+    runs is not picked up. Nothing in the suite does that, and a live view would
+    need a projects_dir shim rather than a real directory.
+    """
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    for source_dir in (fixture_dir, deployment_dir):
+        if not source_dir.is_dir():
+            continue
+        for source in sorted(source_dir.glob('*.yaml')):
+            target = overlay_dir / source.name
+            if target.exists() or target.is_symlink():
+                continue
+            target.symlink_to(source.resolve())
+    return overlay_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_project_configs(tmp_path_factory):
+    """
+    Point the process-wide ConfigManager at a session overlay of
+    tests/fixtures/config/projects/ over config/projects/ (#140 items 35/38).
 
     Two problems, one root cause. `config/projects/` is gitignored AS A
     DIRECTORY, so the `test_project.yaml` / `test-project.yaml` fixtures several
@@ -158,17 +194,25 @@ def isolated_project_configs():
     call site to opt in at, and a test that forgot to would silently read the
     deployment's real projects instead.
 
+    Autouse also means it applies to tests that never asked for it, which is why
+    it OVERLAYS rather than replaces -- see build_project_config_overlay(). The
+    real configs stay reachable by name; only the two fixture projects are added.
+
     Only the singleton is redirected. A test constructing its own
-    ConfigManager() still gets `config/projects/`, which on a clean checkout is
-    empty -- the same answer, since both fixture projects are `hidden: true` and
-    so never appear in list_visible_projects() either way.
+    ConfigManager() still gets `config/projects/` directly, which on a clean
+    checkout is empty -- the same answer for the fixture projects, since both are
+    `hidden: true` and so never appear in list_visible_projects() either way.
     """
     from config.manager import config_manager
 
     original = config_manager.projects_dir
-    config_manager.projects_dir = FIXTURE_PROJECTS_DIR
+    overlay = build_project_config_overlay(
+        tmp_path_factory.mktemp('project-configs'), FIXTURE_PROJECTS_DIR, original
+    )
+    config_manager.projects_dir = overlay
+    config_manager.reload_config()
     try:
-        yield FIXTURE_PROJECTS_DIR
+        yield overlay
     finally:
         config_manager.projects_dir = original
         config_manager.reload_config()
