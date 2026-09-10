@@ -111,7 +111,8 @@ class TestActiveResumeNonHolderShortCircuitLeavesTheIssueRePickupable:
     issue is being left to.
     """
 
-    def _resume_as_non_holder(self, watchdog, signal=None, tracker=None):
+    def _resume_as_non_holder(self, watchdog, signal=None, tracker=None,
+                              started_at=None):
         watchdog.lock_manager.get_lock_fail_closed = Mock(
             return_value=(Mock(locked_by_issue=170), True)
         )
@@ -126,7 +127,7 @@ class TestActiveResumeNonHolderShortCircuitLeavesTheIssueRePickupable:
                 project="proj",
                 board="SDLC Execution",
                 issue_number=42,
-                started_at=old_timestamp(),
+                started_at=started_at or old_timestamp(),
             )
         return resumed, signal, tracker, notify, redispatch
 
@@ -142,6 +143,25 @@ class TestActiveResumeNonHolderShortCircuitLeavesTheIssueRePickupable:
         assert kwargs["issue_number"] == 42
         assert kwargs["active_task_ids"] == set()
         assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_the_abandon_is_scoped_to_the_board_the_decision_was_made_about(
+        self, watchdog
+    ):
+        """REGRESSION: _self_heal_still_holds_lock only established that this
+        issue does not hold THIS board's lock, so the abandon must not reach
+        past it. An issue can sit on several of a project's Projects v2 boards
+        at once, active_task_ids is empty here, and a just-dispatched entry has
+        no task_id stamped yet -- so an unscoped sweep would rewrite another
+        board's live pre-enqueue probe to 'abandoned' and drop
+        has_active_execution() to False for a task still pending in Redis."""
+        frozen_at = "2026-08-10T10:07:24Z"
+        _resumed, _signal, tracker, _notify, _redispatch = self._resume_as_non_holder(
+            watchdog, started_at=frozen_at
+        )
+
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["board_name"] == "SDLC Execution"
+        assert kwargs["started_before"] == frozen_at
 
     def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
         signal = Mock()

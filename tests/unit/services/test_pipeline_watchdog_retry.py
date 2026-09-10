@@ -68,6 +68,12 @@ def watchdog():
     lock_manager.get_lock_fail_closed = Mock(
         return_value=(_lock_held_by_issue_under_test(), True)
     )
+    # Explicitly False, not left to a bare Mock's truthy auto-attribute: this
+    # is the "Redis positively answered no-lock" confirmation the permanent-
+    # decline branch consults when a read comes back unhealthy, and a truthy
+    # default would silently flip every fail-closed test in this file into the
+    # released branch without anyone asking for it.
+    lock_manager.redis_lock_is_missing = Mock(return_value=False)
     project_monitor = Mock()
     # Default to an open issue -- a bare Mock()'s auto-generated attributes
     # are truthy and .upper()-able, which would silently NOT match 'CLOSED'
@@ -532,6 +538,23 @@ class TestRedispatchPermanentDecline:
 
         assert result is False
 
+    def _decline_with_unhealthy_read(self, watchdog, redis_lock_is_missing):
+        from services.project_monitor import DispatchDecline
+
+        watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
+        watchdog.project_monitor.trigger_agent_for_status.return_value = (
+            DispatchDecline.ISSUE_CLOSED
+        )
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(
+            return_value=redis_lock_is_missing
+        )
+
+        with patch("config.manager.config_manager.get_project_config",
+                   return_value=self._fake_project_config()), \
+             patch("services.work_execution_state.work_execution_tracker"):
+            return watchdog._redispatch_same_issue("proj", "SDLC Execution", 159)
+
     def test_a_dual_store_read_failure_also_fails_closed(self, watchdog):
         """The failure mode the fail-closed comment actually names, and the
         one get_lock() cannot report: _read_redis_lock_only and
@@ -540,7 +563,58 @@ class TestRedispatchPermanentDecline:
         which is indistinguishable from "confirmed released". Read through
         get_lock_fail_closed() instead, so reads_healthy=False is treated as
         "assume still held" rather than silently returning a clean success on
-        a lock that is still durably this issue's."""
+        a lock that is still durably this issue's.
+
+        redis_lock_is_missing() is False here because it is False whenever the
+        Redis read itself failed -- which is what "both stores failed" means.
+        Nothing about this read confirms a release."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=False
+        ) is False
+
+    def test_a_yaml_only_read_failure_after_a_confirmed_release_does_not_page(
+        self, watchdog
+    ):
+        """REGRESSION: reads_healthy=False does NOT mean "both stores raised".
+        get_lock_fail_closed() is also unhealthy when the YAML leg alone failed
+        and Redis holds no entry (_get_lock_fail_closed_detail's asymmetric
+        case) -- and on THIS path "Redis holds no entry" is the expected steady
+        state, because trigger_agent_for_status()'s closed-issue branch just
+        released the lock itself. reads_healthy therefore collapses to "did the
+        contended '<state>.yaml.lock' read beat its 20s timeout", and treating
+        that lone file-lock timeout as "still held" re-arms exactly the outcome
+        this branch exists to remove: mark_lock_failed() on a lock that is no
+        longer this issue's, a CRITICAL, and a "Pipeline Stuck - Manual
+        Intervention Required" comment on a CLOSED issue about a board nobody
+        is blocking."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=True
+        ) is True
+        watchdog.lock_manager.mark_lock_failed.assert_not_called()
+
+    def test_the_yaml_only_allowance_is_scoped_to_this_call_site(self, watchdog):
+        """The allowance is only defensible where a release was just triggered.
+        The zombie/resume branches ask the same question at a point where
+        nothing has released anything, so they must keep failing closed on the
+        same unhealthy read."""
+        watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(return_value=True)
+
+        assert watchdog._self_heal_still_holds_lock(
+            watchdog.lock_manager, "proj", "SDLC Execution", 159, "Zombie self-heal"
+        ) is True
+        watchdog.lock_manager.redis_lock_is_missing.assert_not_called()
+
+    def test_a_redisless_deployment_still_fails_closed(self, watchdog):
+        """redis_lock_is_missing() is False when no Redis is configured at all,
+        so a YAML-only deployment whose state file could not be read gets the
+        conservative answer rather than a confirmation nothing actually made."""
+        assert self._decline_with_unhealthy_read(
+            watchdog, redis_lock_is_missing=False
+        ) is False
+
+    def test_a_raising_redis_confirmation_fails_closed(self, watchdog):
+        """An unanswered question is not an answer."""
         from services.project_monitor import DispatchDecline
 
         watchdog.project_monitor.get_issue_column_sync.return_value = "Code Review"
@@ -548,6 +622,9 @@ class TestRedispatchPermanentDecline:
             DispatchDecline.ISSUE_CLOSED
         )
         watchdog.lock_manager.get_lock_fail_closed = Mock(return_value=(None, False))
+        watchdog.lock_manager.redis_lock_is_missing = Mock(
+            side_effect=RuntimeError("redis down")
+        )
 
         with patch("config.manager.config_manager.get_project_config",
                    return_value=self._fake_project_config()), \
@@ -673,6 +750,28 @@ class TestZombieNonHolderShortCircuitLeavesTheIssueRePickupable:
         # The forensic record an operator reads must not claim a restart that
         # never happened, same as _redispatch_same_issue's own reason text.
         assert "not an orchestrator restart" in kwargs["reason"]
+
+    def test_the_abandon_is_scoped_to_the_board_the_decision_was_made_about(
+        self, watchdog
+    ):
+        """REGRESSION: the decision authorising this write is board-scoped --
+        _self_heal_still_holds_lock only established that #42 does not hold
+        THIS board's lock -- so the write must be too. An issue can sit on
+        several of a project's Projects v2 boards at once (see
+        _redispatch_same_issue's board-aware column lookup), active_task_ids is
+        empty here, and record_execution_start() runs BEFORE the Redis enqueue
+        so a just-dispatched entry has no task_id to protect it. An unscoped
+        sweep therefore rewrites another board's live pre-enqueue probe to
+        'abandoned', dropping has_active_execution() to False for a task still
+        pending in Redis -- with no dispatch behind it, unlike the redispatch
+        path."""
+        _cleaned, _signal, tracker, _notify, _redispatch = self._cleanup_as_non_holder(
+            watchdog
+        )
+
+        kwargs = tracker.abandon_stale_in_progress_entries.call_args.kwargs
+        assert kwargs["board_name"] == "SDLC Execution"
+        assert kwargs["started_before"] == "2026-08-10T10:07:24Z"
 
     def test_stays_a_clean_outcome_when_the_cleanups_themselves_fail(self, watchdog):
         """Best-effort, like the equivalent cleanups on the redispatch path:

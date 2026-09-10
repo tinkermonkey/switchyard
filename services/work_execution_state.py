@@ -3046,12 +3046,57 @@ class WorkExecutionStateTracker:
         else:
             logger.info("No stuck in_progress execution states found")
 
+    def _entry_is_in_board_scope(
+        self,
+        execution: Dict,
+        board_name: str,
+        cutoff: Optional[datetime],
+        project_name: str,
+        issue_number: int
+    ) -> bool:
+        """
+        Whether a board-scoped abandon sweep may touch this execution record.
+
+        Three cases, and only the first is an outright match:
+        - recorded on this board: in scope;
+        - recorded on a DIFFERENT board: out of scope, always. This is the case
+          the scoping exists for — the other board's run is somebody else's
+          decision, and it may be live;
+        - no board recorded: in scope only if it predates `cutoff` (the calling
+          run's own start). An unattributed record older than the dead run
+          cannot be a dispatch that started after it, and leaving those behind
+          is what keeps has_active_execution() stuck True on the very records
+          this sweep exists to clear.
+        """
+        recorded_board = execution.get('board_name')
+        if recorded_board:
+            return recorded_board == board_name
+
+        if cutoff is None:
+            return False
+
+        try:
+            return _parse_iso_timestamp(execution['timestamp']) < cutoff
+        except Exception as e:
+            # An unparsable timestamp on an unattributed record leaves no basis
+            # for the decision at all -- skip it rather than guess, same
+            # posture as a missing cutoff.
+            logger.warning(
+                f"Could not parse timestamp on an in_progress entry for "
+                f"{project_name}/#{issue_number} with no recorded board — "
+                f"leaving it in_progress rather than abandoning it "
+                f"unattributed: {e}"
+            )
+            return False
+
     def abandon_stale_in_progress_entries(
         self,
         project_name: str,
         issue_number: int,
         active_task_ids: set,
-        reason: str = 'Orchestrator restarted without completing this execution.'
+        reason: str = 'Orchestrator restarted without completing this execution.',
+        board_name: Optional[str] = None,
+        started_before: Optional[str] = None
     ) -> int:
         """
         Mark orphaned in_progress entries as 'abandoned'.
@@ -3080,12 +3125,45 @@ class WorkExecutionStateTracker:
             reason: Human-readable explanation stored on each abandoned entry's
                 `error` field. Defaults to the restart-recovery wording for
                 backward compatibility with the original caller.
+            board_name: Restrict the sweep to executions recorded on THIS board
+                (#144's board_name stamp). Omitted by the restart-recovery
+                caller, whose authority genuinely is project-wide: the
+                orchestrator just came up, so no execution of this issue on any
+                board can still be live. A caller whose decision was made about
+                ONE board must pass it — see the pipeline watchdog's
+                _clear_non_holder_reentry_blocks. An issue can sit on more than
+                one Projects v2 board at once, and `active_task_ids` cannot
+                protect the other board's entry: it is empty for those callers,
+                and a just-dispatched entry has no task_id stamped yet anyway
+                (record_execution_start deliberately runs BEFORE the enqueue).
+            started_before: Only meaningful alongside board_name, and only for
+                entries carrying no recorded board at all (pre-#144 records,
+                record_execution_outcome()'s synthesised crash-recovery record,
+                and the dispatch paths with no board in scope). Those cannot be
+                attributed to a board, so they are abandoned only when they
+                predate this ISO timestamp — the dead run's started_at, which
+                every such caller has in hand. Without it they would be swept
+                unconditionally, which is the project-wide write the board
+                filter exists to stop.
 
         Returns:
             Number of entries marked as abandoned
         """
         state = self.load_state(project_name, issue_number)
         abandoned = 0
+        cutoff = None
+        if board_name and started_before:
+            try:
+                cutoff = _parse_iso_timestamp(started_before)
+            except Exception as e:
+                # Not fatal: without a usable cutoff the unattributed entries
+                # are simply left alone, which is the conservative half of the
+                # scoping rather than a fall back to the project-wide sweep.
+                logger.warning(
+                    f"Could not parse started_before='{started_before}' while "
+                    f"abandoning stale entries for {project_name}/#{issue_number} "
+                    f"— entries with no recorded board will be left in_progress: {e}"
+                )
 
         for execution in state['execution_history']:
             if execution.get('outcome') != 'in_progress':
@@ -3094,6 +3172,11 @@ class WorkExecutionStateTracker:
             task_id = execution.get('task_id')
             if task_id and task_id in active_task_ids:
                 # Container is still running — leave this entry alone
+                continue
+
+            if board_name and not self._entry_is_in_board_scope(
+                execution, board_name, cutoff, project_name, issue_number
+            ):
                 continue
 
             execution['outcome'] = 'abandoned'
