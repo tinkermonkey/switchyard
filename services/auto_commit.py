@@ -4,7 +4,6 @@ Auto-Commit Service
 Automatically commits code changes made by agents to feature branches.
 """
 
-import contextlib
 import subprocess
 import logging
 from enum import Enum
@@ -187,27 +186,24 @@ class AutoCommitService:
             # startup clone/update, a container run bind-mounting it) instead of
             # racing it. Epic-worktree-scoped commits are deliberately NOT
             # locked -- they don't share a directory with anything else.
-            from services.project_workspace import workspace_manager
-            is_shared_dir = workspace_manager.is_base_clone_dir(project, project_dir)
+            # #149 item 23 collapsed the locked and unlocked paths onto one
+            # self._commit_and_push(...) call via a nullcontext, so a future
+            # argument change cannot be applied to one and missed on the other.
+            # #140 item 4 then moved the is_base_clone_dir() decision itself
+            # into the lock module, where the two other copies of this guard
+            # (claude/claude_integration.py) now go too. `is_shared_dir` is the
+            # yielded value rather than a second is_base_clone_dir() call -- the
+            # branch re-read below depends on it being the SAME answer the lock
+            # decision was made on.
+            #
+            # issue_number here is log attribution only, not the lock's holder
+            # identity -- see project_checkout_lock.py's module docstring ("Why
+            # every acquisition gets its own unique holder id").
+            from services.project_checkout_lock import project_checkout_lock_if_shared_async
 
-            if is_shared_dir:
-                from services.project_checkout_lock import project_checkout_lock_async
-
-                # issue_number here is log attribution only, not the lock's
-                # holder identity -- see project_checkout_lock.py's module
-                # docstring ("Why every acquisition gets its own unique
-                # holder id").
-                lock_cm = project_checkout_lock_async(project, issue_number)
-            else:
-                # #149 item 23: the unlocked path used to be a SECOND,
-                # duplicated self._commit_and_push(...) with an argument list
-                # identical to the locked one, existing only so the locked call
-                # could sit inside the `async with`. A nullcontext collapses
-                # both onto the single call site below, so a future argument
-                # change cannot be applied to one and missed on the other.
-                lock_cm = contextlib.nullcontext()
-
-            async with lock_cm:
+            async with project_checkout_lock_if_shared_async(
+                project, project_dir, issue_number
+            ) as is_shared_dir:
                 # CRITICAL: in the shared base clone, re-read the branch HERE,
                 # AFTER acquiring the lock, rather than reusing the value read
                 # before it (found in final whole-PR review): this lock exists

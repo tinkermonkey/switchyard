@@ -34,7 +34,10 @@ from unittest.mock import patch, MagicMock, AsyncMock
 # removed from the fixture below.
 if not Path('/app').is_dir():
     pytest.skip(
-        "Requires the real Docker orchestrator container — see module docstring.",
+        # The canonical wording every other container-gated file uses, so
+        # tests/conftest.py's summary hook counts this file's skip too
+        # (#140 item 37) -- it matches on that exact substring.
+        "Requires Docker container environment — see module docstring.",
         allow_module_level=True,
     )
 

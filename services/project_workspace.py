@@ -63,6 +63,15 @@ _EPIC_WORKTREE_EXECUTOR_MAX_WORKERS = 16
 _epic_worktree_executor: Optional[ThreadPoolExecutor] = None
 _epic_worktree_executor_guard = threading.Lock()
 
+# Concurrency cap for initialize_all_projects()' per-project startup init
+# (#140 item 3). Each worker runs one project's git clone/fetch under that
+# project's own project_checkout lock, so workers never contend with each
+# other; the cap exists to keep startup from fanning out unbounded network and
+# disk work across every configured project at once. Its pool is built and torn
+# down inside that call -- startup init runs exactly once per process, so a
+# module-level pool would just hold idle threads forever.
+_PROJECT_INIT_MAX_WORKERS = 8
+
 
 def _get_epic_worktree_executor() -> ThreadPoolExecutor:
     """The dedicated pool described above, built on first use."""
@@ -269,56 +278,27 @@ class ProjectWorkspaceManager:
 
         # Only initialize visible (non-hidden) projects
         projects = config_manager.list_visible_projects()
-        needs_setup = {}
 
-        for project_name in projects:
-            try:
-                project_config = config_manager.get_project_config(project_name)
-                was_cloned = self.initialize_project(project_name, project_config)
-
-                # Check if project needs dev environment setup.
-                # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree
-                # resolution (#48). This startup loop runs once per project before
-                # any board is polled and before any issue/epic exists to scope a
-                # worktree by -- Dockerfile.agent presence is a per-project, not
-                # per-epic, property anyway. If a future caller needs a
-                # worktree-scoped result here, that's a larger change than this
-                # startup check.
-                project_dir = self.get_project_dir(project_name)
-                dockerfile_agent = project_dir / 'Dockerfile.agent'
-
-                # Need setup if: newly cloned OR missing Dockerfile.agent
-                needs_setup[project_name] = (
-                    SetupStatus.NEEDED
-                    if (was_cloned or not dockerfile_agent.exists())
-                    else SetupStatus.NOT_NEEDED
-                )
-
-                if needs_setup[project_name] is SetupStatus.NEEDED:
-                    logger.info(f"Project {project_name} needs dev environment setup (newly_cloned={was_cloned}, has_dockerfile={dockerfile_agent.exists()})")
-
-            except Exception as e:
-                # UNKNOWN, never False (#148): this project's checkout was never
-                # inspected, so we cannot assert that it does not need setup.
-                # A lock timeout is called out separately because it is not a
-                # fault of this project's configuration or repository at all --
-                # another holder owned the project_checkout lock for the whole
-                # of initialize_project()'s (deliberately short) wait, most
-                # likely a stale lock left by a crashed prior process.
-                from services.resource_lock_errors import is_lock_timeout_error
-                if is_lock_timeout_error(e):
-                    logger.error(
-                        f"Could not initialize project {project_name}: the project_checkout "
-                        f"lock was held for the whole wait, so the checkout was never "
-                        f"inspected — dev environment setup need is UNKNOWN for this "
-                        f"startup: {e}"
-                    )
-                else:
-                    logger.error(
-                        f"Failed to initialize project {project_name} — dev environment "
-                        f"setup need is UNKNOWN: {type(e).__name__}: {e}"
-                    )
-                needs_setup[project_name] = SetupStatus.UNKNOWN
+        # Concurrently, not one after another (#140 item 3). The project_checkout
+        # lock is per-PROJECT, so no two of these contend with each other; a
+        # sequential loop nonetheless made one project's wait everybody else's
+        # wait. That wait is bounded (initialize_project()'s deliberately short
+        # 120s default, see its docstring), so the sequential worst case was
+        # ~len(projects) x 120s of startup -- roughly half an hour at this
+        # deployment's project count, for contention that is per-project and
+        # almost always a stale lock left by a crashed prior process.
+        #
+        # Bounded pool, created and shut down inside this call: this runs once
+        # per process, so a module-level pool would hold idle threads for the
+        # life of the orchestrator. Each worker does a git clone/fetch against a
+        # different repository, so the cap is about not fanning out unbounded
+        # network/disk work, not about correctness.
+        max_workers = min(len(projects), _PROJECT_INIT_MAX_WORKERS) or 1
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix='project-init'
+        ) as executor:
+            results = executor.map(self._initialize_one_project, projects)
+            needs_setup = dict(zip(projects, results))
 
         unknown = sorted(p for p, status in needs_setup.items() if status is SetupStatus.UNKNOWN)
         if unknown:
@@ -331,6 +311,67 @@ class ProjectWorkspaceManager:
             )
 
         return needs_setup
+
+    def _initialize_one_project(self, project_name: str) -> 'SetupStatus':
+        """
+        One project's share of initialize_all_projects(), so that loop can run
+        its projects concurrently (#140 item 3).
+
+        Split out rather than left inline as a closure: this is the unit whose
+        failure must stay per-project. It never raises -- every outcome, success
+        or failure, comes back as a SetupStatus, so one project's broken config
+        or held lock cannot take down the others' initialization or the startup
+        sequence itself.
+        """
+        try:
+            project_config = config_manager.get_project_config(project_name)
+            was_cloned = self.initialize_project(project_name, project_config)
+
+            # Check if project needs dev environment setup.
+            # INTENTIONALLY base-clone-scoped, not migrated to epic-worktree
+            # resolution (#48). This startup loop runs once per project before
+            # any board is polled and before any issue/epic exists to scope a
+            # worktree by -- Dockerfile.agent presence is a per-project, not
+            # per-epic, property anyway. If a future caller needs a
+            # worktree-scoped result here, that's a larger change than this
+            # startup check.
+            project_dir = self.get_project_dir(project_name)
+            dockerfile_agent = project_dir / 'Dockerfile.agent'
+
+            # Need setup if: newly cloned OR missing Dockerfile.agent
+            status = (
+                SetupStatus.NEEDED
+                if (was_cloned or not dockerfile_agent.exists())
+                else SetupStatus.NOT_NEEDED
+            )
+
+            if status is SetupStatus.NEEDED:
+                logger.info(f"Project {project_name} needs dev environment setup (newly_cloned={was_cloned}, has_dockerfile={dockerfile_agent.exists()})")
+
+            return status
+
+        except Exception as e:
+            # UNKNOWN, never False (#148): this project's checkout was never
+            # inspected, so we cannot assert that it does not need setup.
+            # A lock timeout is called out separately because it is not a
+            # fault of this project's configuration or repository at all --
+            # another holder owned the project_checkout lock for the whole
+            # of initialize_project()'s (deliberately short) wait, most
+            # likely a stale lock left by a crashed prior process.
+            from services.resource_lock_errors import is_lock_timeout_error
+            if is_lock_timeout_error(e):
+                logger.error(
+                    f"Could not initialize project {project_name}: the project_checkout "
+                    f"lock was held for the whole wait, so the checkout was never "
+                    f"inspected — dev environment setup need is UNKNOWN for this "
+                    f"startup: {e}"
+                )
+            else:
+                logger.error(
+                    f"Failed to initialize project {project_name} — dev environment "
+                    f"setup need is UNKNOWN: {type(e).__name__}: {e}"
+                )
+            return SetupStatus.UNKNOWN
 
     def initialize_project(
         self, project_name: str, project_config, checkout_lock_timeout_seconds: float = 120.0

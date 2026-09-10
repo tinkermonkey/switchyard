@@ -8,6 +8,7 @@ Checks for running Docker containers and attempts to reconnect or clean them up.
 import logging
 import subprocess
 import json
+import time
 import redis
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
@@ -1243,6 +1244,19 @@ class AgentContainerRecovery:
         except Exception:
             _repair_agent_timeout = 10800  # fallback: 3 hours
 
+        # ONE auto-commit wait budget for this whole pass (#140 item 11).
+        # _process_completed_repair_cycle() joins each recovered container's
+        # auto-commit thread, and that join is bounded by the project_checkout
+        # lock's own timeout; with N orphaned containers all resolving to the
+        # same contended shared base clone -- plausible right after the crash
+        # that orphaned them -- a per-call budget made this serial loop block
+        # startup for up to N x that timeout. Sharing one budget caps the whole
+        # pass at a single lock timeout instead. A commit whose join is cut
+        # short is not lost: the thread runs on, only this pass's auto-advance
+        # for that issue is skipped, and the next board poll retries.
+        from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
+        commit_join_deadline = time.monotonic() + _CHECKOUT_LOCK_TIMEOUT + 60
+
         running_containers = self.get_running_repair_cycle_containers()
 
         if not running_containers:
@@ -1283,7 +1297,8 @@ class AgentContainerRecovery:
                     # Process the result now to complete the workflow
                     try:
                         self._process_completed_repair_cycle(
-                            container_name, container_id, project, issue_number, result
+                            container_name, container_id, project, issue_number, result,
+                            commit_join_deadline=commit_join_deadline,
                         )
                         logger.info(f"Successfully processed completed repair cycle for {project}/#{issue_number}")
                         recovered += 1
@@ -1455,7 +1470,8 @@ class AgentContainerRecovery:
                         "exited",  # Container ID (doesn't matter, container is gone)
                         project,
                         issue_number,
-                        result
+                        result,
+                        commit_join_deadline=commit_join_deadline,
                     )
                     recovered += 1
                 except Exception as e:
@@ -1510,7 +1526,8 @@ class AgentContainerRecovery:
         return (recovered, killed, errors)
 
     def _process_completed_repair_cycle(self, container_name: str, container_id: str,
-                                       project: str, issue_number: int, result: Dict) -> None:
+                                       project: str, issue_number: int, result: Dict,
+                                       commit_join_deadline: Optional[float] = None) -> None:
         """
         Process a completed repair cycle that finished while orchestrator was restarting.
 
@@ -1527,6 +1544,13 @@ class AgentContainerRecovery:
             project: Project name
             issue_number: Issue number
             result: Result dict from result.json
+            commit_join_deadline: time.monotonic() value past which this call
+                must stop waiting on its auto-commit thread. Supplied by
+                recover_or_cleanup_repair_cycle_containers() so the whole
+                recovery pass shares ONE wait budget (#140 item 11) instead of
+                each orphaned container getting its own multi-thousand-second
+                one, serially. None (the default, used by tests and any future
+                one-off caller) keeps the full per-call join timeout.
         """
         import asyncio
         import threading
@@ -1826,7 +1850,30 @@ class AgentContainerRecovery:
                 # least as long as the lock itself is willing to wait, plus
                 # headroom for the actual git add/commit/push.
                 from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS as _CHECKOUT_LOCK_TIMEOUT
-                thread.join(timeout=_CHECKOUT_LOCK_TIMEOUT + 60)
+                join_timeout = _CHECKOUT_LOCK_TIMEOUT + 60
+                if commit_join_deadline is not None:
+                    # #140 item 11: N orphaned containers all resolving to the
+                    # same contended shared base clone -- plausible right after
+                    # the crash that orphaned them -- used to make startup
+                    # recovery block up to N x join_timeout, serially, because
+                    # each container's join carried its own full budget. The
+                    # pass shares one budget instead: whoever waits first can
+                    # spend it all, and once it is gone the rest do not wait at
+                    # all. Nothing is lost by not waiting -- the commit thread
+                    # runs on regardless (see the is_alive() branch below); only
+                    # this pass's auto-advance for that issue is skipped, and
+                    # the next board poll picks it up.
+                    join_timeout = max(0.0, min(
+                        join_timeout, commit_join_deadline - time.monotonic()
+                    ))
+                    if join_timeout == 0.0:
+                        logger.warning(
+                            f"Repair cycle recovery's shared auto-commit wait budget is "
+                            f"exhausted -- not waiting on issue #{issue_number}'s commit "
+                            "thread; it continues in the background and its result won't "
+                            "be reflected in this recovery pass"
+                        )
+                thread.join(timeout=join_timeout)
 
                 from services.auto_commit import CommitResult
                 if commit_success[0] is CommitResult.COMMITTED:
@@ -1862,7 +1909,7 @@ class AgentContainerRecovery:
                     # actual outcome when the commit may still be in flight.
                     logger.warning(
                         f"Auto-commit thread for repair cycle issue #{issue_number} did not "
-                        f"finish within the join timeout ({_CHECKOUT_LOCK_TIMEOUT + 60}s) -- "
+                        f"finish within the join timeout ({join_timeout}s) -- "
                         "still running in the background; its eventual result won't be "
                         "reflected in this recovery pass"
                     )

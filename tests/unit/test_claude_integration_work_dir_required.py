@@ -83,9 +83,13 @@ class TestLocalExecutionRefusesAMissingWorkDir:
         context = _local_execution_context()
         context.pop('work_dir', None)
 
+        # Patched where the lock module imports it (#140 item 4 moved the
+        # is_base_clone_dir() decision out of claude_integration and into
+        # project_checkout_lock_if_shared_async(), which imports
+        # workspace_manager function-locally to avoid an import cycle).
         with patch('services.dev_container_build_lock.dev_container_build_lock_async',
                    _noop_lock) as _build_lock, \
-             patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_wm, \
              patch('claude.claude_integration._run_claude_code_locally',
                    new_callable=AsyncMock) as mock_local:
             with pytest.raises(Exception) as exc_info:
@@ -103,7 +107,7 @@ class TestLocalExecutionRefusesAMissingWorkDir:
         with patch('services.dev_container_build_lock.dev_container_build_lock_async',
                    _noop_lock), \
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_lock), \
-             patch('claude.claude_integration.workspace_manager') as mock_wm, \
+             patch('services.project_workspace.workspace_manager') as mock_wm, \
              patch('claude.claude_integration._run_claude_code_locally',
                    new_callable=AsyncMock, return_value='done') as mock_local:
             mock_wm.is_base_clone_dir.return_value = True

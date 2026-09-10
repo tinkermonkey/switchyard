@@ -51,6 +51,129 @@ def pytest_configure(config):
         pass
 
 
+# ============================================================================
+# Container-gated test reporting
+# ============================================================================
+
+# The reason string ~60 test files pass to pytest.skip(..., allow_module_level=True)
+# when /app is absent. They import agents/__init__.py and other modules that
+# genuinely cannot import outside the orchestrator container (see CLAUDE.md,
+# "Docker-only imports"), so the gate itself is correct.
+CONTAINER_ONLY_SKIP_REASON = "Requires Docker container environment"
+
+# What those files test for.
+ORCHESTRATOR_CONTAINER_MARKER = '/app'
+
+
+def running_in_orchestrator_container():
+    return os.path.isdir(ORCHESTRATOR_CONTAINER_MARKER)
+
+
+def pytest_report_header(config):
+    """
+    Say up front whether the container-gated portion of the suite can run at all
+    (#140 item 37).
+
+    A host run skips those files wholesale, and pytest's summary line reports
+    those skips indistinguishably from any other -- so the run looks green while
+    a large share of it never executed. It is now stated before the first test.
+    """
+    if running_in_orchestrator_container():
+        return f"orchestrator container: yes ({ORCHESTRATOR_CONTAINER_MARKER} present)"
+    return (
+        f"orchestrator container: NO ({ORCHESTRATOR_CONTAINER_MARKER} absent) -- every "
+        "container-gated test file will be SKIPPED, not run. For full coverage: "
+        "docker exec -w /workspace/switchyard switchyard-orchestrator-1 python -m pytest <path>"
+    )
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """
+    Count the container-gated files that never ran, at the bottom of the report
+    where the green/red verdict is (#140 item 37).
+
+    Deliberately reporting, not failing: a host run of a scoped subset is a
+    legitimate thing to do, and turning it into an error would just teach people
+    to pass -p no:cacheprovider-style opt-outs. What it must not do is look like
+    a clean full pass.
+    """
+    if running_in_orchestrator_container():
+        return
+
+    gated = [
+        report for report in terminalreporter.stats.get('skipped', [])
+        if CONTAINER_ONLY_SKIP_REASON in str(getattr(report, 'longrepr', ''))
+    ]
+    if not gated:
+        return
+
+    terminalreporter.write_sep(
+        '=', f"{len(gated)} container-gated test file(s) did NOT run", red=True
+    )
+    terminalreporter.write_line(
+        f"These skipped because {ORCHESTRATOR_CONTAINER_MARKER} is absent, not because they "
+        "passed. This result does not cover them."
+    )
+    terminalreporter.write_line(
+        "Re-run inside the orchestrator container: "
+        "docker exec -w /workspace/switchyard switchyard-orchestrator-1 python -m pytest <path>"
+    )
+
+
+# ============================================================================
+# Project config isolation
+# ============================================================================
+
+# Tracked home of the suite's fake project configs. See #140 items 35/38.
+FIXTURE_PROJECTS_DIR = Path(__file__).parent / 'fixtures' / 'config' / 'projects'
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_project_configs():
+    """
+    Point the process-wide ConfigManager at tests/fixtures/config/projects/ for
+    the whole session (#140 items 35/38).
+
+    Two problems, one root cause. `config/projects/` is gitignored AS A
+    DIRECTORY, so the `test_project.yaml` / `test-project.yaml` fixtures several
+    test files need could not be committed there -- every fresh checkout and
+    every new worktree failed those tests until somebody hand-copied the files
+    in. And because that directory is also the REAL deployment's project config
+    directory, the copies that did exist were loaded by the running orchestrator
+    as ordinary projects: a 166-day-old stale `test-project/planning` pipeline
+    lock re-evaluated on every startup, board reconciliation and workspace init
+    for a project that does not exist, and real dev_environment_setup /
+    dev_environment_verifier agent runs dispatched against
+    /workspace/test-project -- burning tokens and container slots, with their
+    output addressed to issue #0 (see #162, and #149's FAILSAFE branch guard,
+    which is what finally made those runs visible by refusing to commit them).
+
+    The same file cannot be both test input that must exist and deployment
+    config that must not. So the fixtures live here, tracked, and this fixture
+    redirects lookups at them; `config/projects/` is left to real projects only.
+
+    Session-scoped and autouse rather than opt-in: the tests that need it reach
+    config_manager indirectly (PipelineQueueManager._get_pipeline_trigger_column()
+    -> config_manager.get_project_config(self.project_name)), so there is no
+    call site to opt in at, and a test that forgot to would silently read the
+    deployment's real projects instead.
+
+    Only the singleton is redirected. A test constructing its own
+    ConfigManager() still gets `config/projects/`, which on a clean checkout is
+    empty -- the same answer, since both fixture projects are `hidden: true` and
+    so never appear in list_visible_projects() either way.
+    """
+    from config.manager import config_manager
+
+    original = config_manager.projects_dir
+    config_manager.projects_dir = FIXTURE_PROJECTS_DIR
+    try:
+        yield FIXTURE_PROJECTS_DIR
+    finally:
+        config_manager.projects_dir = original
+        config_manager.reload_config()
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create event loop for async tests"""
