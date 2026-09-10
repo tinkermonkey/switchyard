@@ -142,7 +142,9 @@ def file_lock(lock_file_path: Union[str, Path], timeout: int = 10, enforce_timeo
 
 
 @contextlib.contextmanager
-def safe_yaml_write(yaml_file_path: Union[str, Path]):
+def safe_yaml_write(
+    yaml_file_path: Union[str, Path], timeout: int = 10, enforce_timeout: bool = False
+):
     """
     Context manager for thread-safe YAML file writing.
 
@@ -150,11 +152,21 @@ def safe_yaml_write(yaml_file_path: Union[str, Path]):
 
     Args:
         yaml_file_path: Path to the YAML file to write
+        timeout / enforce_timeout: forwarded to file_lock() unchanged, and
+            defaulted the same way, so existing callers keep today's blocking
+            behavior. Pass enforce_timeout=True where an unbounded wait here
+            would park something that must not park -- e.g.
+            PipelineLockManager._save_lock_to_yaml(), which runs inside that
+            class's '<state>.yaml.acquire.lock' guard and so would otherwise
+            make that guard's hold unbounded.
 
     Usage:
         with safe_yaml_write('/path/to/file.yaml'):
             with open('/path/to/file.yaml', 'w') as f:
                 yaml.dump(data, f)
+
+    Raises:
+        TimeoutError: if enforce_timeout=True and the lock isn't acquired in time.
 
     Note:
         Creates a lock file at: /path/to/file.yaml.lock
@@ -162,5 +174,5 @@ def safe_yaml_write(yaml_file_path: Union[str, Path]):
     yaml_path = Path(yaml_file_path)
     lock_path = yaml_path.with_suffix(yaml_path.suffix + '.lock')
 
-    with file_lock(lock_path):
+    with file_lock(lock_path, timeout=timeout, enforce_timeout=enforce_timeout):
         yield

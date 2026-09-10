@@ -477,6 +477,152 @@ class TestNoEventTimeIsNotOneState(BoardLockHeartbeatTestBase):
         self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
 
 
+class TestAFailingQueryIsBoundedByObservedProgressNotRunAge(BoardLockHeartbeatTestBase):
+    """
+    Found in the WI-8 review round after 'query_failed' was first given
+    'no_events'' started_at bound. The two reasons are not symmetric, and
+    treating them so traded one failure mode for a worse, correlated one.
+
+    'no_events' is an ANSWER -- ES searched and this run has written nothing --
+    so started_at genuinely measures its silence. 'query_failed' is not an
+    answer at all: the run may be writing a decision event every 30 seconds and
+    the probe simply cannot see them, so started_at is just run age. A red
+    shard on decision-events-*, or a sort-on-timestamp mapping conflict after a
+    daily rollover, makes every board's probe fail at once -- and every hold
+    older than the ~6.5h max-silence bound (ordinary for a multi-stage
+    sdlc_execution run) would then stop being heartbeated, lose its Redis key
+    to the 7200s TTL under a still-running agent, and be granted to the next
+    queued issue. Two agents in one shared /workspace/<project> checkout, on
+    every board simultaneously.
+
+    So a failing query is measured from the newest decision event this process
+    has actually READ for the run, which is a real silence measurement (at most
+    one sweep stale), and only a run with no such observation falls back to
+    started_at.
+    """
+
+    def _run(self, started_minutes_ago=45):
+        return Mock(
+            id="run-1", status='active',
+            started_at=(
+                datetime.now(timezone.utc) - timedelta(minutes=started_minutes_ago)
+            ).isoformat(),
+        )
+
+    def test_a_failing_query_keeps_refreshing_a_long_run_that_was_recently_progressing(self):
+        """The correlated-ES-failure case. This run is far older than the
+        max-silence bound, but the last event this process managed to read for
+        it was seconds ago -- that is evidence of progress, and run age is not
+        evidence of anything."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = self._run(
+            started_minutes_ago=60 * 24 * 30
+        )
+        self.monitor._board_lock_last_seen_event_at["run-1"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'query_failed')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_successful_probe_records_the_anchor_a_later_failing_one_uses(self):
+        """The anchor is not something a caller supplies -- it is laid down by
+        the ordinary 'ok' path, so the protection above exists without anyone
+        having to arrange it."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = self._run(
+            started_minutes_ago=60 * 24 * 30
+        )
+        last_event = datetime.now(timezone.utc) - timedelta(seconds=30)
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(last_event, 'ok')
+        )
+
+        self.sweep()
+
+        self.assertEqual(
+            self.monitor._board_lock_last_seen_event_at["run-1"], last_event
+        )
+
+        # Now the probe starts failing, on a run old enough that run age would
+        # have un-pinned it immediately.
+        self.lock_manager.touch_lock.reset_mock()
+        self.monitor._last_board_lock_heartbeat_at -= (
+            self.monitor._board_lock_sweep_interval_seconds + 1
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'query_failed')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+
+    def test_a_failing_query_still_un_pins_a_run_whose_last_observed_event_is_old(self):
+        """The other side: the bound must still fire for a run that genuinely
+        died, or 'query_failed' is fail-open again and a killed container plus
+        a persistently failing query pins the board forever."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = self._run(
+            started_minutes_ago=60 * 24 * 30
+        )
+        self.monitor._board_lock_last_seen_event_at["run-1"] = (
+            datetime.now(timezone.utc) - timedelta(days=2)
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'query_failed')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_no_events_is_an_answer_and_ignores_the_anchor(self):
+        """'no_events' means ES searched and found nothing for this run, so the
+        run's own start is the right measurement -- an anchor from before the
+        index rolled off must not keep a dead run pinned."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = self._run(
+            started_minutes_ago=60 * 24 * 30
+        )
+        self.monitor._board_lock_last_seen_event_at["run-1"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        )
+        self.monitor._get_last_pipeline_run_event_time_with_reason = Mock(
+            return_value=(None, 'no_events')
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_anchors_older_than_the_bound_are_pruned_each_sweep(self):
+        """The dict is keyed by pipeline run id, so without pruning it would
+        grow for the life of the process. An anchor past the bound cannot
+        change an answer anyway -- the started_at fallback it leaves behind
+        fails the same comparison, because a run cannot start after its own
+        last event."""
+        self.lock_manager.get_lock_fail_closed.return_value = (None, True)
+        self.monitor._board_lock_last_seen_event_at = {
+            "old-run": datetime.now(timezone.utc) - timedelta(days=7),
+            "live-run": datetime.now(timezone.utc) - timedelta(seconds=30),
+        }
+
+        self.sweep()
+
+        self.assertEqual(
+            list(self.monitor._board_lock_last_seen_event_at), ["live-run"]
+        )
+
+
 class TestEventTimeReasonsAreDistinguished(unittest.TestCase):
     """
     _get_last_pipeline_run_event_time_with_reason() is what makes the three

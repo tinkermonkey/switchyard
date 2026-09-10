@@ -959,6 +959,13 @@ class ProjectMonitor:
         # Lazily-read ceiling from config/foundations/agents.yaml — see
         # _max_agent_timeout_seconds().
         self._max_agent_timeout_seconds_cache: Optional[float] = None
+        # pipeline_run_id -> the most recent decision-event timestamp this
+        # process has ever successfully read for that run. The anchor
+        # _board_lock_holder_is_still_progressing() measures silence from when
+        # the events query itself is failing — see there. Pruned every sweep by
+        # _refresh_held_board_locks(), so it holds at most one entry per run
+        # that has recently held a board lock.
+        self._board_lock_last_seen_event_at: Dict[str, datetime] = {}
 
         # --- Batched board queries + per-board adaptive backoff (issue #94) ---
         # Feature-gated: OFF by default so today's behavior (one sequential
@@ -8957,6 +8964,29 @@ _Repair cycle initiated by Switchyard_
                         f"{pipeline.board_name}: {e}"
                     )
 
+        self._prune_board_lock_event_anchors()
+
+    def _prune_board_lock_event_anchors(self):
+        """
+        Drop _board_lock_last_seen_event_at entries that can no longer change an
+        answer, so the dict cannot grow with every run the process ever sees.
+
+        An anchor older than the max-silence bound already fails
+        _board_lock_holder_is_still_progressing()'s comparison, and the
+        started_at fallback it leaves behind fails it too (a run cannot have
+        started after its own last event), so dropping it is answer-preserving
+        rather than a shortcut.
+        """
+        if not self._board_lock_last_seen_event_at:
+            return
+        now = datetime.now(timezone.utc)
+        max_silence = self._board_lock_max_silence_seconds()
+        self._board_lock_last_seen_event_at = {
+            run_id: seen_at
+            for run_id, seen_at in self._board_lock_last_seen_event_at.items()
+            if (now - seen_at).total_seconds() <= max_silence
+        }
+
     def _refresh_held_board_lock(
         self, lock_manager, project_name: str, board_name: str, heartbeat_interval_seconds: float
     ):
@@ -9152,6 +9182,80 @@ _Repair cycle initiated by Switchyard_
                 self._max_agent_timeout_seconds_cache = 10800.0
         return self._max_agent_timeout_seconds_cache
 
+    def _board_lock_max_silence_seconds(self) -> float:
+        """
+        The longest a board-lock holder may legitimately write no decision
+        event — see _board_lock_holder_is_still_progressing(), which is the
+        only place this bound means anything.
+
+        Imported, not restated: both halves are constants owned elsewhere and
+        calibrated against real timeouts (agents.yaml's ceiling, and the
+        checkout lock's own wait budget), which is the drift #146 WI-1 removed
+        everywhere else in this mechanism.
+        """
+        from services.project_checkout_lock import (
+            DEFAULT_TIMEOUT_SECONDS as CHECKOUT_LOCK_WAIT_BUDGET_SECONDS,
+            HEARTBEAT_INTERVAL_SECONDS,
+        )
+
+        return (
+            self._max_agent_timeout_seconds()
+            + CHECKOUT_LOCK_WAIT_BUDGET_SECONDS
+            + HEARTBEAT_INTERVAL_SECONDS
+        )
+
+    def _board_lock_silence_anchor(self, pipeline_run, reason: str):
+        """
+        What to measure a holder's silence FROM when the decision-events probe
+        returned no timestamp. Returns (anchor_or_None, phrase_for_the_log);
+        a None anchor means "nothing to measure against, treat as progressing".
+
+        The two reasons that reach here are not symmetric, and treating them so
+        was a reduction in protection (found in the WI-8 review round after
+        'query_failed' was first given 'no_events'' bound):
+
+          - 'no_events' is an ANSWER. ES searched and this run has written
+            nothing, so the run's own started_at genuinely measures its silence
+            — the same fallback _find_stalled_issues_for_pipeline() applies to
+            this identical ambiguity.
+          - 'query_failed' is NOT an answer. The run may be writing a decision
+            event every 30 seconds and the probe simply cannot see them, so
+            started_at is not a silence measurement at all — it is just run
+            age. Bounding by it means a correlated Elasticsearch failure (a red
+            shard on decision-events-*, a sort-on-timestamp mapping conflict
+            after a daily rollover) stops the heartbeat for EVERY board at
+            once, and every hold older than the max-silence bound — ordinary
+            for a multi-stage sdlc_execution run — then loses its Redis key to
+            the TTL under a still-running agent. That is the double-dispatch
+            this sweep exists to prevent, arriving on every board
+            simultaneously.
+
+        So a failing query is anchored to the newest decision event this
+        process has actually seen for the run (_board_lock_last_seen_event_at),
+        which is a real silence measurement, just a stale one: at most one
+        sweep older than the last successful probe. A failing query degrades
+        into "stop refreshing max_silence after the last OBSERVED progress"
+        rather than "stop refreshing everything old right now", while a run
+        that genuinely died still loses its lock on the same bound. A run whose
+        probe has never once succeeded has no such anchor and falls back to
+        started_at, which for it is the only evidence there is.
+        """
+        if reason == 'query_failed':
+            last_seen = self._board_lock_last_seen_event_at.get(pipeline_run.id)
+            if last_seen is not None:
+                return last_seen, "the last decision event this process could read for it"
+
+        started_at_str = getattr(pipeline_run, 'started_at', None)
+        if not started_at_str:
+            return None, ""
+        try:
+            started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+        except (ValueError, TypeError, AttributeError):
+            return None, ""
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        return started_at, "it started"
+
     def _board_lock_holder_is_still_progressing(
         self, project_name: str, board_name: str, issue_number: int, pipeline_run
     ) -> bool:
@@ -9194,9 +9298,12 @@ _Repair cycle initiated by Switchyard_
             ONLY because PipelineRunManager's own client is unusable in the
             same breath: it is not a general "ES is having trouble" argument,
             which is why the next case no longer borrows it.
-          - The events query FAILED with ES up: bounded by started_at, exactly
-            like the no-events case below, and for the same reason. This was
-            the one fail-open default left in this mechanism, and its
+          - The events query FAILED with ES up: bounded, but from the newest
+            decision event this process has actually seen for the run rather
+            than from the run's start — see _board_lock_silence_anchor() for
+            why those are different measurements and why anchoring a failing
+            probe to run age re-opened double-dispatch on every board at once.
+            This was the one fail-open default left in this mechanism, and its
             justification did not survive checking: obs.es being present means
             PipelineRunManager.es is too (both build Elasticsearch([...])
             lazily, so the client exists whenever the import succeeded, even
@@ -9222,20 +9329,7 @@ _Repair cycle initiated by Switchyard_
             — the same fallback _find_stalled_issues_for_pipeline() applies to
             this identical ambiguity.
         """
-        from services.project_checkout_lock import (
-            DEFAULT_TIMEOUT_SECONDS as CHECKOUT_LOCK_WAIT_BUDGET_SECONDS,
-            HEARTBEAT_INTERVAL_SECONDS,
-        )
-
-        # Imported, not restated: both halves are constants owned elsewhere and
-        # calibrated against real timeouts (agents.yaml's ceiling, and the
-        # checkout lock's own wait budget), which is the drift #146 WI-1
-        # removed everywhere else in this mechanism.
-        max_silence = (
-            self._max_agent_timeout_seconds()
-            + CHECKOUT_LOCK_WAIT_BUDGET_SECONDS
-            + HEARTBEAT_INTERVAL_SECONDS
-        )
+        max_silence = self._board_lock_max_silence_seconds()
 
         last_event_at, reason = self._get_last_pipeline_run_event_time_with_reason(
             pipeline_run.id
@@ -9244,21 +9338,10 @@ _Repair cycle initiated by Switchyard_
             if reason == 'es_unavailable':
                 # No answer to be had anywhere — see the docstring.
                 return True
-            # 'query_failed' and 'no_events' alike: the run's own start time
-            # bounds this probe without needing decision events at all, and
-            # applying it to both is what keeps a persistently-failing events
-            # query from pinning the board forever (found in the WI-8 review
-            # round — 'query_failed' used to return True unconditionally).
-            started_at_str = getattr(pipeline_run, 'started_at', None)
-            if not started_at_str:
+            anchor, anchor_phrase = self._board_lock_silence_anchor(pipeline_run, reason)
+            if anchor is None:
                 return True
-            try:
-                started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
-            except (ValueError, TypeError, AttributeError):
-                return True
-            if started_at.tzinfo is None:
-                started_at = started_at.replace(tzinfo=timezone.utc)
-            silence_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+            silence_seconds = (datetime.now(timezone.utc) - anchor).total_seconds()
             if silence_seconds <= max_silence:
                 return True
             no_activity_phrase = (
@@ -9270,13 +9353,17 @@ _Repair cycle initiated by Switchyard_
                 f"Board lock on {project_name}/{board_name} is held by issue #{issue_number} "
                 f"whose run {pipeline_run.id} still reads '{pipeline_run.status}' but "
                 f"{no_activity_phrase}, {silence_seconds / 3600:.1f} hours after "
-                f"it started — no longer refreshing its liveness, so the board's own TTL "
-                f"and staleness recovery can reclaim it"
+                f"{anchor_phrase} — no longer refreshing its liveness, so the board's own "
+                f"TTL and staleness recovery can reclaim it"
             )
             return False
 
         if last_event_at.tzinfo is None:
             last_event_at = last_event_at.replace(tzinfo=timezone.utc)
+        # Remembered so a LATER sweep whose events query fails has a real
+        # silence measurement to fall back on rather than the run's age — see
+        # _board_lock_silence_anchor().
+        self._board_lock_last_seen_event_at[pipeline_run.id] = last_event_at
         silence_seconds = (datetime.now(timezone.utc) - last_event_at).total_seconds()
         if silence_seconds <= max_silence:
             return True

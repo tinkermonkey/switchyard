@@ -331,6 +331,7 @@ from services.project_checkout_lock import (
     _log_busy,
     _mint_unique_holder_id,
     _release_and_warn,
+    _release_and_warn_async,
     _timeout_error,
     _tracked_resource_activity,
 )
@@ -488,9 +489,11 @@ async def dev_container_build_lock_async(
             ):
                 yield
         finally:
-            # Deliberately synchronous, not offloaded -- see the same finally in
+            # Offloaded, not inline -- see the same finally in
             # project_checkout_lock_async() for why.
-            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+            await _release_and_warn_async(
+                facade, RESOURCE_NAME, project, holder_id, issue_number
+            )
 
 
 @contextmanager
@@ -644,7 +647,11 @@ async def dev_container_build_lock_if_free_async(
         ):
             yield True
     finally:
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+        # Offloaded for the same reason dev_container_build_lock_async()'s
+        # release is -- see project_checkout_lock._release_and_warn_async().
+        await _release_and_warn_async(
+            facade, RESOURCE_NAME, project, holder_id, issue_number
+        )
 
 
 @contextmanager
