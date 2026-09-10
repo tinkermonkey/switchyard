@@ -9,6 +9,13 @@ A pipeline run is considered a zombie if:
 1. Status is 'active' in Elasticsearch
 2. Started more than 30 minutes ago
 3. No agent container is running for the issue
+4. Nothing in this process is still legitimately working on the issue without a
+   container: no active review cycle, no active human feedback loop, and no
+   in-flight project_checkout / dev_container_build resource lock wait or hold
+   (those run up to ~3h and are invisible to the container probe in 3). A lock
+   wait/hold that outlives its own budget stops counting -- see
+   project_checkout_lock's activity registry -- so a hung guarded operation is
+   still reapable rather than exempt forever.
 
 Runs periodically as a background task to ensure automatic recovery.
 """
@@ -223,6 +230,42 @@ class PipelineWatchdog:
                     )
                     continue
 
+                # Never touch a run whose dispatch is still inside a project
+                # resource lock (#140 item 9). project_checkout /
+                # dev_container_build waits run up to ~3h with a heartbeat, and
+                # the operation they guard (a shared-checkout agent run, an
+                # image build) has no container labelled for the issue for the
+                # probe above to find — so past the 30-minute threshold this
+                # loop reaped the run and redispatched the same issue while the
+                # original coroutine was still waiting. That coroutine then
+                # acquires the lock and launches its own container: two
+                # concurrent executions of one issue.
+                #
+                # Checked BEFORE the frozen branch below, not alongside the
+                # review-cycle/feedback-loop exemptions further down, on
+                # purpose. is_frozen_by_circuit_breaker() reads the LAST
+                # recorded execution outcome, so a fresh dispatch that is right
+                # now waiting on a lock still looks 'frozen' from a previous
+                # attempt — and _actively_resume_run() would double-dispatch it
+                # exactly like _cleanup_zombie_run() would.
+                try:
+                    from services.project_checkout_lock import (
+                        describe_active_resource_lock_activity,
+                    )
+                    lock_activity = describe_active_resource_lock_activity(project, issue_number)
+                except Exception as e:
+                    logger.warning(
+                        f"Could not check resource lock activity for issue #{issue_number}: {e}"
+                    )
+                    continue  # Fail-safe: don't kill a run we can't verify
+
+                if lock_activity:
+                    logger.info(
+                        f"Pipeline run {pipeline_run_id[:8]}... for {project} issue #{issue_number} "
+                        f"is inside a project resource lock ({lock_activity}) - skipping zombie cleanup"
+                    )
+                    continue
+
                 if was_frozen:
                     # Uniform clean-restart across every pipeline type (review_cycle,
                     # human_feedback_loop, pr_review_stage alike) — takes priority over
@@ -273,12 +316,17 @@ class PipelineWatchdog:
                         })
                     continue
 
-                # NOTE: We intentionally do NOT skip cleanup just because the lock is held.
-                # The lock alone is not proof of life — a crashed container leaves the lock
-                # held with nobody to release it. The review cycle and feedback loop checks
-                # below (plus the 30-minute age threshold) cover every legitimate
-                # non-containerized state. If none of those fire, the lock is stale and
-                # _cleanup_zombie_run will release it.
+                # NOTE: We intentionally do NOT skip cleanup just because the run's
+                # BOARD lock is held. That lock alone is not proof of life — a crashed
+                # container leaves it held with nobody to release it. Distinct from the
+                # PROJECT RESOURCE lock registry checked above, which IS proof of life:
+                # that registry is process-local and frame-scoped, so an entry means a
+                # coroutine in this very process is still inside the lock's context
+                # manager (and it stops vouching once the entry outlives its budget).
+                # The resource-lock check above, plus the review cycle and feedback loop
+                # checks below (plus the 30-minute age threshold), cover every legitimate
+                # non-containerized state. If none of those fire, the board lock is stale
+                # and _cleanup_zombie_run will release it.
 
                 # Never clean up a run that has an active human feedback loop.
                 # Feedback-listening phases legitimately have no Docker container running —
@@ -314,7 +362,8 @@ class PipelineWatchdog:
                     logger.warning(f"Could not check review cycle state for issue #{issue_number}: {e}")
                     continue  # Fail-safe: don't kill a run we can't verify
 
-                # No container, old enough, no active review cycle or feedback loop = ZOMBIE
+                # No container, old enough, no in-flight project resource lock, no
+                # active review cycle or feedback loop = ZOMBIE
                 # Coordination guard: prevent double-processing with other cleanup mechanisms
                 try:
                     from services.cleanup_guard import try_claim_cleanup

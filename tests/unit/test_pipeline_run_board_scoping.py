@@ -439,6 +439,70 @@ class TestGetActivePipelineRunBoardParameter:
         assert 'proj:9' not in mapping
 
 
+class TestGetActivePipelineRunReadOnlyLookup:
+    """restore_to_redis=False — the variant periodic sweeps have to use (#150).
+
+    The watchdog calls this once per examined state file to answer "is there an
+    active run?". On a mapping miss the method falls through to Elasticsearch
+    and, on a hit, writes the run back with a fresh TTL under the board-less
+    legacy key. For a maintenance sweep that is resurrection, not repair: a run
+    that crashed without end_pipeline_run() still reads 'active' in ES, so every
+    pass would re-create it, and the legacy key it lands under is the one
+    documented as able to shadow a board-scoped lookup.
+    """
+
+    def test_the_es_fallback_still_answers_the_question(self):
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        del mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:9']
+        del mock_redis.data[manager._get_redis_key(run.id)]
+
+        found = manager.get_active_pipeline_run('proj', 9, restore_to_redis=False)
+
+        assert found is not None
+        assert found.id == run.id
+
+    def test_it_writes_nothing_back_to_redis(self):
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        del mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:9']
+        del mock_redis.data[manager._get_redis_key(run.id)]
+
+        manager.get_active_pipeline_run('proj', 9, restore_to_redis=False)
+
+        assert manager._get_redis_key(run.id) not in mock_redis.data, (
+            "a read-only lookup refreshed the run blob's TTL -- a dead run would "
+            "be kept alive by the sweep that merely looked at it"
+        )
+        assert 'proj:9' not in mock_redis.data[manager.redis_issue_mapping], (
+            "a read-only lookup wrote the board-less legacy issue mapping, which "
+            "can shadow a later board-scoped lookup"
+        )
+
+    def test_the_default_still_restores(self):
+        """Every live caller is about to act on the run it gets back, so the
+        rehydration the fallback exists for must stay the default."""
+        manager, _, mock_redis = make_manager()
+        run = manager.create_pipeline_run(
+            issue_number=9, issue_title='t', issue_url='u',
+            project='proj', board='BoardA',
+        )
+        del mock_redis.data[manager.redis_issue_mapping]['proj:BoardA:9']
+        del mock_redis.data[manager._get_redis_key(run.id)]
+
+        found = manager.get_active_pipeline_run('proj', 9)
+
+        assert found is not None
+        assert manager._get_redis_key(run.id) in mock_redis.data
+        assert mock_redis.data[manager.redis_issue_mapping].get('proj:9') == run.id
+
+
 class TestGetOrCreatePipelineRunReusesFreshRun:
     """Regression test for the phantom-duplicate-run bug this PR fixes: a run
     created moments earlier for a given (project, board, issue_number) must be

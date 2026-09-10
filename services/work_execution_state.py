@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 # before being consumed and the probe is now a permanent blocker — clear it.
 _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp after 60s means the Redis task was lost
 
+# How far back detect_and_retry_empty_successful_executions() will look (#150).
+# The sweep globs EVERY state file ever written, every 15 minutes -- 4700+ of them
+# on the live orchestrator, ~97% months old and terminal -- and each one that gets
+# past the cheap checks costs lock reads, queue reads and a GitHub query. Until
+# PROTECTION 1's re-entrant flock was fixed the sweep wedged on the first 'success'
+# record it found, so none of that cost was ever paid and none of it was visible.
+# Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
+_WATCHDOG_MAX_RECORD_AGE_HOURS = 24
+
+
+def _parse_iso_timestamp(value: str) -> datetime:
+    """Parse a recorded ISO timestamp as an aware UTC datetime.
+
+    Records written by this module are always UTC-aware, but a few older ones
+    (and anything hand-edited) are naive; comparing one of those against an aware
+    datetime raises TypeError, which the watchdog's handlers turn into a silent
+    "cannot verify". Assume UTC rather than letting that happen.
+    """
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
 
 @dataclass
 class ExecutionRecord:
@@ -40,6 +63,12 @@ class ExecutionRecord:
     outcome: str  # 'success', 'failure', 'frozen', 'lock_contention', 'cancelled', 'in_progress'
     trigger_source: str  # 'manual_move', 'pipeline_progression', 'webhook'
     error: Optional[str] = None
+    # The board this execution ran on (#144). Optional because records written
+    # before this field existed don't have it, and because a couple of dispatch
+    # paths genuinely have no board in scope. Consumers must handle None -- see
+    # detect_and_retry_empty_successful_executions()'s PROTECTION 2, which falls
+    # back to checking every board of the project when it's missing.
+    board_name: Optional[str] = None
 
 
 @dataclass
@@ -72,56 +101,115 @@ class WorkExecutionStateTracker:
         """Get the state file path for an issue"""
         return self.state_dir / f"{project_name}_issue_{issue_number}.yaml"
 
+    def _empty_state(self, project_name: str, issue_number: int) -> Dict:
+        """The state an issue with nothing recorded yet gets -- also the fallback
+        every load_state() failure path returns, so they can't drift apart."""
+        return {
+            'issue_number': issue_number,
+            'project_name': project_name,
+            'execution_history': [],
+            'status_changes': [],
+            'current_status': None,
+            'last_updated': None
+        }
+
     def load_state(self, project_name: str, issue_number: int) -> Dict:
         """Load execution state for an issue"""
         state_file = self.get_state_file(project_name, issue_number)
 
         if not state_file.exists():
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
+
+        from utils.file_lock import file_lock, ReentrantFileLockError
 
         try:
-            from utils.file_lock import file_lock
-
             # Use file lock when reading to prevent reading partial writes
             lock_file = state_file.with_suffix(state_file.suffix + '.lock')
             with file_lock(lock_file):
                 if state_file.exists():  # Check again inside lock
                     with open(state_file, 'r') as f:
-                        state = yaml.safe_load(f)
-                        # Ensure all expected keys exist
-                        state.setdefault('execution_history', [])
-                        state.setdefault('status_changes', [])
-                        return state
+                        try:
+                            state = yaml.safe_load(f)
+                        except yaml.YAMLError as parse_error:
+                            # Same corrupted-state-file condition as the non-mapping
+                            # case below, just detected one step earlier -- report it
+                            # the same way rather than as an opaque load failure.
+                            self._log_corrupted_state_file(
+                                state_file, str(parse_error),
+                                owner=f"{project_name}/#{issue_number}"
+                            )
+                            return self._empty_state(project_name, issue_number)
+
+                    # A truncated or empty state file parses to None, and anything
+                    # that isn't a mapping (e.g. a stray scalar) parses to a
+                    # non-dict -- either way the setdefault() calls below raise
+                    # AttributeError/TypeError into the generic handler, which is
+                    # how a single empty file on disk produced
+                    # "'NoneType' object has no attribute 'setdefault'" at ERROR on
+                    # every load of that issue, forever, without ever naming the
+                    # file as the thing needing repair. Report it as its own
+                    # condition and fall back to the same empty state a file that
+                    # doesn't exist yet gets.
+                    if not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping",
+                            owner=f"{project_name}/#{issue_number}"
+                        )
+                        return self._empty_state(project_name, issue_number)
+
+                    # Ensure all expected keys exist
+                    state.setdefault('execution_history', [])
+                    state.setdefault('status_changes', [])
+                    return state
             # File doesn't exist inside lock, return default
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
+        except ReentrantFileLockError:
+            # A caller that already holds this issue's lock, i.e. a programming
+            # error -- the exact shape PROTECTION 1 had until #150. Swallowing it
+            # here hands that caller execution_history: [], which
+            # has_active_execution() reads as "nothing is running" and dispatches
+            # on: a double execution of a live issue, strictly worse than the
+            # deadlock the guard replaced. Let it surface as a traceback.
+            raise
         except Exception as e:
             logger.error(f"Failed to load state for {project_name}/#{issue_number}: {e}")
-            return {
-                'issue_number': issue_number,
-                'project_name': project_name,
-                'execution_history': [],
-                'status_changes': [],
-                'current_status': None,
-                'last_updated': None
-            }
+            return self._empty_state(project_name, issue_number)
+
+    @staticmethod
+    def _log_corrupted_state_file(
+        state_file: Path, detail: str, owner: Optional[str] = None
+    ) -> None:
+        """
+        Report an execution state file that exists but holds nothing loadable.
+
+        Deliberately NOT repaired automatically. Readers and writers here are
+        strictly serialised -- utils.file_lock.file_lock() is always LOCK_EX, and
+        every reader in this module takes it on the same `<state>.yaml.lock` path
+        save_state() writes under -- so a zero-byte file is never a write caught
+        in flight. It means one of two things this code cannot tell apart:
+        save_state() truncates in place (open(..., 'w')) and the process was
+        killed between the truncate and the yaml.dump, or something outside this
+        module wrote the file. Deleting it would silently discard execution
+        history an operator may want to inspect in either case, so naming the path
+        is what they get; every caller falls back to empty state anyway, which
+        makes this a visibility fix, not a fatal condition.
+
+        Args:
+            state_file: Path to the unreadable file -- the point of this message.
+            detail: Why it isn't loadable (parse error, or what it parsed as).
+            owner: "project/#issue" when the caller already knows it; omitted by
+                callers that were about to learn it FROM the file.
+        """
+        logger.warning(
+            f"Corrupted execution state file {state_file}"
+            f"{f' for {owner}' if owner else ''}: {detail} -- treating it as having "
+            f"no recorded execution history. Delete or repair the file to clear this."
+        )
 
     def save_state(self, project_name: str, issue_number: int, state: Dict):
         """Save execution state for an issue with thread-safe file locking"""
-        from utils.file_lock import safe_yaml_write
+        from utils.file_lock import safe_yaml_write, ReentrantFileLockError
 
         state_file = self.get_state_file(project_name, issue_number)
 
@@ -132,6 +220,12 @@ class WorkExecutionStateTracker:
                     yaml.dump(state, f, default_flow_style=False, sort_keys=False)
 
             logger.debug(f"Saved execution state for {project_name}/#{issue_number}")
+        except ReentrantFileLockError:
+            # See load_state()'s matching handler. A re-entrant save is a caller
+            # bug, and logging it here would silently DROP the write -- the
+            # execution outcome or probe cleanup this call was persisting is
+            # simply lost, with the in-memory dict still claiming it was saved.
+            raise
         except Exception as e:
             logger.error(f"Failed to save state for {project_name}/#{issue_number}: {e}")
 
@@ -141,7 +235,8 @@ class WorkExecutionStateTracker:
         column: str,
         agent: str,
         trigger_source: str,
-        project_name: str
+        project_name: str,
+        board_name: Optional[str] = None
     ):
         """
         Record the start of work execution.
@@ -160,6 +255,13 @@ class WorkExecutionStateTracker:
             agent: Agent name
             trigger_source: Source of the trigger (e.g., 'manual', 'pipeline_progression')
             project_name: Project name
+            board_name: Board this execution runs on (#144). Recorded so the
+                watchdog can scope its pipeline-lock check to THIS execution's
+                own board instead of every board configured for the project.
+                Every dispatch call site that has a board in scope passes it;
+                omitting it is not an error, it just leaves the watchdog with
+                the older, deliberately conservative every-board behavior for
+                this record.
         """
         state = self.load_state(project_name, issue_number)
 
@@ -171,6 +273,12 @@ class WorkExecutionStateTracker:
             'trigger_source': trigger_source
         }
 
+        # Only written when actually known -- an explicit key holding None would
+        # be indistinguishable from a board that was recorded as empty, and the
+        # consumer's fallback keys off "absent or falsy" either way.
+        if board_name:
+            execution['board_name'] = board_name
+
         state['execution_history'].append(execution)
         state['current_status'] = column
 
@@ -178,7 +286,8 @@ class WorkExecutionStateTracker:
 
         logger.info(
             f"Recorded execution start: {project_name}/#{issue_number} "
-            f"{agent} in {column} (trigger: {trigger_source})"
+            f"{agent} in {column} (trigger: {trigger_source}"
+            f"{f', board: {board_name}' if board_name else ''})"
         )
 
     def stamp_execution_task_id(self, project_name, issue_number, agent, column, task_id):
@@ -222,6 +331,15 @@ class WorkExecutionStateTracker:
         already established a Claude Code session — see docker_runner.py's
         _rate_limit_signal capture. Used by the active-resume step to decide
         whether a captured session is worth --resume-ing.
+
+        board_name (#144) is deliberately NOT a parameter here: the normal path
+        mutates the in_progress entry record_execution_start() already wrote, so
+        the board it recorded is carried through to the 'success'/'failure'
+        record the watchdog inspects. Only the crash-recovery path below
+        (no matching in_progress entry) appends a fresh record, and it has no
+        board to record for the same reason it has no trigger_source -- nothing
+        in scope knows what the lost execution was dispatched onto. Those records
+        get PROTECTION 2's every-board fallback; see the comment there.
         """
         state = self.load_state(project_name, issue_number)
 
@@ -237,7 +355,16 @@ class WorkExecutionStateTracker:
 
                 execution['outcome'] = outcome
                 if not found_primary:
-                    # Most recent in_progress: the real execution entry
+                    # Most recent in_progress: the real execution entry.
+                    #
+                    # Deliberately does NOT stamp completed_at. Nothing in
+                    # production writes that field, which is what keeps
+                    # _has_github_output() a "cannot verify" no-op on every record
+                    # -- and that gate is not yet safe to activate (it never checks
+                    # Discussions, and the crash-recovery record below has no real
+                    # start time to anchor against). Stamping it here is the single
+                    # line that turns the empty-output watchdog live across 54k+
+                    # 'success' records, so it belongs with the rest of that work.
                     if error:
                         execution['error'] = error
                     if claude_session_id:
@@ -285,6 +412,12 @@ class WorkExecutionStateTracker:
             f"This should only happen after orchestrator restart/crash."
         )
 
+        # No board_name and no trigger_source: this record is synthesised from
+        # what the caller knows now, not from the lost dispatch. See the docstring.
+        # `timestamp` is therefore a stand-in -- the real start time went with the
+        # lost dispatch -- which is one of the reasons the empty-output gate is not
+        # activated on this branch: a record whose "start" is really its finish
+        # cannot anchor a "has anything been posted since?" question.
         execution = {
             'column': column,
             'agent': agent,
@@ -631,10 +764,47 @@ class WorkExecutionStateTracker:
         - Project Monitor and Repair Cycle containers
         - Pipeline Orchestrator and Project Monitor
         - Any concurrent work trigger sources
+
+        Callers that ALREADY hold this issue's state-file lock must call
+        has_active_execution_for_state() instead -- see its docstring.
+        """
+        state = self.load_state(project_name, issue_number)
+        return self.has_active_execution_for_state(state, project_name, issue_number)
+
+    def has_active_execution_for_state(
+        self,
+        state: Dict,
+        project_name: str,
+        issue_number: int,
+        persist_probe_cleanup: bool = True
+    ) -> bool:
+        """
+        has_active_execution()'s body, operating on an ALREADY-LOADED state dict
+        instead of reading the state file itself.
+
+        Exists because fcntl.flock() locks are per open-file-description, not per
+        process or per thread: a caller holding <issue>.yaml.lock that then called
+        has_active_execution() re-entered load_state(), which opens the SAME lock
+        path on a fresh fd and blocks forever on its own lock. That is exactly what
+        detect_and_retry_empty_successful_executions()'s PROTECTION 1 did -- it took
+        the state file's lock for the whole per-file body and then called
+        has_active_execution() -- wedging the sweep's scheduler thread on the first
+        'success' record it found and leaving every later protection, including
+        #144's board scoping, permanently unreachable.
+
+        Args:
+            state: state dict the caller already read (under its own lock)
+            persist_probe_cleanup: whether a cleared stale pre-enqueue probe may be
+                written back via save_state(). Callers holding the state file's lock
+                MUST pass False -- save_state() takes that same lock and would
+                deadlock the same way. The mutation still happens on the passed-in
+                dict, so a caller that writes `state` back itself persists it; if
+                nobody does, the next unlocked has_active_execution() call re-derives
+                and persists it, since the decision is a pure function of the probe's
+                age.
         """
         # Check 1: Regular agent execution in execution_history
-        state = self.load_state(project_name, issue_number)
-        for execution in state['execution_history']:
+        for execution in state.get('execution_history', []):
             if execution.get('outcome') == 'in_progress':
                 # Detect stale pre-enqueue probes written by pipeline_progression.
                 #
@@ -675,7 +845,8 @@ class WorkExecutionStateTracker:
                                 f'with no task_id stamp; Redis task was swept '
                                 f'from queue before being consumed'
                             )
-                            self.save_state(project_name, issue_number, state)
+                            if persist_probe_cleanup:
+                                self.save_state(project_name, issue_number, state)
                             continue  # not blocking
                     except Exception as e:
                         logger.warning(
@@ -1178,7 +1349,8 @@ class WorkExecutionStateTracker:
         issue_number: int,
         agent: str,
         column: str,
-        execution: dict
+        execution: dict,
+        project_config=None
     ) -> tuple:
         """
         Determine if a failed execution should be retried by watchdog.
@@ -1197,6 +1369,11 @@ class WorkExecutionStateTracker:
             agent: Agent name
             column: Column name
             execution: Execution record dict
+            project_config: Already-loaded ProjectConfig, when the caller has one.
+                get_project_config() re-reads and re-parses the project's YAML from
+                disk on every call, and the sweep already caches it per project --
+                passing it through stops this method re-reading the same file once
+                per state file. Omitted (None) means fetch it here, as before.
 
         Returns:
             (should_retry, reason) tuple
@@ -1215,7 +1392,8 @@ class WorkExecutionStateTracker:
             from config.manager import config_manager
             from services.github_api_client import get_github_client
 
-            project_config = config_manager.get_project_config(project_name)
+            if project_config is None:
+                project_config = config_manager.get_project_config(project_name)
             if not project_config:
                 return False, "project_config_not_found"
 
@@ -1273,11 +1451,23 @@ class WorkExecutionStateTracker:
             return False, f"error_checking_issue_state: {str(e)}"
 
         # Check 3: Pipeline run active (moved before workflow check to get board name)
+        #
+        # restore_to_redis=False because this is NOT the plain Redis hash lookup it
+        # looks like: on a mapping miss -- the normal case once end_pipeline_run()
+        # has deleted the mapping -- get_active_pipeline_run() falls through to an
+        # Elasticsearch search and, on a hit, writes the run back with a fresh TTL
+        # under the board-less legacy issue key. A periodic sweep must not do that:
+        # a crashed run whose ES doc still reads 'active' would be resurrected on
+        # every pass, and the legacy key it lands under can shadow a later
+        # board-scoped lookup. The watchdog only needs to know whether a run is
+        # active, not to repair Redis.
         try:
             from services.pipeline_run import get_pipeline_run_manager
 
             pipeline_run_mgr = get_pipeline_run_manager()
-            active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+            active_run = pipeline_run_mgr.get_active_pipeline_run(
+                project_name, issue_number, restore_to_redis=False
+            )
 
             if not active_run:
                 return False, "no_active_pipeline_run"
@@ -1368,6 +1558,8 @@ class WorkExecutionStateTracker:
 
         This watchdog runs as a scheduled task and uses comprehensive race condition
         protections to prevent duplicate work launches:
+        0. Age gate - records older than _WATCHDOG_MAX_RECORD_AGE_HOURS are skipped
+           before any I/O is spent on them
         1. has_active_execution() - Checks ALL 4 types of active work
         2. Pipeline lock verification
         3. Queue status check
@@ -1393,6 +1585,10 @@ class WorkExecutionStateTracker:
         retried_count = 0
         state_files = list(self.state_dir.glob("*.yaml"))
 
+        max_record_age_hours = float(
+            os.environ.get('WATCHDOG_MAX_RECORD_AGE_HOURS', _WATCHDOG_MAX_RECORD_AGE_HOURS)
+        )
+
         logger.info(f"Watchdog: Checking {len(state_files)} execution state files for empty outputs")
 
         # Cache project_config across every state file in this sweep, keyed
@@ -1403,6 +1599,18 @@ class WorkExecutionStateTracker:
         # once per project multiplies disk I/O by issue count rather than
         # project count on this periodic maintenance path).
         project_config_cache = {}
+
+        # Cache PipelineQueueManager instances across the whole sweep, keyed by
+        # (project, board) (#140 item 17): get_pipeline_queue_manager() constructs
+        # a brand-new manager -- state_dir mkdir included -- on every call, and
+        # PROTECTION 3 below calls it once per board for EVERY stuck state file it
+        # examines, so an N-file x M-board sweep built N*M throwaway managers for
+        # the same M boards. Only the manager is cached, deliberately not the
+        # queue contents: get_issue_status() re-reads the queue file under its own
+        # lock on each call, and PROTECTION 3 is a race guard -- acting on a
+        # snapshot taken at the top of a long sweep is exactly the staleness it
+        # exists to avoid.
+        queue_manager_cache = {}
 
         for state_file in state_files:
             try:
@@ -1417,7 +1625,19 @@ class WorkExecutionStateTracker:
                     with open(state_file, 'r') as f:
                         state = yaml.safe_load(f)
 
-                    if not state or not state['execution_history']:
+                    # Same corrupted-state-file condition load_state() reports --
+                    # see _log_corrupted_state_file(). Without this an empty or
+                    # non-mapping file reached state['execution_history'] below and
+                    # surfaced as a generic TypeError/KeyError from this loop's
+                    # outer handler, naming the exception rather than the file.
+                    if state is not None and not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping"
+                        )
+                        continue
+
+                    if not state or not state.get('execution_history'):
                         continue
 
                     # Get last execution
@@ -1435,8 +1655,68 @@ class WorkExecutionStateTracker:
                         logger.warning(f"Malformed state file {state_file}: missing project or issue")
                         continue
 
+                    # PROTECTION 0: Age gate -- see _WATCHDOG_MAX_RECORD_AGE_HOURS.
+                    #
+                    # Placed ahead of every other protection because it is the only
+                    # one that costs nothing: PROTECTION 2 and 3 read lock and queue
+                    # state per configured board, and PROTECTION 4 issues a GitHub
+                    # GraphQL query. On the live orchestrator 4570 of 4721 state
+                    # files end in 'success', so an ungated sweep every 15 minutes
+                    # is ~18k GraphQL queries an hour against a 5k/hour budget --
+                    # the watchdog would exhaust the budget for the whole
+                    # orchestrator in the first minutes of every hour. A record this
+                    # old is not something a retry can un-stick anyway; nothing is
+                    # waiting on it.
+                    #
+                    # Anchored on the record's start timestamp, which is the only
+                    # time any production record carries -- nothing writes
+                    # completed_at. A start anchor makes a record look OLDER than a
+                    # completion anchor would, i.e. more likely to be skipped before
+                    # any I/O is spent on it, which is the conservative direction
+                    # for a gate that exists to bound cost.
+                    #
+                    # A record with no parseable timestamp is NOT skipped: this gate
+                    # exists to bound cost, and silently dropping records it cannot
+                    # date would be the same class of quiet no-op #150 is undoing.
+                    age_anchor = last_exec.get('timestamp')
+                    if age_anchor and max_record_age_hours > 0:
+                        try:
+                            age_hours = (
+                                datetime.now(timezone.utc) - _parse_iso_timestamp(age_anchor)
+                            ).total_seconds() / 3600
+                            if age_hours > max_record_age_hours:
+                                logger.debug(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                                    f"last execution is {age_hours:.1f}h old "
+                                    f"(cutoff {max_record_age_hours}h)"
+                                )
+                                continue
+                        except (ValueError, TypeError, AttributeError) as e:
+                            # An unquoted timestamp in a hand-edited file parses as
+                            # a datetime, not a str, and anything else parses as
+                            # whatever it looks like -- none of which this gate
+                            # needs to be fatal about.
+                            logger.debug(
+                                f"Watchdog: Could not date {project_name}/#{issue_number} "
+                                f"({age_anchor!r}) -- age gate skipped: {e}"
+                            )
+
                     # PROTECTION 1: Check for active execution (ANY type of work)
-                    if self.has_active_execution(project_name, issue_number):
+                    #
+                    # Uses the already-loaded `state` rather than has_active_execution()
+                    # (#150): this loop holds `state_file`'s flock for the whole body,
+                    # and has_active_execution() re-reads the file through load_state(),
+                    # which opens the SAME lock path on a fresh fd. flock locks are per
+                    # open-file-description, so that second acquire blocked forever --
+                    # in the same thread, with no timeout. Every line below this one,
+                    # #144's board scoping included, was therefore unreachable, and the
+                    # wedged thread never released this issue's lock either, so all
+                    # later record_execution_start()/record_execution_outcome() calls
+                    # for it blocked too. persist_probe_cleanup=False for the same
+                    # reason: save_state() takes this lock as well.
+                    if self.has_active_execution_for_state(
+                        state, project_name, issue_number, persist_probe_cleanup=False
+                    ):
                         logger.debug(
                             f"Watchdog: Skipping {project_name}/#{issue_number}: work already in progress"
                         )
@@ -1491,17 +1771,95 @@ class WorkExecutionStateTracker:
                             project_config_cache[project_name] = project_config
                         except Exception as e:
                             project_config = None
-                            logger.debug(f"Watchdog: Could not load project config for {project_name}: {e}")
+                            # Warning, not debug (#140 item 31): a failure here
+                            # silently degrades BOTH PROTECTION 2 and PROTECTION 3
+                            # to no-ops for this state file, which is exactly the
+                            # kind of quiet degradation that hid two real bugs in
+                            # this code.
+                            logger.warning(
+                                f"Watchdog: Could not load project config for {project_name} "
+                                f"-- PROTECTION 2/3 degraded for this state file: {e}"
+                            )
 
                     try:
                         lock_manager = get_pipeline_lock_manager()
 
+                        # Scope the lock check to the board this stuck execution
+                        # actually ran on (#144). A lock held on some OTHER board of
+                        # the same project says nothing about whether THIS execution
+                        # is safe to retry: issue #10 stuck on a completely idle
+                        # sdlc_execution board was being skipped every sweep because
+                        # issue #20 was legitimately working on planning_design.
+                        #
+                        # Two cases fall back to the original every-board behavior,
+                        # and both are deliberate:
+                        #   - no board recorded at all (every record written before
+                        #     record_execution_start() started carrying board_name,
+                        #     plus the crash-recovery record record_execution_outcome()
+                        #     synthesises when it finds no matching in_progress
+                        #     entry, plus the dispatch paths with no board in scope);
+                        #   - a board recorded that is no longer one of this
+                        #     project's configured boards (a board rename, or the
+                        #     'system' pseudo-board some task contexts carry).
+                        # The second case MUST NOT be trusted as-is: get_lock_holder
+                        # on an unknown board name is not an error, both stores
+                        # simply have no entry and it returns None, which would turn
+                        # this protection into a guaranteed no-op -- strictly weaker
+                        # than the pre-#144 behavior it replaced, rather than more
+                        # conservative than it.
+                        #
+                        # The fallback is genuinely conservative, not free: a board
+                        # lock is held for the life of a pipeline run (up to
+                        # LOCK_TTL_SECONDS, 2h), so a record without a usable board
+                        # reproduces #144 -- skipped every sweep while ANY other
+                        # board of the project stays busy -- for as long as that lock
+                        # lives, not just until the next sweep. That is accepted
+                        # because it only defers: no retry budget is consumed, the
+                        # record stays 'success' and is re-examined on every sweep,
+                        # and the issue is picked up as soon as the other board frees
+                        # up. Everything already on disk before this change lands is
+                        # in exactly that state.
+                        configured_boards = [
+                            board for board in (
+                                getattr(pipeline_config, 'board_name', None)
+                                for pipeline_config in getattr(project_config, 'pipelines', None) or []
+                            ) if board
+                        ]
+                        recorded_board = last_exec.get('board_name')
+                        if recorded_board and recorded_board in configured_boards:
+                            boards_to_check = [recorded_board]
+                        else:
+                            if recorded_board:
+                                logger.warning(
+                                    f"Watchdog: {project_name}/#{issue_number} recorded board "
+                                    f"'{recorded_board}', which is not one of this project's "
+                                    f"configured boards ({configured_boards}) -- falling back to "
+                                    f"checking every board rather than trusting a name no lock "
+                                    f"is ever keyed on"
+                                )
+                            boards_to_check = configured_boards
+
                         locked_by_another_issue = False
-                        for pipeline_config in getattr(project_config, 'pipelines', None) or []:
-                            board_name = getattr(pipeline_config, 'board_name', None)
-                            if not board_name:
-                                continue
-                            holder_issue = lock_manager.get_lock_holder(project_name, board_name)
+                        for board_name in boards_to_check:
+                            # Fail-closed read (#150): get_lock_holder() goes through
+                            # get_lock(), which drops the health flag both stores
+                            # return, and those stores swallow their own exceptions --
+                            # so Redis down + an unreadable YAML lock file surfaced
+                            # here as "no holder", i.e. exactly the same answer as an
+                            # idle board, and this protection cheerfully marked the
+                            # execution for retry onto a board another issue was
+                            # actively holding.
+                            holder_issue, reads_healthy = lock_manager.get_lock_holder_fail_closed(
+                                project_name, board_name
+                            )
+                            if not reads_healthy:
+                                logger.warning(
+                                    f"Watchdog: Skipping {project_name}/#{issue_number}: lock state "
+                                    f"for board '{board_name}' could not be read from either store "
+                                    f"-- assuming locked rather than deciding on unverified data"
+                                )
+                                locked_by_another_issue = True
+                                break
                             # CRITICAL fix (found in #58 review): this must only
                             # skip when the lock is held by a DIFFERENT issue.
                             # The original version fired for ANY holder,
@@ -1515,15 +1873,47 @@ class WorkExecutionStateTracker:
                             if holder_issue and holder_issue != issue_number:
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                    f"pipeline locked by issue #{holder_issue}"
+                                    f"board '{board_name}' locked by issue #{holder_issue}"
                                 )
                                 locked_by_another_issue = True
                                 break
 
                         if locked_by_another_issue:
                             continue
+                    except (AttributeError, TypeError) as e:
+                        # A coding bug, not a transient outage -- and precisely the
+                        # shape (.get() on a dataclass, a method that doesn't exist)
+                        # that kept this protection a silent permanent no-op until
+                        # #57/#58 (#140 item 31). Surfaced distinctly from the
+                        # transient case below, and loudly, so the next one can't
+                        # hide the same way.
+                        #
+                        # Both handlers fall THROUGH to PROTECTION 3 rather than
+                        # skipping this issue -- the opposite posture to
+                        # services/pipeline_watchdog.py, which bails out on a check
+                        # it can't verify, and deliberately so. That watchdog ends
+                        # the run and releases its board lock, so acting on a bad
+                        # answer there produces a genuinely concurrent second
+                        # container; this sweep only rewrites a state record, and the
+                        # redispatch it invites still goes through project_monitor,
+                        # which takes the board's pipeline lock and consults the
+                        # queue itself. Failing closed here would instead let one
+                        # permanent coding bug silently freeze the un-sticking
+                        # watchdog for every issue, which is the failure mode #57/#58
+                        # already cost us twice. The narrower "lock state is
+                        # unreadable" case above IS failed closed, because there the
+                        # check itself worked and told us it doesn't know.
+                        logger.error(
+                            f"Watchdog: PROTECTION 2 (pipeline lock) failed for "
+                            f"{project_name}/#{issue_number} with a programming error "
+                            f"-- this protection is not working, continuing without it: {e}",
+                            exc_info=True
+                        )
                     except Exception as e:
-                        logger.debug(f"Watchdog: Could not check pipeline lock: {e}")
+                        logger.warning(
+                            f"Watchdog: Could not check pipeline lock for "
+                            f"{project_name}/#{issue_number} -- PROTECTION 2 skipped: {e}"
+                        )
 
                     # PROTECTION 3: Check queue state
                     #
@@ -1545,13 +1935,23 @@ class WorkExecutionStateTracker:
                         already_queued_or_active = False
                         # Reuses project_config fetched once above PROTECTION 2 --
                         # see the comment there.
+                        #
+                        # Deliberately still checks EVERY board, unlike PROTECTION 2
+                        # above: this asks "is this issue already queued anywhere",
+                        # and an issue very often sits in a different board's queue
+                        # from the one its last execution ran on (that's what a
+                        # board-to-board handoff looks like). Narrowing this one to
+                        # the recorded board would make the watchdog mark an issue
+                        # for retry while it is legitimately queued elsewhere.
                         for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
                             board_name = getattr(pipeline_cfg, 'board_name', None)
                             if not board_name:
                                 continue
-                            queue_status = get_pipeline_queue_manager(
-                                project_name, board_name
-                            ).get_issue_status(issue_number)
+                            queue_manager = queue_manager_cache.get((project_name, board_name))
+                            if queue_manager is None:
+                                queue_manager = get_pipeline_queue_manager(project_name, board_name)
+                                queue_manager_cache[(project_name, board_name)] = queue_manager
+                            queue_status = queue_manager.get_issue_status(issue_number)
                             if queue_status in ('waiting', 'active'):
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
@@ -1562,8 +1962,24 @@ class WorkExecutionStateTracker:
 
                         if already_queued_or_active:
                             continue
+                    except (AttributeError, TypeError, ImportError) as e:
+                        # See PROTECTION 2's matching handler (#140 item 31) --
+                        # including why both of these log and fall through rather
+                        # than skipping the issue. ImportError is in the list here
+                        # because that is literally how this protection was dead
+                        # before #57 -- an import of a function that never existed,
+                        # logged at debug and never noticed.
+                        logger.error(
+                            f"Watchdog: PROTECTION 3 (queue status) failed for "
+                            f"{project_name}/#{issue_number} with a programming error "
+                            f"-- this protection is not working, continuing without it: {e}",
+                            exc_info=True
+                        )
                     except Exception as e:
-                        logger.debug(f"Watchdog: Could not check queue status: {e}")
+                        logger.warning(
+                            f"Watchdog: Could not check queue status for "
+                            f"{project_name}/#{issue_number} -- PROTECTION 3 skipped: {e}"
+                        )
 
                     # PROTECTION 4: Check execution eligibility
                     agent = last_exec.get('agent')
@@ -1573,8 +1989,12 @@ class WorkExecutionStateTracker:
                         logger.warning(f"Watchdog: Missing agent or column for {project_name}/#{issue_number}")
                         continue
 
+                    # project_config is the sweep's per-project cached copy (may be
+                    # None if the lookup above failed, in which case the callee
+                    # fetches it itself) -- see the cache comment above PROTECTION 2.
                     should_retry, reason = self._should_retry_failed_execution(
-                        project_name, issue_number, agent, column, last_exec
+                        project_name, issue_number, agent, column, last_exec,
+                        project_config=project_config
                     )
 
                     if not should_retry:
@@ -1586,11 +2006,17 @@ class WorkExecutionStateTracker:
                     # PROTECTION 5: Verify no recent execution started
                     # Check if execution completed within last 5 minutes
                     # (could be starting but not yet marked as in_progress)
+                    #
+                    # Still gated on completed_at, which no production code path
+                    # writes -- so like _has_github_output() below this is a
+                    # "cannot verify" no-op today. Both come alive together, with
+                    # the same design work and the same review; giving this one an
+                    # anchor on its own would only shift the window earlier by the
+                    # execution's whole duration, which is narrower, not safer.
                     if last_exec.get('completed_at'):
                         try:
-                            completed_at_str = last_exec['completed_at'].replace('Z', '+00:00')
-                            completed_at = datetime.fromisoformat(completed_at_str)
-                            if datetime.now(completed_at.tzinfo) - completed_at < timedelta(minutes=5):
+                            completed_at = _parse_iso_timestamp(last_exec['completed_at'])
+                            if datetime.now(timezone.utc) - completed_at < timedelta(minutes=5):
                                 logger.debug(
                                     f"Watchdog: Skipping {project_name}/#{issue_number}: "
                                     f"execution too recent ({completed_at})"
@@ -1599,11 +2025,13 @@ class WorkExecutionStateTracker:
                         except Exception as e:
                             logger.debug(f"Could not parse completed_at timestamp: {e}")
 
-                    # Check if GitHub output exists
+                    # Check if GitHub output exists (fails closed - see the method's
+                    # docstring: True also means "could not verify", which defers
+                    # rather than redispatching)
                     if self._has_github_output(project_name, issue_number, last_exec):
                         logger.debug(
-                            f"Watchdog: {project_name}/#{issue_number} has GitHub output, "
-                            f"execution is truly successful"
+                            f"Watchdog: {project_name}/#{issue_number} has GitHub output "
+                            f"(or it could not be verified) - leaving the record alone"
                         )
                         continue
 
@@ -1653,7 +2081,28 @@ class WorkExecutionStateTracker:
 
     def _has_github_output(self, project_name: str, issue_number: int, execution: dict) -> bool:
         """
-        Check if execution resulted in GitHub output (comment/discussion post).
+        Check if execution resulted in GitHub output (comment post).
+
+        NOT CURRENTLY LIVE, deliberately. The gate requires completed_at and no
+        production code path writes that field, so this returns True ("cannot
+        verify") for every record on the live orchestrator and the sweep never
+        rewrites one. Activating it is tracked as #166, because the gate is still
+        wrong in two ways confirmed against live data: it queries only the
+        issue-comments endpoint, so the six
+        planning_design columns whose workspace is "discussions" post their output
+        somewhere it never looks, and it counts ANY comment in the window as the
+        agent's, including the pipeline watchdog's own "Pipeline Stuck" notice.
+        Both produce a false "no output" on 54k+ 'success' records, and a false
+        "no output" rewrites the record to 'failure' and redispatches the agent.
+
+        This is the LAST gate before an execution is rewritten to 'failure' and
+        redispatched, so every "can't verify" path deliberately fails CLOSED
+        (reports output, i.e. leaves the record alone) rather than open (#150). The
+        two directions are not symmetric: a wrong "no output" answer redispatches a
+        real agent container onto an issue that already has its comment, while a
+        wrong "has output" answer only defers -- the record stays 'success', no
+        retry budget is consumed, and the next sweep re-examines it. That is the
+        same posture PROTECTION 2's fail-closed lock read takes.
 
         Args:
             project_name: Project name
@@ -1661,47 +2110,75 @@ class WorkExecutionStateTracker:
             execution: Execution record dict
 
         Returns:
-            True if GitHub output exists, False otherwise
+            True if GitHub output exists (or could not be verified), False if the
+            execution demonstrably produced none
         """
-        from datetime import datetime
-
         try:
             from services.github_api_client import get_github_client
             from config.manager import config_manager
 
             gh = get_github_client()
+            # get_project_config() raises rather than returning None for an unknown
+            # project, so there is no falsy-config case to test for here -- and a
+            # ProjectConfig dataclass instance is always truthy anyway.
             project_config = config_manager.get_project_config(project_name)
-
-            if not project_config:
-                logger.warning(f"No project config for {project_name}")
-                return False  # Can't verify, assume no output
 
             agent = execution.get('agent')
             completed_at = execution.get('completed_at')
 
             if not agent or not completed_at:
-                logger.debug("Missing agent or completed_at in execution record")
-                return False
+                # The permanent case in production: nothing writes completed_at, so
+                # "after what?" has no answer and there is no comparison to make.
+                # Unverifiable, not verified-empty -- and until the gate is
+                # correct for discussion-workspace columns and can tell the agent's
+                # comment from anyone else's, unverifiable is where it should stay.
+                logger.debug(
+                    f"Watchdog: No completion timestamp for {project_name}/#{issue_number} "
+                    f"-- cannot verify GitHub output, leaving the record alone"
+                )
+                return True
 
-            # Parse completion timestamp
-            completed_at_str = completed_at.replace('Z', '+00:00')
-            completed_dt = datetime.fromisoformat(completed_at_str)
+            # Parse the completion timestamp
+            completed_dt = _parse_iso_timestamp(completed_at)
 
-            # Check for comments after completion time
-            org = project_config['github']['org']
-            repo = project_config['github']['repo']
+            # Check for comments after completion time.
+            #
+            # Attribute access, not subscription (#150): ProjectConfig is a plain
+            # dataclass with no __getitem__, so project_config['github'] raised
+            # TypeError on EVERY call, was swallowed by the broad handler below and
+            # returned False -- making this gate unconditionally "no output" for
+            # every project. Same defect class as the .get()-on-a-dataclass bugs
+            # #57/#58 fixed in PROTECTION 2/3; _should_retry_failed_execution()
+            # above has always used the correct form.
+            org = project_config.github['org']
+            repo = project_config.github['repo']
             endpoint = f'repos/{org}/{repo}/issues/{issue_number}/comments'
 
             success, comments = gh.rest('GET', endpoint)
 
             if not success:
-                logger.warning(f"Failed to fetch comments for {project_name}/#{issue_number}")
-                return False  # Can't verify, assume no output to be safe
+                logger.warning(
+                    f"Watchdog: Failed to fetch comments for {project_name}/#{issue_number} "
+                    f"-- cannot verify GitHub output, leaving the record alone"
+                )
+                return True  # Can't verify - defer rather than redispatch blind
+
+            if not isinstance(comments, list):
+                # rest() hands back whatever the response body decoded to. A dict
+                # (an error envelope) or a string iterates into something the loop
+                # below silently skips, ending in a confident "no output" derived
+                # from a body that was never a comment list.
+                logger.warning(
+                    f"Watchdog: Comments response for {project_name}/#{issue_number} was "
+                    f"{type(comments).__name__}, not a list -- cannot verify GitHub "
+                    f"output, leaving the record alone"
+                )
+                return True
 
             # Check if any comment was created after completion
             for comment in comments:
                 try:
-                    created_at = datetime.fromisoformat(comment['created_at'].replace('Z', '+00:00'))
+                    created_at = _parse_iso_timestamp(comment['created_at'])
                     if created_at > completed_dt:
                         # Found a comment after execution - assume it's the output
                         logger.debug(
@@ -1716,9 +2193,25 @@ class WorkExecutionStateTracker:
             logger.debug(f"No GitHub output found for {project_name}/#{issue_number} after {completed_dt}")
             return False
 
+        except (AttributeError, TypeError, KeyError) as e:
+            # A coding bug, not a transient outage -- and the exact shape (dataclass
+            # vs dict mixup) that made this gate a permanent "no output" until #150.
+            # Surfaced at ERROR with a traceback and distinctly from the transient
+            # case below, the same way PROTECTION 2/3's handlers were narrowed, so
+            # the next one can't hide as another quiet return value.
+            logger.error(
+                f"Watchdog: GitHub output check failed for {project_name}/#{issue_number} "
+                f"with a programming error -- this gate is not working, leaving the "
+                f"record alone: {e}",
+                exc_info=True
+            )
+            return True
         except Exception as e:
-            logger.error(f"Error checking GitHub output for {project_name}/#{issue_number}: {e}")
-            return False  # Can't verify, mark as no output to be safe
+            logger.warning(
+                f"Watchdog: Error checking GitHub output for {project_name}/#{issue_number} "
+                f"-- cannot verify, leaving the record alone: {e}"
+            )
+            return True  # Can't verify - defer rather than redispatch blind
 
     def _try_recover_result_from_redis(self, project_name, issue_number, agent, column, execution):
         """
@@ -1942,6 +2435,18 @@ class WorkExecutionStateTracker:
                         continue
                     with open(state_file, 'r') as f:
                         state = yaml.safe_load(f)
+
+                    # Third of this module's three state-file readers -- same
+                    # corrupted-state-file condition, same report. The membership
+                    # test below happens to survive a string or a list, but not a
+                    # scalar (`'x' not in 42` raises TypeError), so this site was
+                    # unguarded too.
+                    if state is not None and not isinstance(state, dict):
+                        self._log_corrupted_state_file(
+                            state_file,
+                            f"YAML parsed as {type(state).__name__}, expected a mapping"
+                        )
+                        continue
 
                     if not state or 'execution_history' not in state:
                         continue
@@ -2256,7 +2761,13 @@ class WorkExecutionStateTracker:
                                         obs = get_observability_manager()
                                         decision_events = DecisionEventEmitter(obs)
                                         pipeline_run_mgr = get_pipeline_run_manager()
-                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+                                        # read-only: this lookup only wants an id
+                                        # to stamp on an event, and the ES fallback
+                                        # would otherwise write a possibly-dead run
+                                        # back into Redis (#150)
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(
+                                            project_name, issue_number, restore_to_redis=False
+                                        )
 
                                         decision_events.emit_execution_state_reconciled(
                                             agent=agent,
@@ -2356,7 +2867,13 @@ class WorkExecutionStateTracker:
                                         obs = get_observability_manager()
                                         decision_events = DecisionEventEmitter(obs)
                                         pipeline_run_mgr = get_pipeline_run_manager()
-                                        active_run = pipeline_run_mgr.get_active_pipeline_run(project_name, issue_number)
+                                        # read-only: this lookup only wants an id
+                                        # to stamp on an event, and the ES fallback
+                                        # would otherwise write a possibly-dead run
+                                        # back into Redis (#150)
+                                        active_run = pipeline_run_mgr.get_active_pipeline_run(
+                                            project_name, issue_number, restore_to_redis=False
+                                        )
 
                                         # Emit error decision event with blocking context
                                         decision_events.emit_error_decision(

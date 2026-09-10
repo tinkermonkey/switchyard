@@ -665,7 +665,8 @@ class PipelineProgression:
                                 column=current_column,
                                 agent=agent,
                                 trigger_source='pipeline_progression',
-                                project_name=project_name
+                                project_name=project_name,
+                                board_name=board_name
                             )
 
                             # Enqueue task LAST so workers find in_progress state
@@ -873,7 +874,8 @@ class PipelineProgression:
                 column=next_column,
                 agent=next_agent,
                 trigger_source='pipeline_progression',
-                project_name=project_name
+                project_name=project_name,
+                board_name=board_name
             )
 
             # Enqueue task LAST so workers find in_progress state

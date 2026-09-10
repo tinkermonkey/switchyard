@@ -580,7 +580,8 @@ class PRReviewStage(PipelineStage):
                             column=column,
                             agent=self.requirements_verifier_agent,
                             trigger_source='pr_review_phase2',
-                            project_name=project_name
+                            project_name=project_name,
+                            board_name=task_context.get('board')
                         )
 
                         # Launch requirements_verifier in Docker (via AgentExecutor)
@@ -1850,7 +1851,8 @@ class PRReviewStage(PipelineStage):
             column=column,
             agent=self.pr_review_agent,
             trigger_source='pr_review_phase4',
-            project_name=project_name
+            project_name=project_name,
+            board_name=task_context.get('board')
         )
 
         phase4_ctx: Dict[str, Any] = {

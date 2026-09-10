@@ -1390,6 +1390,32 @@ class PipelineLockManager:
         lock = self.get_lock(project, board)
         return lock.locked_by_issue if lock else None
 
+    def get_lock_holder_fail_closed(
+        self, project: str, board: str
+    ) -> Tuple[Optional[int], bool]:
+        """
+        Like get_lock_holder(), but also reports whether the read was trustworthy.
+
+        get_lock_holder() goes through get_lock(), which discards the health flag
+        both stores return -- and _read_redis_lock_only()/_read_yaml_lock_only()
+        swallow their own exceptions, so a total store outage surfaces there as
+        "no lock holder", indistinguishable from "board is free". A caller making
+        a safety decision from that answer (work_execution_state's PROTECTION 2)
+        would then proceed as if the board were idle precisely when it cannot
+        tell. This exposes the same (value, reads_healthy) contract
+        get_lock_fail_closed() already provides for the lock itself.
+
+        Args:
+            project: Project name
+            board: Board name
+
+        Returns:
+            (issue_number holding the lock or None, reads_healthy). Treat
+            reads_healthy=False as "unknown -- assume locked", never as unlocked.
+        """
+        lock, reads_healthy = self.get_lock_fail_closed(project, board)
+        return (lock.locked_by_issue if lock else None), reads_healthy
+
     def is_locked_by_issue(self, project: str, board: str, issue_number: int) -> bool:
         """
         Check if a specific issue currently holds the lock.

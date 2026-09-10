@@ -168,6 +168,7 @@ from services.project_checkout_lock import (
     _mint_unique_holder_id,
     _release_and_warn,
     _timeout_error,
+    _tracked_resource_activity,
 )
 from services.project_resource_lock_manager import ProjectResourceLockManager
 
@@ -258,26 +259,44 @@ async def dev_container_build_lock_async(
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
-            facade, RESOURCE_NAME, project, holder_id, issue_number
-        )
-        if can_execute:
-            break
-        if time.monotonic() >= deadline:
-            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
-        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-        await asyncio.sleep(poll_interval_seconds)
+    # Publishes the wait AND the hold to project_checkout_lock's in-process
+    # registry so the zombie watchdog can tell a dispatch that is legitimately
+    # blocked here from one that has genuinely died -- see that registry's
+    # comment. Matters at least as much for this lock as for project_checkout:
+    # the operation it guards is an image build, which runs no container
+    # labelled for the issue for the watchdog's probe to find.
+    #
+    # The hold is budgeted (HELD_ACTIVITY_MAX_SECONDS), not unconditional: the
+    # body guarded here is claude_integration._run_claude_code_locally(), whose
+    # subprocess readline() loop has no timeout of any kind, so a Claude CLI that
+    # stalls with no output would otherwise keep this issue's pipeline run
+    # exempt from zombie cleanup until the orchestrator process restarts.
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
+        while True:
+            can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+                facade, RESOURCE_NAME, project, holder_id, issue_number
+            )
+            if can_execute:
+                break
+            if time.monotonic() >= deadline:
+                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
+            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
+            await asyncio.sleep(poll_interval_seconds)
 
-    try:
-        async with _held_with_heartbeat_async(
-            facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
-        ):
-            yield
-    finally:
-        # Deliberately synchronous, not offloaded -- see the same finally in
-        # project_checkout_lock_async() for why.
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+        if activity is not None:
+            activity.mark_held()
+
+        try:
+            async with _held_with_heartbeat_async(
+                facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
+            ):
+                yield
+        finally:
+            # Deliberately synchronous, not offloaded -- see the same finally in
+            # project_checkout_lock_async() for why.
+            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 
 @contextmanager
@@ -303,17 +322,23 @@ def dev_container_build_lock_sync(
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
-        if can_execute:
-            break
-        if time.monotonic() >= deadline:
-            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
-        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-        time.sleep(poll_interval_seconds)
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
+        while True:
+            can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
+            if can_execute:
+                break
+            if time.monotonic() >= deadline:
+                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason, error_cls=DevContainerBuildLockTimeoutError)
+            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
+            time.sleep(poll_interval_seconds)
 
-    try:
-        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
-            yield
-    finally:
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+        if activity is not None:
+            activity.mark_held()
+
+        try:
+            with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
+                yield
+        finally:
+            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)

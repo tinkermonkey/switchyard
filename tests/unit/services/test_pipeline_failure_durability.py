@@ -230,6 +230,35 @@ class TestMarkLockFailedDurability(unittest.TestCase):
         self.assertTrue(healthy)
         self.assertEqual(lock.retained_reason, "crashed")
 
+    def test_get_lock_holder_fail_closed_reports_an_unreadable_store(self):
+        """work_execution_state's PROTECTION 2 decides whether it is safe to
+        redispatch a stuck issue from this answer, so "I cannot read the lock"
+        must not arrive looking like "nobody holds the lock". get_lock_holder()
+        cannot tell them apart: get_lock() discards the health flag, and both
+        _read_*_lock_only() helpers swallow their own exceptions and return
+        None."""
+        self.mock_redis.hgetall.side_effect = Exception("redis down")
+        state_file = self.manager._get_state_file("proj", "board")
+        state_file.write_text("not: valid: yaml: [")
+
+        self.assertIsNone(self.manager.get_lock_holder("proj", "board"))
+
+        holder, healthy = self.manager.get_lock_holder_fail_closed("proj", "board")
+        self.assertIsNone(holder)
+        self.assertFalse(healthy)
+
+    def test_get_lock_holder_fail_closed_reports_a_healthy_read(self):
+        """Control: an ordinary read still answers with the holder and says so."""
+        self.mock_redis.hgetall.return_value = {
+            'project': 'proj', 'board': 'board', 'locked_by_issue': '123',
+            'lock_acquired_at': datetime.now(timezone.utc).isoformat(),
+            'lock_status': 'locked', 'retained_reason': '', 'retained_at': '',
+        }
+
+        holder, healthy = self.manager.get_lock_holder_fail_closed("proj", "board")
+        self.assertEqual(holder, 123)
+        self.assertTrue(healthy)
+
     def test_mark_lock_failed_rejects_empty_reason(self):
         self.manager._create_lock("proj", "board", 123)
         marked = self.manager.mark_lock_failed("proj", "board", 123, reason="")

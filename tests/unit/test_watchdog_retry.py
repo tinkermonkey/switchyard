@@ -8,6 +8,7 @@ Tests:
 - GitHub output verification
 """
 
+import logging
 import os
 import pytest
 if not os.path.isdir('/app'):
@@ -18,11 +19,24 @@ from unittest.mock import MagicMock, patch, mock_open
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
+import threading
 
 # Mock ORCHESTRATOR_ROOT before importing work_execution_state to avoid /app permission errors
 with tempfile.TemporaryDirectory() as _tmpdir:
     with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
         from services.work_execution_state import WorkExecutionStateTracker
+
+from config.manager import ProjectConfig
+
+
+# detect_and_retry_empty_successful_executions() only examines a record that sits
+# between its two time gates: newer than _WATCHDOG_MAX_RECORD_AGE_HOURS (the age
+# gate that keeps a 4700-file sweep off GitHub) and older than PROTECTION 5's
+# 5-minute recency window. A hard-coded 2025-01-01 fixture is outside both, so
+# every fixture below that expects the sweep to reach its protections has to be
+# dated relative to now.
+_EXAMINABLE_COMPLETED_AT = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+_EXAMINABLE_TIMESTAMP = (datetime.now(timezone.utc) - timedelta(minutes=40)).isoformat()
 
 
 class TestEmptyOutputDetection:
@@ -51,8 +65,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -91,8 +105,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -132,8 +146,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -180,8 +194,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -224,7 +238,7 @@ class TestEmptyOutputDetection:
         protection a permanent no-op (the same bug class already fixed for
         PROTECTION 3's dead get_pipeline_queue() import). Now uses the real
         ProjectPipeline.board_name attribute and
-        PipelineLockManager.get_lock_holder() -- a pipeline board genuinely
+        PipelineLockManager.get_lock_holder_fail_closed() -- a pipeline board genuinely
         locked by a different issue must skip marking this execution for
         retry rather than racing the in-progress run."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
@@ -236,8 +250,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -251,7 +265,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a different issue
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (999, True)  # locked by a different issue
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -266,17 +280,17 @@ class TestEmptyOutputDetection:
                                 retried_count = tracker.detect_and_retry_empty_successful_executions()
 
         assert retried_count == 0
-        mock_lock_manager.get_lock_holder.assert_called_once_with('test-project', 'SDLC Execution')
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'SDLC Execution')
 
         with open(state_file) as f:
             updated_state = yaml.safe_load(f)
         assert updated_state['execution_history'][-1]['outcome'] == 'success'
 
     def test_proceeds_when_pipeline_lock_is_free(self, tracker, temp_state_dir):
-        """Control case: get_lock_holder() returns None (board unlocked) --
-        the watchdog must proceed exactly as before this fix, and must not
-        raise despite the real ProjectPipeline/PipelineLockManager objects
-        now actually being called."""
+        """Control case: get_lock_holder_fail_closed() reports no holder on a
+        healthy read (board unlocked) -- the watchdog must proceed exactly as
+        before this fix, and must not raise despite the real
+        ProjectPipeline/PipelineLockManager objects now actually being called."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
         state_data = {
             'project_name': 'test-project',
@@ -286,8 +300,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -301,7 +315,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = None
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -327,8 +341,9 @@ class TestEmptyOutputDetection:
         still holds its own lock right after finishing a stage (locks
         release only at specific exit columns, not after every stage), that
         version would have skipped almost every retry check, not just ones
-        actually racing a different issue's in-progress work. get_lock_holder()
-        returning this SAME issue_number must proceed exactly as if unlocked."""
+        actually racing a different issue's in-progress work.
+        get_lock_holder_fail_closed() returning this SAME issue_number must
+        proceed exactly as if unlocked."""
         state_file = temp_state_dir / "test_project_issue_123.yaml"
         state_data = {
             'project_name': 'test-project',
@@ -338,8 +353,8 @@ class TestEmptyOutputDetection:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z',
-                    'timestamp': '2025-01-01T11:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT,
+                    'timestamp': _EXAMINABLE_TIMESTAMP
                 }
             ]
         }
@@ -353,7 +368,7 @@ class TestEmptyOutputDetection:
         project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 123  # this SAME issue holds it
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (123, True)  # this SAME issue holds it
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -445,7 +460,7 @@ class TestRaceConditionProtections:
                     'agent': 'test-agent',
                     'column': 'In Progress',
                     'outcome': 'success',
-                    'completed_at': '2025-01-01T12:00:00Z'
+                    'completed_at': _EXAMINABLE_COMPLETED_AT
                 }
             ]
         }
@@ -608,12 +623,31 @@ class TestRetryEligibility:
 
 
 class TestGitHubOutputVerification:
-    """Test GitHub output verification"""
+    """Test GitHub output verification.
+
+    These tests build a REAL ProjectConfig rather than a dict (#150). The dict
+    stand-in they used before is what let _has_github_output() ship a
+    project_config['github']['org'] subscript against a dataclass with no
+    __getitem__: production raised TypeError on every single call, the broad
+    handler swallowed it, and the gate answered "no output" unconditionally --
+    with a green test suite the whole time.
+    """
 
     @pytest.fixture
     def tracker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             return WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    @staticmethod
+    def _project_config():
+        return ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[],
+            pipeline_routing={},
+        )
 
     def test_has_github_output_comment_found(self, tracker):
         """Test detects GitHub comment after execution"""
@@ -634,9 +668,7 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
@@ -661,16 +693,21 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
                 assert has_output is False
 
     def test_has_github_output_api_failure(self, tracker):
-        """Test assumes no output when API fails (safe default)"""
+        """An unverifiable answer must fail CLOSED (#150).
+
+        This is the last gate before an execution is rewritten to 'failure' and
+        an agent is redispatched, and the two wrong answers are not symmetric: a
+        spurious "no output" launches a container onto an issue that already has
+        its comment, while a spurious "has output" only defers -- the record
+        stays 'success', no retry budget is spent, and the next sweep looks
+        again. It used to return False here."""
         execution = {
             'agent': 'test-agent',
             'completed_at': '2025-01-01T12:00:00Z'
@@ -681,14 +718,82 @@ class TestGitHubOutputVerification:
 
         with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
             with patch('config.manager.config_manager.get_project_config') as mock_config:
-                mock_config.return_value = {
-                    'github': {'org': 'test-org', 'repo': 'test-repo'}
-                }
+                mock_config.return_value = self._project_config()
 
                 has_output = tracker._has_github_output('test-project', 123, execution)
 
-                # Assumes no output to be safe (triggers retry)
-                assert has_output is False
+                assert has_output is True
+
+    def test_has_github_output_programming_error_fails_closed_and_logs_loudly(
+        self, tracker, caplog
+    ):
+        """A dataclass/dict mixup -- the exact defect that made this gate a
+        permanent "no output" -- must surface at ERROR with a traceback rather
+        than becoming another quiet return value, and must not redispatch."""
+        execution = {
+            'agent': 'test-agent',
+            'completed_at': '2025-01-01T12:00:00Z'
+        }
+
+        broken_config = object()  # no .github at all
+
+        with patch('services.github_api_client.get_github_client', return_value=MagicMock()):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = broken_config
+
+                with caplog.at_level(logging.ERROR, logger='services.work_execution_state'):
+                    has_output = tracker._has_github_output('test-project', 123, execution)
+
+        assert has_output is True
+        assert any(
+            'programming error' in record.message for record in caplog.records
+        ), caplog.text
+
+    def test_has_github_output_without_completed_at_fails_closed(self, tracker):
+        """The production shape, and the reason this gate is inert (#150).
+
+        No production code path writes completed_at -- record_execution_outcome()
+        deliberately does not stamp it on this branch -- so "was there a comment
+        AFTER completion?" has no anchor and every real record answers
+        "cannot verify". That keeps the sweep from rewriting any of the 54k+
+        'success' records while the gate is still wrong in ways confirmed against
+        live data (it never looks at Discussions, and it counts any comment in the
+        window as the agent's). Activating it is tracked as #166.
+
+        Note this is the shape record_execution_start() actually writes: a start
+        timestamp and nothing else."""
+        execution = {
+            'agent': 'test-agent',
+            'timestamp': '2025-01-01T12:00:00Z',  # start only -- no completed_at
+        }
+
+        gh_client = MagicMock()
+        with patch('services.github_api_client.get_github_client', return_value=gh_client):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = self._project_config()
+
+                assert tracker._has_github_output('test-project', 123, execution) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_has_github_output_non_list_response_fails_closed(self, tracker):
+        """rest() hands back whatever the body decoded to. A dict (an error
+        envelope) or a string iterates into something the comment loop silently
+        skips, ending in a confident "no output" derived from a body that was
+        never a comment list."""
+        execution = {
+            'agent': 'test-agent',
+            'completed_at': '2025-01-01T12:00:00Z'
+        }
+
+        mock_gh_client = MagicMock()
+        mock_gh_client.rest.return_value = (True, {'message': 'Not Found'})
+
+        with patch('services.github_api_client.get_github_client', return_value=mock_gh_client):
+            with patch('config.manager.config_manager.get_project_config') as mock_config:
+                mock_config.return_value = self._project_config()
+
+                assert tracker._has_github_output('test-project', 123, execution) is True
 
 
 class TestWatchdogIncrementsRetryCount:
@@ -776,8 +881,8 @@ class TestProjectConfigCacheDoesNotPoisonOnFailure:
                         'agent': 'test-agent',
                         'column': 'In Progress',
                         'outcome': 'success',
-                        'completed_at': '2025-01-01T12:00:00Z',
-                        'timestamp': '2025-01-01T11:00:00Z',
+                        'completed_at': _EXAMINABLE_COMPLETED_AT,
+                        'timestamp': _EXAMINABLE_TIMESTAMP,
                     }
                 ],
             }
@@ -790,7 +895,7 @@ class TestProjectConfigCacheDoesNotPoisonOnFailure:
         real_project_config.pipelines = [pipeline_cfg]
 
         mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder.return_value = 999  # locked by a DIFFERENT issue
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (999, True)  # locked by a DIFFERENT issue
 
         # First call (for whichever state file is processed first) raises;
         # every subsequent call succeeds.
@@ -833,3 +938,1258 @@ class TestProjectConfigCacheDoesNotPoisonOnFailure:
         # raised) and one 'success' (the file that must have been protected
         # by a real, non-poisoned config fetch).
         assert sorted(outcomes.values()) == ['failure', 'success']
+
+
+def _successful_execution_state(issue_number, board_name=None):
+    """A state file body whose last execution is a bare 'success' -- the shape
+    detect_and_retry_empty_successful_executions() actually inspects."""
+    execution = {
+        'agent': 'test-agent',
+        'column': 'In Progress',
+        'outcome': 'success',
+        'completed_at': _EXAMINABLE_COMPLETED_AT,
+        'timestamp': _EXAMINABLE_TIMESTAMP
+    }
+    if board_name:
+        execution['board_name'] = board_name
+    return {
+        'project_name': 'test-project',
+        'issue_number': issue_number,
+        'execution_history': [execution]
+    }
+
+
+def _write_state(temp_state_dir, issue_number, board_name=None):
+    state_file = temp_state_dir / f"test_project_issue_{issue_number}.yaml"
+    with open(state_file, 'w') as f:
+        yaml.dump(_successful_execution_state(issue_number, board_name), f)
+    return state_file
+
+
+def _two_board_project_config():
+    """A project with the planning board FIRST, so the pre-#144 every-board loop
+    hits the locked board before it ever reaches the execution's own board."""
+    planning = MagicMock()
+    planning.board_name = 'Planning Design'
+    sdlc = MagicMock()
+    sdlc.board_name = 'SDLC Execution'
+    project_config = MagicMock()
+    project_config.pipelines = [planning, sdlc]
+    return project_config
+
+
+class TestProtection2BoardScoping:
+    """
+    #144: PROTECTION 2 looped over EVERY board configured for the project and
+    skipped the retry-eligibility check if ANY of them was locked by a different
+    issue -- so an execution stuck on a completely idle board was skipped
+    because an unrelated board of the same project was busy with unrelated work.
+    Execution records now carry the board they ran on (record_execution_start's
+    board_name), and the lock check scopes to it.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _lock_manager_with_planning_locked():
+        mock_lock_manager = MagicMock()
+
+        def _holder(project_name, board_name):
+            # Only the planning board is busy, and by an unrelated issue.
+            return (999, True) if board_name == 'Planning Design' else (None, True)
+
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = _holder
+        return mock_lock_manager
+
+    @staticmethod
+    def _run(tracker, mock_lock_manager):
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = _two_board_project_config()
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                return tracker.detect_and_retry_empty_successful_executions()
+
+    def test_another_boards_lock_does_not_skip_this_executions_retry(self, tracker, temp_state_dir):
+        """REGRESSION (#144): the stuck execution ran on 'SDLC Execution', which
+        is unlocked. 'Planning Design' being locked by issue #999 has nothing to
+        do with it, and must not skip the retry."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        mock_lock_manager = self._lock_manager_with_planning_locked()
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 1
+        # Scoped: only the execution's own board was consulted at all.
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'SDLC Execution')
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'failure'
+
+    def test_a_lock_on_the_executions_own_board_still_skips(self, tracker, temp_state_dir):
+        """Control: scoping must not make PROTECTION 2 toothless. A lock held by
+        a different issue on the execution's OWN board still skips the retry."""
+        state_file = _write_state(temp_state_dir, 123, board_name='Planning Design')
+        mock_lock_manager = self._lock_manager_with_planning_locked()
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'Planning Design')
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_board_that_is_no_longer_configured_falls_back_to_every_board(
+        self, tracker, temp_state_dir
+    ):
+        """A recorded board that no longer resolves (a board rename, or the
+        'system' pseudo-board some task contexts carry) must NOT be trusted:
+        get_lock_holder on an unknown board name is not an error, both stores
+        simply have no entry, so scoping to it would make PROTECTION 2 a
+        guaranteed no-op -- strictly weaker than the every-board behavior it
+        replaced, not more conservative than it."""
+        state_file = _write_state(temp_state_dir, 123, board_name='Renamed Away')
+        mock_lock_manager = self._lock_manager_with_planning_locked()
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
+        # Fell back to the configured boards rather than the recorded one.
+        checked = {
+            call.args[1]
+            for call in mock_lock_manager.get_lock_holder_fail_closed.call_args_list
+        }
+        assert 'Renamed Away' not in checked
+        assert 'Planning Design' in checked
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_an_unverifiable_lock_read_assumes_locked(self, tracker, temp_state_dir):
+        """#150: get_lock_holder() drops the health flag both stores return, and
+        those stores swallow their own exceptions -- so Redis down plus an
+        unreadable YAML lock file used to surface here as "no holder", identical
+        to an idle board, and the execution was marked for retry onto a board
+        another issue was actively holding."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, False)
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_records_without_a_board_keep_the_every_board_behavior(self, tracker, temp_state_dir):
+        """Execution records written before board_name existed have no board to
+        scope to. "Some board of this project is busy" is then the only signal
+        there is, so those keep the old conservative behavior rather than
+        silently losing PROTECTION 2 entirely."""
+        state_file = _write_state(temp_state_dir, 123, board_name=None)
+        mock_lock_manager = self._lock_manager_with_planning_locked()
+
+        retried_count = self._run(tracker, mock_lock_manager)
+
+        assert retried_count == 0
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+
+class TestQueueManagerCachedPerSweep:
+    """
+    #140 item 17: PROTECTION 3 built a brand-new PipelineQueueManager (state_dir
+    mkdir included) once per board for EVERY state file examined, so an
+    N-file x M-board sweep constructed N*M throwaway managers for the same M
+    boards.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    def test_one_manager_per_board_per_sweep(self, tracker, temp_state_dir):
+        _write_state(temp_state_dir, 123)
+        _write_state(temp_state_dir, 456)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.return_value = None
+        factory = MagicMock(return_value=mock_queue_manager)
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                with patch(
+                                    'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                                    factory
+                                ):
+                                    retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        assert retried_count == 2
+        # One manager for the one board, reused across both state files...
+        factory.assert_called_once_with('test-project', 'SDLC Execution')
+        # ...but the queue itself is still re-read per check, never snapshotted:
+        # PROTECTION 3 is a race guard and must not act on a stale view.
+        assert mock_queue_manager.get_issue_status.call_count == 2
+
+
+class TestProtectionFailureVisibility:
+    """
+    #140 item 31: PROTECTION 2/3 logged every failure at debug. That is exactly
+    how an AttributeError on a dataclass and an import of a function that never
+    existed both survived as permanent silent no-ops through two review rounds.
+    A programming error must now surface at ERROR, distinctly from a transient
+    outage at WARNING.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    def _run_with_lock_manager(self, tracker, mock_lock_manager, mock_queue_manager=None):
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        if mock_queue_manager is None:
+            mock_queue_manager = MagicMock()
+            mock_queue_manager.get_issue_status.return_value = None
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.return_value = project_config
+                            with patch(
+                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                return_value=mock_lock_manager
+                            ):
+                                with patch(
+                                    'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                                    return_value=mock_queue_manager
+                                ):
+                                    return tracker.detect_and_retry_empty_successful_executions()
+
+    def test_protection_2_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
+        _write_state(temp_state_dir, 123)
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = AttributeError(
+            "'ProjectConfig' object has no attribute 'get'"
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            retried_count = self._run_with_lock_manager(tracker, mock_lock_manager)
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any('PROTECTION 2' in r.getMessage() for r in errors), \
+            "a coding bug in PROTECTION 2 must be logged at ERROR, not debug"
+        # ...and the sweep FALLS THROUGH rather than skipping the issue. See the
+        # handler's comment: a permanent coding bug must not silently freeze the
+        # un-sticking watchdog, and the redispatch this invites still contends on
+        # the board's pipeline lock at project_monitor.
+        assert retried_count == 1
+
+    def test_protection_2_transient_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
+        _write_state(temp_state_dir, 123)
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.side_effect = ConnectionError("Redis unreachable")
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            retried_count = self._run_with_lock_manager(tracker, mock_lock_manager)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('PROTECTION 2 skipped' in r.getMessage() for r in warnings)
+        # Same fall-through posture as the programming-error case above.
+        assert retried_count == 1
+        # A transient outage is NOT a coding bug -- it must not be logged as one.
+        assert not [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR and 'PROTECTION 2' in r.getMessage()
+        ]
+
+    def test_protection_3_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
+        _write_state(temp_state_dir, 123)
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.side_effect = TypeError(
+            "'NoneType' object is not subscriptable"
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            retried_count = self._run_with_lock_manager(
+                tracker, mock_lock_manager, mock_queue_manager
+            )
+
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any('PROTECTION 3' in r.getMessage() for r in errors)
+        assert retried_count == 1
+
+    def test_protection_3_transient_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
+        _write_state(temp_state_dir, 123)
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.side_effect = TimeoutError("queue lock timeout")
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            retried_count = self._run_with_lock_manager(
+                tracker, mock_lock_manager, mock_queue_manager
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('PROTECTION 3 skipped' in r.getMessage() for r in warnings)
+        assert retried_count == 1
+
+    def test_project_config_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
+        """A config read that fails degrades BOTH protections to no-ops for that
+        state file -- the same silent-degradation class, so the same visibility."""
+        _write_state(temp_state_dir, 123)
+
+        with patch.object(tracker, 'has_active_execution', return_value=False):
+            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                with patch.object(tracker, '_has_github_output', return_value=False):
+                    with patch('utils.file_lock.file_lock'):
+                        with patch('config.manager.config_manager') as mock_config_manager:
+                            mock_config_manager.get_project_config.side_effect = Exception("config read failed")
+                            with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+                                tracker.detect_and_retry_empty_successful_executions()
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('PROTECTION 2/3 degraded' in r.getMessage() for r in warnings)
+
+
+class TestCorruptedStateFile:
+    """
+    A truncated/empty state file parses to None, and .setdefault() on it raised
+    into load_state()'s generic handler -- producing
+    "Failed to load state for rounds/#159: 'NoneType' object has no attribute
+    'setdefault'" at ERROR on every load of that issue, forever, without ever
+    naming the file that needed repairing.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    def test_empty_file_is_reported_as_corrupted_not_as_an_attributeerror(
+        self, tracker, temp_state_dir, caplog
+    ):
+        state_file = temp_state_dir / "rounds_issue_159.yaml"
+        state_file.write_text("")
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            state = tracker.load_state('rounds', 159)
+
+        # Falls back to the same empty state a missing file gets.
+        assert state['execution_history'] == []
+        assert state['status_changes'] == []
+        assert state['issue_number'] == 159
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            'Corrupted execution state file' in m and str(state_file) in m
+            for m in messages
+        ), "the corrupted file must be named so it can be repaired"
+        assert not any('has no attribute' in m for m in messages), \
+            "must not surface as a generic AttributeError any more"
+
+    def test_non_mapping_file_is_reported_as_corrupted(self, tracker, temp_state_dir, caplog):
+        state_file = temp_state_dir / "rounds_issue_160.yaml"
+        state_file.write_text("just a bare string\n")
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            state = tracker.load_state('rounds', 160)
+
+        assert state['execution_history'] == []
+        assert any(
+            'Corrupted execution state file' in r.getMessage() and str(state_file) in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_unparseable_yaml_is_reported_as_corrupted(self, tracker, temp_state_dir, caplog):
+        state_file = temp_state_dir / "rounds_issue_161.yaml"
+        state_file.write_text("execution_history: [\n  - unterminated\n")
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            state = tracker.load_state('rounds', 161)
+
+        assert state['execution_history'] == []
+        assert any(
+            'Corrupted execution state file' in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_sweep_skips_a_corrupted_file_by_name(self, tracker, temp_state_dir, caplog):
+        """The watchdog sweep reads state files itself rather than through
+        load_state(), so it needs the same treatment -- otherwise a non-mapping
+        file surfaced as a generic TypeError from the loop's outer handler."""
+        corrupt = temp_state_dir / "rounds_issue_162.yaml"
+        corrupt.write_text("just a bare string\n")
+        _write_state(temp_state_dir, 123)
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        mock_queue_manager = MagicMock()
+        mock_queue_manager.get_issue_status.return_value = None
+
+        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
+            with patch.object(tracker, 'has_active_execution', return_value=False):
+                with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
+                    with patch.object(tracker, '_has_github_output', return_value=False):
+                        with patch('utils.file_lock.file_lock'):
+                            with patch('config.manager.config_manager') as mock_config_manager:
+                                mock_config_manager.get_project_config.return_value = project_config
+                                with patch(
+                                    'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                                    return_value=mock_lock_manager
+                                ):
+                                    with patch(
+                                        'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                                        return_value=mock_queue_manager
+                                    ):
+                                        retried_count = tracker.detect_and_retry_empty_successful_executions()
+
+        # The healthy file is still processed.
+        assert retried_count == 1
+        assert any(
+            'Corrupted execution state file' in r.getMessage() and str(corrupt) in r.getMessage()
+            for r in caplog.records
+        )
+        assert not any(
+            'Error processing' in r.getMessage() for r in caplog.records
+        ), "a corrupted file is a known condition, not an unhandled loop error"
+
+
+class TestRecordExecutionStartBoardName:
+    """record_execution_start() is the write side of #144's fix."""
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _backdate_the_record(tracker, issue_number):
+        """Backdate the record written by the real writers a little.
+
+        Keeps the on-disk shape production actually has -- a start timestamp and
+        no completed_at -- while putting the record far enough in the past that
+        nothing time-based interferes with what these tests are about, which is
+        board scoping.
+        """
+        state = tracker.load_state('test-project', issue_number)
+        state['execution_history'][-1]['timestamp'] = (
+            datetime.now(timezone.utc) - timedelta(minutes=30)
+        ).isoformat()
+        tracker.save_state('test-project', issue_number, state)
+
+    def test_board_name_is_persisted_on_the_execution_record(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            trigger_source='manual',
+            project_name='test-project',
+            board_name='SDLC Execution'
+        )
+
+        state = tracker.load_state('test-project', 123)
+        assert state['execution_history'][-1]['board_name'] == 'SDLC Execution'
+
+    def test_board_name_survives_record_execution_outcome_and_scopes_the_sweep(
+        self, tracker, temp_state_dir
+    ):
+        """The two halves of #144's fix only meet through
+        record_execution_outcome() mutating the in_progress entry in place. If
+        that ever stopped carrying board_name through, both sides would still
+        pass their own tests while the fix quietly stopped applying."""
+        tracker.record_execution_start(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            trigger_source='manual',
+            project_name='test-project',
+            board_name='SDLC Execution'
+        )
+        tracker.record_execution_outcome(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            outcome='success',
+            project_name='test-project'
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['outcome'] == 'success'
+        assert last_exec['board_name'] == 'SDLC Execution'
+
+        self._backdate_the_record(tracker, 123)
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        retried_count = TestProtection2BoardScoping._run(tracker, mock_lock_manager)
+
+        assert retried_count == 1
+        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with(
+            'test-project', 'SDLC Execution'
+        )
+
+    def test_the_crash_recovery_record_has_no_board_and_gets_the_fallback(
+        self, tracker, temp_state_dir
+    ):
+        """record_execution_outcome() with no matching in_progress entry -- the
+        documented orchestrator restart/crash case -- appends a record synthesised
+        from what the caller knows now, which includes no board. That record gets
+        PROTECTION 2's every-board fallback, deliberately rather than
+        accidentally."""
+        tracker.record_execution_outcome(
+            issue_number=123,
+            column='In Progress',
+            agent='test-agent',
+            outcome='success',
+            project_name='test-project'
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['trigger_source'] == 'unknown'
+        assert 'board_name' not in last_exec
+
+        self._backdate_the_record(tracker, 123)
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        TestProtection2BoardScoping._run(tracker, mock_lock_manager)
+
+        checked = [
+            call.args[1]
+            for call in mock_lock_manager.get_lock_holder_fail_closed.call_args_list
+        ]
+        assert checked == ['Planning Design', 'SDLC Execution']
+
+    def test_board_name_is_omitted_rather_than_written_as_none(self, tracker):
+        """An explicit None would be indistinguishable from a board recorded as
+        empty; consumers key off "absent or falsy" either way."""
+        tracker.record_execution_start(
+            issue_number=124,
+            column='In Progress',
+            agent='test-agent',
+            trigger_source='manual',
+            project_name='test-project'
+        )
+
+        state = tracker.load_state('test-project', 124)
+        assert 'board_name' not in state['execution_history'][-1]
+
+
+class TestSweepReachesItsProtectionsForReal:
+    """End-to-end reachability of detect_and_retry_empty_successful_executions().
+
+    Every other test in this file replaces has_active_execution() and
+    _has_github_output() with constants. That is fine for unit-testing the
+    protections between them, but it is also how 599 lines of green tests were
+    written over a sweep that had never completed a single pass in production
+    (#150): PROTECTION 1 called has_active_execution(), which re-read the state
+    file through load_state(), which re-acquired the state file's own flock on a
+    fresh fd -- and blocked forever, in the same thread, with no timeout. Nothing
+    after it ran, including #144's board scoping.
+
+    These tests use the REAL protections, the REAL file locking and a real temp
+    state dir, and run the sweep on a worker thread with a hard join timeout so a
+    re-entrancy regression fails the test instead of hanging the suite.
+    """
+
+    SWEEP_TIMEOUT_SECONDS = 20
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _write_state(tracker, history):
+        # get_state_file(), not a hand-spelled name: the deadlock only reproduces
+        # when the sweep's lock path and load_state()'s lock path are the same
+        # file, which is exactly what production always has and what a
+        # "test_project_issue_123.yaml" stand-in for project "test-project"
+        # quietly does not.
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': history,
+                },
+                f,
+            )
+        return state_file
+
+    @staticmethod
+    def _success_record(**overrides):
+        """A record carrying a synthetic completed_at.
+
+        Deliberately NOT the production shape: no production code path writes
+        completed_at, so a real record makes _has_github_output() answer "cannot
+        verify" and the sweep stops one gate short of the retry marking -- which
+        is the point of TestSweepOnProductionShapedRecords, but would make these
+        reachability tests unable to tell "the sweep ran to completion" from "the
+        sweep wedged". Stamping the field here is what lets them assert the sweep
+        reaches its last gate and past it.
+        """
+        record = {
+            'agent': 'test-agent',
+            'column': 'In Progress',
+            'board_name': 'SDLC Execution',
+            'outcome': 'success',
+            'completed_at': _EXAMINABLE_COMPLETED_AT,
+            'timestamp': _EXAMINABLE_TIMESTAMP,
+        }
+        record.update(overrides)
+        return record
+
+    def _run_sweep(self, tracker, comments):
+        """Run the sweep with only the leaves mocked, on a bounded thread."""
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[pipeline_cfg],
+            pipeline_routing={},
+        )
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, comments)
+
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        result = {}
+
+        def sweep():
+            result['count'] = tracker.detect_and_retry_empty_successful_executions()
+
+        with patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch(
+                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                 return_value=lock_manager
+             ), \
+             patch(
+                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                 return_value=queue_manager
+             ), \
+             patch.object(
+                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+             ), \
+             patch.object(
+                 tracker, '_check_redis_repair_cycle_tracking', return_value=False
+             ), \
+             patch('services.review_cycle.review_cycle_executor') as mock_rc, \
+             patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_rc._cycle_key.return_value = 'test-project:123'
+            mock_rc.active_cycles = {}
+            mock_hfl._loop_key.return_value = 'test-project:123'
+            mock_hfl.active_loops = {}
+
+            worker = threading.Thread(target=sweep, daemon=True)
+            worker.start()
+            worker.join(timeout=self.SWEEP_TIMEOUT_SECONDS)
+
+        assert not worker.is_alive(), (
+            f"detect_and_retry_empty_successful_executions() did not finish within "
+            f"{self.SWEEP_TIMEOUT_SECONDS}s -- it is blocked, almost certainly on a "
+            f"re-entrant acquire of a state file's own lock"
+        )
+        return result.get('count'), gh_client
+
+    def test_the_sweep_completes_and_marks_an_output_less_execution(
+        self, tracker, temp_state_dir
+    ):
+        """The reachability test: with nothing stubbed out between the state file
+        and GitHub, the sweep runs to completion and actually rewrites the
+        record."""
+        state_file = self._write_state(tracker, [self._success_record()])
+
+        count, gh_client = self._run_sweep(tracker, comments=[])
+
+        assert count == 1
+        (method, endpoint), _ = gh_client.rest.call_args
+        assert method == 'GET'
+        assert endpoint == 'repos/test-org/test-repo/issues/123/comments'
+
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        last_exec = updated['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_real_github_comment_after_completion_spares_the_execution(
+        self, tracker, temp_state_dir
+    ):
+        """The real _has_github_output() must be able to answer "yes". It could
+        not before #150 -- the ProjectConfig subscript raised TypeError on every
+        call, so this gate said "no output" for every project and every agent
+        that had posted its comment perfectly well."""
+        state_file = self._write_state(tracker, [self._success_record()])
+
+        posted_at = (datetime.now(timezone.utc) - timedelta(minutes=29)).isoformat()
+        count, _ = self._run_sweep(
+            tracker,
+            comments=[{'created_at': posted_at, 'body': 'Agent output'}],
+        )
+
+        assert count == 0
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        assert updated['execution_history'][-1]['outcome'] == 'success'
+
+    def test_the_real_protection_1_still_blocks_on_in_progress_work(
+        self, tracker, temp_state_dir
+    ):
+        """PROTECTION 1 has to keep working, not merely stop hanging: a live
+        in_progress record for the same issue must skip the file."""
+        state_file = self._write_state(
+            tracker,
+            [
+                {
+                    'agent': 'other-agent',
+                    'column': 'Code Review',
+                    'outcome': 'in_progress',
+                    'trigger_source': 'manual',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                },
+                self._success_record(),
+            ],
+        )
+
+        count, gh_client = self._run_sweep(tracker, comments=[])
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        assert updated['execution_history'][-1]['outcome'] == 'success'
+
+
+class TestCompletedAtIsNotStampedYet:
+    """No production writer stamps completed_at, and that is load-bearing (#150).
+
+    _has_github_output() is the last gate before an execution is rewritten to
+    'failure' and the issue is redispatched, and it keys off completed_at. Absent
+    the field the gate answers "cannot verify" and the sweep leaves the record
+    alone -- which is the only thing keeping it off 54,594 'success' records
+    while the gate is still wrong in two ways confirmed against live data: it
+    queries only the issue-comments endpoint, so the six planning_design columns
+    whose workspace is "discussions" post where it never looks, and the
+    crash-recovery record below carries a `timestamp` that is really its finish
+    time, so it has no start to anchor against either.
+
+    Stamping the field is a one-line change in each of these three writers, which
+    is exactly why it needs a test: it activates the watchdog across production
+    the moment anyone adds it. Activation is tracked as #166.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    def test_the_normal_path_does_not_stamp_completed_at(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='manual_move', project_name='test-project',
+            board_name='SDLC Execution',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['outcome'] == 'success'
+        assert 'completed_at' not in last_exec, (
+            "stamping completed_at makes _has_github_output() live across every "
+            "'success' record in production -- see the class docstring; that "
+            "belongs with the Discussions support, not here"
+        )
+
+    def test_the_crash_recovery_record_does_not_stamp_completed_at(self, tracker):
+        """The synthesised record (no matching in_progress entry) is the one path
+        that appends rather than mutating, and the one whose `timestamp` is not a
+        real start time at all -- it is stamped at outcome-recording time, after
+        the agent has already posted. Giving it a completed_at would convert
+        "cannot verify" into "verified empty" for the 15.9% of live records that
+        have this shape."""
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+
+        last_exec = tracker.load_state('test-project', 123)['execution_history'][-1]
+        assert last_exec['trigger_source'] == 'unknown'
+        assert 'completed_at' not in last_exec
+
+    def test_apply_redis_result_does_not_stamp_completed_at(self, tracker):
+        """The Redis recovery path finalises a record too, so it is the third
+        place a stamp would leak in."""
+        execution = {
+            'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'in_progress',
+            'timestamp': '2025-01-01T11:00:00+00:00',
+        }
+
+        applied = tracker._apply_redis_result(
+            execution,
+            {'exit_code': 0, 'completed_at': '2025-01-01T12:00:00+00:00'},
+            'agent_result:test-project:123:task-1', 'test-project', 123,
+            'test-agent', 'In Progress', MagicMock(),
+        )
+
+        assert applied is True
+        assert execution['outcome'] == 'success'
+        assert 'completed_at' not in execution
+
+
+class TestSweepOnProductionShapedRecords:
+    """The sweep against records shaped exactly like the ones on disk.
+
+    Everything else in this file feeds the sweep a 'completed_at' no real record
+    has -- either as a fixture field or by patching _has_github_output() to a
+    constant. That is fine for unit-testing the protections, but it hides the
+    single most important property of this branch: against a record with the
+    field set production actually writes, the sweep runs every protection and
+    then declines to rewrite anything, because _has_github_output() has no anchor
+    and answers "cannot verify".
+
+    That is deliberate, not an oversight. The gate is still wrong in two ways
+    confirmed against live data (it never queries Discussions, where six
+    planning_design columns post their output; and the crash-recovery record's
+    `timestamp` is really its finish time), and a wrong "no output" rewrites the
+    record to 'failure' and redispatches the agent. Activation is tracked as
+    #166.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _production_record(**overrides):
+        """A record with the exact field set state/execution_history/*.yaml holds:
+        no completed_at, no watchdog_* keys, start timestamp only."""
+        record = {
+            'column': 'In Progress',
+            'agent': 'test-agent',
+            'timestamp': (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat(),
+            'outcome': 'success',
+            'trigger_source': 'pipeline_progression',
+            'board_name': 'SDLC Execution',
+        }
+        record.update(overrides)
+        return record
+
+    @staticmethod
+    def _write_state(tracker, history):
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': history,
+                },
+                f,
+            )
+        return state_file
+
+    @staticmethod
+    def _gh_client(comments):
+        client = MagicMock()
+        client.rest.return_value = (True, comments)
+        return client
+
+    def _run_sweep(self, tracker, gh_client, has_github_output=None):
+        """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed.
+
+        has_github_output stays None -- the REAL gate -- unless a test is about a
+        protection that sits in front of it and needs the sweep to be able to
+        reach the retry marking at all.
+        """
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = ProjectConfig(
+            name='test-project',
+            description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={},
+            pipelines=[pipeline_cfg],
+            pipeline_routing={},
+        )
+
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        with patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch(
+                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
+                 return_value=lock_manager
+             ), \
+             patch(
+                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
+                 return_value=queue_manager
+             ), \
+             patch.object(
+                 tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+             ), \
+             patch.object(tracker, '_check_redis_repair_cycle_tracking', return_value=False), \
+             patch('services.review_cycle.review_cycle_executor') as mock_rc, \
+             patch('services.human_feedback_loop.human_feedback_loop_executor') as mock_hfl:
+            mock_config_manager.get_project_config.return_value = project_config
+            mock_rc._cycle_key.return_value = 'test-project:123'
+            mock_rc.active_cycles = {}
+            mock_hfl._loop_key.return_value = 'test-project:123'
+            mock_hfl.active_loops = {}
+
+            if has_github_output is None:
+                return tracker.detect_and_retry_empty_successful_executions()
+            with patch.object(
+                tracker, '_has_github_output', return_value=has_github_output
+            ):
+                return tracker.detect_and_retry_empty_successful_executions()
+
+    def test_a_production_shaped_record_is_never_rewritten(self, tracker):
+        """The property this branch has to hold: with the real gate and a record
+        shaped exactly like the 54,594 'success' records on the live
+        orchestrator, the sweep runs all five protections and rewrites nothing.
+
+        It bails at _has_github_output(), which finds no completed_at and reports
+        "cannot verify" rather than "verified empty" -- the same gate main stops
+        at, with the safe answer instead of main's unsafe one. Making it answer
+        for real needs Discussions support and a crash-recovery record shape that
+        does not claim a start time it lacks; both are tracked as #166.
+        """
+        state_file = self._write_state(tracker, [self._production_record()])
+        gh_client = self._gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0, (
+            "the sweep rewrote a production-shaped record -- the empty-output "
+            "gate has been activated without the Discussions support it needs"
+        )
+        # The gate answered from the record alone; it never even asked GitHub.
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            last_exec = yaml.safe_load(f)['execution_history'][-1]
+        assert last_exec['outcome'] == 'success'
+        assert 'watchdog_retry_triggered' not in last_exec
+
+    def test_the_crash_recovery_shape_is_never_rewritten(self, tracker):
+        """15.9% of live 'success' records (8,692 of 54,594) are the
+        trigger_source: 'unknown' shape record_execution_outcome() synthesises
+        when it finds no matching in_progress entry. Its `timestamp` is stamped
+        at outcome-recording time, i.e. AFTER the agent posted, so it is not a
+        start time and cannot anchor a "has anything been posted since?"
+        question. It must stay unverifiable too."""
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Progress', agent='test-agent',
+            outcome='success', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1]['timestamp'] = (
+            datetime.now(timezone.utc) - timedelta(minutes=90)
+        ).isoformat()
+        tracker.save_state('test-project', 123, state)
+
+        gh_client = self._gh_client([])
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+
+    def test_a_completed_at_inside_the_recency_window_defers(self, tracker):
+        """PROTECTION 5 still guards a record that does carry a completion time:
+        five minutes is measured from the end of the execution. Nothing in
+        production writes the field today, so this is the gate's behaviour on the
+        shape it will have once the watchdog is activated, pinned now."""
+        finished = datetime.now(timezone.utc) - timedelta(minutes=1)
+        state_file = self._write_state(tracker, [
+            self._production_record(
+                timestamp=(finished - timedelta(minutes=20)).isoformat(),
+                completed_at=finished.isoformat(),
+            )
+        ])
+        gh_client = self._gh_client([])
+
+        count = self._run_sweep(tracker, gh_client)
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_a_record_older_than_the_age_gate_costs_nothing(self, tracker):
+        """PROTECTION 0. 4570 of the 4721 live state files end in 'success' and
+        97% of them are months old; without this gate every one of them reaches
+        PROTECTION 4's GitHub query on every 15-minute sweep -- ~18k GraphQL
+        queries an hour against a 5000/hour budget.
+
+        _has_github_output() is stubbed to False so that "the sweep declined" can
+        only mean the age gate; with the real gate every record declines and the
+        test would pass whether or not PROTECTION 0 exists.
+        """
+        state_file = self._write_state(tracker, [
+            self._production_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+            )
+        ])
+        gh_client = self._gh_client([])
+
+        count = self._run_sweep(tracker, gh_client, has_github_output=False)
+
+        assert count == 0
+        with open(state_file) as f:
+            assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+    def test_the_age_gate_cutoff_is_configurable(self, tracker):
+        """An operator investigating a long-stuck issue can widen the window
+        without a code change. Same stub as above, for the same reason."""
+        self._write_state(tracker, [
+            self._production_record(
+                timestamp=(datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+            )
+        ])
+
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RECORD_AGE_HOURS': '2400'}):
+            count = self._run_sweep(
+                tracker, self._gh_client([]), has_github_output=False
+            )
+
+        assert count == 1
+
+
+class TestRetryEligibilityLookups:
+    """_should_retry_failed_execution()'s own I/O.
+
+    Its "is there an active pipeline run?" check keeps its position after the
+    GitHub issue-state query, where it has always been. Moving it ahead was part
+    of the empty-output activation -- it only mattered once PROTECTION 1 stopped
+    wedging and the sweep started reaching this method for every 'success'
+    record -- and it puts an Elasticsearch fallback that WRITES back to Redis on
+    records that never used to reach it. The read-only flag stays regardless:
+    see test_the_run_lookup_is_read_only.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    @staticmethod
+    def _project_config():
+        return ProjectConfig(
+            name='test-project', description='test',
+            github={'org': 'test-org', 'repo': 'test-repo'},
+            tech_stacks={}, pipelines=[], pipeline_routing={},
+        )
+
+    def test_the_run_lookup_is_read_only(self, tracker):
+        """get_active_pipeline_run() is not the plain hash lookup it looks like:
+        on a mapping miss -- the normal case once end_pipeline_run() has deleted
+        the mapping -- it searches Elasticsearch and, on a hit, writes the run
+        back with a fresh TTL under the board-less legacy issue key. A periodic
+        sweep must not do that: a crashed run whose ES doc still reads 'active'
+        would be resurrected on every pass, and the legacy key it lands under can
+        shadow a later board-scoped lookup."""
+        github_client = MagicMock()
+        github_client.graphql.return_value = (True, {
+            'repository': {
+                'issue': {
+                    'state': 'OPEN',
+                    'projectItems': {'nodes': [
+                        {'fieldValueByName': {'name': 'In Progress'}}
+                    ]},
+                }
+            }
+        })
+        run_manager = MagicMock()
+        run_manager.get_active_pipeline_run.return_value = None
+
+        with patch('services.github_api_client.get_github_client', return_value=github_client), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager):
+            should_retry, reason = tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', {},
+                project_config=self._project_config(),
+            )
+
+        assert should_retry is False
+        assert reason == 'no_active_pipeline_run'
+        assert run_manager.get_active_pipeline_run.call_args.kwargs.get(
+            'restore_to_redis'
+        ) is False
+
+    def test_a_passed_in_project_config_is_not_re_read_from_disk(self, tracker):
+        """get_project_config() re-reads and re-parses the project's YAML on every
+        call, and the sweep already caches it per project."""
+        github_client = MagicMock()
+        github_client.graphql.return_value = (True, {
+            'repository': {'issue': {'state': 'OPEN', 'projectItems': {'nodes': []}}}
+        })
+        run_manager = MagicMock()
+        run_manager.get_active_pipeline_run.return_value = MagicMock(board='SDLC Execution')
+
+        with patch('services.github_api_client.get_github_client', return_value=github_client), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch('config.manager.config_manager') as mock_config_manager:
+            tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', {},
+                project_config=self._project_config(),
+            )
+
+        mock_config_manager.get_project_config.assert_not_called()
+
+
+class TestReentrantLockErrorReachesTheCaller:
+    """A re-entrant acquire must surface, not become 'no execution history'.
+
+    load_state()/save_state() wrap their locked body in a broad
+    `except Exception` that logs and returns _empty_state(). That turns
+    ReentrantFileLockError -- a programming error the guard raises specifically
+    so it shows up as a traceback -- into execution_history: [], which
+    has_active_execution() reads as "nothing is running". The caller then
+    dispatches: a double execution of a live issue, strictly worse than the
+    deadlock the guard replaced, which at least failed safe.
+    """
+
+    @pytest.fixture
+    def tracker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield WorkExecutionStateTracker(state_dir=Path(tmpdir))
+
+    @staticmethod
+    def _write_live_state(tracker):
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump(
+                {
+                    'project_name': 'test-project',
+                    'issue_number': 123,
+                    'execution_history': [
+                        {
+                            'agent': 'test-agent',
+                            'column': 'In Progress',
+                            'outcome': 'in_progress',
+                            'trigger_source': 'manual_move',
+                            'task_id': 'task-1',
+                            'timestamp': datetime.now(timezone.utc).isoformat(),
+                        }
+                    ],
+                },
+                f,
+            )
+        return state_file
+
+    def test_load_state_lets_it_surface(self, tracker):
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.load_state('test-project', 123)
+
+    def test_has_active_execution_raises_rather_than_answering_false(self, tracker):
+        """The consequence that actually matters: the answer would have been
+        False for an issue with a live in_progress record."""
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.has_active_execution('test-project', 123)
+
+    def test_save_state_lets_it_surface_rather_than_dropping_the_write(self, tracker):
+        from utils.file_lock import ReentrantFileLockError, file_lock
+
+        state_file = self._write_live_state(tracker)
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+
+        with file_lock(lock_file):
+            with pytest.raises(ReentrantFileLockError):
+                tracker.save_state(
+                    'test-project', 123,
+                    {'project_name': 'test-project', 'issue_number': 123,
+                     'execution_history': []},
+                )

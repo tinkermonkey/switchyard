@@ -178,7 +178,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from services.pipeline_lock_manager import LOCK_TTL_SECONDS
 from services.project_resource_lock_manager import ProjectResourceLockManager, TouchResult
@@ -246,6 +246,198 @@ def _mint_unique_holder_id() -> int:
     """
     with _unique_holder_ids_guard:
         return next(_unique_holder_ids)
+
+
+# ---------------------------------------------------------------------------
+# In-process registry of live resource-lock waits and holds (#140 item 9)
+# ---------------------------------------------------------------------------
+# services/pipeline_watchdog.py decides a pipeline run is a zombie from "marked
+# active, older than zombie_threshold_minutes, and no agent container running",
+# with hand-written exemptions for the two in-process executors that
+# legitimately sit containerless for a long time (review_cycle_executor.
+# active_cycles, human_feedback_loop_executor.active_loops). A dispatch parked
+# in the poll loop below is a third such state and had no equivalent signal: it
+# waits up to DEFAULT_TIMEOUT_SECONDS (~3h) with no container to find, so past
+# 30 minutes the watchdog reaped the run and redispatched the same issue while
+# the original coroutine was still waiting -- and that coroutine then acquires
+# the lock and launches its OWN container, giving one issue two concurrent
+# executions.
+#
+# This registry is the missing signal, in the same shape as those two
+# exemptions: process-local, in memory only, no durable state, and strictly
+# bounded by the lifetime of the `with`/`async with` frame that registered it
+# (an abandoned or crashed caller unwinds the frame and deregisters itself).
+# Registration deliberately spans BOTH the wait AND the hold: the guarded body
+# of the dev_container_build lock is an image build, which runs no container
+# labelled for the issue either, so a hold is just as invisible to the
+# watchdog's container probe as a wait is.
+#
+# Every activity carries a per-phase BUDGET, and an over-budget one stops
+# counting as proof of life (_ResourceLockActivity.is_expired). Without that the
+# exemption has no upper bound and a hung guarded body makes its pipeline run
+# permanently un-reapable: a wait can only outlive its own timeout_seconds by a
+# poll interval, but the hold is bounded solely by the operation inside it, and
+# on the non-Docker path that bound does not exist -- claude_integration.
+# _run_claude_code_locally() (every requires_docker: false agent) blocks on
+# subprocess readline() with no timeout of any kind, so a Claude CLI that stalls
+# with no output would keep the run 'active' and its board lock held until the
+# orchestrator process restarts. Past the budget the watchdog goes back to
+# treating the run as a zombie: double execution is the worse failure, but only
+# for as long as somebody is plausibly still working.
+_resource_activity_guard = threading.Lock()
+_resource_activity: Dict[Tuple[str, int], List["_ResourceLockActivity"]] = {}
+
+# Ceiling on how long a HELD activity still counts as proof of life. Matches
+# docker_runner's agent_hard_timeout default -- also the longest timeout any
+# agent is configured with in config/foundations/agents.yaml -- because that is
+# the longest a guarded body (an agent container run, an image build, a local
+# Claude CLI session) can legitimately take. A WAITING activity gets a different
+# budget: the caller's own timeout_seconds, which its poll loop already enforces.
+HELD_ACTIVITY_MAX_SECONDS = 10800.0
+
+# Slack on a WAITING activity's budget, so a poll that is in flight when the
+# deadline passes isn't declared hung a beat before the loop itself raises
+# ProjectCheckoutLockTimeoutError and unwinds the frame.
+WAITING_ACTIVITY_GRACE_SECONDS = 60.0
+
+
+class _ResourceLockActivity:
+    """One live acquisition attempt (and, once acquired, hold) of a resource lock."""
+
+    __slots__ = (
+        "resource_name",
+        "project",
+        "issue_number",
+        "started_at",
+        "phase",
+        "phase_started_at",
+        "budget_seconds",
+    )
+
+    def __init__(
+        self,
+        resource_name: str,
+        project: str,
+        issue_number: int,
+        wait_budget_seconds: float,
+    ):
+        self.resource_name = resource_name
+        self.project = project
+        self.issue_number = issue_number
+        self.started_at = time.monotonic()
+        self.phase = "waiting"
+        # Budgeted per PHASE rather than per activity: a wait that legitimately
+        # ran most of its timeout and then acquired the lock must start the hold
+        # with a fresh allowance, not an already-spent one.
+        self.phase_started_at = self.started_at
+        self.budget_seconds = wait_budget_seconds + WAITING_ACTIVITY_GRACE_SECONDS
+
+    def mark_held(self) -> None:
+        self.phase = "held"
+        self.phase_started_at = time.monotonic()
+        self.budget_seconds = HELD_ACTIVITY_MAX_SECONDS
+
+    def is_expired(self) -> bool:
+        """True once this phase has run longer than it could legitimately need --
+        i.e. the frame is still registered but the work inside it is hung."""
+        return (time.monotonic() - self.phase_started_at) > self.budget_seconds
+
+    def describe(self) -> str:
+        age_minutes = (time.monotonic() - self.started_at) / 60
+        return (
+            f"'{self.resource_name}' lock {self.phase} for {age_minutes:.1f} minutes"
+        )
+
+
+@contextmanager
+def _tracked_resource_activity(
+    resource_name: str,
+    project: str,
+    issue_number: Optional[int],
+    wait_budget_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+):
+    """
+    Publish this acquisition to the registry above for its whole lifetime.
+
+    Yields the activity (so the caller can mark_held() once acquired), or None
+    when there is no issue to attribute it to -- project_checkout_lock's
+    issue_number is optional and log-only, and an activity nothing can key on
+    is an activity nothing can look up. Never raises out of registration:
+    failing to publish must not take down the guarded operation itself.
+
+    Args:
+        wait_budget_seconds: the caller's own acquisition timeout -- how long the
+            wait phase can legitimately last before its poll loop gives up. Past
+            that (plus WAITING_ACTIVITY_GRACE_SECONDS) the activity stops
+            vouching for the issue; see the registry comment above.
+    """
+    if issue_number is None:
+        yield None
+        return
+
+    activity = _ResourceLockActivity(
+        resource_name, project, issue_number, wait_budget_seconds
+    )
+    key = (project, issue_number)
+    with _resource_activity_guard:
+        _resource_activity.setdefault(key, []).append(activity)
+    try:
+        yield activity
+    finally:
+        with _resource_activity_guard:
+            entries = _resource_activity.get(key)
+            if entries is not None:
+                try:
+                    entries.remove(activity)
+                except ValueError:
+                    pass
+                if not entries:
+                    _resource_activity.pop(key, None)
+
+
+def describe_active_resource_lock_activity(project: str, issue_number: int) -> Optional[str]:
+    """
+    Describe the oldest live resource-lock wait/hold for (project, issue_number),
+    or None when this process has none.
+
+    A non-None return means some coroutine or thread in THIS process is inside a
+    project_checkout / dev_container_build lock context manager for this issue and
+    is going to run the guarded operation once it gets the lock. Callers that
+    reap or redispatch stalled work (services/pipeline_watchdog.py) must treat
+    that as "still legitimately in flight", exactly as they already treat an
+    entry in review_cycle_executor.active_cycles.
+
+    An activity past its own budget reports as None even though its frame is
+    still registered (see _ResourceLockActivity.is_expired): at that point the
+    guarded operation is hung rather than working, and continuing to vouch for it
+    would leave its pipeline run un-reapable for the life of the process. It is
+    logged at warning on the way past, so the hang itself is visible and not just
+    the reaping that follows.
+
+    Returns a description rather than the activity object on purpose: the only
+    two things a caller needs are whether anything is live and what to say about
+    it in a log line.
+    """
+    with _resource_activity_guard:
+        entries = list(_resource_activity.get((project, issue_number), ()))
+    if not entries:
+        return None
+
+    live = []
+    for activity in entries:
+        if activity.is_expired():
+            logger.warning(
+                f"Resource lock activity for {project} issue #{issue_number} is past its "
+                f"budget ({activity.describe()}) -- treating it as hung rather than as work "
+                f"in flight. The guarded operation is not going to finish on its own; the "
+                f"pipeline run is no longer protected from zombie cleanup."
+            )
+        else:
+            live.append(activity)
+
+    if not live:
+        return None
+    return min(live, key=lambda a: a.started_at).describe()
 
 
 class ProjectCheckoutLockTimeoutError(RuntimeError):
@@ -808,31 +1000,52 @@ async def project_checkout_lock_async(
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
-            facade, RESOURCE_NAME, project, holder_id, issue_number
-        )
-        if can_execute:
-            break
-        if time.monotonic() >= deadline:
-            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
-        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-        await asyncio.sleep(poll_interval_seconds)
+    # Spans the wait AND the hold -- see the registry's own comment above for
+    # why the watchdog needs both halves published, not just the wait.
+    #
+    # The registry comment's rationale (an image build runs no container for the
+    # probe to find) is dev_container_build's, not this lock's: THIS lock's
+    # guarded body is claude_integration's `await run_agent_in_container(...)`,
+    # which does run a labelled container, so during a healthy run the watchdog's
+    # cheaper container probe already exempts it and publishing the hold changes
+    # nothing. Publishing the hold matters in exactly one window -- container
+    # gone (OOM-kill, docker daemon restart), coroutine still inside this frame
+    # -- and in that window it is the difference between the watchdog reaping a
+    # run whose coroutine is about to launch its own container and leaving it
+    # alone. That is also why the hold is budgeted rather than unconditional: an
+    # await that never returns would otherwise suppress zombie cleanup for the
+    # life of the process.
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
+        while True:
+            can_execute, reason, heartbeat = await _acquire_and_start_heartbeat_off_loop(
+                facade, RESOURCE_NAME, project, holder_id, issue_number
+            )
+            if can_execute:
+                break
+            if time.monotonic() >= deadline:
+                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
+            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
+            await asyncio.sleep(poll_interval_seconds)
 
-    try:
-        async with _held_with_heartbeat_async(
-            facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
-        ):
-            yield
-    finally:
-        # Deliberately synchronous, not offloaded -- shape (c) in this
-        # module's docstring. NOT because awaits are cancellable in general
-        # (_join_heartbeat_thread_async offloads an exit path safely with
-        # shield + a synchronous fallback), but because a SKIPPED release has
-        # no orphan-cleanup path: nothing else in the process knows this
-        # holder_id, so it would leak until TTL/staleness recovery. Bounded by
-        # PipelineLockManager's own Redis socket timeouts.
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+        if activity is not None:
+            activity.mark_held()
+
+        try:
+            async with _held_with_heartbeat_async(
+                facade, RESOURCE_NAME, project, holder_id, heartbeat=heartbeat
+            ):
+                yield
+        finally:
+            # Deliberately synchronous, not offloaded -- shape (c) in this
+            # module's docstring. NOT because awaits are cancellable in general
+            # (_join_heartbeat_thread_async offloads an exit path safely with
+            # shield + a synchronous fallback), but because a SKIPPED release has
+            # no orphan-cleanup path: nothing else in the process knows this
+            # holder_id, so it would leak until TTL/staleness recovery. Bounded by
+            # PipelineLockManager's own Redis socket timeouts.
+            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 
 @contextmanager
@@ -857,17 +1070,23 @@ def project_checkout_lock_sync(
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     deadline = time.monotonic() + timeout_seconds
-    while True:
-        can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
-        if can_execute:
-            break
-        if time.monotonic() >= deadline:
-            raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
-        _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
-        time.sleep(poll_interval_seconds)
+    with _tracked_resource_activity(
+        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+    ) as activity:
+        while True:
+            can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)
+            if can_execute:
+                break
+            if time.monotonic() >= deadline:
+                raise _timeout_error(RESOURCE_NAME, project, issue_number, timeout_seconds, reason)
+            _log_busy(RESOURCE_NAME, project, issue_number, reason, poll_interval_seconds)
+            time.sleep(poll_interval_seconds)
 
-    try:
-        with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
-            yield
-    finally:
-        _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
+        if activity is not None:
+            activity.mark_held()
+
+        try:
+            with _held_with_heartbeat_sync(facade, RESOURCE_NAME, project, holder_id):
+                yield
+        finally:
+            _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
