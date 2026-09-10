@@ -517,12 +517,15 @@ class TestFeatureBranchManagerHandlesStandalone:
     """Test that feature branch manager handles standalone issues gracefully"""
 
     @pytest.mark.asyncio
-    async def test_finalize_handles_standalone_issue(self):
+    async def test_finalize_handles_standalone_issue(self, tmp_path):
         """Feature branch manager should handle issues without parent tracking"""
         from services.feature_branch_manager import FeatureBranchManager
         from services.git_workflow_manager import GitWorkflowManager
 
-        fbm = FeatureBranchManager(workspace_root='/tmp/test')
+        # A real directory: finalize refuses up front when its resolved
+        # project_dir doesn't exist (#151/WI-6 review).
+        (tmp_path / 'test-project').mkdir()
+        fbm = FeatureBranchManager(workspace_root=str(tmp_path))
 
         with patch.object(fbm, 'get_feature_branch_for_issue', return_value=None), \
              patch.object(fbm, 'git_add_all', new_callable=AsyncMock), \
@@ -552,11 +555,12 @@ class TestFeatureBranchManagerHandlesStandalone:
             fbm.git_push.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_finalize_handles_tracked_issue(self):
+    async def test_finalize_handles_tracked_issue(self, tmp_path):
         """Feature branch manager should handle tracked sub-issues normally"""
         from services.feature_branch_manager import FeatureBranchManager, FeatureBranch
 
-        fbm = FeatureBranchManager(workspace_root='/tmp/test')
+        (tmp_path / 'test-project').mkdir()
+        fbm = FeatureBranchManager(workspace_root=str(tmp_path))
 
         # Create mock feature branch
         mock_fb = FeatureBranch(

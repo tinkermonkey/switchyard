@@ -570,9 +570,13 @@ class TestExecuteAgentEpicResolution:
         captured = {}
 
         def fake_build_execution_context(agent_name, project_name, task_id, task_context,
-                                          epic_id=None, branch_name=None):
+                                          epic_id=None, branch_name=None, project_dir=None):
             captured['epic_id'] = epic_id
             captured['branch_name'] = branch_name
+            # execute_agent() now resolves the working directory itself, off the
+            # event loop, and hands it in (#151/WI-6 review) -- the resolution
+            # that used to happen inside this method.
+            captured['project_dir'] = project_dir
             return {'work_dir': '/fake', 'use_docker': True, 'context': task_context}
 
         mock_project_config = MagicMock()
@@ -603,6 +607,8 @@ class TestExecuteAgentEpicResolution:
         mock_prm.resolve_workspace = AsyncMock(side_effect=fake_resolve_workspace)
 
         with patch('services.agent_executor.config_manager') as mock_config, \
+             patch('services.project_workspace.workspace_manager.get_project_dir',
+                   return_value=Path('/workspace/test-project')) as mock_get_project_dir, \
              patch.object(agent_executor, '_build_execution_context',
                           side_effect=fake_build_execution_context), \
              patch.object(agent_executor, '_apply_frozen_session_resume'), \
@@ -649,6 +655,8 @@ class TestExecuteAgentEpicResolution:
                 project_name='test-project',
                 task_context=task_context,
             )
+
+            captured['get_project_dir_calls'] = list(mock_get_project_dir.call_args_list)
 
         return captured
 

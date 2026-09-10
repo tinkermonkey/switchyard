@@ -9,7 +9,14 @@ import pytest
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
+
+
+@asynccontextmanager
+async def _noop_checkout_lock(*args, **kwargs):
+    """Stand-in for project_checkout_lock_async() (#54, #151) -- see its use below."""
+    yield
 
 
 @pytest.fixture
@@ -223,13 +230,27 @@ class TestFeatureBranchManagerStandalone:
     """Test that feature branch manager handles standalone issues"""
 
     @pytest.mark.asyncio
-    async def test_finalize_succeeds_without_feature_branch_state(self):
+    async def test_finalize_succeeds_without_feature_branch_state(self, tmp_path):
         """MUST handle issues without parent tracking (standalone issues)"""
         from services.feature_branch_manager import FeatureBranchManager
 
-        fbm = FeatureBranchManager(workspace_root='/tmp/test')
+        # A real directory, not a bare '/tmp/test' path: finalize refuses up
+        # front when its resolved project_dir doesn't exist (#151/WI-6 review --
+        # is_base_clone_dir() fails closed on a missing directory, which used to
+        # send this straight into the shared base clone's lock).
+        (tmp_path / 'test-project').mkdir()
+        fbm = FeatureBranchManager(workspace_root=str(tmp_path))
 
+        # No project_dir_override, so this exercises the shared-base-clone
+        # fallback -- which now takes the project_checkout lock (#151/WI-6 item
+        # 16) whenever the resolved directory really is the singleton workspace
+        # manager's base clone for this project. It isn't, under tmp_path, but the
+        # lock is neutralized anyway so this behavior test can never acquire a
+        # real Redis/YAML lock as a side effect; the lock itself is covered by
+        # tests/unit/services/test_finalize_checkout_lock.py.
         with patch.object(fbm, 'get_feature_branch_for_issue', return_value=None), \
+             patch('services.project_checkout_lock.project_checkout_lock_async',
+                   _noop_checkout_lock), \
              patch.object(fbm, 'git_add_all', new_callable=AsyncMock), \
              patch.object(fbm, 'git_commit', new_callable=AsyncMock), \
              patch.object(fbm, 'git_push', new_callable=AsyncMock), \

@@ -11,6 +11,7 @@ Manages hierarchical branch workflows where:
 import os
 import yaml
 import asyncio
+import contextlib
 import logging
 import time
 from datetime import datetime
@@ -1495,6 +1496,23 @@ git push --force-with-lease
             branch-verifying) failsafe, because that path can succeed where this
             one could not, and only blocks the pipeline if the failsafe cannot
             confirm the branch either.
+
+        Raises:
+            PushFailedError: the commit landed locally but the push was rejected.
+            ProjectCheckoutLockTimeoutError: this finalization resolved to the
+                SHARED base clone and that clone stayed held for the whole of the
+                lock's timeout, so nothing was verified, staged, committed or
+                pushed and the work is still on disk (#151/WI-6). Documented, and
+                deliberately not folded into a {'success': False} dict, for the
+                same reason auto_commit.commit_agent_changes() re-raises it:
+                'failure' routes callers into failsafe paths that treat contention
+                as a fault, when what it actually needs is
+                services/resource_lock_errors.is_lock_timeout_error() and a
+                deliberate decision about the stranded work. On the agent_executor
+                path that decision is _handle_post_completion_lock_timeout(): the
+                agent has already run and commented by then, so a plain contention
+                retry would duplicate both, and the pipeline is blocked for an
+                operator instead (#151/WI-6 review).
         """
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely
@@ -1508,120 +1526,183 @@ git push --force-with-lease
         # here is deliberately kept for this method's other, legitimate callers.
         project_dir = project_dir_override or os.path.join(self.workspace_root, project)
 
-        # Verify the branch BEFORE the prompt-file cleanup, the staging and the
-        # PR work below -- both the standalone and the tracked path stage and
-        # push whatever is checked out, so this has to sit ahead of the fork.
-        mismatch = await self._verify_finalize_branch(
-            project=project,
-            issue_number=issue_number,
-            project_dir=project_dir,
-            expected_branch=expected_branch,
-        )
-        if mismatch:
-            return mismatch
-
-        feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
-
-        if not feature_branch:
-            # This is a standalone issue without parent tracking
-            # Still commit and push, but skip state management
-            logger.info(f"No feature branch state for issue #{issue_number} - handling as standalone")
-
-            try:
-                # Clean up ALL prompt files BEFORE staging to prevent accidental commits
-                try:
-                    import glob
-                    prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
-                    for prompt_file in prompt_files:
-                        try:
-                            os.remove(prompt_file)
-                            logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
-                        except Exception as e:
-                            logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
-                    if prompt_files:
-                        logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
-                except Exception as e:
-                    logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
-
-                # Commit and push standalone branch
-                await self.git_add_all(project_dir)
-                commit_succeeded = await self.git_commit(project_dir, commit_message)
-                if not commit_succeeded:
-                    logger.warning(f"Standalone commit was blocked for issue #{issue_number}. Continuing with push of prior commits.")
-
-                # Determine standalone branch name
-                from services.git_workflow_manager import git_workflow_manager
-                branch_name = await git_workflow_manager.get_current_branch(project_dir)
-
-                await self.git_push(project_dir, branch_name)
-
-                logger.info(f"Pushed standalone changes for issue #{issue_number} to {branch_name}")
-
-                return {
-                    "success": True,
-                    "branch_name": branch_name,
-                    "standalone": True
-                }
-            except Exception as e:
-                from services.git_workflow_manager import PushFailedError
-                if isinstance(e, PushFailedError):
-                    raise  # Let PushFailedError propagate — agent_executor handles it
-                logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
-                return {"success": False, "error": str(e)}
-
-        # Step 1: Get the actual current branch (git is source of truth)
-        current_branch = await self.get_current_branch(project_dir)
-
-        # Step 2: Trust git - use whatever branch we're currently on
-        # The feature_branch object now comes from git queries, so it should match
-        # But if there's any mismatch, git wins
+        # project_checkout lock (#151/WI-6 item 16). The fallback right above
+        # resolves to the SHARED base clone, and everything from the branch
+        # verification down to the push below stages, commits and pushes from
+        # whatever directory it lands on -- ungated, unlike every other
+        # base-clone writer #54/#56 wired up. Latent rather than live (the
+        # workspace-context callers always pass project_dir_override, so
+        # is_base_clone_dir() answers False and this is a nullcontext for them),
+        # but the standalone/test callers the fallback exists for are exactly the
+        # ones that reach the shared clone, and nothing stops a future caller
+        # from omitting the override.
         #
-        # This is only a reconciliation with the TRACKED branch name, not a
-        # branch-target check: whether what git says is this dispatch's own
-        # target was already settled by _verify_finalize_branch() above, which
-        # refused outright rather than adopting the checked-out name when an
-        # expected_branch disagreed (#149 WI-4 review). With one supplied and
-        # matched, current_branch IS expected_branch here.
-        if current_branch != feature_branch.branch_name:
-            logger.warning(
-                f"Current branch '{current_branch}' doesn't match feature branch '{feature_branch.branch_name}'. "
-                f"Git is the source of truth - using current branch '{current_branch}'."
+        # Async, so the wait costs the event loop nothing (#146/WI-1). The hold
+        # spans the branch verification too, deliberately: verifying before
+        # acquiring would re-create the staleness auto_commit.py had to fix by
+        # re-reading its branch AFTER the lock -- a different operation can check
+        # a different branch out in this same shared directory while we wait.
+        # It ends at the push; the PR/GitHub tail below touches no git and is
+        # left outside.
+        from services.project_workspace import workspace_manager
+
+        # Existence guard BEFORE is_base_clone_dir(), mirroring
+        # auto_commit.commit_agent_changes() (code review on #151/WI-6).
+        # is_base_clone_dir() fails CLOSED -- a directory that doesn't exist
+        # answers True -- which is right for a lock gate but wrong as a
+        # precondition: a project_dir_override whose epic worktree was removed
+        # between prepare and finalize (cleanup_epic_worktree/
+        # prune_epic_worktrees, or an operator) would otherwise take this
+        # project's real base-clone lock, wait behind whatever holds it, and then
+        # run git against a directory that isn't there. Nothing below can succeed
+        # without the directory, so refuse in the same shape every other
+        # unrecoverable finalize failure uses.
+        if not os.path.isdir(project_dir):
+            error_msg = (
+                f"Cannot finalize issue #{issue_number} for {project}: {project_dir} "
+                "does not exist. The workspace this dispatch ran in is gone (removed "
+                "worktree, or a project_dir_override pointing at nothing) -- nothing "
+                "can be staged, committed or pushed from it."
             )
-            feature_branch.branch_name = current_branch
-
-        # Step 2: Clean up ALL prompt files BEFORE staging to prevent accidental commits
-        # This is CRITICAL: git add . will stage prompt files if they exist
-        try:
-            import glob
-            prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
-            for prompt_file in prompt_files:
-                try:
-                    os.remove(prompt_file)
-                    logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
-            if prompt_files:
-                logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
-        except Exception as e:
-            logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
-
-        # Step 3: Commit changes
-        await self.git_add_all(project_dir)
-        commit_succeeded = await self.git_commit(project_dir, commit_message)
-        if not commit_succeeded:
-            logger.warning(f"Commit was blocked (likely unwanted docs validation). Continuing with push of prior commits.")
-
-        # Step 3: Verify branch exists before pushing
-        branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)
-        if not branch_exists:
-            error_msg = f"Branch {feature_branch.branch_name} does not exist locally, cannot push"
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
 
-        # Step 4: Push to remote — raises PushFailedError on failure
-        await self.git_push(project_dir, feature_branch.branch_name)
+        if workspace_manager.is_base_clone_dir(project, project_dir):
+            from services.project_checkout_lock import project_checkout_lock_async
 
-        logger.info(f"Pushed changes for issue #{issue_number} to {feature_branch.branch_name}")
+            # issue_number is log attribution for the lock, and the key
+            # project_checkout_lock's activity registry publishes this wait
+            # under -- which is what keeps pipeline_watchdog from reaping this
+            # containerless run while it waits. Never the lock's holder identity
+            # -- see project_checkout_lock.py's module docstring.
+            #
+            # No explicit timeout_seconds, so the calibrated ~3h default stands,
+            # matching auto_commit.commit_agent_changes() -- the sibling writer
+            # of this same directory (#151/WI-6 review). A shorter budget would
+            # be wrong here in a way it isn't at a resolution call site: after
+            # the wait this method has real work to do (the agent's commit and
+            # push), so giving up early abandons that work rather than deferring
+            # it, and the legitimate holder it waits behind can be an agent
+            # container run of up to agents.yaml's 10800s.
+            lock_cm = project_checkout_lock_async(project, issue_number)
+        else:
+            lock_cm = contextlib.nullcontext()
+
+        async with lock_cm:
+            # Verify the branch BEFORE the prompt-file cleanup, the staging and the
+            # PR work below -- both the standalone and the tracked path stage and
+            # push whatever is checked out, so this has to sit ahead of the fork.
+            mismatch = await self._verify_finalize_branch(
+                project=project,
+                issue_number=issue_number,
+                project_dir=project_dir,
+                expected_branch=expected_branch,
+            )
+            if mismatch:
+                return mismatch
+
+            feature_branch = await self.get_feature_branch_for_issue(project, issue_number, github_integration)
+
+            if not feature_branch:
+                # This is a standalone issue without parent tracking
+                # Still commit and push, but skip state management
+                logger.info(f"No feature branch state for issue #{issue_number} - handling as standalone")
+
+                try:
+                    # Clean up ALL prompt files BEFORE staging to prevent accidental commits
+                    try:
+                        import glob
+                        prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+                        for prompt_file in prompt_files:
+                            try:
+                                os.remove(prompt_file)
+                                logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
+                            except Exception as e:
+                                logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+                        if prompt_files:
+                            logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
+                    except Exception as e:
+                        logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
+
+                    # Commit and push standalone branch
+                    await self.git_add_all(project_dir)
+                    commit_succeeded = await self.git_commit(project_dir, commit_message)
+                    if not commit_succeeded:
+                        logger.warning(f"Standalone commit was blocked for issue #{issue_number}. Continuing with push of prior commits.")
+
+                    # Determine standalone branch name
+                    from services.git_workflow_manager import git_workflow_manager
+                    branch_name = await git_workflow_manager.get_current_branch(project_dir)
+
+                    await self.git_push(project_dir, branch_name)
+
+                    logger.info(f"Pushed standalone changes for issue #{issue_number} to {branch_name}")
+
+                    return {
+                        "success": True,
+                        "branch_name": branch_name,
+                        "standalone": True
+                    }
+                except Exception as e:
+                    from services.git_workflow_manager import PushFailedError
+                    if isinstance(e, PushFailedError):
+                        raise  # Let PushFailedError propagate — agent_executor handles it
+                    logger.error(f"Failed to finalize standalone branch for issue #{issue_number}: {e}")
+                    return {"success": False, "error": str(e)}
+
+            # Step 1: Get the actual current branch (git is source of truth)
+            current_branch = await self.get_current_branch(project_dir)
+
+            # Step 2: Trust git - use whatever branch we're currently on
+            # The feature_branch object now comes from git queries, so it should match
+            # But if there's any mismatch, git wins
+            #
+            # This is only a reconciliation with the TRACKED branch name, not a
+            # branch-target check: whether what git says is this dispatch's own
+            # target was already settled by _verify_finalize_branch() above, which
+            # refused outright rather than adopting the checked-out name when an
+            # expected_branch disagreed (#149 WI-4 review). With one supplied and
+            # matched, current_branch IS expected_branch here.
+            if current_branch != feature_branch.branch_name:
+                logger.warning(
+                    f"Current branch '{current_branch}' doesn't match feature branch '{feature_branch.branch_name}'. "
+                    f"Git is the source of truth - using current branch '{current_branch}'."
+                )
+                feature_branch.branch_name = current_branch
+
+            # Step 2: Clean up ALL prompt files BEFORE staging to prevent accidental commits
+            # This is CRITICAL: git add . will stage prompt files if they exist
+            try:
+                import glob
+                prompt_files = glob.glob(os.path.join(project_dir, '.claude_prompt_*.txt'))
+                for prompt_file in prompt_files:
+                    try:
+                        os.remove(prompt_file)
+                        logger.info(f"Cleaned up prompt file before commit: {os.path.basename(prompt_file)}")
+                    except Exception as e:
+                        logger.warning(f"Failed to remove prompt file {prompt_file}: {e}")
+                if prompt_files:
+                    logger.info(f"Removed {len(prompt_files)} prompt file(s) before staging changes")
+            except Exception as e:
+                logger.warning(f"Error during pre-commit prompt file cleanup: {e}")
+
+            # Step 3: Commit changes
+            await self.git_add_all(project_dir)
+            commit_succeeded = await self.git_commit(project_dir, commit_message)
+            if not commit_succeeded:
+                logger.warning(f"Commit was blocked (likely unwanted docs validation). Continuing with push of prior commits.")
+
+            # Step 3: Verify branch exists before pushing
+            branch_exists = await self.branch_exists(project_dir, feature_branch.branch_name)
+            if not branch_exists:
+                error_msg = f"Branch {feature_branch.branch_name} does not exist locally, cannot push"
+                logger.error(error_msg)
+                return {"success": False, "error": error_msg}
+
+            # Step 4: Push to remote — raises PushFailedError on failure
+            await self.git_push(project_dir, feature_branch.branch_name)
+
+            logger.info(f"Pushed changes for issue #{issue_number} to {feature_branch.branch_name}")
 
         # Step 5: Update sub-issue status
         self.mark_sub_issue_complete(project, feature_branch, issue_number)

@@ -20,6 +20,7 @@ All git operations are mocked (subprocess.run) — no real git commands run.
 import sys
 import types
 import pytest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, Mock
 
@@ -40,6 +41,24 @@ def _fail(stderr: str = "error") -> Mock:
     result.stdout = ""
     result.stderr = stderr
     return result
+
+
+@pytest.fixture(autouse=True)
+def _no_op_checkout_lock():
+    """Neutralize the project_checkout lock get_or_create_epic_worktree()'s
+    creation path now takes (#151/WI-6 item 1).
+
+    These tests are about worktree mechanics, not locking -- without this they
+    would each build a real ProjectResourceLockManager (Redis / on-disk YAML lock
+    state) as a side effect. The lock's own behavior on this path is covered by
+    tests/unit/services/test_epic_worktree_checkout_lock.py.
+    """
+    @contextmanager
+    def _noop(*args, **kwargs):
+        yield
+
+    with patch('services.project_checkout_lock.project_checkout_lock_sync', _noop):
+        yield
 
 
 @pytest.fixture

@@ -124,8 +124,13 @@ class TestResolveWorkspaceExistingBranchHit:
 
         mock_resolve_branch.assert_called_once_with("context-studio", "10")
         mock_create_name.assert_not_called()
+        # issue_number is THIS run's own issue, not the epic's (#151/WI-6
+        # review): it is the key project_checkout_lock publishes the creation's
+        # wait under, and the run pipeline_watchdog must not reap is the
+        # sub-issue's.
         mock_worktree.assert_called_once_with(
-            "context-studio", "10", "feature/issue-10-existing-epic"
+            "context-studio", "10", "feature/issue-10-existing-epic", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
 
         assert result is pipeline_run
@@ -162,7 +167,8 @@ class TestResolveWorkspaceColdStart:
 
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-feature"
+            "context-studio", "42", "feature/issue-42-feature", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
 
         assert result.branch_name == "feature/issue-42-feature"
@@ -409,7 +415,8 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
         mock_resolve_branch.assert_called_once_with("context-studio", "42")
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-standalone"
+            "context-studio", "42", "feature/issue-42-standalone", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
         assert result.branch_name == "feature/issue-42-standalone"
         assert result.project_dir == "/workspace/.orchestrator/worktrees/test-project/42"

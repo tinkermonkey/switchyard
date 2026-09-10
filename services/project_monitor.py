@@ -8504,11 +8504,26 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     has_running_loop = False
 
                 if has_running_loop:
+                    # checkout_lock_timeout_seconds=0.0 (code review on
+                    # #151/WI-6): the .result() below blocks THIS thread's event
+                    # loop for the whole resolution, and every in-process holder
+                    # of the project_checkout lock a cold epic's creation path
+                    # would wait for releases from a coroutine on that same
+                    # loop -- so a wait here can only ever time out, after
+                    # freezing the orchestrator for up to the full ~3h budget.
+                    # get_or_create_epic_worktree() clamps exactly this hazard
+                    # by itself everywhere it can SEE it, but it cannot see it
+                    # here: resolve_workspace() reaches it from inside
+                    # asyncio.run() on a pool thread, so its
+                    # asyncio.get_running_loop() probe finds the INNER loop's
+                    # worker (no running loop) and reports off-loop. Say
+                    # explicitly what the probe cannot: one attempt, no sleeping.
                     with concurrent.futures.ThreadPoolExecutor() as pool:
                         pool.submit(
                             asyncio.run,
                             self.pipeline_run_manager.resolve_workspace(
-                                pipeline_run, github, workspace_type
+                                pipeline_run, github, workspace_type,
+                                checkout_lock_timeout_seconds=0.0,
                             )
                         ).result()
                 else:
@@ -8776,11 +8791,21 @@ _Repair cycle initiated by Switchyard_
                     logger.error(f"Failed to end phantom run after repair cycle error: {cleanup_e}")
             try:
                 if 'stage_config' in dir() and 'work_execution_tracker' in dir():
+                    # Contention, not a failure (#148; wired here in #151/WI-6
+                    # review). resolve_workspace() above can now raise
+                    # ProjectCheckoutLockTimeoutError -- a cold epic worktree
+                    # whose base clone stayed held -- and nothing ran. Recorded as
+                    # 'failure' it feeds count_consecutive_failures(), and three
+                    # of those reach MAX_CONSECUTIVE_DISPATCH_FAILURES and
+                    # mark_failed(), which durably retains the BOARD's lock over
+                    # contention that clears itself.
+                    from services.resource_lock_errors import is_lock_timeout_error
+                    startup_outcome = 'lock_contention' if is_lock_timeout_error(e) else 'failure'
                     work_execution_tracker.record_execution_outcome(
                         issue_number=issue_number,
                         column=status,
                         agent=stage_config.default_agent,
-                        outcome='failure',
+                        outcome=startup_outcome,
                         project_name=project_name,
                         error=f"Repair cycle startup error: {e}"
                     )
