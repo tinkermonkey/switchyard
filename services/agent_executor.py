@@ -331,22 +331,13 @@ class AgentExecutor:
                             pipeline_run_for_workspace, gh_integration_for_workspace, workspace_type_for_epic_gate
                         )
                     except Exception as resolve_err:
-                        if 'issue_number' in task_context:
-                            from services.work_execution_state import work_execution_tracker
-                            try:
-                                work_execution_tracker.record_execution_outcome(
-                                    issue_number=task_context['issue_number'],
-                                    column=task_context.get('column', 'unknown'),
-                                    agent=agent_name,
-                                    outcome='failure',
-                                    project_name=project_name,
-                                    error=f"Workspace resolution failed: {resolve_err}"
-                                )
-                            except Exception as record_err:
-                                logger.warning(
-                                    f"Failed to record workspace-resolution failure outcome for "
-                                    f"{project_name}/#{task_context['issue_number']}: {record_err}"
-                                )
+                        self._record_pre_dispatch_failure_outcome(
+                            agent_name=agent_name,
+                            project_name=project_name,
+                            task_context=task_context,
+                            error=resolve_err,
+                            what="Workspace resolution",
+                        )
                         raise
                     epic_id = pipeline_run_for_workspace.epic_id
                     epic_branch_name = pipeline_run_for_workspace.branch_name
@@ -431,6 +422,49 @@ class AgentExecutor:
                 epic_id = None
                 epic_branch_name = None
 
+        # Resolve the agent's working directory HERE, off the event loop, rather
+        # than letting _build_execution_context() do it inline (code review on
+        # #151/WI-6). With an epic_id it can reach
+        # get_or_create_epic_worktree()'s creation path, which now waits on this
+        # project's project_checkout lock via a time.sleep() poll loop -- and
+        # every in-process holder of that lock releases from a coroutine on THIS
+        # loop, so polling on the loop thread starves the holder and freezes the
+        # orchestrator instead of waiting for it. The 'discussions' branch above
+        # is the live case: it sets task_context['epic_id'] but never
+        # task_context['project_dir'], so nothing had resolved the worktree
+        # off-loop beforehand the way resolve_workspace() does for
+        # 'issues'/'hybrid'.
+        #
+        # The record_execution_outcome() guard mirrors the resolve_workspace()
+        # one above, and exists for the same reason: this runs well before this
+        # method's own big try/except, so without it a failure here propagates
+        # out of execute_agent() leaving record_execution_start()'s 'in_progress'
+        # entry with no terminal outcome -- should_execute_work() then answers
+        # "work_already_in_progress" on every subsequent poll and the issue is
+        # silently skipped until the stuck-state sweep catches it, rather than
+        # being retried the way the lock-contention design assumes.
+        from services.project_workspace import workspace_manager
+
+        try:
+            resolved_project_dir = task_context.get('project_dir')
+            if not resolved_project_dir:
+                resolved_project_dir = str(await asyncio.to_thread(
+                    workspace_manager.get_project_dir,
+                    project_name,
+                    epic_id,
+                    epic_branch_name,
+                    issue_number=task_context.get('issue_number'),
+                ))
+        except Exception as resolve_dir_err:
+            self._record_pre_dispatch_failure_outcome(
+                agent_name=agent_name,
+                project_name=project_name,
+                task_context=task_context,
+                error=resolve_dir_err,
+                what="Working-directory resolution",
+            )
+            raise
+
         # Build execution context with ALL required fields
         # NOTE: Stream callback removed - docker-claude-wrapper.py handles all Claude log streaming
         execution_context = self._build_execution_context(
@@ -439,7 +473,8 @@ class AgentExecutor:
             task_id=task_id,
             task_context=task_context,
             epic_id=epic_id,
-            branch_name=epic_branch_name
+            branch_name=epic_branch_name,
+            project_dir=resolved_project_dir,
         )
 
         self._apply_frozen_session_resume(execution_context, task_context, project_name, agent_name)
@@ -1104,6 +1139,28 @@ class AgentExecutor:
                         # refusal declined to do.
                         raise
 
+                    # Resource-lock timeout (#151/WI-6 review): finalize_feature_
+                    # branch_work() acquires the project_checkout lock when it
+                    # resolves to the shared base clone, so it can raise this now.
+                    # Falling through to the generic branch below runs the failsafe
+                    # (whose own auto_commit hits the same contended lock) and then
+                    # "continues execution even if finalization fails" straight into
+                    # record_execution_outcome(outcome='success') -- the issue
+                    # advances with nothing staged, committed, pushed or PR'd and
+                    # the work left uncommitted on disk. The outer handler's
+                    # is_lock_timeout_error() branch exists precisely to record this
+                    # as 'lock_contention' and let the next poll retry; re-raise so
+                    # it is reached instead of swallowed here.
+                    from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+                    if is_lock_timeout_error(e):
+                        logger.warning(
+                            f"Workspace finalization for {project_name}/#"
+                            f"{task_context.get('issue_number')} could not acquire a "
+                            f"project resource lock — propagating to the contention "
+                            f"path rather than recording a success: {describe_lock_timeout(e)}"
+                        )
+                        raise
+
                     from services.git_workflow_manager import PushFailedError
                     if isinstance(e, PushFailedError):
                         # Push was rejected — agent did real work but it cannot reach origin.
@@ -1166,6 +1223,12 @@ class AgentExecutor:
                             from services.git_workflow_manager import PushFailedError
                             if isinstance(failsafe_error, PushFailedError):
                                 raise  # Re-raise into outer PushFailedError handler
+                            # Same reasoning as the finalization handler above: the
+                            # failsafe never ran, so swallowing this records a
+                            # success over uncommitted work (#151/WI-6 review).
+                            from services.resource_lock_errors import is_lock_timeout_error
+                            if is_lock_timeout_error(failsafe_error):
+                                raise  # Re-raise into the outer contention path
                             logger.error(
                                 f"❌ Failsafe commit check also failed: {failsafe_error}",
                                 exc_info=True
@@ -1543,6 +1606,62 @@ class AgentExecutor:
         except Exception as e:
             logger.warning(f"Could not check for a resumable frozen session: {e}")
 
+    def _record_pre_dispatch_failure_outcome(
+        self,
+        agent_name: str,
+        project_name: str,
+        task_context: Dict[str, Any],
+        error: Exception,
+        what: str,
+    ) -> None:
+        """Close out the 'in_progress' entry for a failure raised BEFORE
+        execute_agent()'s own big try/except starts.
+
+        Everything between record_execution_start() and that try -- workspace
+        resolution, working-directory resolution -- propagates straight out of
+        execute_agent(), so without this the 'in_progress' entry never gets a
+        terminal outcome and should_execute_work() answers
+        "work_already_in_progress" on every subsequent board poll: the issue is
+        silently skipped until cleanup_stuck_in_progress_states() sweeps it.
+        That is the "escalation never fires" bug class fixed by 76e7adc for the
+        repair-cycle path.
+
+        Classifies the same way the big try's own handler does (#148): a
+        resource-lock timeout is contention, not an agent failure, and must not
+        feed count_consecutive_failures() -- three of those reach
+        project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES and mark_failed(),
+        which durably retains the BOARD's pipeline lock over contention that
+        clears itself. Added when get_or_create_epic_worktree() started raising
+        ProjectCheckoutLockTimeoutError (#151/WI-6), which reaches this method
+        through both of the call sites above; before that, no lock timeout could
+        be raised this early, so the hand-written 'failure' this replaces had
+        never been exercised with one.
+
+        Never raises: the caller re-raises the original error, and a failure to
+        record must not replace it.
+        """
+        if 'issue_number' not in task_context:
+            return
+
+        from services.resource_lock_errors import is_lock_timeout_error
+        from services.work_execution_state import work_execution_tracker
+
+        outcome = 'lock_contention' if is_lock_timeout_error(error) else 'failure'
+        try:
+            work_execution_tracker.record_execution_outcome(
+                issue_number=task_context['issue_number'],
+                column=task_context.get('column', 'unknown'),
+                agent=agent_name,
+                outcome=outcome,
+                project_name=project_name,
+                error=f"{what} failed: {error}"
+            )
+        except Exception as record_err:
+            logger.warning(
+                f"Failed to record {what.lower()} {outcome} outcome for "
+                f"{project_name}/#{task_context['issue_number']}: {record_err}"
+            )
+
     def _build_execution_context(
         self,
         agent_name: str,
@@ -1550,7 +1669,8 @@ class AgentExecutor:
         task_id: str,
         task_context: Dict[str, Any],
         epic_id: Optional[str] = None,
-        branch_name: Optional[str] = None
+        branch_name: Optional[str] = None,
+        project_dir: Optional[str] = None
     ) -> Dict[str, Any]:
         """Build standardized execution context for agent.
 
@@ -1558,6 +1678,13 @@ class AgentExecutor:
         the returned work_dir to the epic's isolated git worktree instead of the
         shared base clone. Omitting epic_id preserves the pre-worktree-isolation
         behavior exactly (plain base-clone path, no side effects).
+
+        project_dir short-circuits that resolution entirely with a directory the
+        caller already resolved. execute_agent() always passes it, because it
+        resolves off the event loop (get_project_dir() can reach a
+        project_checkout lock wait that must not run on the loop thread -- see
+        its call site there). The in-method fallback below is kept for this
+        method's direct sync callers, which are off-loop by construction.
         """
         from pathlib import Path
         from services.project_workspace import workspace_manager
@@ -1570,7 +1697,7 @@ class AgentExecutor:
         # in-process worktree cache (ProjectWorkspaceManager's cache is
         # process-local) and could attempt to `git worktree add` a worktree that
         # already exists on disk -- which is not idempotent and would raise.
-        existing_project_dir = task_context.get('project_dir')
+        existing_project_dir = project_dir or task_context.get('project_dir')
         if existing_project_dir:
             project_dir = Path(existing_project_dir)
         else:
@@ -2232,6 +2359,16 @@ class AgentExecutor:
             must escalate a refusal whose `escalate` flag is set rather than
             reporting the run as a success; every one of them used to discard this
             return value entirely (#149 WI-4 review).
+
+        Raises:
+            PushFailedError: the failsafe committed but could not push.
+            ProjectCheckoutLockTimeoutError / DevContainerBuildLockTimeoutError:
+                the two exceptions this method's catch-all deliberately does NOT
+                fold into None (#151/WI-6 review). Nothing was checked or
+                committed and the work is still on disk, which is the opposite of
+                what None asserts; callers route it through
+                services/resource_lock_errors.is_lock_timeout_error(), exactly as
+                they already do for auto_commit.commit_agent_changes().
         """
         import subprocess
         import glob
@@ -2255,10 +2392,17 @@ class AgentExecutor:
             if existing_project_dir:
                 project_dir = str(existing_project_dir)
             else:
-                project_dir = str(workspace_manager.get_project_dir(
+                # Off the event loop (code review on #151/WI-6): this fallback can
+                # reach get_or_create_epic_worktree()'s creation path, whose
+                # project_checkout wait is a time.sleep() poll loop that must never
+                # run on the loop thread -- the holders it waits behind release
+                # from coroutines on that same loop.
+                project_dir = str(await asyncio.to_thread(
+                    workspace_manager.get_project_dir,
                     project_name,
-                    epic_id=task_context.get('epic_id'),
-                    branch_name=task_context.get('branch_name'),
+                    task_context.get('epic_id'),
+                    task_context.get('branch_name'),
+                    issue_number=task_context.get('issue_number'),
                 ))
             issue_number = task_context.get('issue_number')
 
@@ -2388,6 +2532,25 @@ class AgentExecutor:
             from services.git_workflow_manager import PushFailedError
             if isinstance(e, PushFailedError):
                 raise  # Propagate — finalization exception handler will block the pipeline
+
+            # Resource-lock timeout (#148, wired here in #151/WI-6 review): this
+            # method's documented contract is that None means "the check passed
+            # and the failsafe ran as it always has". A lock timeout means the
+            # opposite -- the directory resolution or the auto-commit below it
+            # never ran, and the agent's work is still uncommitted on disk.
+            # Swallowing it to None reports that as a clean failsafe and the run
+            # is recorded as a success with the work abandoned. Propagate instead,
+            # the way auto_commit.commit_agent_changes() does, so execute_agent()'s
+            # lock-contention path records it and the next poll retries.
+            from services.resource_lock_errors import is_lock_timeout_error, describe_lock_timeout
+            if is_lock_timeout_error(e):
+                logger.warning(
+                    f"❌ FAILSAFE: could not acquire a project resource lock for "
+                    f"{project_name}/#{task_context.get('issue_number')} — propagating "
+                    f"rather than reporting a clean failsafe: {describe_lock_timeout(e)}"
+                )
+                raise
+
             logger.error(f"❌ FAILSAFE: Exception during commit check: {e}", exc_info=True)
             return None
 

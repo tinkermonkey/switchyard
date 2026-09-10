@@ -1496,6 +1496,18 @@ git push --force-with-lease
             branch-verifying) failsafe, because that path can succeed where this
             one could not, and only blocks the pipeline if the failsafe cannot
             confirm the branch either.
+
+        Raises:
+            PushFailedError: the commit landed locally but the push was rejected.
+            ProjectCheckoutLockTimeoutError: this finalization resolved to the
+                SHARED base clone and that clone stayed held for the whole of the
+                lock's timeout, so nothing was verified, staged, committed or
+                pushed and the work is still on disk (#151/WI-6). Documented, and
+                deliberately not folded into a {'success': False} dict, for the
+                same reason auto_commit.commit_agent_changes() re-raises it:
+                'failure' routes callers into mark_failed()/failsafe paths that
+                treat contention as a fault, when what it actually needs is
+                services/resource_lock_errors.is_lock_timeout_error() and a retry.
         """
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely
@@ -1529,11 +1541,44 @@ git push --force-with-lease
         # left outside.
         from services.project_workspace import workspace_manager
 
+        # Existence guard BEFORE is_base_clone_dir(), mirroring
+        # auto_commit.commit_agent_changes() (code review on #151/WI-6).
+        # is_base_clone_dir() fails CLOSED -- a directory that doesn't exist
+        # answers True -- which is right for a lock gate but wrong as a
+        # precondition: a project_dir_override whose epic worktree was removed
+        # between prepare and finalize (cleanup_epic_worktree/
+        # prune_epic_worktrees, or an operator) would otherwise take this
+        # project's real base-clone lock, wait behind whatever holds it, and then
+        # run git against a directory that isn't there. Nothing below can succeed
+        # without the directory, so refuse in the same shape every other
+        # unrecoverable finalize failure uses.
+        if not os.path.isdir(project_dir):
+            error_msg = (
+                f"Cannot finalize issue #{issue_number} for {project}: {project_dir} "
+                "does not exist. The workspace this dispatch ran in is gone (removed "
+                "worktree, or a project_dir_override pointing at nothing) -- nothing "
+                "can be staged, committed or pushed from it."
+            )
+            logger.error(error_msg)
+            return {"success": False, "error": error_msg}
+
         if workspace_manager.is_base_clone_dir(project, project_dir):
             from services.project_checkout_lock import project_checkout_lock_async
 
-            # issue_number is log attribution only, never the lock's holder
-            # identity -- see project_checkout_lock.py's module docstring.
+            # issue_number is log attribution for the lock, and the key
+            # project_checkout_lock's activity registry publishes this wait
+            # under -- which is what keeps pipeline_watchdog from reaping this
+            # containerless run while it waits. Never the lock's holder identity
+            # -- see project_checkout_lock.py's module docstring.
+            #
+            # No explicit timeout_seconds, so the calibrated ~3h default stands,
+            # matching auto_commit.commit_agent_changes() -- the sibling writer
+            # of this same directory (#151/WI-6 review). A shorter budget would
+            # be wrong here in a way it isn't at a resolution call site: after
+            # the wait this method has real work to do (the agent's commit and
+            # push), so giving up early abandons that work rather than deferring
+            # it, and the legitimate holder it waits behind can be an agent
+            # container run of up to agents.yaml's 10800s.
             lock_cm = project_checkout_lock_async(project, issue_number)
         else:
             lock_cm = contextlib.nullcontext()

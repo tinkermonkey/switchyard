@@ -496,6 +496,15 @@ class PipelineRunManager:
                 re-resolves once branch_name/project_dir/epic_id are set). Fixed at
                 the source rather than special-cased here.
             ValueError: The project has no base clone to source the worktree from.
+            ProjectCheckoutLockTimeoutError: A brand-new epic worktree had to be
+                created but this project's shared base clone stayed held for the
+                whole acquire budget -- nothing was fetched, checked out or
+                registered (#151/WI-6). Unlike the three below, this one is NOT
+                for the generic failure path: it is a contention outcome, and
+                every caller must route it through
+                services/resource_lock_errors.is_lock_timeout_error() so it is
+                recorded as 'lock_contention' rather than counted against
+                MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
             RuntimeError: The underlying git worktree add command failed, OR (code
                 review finding on a later fix) the epic's worktree directory exists
                 but has no .git at all -- a corrupted state get_or_create_epic_worktree()
@@ -570,8 +579,22 @@ class PipelineRunManager:
         if not branch_name:
             branch_name = feature_branch_manager.create_feature_branch_name(int(epic_id), "")
 
+        # issue_number is THIS run's own issue, not the epic's (code review on
+        # #151/WI-6): a cold epic's creation path now waits on the project's
+        # project_checkout lock, and project_checkout_lock publishes that wait to
+        # its activity registry keyed on (project, issue_number) -- which is
+        # exactly what tells services/pipeline_watchdog.py this containerless run
+        # is parked on a lock rather than a zombie to reap. Keyed on the epic it
+        # would vouch for the wrong run. Passing it also selects the full
+        # calibrated acquire budget over the unattributed cap; see
+        # get_or_create_epic_worktree()'s issue_number docs. Already off the event
+        # loop here, so waiting costs the loop nothing.
         project_dir = await asyncio.to_thread(
-            workspace_manager.get_or_create_epic_worktree, pipeline_run.project, epic_id, branch_name
+            workspace_manager.get_or_create_epic_worktree,
+            pipeline_run.project,
+            epic_id,
+            branch_name,
+            issue_number=pipeline_run.issue_number,
         )
 
         # get_or_create_epic_worktree() can silently adopt a pre-existing worktree that's

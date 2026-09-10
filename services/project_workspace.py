@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import logging
 import shutil
@@ -8,6 +9,18 @@ from typing import Callable, Dict, List, Optional, Tuple
 from config.manager import config_manager
 
 logger = logging.getLogger(__name__)
+
+# Acquire budget for an epic-worktree creation that has no dispatching issue
+# number to attribute its project_checkout wait to (see
+# ProjectWorkspaceManager._resolve_checkout_lock_timeout). Deliberately well
+# under services/pipeline_watchdog.py's 30-minute zombie_threshold_minutes
+# default: project_checkout_lock's in-process activity registry -- the thing
+# that tells the watchdog a containerless run is parked on a lock rather than
+# dead -- is keyed on (project, issue_number), so an unattributed wait publishes
+# nothing and gets no exemption. Wait longer than the threshold with no
+# attribution and the watchdog reaps the run and redispatches the issue while
+# this thread is still waiting to create its worktree.
+UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS = 900.0
 
 
 class SetupStatus(Enum):
@@ -152,10 +165,23 @@ class ProjectWorkspaceManager:
         # Branch each tracked epic worktree was actually checked out to (for the
         # cache-hit mismatch check in get_or_create_epic_worktree).
         self._epic_worktree_branches: Dict[Tuple[str, str], str] = {}
-        # Guards check-then-create/cleanup on _epic_worktrees so two concurrent
-        # calls for the same (project, epic_id) can't both attempt to create (or
-        # one create/one cleanup can't race) the same worktree.
+        # MAP guard only: held for dict reads/writes on the two maps above (and
+        # on _epic_worktree_key_locks), never across git work or a lock wait.
+        # Code review on #151/WI-6: this used to be the whole serializer for
+        # get_or_create_epic_worktree()/cleanup_epic_worktree(), which meant one
+        # project's `git worktree add` -- and, once that path started waiting on
+        # the project_checkout lock, one project's lock WAIT -- blocked every
+        # other project's epic resolution, including cache hits that are
+        # otherwise a single dict lookup. The per-(project, epic_id) locks below
+        # do the actual check-then-create/cleanup serialization instead, so the
+        # blast radius of a slow creation is the one epic it belongs to.
         self._epic_worktree_lock = threading.Lock()
+        # One serializer per (project_name, epic_id), created on demand under the
+        # map guard above. Never evicted: one small Lock per epic this process
+        # has touched, and popping an entry a thread is still holding would
+        # silently let the next caller create a second serializer for the same
+        # key -- exactly the race these exist to prevent.
+        self._epic_worktree_key_locks: Dict[Tuple[str, str], threading.Lock] = {}
 
     def initialize_all_projects(self) -> Dict[str, 'SetupStatus']:
         """
@@ -424,6 +450,8 @@ class ProjectWorkspaceManager:
         epic_id: Optional[str] = None,
         branch_name: Optional[str] = None,
         default_branch: str = 'main',
+        issue_number: Optional[int] = None,
+        checkout_lock_timeout_seconds: Optional[float] = None,
     ) -> Path:
         """Get the directory path for a project.
 
@@ -454,6 +482,15 @@ class ProjectWorkspaceManager:
                 already-in-flight worktree.
             default_branch: Base branch to cut a brand-new epic branch from, when
                 branch_name doesn't already exist on origin. Defaults to 'main'.
+            issue_number: The DISPATCHING issue whose pipeline run is waiting on this
+                resolution. Forwarded, with checkout_lock_timeout_seconds, to
+                get_or_create_epic_worktree() -- see its docstring for why the
+                creation path's project_checkout wait needs it (the watchdog
+                exemption is keyed on it, and the acquire budget follows from
+                that). Code review on #151/WI-6: neither was forwarded here at
+                first, so no caller reaching the creation path through
+                get_project_dir() could supply either.
+            checkout_lock_timeout_seconds: See get_or_create_epic_worktree().
 
         Returns:
             The base clone path (epic_id=None), or the epic's isolated worktree path.
@@ -462,7 +499,12 @@ class ProjectWorkspaceManager:
             return self.workspace_root / project_name
 
         return self.get_or_create_epic_worktree(
-            project_name, epic_id, branch_name, default_branch=default_branch
+            project_name,
+            epic_id,
+            branch_name,
+            default_branch=default_branch,
+            issue_number=issue_number,
+            checkout_lock_timeout_seconds=checkout_lock_timeout_seconds,
         )
 
     def is_base_clone_dir(self, project_name: str, project_dir) -> bool:
@@ -518,6 +560,93 @@ class ProjectWorkspaceManager:
             )
             return True
 
+    def _epic_worktree_key_lock(self, key: Tuple[str, str]) -> threading.Lock:
+        """The per-(project_name, epic_id) serializer for check-then-create and
+        cleanup on that one epic's worktree.
+
+        Guards exactly what _epic_worktree_lock used to guard globally, minus the
+        cross-project/cross-epic blocking: two concurrent calls for the SAME epic
+        still cannot both attempt a create (or race a create against a cleanup),
+        while an unrelated epic's cache hit stays a dict lookup even while this
+        one is mid-`git worktree add` or mid-project_checkout-wait.
+
+        Lock ordering, everywhere these two are used together: per-key lock
+        OUTER, _epic_worktree_lock (the map guard) INNER, never the reverse.
+        """
+        with self._epic_worktree_lock:
+            key_lock = self._epic_worktree_key_locks.get(key)
+            if key_lock is None:
+                key_lock = threading.Lock()
+                self._epic_worktree_key_locks[key] = key_lock
+            return key_lock
+
+    def _resolve_checkout_lock_timeout(
+        self,
+        project_name: str,
+        epic_id: str,
+        issue_number: Optional[int],
+        requested_seconds: Optional[float],
+    ) -> float:
+        """How long get_or_create_epic_worktree()'s creation path may wait for
+        this project's project_checkout lock.
+
+        Three cases, in priority order (code review on #151/WI-6):
+
+        1. A running event loop on THIS thread -> 0.0, i.e. one attempt and no
+           time.sleep() at all. project_checkout_lock_sync()'s poll loop on the
+           loop thread does not merely stall other coroutines for its duration:
+           every in-process holder of this same lock (claude_integration's
+           `async with project_checkout_lock_async` around a container run,
+           auto_commit, finalize_feature_branch_work) can only reach its release
+           by being rescheduled on that loop, so a poll there STARVES the holder
+           it is waiting for and the wait is guaranteed to fail. Every production
+           caller now hops off the loop (asyncio.to_thread) before reaching here;
+           this clamp is the backstop that turns a future on-loop caller into a
+           loud, immediate failure instead of a frozen orchestrator, and it
+           overrides an explicitly requested budget for the same reason.
+        2. An explicit requested_seconds (off-loop) -> honoured as given.
+        3. Otherwise the calibrated wait, which depends on whether this wait is
+           attributable: project_checkout_lock publishes waits to its
+           in-process activity registry keyed on (project, issue_number), and
+           services/pipeline_watchdog.py reads that registry to know a
+           containerless run is legitimately parked rather than a zombie. WITH a
+           dispatching issue number the wait is exempt, so it can use the same
+           ~3h DEFAULT_TIMEOUT_SECONDS every other project_checkout acquisition
+           uses -- calibrated (see services/resource_lock_errors.py) to outlast
+           the longest legitimate holder, which for this lock is a base-clone-
+           scoped agent container run of up to agents.yaml's 10800s. Anything
+           shorter turns a perfectly legitimate holder into a
+           ProjectCheckoutLockTimeoutError, and three of those on consecutive
+           board polls escalate to a human via project_monitor's
+           MAX_CONSECUTIVE_LOCK_CONTENTIONS. WITHOUT one, nothing vouches for
+           the waiting run, so the budget has to stay well under the watchdog's
+           30-minute zombie threshold instead.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            logger.error(
+                f"get_or_create_epic_worktree({project_name!r}, epic #{epic_id}) reached "
+                "its creation path on the event-loop thread. Its project_checkout wait "
+                "is a time.sleep() poll loop, and the holders it would wait behind "
+                "release from coroutines on this same loop -- so waiting here freezes "
+                "the orchestrator and starves the holder. Failing immediately instead. "
+                "This is a bug in the caller: resolve the worktree off the loop "
+                "(asyncio.to_thread), the way PipelineRunManager.resolve_workspace() does."
+            )
+            return 0.0
+
+        if requested_seconds is not None:
+            return requested_seconds
+
+        if issue_number is None:
+            return UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS
+
+        from services.project_checkout_lock import DEFAULT_TIMEOUT_SECONDS
+        return DEFAULT_TIMEOUT_SECONDS
+
     def _epic_worktree_path(self, project_name: str, epic_id: str) -> Path:
         """Staging path for an epic's worktree: .orchestrator/worktrees/<project>/<epic_id>/
 
@@ -541,10 +670,16 @@ class ProjectWorkspaceManager:
         epic_id: str,
         branch_name: Optional[str] = None,
         default_branch: str = 'main',
-        checkout_lock_timeout_seconds: float = 120.0,
+        issue_number: Optional[int] = None,
+        checkout_lock_timeout_seconds: Optional[float] = None,
     ) -> Path:
         """
         Get (creating if absent) an isolated, non-detached git worktree for one epic.
+
+        MUST NOT be called from the event-loop thread when it might have to CREATE
+        (see checkout_lock_timeout_seconds below and _resolve_checkout_lock_timeout()
+        for what happens if it is). Every production caller hops off the loop via
+        asyncio.to_thread first.
 
         Mirrors DockerAgentRunner._create_reference_worktree's create-if-absent pattern,
         but sourced from the primary (non-bare) base clone rather than a dedicated
@@ -571,12 +706,27 @@ class ProjectWorkspaceManager:
                 this epic's worktree is created; unused on reuse.
             default_branch: Base branch to cut a new epic branch from if branch_name
                 doesn't exist on origin yet.
-            checkout_lock_timeout_seconds: How long the brand-new-worktree path below
-                waits for this project's project_checkout lock before giving up
-                (#151/WI-6 item 1). Deliberately short, for the reasons spelled out
-                at that call site; only the creation path consults it at all (a cache
-                hit, a restart adoption and every failure branch above never touch
-                the base clone, so they never take the lock).
+            issue_number: The DISPATCHING issue whose pipeline run is waiting on this
+                resolution -- the sub-issue for sdlc_execution, the board item itself
+                for planning_design. Used for the creation path's project_checkout
+                acquisition: it is log attribution for the lock itself, but it is
+                also the key project_checkout_lock's activity registry publishes the
+                WAIT under, which is what exempts the waiting run from
+                services/pipeline_watchdog.py's zombie reaping. Supply it whenever
+                one is in scope; omitting it caps the wait at
+                UNATTRIBUTED_CHECKOUT_LOCK_TIMEOUT_SECONDS, because nothing would
+                vouch for a longer one. Defaults to the epic id when it is a plain
+                number (planning_design's board item, and the only attribution this
+                method had before the parameter existed).
+            checkout_lock_timeout_seconds: Overrides how long the brand-new-worktree
+                path below waits for this project's project_checkout lock before
+                giving up (#151/WI-6 item 1). None (the default) means "decide from
+                the calling thread and the attribution above" -- see
+                _resolve_checkout_lock_timeout(), which is also where an on-event-
+                loop caller gets clamped to a single non-blocking attempt regardless
+                of what is passed here. Only the creation path consults it at all (a
+                cache hit, a restart adoption and every failure branch above never
+                touch the base clone, so they never take the lock).
 
         Returns:
             The epic's worktree path.
@@ -585,11 +735,16 @@ class ProjectWorkspaceManager:
             ValueError: No worktree exists yet for this epic and branch_name was not
                 given, or the project has no base clone to source the worktree from.
             ProjectCheckoutLockTimeoutError: A brand-new worktree had to be created
-                but this project's shared base clone was busy for the whole of
-                checkout_lock_timeout_seconds -- nothing was fetched, checked out or
-                registered. Propagates untouched (#148/WI-3 keeps lock-timeout types
-                out of the generic retry loop and the circuit breaker) so the
-                dispatch fails loudly and its next trigger retries.
+                but this project's shared base clone stayed held for the whole of
+                the acquire budget (_resolve_checkout_lock_timeout()) -- nothing was
+                fetched, checked out or registered. Propagates untouched (#148/WI-3
+                keeps lock-timeout types out of the generic retry loop and the
+                circuit breaker) so the dispatch fails loudly and its next trigger
+                retries. Callers MUST route it through
+                services/resource_lock_errors.is_lock_timeout_error() and record
+                'lock_contention' rather than 'failure', or three contended polls
+                reach MAX_CONSECUTIVE_DISPATCH_FAILURES and mark_failed() retains
+                the board's lock over contention that clears itself.
             RuntimeError: Either the underlying `git worktree add` command failed
                 (the pre-existing cause), OR (issue found investigating a
                 code-wrapper dev-container block, 2026-09-06) the worktree
@@ -641,8 +796,15 @@ class ProjectWorkspaceManager:
         """
         key = (project_name, str(epic_id))
         newly_created = False
-        with self._epic_worktree_lock:
-            existing = self._epic_worktrees.get(key)
+        # Per-epic, not process-global (code review on #151/WI-6): everything
+        # below -- the git subprocess work AND, on the creation path, a wait for
+        # this project's project_checkout lock -- used to run under one
+        # threading.Lock shared by every project and every epic, so a single slow
+        # creation blocked unrelated projects' cache hits too. See
+        # _epic_worktree_key_lock() for the ordering rule against the map guard.
+        with self._epic_worktree_key_lock(key):
+            with self._epic_worktree_lock:
+                existing = self._epic_worktrees.get(key)
             if existing is not None:
                 # Code review finding on this method's own corruption check
                 # further down: that check only runs on the NOT-yet-cached
@@ -656,7 +818,8 @@ class ProjectWorkspaceManager:
                 # branch itself -- just falls through to it below instead of
                 # returning early.
                 if (Path(existing) / '.git').exists():
-                    tracked_branch = self._epic_worktree_branches.get(key)
+                    with self._epic_worktree_lock:
+                        tracked_branch = self._epic_worktree_branches.get(key)
                     if branch_name and tracked_branch and branch_name != tracked_branch:
                         logger.warning(
                             f"get_or_create_epic_worktree called for {project_name} epic #{epic_id} "
@@ -712,8 +875,9 @@ class ProjectWorkspaceManager:
                         f"{branch_name!r} but it's actually on {actual_branch!r} -- "
                         "keeping the worktree's real branch rather than the request."
                     )
-                self._epic_worktrees[key] = str(worktree_path)
-                self._epic_worktree_branches[key] = actual_branch
+                with self._epic_worktree_lock:
+                    self._epic_worktrees[key] = str(worktree_path)
+                    self._epic_worktree_branches[key] = actual_branch
                 logger.info(
                     f"Adopted pre-existing epic worktree for {project_name} epic "
                     f"#{epic_id} at {worktree_path} (branch={actual_branch})"
@@ -751,60 +915,74 @@ class ProjectWorkspaceManager:
             # own .git/worktrees/. Nothing gated it, because every other call site
             # decides whether to lock from its FINAL resolved directory
             # (is_base_clone_dir()) -- which here is the new worktree path, by
-            # definition never the base clone -- so this was the one writer free to
-            # race the startup clone/update, a base-clone-scoped container run and
-            # auto_commit's add/commit/push against that same .git.
+            # definition never the base clone -- so this was the last unlocked
+            # base-clone writer on the CREATION side, free to race the startup
+            # clone/update, a base-clone-scoped container run and auto_commit's
+            # add/commit/push against that same .git. Epic-worktree TEARDOWN is
+            # still an unlocked writer of this same .git/worktrees/ --
+            # cleanup_epic_worktree() and prune_epic_worktrees() both run `git -C
+            # <base clone> worktree remove --force` with no project_checkout lock
+            # -- tracked separately in #169; do not read this block as saying
+            # base-clone coverage is now complete.
             #
             # Sync, not async: this is a plain sync method with sync callers. #146
             # WI-1 made that safe for the HOLD -- the heartbeat runs on a real OS
             # thread, so a guarded body that never yields to the event loop still
             # gets its lock refreshed, with no change to this method's control
-            # flow. It does NOT make the WAIT safe: this method is reached from the
-            # event-loop thread (agent_executor's _build_execution_context and
-            # _failsafe_commit_check, claude_integration's run_claude_code) whenever
-            # task_context['project_dir'] wasn't already resolved off-loop by
-            # PipelineRunManager.resolve_workspace(), and a poll loop there stalls
-            # every other coroutine for its whole duration.
+            # flow. It does NOT make the WAIT safe, and the failure mode is worse
+            # than a stall: project_checkout_lock_sync()'s poll loop is
+            # time.sleep(), and every in-process holder of this lock releases from
+            # a coroutine on the event loop -- so a poll on the loop thread starves
+            # the holder it is waiting for and can never succeed. Every production
+            # caller therefore reaches this method off the loop (asyncio.to_thread),
+            # and _resolve_checkout_lock_timeout() clamps a stray on-loop caller to
+            # a single non-blocking attempt rather than freezing the process.
             #
-            # Hence a short timeout rather than DEFAULT_TIMEOUT_SECONDS (~3h) --
-            # the same tradeoff, and the same 120s default, initialize_project()
-            # already settled for its own startup call site, for the same reason:
-            # the thing worth waiting for is another short base-clone operation,
-            # and anything longer means the base clone is held by an agent
-            # container run this dispatch cannot usefully wait behind. It is also
-            # strictly less added stall than the guarded body can already impose on
-            # that same thread today (_add_epic_worktree's own git subprocess
-            # timeouts sum to ~330s), and a timeout here raises rather than
-            # proceeding unlocked, so the next board poll retries.
+            # Off the loop, the budget is project_checkout's ordinary calibrated
+            # ~3h (see _resolve_checkout_lock_timeout() for the two things that
+            # change it): waiting is what this lock is FOR, the legitimate holder
+            # here can be an agent container run of up to agents.yaml's 10800s, and
+            # a budget below that would convert normal contention into a
+            # ProjectCheckoutLockTimeoutError that project_monitor escalates to a
+            # human after three consecutive polls. A timeout raises rather than
+            # proceeding unlocked, so nothing is fetched, checked out or registered
+            # when it does.
             #
-            # Lock ordering: self._epic_worktree_lock is held here and the
+            # Lock ordering: this epic's per-key lock is held here and the
             # project_checkout lock is taken INSIDE it. Nothing acquires them the
             # other way round -- no project_checkout holder calls back into this
-            # method -- so the nesting cannot deadlock.
+            # method -- so the nesting cannot deadlock. The process-global map
+            # guard (_epic_worktree_lock) is deliberately NOT held across this
+            # wait; see _epic_worktree_key_lock().
             from services.project_checkout_lock import project_checkout_lock_sync
 
-            # Log attribution only, never the lock's holder identity (see
-            # project_checkout_lock.py's module docstring). The epic id is the
-            # nearest real GitHub issue number in scope here; it is deliberately
-            # NOT relied on for #150/WI-5's watchdog exemption, which is keyed on
-            # the SUB-issue whose pipeline run is at risk of being reaped -- a wait
-            # bounded at checkout_lock_timeout_seconds is far below that watchdog's
-            # 30-minute zombie threshold, so there is nothing here for it to
-            # misjudge.
-            try:
-                lock_issue_number = int(str(epic_id).strip())
-            except (TypeError, ValueError):
-                lock_issue_number = None
+            # Attribution for the lock's logs AND for the wait's entry in
+            # project_checkout_lock's activity registry, which is what exempts the
+            # waiting pipeline run from the watchdog (see the issue_number arg
+            # docs). Never the lock's holder identity -- see
+            # project_checkout_lock.py's module docstring. Falls back to the epic
+            # id when the caller supplied nothing, which is exactly right for
+            # planning_design (the board item IS the epic) and is what this call
+            # site used before the parameter existed.
+            lock_issue_number = issue_number
+            if lock_issue_number is None:
+                try:
+                    lock_issue_number = int(str(epic_id).strip())
+                except (TypeError, ValueError):
+                    lock_issue_number = None
 
             with project_checkout_lock_sync(
                 project_name,
                 lock_issue_number,
-                timeout_seconds=checkout_lock_timeout_seconds,
+                timeout_seconds=self._resolve_checkout_lock_timeout(
+                    project_name, epic_id, lock_issue_number, checkout_lock_timeout_seconds
+                ),
             ):
                 self._add_epic_worktree(base_repo_dir, worktree_path, branch_name, default_branch)
 
-            self._epic_worktrees[key] = str(worktree_path)
-            self._epic_worktree_branches[key] = branch_name
+            with self._epic_worktree_lock:
+                self._epic_worktrees[key] = str(worktree_path)
+                self._epic_worktree_branches[key] = branch_name
             logger.info(
                 f"Created epic worktree for {project_name} epic #{epic_id} "
                 f"at {worktree_path} (branch={branch_name})"
@@ -1357,8 +1535,16 @@ class ProjectWorkspaceManager:
             epic had no tracked worktree to clean up.
         """
         key = (project_name, str(epic_id))
-        with self._epic_worktree_lock:
-            worktree_path = self._epic_worktrees.get(key)
+        # This epic's own serializer, not the process-global map guard (code
+        # review on #151/WI-6): the body below runs `git worktree remove --force`
+        # (15s), a directory removal, a `worktree prune` (15s) and possibly a push
+        # (30s), and holding the global guard across all of that blocked every
+        # other project's worktree resolution too. Same lock ordering as
+        # get_or_create_epic_worktree(): per-key OUTER, map guard INNER, so a
+        # cleanup and a creation for the SAME epic still cannot interleave.
+        with self._epic_worktree_key_lock(key):
+            with self._epic_worktree_lock:
+                worktree_path = self._epic_worktrees.get(key)
 
             if worktree_path is None:
                 logger.debug(f"No in-flight worktree tracked for {project_name} epic #{epic_id}; nothing to clean up")
@@ -1391,8 +1577,9 @@ class ProjectWorkspaceManager:
                 removed = not Path(worktree_path).exists()
 
             if removed:
-                self._epic_worktrees.pop(key, None)
-                self._epic_worktree_branches.pop(key, None)
+                with self._epic_worktree_lock:
+                    self._epic_worktrees.pop(key, None)
+                    self._epic_worktree_branches.pop(key, None)
                 logger.info(f"Cleaned up epic worktree for {project_name} epic #{epic_id} at {worktree_path}")
             else:
                 logger.error(

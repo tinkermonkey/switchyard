@@ -28,8 +28,23 @@ from services.feature_branch_manager import FeatureBranchManager
 
 
 @pytest.fixture
-def manager():
-    return FeatureBranchManager(workspace_root='/workspace')
+def workspace_root(tmp_path):
+    """A real on-disk workspace root.
+
+    finalize_feature_branch_work() refuses up front when its resolved project_dir
+    doesn't exist (#151/WI-6 review -- is_base_clone_dir() fails CLOSED on a
+    missing directory, so a vanished workspace used to take the real base-clone
+    lock and then run git against nothing), so these tests need directories that
+    actually exist even though every git call below is mocked.
+    """
+    (tmp_path / 'test-project').mkdir()
+    (tmp_path / '.orchestrator' / 'worktrees' / 'test-project' / '5').mkdir(parents=True)
+    return tmp_path
+
+
+@pytest.fixture
+def manager(workspace_root):
+    return FeatureBranchManager(workspace_root=str(workspace_root))
 
 
 class _RecordingLock:
@@ -203,7 +218,7 @@ class TestBaseCloneFallbackIsLocked:
 @pytest.mark.asyncio
 class TestEpicWorktreeOverrideIsNotLocked:
 
-    async def test_no_lock_for_a_resolved_epic_worktree(self, manager):
+    async def test_no_lock_for_a_resolved_epic_worktree(self, manager, workspace_root):
         """An isolated epic worktree shares its directory with nothing; locking it
         would serialize sibling epics for no reason (is_base_clone_dir()'s whole
         point)."""
@@ -228,9 +243,46 @@ class TestEpicWorktreeOverrideIsNotLocked:
                 issue_number=88,
                 commit_message='msg',
                 github_integration=Mock(),
-                project_dir_override='/workspace/.orchestrator/worktrees/test-project/5',
+                project_dir_override=str(
+                    workspace_root / '.orchestrator' / 'worktrees' / 'test-project' / '5'
+                ),
             )
 
         assert result['success'] is True
         mock_add.assert_awaited_once()
         assert recording_lock.calls == []
+
+
+@pytest.mark.asyncio
+class TestAVanishedWorkspaceRefusesBeforeTheLock:
+    """#151/WI-6 review: is_base_clone_dir() fails CLOSED, answering True for any
+    directory that doesn't exist. That is right for a lock GATE and wrong as a
+    precondition -- an epic worktree removed between prepare and finalize
+    (cleanup_epic_worktree/prune_epic_worktrees, or an operator) would otherwise
+    take this project's real shared base-clone lock, wait behind whatever holds
+    it, and then run git against a directory that isn't there. auto_commit.
+    commit_agent_changes() has guarded this since #54; finalize did not."""
+
+    async def test_missing_override_directory_returns_failure_without_locking(
+        self, manager, workspace_root
+    ):
+        recording_lock = _RecordingLock([])
+
+        with patch('services.project_checkout_lock.project_checkout_lock_async',
+                   recording_lock), \
+             patch.object(manager, '_verify_finalize_branch', new_callable=AsyncMock) as mock_verify, \
+             patch.object(manager, 'git_add_all', new_callable=AsyncMock) as mock_add:
+            result = await manager.finalize_feature_branch_work(
+                project='test-project',
+                issue_number=88,
+                commit_message='msg',
+                github_integration=Mock(),
+                project_dir_override=str(workspace_root / 'gone' / 'worktree'),
+            )
+
+        assert result['success'] is False
+        assert 'does not exist' in result['error']
+        # Never reached the lock, the verification or any git write.
+        assert recording_lock.calls == []
+        mock_verify.assert_not_called()
+        mock_add.assert_not_called()

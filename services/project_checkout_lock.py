@@ -1057,11 +1057,22 @@ def project_checkout_lock_sync(
     facade: Optional[ProjectResourceLockManager] = None,
 ):
     """
-    Synchronous counterpart of project_checkout_lock_async(), for the one
-    call site (ProjectWorkspaceManager.initialize_project(), at startup,
-    before any asyncio event loop is guaranteed to be running) that cannot
-    await. Uses time.sleep() between polls -- MUST NOT be called from a
-    coroutine running on an asyncio event loop, which it would block.
+    Synchronous counterpart of project_checkout_lock_async(), for the call
+    sites that cannot await: ProjectWorkspaceManager.initialize_project()
+    (startup, before any asyncio event loop is guaranteed to be running) and
+    ProjectWorkspaceManager.get_or_create_epic_worktree() (a plain sync method
+    whose async callers reach it through asyncio.to_thread).
+
+    Uses time.sleep() between polls -- MUST NOT be called from a coroutine
+    running on an asyncio event loop. Not merely because it would block the
+    loop for its whole wait: every in-process holder of the project_checkout
+    lock (claude_integration's `async with project_checkout_lock_async` around
+    a container run, auto_commit, finalize_feature_branch_work) releases from a
+    coroutine on that same loop, so a poll there starves the holder it is
+    waiting for and the wait cannot succeed. get_or_create_epic_worktree()
+    detects a running loop and clamps its own timeout to a single non-blocking
+    attempt for exactly this reason; a new sync call site reachable from the
+    loop needs the same treatment, or (better) an off-loop hop at its caller.
 
     See project_checkout_lock_async() for the full contract (including the
     `facade` test-injection parameter and the `issue_number` log-only

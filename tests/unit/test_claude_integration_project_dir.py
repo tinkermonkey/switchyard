@@ -62,8 +62,11 @@ class TestRunClaudeCodeProjectDirResolution:
 
             result = await run_claude_code('do the thing', context)
 
+            # Resolved off the event loop (#151/WI-6 review), so epic_id and
+            # branch_name go positionally through asyncio.to_thread; issue_number
+            # is the wait's watchdog-exemption key.
             mock_wm.get_project_dir.assert_called_once_with(
-                'test-project', epic_id=None, branch_name=None
+                'test-project', None, None, issue_number=100
             )
             assert result == 'output'
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
@@ -90,7 +93,7 @@ class TestRunClaudeCodeProjectDirResolution:
             await run_claude_code('do the thing', context)
 
             mock_wm.get_project_dir.assert_called_once_with(
-                'test-project', epic_id='42', branch_name='feature/issue-42-shared'
+                'test-project', '42', 'feature/issue-42-shared', issue_number=100
             )
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
             assert mount_dir == Path('/workspace/.orchestrator/worktrees/test-project/42')
@@ -143,5 +146,5 @@ class TestRunClaudeCodeProjectDirResolution:
             await run_claude_code('do the thing', context)
 
             mock_wm.get_project_dir.assert_called_once_with(
-                'test-project', epic_id='200', branch_name=None
+                'test-project', '200', None, issue_number=200
             )

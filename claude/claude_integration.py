@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import json
 import os
@@ -143,10 +144,23 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             # has already been created upstream (or never needed a branch at
             # all), so it is safe to pass along whatever (if anything) is
             # already known.
+            #
+            # Resolved off the event loop (code review on #151/WI-6): with an
+            # epic_id this can reach get_or_create_epic_worktree()'s creation
+            # path, whose project_checkout wait is a time.sleep() poll loop. Run
+            # on this loop it would not merely stall other coroutines -- every
+            # in-process holder of that lock (including this very function's
+            # `async with project_checkout_lock_async` below) releases from a
+            # coroutine on this loop, so the poll would starve the holder it is
+            # waiting for and be guaranteed to time out.
             epic_id = task_context_for_dir.get('epic_id')
             branch_name = task_context_for_dir.get('branch_name')
-            project_dir = workspace_manager.get_project_dir(
-                project, epic_id=epic_id, branch_name=branch_name
+            project_dir = await asyncio.to_thread(
+                workspace_manager.get_project_dir,
+                project,
+                epic_id,
+                branch_name,
+                issue_number=task_context_for_dir.get('issue_number') or context.get('issue_number'),
             )
 
         if not project_dir.exists():
