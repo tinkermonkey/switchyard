@@ -59,10 +59,16 @@ class BoardLockHeartbeatTestBase(unittest.TestCase):
         self.config_manager.list_projects.return_value = []
         self.config_manager.list_visible_projects.return_value = ["proj"]
         self.config_manager.get_project_config.return_value = project_config
+        self.config_manager.get_agents.return_value = {}
 
         self.monitor = ProjectMonitor(Mock(), self.config_manager)
         self.monitor.pipeline_run_manager = Mock()
-        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(id="run-1")
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='active'
+        )
+        # No decision-event heartbeat available (what an unreachable
+        # Elasticsearch returns) unless a test says otherwise.
+        self.monitor._get_last_pipeline_run_event_time = Mock(return_value=None)
 
         self.lock_manager = MagicMock()
         self.lock_manager.touch_lock.return_value = TouchResult.REFRESHED
@@ -84,7 +90,84 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
 
         self.sweep()
 
-        self.lock_manager.touch_lock.assert_called_once_with("proj", "board", 123)
+        self.lock_manager.touch_lock.assert_called_once_with(
+            "proj", "board", 123, create_if_missing=False
+        )
+
+    def test_the_liveness_lookup_is_board_scoped_and_read_only(self):
+        """
+        Both arguments are load-bearing and were missing. Without board=,
+        get_active_pipeline_run() checks only the LEGACY board-less Redis
+        mapping -- which create_pipeline_run() never writes -- so every lookup
+        falls through to Elasticsearch and returns None whenever ES is down,
+        silently turning this whole heartbeat off (and, when ES is up, letting
+        one board's run keep a leaked lock alive on another board). Without
+        restore_to_redis=False, this periodic sweep re-setexes a crashed run's
+        blob on every pass, keeping alive the very predicate that decides to
+        pin the lock -- exactly what that flag's docstring warns sweeps about.
+        """
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+
+        self.sweep()
+
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.assert_called_once_with(
+            "proj", 123, board="board", restore_to_redis=False
+        )
+
+    def test_does_not_refresh_a_run_parked_in_feedback_listening(self):
+        """
+        get_active_pipeline_run() also returns runs whose status is
+        'feedback_listening' -- the status the human-feedback loop sets
+        precisely so the zombie watchdog will NOT kill it while a human takes
+        "many hours" to reply. Heartbeating that hold would pin the whole board
+        for the entire wait, with no automatic recovery: the TTL and the 4-hour
+        staleness heuristic are the only continuous reclaim paths board locks
+        have, and refreshing disables both.
+        """
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = Mock(
+            id="run-1", status='feedback_listening'
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_stops_refreshing_a_run_that_has_gone_silent_longer_than_any_agent_may_run(self):
+        """
+        The bound on pinning. A run that dies without ever being marked ended
+        keeps reading 'active' in Elasticsearch, and refreshing it forever
+        would wedge the board until the orchestrator restarts --
+        _reconcile_active_runs()'s stale-lock watchdog runs only at startup,
+        and pipeline_watchdog reaps runs, not locks (and skips its whole pass
+        while the Claude Code breaker is open, which is the window this sweep
+        is placed above the breaker checks to keep running through).
+        """
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor._get_last_pipeline_run_event_time = Mock(
+            return_value=datetime.now(timezone.utc) - timedelta(seconds=3600 + HEARTBEAT_INTERVAL_SECONDS + 60)
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_not_called()
+
+    def test_still_refreshes_a_run_whose_last_event_is_within_that_window(self):
+        """The silence window has to clear the longest an agent may legitimately
+        run without writing a decision event, or this bound would itself
+        re-open the double-dispatch the sweep exists to prevent."""
+        self.config_manager.get_agents.return_value = {'agent': Mock(timeout=3600)}
+        self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
+        self.monitor._get_last_pipeline_run_event_time = Mock(
+            return_value=datetime.now(timezone.utc) - timedelta(seconds=3600 - 60)
+        )
+
+        self.sweep()
+
+        self.lock_manager.touch_lock.assert_called_once_with(
+            "proj", "board", 123, create_if_missing=False
+        )
 
     def test_does_not_refresh_a_lock_younger_than_the_heartbeat_interval(self):
         """Aged against the lock's OWN lock_acquired_at (which touch_lock
@@ -98,9 +181,10 @@ class TestRefreshesLiveBoardLocks(BoardLockHeartbeatTestBase):
         self.lock_manager.touch_lock.assert_not_called()
 
     def test_does_not_refresh_when_the_holder_has_no_active_pipeline_run(self):
-        """Same predicate _reconcile_active_runs()'s stale-lock watchdog uses to
-        decide a lock is abandoned -- refreshing unconditionally would pin an
-        abandoned lock forever and disable both recovery paths."""
+        """Refreshing unconditionally would pin an abandoned lock forever and
+        disable both recovery paths board locks actually have at runtime (the
+        7200s TTL and the 4-hour age heuristic) -- _reconcile_active_runs()'s
+        stale-lock watchdog only runs at startup."""
         self.lock_manager.get_lock_fail_closed.return_value = (_lock(), True)
         self.monitor.pipeline_run_manager.get_active_pipeline_run.return_value = None
 
@@ -161,7 +245,9 @@ class TestSweepIsResilientAndRateLimited(BoardLockHeartbeatTestBase):
 
         self.sweep()
 
-        self.lock_manager.touch_lock.assert_called_once_with("proj", "board2", 123)
+        self.lock_manager.touch_lock.assert_called_once_with(
+            "proj", "board2", 123, create_if_missing=False
+        )
 
     def test_a_project_whose_config_cannot_be_loaded_is_skipped(self):
         self.config_manager.get_project_config.side_effect = Exception("no config")

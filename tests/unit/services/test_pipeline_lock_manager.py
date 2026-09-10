@@ -13,7 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.
 from services.pipeline_lock_manager import PipelineLockManager, PipelineLock, TouchResult
 
 
-def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=None):
+def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=None, before=None):
     """
     Stand in for redis-py's Redis.transaction(func, *watches,
     value_from_callable=True), which touch_lock()'s Redis leg now goes through
@@ -25,15 +25,38 @@ def _touch_transaction_side_effect(hgetall_result, hset_exc=None, expire_exc=Non
     upfront read and the write" race expressible in a test at all. hset/expire
     failures are raised at call time rather than at execute(); either way the
     exception leaves transaction(), which is the boundary touch_lock() catches.
+    `before` runs just before the callable does, so a test can land a
+    concurrent release in the middle of a touch.
+
+    The returned function records the ORDER of the pipeline calls the callable
+    makes on `.calls`. That ordering is load-bearing and otherwise invisible:
+    MagicMock makes pipe.multi() a no-op, but in real redis-py a watching
+    pipeline executes commands immediately until multi() is called, so
+    hset/expire issued before it would fire outside the transaction and the
+    WATCH would gate nothing.
     """
+    calls = []
+
+    def _record(name, exc):
+        def _call(*args, **kwargs):
+            calls.append(name)
+            if exc is not None:
+                raise exc
+        return _call
+
     def _side_effect(func, *keys, **kwargs):
+        if before is not None:
+            before()
         mock_pipe = MagicMock()
-        mock_pipe.hgetall.return_value = hgetall_result
-        if hset_exc is not None:
-            mock_pipe.hset.side_effect = hset_exc
-        if expire_exc is not None:
-            mock_pipe.expire.side_effect = expire_exc
+        mock_pipe.hgetall.return_value = (
+            hgetall_result() if callable(hgetall_result) else hgetall_result
+        )
+        mock_pipe.multi.side_effect = _record('multi', None)
+        mock_pipe.hset.side_effect = _record('hset', hset_exc)
+        mock_pipe.expire.side_effect = _record('expire', expire_exc)
         return func(mock_pipe)
+
+    _side_effect.calls = calls
     return _side_effect
 
 
@@ -380,15 +403,56 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
     def test_redis_leg_still_re_establishes_a_key_whose_ttl_lapsed(self):
         """An ABSENT key is the TTL having lapsed under a hold the
         non-expiring YAML copy still records as ours -- re-establishing it is
-        the self-heal the heartbeat exists for, and WATCH is what makes it safe
-        (it aborts if anyone creates the key underneath us)."""
+        the self-heal the heartbeat exists for. What authorizes it is the
+        GUARDED YAML re-read confirming the holder, not this call's opening
+        snapshot, so the write only happens on a second transaction after that
+        confirmation."""
         self.mock_redis.hgetall.return_value = {}
         self.manager._create_lock("proj", "board", 123)
-        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect({})
+        side_effect = _touch_transaction_side_effect({})
+        self.mock_redis.transaction.side_effect = side_effect
 
         result = self.manager.touch_lock("proj", "board", 123)
 
         self.assertIs(result, TouchResult.REFRESHED)
+        self.assertEqual(self.mock_redis.transaction.call_count, 2)
+        self.assertEqual(side_effect.calls, ['multi', 'hset', 'expire'])
+
+    def test_the_redis_leg_watches_the_lock_key_and_takes_the_callables_value(self):
+        """
+        The two arguments that MAKE this a compare-and-set, and which a
+        stateless MagicMock cannot fail on: the watched key (without it nothing
+        is WATCHed and a concurrent acquire between the read and the execute is
+        never detected) and value_from_callable (without it redis-py returns
+        execute()'s list, the "not_held" comparison is never true, and the leg
+        reports REFRESHED for every input -- a blind overwrite again).
+        """
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.manager._create_lock("proj", "board", 123)
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            _redis_lock_hash(123)
+        )
+
+        self.manager.touch_lock("proj", "board", 123)
+
+        self.assertEqual(
+            self.mock_redis.transaction.call_args.args[1:],
+            (self.manager._get_lock_key("proj", "board"),),
+        )
+        self.assertIs(self.mock_redis.transaction.call_args.kwargs["value_from_callable"], True)
+
+    def test_the_redis_leg_buffers_its_writes_behind_multi(self):
+        """A watching redis-py pipeline runs commands immediately until
+        multi() is called, so an hset issued before it would land outside the
+        transaction and the WATCH would gate nothing."""
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.manager._create_lock("proj", "board", 123)
+        side_effect = _touch_transaction_side_effect(_redis_lock_hash(123))
+        self.mock_redis.transaction.side_effect = side_effect
+
+        self.manager.touch_lock("proj", "board", 123)
+
+        self.assertEqual(side_effect.calls, ['multi', 'hset', 'expire'])
 
     def test_yaml_leg_refuses_a_holder_that_changed_between_the_read_and_the_write(self):
         """Same race on the YAML side, which try_acquire_lock()'s YAML fallback
@@ -419,7 +483,9 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
         original = self.manager.get_lock("proj", "board")
 
         with patch('utils.file_lock.file_lock', side_effect=TimeoutError("guard busy")):
-            result = self.manager._touch_lock_yaml("proj", "board", 123, original)
+            result, _ = self.manager._touch_lock_yaml(
+                "proj", "board", 123, original, allow_reestablish=False
+            )
 
         self.assertIs(result, TouchResult.REFRESH_FAILED)
         self.assertEqual(
@@ -450,12 +516,156 @@ class TestTouchLockIsACompareAndSet(unittest.TestCase):
             return real_file_lock(path, *args, **kwargs)
 
         with patch('utils.file_lock.file_lock', side_effect=spy):
-            result = self.manager._touch_lock_yaml("proj", "board", 123, original)
+            result, _ = self.manager._touch_lock_yaml(
+                "proj", "board", 123, original, allow_reestablish=False
+            )
 
         self.assertIs(result, TouchResult.REFRESHED)
         state_file = self.manager._get_state_file("proj", "board")
         self.assertEqual(taken[0], str(state_file) + '.acquire.lock')
         self.assertIn(str(state_file) + '.lock', taken[1:])
+
+
+class TestTouchLockDoesNotResurrectAReleasedLock(unittest.TestCase):
+    """
+    Found in the #153 WI-8 review round. Neither store can tell "the TTL
+    lapsed under a live hold" from "release_lock() just deleted this": an
+    absent Redis key and a missing state file are exactly what a completed
+    release leaves behind. Both legs used to re-create their record from
+    `fallback_lock` -- the snapshot touch_lock() read BEFORE the race -- so a
+    touch overlapping a release silently put the lock back, with a fresh
+    lock_acquired_at and a fresh 7200s TTL, held by an issue whose run had
+    already ended. WATCH does not help: it aborts on a concurrent CREATE, and
+    the absent branch is reached by a concurrent DELETE (redis-py then re-runs
+    the callable, whose re-read sees the same absent key).
+
+    Nothing reclaims such a lock at runtime -- _reconcile_active_runs()'s
+    stale-lock watchdog runs only at orchestrator startup and
+    pipeline_watchdog reaps runs, not locks -- so the board stops dispatching
+    until the TTL lapses again or scripts/release_lock.py is run.
+
+    The rule now is cross-store: a record missing from one store is only
+    re-created while the OTHER store still positively names this holder.
+    Both stores empty is a release, and stays released.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_a_release_landing_between_the_read_and_the_write_is_not_put_back(self):
+        """release_lock() deletes the Redis key and then unlinks the state
+        file, taking neither guard this method could serialize against."""
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)  # opening read: still ours
+        self.manager._create_lock("proj", "board", 123)
+        state_file = self.manager._get_state_file("proj", "board")
+        side_effect = _touch_transaction_side_effect({}, before=state_file.unlink)
+        self.mock_redis.transaction.side_effect = side_effect
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(result)
+        self.assertEqual(side_effect.calls, [])  # nothing written to Redis
+        self.assertFalse(state_file.exists())
+
+    def test_a_yaml_only_manager_does_not_re_create_a_record_released_under_it(self):
+        """Same race with no Redis configured, where the state file is the
+        only copy there is -- and there is no authoritative Redis record to
+        overwrite it on the next acquire."""
+        self.manager.redis_client = None
+        self.manager._create_lock("proj", "board", 123)
+        state_file = self.manager._get_state_file("proj", "board")
+        stale_view = self.manager.get_lock("proj", "board")
+        state_file.unlink()
+
+        with patch.object(self.manager, 'get_lock_fail_closed', return_value=(stale_view, True)):
+            result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(state_file.exists())
+
+    def test_a_missing_yaml_record_is_still_healed_while_redis_names_this_holder(self):
+        """The other direction is NOT a release signature: release_lock()
+        deletes the Redis key BEFORE unlinking the state file, so "Redis has
+        it, YAML doesn't" can only be a YAML write that failed at acquisition
+        time -- which is exactly what this leg should heal."""
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.mock_redis.transaction.side_effect = _touch_transaction_side_effect(
+            _redis_lock_hash(123)
+        )
+        state_file = self.manager._get_state_file("proj", "board")
+        self.assertFalse(state_file.exists())
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.REFRESHED)
+        self.assertTrue(state_file.exists())
+        self.assertEqual(self.manager.get_lock("proj", "board").locked_by_issue, 123)
+
+    def test_create_if_missing_false_refuses_an_absent_key_outright(self):
+        """
+        What the board-lock sweep passes. Board locks are released and
+        re-acquired constantly from worker threads with no coupling to that
+        sweep, and the sweep refreshes them every 1800s against a 7200s TTL --
+        so an absent key there is far more likely to be a completed release
+        than a lapse, and re-establishing it would wedge the board.
+        """
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)
+        self.manager._create_lock("proj", "board", 123)
+        original = self.manager.get_lock("proj", "board")
+        side_effect = _touch_transaction_side_effect({})
+        self.mock_redis.transaction.side_effect = side_effect
+
+        result = self.manager.touch_lock("proj", "board", 123, create_if_missing=False)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertEqual(side_effect.calls, [])
+        # The YAML leg is not reached either -- nothing is rewritten anywhere.
+        self.assertEqual(
+            self.manager.get_lock("proj", "board").lock_acquired_at,
+            original.lock_acquired_at,
+        )
+
+
+class TestTouchLockSurfacesAYamlConfirmedLoss(unittest.TestCase):
+    """
+    Found in the #153 WI-8 review round: a YAML-confirmed loss was downgraded
+    to REFRESH_FAILED whenever a Redis client was merely CONFIGURED, on the
+    reasoning that "Redis already answered above". It has not answered when its
+    own leg raised -- and a Redis outage is precisely when try_acquire_lock()
+    falls to its YAML path and hands the lock to a second caller, so the YAML
+    record is the only store that knows. Reporting REFRESH_FAILED there left
+    project_checkout_lock's "may now be racing a different holder" ERROR
+    unreachable for that outage, which is the one thing TouchResult exists to
+    make loud.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.mock_redis = MagicMock()
+        self.manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=self.mock_redis)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_not_held_when_the_redis_leg_errored_and_yaml_names_another_holder(self):
+        self.mock_redis.hgetall.return_value = _redis_lock_hash(123)  # opening read: ours
+        self.manager._create_lock("proj", "board", 456)  # what is actually on disk
+        self.mock_redis.transaction.side_effect = Exception("connection reset by peer")
+
+        result = self.manager.touch_lock("proj", "board", 123)
+
+        self.assertIs(result, TouchResult.NOT_HELD)
+        self.assertFalse(result)
+        # Read the YAML copy directly: get_lock() prefers the (mocked) Redis
+        # record, which is the stale view this test is about.
+        yaml_lock, _ = self.manager._read_yaml_lock_only("proj", "board")
+        self.assertEqual(yaml_lock.locked_by_issue, 456)
 
 
 class TestYamlFallbackAcquisitionIsSerialized(unittest.TestCase):
