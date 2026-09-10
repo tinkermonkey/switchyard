@@ -1479,6 +1479,23 @@ class TestExternalEffects:
         pytest.importorskip('redis')
         elasticsearch = pytest.importorskip('elasticsearch')
 
+        import services.pipeline_run as pipeline_run
+
+        #  The precondition the script has in its own process and cannot have in
+        #  this one. scripts/dry_run_state_sweep.py holds no orchestrator imports
+        #  at module scope, so services.pipeline_run is absent from sys.modules
+        #  when a real run starts and the global is None. Under pytest it is
+        #  already populated: ProjectMonitor.__init__ calls
+        #  get_pipeline_run_manager() eagerly, so every test file in
+        #  tests/unit/services/ that constructs one leaves a live manager in this
+        #  global for the rest of the session. _module_global_discarded() restores
+        #  whatever it found -- correctly, a programmatic caller's own singleton is
+        #  not the harness's to destroy -- so without this line the assertions
+        #  below read back that neighbour's manager and the test's result depends
+        #  on which files ran before it. Same reason, same shape, as
+        #  test_a_redis_client_built_inside_the_window_does_not_outlive_it.
+        pipeline_run._pipeline_run_manager = None
+
         def _build_manager(manager):
             from services.pipeline_run import get_pipeline_run_manager
 
@@ -1486,7 +1503,7 @@ class TestExternalEffects:
             return 0
 
         first = _run(_spec(_build_manager), deployment, tmp_path / 'a')
-        pipeline_run = sys.modules['services.pipeline_run']
+        assert pipeline_run is sys.modules['services.pipeline_run']
 
         # The two PUTs __init__ makes, intercepted rather than performed.
         assert first['external_effects']['es_writes']['by_operation'] == {
