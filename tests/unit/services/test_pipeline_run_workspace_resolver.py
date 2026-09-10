@@ -129,7 +129,8 @@ class TestResolveWorkspaceExistingBranchHit:
         # wait under, and the run pipeline_watchdog must not reap is the
         # sub-issue's.
         mock_worktree.assert_called_once_with(
-            "context-studio", "10", "feature/issue-10-existing-epic", issue_number=42
+            "context-studio", "10", "feature/issue-10-existing-epic", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
 
         assert result is pipeline_run
@@ -166,7 +167,8 @@ class TestResolveWorkspaceColdStart:
 
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-feature", issue_number=42
+            "context-studio", "42", "feature/issue-42-feature", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
 
         assert result.branch_name == "feature/issue-42-feature"
@@ -413,7 +415,8 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
         mock_resolve_branch.assert_called_once_with("context-studio", "42")
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-standalone", issue_number=42
+            "context-studio", "42", "feature/issue-42-standalone", issue_number=42,
+            checkout_lock_timeout_seconds=None,
         )
         assert result.branch_name == "feature/issue-42-standalone"
         assert result.project_dir == "/workspace/.orchestrator/worktrees/test-project/42"

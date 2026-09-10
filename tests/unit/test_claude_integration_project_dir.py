@@ -56,16 +56,20 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
-            mock_wm.get_project_dir.return_value = Path('/workspace/test-project')
+            mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/test-project'))
             mock_wm.is_base_clone_dir.return_value = True  # this IS the shared base clone (epic_id=None)
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             result = await run_claude_code('do the thing', context)
 
-            # Resolved off the event loop (#151/WI-6 review), so epic_id and
-            # branch_name go positionally through asyncio.to_thread; issue_number
-            # is the wait's watchdog-exemption key.
-            mock_wm.get_project_dir.assert_called_once_with(
+            # Resolved off the event loop (#151/WI-6 review) via
+            # get_project_dir_off_loop(), which runs the blocking resolution on
+            # project_workspace's DEDICATED pool rather than asyncio.to_thread()'s
+            # default executor -- the default one is also how
+            # project_checkout_lock_async acquires and releases, so waits for that
+            # lock must not sit in it. epic_id and branch_name go positionally;
+            # issue_number is the wait's watchdog-exemption key.
+            mock_wm.get_project_dir_off_loop.assert_called_once_with(
                 'test-project', None, None, issue_number=100
             )
             assert result == 'output'
@@ -86,13 +90,13 @@ class TestRunClaudeCodeProjectDirResolution:
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('pathlib.Path.exists', return_value=True):
-            mock_wm.get_project_dir.return_value = Path('/workspace/.orchestrator/worktrees/test-project/42')
+            mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/42'))
             mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
 
-            mock_wm.get_project_dir.assert_called_once_with(
+            mock_wm.get_project_dir_off_loop.assert_called_once_with(
                 'test-project', '42', 'feature/issue-42-shared', issue_number=100
             )
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
@@ -120,7 +124,7 @@ class TestRunClaudeCodeProjectDirResolution:
 
             await run_claude_code('do the thing', context)
 
-            mock_wm.get_project_dir.assert_not_called()
+            mock_wm.get_project_dir_off_loop.assert_not_called()
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
             assert mount_dir == Path('/workspace/.orchestrator/worktrees/test-project/77')
 
@@ -139,12 +143,12 @@ class TestRunClaudeCodeProjectDirResolution:
         with patch('claude.claude_integration.workspace_manager') as mock_wm, \
              patch('claude.claude_integration.docker_runner') as mock_runner, \
              patch('pathlib.Path.exists', return_value=True):
-            mock_wm.get_project_dir.return_value = Path('/workspace/.orchestrator/worktrees/test-project/200')
+            mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/200'))
             mock_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
 
-            mock_wm.get_project_dir.assert_called_once_with(
+            mock_wm.get_project_dir_off_loop.assert_called_once_with(
                 'test-project', '200', None, issue_number=200
             )

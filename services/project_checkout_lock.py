@@ -395,6 +395,18 @@ def _tracked_resource_activity(
                     _resource_activity.pop(key, None)
 
 
+# Public name for the registrar above. services/project_workspace.py publishes
+# its own per-epic serializer wait through this same registry (code review on
+# #151/WI-6): a thread queued on that plain threading.Lock is exactly as
+# invisible to the watchdog's container probe as one queued in the poll loop
+# below, and for the same reason -- it is waiting to run work that has no
+# container yet. The registry is deliberately generic over resource_name (the
+# key is (project, issue_number), and describe_active_resource_lock_activity()
+# just reports whichever resource the oldest live activity names), so it needs
+# no change to carry a second waiter type.
+tracked_resource_activity = _tracked_resource_activity
+
+
 def describe_active_resource_lock_activity(project: str, issue_number: int) -> Optional[str]:
     """
     Describe the oldest live resource-lock wait/hold for (project, issue_number),

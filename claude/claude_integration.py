@@ -153,10 +153,17 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
             # `async with project_checkout_lock_async` below) releases from a
             # coroutine on this loop, so the poll would starve the holder it is
             # waiting for and be guaranteed to time out.
+            #
+            # On the dedicated worktree pool, not asyncio.to_thread()'s default
+            # executor (code review on #151/WI-6): that default pool is also what
+            # `async with project_checkout_lock_async` below uses to acquire the
+            # lock and -- via _join_heartbeat_thread_async(), which runs before
+            # the release -- to release it, so filling it with up-to-3h waits for
+            # that same lock starves the holder rather than merely queueing
+            # behind it. See project_workspace._get_epic_worktree_executor().
             epic_id = task_context_for_dir.get('epic_id')
             branch_name = task_context_for_dir.get('branch_name')
-            project_dir = await asyncio.to_thread(
-                workspace_manager.get_project_dir,
+            project_dir = await workspace_manager.get_project_dir_off_loop(
                 project,
                 epic_id,
                 branch_name,

@@ -8504,11 +8504,26 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     has_running_loop = False
 
                 if has_running_loop:
+                    # checkout_lock_timeout_seconds=0.0 (code review on
+                    # #151/WI-6): the .result() below blocks THIS thread's event
+                    # loop for the whole resolution, and every in-process holder
+                    # of the project_checkout lock a cold epic's creation path
+                    # would wait for releases from a coroutine on that same
+                    # loop -- so a wait here can only ever time out, after
+                    # freezing the orchestrator for up to the full ~3h budget.
+                    # get_or_create_epic_worktree() clamps exactly this hazard
+                    # by itself everywhere it can SEE it, but it cannot see it
+                    # here: resolve_workspace() reaches it from inside
+                    # asyncio.run() on a pool thread, so its
+                    # asyncio.get_running_loop() probe finds the INNER loop's
+                    # worker (no running loop) and reports off-loop. Say
+                    # explicitly what the probe cannot: one attempt, no sleeping.
                     with concurrent.futures.ThreadPoolExecutor() as pool:
                         pool.submit(
                             asyncio.run,
                             self.pipeline_run_manager.resolve_workspace(
-                                pipeline_run, github, workspace_type
+                                pipeline_run, github, workspace_type,
+                                checkout_lock_timeout_seconds=0.0,
                             )
                         ).result()
                 else:

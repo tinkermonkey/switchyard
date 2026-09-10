@@ -413,6 +413,7 @@ class PipelineRunManager:
         pipeline_run: 'PipelineRun',
         github_integration,
         workspace_type: str,
+        checkout_lock_timeout_seconds: Optional[float] = None,
     ) -> 'PipelineRun':
         """
         Resolve (and persist) the git branch and isolated epic worktree this
@@ -477,6 +478,22 @@ class PipelineRunManager:
                 parent issue (see FeatureBranchManager.get_parent_issue).
             workspace_type: The dispatch's workspace type ('issues', 'hybrid',
                 'discussions', ...). Only 'issues'/'hybrid' are resolved.
+            checkout_lock_timeout_seconds: Forwarded to
+                get_or_create_epic_worktree() -- how long a cold epic's creation
+                path may wait for this project's project_checkout lock. None (the
+                default) lets that method decide from the calling thread and the
+                run's attribution. Exists for the one caller that CANNOT be
+                detected from the calling thread (code review on #151/WI-6):
+                project_monitor._start_repair_cycle_for_issue() runs this
+                coroutine via `asyncio.run` submitted to a throwaway
+                ThreadPoolExecutor and then blocks its own event loop on
+                .result(). Inside that worker thread there is no running loop for
+                _resolve_checkout_lock_timeout()'s probe to find, so its
+                on-the-loop clamp reports a false negative and grants the full ~3h
+                budget -- while the OUTER loop, which is where every in-process
+                holder of that lock releases from, is frozen for the duration and
+                the wait therefore cannot succeed. That call site passes 0.0 to
+                say what the probe cannot see.
 
         Returns:
             pipeline_run, with branch_name/project_dir/epic_id populated for 'issues'/
@@ -589,12 +606,20 @@ class PipelineRunManager:
         # calibrated acquire budget over the unattributed cap; see
         # get_or_create_epic_worktree()'s issue_number docs. Already off the event
         # loop here, so waiting costs the loop nothing.
-        project_dir = await asyncio.to_thread(
-            workspace_manager.get_or_create_epic_worktree,
+        #
+        # get_or_create_epic_worktree_off_loop(), not asyncio.to_thread() (code
+        # review on #151/WI-6): to_thread() puts this up-to-3h wait on the loop's
+        # DEFAULT executor, which is also the pool project_checkout_lock_async
+        # uses to acquire and -- via _join_heartbeat_thread_async() -- to release.
+        # Saturate it with waits for that lock and its holder cannot get a thread
+        # to finish releasing it. The dedicated pool breaks that cycle; see
+        # project_workspace._get_epic_worktree_executor().
+        project_dir = await workspace_manager.get_or_create_epic_worktree_off_loop(
             pipeline_run.project,
             epic_id,
             branch_name,
             issue_number=pipeline_run.issue_number,
+            checkout_lock_timeout_seconds=checkout_lock_timeout_seconds,
         )
 
         # get_or_create_epic_worktree() can silently adopt a pre-existing worktree that's

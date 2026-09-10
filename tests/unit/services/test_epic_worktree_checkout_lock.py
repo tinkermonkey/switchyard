@@ -41,6 +41,7 @@ import shutil
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -594,3 +595,342 @@ class TestContentionIsScopedToTheEpic:
         assert second_result == [
             tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '802'
         ]
+
+
+class TestPruneDoesNotDeleteAnInFlightWorktree:
+    """Code review on #151/WI-6. prune_epic_worktrees()'s per-worktree
+    tracked-check used to be a genuine barrier: _epic_worktree_lock was
+    get_or_create_epic_worktree()'s whole serializer, so acquiring it here
+    blocked until any concurrent adoption/creation had finished AND registered
+    itself in _epic_worktrees. Demoting that lock to a map guard (so one epic's
+    slow creation stops blocking every other epic) turned the check into an
+    instant read that returns 'untracked' for a worktree another thread is
+    actively populating -- and this sweep then force-removes the directory,
+    which is exactly the outcome prune's own docstring says the check exists to
+    prevent ("every subsequent operation on that epic would fail until the next
+    restart, silently defeating #48's own fix").
+
+    _epic_worktrees_pending restores the skip decision without restoring the
+    blocking: prune runs on the event-loop thread at startup, so taking the
+    per-key lock here would freeze the loop for the creation's whole budget.
+    """
+
+    def _quiet_prune_environment(self, manager):
+        """prune's own side calls, stubbed: the docker liveness probe (no
+        containers running) and every git subprocess it may run."""
+        return (
+            patch.object(manager, '_get_running_container_mount_sources', return_value=set()),
+            patch('services.project_workspace.subprocess.run', return_value=_ok()),
+        )
+
+    def test_a_worktree_being_adopted_is_not_pruned(self, manager, tmp_path):
+        """The concrete startup interleaving: container recovery's
+        _process_completed_repair_cycle() adopts a surviving worktree on its
+        monitor thread while main.py's prune sweep runs on the event loop."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'
+        (worktree_path / '.git').mkdir(parents=True)
+
+        adopting = threading.Event()
+        release = threading.Event()
+
+        def _slow_branch_probe(_path):
+            adopting.set()
+            release.wait(10)
+            return "feature/issue-900"
+
+        liveness_patch, subprocess_patch = self._quiet_prune_environment(manager)
+        with patch.object(manager, '_current_worktree_branch', side_effect=_slow_branch_probe), \
+             liveness_patch, subprocess_patch as mock_run:
+            adopter = threading.Thread(
+                target=manager.get_or_create_epic_worktree,
+                args=("my-project", "900", "feature/issue-900"),
+                daemon=True,
+            )
+            adopter.start()
+            try:
+                assert adopting.wait(10), "test setup: the adoption never started"
+                manager.prune_epic_worktrees()
+            finally:
+                release.set()
+                adopter.join(10)
+
+        assert worktree_path.exists(), (
+            "prune deleted a worktree another thread was mid-adoption of -- the "
+            "adopting thread then caches a path that no longer exists"
+        )
+        removals = [
+            call for call in mock_run.call_args_list
+            if 'worktree' in call.args[0] and 'remove' in call.args[0]
+        ]
+        assert not removals, f"prune ran a worktree removal anyway: {removals}"
+
+    def test_a_worktree_being_created_is_not_pruned(self, manager, tmp_path):
+        """Same window on the creation path, where it is seconds-to-hours wide
+        rather than milliseconds: `git worktree add` has made the directory but
+        the map write is still behind a project_checkout wait."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '901'
+
+        creating = threading.Event()
+        release = threading.Event()
+
+        def _slow_add(_base_repo_dir, path, _branch_name, _default_branch):
+            (Path(path) / '.git').mkdir(parents=True)
+            creating.set()
+            release.wait(10)
+
+        liveness_patch, subprocess_patch = self._quiet_prune_environment(manager)
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _RecordingLock([])), \
+             patch.object(manager, '_add_epic_worktree', side_effect=_slow_add), \
+             liveness_patch, subprocess_patch as mock_run:
+            creator = threading.Thread(
+                target=manager.get_or_create_epic_worktree,
+                args=("my-project", "901", "feature/issue-901"),
+                daemon=True,
+            )
+            creator.start()
+            try:
+                assert creating.wait(10), "test setup: the creation never started"
+                manager.prune_epic_worktrees()
+            finally:
+                release.set()
+                creator.join(10)
+
+        assert worktree_path.exists(), (
+            "prune deleted a worktree `git worktree add` had just created but "
+            "whose creating thread had not yet registered it"
+        )
+        removals = [
+            call for call in mock_run.call_args_list
+            if 'worktree' in call.args[0] and 'remove' in call.args[0]
+        ]
+        assert not removals, f"prune ran a worktree removal anyway: {removals}"
+
+    def test_a_genuinely_idle_worktree_is_still_pruned(self, manager, tmp_path):
+        """The negative control: the in-flight marker must not turn this sweep
+        into a no-op for the crash leftovers it exists to clean up."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree_path = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '902'
+        (worktree_path / '.git').mkdir(parents=True)
+
+        liveness_patch, subprocess_patch = self._quiet_prune_environment(manager)
+        with liveness_patch, subprocess_patch as mock_run:
+            manager.prune_epic_worktrees()
+
+        removals = [
+            call for call in mock_run.call_args_list
+            if 'worktree' in call.args[0] and 'remove' in call.args[0]
+        ]
+        assert removals, "an untracked, unmounted, uncorrupted leftover was not pruned"
+        assert not worktree_path.exists()
+
+    def test_the_pending_marker_is_dropped_when_a_creation_fails(self, manager, tmp_path):
+        """The marker is a suppression, so it has to be released on every exit --
+        a leaked one would make this epic's leftovers un-prunable for the life of
+        the process."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _RecordingLock([])), \
+             patch.object(manager, '_add_epic_worktree',
+                          side_effect=RuntimeError("git worktree add failed")):
+            with pytest.raises(RuntimeError):
+                manager.get_or_create_epic_worktree(
+                    "my-project", "903", branch_name="feature/issue-903"
+                )
+
+        assert manager._epic_worktrees_pending == {}
+
+
+class TestSameEpicContentionIsBoundedAndAttributed:
+    """Code review on #151/WI-6. The per-key serializer was taken as a bare,
+    untimed `with lock:` -- one level ABOVE the point where
+    project_checkout_lock publishes a wait to its activity registry. So a second
+    dispatch for the SAME epic queued behind a winner that could sit in its
+    project_checkout wait for ~3h, with nothing published under its own
+    (project, issue_number) and no budget of its own: past
+    zombie_threshold_minutes the watchdog reaped that run and redispatched the
+    issue while this thread was still queued, which is the exact double
+    execution the registry was added to prevent."""
+
+    def _parked_winner(self, manager, epic_id):
+        """A thread holding this epic's serializer, parked where a real winner
+        parks: inside the guarded body, with the map guard released."""
+        in_body = threading.Event()
+        release = threading.Event()
+
+        def _slow_add(_base_repo_dir, path, _branch_name, _default_branch):
+            (Path(path) / '.git').mkdir(parents=True)
+            in_body.set()
+            release.wait(10)
+
+        return in_body, release, _slow_add
+
+    def test_a_second_call_for_the_same_epic_publishes_its_wait(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        in_body, release, slow_add = self._parked_winner(manager, "910")
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _RecordingLock([])), \
+             patch.object(manager, '_add_epic_worktree', side_effect=slow_add):
+            winner = threading.Thread(
+                target=manager.get_or_create_epic_worktree,
+                args=("my-project", "910", "feature/issue-910"),
+                kwargs={'issue_number': 911},
+                daemon=True,
+            )
+            winner.start()
+            try:
+                assert in_body.wait(10), "test setup: the winner never reached its body"
+
+                loser = threading.Thread(
+                    target=manager.get_or_create_epic_worktree,
+                    args=("my-project", "910", "feature/issue-910"),
+                    kwargs={'issue_number': 912},
+                    daemon=True,
+                )
+                loser.start()
+
+                # The loser's wait must vouch for ITS OWN issue -- that is what
+                # pipeline_watchdog reads to tell "parked on a lock" from "zombie".
+                deadline = time.monotonic() + 10
+                described = None
+                while time.monotonic() < deadline:
+                    described = project_checkout_lock.describe_active_resource_lock_activity(
+                        "my-project", 912
+                    )
+                    if described:
+                        break
+                    time.sleep(0.05)
+                assert described, (
+                    "a second dispatch for the same epic waited with nothing published "
+                    "under its own issue -- pipeline_watchdog will reap and redispatch it"
+                )
+                assert 'epic_worktree' in described
+            finally:
+                release.set()
+                winner.join(10)
+                loser.join(10)
+
+        assert project_checkout_lock.describe_active_resource_lock_activity(
+            "my-project", 912
+        ) is None, "the wait's registry entry outlived its frame"
+
+    def test_a_second_call_for_the_same_epic_gives_up_instead_of_queueing_forever(
+        self, manager, tmp_path
+    ):
+        from services.resource_lock_errors import is_lock_timeout_error
+
+        _make_base_clone(tmp_path, "my-project")
+        in_body, release, slow_add = self._parked_winner(manager, "913")
+        raised = []
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _RecordingLock([])), \
+             patch.object(manager, '_add_epic_worktree', side_effect=slow_add):
+            winner = threading.Thread(
+                target=manager.get_or_create_epic_worktree,
+                args=("my-project", "913", "feature/issue-913"),
+                kwargs={'issue_number': 914},
+                daemon=True,
+            )
+            winner.start()
+            try:
+                assert in_body.wait(10), "test setup: the winner never reached its body"
+
+                def _loser():
+                    try:
+                        manager.get_or_create_epic_worktree(
+                            "my-project", "913", "feature/issue-913",
+                            issue_number=915,
+                            checkout_lock_timeout_seconds=0.5,
+                        )
+                    except BaseException as e:
+                        raised.append(e)
+
+                loser = threading.Thread(target=_loser, daemon=True)
+                loser.start()
+                loser.join(10)
+                assert not loser.is_alive(), "the second call queued past its own budget"
+            finally:
+                release.set()
+                winner.join(10)
+
+        assert len(raised) == 1, f"expected the loser to fail loud, got {raised}"
+        assert isinstance(raised[0], ProjectCheckoutLockTimeoutError)
+        assert is_lock_timeout_error(raised[0]), (
+            "the loser must route through the 'lock_contention' path, not count as "
+            "a dispatch failure"
+        )
+
+
+class TestBlockingWaitsGetTheirOwnExecutor:
+    """Code review on #151/WI-6. asyncio.to_thread() runs on the loop's DEFAULT
+    executor, and project_checkout_lock_async uses that same pool to acquire the
+    lock AND to release it (_join_heartbeat_thread_async submits the heartbeat
+    join to run_in_executor(None, ...) and awaits it BEFORE the outer finally
+    reaches _release_and_warn). Park enough up-to-3h waits for that lock in the
+    default pool and the coroutine holding it cannot get a thread to finish
+    letting go -- a circular wait in which every waiter is then guaranteed to
+    time out. The off-loop entry points use a dedicated pool so a wait can only
+    ever starve other waits."""
+
+    def test_the_wait_runs_off_the_default_executor(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        parked = threading.Event()
+        release = threading.Event()
+        worker_names = []
+
+        def _slow_add(_base_repo_dir, path, _branch_name, _default_branch):
+            worker_names.append(threading.current_thread().name)
+            (Path(path) / '.git').mkdir(parents=True)
+            parked.set()
+            release.wait(10)
+
+        async def _scenario():
+            loop = asyncio.get_running_loop()
+            # A single-thread default executor makes the hazard exact: if the
+            # resolution below went through asyncio.to_thread it would occupy
+            # the only thread project_checkout_lock_async has to release with.
+            loop.set_default_executor(
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix='default-pool')
+            )
+            resolution = asyncio.create_task(
+                manager.get_or_create_epic_worktree_off_loop(
+                    "my-project", "920", "feature/issue-920"
+                )
+            )
+            await asyncio.to_thread(parked.wait, 10)
+            assert parked.is_set(), "test setup: the resolution never parked"
+            # The default pool must still be usable while that wait is parked.
+            still_free = await asyncio.wait_for(
+                asyncio.to_thread(lambda: 'free'), timeout=5
+            )
+            assert still_free == 'free'
+            release.set()
+            return await resolution
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync', _RecordingLock([])), \
+             patch.object(manager, '_add_epic_worktree', side_effect=_slow_add):
+            resolved = asyncio.run(_scenario())
+
+        assert resolved == tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '920'
+        assert worker_names and worker_names[0].startswith('epic-worktree'), (
+            f"the blocking wait ran on {worker_names!r} -- it must not share a pool "
+            "with project_checkout_lock_async's acquire/release submissions"
+        )
+
+    def test_the_off_loop_entry_point_forwards_its_arguments_verbatim(self, manager, tmp_path):
+        """It is a thread hop and nothing else -- no defaults of its own to drift
+        away from the method it wraps."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch.object(manager, 'get_project_dir', return_value=Path('/x')) as mock_get:
+            resolved = asyncio.run(
+                manager.get_project_dir_off_loop(
+                    "my-project", "921", "feature/issue-921", issue_number=922
+                )
+            )
+
+        assert resolved == Path('/x')
+        mock_get.assert_called_once_with(
+            "my-project", "921", "feature/issue-921", issue_number=922
+        )

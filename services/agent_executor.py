@@ -443,13 +443,20 @@ class AgentExecutor:
         # "work_already_in_progress" on every subsequent poll and the issue is
         # silently skipped until the stuck-state sweep catches it, rather than
         # being retried the way the lock-contention design assumes.
+        #
+        # get_project_dir_off_loop(), not asyncio.to_thread() (code review on
+        # #151/WI-6): to_thread() runs on the loop's DEFAULT executor, which
+        # project_checkout_lock_async also uses to acquire the lock AND -- via
+        # _join_heartbeat_thread_async(), which runs before the release -- to let
+        # go of it. A pool full of up-to-3h waits for that lock therefore starves
+        # the holder they are queued behind. See
+        # project_workspace._get_epic_worktree_executor().
         from services.project_workspace import workspace_manager
 
         try:
             resolved_project_dir = task_context.get('project_dir')
             if not resolved_project_dir:
-                resolved_project_dir = str(await asyncio.to_thread(
-                    workspace_manager.get_project_dir,
+                resolved_project_dir = str(await workspace_manager.get_project_dir_off_loop(
                     project_name,
                     epic_id,
                     epic_branch_name,
@@ -2504,7 +2511,6 @@ class AgentExecutor:
         """
         import subprocess
         import glob
-        from services.project_workspace import workspace_manager
 
         try:
             # Resolve the SAME directory the agent actually ran in. Read it
@@ -2528,9 +2534,15 @@ class AgentExecutor:
                 # reach get_or_create_epic_worktree()'s creation path, whose
                 # project_checkout wait is a time.sleep() poll loop that must never
                 # run on the loop thread -- the holders it waits behind release
-                # from coroutines on that same loop.
-                project_dir = str(await asyncio.to_thread(
-                    workspace_manager.get_project_dir,
+                # from coroutines on that same loop. On the dedicated worktree pool
+                # rather than asyncio.to_thread()'s default executor for a related
+                # reason: that pool is also how project_checkout_lock_async both
+                # acquires and releases, so filling it with waits for that lock
+                # starves the holder they are waiting on. See
+                # project_workspace._get_epic_worktree_executor().
+                from services.project_workspace import workspace_manager
+
+                project_dir = str(await workspace_manager.get_project_dir_off_loop(
                     project_name,
                     task_context.get('epic_id'),
                     task_context.get('branch_name'),

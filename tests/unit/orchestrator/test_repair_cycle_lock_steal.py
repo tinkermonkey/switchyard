@@ -155,7 +155,10 @@ def _run_start_repair_cycle(
     mock_run.project_dir = None
     mock_run.epic_id = None
 
-    async def _default_resolve_workspace(pipeline_run, github_integration, workspace_type):
+    async def _default_resolve_workspace(
+        pipeline_run, github_integration, workspace_type,
+        checkout_lock_timeout_seconds=None,
+    ):
         # No parent (parent_issue_number=None) is resolve_epic_id()'s established
         # lenient fallback, not a hard-fail (code review correction, issue #122):
         # a genuinely standalone issue has no siblings to isolate FROM, so scoping
@@ -619,6 +622,59 @@ class TestEpicWorktreeResolution:
         saved_context = stage_config._epic_mocks['save_context'].call_args.kwargs['context']
         assert saved_context['epic_id'] == '100'
         assert saved_context['project_dir'] == '/workspace/.orchestrator/worktrees/test-project/100'
+
+    def test_no_running_loop_leaves_the_acquire_budget_to_the_resolver(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The plain `asyncio.run(...)` branch blocks no outer loop, so a cold
+        epic's creation path is free to wait out real contention on the base
+        clone -- resolve_workspace() decides the budget for itself."""
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        _result, _launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+        )
+
+        await_kwargs = stage_config._epic_mocks['resolve_workspace'].await_args.kwargs
+        assert await_kwargs.get('checkout_lock_timeout_seconds') is None
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_outer_loop_forbids_a_worktree_lock_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Code review on #151/WI-6. With a loop already running on this thread
+        the method resolves the workspace via `asyncio.run` on a throwaway pool
+        thread and blocks on .result() -- so the OUTER loop is frozen for the
+        whole resolution. get_or_create_epic_worktree()'s own on-the-loop clamp
+        cannot see that: its asyncio.get_running_loop() probe runs on the pool
+        thread, finds no loop, and grants the full ~3h project_checkout budget --
+        while every in-process holder of that lock releases from a coroutine on
+        the frozen loop, so the wait can only ever end in a timeout. This call
+        site has to state the constraint the probe cannot observe.
+        """
+        mock_task_queue.redis_client.get.return_value = None
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue,
+            issue_number=100,
+            parent_issue_number=42,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+        await_kwargs = stage_config._epic_mocks['resolve_workspace'].await_args.kwargs
+        assert await_kwargs.get('checkout_lock_timeout_seconds') == 0.0, (
+            "the loop-blocking branch granted a wait budget it cannot survive -- "
+            "the orchestrator freezes for up to three hours and then fails anyway"
+        )
 
 
 class TestPhantomRunCleanup:
