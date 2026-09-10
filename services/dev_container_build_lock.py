@@ -100,31 +100,71 @@ build images and is not added to the set) is why the gate lives here, next to
 the lock and its docstring, rather than as an inline literal at the call
 site.
 
-Why dev_container_state.set_status() itself is deliberately left unlocked
----------------------------------------------------------------------------
-#56's own issue text flags set_status()'s blind read-modify-write as
-"already flagged as a Phase 0 item (don't re-scope the locking fix itself
-here, just confirm it as this issue's acquire-target once the project-level
-lock exists)". Investigation confirms locking set_status() itself would be
-actively wrong here, not just out of scope: dev_environment_verifier's own
-prompt (Step 5, prompts/content/agents/dev_environment_verifier/
-review_task.md) instructs its live Claude Code session to run inline Python
-that imports dev_container_state and calls set_status() directly, via that
-session's own Bash tool -- WHILE the session is running inside the very
-window this module's lock holds around the whole local execution (see
-claude/claude_integration.py). If set_status() also tried to acquire this
-same resource lock internally, that in-session call would be strictly
-serialized behind the very session it is part of -- the session can't finish
-without that call returning, and that call can't return until the session
-(which holds the lock) finishes. Every acquisition here mints its own unique
-holder id (see below), so this is NOT rescued by PipelineLockManager's
-same-issue-number reentrancy check -- it is a genuine self-block, bounded
-only by this module's own timeout, not a legitimate resolution. So
-set_status() stays exactly as unlocked as it was before this issue;
-protection instead comes from every caller that owns a build/verify
-execution window (claude_integration.py's agent-gated wrap, and each admin
-script's own wrap around its build+state-update sequence) acquiring this
-lock around that whole window before calling set_status() at all.
+Two locks, and which one guards what (#152, item A)
+------------------------------------------------------
+The state file this lock exists for has TWO locks over it, and they are not
+alternatives:
+
+  * THIS lock (dev_container_build, Redis/YAML via
+    ProjectResourceLockManager) guards the whole build/verify EXECUTION
+    WINDOW -- the minutes-to-an-hour during which a `docker build` runs and
+    the resulting verdict is decided. Every caller that owns such a window
+    takes it: claude_integration.py's agent-gated wrap around the local
+    Claude Code session, each admin script's wrap around its build +
+    state-update sequence, and the rebuild endpoint's wrap around its
+    IN_PROGRESS -> build -> BLOCKED sequence.
+  * The state file's OWN lock (state/dev_containers/<project>.yaml.lock,
+    fcntl via utils.file_lock) guards each individual read-modify-write of
+    that YAML, inside DevContainerStateManager._merge_state()/_read_state().
+    #56's issue text deferred set_status()'s blind read-modify-write as a
+    Phase 0 item; #152 closed it here, because "every writer is inside the
+    dev_container_build lock" was never true of this file and cannot be made
+    true -- the pending-operation marker is deliberately written from the
+    rebuild endpoint's REQUEST thread, before the lock wait even starts,
+    precisely so the first poll can see it. Without a lock of its own, that
+    unlocked writer's whole-file rewrite could land on top of a set_status()
+    another container made in between and silently revert it. It is
+    cross-process for the same reason: the observability server and the
+    orchestrator are separate containers.
+
+Ordering is fixed: build lock OUTERMOST, state-file lock INNERMOST, and the
+state-file critical section never calls out -- it does one YAML
+read-modify-write and returns. So there is no lock-order cycle to deadlock
+on.
+
+The verifier's in-session set_status() does not self-block on either
+--------------------------------------------------------------------------
+dev_environment_verifier's own prompt (Step 5,
+prompts/content/agents/dev_environment_verifier/review_task.md) has its live
+Claude Code session run inline Python that imports dev_container_state and
+calls set_status() directly, via that session's own Bash tool -- WHILE the
+session is running inside the very window this module's lock holds around
+the whole local execution (see claude/claude_integration.py). That is why
+set_status() must never acquire THIS lock internally: the call would be
+serialized behind the session it is part of (the session can't finish
+without the call returning; the call can't return until the session, which
+holds the lock, finishes), and since every acquisition here mints its own
+unique holder id (see below), PipelineLockManager's same-issue-number
+reentrancy check does not rescue it -- it is a genuine self-block bounded
+only by this module's timeout.
+
+The state file's own lock does NOT reintroduce that: that in-session call
+runs in a separate subprocess (the Claude Code CLI's Bash tool), so its
+flock is on a different open file description from anything the orchestrator
+thread holds, and the orchestrator thread is not holding the state-file lock
+across the session anyway -- it holds it only for the microseconds of one
+read-modify-write. What the state-file lock DOES do for that call is make it
+safe: the in-session write and the orchestrator-side writes bracketing the
+session no longer interleave mid-file.
+
+The trap that replaces it: utils.file_lock is not re-entrant and raises
+ReentrantFileLockError on a nested same-thread acquire, which both
+_merge_state() and _read_state() swallow via `except Exception`, degrading
+silently to False / {} -- get_status() would report UNVERIFIED for a VERIFIED
+project. Nothing nests today, and the critical sections are kept to the one
+YAML read-modify-write so nothing has cause to: anyone needing another field
+inside one has to read it off the dict already loaded there rather than
+calling back into DevContainerStateManager.
 
 Known, deliberately accepted gaps in coverage
 ------------------------------------------------
@@ -156,7 +196,11 @@ risk to every other agent) was judged out of scope for a surgical fix here.
 The residual exposure is narrow -- at most a few Python statements running
 immediately adjacent to the locked window, never the actual docker build or
 the multi-minute verification session -- and is a state-file bookkeeping
-race, not the Docker-daemon-level race #56 exists to close.
+race, not the Docker-daemon-level race #56 exists to close. Since #152 each
+of those statements is at least atomic in itself: the state file's own lock
+(see "Two locks" above) makes every one of them a serialized
+read-modify-write, so what is still unguarded here is WHICH verdict wins, not
+whether the file survives two of them landing together.
 
 Bookkeeping writers, and why they get a NON-BLOCKING variant (#152, item A)
 -----------------------------------------------------------------------------

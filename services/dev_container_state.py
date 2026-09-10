@@ -274,7 +274,17 @@ class DevContainerStateManager:
         )
 
     def clear_last_operation_error(self, project_name: str) -> None:
-        """Clear the record set by set_last_operation_error()."""
+        """
+        Clear the record set by set_last_operation_error().
+
+        Not the only thing that clears it, and no longer the load-bearing one:
+        _merge_state() drops the record on any write carrying a `status`, so
+        every set_status() from every path supersedes it (see _merge_state).
+        This stays for the rebuild endpoint, which retracts an earlier request's
+        drop explicitly the moment it takes the lock rather than leaving it to
+        the IN_PROGRESS mark that follows -- the retraction is the point there,
+        not a side effect of the next write.
+        """
         self._merge_state(
             project_name, {'last_operation_error': None, 'last_operation_error_at': None}
         )
@@ -283,6 +293,14 @@ class DevContainerStateManager:
         """
         The last requested operation that could not be carried out, as
         {'error': ..., 'at': ...}, or None.
+
+        Reported only until something writes a `status` for this project, which
+        drops the record (see _merge_state) -- so what comes back here always
+        post-dates the project's current verdict rather than describing a
+        rebuild that has since happened. 'at' is part of the payload, not
+        decoration: every consumer (the /api/projects payload, the web UI's
+        DevContainerStatus, mcp/server.py's get_image_build_status) shows it
+        alongside the message so a reader can date the drop.
         """
         state = self._read_state(project_name)
 
@@ -333,7 +351,17 @@ class DevContainerStateManager:
 
     @staticmethod
     def _state_lock_file(state_file: Path) -> Path:
-        """Guard file serializing every read and write of `state_file`."""
+        """
+        Guard file serializing every read and write of `state_file`.
+
+        Nothing inside a _read_state()/_merge_state() critical section may call
+        back into this class: utils.file_lock is not re-entrant and raises
+        ReentrantFileLockError on a nested same-thread acquire, which both
+        methods swallow via their `except Exception` and degrade to {} / False
+        -- i.e. get_status() would start reporting UNVERIFIED for a VERIFIED
+        project rather than raising. No path nests today; the critical sections
+        are deliberately kept to the one YAML read-modify-write for that reason.
+        """
         return state_file.with_suffix(state_file.suffix + '.lock')
 
     def _merge_state(self, project_name: str, updates: Dict) -> bool:
@@ -355,6 +383,19 @@ class DevContainerStateManager:
         as UNVERIFIED, which refuses every task for the project. The lock is
         cross-process (fcntl on the shared bind mount), which matters because
         the observability server and the orchestrator are separate containers.
+
+        Any write carrying a 'status' also drops the last-operation-error
+        record. That record says a requested operation never ran, and it is the
+        one field here with no owner coming back to retract it: its only
+        explicit clear is the rebuild endpoint's, which fires only when ANOTHER
+        rebuild is requested and gets the lock, and unlike the pending-operation
+        marker it has no age-out. So a rebuild dropped on lock contention was
+        reported forever -- an orange "rebuild never started" line under a green
+        "verified" badge, and a "the rebuild has to be requested again" payload
+        to every agent polling get_image_build_status -- on a project some other
+        path had since rebuilt and verified (#152 review). A real verdict
+        genuinely supersedes it, so writing one retracts it here, where every
+        status writer already passes.
 
         Returns True if the file was written.
         """
@@ -383,6 +424,12 @@ class DevContainerStateManager:
                         state.pop(key, None)
                     else:
                         state[key] = value
+
+                if 'status' in updates:
+                    # See the docstring: a verdict retracts the record of an
+                    # operation that never produced one.
+                    state.pop('last_operation_error', None)
+                    state.pop('last_operation_error_at', None)
 
                 with open(state_file, 'w') as f:
                     yaml.dump(state, f, default_flow_style=False)

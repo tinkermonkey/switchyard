@@ -93,9 +93,13 @@ export default function DevContainerStatus({ devContainer }) {
       {devContainer?.last_operation_error && (
         // A requested operation that never ran at all. Not a verdict on the image
         // (the badge above is), so it is reported separately rather than as a
-        // status.
+        // status. Dated like the queued line above: the record survives until
+        // something writes a new status, so an operator has to be able to tell
+        // whether it predates the badge.
         <p className="text-xs text-orange-500 mt-2">
           {devContainer.last_operation_error}
+          {devContainer.last_operation_error_at &&
+            ` (${formatTimestamp(devContainer.last_operation_error_at)})`}
         </p>
       )}
     </div>

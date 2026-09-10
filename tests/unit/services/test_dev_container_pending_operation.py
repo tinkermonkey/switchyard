@@ -226,6 +226,89 @@ class TestLastOperationError:
         assert manager.get_status("proj") == DevContainerStatus.VERIFIED
 
 
+class TestARealVerdictRetractsTheRecord:
+    """#152 review: unlike the pending-operation marker, this record had no
+    age-out and no owner coming back for it -- its only explicit clear fires
+    when ANOTHER rebuild is requested and gets the lock. So a rebuild dropped on
+    contention was reported forever (orange "rebuild never started" under a
+    green "verified" badge; "the rebuild has to be requested again" to every
+    agent polling get_image_build_status) on a project some other path had since
+    rebuilt and verified. Writing a status is what retracts it."""
+
+    def test_a_later_status_write_retracts_it(self, manager):
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+        manager.set_last_operation_error("proj", "rebuild never started")
+
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+
+        assert manager.get_last_operation_error("proj") is None
+
+    def test_a_rebuild_that_followed_the_drop_retracts_it(self, manager):
+        """The sequence that produced the bug: the endpoint's worker times out
+        at 900s and records the drop, then the setup session that was holding
+        the lock finishes and the verifier writes VERIFIED through set_status()
+        -- a path that never touches clear_last_operation_error()."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+        manager.set_last_operation_error(
+            "proj", "rebuild never started: the dev_container_build lock was held"
+        )
+        assert manager.get_last_operation_error("proj")
+
+        manager.set_status("proj", DevContainerStatus.IN_PROGRESS)
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        assert manager.get_last_operation_error("proj") is None
+        assert manager.get_status("proj") == DevContainerStatus.VERIFIED
+
+    def test_it_is_gone_from_the_file_not_merely_unreported(self, manager):
+        """Both keys go, so nothing reads the orphaned timestamp back."""
+        import yaml
+
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+        manager.set_last_operation_error("proj", "rebuild never started")
+
+        manager.set_status("proj", DevContainerStatus.UNVERIFIED)
+
+        state = yaml.safe_load(manager.get_state_file("proj").read_text())
+        assert 'last_operation_error' not in state
+        assert 'last_operation_error_at' not in state
+
+    def test_a_pending_marker_write_does_not_retract_it(self, manager):
+        """Only a verdict supersedes a drop. The marker writes carry no status
+        and say nothing about whether the earlier operation ran, so a rebuild
+        queued behind the same contention must not erase the record of the one
+        that was already dropped."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+        manager.set_last_operation_error("proj", "rebuild never started")
+
+        manager.set_pending_operation("proj", "rebuild")
+        manager.clear_pending_operation("proj")
+
+        assert manager.get_last_operation_error("proj")['error'] == "rebuild never started"
+
+    def test_a_drop_recorded_after_the_verdict_is_kept(self, manager):
+        """Retraction is ordered, not blanket: the concurrent-clicks case where
+        the winning thread finishes BEFORE the losing thread times out still has
+        to report the loser's drop."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+        manager.set_status("proj", DevContainerStatus.IN_PROGRESS)
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+
+        manager.set_last_operation_error("proj", "rebuild never started")
+
+        assert manager.get_last_operation_error("proj")['error'] == "rebuild never started"
+
+    def test_the_record_carries_the_timestamp_its_consumers_display(self, manager):
+        """Every consumer dates the message (the /api/projects payload, the web
+        UI's DevContainerStatus, get_image_build_status), which needs 'at' to be
+        present rather than optional."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED)
+        manager.set_last_operation_error("proj", "rebuild never started")
+
+        recorded = manager.get_last_operation_error("proj")
+        assert datetime.fromisoformat(recorded['at'])
+
+
 class TestGetImageBuildStatusSurfacesTheWait:
     """The reader half. Without it the marker is written and never seen."""
 
@@ -292,3 +375,19 @@ class TestGetImageBuildStatusSurfacesTheWait:
 
         assert result['status'] == "verified"
         assert result['last_operation_error']['error'] == "rebuild never started: lock held"
+        # Dated, so the reading agent can tell a fresh drop from an old one.
+        assert result['last_operation_error']['at']
+
+    def test_a_dropped_rebuild_stops_being_reported_once_a_verdict_lands(self, manager):
+        """#152 review: this tool's docstring tells the reading agent the
+        rebuild "simply has to be requested again", so a record left behind on a
+        project that has since been rebuilt and verified sent every polling
+        agent to re-request a rebuild that already happened."""
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+        manager.set_last_operation_error("proj", "rebuild never started: lock held")
+        manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
+
+        result = self._status(manager, "proj")
+
+        assert result['status'] == "verified"
+        assert result['last_operation_error'] is None

@@ -1130,7 +1130,10 @@ def get_image_build_status(project: str) -> dict:
     carried out at all — most often a rebuild that waited out its whole lock
     window and never started. It is reported separately from "status" because
     it is not a verdict on the image: the image is still whatever it was, and
-    the rebuild simply has to be requested again.
+    the rebuild simply has to be requested again. It carries its own "at"
+    timestamp, and is dropped the moment anything writes a new status for the
+    project, so a record that is present always post-dates the "image_status"
+    alongside it rather than describing a rebuild that has since happened.
 
     Args:
         project: Project name.
