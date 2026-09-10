@@ -264,11 +264,21 @@ def kill_agent(container_name):
             'container_name': container_name
         }), 500
 
+# How long the operator-triggered rebuild endpoint waits for the
+# dev_container_build lock. Deliberately far short of the module default
+# (DEFAULT_TIMEOUT_SECONDS, 3700s), which is calibrated to outlast an agent's own
+# build window: this path is an interactive request whose only feedback channel
+# is the project's state file, and an hour of waiting before recording anything
+# is indistinguishable from the rebuild having silently never happened.
+REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS = 900.0
+
+
 @app.route('/api/projects/<project>/rebuild-image', methods=['POST'])
 def rebuild_image(project):
     """Trigger a background rebuild of a project's agent Docker image."""
     from scripts.rebuild_project_images import rebuild_project_image
     from services.dev_container_build_lock import (
+        dev_container_build_lock_if_free_sync,
         dev_container_build_lock_sync,
         DevContainerBuildLockTimeoutError,
     )
@@ -289,7 +299,9 @@ def rebuild_image(project):
         # thread: a rebuild that never gets the lock never runs, and must not
         # leave the project's status claiming a build is under way.
         try:
-            with dev_container_build_lock_sync(project):
+            with dev_container_build_lock_sync(
+                project, timeout_seconds=REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS
+            ):
                 dev_container_state.set_status(project, DevContainerStatus.IN_PROGRESS)
                 try:
                     ok = rebuild_project_image(project, update_state=True, lock_held_by_caller=True)
@@ -298,10 +310,35 @@ def rebuild_image(project):
                 except Exception as e:
                     dev_container_state.set_status(project, DevContainerStatus.BLOCKED, error_message=str(e))
         except DevContainerBuildLockTimeoutError as e:
-            # Contention, not a build failure -- nothing ran, so nothing about
-            # this project's container state changed and none of it should be
-            # rewritten (#148/WI-3). The operator retries.
+            # Contention, not a build failure -- nothing ran. But this endpoint
+            # already answered {"success": true, "triggered": true} and its only
+            # feedback channel is the state file every caller polls (mcp/server.py's
+            # get_image_build_status reads it directly), so a bare log line here
+            # left that caller reading the project's PRE-EXISTING status -- commonly
+            # 'verified' -- and concluding the rebuild had finished (#152 review).
+            # Record the drop instead.
+            #
+            # Under the non-blocking variant, so this never lands on top of a build
+            # that is genuinely running: if the lock frees up in the meantime the
+            # write is accurate, and if it does not, its holder owns the status and
+            # writes a better one itself (_log_skipped reports which).
             logger.error(f"Rebuild of {project} never started: {e}")
+            try:
+                with dev_container_build_lock_if_free_sync(project) as acquired:
+                    if acquired:
+                        dev_container_state.set_status(
+                            project,
+                            DevContainerStatus.BLOCKED,
+                            error_message=(
+                                f"rebuild never started: the dev_container_build lock was held "
+                                f"for the whole {REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS:.0f}s wait"
+                            ),
+                        )
+            except Exception as record_error:
+                logger.error(
+                    f"Could not record the dropped rebuild of {project}: {record_error}",
+                    exc_info=True,
+                )
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"success": True, "triggered": True, "project": project})
@@ -2362,7 +2399,16 @@ def get_pipeline_run_analysis(pipeline_run_id):
             index='pipeline-runs-*',
             body={
                 'query': {'term': {'id': pipeline_run_id}},
-                '_source': ['summary', 'orchestratorRecommendations', 'projectRecommendations', 'outcome'],
+                '_source': [
+                    'summary', 'orchestratorRecommendations', 'projectRecommendations', 'outcome',
+                    # A failed attempt records these and deliberately never writes
+                    # `summary` (that is what keeps the run re-analysable -- see
+                    # PipelineRunAnalysisService._record_analysis_failure). Without
+                    # them in the projection an attempted-and-failed analysis was
+                    # indistinguishable from one that never ran, which is the exact
+                    # "silent drop" #152 item B set out to fix (#152 review).
+                    'analysis_error', 'analysis_attempted_at',
+                ],
                 'size': 1,
             }
         )
@@ -2371,8 +2417,24 @@ def get_pipeline_run_analysis(pipeline_run_id):
             return jsonify({'success': True, 'analysis': None})
         source = hits[0]['_source']
         summary = source.get('summary', '')
+        analysis_error = source.get('analysis_error')
         if not summary or not summary.strip():
-            return jsonify({'success': True, 'analysis': None})
+            if not analysis_error:
+                return jsonify({'success': True, 'analysis': None})
+            # No summary but a recorded failure: return an analysis payload
+            # carrying the error so the UI renders why, rather than collapsing to
+            # `analysis: null` and showing "No analysis available for this run."
+            return jsonify({
+                'success': True,
+                'analysis': {
+                    'summary': '',
+                    'outcome': source.get('outcome'),
+                    'orchestratorRecommendations': [],
+                    'projectRecommendations': [],
+                    'error': analysis_error,
+                    'attemptedAt': source.get('analysis_attempted_at'),
+                }
+            })
         return jsonify({
             'success': True,
             'analysis': {

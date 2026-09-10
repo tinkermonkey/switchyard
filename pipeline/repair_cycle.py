@@ -57,6 +57,21 @@ logger = logging.getLogger(__name__)
 
 MAX_SYSTEMIC_SUB_CYCLES = 3   # max attempts per special-case sub-cycle
 
+# How long _finalize_unconfirmed_changes_needed() will wait for the
+# dev_container_build lock before giving up on its CHANGES_NEEDED -> BLOCKED
+# write. Deliberately a BOUNDED BLOCKING wait rather than the single
+# non-blocking attempt the other dev_container_state bookkeeping writers use
+# (#152 review): this writer holds no file lock and is not on a startup path,
+# and the interleaving that makes the lock busy here is the common one, not the
+# exceptional one -- dev_environment_verifier writes CHANGES_NEEDED from inside
+# its own Claude Code session (prompts/content/agents/dev_environment_verifier/
+# review_task.md, Step 5), so the 30s poll below routinely observes it while
+# that session still holds the lock for the rest of its output. Five minutes
+# comfortably outlasts that tail without waiting out a whole build (the agents'
+# own timeout is 3600s); a timeout past it is reported loudly rather than
+# skipped silently, because CHANGES_NEEDED has no other owner.
+FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS = 300.0
+
 # "__infrastructure__" failures constructed directly by _run_tests()'s own retry-
 # exhaustion paths (JSON parsing never found a result, or the execution call itself
 # kept failing) carry no diagnostic content about the codebase or environment — there
@@ -2301,42 +2316,75 @@ class RepairCycleStage(PipelineStage):
             a `break` after the setup-queue exception is exempt because that
             path resets state to UNVERIFIED (self-healing) before it can fail.
 
-            The write goes through dev_container_build_lock_if_free_async()
-            (#152 item A). `final_status` was observed one poll interval to
-            several minutes ago, so writing BLOCKED on the strength of it can
-            clobber a newer status a concurrent build/verify or an operator
-            rebuild has since written — turning a project that just came back
-            VERIFIED into a permanently BLOCKED one. Re-reading INSIDE the lock
-            is what makes this check-then-act atomic; locking the write alone
-            would not have. The non-blocking variant is deliberate: if the lock
-            is busy, its holder owns this project's container state and is about
-            to write a terminal status of its own, so waiting out a build for a
-            one-statement write buys nothing. See that module's docstring.
+            The write goes through the dev_container_build lock (#152 item A).
+            `final_status` was observed one poll interval to several minutes ago,
+            so writing BLOCKED on the strength of it can clobber a newer status a
+            concurrent build/verify or an operator rebuild has since written —
+            turning a project that just came back VERIFIED into a permanently
+            BLOCKED one. Re-reading INSIDE the lock is what makes this
+            check-then-act atomic; locking the write alone would not have.
+
+            Unlike the other dev_container_state bookkeeping writers, this one
+            takes the BLOCKING variant with a bounded timeout rather than a single
+            non-blocking attempt (#152 review). A busy lock does not imply a
+            holder that is about to write a terminal status of its own: the
+            verifier writes CHANGES_NEEDED from inside its own session and then
+            holds the lock for the rest of it, and after a restart the dead
+            process's lock can sit in Redis under its own TTL with no holder at
+            all. Skipping on either would leave the project at CHANGES_NEEDED with
+            nothing driving it — the exact permanent block this function exists to
+            prevent. See FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS.
+
+            A timeout past that window is NOT silently swallowed: the event below
+            is emitted either way, carrying whether the terminal write actually
+            landed, and validate_task_can_run()'s CHANGES_NEEDED staleness escape
+            (STALE_CHANGES_NEEDED_MINUTES) is the backstop that keeps the project
+            schedulable regardless.
             """
             if final_status != DevContainerStatus.CHANGES_NEEDED:
                 return
 
-            from services.dev_container_build_lock import dev_container_build_lock_if_free_async
+            from services.dev_container_build_lock import (
+                DevContainerBuildLockTimeoutError,
+                dev_container_build_lock_async,
+            )
 
-            async with dev_container_build_lock_if_free_async(project, issue_number) as acquired:
-                if not acquired:
-                    return
-                current_status = dev_container_state.get_status(project)
-                if current_status != DevContainerStatus.CHANGES_NEEDED:
-                    logger.info(
-                        f"Env rebuild sub-cycle {reason} for {project}, but the dev container "
-                        f"has since moved to {current_status.value} — leaving it alone instead "
-                        f"of forcing BLOCKED"
-                    )
-                    return
-                dev_container_state.set_status(
+            error_type = "env_rebuild_changes_needed_exhausted"
+            try:
+                async with dev_container_build_lock_async(
                     project,
-                    DevContainerStatus.BLOCKED,
-                    error_message=(
-                        f"Env rebuild sub-cycle {reason}; verifier never confirmed "
-                        f"the required fix: {analysis.env_issue_description[:200]}"
-                    ),
+                    issue_number,
+                    timeout_seconds=FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS,
+                ):
+                    current_status = dev_container_state.get_status(project)
+                    if current_status != DevContainerStatus.CHANGES_NEEDED:
+                        logger.info(
+                            f"Env rebuild sub-cycle {reason} for {project}, but the dev container "
+                            f"has since moved to {current_status.value} — leaving it alone instead "
+                            f"of forcing BLOCKED"
+                        )
+                        return
+                    dev_container_state.set_status(
+                        project,
+                        DevContainerStatus.BLOCKED,
+                        error_message=(
+                            f"Env rebuild sub-cycle {reason}; verifier never confirmed "
+                            f"the required fix: {analysis.env_issue_description[:200]}"
+                        ),
+                    )
+            except DevContainerBuildLockTimeoutError as e:
+                # Deliberately caught, not propagated: the sub-cycle is already
+                # finished, and re-raising here would surface as a lock-contention
+                # dispatch outcome for a repair cycle that genuinely ran.
+                logger.error(
+                    f"Env rebuild sub-cycle {reason} for {project}, but the terminal "
+                    f"changes_needed -> blocked transition could not be written: {e}. "
+                    f"The project is left at changes_needed with no sub-cycle driving "
+                    f"it; validate_task_can_run()'s staleness escape will re-queue "
+                    f"setup once it goes stale."
                 )
+                error_type = "env_rebuild_finalize_lock_timeout"
+
             if obs:
                 obs.emit(
                     EventType.ERROR_ENCOUNTERED,
@@ -2345,7 +2393,7 @@ class RepairCycleStage(PipelineStage):
                     project,
                     {
                         "test_type": config.test_type,
-                        "error_type": "env_rebuild_changes_needed_exhausted",
+                        "error_type": error_type,
                         "attempts": attempts_made,
                     },
                     pipeline_run_id=pipeline_run_id,

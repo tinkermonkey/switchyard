@@ -456,7 +456,12 @@ class TestReconciliationTakesTheDevContainerBuildLock:
             status=initial_status,
             image_name=f"{project_name}-agent:latest"
         )
+        self._run_cleanup(dev_container_mgr, lock_granted, execution_tracker)
+        return project_name
 
+    def _run_cleanup(self, dev_container_mgr, lock_granted, execution_tracker):
+        """One cleanup sweep, with the build lock granted or not. Separate from
+        the seeding above so a test can run two sweeps over the same record."""
         with patch('subprocess.run') as mock_run:
             mock_run.return_value = Mock(returncode=0, stdout='', stderr='')
             with patch('redis.Redis') as mock_redis:
@@ -468,19 +473,18 @@ class TestReconciliationTakesTheDevContainerBuildLock:
                 mock_redis_client.lrange.return_value = []
 
                 with patch('services.dev_container_state.dev_container_state', dev_container_mgr), \
+                     patch('services.cleanup_guard.try_claim_cleanup', return_value=True), \
                      patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync',
                            _build_lock(lock_granted)):
                     execution_tracker.cleanup_stuck_in_progress_states()
-
-        return project_name
 
     def test_a_busy_build_lock_skips_the_dev_container_write(
         self, execution_tracker, dev_container_mgr, temp_dirs
     ):
         """THE regression: a build/verify holding the lock owns this project's
-        container state, and this stuck record must not overwrite it. Skipping
-        is recoverable -- validate_task_can_run()'s staleness check on
-        get_status_updated_at() picks up a status left at IN_PROGRESS."""
+        container state, and this stuck record must not overwrite it. The skip is
+        not the end of it -- the record stays in_progress so the next sweep
+        retries (see the two tests below)."""
         project_name = self._run_cleanup_with_stuck_verifier(
             execution_tracker, dev_container_mgr,
             lock_granted=False, initial_status=DevContainerStatus.IN_PROGRESS,
@@ -488,11 +492,13 @@ class TestReconciliationTakesTheDevContainerBuildLock:
 
         assert dev_container_mgr.get_status(project_name) == DevContainerStatus.IN_PROGRESS
 
-    def test_the_work_execution_record_is_still_reconciled_when_the_lock_is_busy(
+    def test_the_stuck_record_is_left_in_progress_when_the_lock_is_busy(
         self, execution_tracker, dev_container_mgr, temp_dirs
     ):
-        """Only the dev container write is skipped: the execution record itself
-        is this module's own state and has nothing to do with the build lock."""
+        """#152 review: marking the record 'failure' is what makes it invisible to
+        every later sweep (this cleanup only looks at 'in_progress'), so consuming
+        it while the dev container reset was skipped stranded the project with
+        nothing scheduled to revisit it. The record must survive the sweep."""
         self._run_cleanup_with_stuck_verifier(
             execution_tracker, dev_container_mgr,
             lock_granted=False, initial_status=DevContainerStatus.IN_PROGRESS,
@@ -500,6 +506,28 @@ class TestReconciliationTakesTheDevContainerBuildLock:
 
         last_exec = execution_tracker.get_last_execution(
             project_name="test-project",
+            issue_number=42,
+            column="Verification",
+            agent="dev_environment_verifier",
+        )
+        assert last_exec['outcome'] == 'in_progress'
+
+    def test_the_next_sweep_completes_the_reconciliation_the_busy_lock_deferred(
+        self, execution_tracker, dev_container_mgr, temp_dirs
+    ):
+        """And the deferral is genuinely self-healing rather than a permanent
+        park: the scheduled 15-minute pass retries and, once the lock is free,
+        both the container state and the execution record are reconciled."""
+        project_name = self._run_cleanup_with_stuck_verifier(
+            execution_tracker, dev_container_mgr,
+            lock_granted=False, initial_status=DevContainerStatus.IN_PROGRESS,
+        )
+
+        self._run_cleanup(dev_container_mgr, True, execution_tracker)
+
+        assert dev_container_mgr.get_status(project_name) == DevContainerStatus.UNVERIFIED
+        last_exec = execution_tracker.get_last_execution(
+            project_name=project_name,
             issue_number=42,
             column="Verification",
             agent="dev_environment_verifier",

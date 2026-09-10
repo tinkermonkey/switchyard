@@ -22,22 +22,31 @@ from pipeline.repair_cycle import (
     RepairTestFailure,
     SystemicAnalysisResult,
     MAX_SYSTEMIC_SUB_CYCLES,
+    FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS,
 )
+from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
 from services.dev_container_state import DevContainerStatus
 
 
-def _lock(granted: bool):
-    """Stand-in for dev_container_build_lock_if_free_async (#152 item A).
+def _lock(granted: bool, calls: list = None):
+    """Stand-in for dev_container_build_lock_async (#152 item A).
 
-    _finalize_unconfirmed_changes_needed() now takes that lock non-blockingly
-    before forcing CHANGES_NEEDED -> BLOCKED, so every test here has to say
-    whether the lock was free. Patched rather than left real so these stay unit
-    tests -- the real one would reach the process-wide PipelineLockManager and
-    its Redis/YAML stores.
+    _finalize_unconfirmed_changes_needed() takes that lock before forcing
+    CHANGES_NEEDED -> BLOCKED, so every test here has to say whether it was
+    obtainable. `granted=False` raises DevContainerBuildLockTimeoutError, which
+    is what the real blocking variant does once its bounded timeout elapses.
+    Patched rather than left real so these stay unit tests -- the real one would
+    reach the process-wide PipelineLockManager and its Redis/YAML stores.
     """
     @asynccontextmanager
     async def _cm(*args, **kwargs):
-        yield granted
+        if calls is not None:
+            calls.append((args, kwargs))
+        if not granted:
+            raise DevContainerBuildLockTimeoutError(
+                "'dev_container_build' lock for project 'test-project' not acquired"
+            )
+        yield
     return _cm
 
 
@@ -83,7 +92,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock(return_value=_passing_result())) as mock_run_tests:
 
@@ -108,7 +117,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -143,7 +152,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock(return_value=failing_result)) as mock_run_tests:
 
@@ -179,7 +188,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock(side_effect=_queue_side_effect)) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -210,7 +219,7 @@ class TestEnvRebuildSubCycleRetrySemantics:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()) as mock_queue, \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()) as mock_run_tests:
 
@@ -240,17 +249,26 @@ class TestFinalizeTakesTheDevContainerBuildLock:
     several minutes earlier. A concurrent build/verify or an operator rebuild
     that finished in between had its result clobbered -- turning a project that
     just came back VERIFIED into a permanently BLOCKED one.
+
+    It takes the BLOCKING variant with a bounded timeout, not the non-blocking
+    one the other dev_container_state bookkeeping writers use: this is the only
+    skipped write with no other owner, and skipping it strands the project at
+    CHANGES_NEEDED -- the exact permanent block the function exists to prevent.
     """
 
-    async def test_no_blocked_write_when_the_build_lock_is_busy(self):
-        """A busy lock means a build/verify owns this project's container state
-        and is about to write a terminal status of its own. Skipping is correct;
-        waiting out a whole build for a one-statement write is not."""
+    async def test_waits_for_the_lock_rather_than_giving_up_on_one_attempt(self):
+        """#152 review: this writer used to take the non-blocking variant and
+        return without writing when the lock was busy. That is the one skipped
+        write with no other owner, and the interleaving that makes the lock busy
+        here is the COMMON one -- the verifier writes CHANGES_NEEDED from inside
+        its own session and holds the lock for the rest of it. It must wait, with
+        a bounded timeout."""
         stage = _stage()
+        calls = []
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(False)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True, calls)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()):
 
@@ -261,10 +279,66 @@ class TestFinalizeTakesTheDevContainerBuildLock:
                 test_cycle_iteration=1, test_type_index=0,
             )
 
+        assert len(calls) == 1
+        assert calls[0][1]['timeout_seconds'] == FINALIZE_CHANGES_NEEDED_LOCK_TIMEOUT_SECONDS
+        assert mock_state.set_status.call_args_list[-1].args[1] == DevContainerStatus.BLOCKED
+
+    async def test_a_lock_timeout_is_reported_not_swallowed(self):
+        """If the bounded wait does elapse the project really is left at
+        CHANGES_NEEDED, so the sub-cycle must say so: an ERROR_ENCOUNTERED event
+        naming the timeout, not a silent return. Skipping the event too (which the
+        old `return` inside the `with` did) left one WARNING as the only trace of
+        a project that no scheduler would touch again."""
+        stage = _stage()
+        obs = Mock()
+        context = _context()
+        context['observability'] = obs
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(False)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
+             patch.object(stage, '_run_tests', new=AsyncMock()):
+
+            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+
+            await stage._run_env_rebuild_sub_cycle(
+                _analysis(), RepairTestRunConfig(test_type="unit"), context,
+                test_cycle_iteration=1, test_type_index=0,
+            )
+
         written = [c.args[1] for c in mock_state.set_status.call_args_list]
         assert DevContainerStatus.BLOCKED not in written
         # The per-attempt UNVERIFIED resets that drive the sub-cycle are untouched.
         assert DevContainerStatus.UNVERIFIED in written
+
+        error_types = [
+            c.args[4].get('error_type')
+            for c in obs.emit.call_args_list
+            if len(c.args) > 4 and isinstance(c.args[4], dict)
+        ]
+        assert 'env_rebuild_finalize_lock_timeout' in error_types
+
+    async def test_no_lock_timeout_escapes_the_sub_cycle(self):
+        """The timeout must not propagate: the sub-cycle genuinely ran, and a
+        DevContainerBuildLockTimeoutError escaping here would be classified as a
+        lock-contention dispatch outcome by services/resource_lock_errors."""
+        stage = _stage()
+
+        with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
+             patch('services.dev_container_state.dev_container_state') as mock_state, \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(False)), \
+             patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
+             patch.object(stage, '_run_tests', new=AsyncMock()):
+
+            mock_state.get_status.return_value = DevContainerStatus.CHANGES_NEEDED
+
+            result = await stage._run_env_rebuild_sub_cycle(
+                _analysis(), RepairTestRunConfig(test_type="unit"), _context(),
+                test_cycle_iteration=1, test_type_index=0,
+            )
+
+        assert result.has_failures() is True
 
     async def test_a_status_that_moved_under_the_lock_is_not_clobbered(self):
         """THE regression: the decision was already stale by the time the write
@@ -276,7 +350,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()):
 
@@ -300,7 +374,7 @@ class TestFinalizeTakesTheDevContainerBuildLock:
 
         with patch('agents.orchestrator_integration.queue_dev_environment_setup', new=AsyncMock()), \
              patch('services.dev_container_state.dev_container_state') as mock_state, \
-             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_async', _lock(True)), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_async', _lock(True)), \
              patch('pipeline.repair_cycle.asyncio.sleep', new=AsyncMock()), \
              patch.object(stage, '_run_tests', new=AsyncMock()):
 

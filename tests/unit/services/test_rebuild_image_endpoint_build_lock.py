@@ -75,7 +75,7 @@ class TestRebuildProjectImageLockHeldByCaller:
 
 class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
 
-    def _invoke(self, rebuild_result, lock_busy=False):
+    def _invoke(self, rebuild_result, lock_busy=False, if_free_granted=True):
         """Drive the endpoint's background worker synchronously."""
         from services import observability_server
         from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
@@ -91,6 +91,11 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
                 yield
             finally:
                 events.append(('lock:exit', project))
+
+        @contextlib.contextmanager
+        def _if_free_lock(project, *args, **kwargs):
+            events.append(('if_free:attempt', project))
+            yield if_free_granted
 
         state = MagicMock()
         state.set_status.side_effect = lambda project, status, **kw: events.append(
@@ -115,6 +120,7 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
 
         with patch('scripts.rebuild_project_images.rebuild_project_image', _rebuild), \
              patch('services.dev_container_build_lock.dev_container_build_lock_sync', _lock), \
+             patch('services.dev_container_build_lock.dev_container_build_lock_if_free_sync', _if_free_lock), \
              patch('services.dev_container_state.dev_container_state', state), \
              patch.object(observability_server, 'threading') as mock_threading:
             mock_threading.Thread = _ImmediateThread
@@ -149,11 +155,48 @@ class TestRebuildImageEndpointHoldsTheLockAcrossItsStateWrites:
         assert events[-1] == ('lock:exit', 'proj')
         assert ('set_status', DevContainerStatus.BLOCKED) in events
 
-    def test_lock_contention_writes_no_state_at_all(self):
-        """#148/WI-3: nothing ran, so nothing about this project's container
-        state changed and none of it should be rewritten -- least of all
-        IN_PROGRESS, which used to be stamped before any lock was attempted."""
+    def test_lock_contention_never_marks_in_progress(self):
+        """#148/WI-3: nothing ran, so IN_PROGRESS -- which used to be stamped in
+        the request thread before any lock was attempted -- must not be written."""
+        from services.dev_container_state import DevContainerStatus
+
         response, events = self._invoke(rebuild_result=True, lock_busy=True)
 
         assert response.status_code == 200
-        assert events == []
+        assert ('set_status', DevContainerStatus.IN_PROGRESS) not in events
+        assert ('rebuild', True) not in [e for e in events]
+
+    def test_lock_contention_records_that_the_rebuild_never_started(self):
+        """#152 review: the endpoint answers {"success": true, "triggered": true}
+        and its only feedback channel is the state file every caller polls
+        (mcp/server.py's get_image_build_status reads it directly). A bare log
+        line left that caller reading the project's PRE-EXISTING status --
+        commonly 'verified' -- and concluding the rebuild had finished."""
+        from services.dev_container_state import DevContainerStatus
+
+        response, events = self._invoke(rebuild_result=True, lock_busy=True)
+
+        assert response.status_code == 200
+        assert ('if_free:attempt', 'proj') in events
+        assert ('set_status', DevContainerStatus.BLOCKED) in events
+
+    def test_the_drop_is_recorded_under_the_lock_not_over_a_live_holder(self):
+        """That record still never lands on top of a build that is genuinely
+        running: it goes through the non-blocking variant, so a lock that is
+        still held leaves the holder's own status alone."""
+        from services.dev_container_state import DevContainerStatus
+
+        _, events = self._invoke(
+            rebuild_result=True, lock_busy=True, if_free_granted=False
+        )
+
+        assert ('if_free:attempt', 'proj') in events
+        assert ('set_status', DevContainerStatus.BLOCKED) not in events
+
+    def test_the_operator_path_does_not_wait_out_a_whole_build_window(self):
+        """3700s is calibrated for an agent's build window, not an interactive
+        request whose caller is polling the state file for an answer."""
+        from services import observability_server
+        from services.dev_container_build_lock import DEFAULT_TIMEOUT_SECONDS
+
+        assert observability_server.REBUILD_ENDPOINT_LOCK_TIMEOUT_SECONDS < DEFAULT_TIMEOUT_SECONDS

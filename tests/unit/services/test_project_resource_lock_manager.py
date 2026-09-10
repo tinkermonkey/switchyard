@@ -619,3 +619,77 @@ class TestTouchResource(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestRecoverOrphanedResourceLocks(unittest.TestCase):
+    """
+    #152 review: a resource lock held by the process that died survives the
+    restart (PipelineLockManager reclaims it only after its 4-hour staleness
+    heuristic or the 7200s Redis TTL), and main.py's startup lock recovery
+    iterates configured pipeline BOARDS, so it never sees a lock parked under
+    the reserved `__resource__*` board. That made
+    services/work_execution_state.py's post-restart dev-container
+    reconciliation a guaranteed no-op in exactly the case it exists for: the
+    orphaned lock exists if and only if a setup/verifier session was in flight,
+    which is the same condition that produces the stuck record.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        # YAML-only path -- the recovery is a get_all_locks() scan plus releases,
+        # neither of which needs a hand-mocked Redis transaction.
+        self.lock_manager = PipelineLockManager(state_dir=Path(self.test_dir), redis_client=None)
+        self.facade = ProjectResourceLockManager(lock_manager=self.lock_manager)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_releases_the_dead_holders_lock_so_the_next_acquire_succeeds(self):
+        self.facade.acquire_resource("proj", "dev_container_build", -12345)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 1)
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+        can_execute, _ = self.facade.acquire_resource("proj", "dev_container_build", -999)
+        self.assertTrue(can_execute)
+
+    def test_recovers_every_project_not_just_one(self):
+        for project in ("alpha", "beta", "gamma"):
+            self.facade.acquire_resource(project, "dev_container_build", -1)
+
+        self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 3)
+        for project in ("alpha", "beta", "gamma"):
+            self.assertIsNone(self.facade.get_resource_lock(project, "dev_container_build"))
+
+    def test_leaves_other_resources_and_real_board_locks_alone(self):
+        """Scoped by resource name: recovering one resource must not free a
+        different resource's lock, nor any pipeline board lock."""
+        self.facade.acquire_resource("proj", "dev_container_build", -1)
+        self.facade.acquire_resource("proj", "project_checkout", -2)
+        self.lock_manager._create_lock("proj", "dev_workflow", 111)
+
+        self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertIsNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "project_checkout"))
+        self.assertEqual(self.lock_manager.get_lock("proj", "dev_workflow").locked_by_issue, 111)
+
+    def test_leaves_a_retained_lock_in_place(self):
+        """A lock retained after a failed run is a durable marker for deliberate
+        human recovery -- only scripts/release_lock.py may clear it."""
+        self.facade.acquire_resource("proj", "dev_container_build", -7)
+        self.facade.mark_resource_failed("proj", "dev_container_build", -7, "build blew up")
+
+        released = self.facade.recover_orphaned_resource_locks("dev_container_build")
+
+        self.assertEqual(released, 0)
+        self.assertIsNotNone(self.facade.get_resource_lock("proj", "dev_container_build"))
+
+    def test_is_a_no_op_when_nothing_is_held(self):
+        self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)
+
+    def test_an_unreadable_lock_store_does_not_break_startup(self):
+        with patch.object(self.lock_manager, 'get_all_locks', side_effect=RuntimeError("redis down")):
+            self.assertEqual(self.facade.recover_orphaned_resource_locks("dev_container_build"), 0)

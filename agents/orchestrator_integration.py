@@ -21,6 +21,17 @@ logger = logging.getLogger(__name__)
 # validate_task_can_run below.
 STALE_IN_PROGRESS_MINUTES = 20
 
+# Same idea for CHANGES_NEEDED, which the repair cycle's env-rebuild sub-cycle is
+# supposed to own (see the CHANGES_NEEDED branch below). It is the ONLY status
+# whose retry has no owner other than that sub-cycle, so any path that stops the
+# sub-cycle without completing its terminal CHANGES_NEEDED -> BLOCKED transition
+# used to leave the project unschedulable forever, with the operator-facing reason
+# still claiming a retry was under way (#152 review). A live sub-cycle never parks
+# here for long -- it polls every 30s and resets to UNVERIFIED at the top of its
+# next attempt -- so 30 minutes is comfortably above any healthy window while still
+# bounding the damage from a sub-cycle that died mid-flight.
+STALE_CHANGES_NEEDED_MINUTES = 30
+
 
 async def validate_task_can_run(task, logger) -> Dict[str, Any]:
     """
@@ -84,6 +95,28 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
             'needs_dev_setup': False
         }
     elif status == DevContainerStatus.CHANGES_NEEDED:
+        # Staleness fallback, mirroring the IN_PROGRESS one above. CHANGES_NEEDED is
+        # driven by exactly one owner (the repair cycle's env-rebuild sub-cycle), so
+        # a sub-cycle that stops without completing its own terminal transition --
+        # crashed, or unable to take the dev_container_build lock to write BLOCKED --
+        # leaves this status with nobody to move it and every future task for the
+        # project refused forever. See STALE_CHANGES_NEEDED_MINUTES.
+        updated_at = dev_container_state.get_status_updated_at(task.project)
+        if updated_at and (datetime.now() - updated_at) > timedelta(minutes=STALE_CHANGES_NEEDED_MINUTES):
+            logger.log_warning(
+                f"Dev container for '{task.project}' has been stuck CHANGES_NEEDED since "
+                f"{updated_at.isoformat()} (over {STALE_CHANGES_NEEDED_MINUTES} minutes) - "
+                f"no repair cycle is driving it, treating as unverified so setup gets retried"
+            )
+            return {
+                'can_run': False,
+                'reason': (
+                    f"Dev container verification for '{task.project}' has been stuck at "
+                    f"changes_needed since {updated_at.isoformat()} with no repair cycle "
+                    f"driving it - retrying setup"
+                ),
+                'needs_dev_setup': True,
+            }
         # needs_dev_setup=False (not the UNVERIFIED default) is deliberate: the
         # repair cycle's env-rebuild sub-cycle owns retrying this project and will
         # re-queue setup itself on its next attempt. If this returned
@@ -108,7 +141,10 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
     """
     Queue a dev_environment_setup task for a project.
 
-    Idempotent: skips queuing if setup is already IN_PROGRESS.
+    Idempotent: skips queuing if setup is already IN_PROGRESS and that status is
+    fresher than STALE_IN_PROGRESS_MINUTES -- past that window the run it would
+    be deferring to is not coming back, and deferring to it means nothing is ever
+    queued (see the guard's own comment).
     Sets status to IN_PROGRESS before enqueuing to prevent races.
 
     Args:
@@ -125,11 +161,30 @@ async def queue_dev_environment_setup(project: str, logger, change_description: 
     from task_queue.task_manager import Task, TaskPriority, TaskQueue
     from services.dev_container_state import dev_container_state, DevContainerStatus
 
-    # Check if setup is already in progress - avoid duplicate queuing
+    # Check if setup is already in progress - avoid duplicate queuing.
+    #
+    # The guard is bounded by the same staleness window validate_task_can_run uses
+    # to decide a task NEEDS setup. Without that bound the two disagreed and the
+    # disagreement was silent: past STALE_IN_PROGRESS_MINUTES, validation returns
+    # needs_dev_setup=True, its caller calls this function, this function sees
+    # IN_PROGRESS and returns having queued nothing, and the status is never
+    # written -- so the next task repeats it, forever, while emitting a
+    # "Recovery successful" decision event each pass (#152 review).
     current_status = dev_container_state.get_status(project)
     if current_status == DevContainerStatus.IN_PROGRESS:
-        logger.info(f"Dev environment setup already in progress for {project}, skipping duplicate queue")
-        return
+        updated_at = dev_container_state.get_status_updated_at(project)
+        is_stale = bool(
+            updated_at
+            and (datetime.now() - updated_at) > timedelta(minutes=STALE_IN_PROGRESS_MINUTES)
+        )
+        if not is_stale:
+            logger.info(f"Dev environment setup already in progress for {project}, skipping duplicate queue")
+            return
+        logger.warning(
+            f"Dev environment setup for {project} has been IN_PROGRESS since "
+            f"{updated_at.isoformat()} (over {STALE_IN_PROGRESS_MINUTES} minutes) - "
+            f"queuing a fresh setup rather than deferring to a run that is not coming back"
+        )
 
     # Mark as in-progress BEFORE queuing to prevent races
     dev_container_state.set_status(

@@ -42,7 +42,7 @@ def _transition_dev_container_state(
     skip_when: Tuple = (),
     image_name: Optional[str] = None,
     error_message: Optional[str] = None,
-) -> None:
+) -> bool:
     """
     Reconcile a project's dev container state under the dev_container_build lock.
 
@@ -54,17 +54,31 @@ def _transition_dev_container_state(
     get_status() outside the lock and then wrote on the strength of that read, so
     a status the live holder changed in between was silently clobbered.
 
-    Uses the NON-BLOCKING variant of the lock, and skips the write entirely when
-    it is busy. That is deliberate on this path above all others: this runs from
-    main.py's startup and from inside the per-project execution state file lock,
-    and right after a restart the dead process's lock is routinely still in Redis
-    under its own TTL -- so a blocking acquire here would burn its whole timeout
-    every time, holding the file lock throughout, before failing anyway. Skipping
-    is also the correct outcome: the holder owns this project's container state
-    and is writing a fresher status than this stuck record could. A skipped reset
-    is recovered by validate_task_can_run()'s staleness check on
-    get_status_updated_at(). See services/dev_container_build_lock.py's module
-    docstring ("Bookkeeping writers").
+    Uses the NON-BLOCKING variant of the lock: this runs from main.py's startup
+    and from inside the per-project execution state file lock, so it must never
+    stall holding that file lock. On a busy lock it does NOT write, and returns
+    False so the caller can leave its execution record alone for the next sweep.
+
+    Whether a skip is safe was the subject of two #152 review rounds, and the
+    honest answer is that it is only safe when there really is a live holder:
+
+      - Right after a restart, the lock of the process that died is still in
+        Redis under its own TTL, and a dead holder never writes a fresher status.
+        That case is now removed at the source -- main.py releases this
+        resource's orphaned locks BEFORE this sweep runs (see
+        ProjectResourceLockManager.recover_orphaned_resource_locks) -- and, for
+        whatever is left, by the caller retrying rather than consuming the record.
+      - "Not acquired" is not always contention: try_acquire_lock() also fails
+        closed on unknown/degraded lock state. dev_container_build_lock's
+        _log_skipped() reports those at ERROR with the real reason instead of
+        claiming a holder exists.
+
+    The one recovery that does exist without any of this is narrow and worth
+    naming precisely: validate_task_can_run()'s staleness check on
+    get_status_updated_at() covers IN_PROGRESS only. CHANGES_NEEDED gets its own
+    (see STALE_CHANGES_NEEDED_MINUTES); the terminal statuses get none. See
+    services/dev_container_build_lock.py's module docstring ("Bookkeeping
+    writers").
 
     Args:
         project_name: project whose dev container state to reconcile.
@@ -74,6 +88,12 @@ def _transition_dev_container_state(
             against a re-read taken INSIDE the lock, which is what makes the
             check-then-act atomic rather than merely serialized.
         image_name / error_message: passed through to set_status().
+
+    Returns:
+        True when the reconciliation reached a conclusion (wrote, or deliberately
+        skipped because the status inside the lock said the write was superseded).
+        False when the lock could not be taken, so nothing was decided and the
+        caller should arrange for this to be retried.
     """
     try:
         from services.dev_container_build_lock import dev_container_build_lock_if_free_sync
@@ -81,11 +101,13 @@ def _transition_dev_container_state(
 
         with dev_container_build_lock_if_free_sync(project_name) as acquired:
             if not acquired:
+                # _log_skipped() has already reported the acquire's real reason
+                # (WARNING for genuine contention, ERROR for a degraded outcome).
                 logger.warning(
                     f"Skipped dev container state reconciliation for {project_name} "
-                    f"({reason}): a build/verify holds the lock and owns that state"
+                    f"({reason}): the dev_container_build lock could not be taken"
                 )
-                return
+                return False
 
             current_status = dev_container_state.get_status(project_name)
             if current_status in skip_when:
@@ -93,7 +115,7 @@ def _transition_dev_container_state(
                     f"{reason} for {project_name}, but dev container is already "
                     f"{current_status.value} — skipping reset"
                 )
-                return
+                return True
 
             logger.info(
                 f"{reason} for {project_name}, setting dev container state to {status.value}"
@@ -104,11 +126,16 @@ def _transition_dev_container_state(
                 image_name=image_name,
                 error_message=error_message,
             )
+            return True
     except Exception as e:
         logger.error(
             f"Failed to update dev container state for {project_name}: {e}",
             exc_info=True
         )
+        # An exception here is not lock contention -- retrying it every sweep
+        # would loop on the same failure. Treated as concluded; the ERROR above
+        # is the signal.
+        return True
 
 
 def _parse_iso_timestamp(value: str) -> datetime:
@@ -2727,6 +2754,49 @@ class WorkExecutionStateTracker:
                                 )
 
                                 if not recovered:
+                                    # Reconcile the dev container state BEFORE writing this
+                                    # record off. Marking the record 'failure' is what makes it
+                                    # invisible to every later sweep (this loop only looks at
+                                    # 'in_progress'), so consuming it while the reset was skipped
+                                    # would strand the project at whatever the dead build left
+                                    # behind, with nothing scheduled to revisit it (#152 review).
+                                    # Leaving the record alone instead costs one more sweep and
+                                    # is self-healing: the 15-minute pass retries until the lock
+                                    # is free.
+                                    #
+                                    # Only reset to UNVERIFIED if the current state is NOT already
+                                    # VERIFIED. A later setup/verifier execution may have already
+                                    # succeeded, in which case this stuck record is from a
+                                    # superseded execution and should not clobber the verified
+                                    # state. (The re-read that decides this happens inside the
+                                    # lock — see _transition_dev_container_state.)
+                                    if agent in ('dev_environment_verifier', 'dev_environment_setup'):
+                                        from services.dev_container_state import DevContainerStatus
+                                        _reconciled = _transition_dev_container_state(
+                                            project_name,
+                                            DevContainerStatus.UNVERIFIED,
+                                            reason=f"Stuck {agent} detected",
+                                            skip_when=(DevContainerStatus.VERIFIED,),
+                                            error_message=(
+                                                "Verification container died before completion"
+                                                if agent == 'dev_environment_verifier'
+                                                else "Setup container died before completion"
+                                            ),
+                                        )
+                                        if not _reconciled:
+                                            logger.warning(
+                                                f"Leaving stuck {agent} execution "
+                                                f"{project_name}/#{issue_number} as in_progress — "
+                                                f"its dev container state could not be reconciled "
+                                                f"yet; the next cleanup pass will retry"
+                                            )
+                                            try:
+                                                from services.cleanup_guard import release_cleanup
+                                                release_cleanup(project_name, issue_number)
+                                            except Exception:
+                                                pass  # TTL expires the claim well before the next sweep
+                                            continue
+
                                     # No container AND no Redis result — truly lost execution
                                     execution['outcome'] = 'failure'
                                     execution['error'] = (
@@ -2734,33 +2804,6 @@ class WorkExecutionStateTracker:
                                         'state was not updated. This may indicate the agent crashed, was killed, '
                                         'or the orchestrator was restarted before outcome could be recorded.'
                                     )
-
-                                    # Special handling for dev_environment_verifier agent
-                                    # Only reset to UNVERIFIED if the current state is NOT already VERIFIED.
-                                    # A later verifier execution may have already succeeded, in which case
-                                    # this stuck record is from a superseded execution and should not clobber
-                                    # the verified state.
-                                    if agent == 'dev_environment_verifier':
-                                        from services.dev_container_state import DevContainerStatus
-                                        _transition_dev_container_state(
-                                            project_name,
-                                            DevContainerStatus.UNVERIFIED,
-                                            reason="Stuck dev_environment_verifier detected",
-                                            skip_when=(DevContainerStatus.VERIFIED,),
-                                            error_message="Verification container died before completion",
-                                        )
-
-                                    # Special handling for dev_environment_setup agent
-                                    # Only reset if not already VERIFIED (a verifier may have already confirmed).
-                                    if agent == 'dev_environment_setup':
-                                        from services.dev_container_state import DevContainerStatus
-                                        _transition_dev_container_state(
-                                            project_name,
-                                            DevContainerStatus.UNVERIFIED,
-                                            reason="Stuck dev_environment_setup detected",
-                                            skip_when=(DevContainerStatus.VERIFIED,),
-                                            error_message="Setup container died before completion",
-                                        )
 
                                 modified = True
                                 cleaned_count += 1
@@ -2779,6 +2822,12 @@ class WorkExecutionStateTracker:
 
                                     # Verify dev container state consistency for dev_environment_verifier
                                     # The agent should have already set state to VERIFIED before exiting
+                                    # Unlike the not-recovered path above, this one cannot
+                                    # defer the record: the Redis result it recovered has
+                                    # already been consumed, so a retry next sweep would find
+                                    # nothing. A skipped write here is reported by
+                                    # _log_skipped() (ERROR when the acquire was degraded
+                                    # rather than contended) and left for the operator.
                                     if agent == 'dev_environment_verifier':
                                         from services.dev_container_state import DevContainerStatus
                                         _transition_dev_container_state(

@@ -47,6 +47,7 @@ from services.pipeline_lock_manager import PipelineLockManager, TouchResult
 from services.project_resource_lock_manager import ProjectResourceLockManager
 from services import project_checkout_lock
 from services.dev_container_build_lock import (
+    acquire_failure_is_contention,
     agent_holds_build_window,
     BUILD_WINDOW_AGENTS,
     dev_container_build_lock_async,
@@ -805,3 +806,84 @@ class TestIfFreeAsyncVariant:
                 assert acquired is True
 
         assert seen and all(t != loop_thread for t in seen)
+
+
+class TestAcquireFailureClassification(unittest.TestCase):
+    """
+    #152 review: the non-blocking variant's callers were told every False meant
+    "a build owns this project's state and is about to write a fresher status".
+    PipelineLockManager.try_acquire_lock() also returns False fail-closed on
+    unknown/degraded lock state and for a lock retained after a failed run -- in
+    none of which is anybody holding a build window, so a caller that skips its
+    write on one of those drops it for good while the log narrates a holder that
+    does not exist.
+    """
+
+    def test_a_live_holder_is_contention(self):
+        self.assertTrue(acquire_failure_is_contention("locked_by_issue_42"))
+
+    def test_a_retained_lock_is_not_contention(self):
+        """`locked_by_issue_N_failed` is a durable marker left for deliberate
+        human recovery -- its 'holder' is a run that already ended."""
+        self.assertFalse(acquire_failure_is_contention("locked_by_issue_42_failed"))
+
+    def test_fail_closed_reasons_are_not_contention(self):
+        for reason in (
+            "lock_state_unknown_failing_closed",
+            "lock_acquire_serialization_timeout",
+            "lock_acquire_serialization_unavailable",
+        ):
+            with self.subTest(reason=reason):
+                self.assertFalse(acquire_failure_is_contention(reason))
+
+    def test_an_unrecognised_reason_is_not_assumed_to_be_a_holder(self):
+        self.assertFalse(acquire_failure_is_contention("something_new"))
+        self.assertFalse(acquire_failure_is_contention(None))
+
+    def test_the_classified_reasons_really_are_what_the_lock_manager_returns(self):
+        """Guard against the classifier drifting from its source: every string
+        it special-cases must still be spelled that way in try_acquire_lock()."""
+        import inspect
+        from services.pipeline_lock_manager import PipelineLockManager as _PLM
+
+        source = inspect.getsource(_PLM.try_acquire_lock) + inspect.getsource(
+            _PLM._try_acquire_lock_yaml_unguarded
+        )
+        for reason in (
+            "lock_state_unknown_failing_closed",
+            "lock_acquire_serialization_timeout",
+            "lock_acquire_serialization_unavailable",
+        ):
+            with self.subTest(reason=reason):
+                self.assertIn(reason, source)
+
+
+class TestDegradedSkipsAreLoggedAsErrors(unittest.TestCase):
+    """A skipped bookkeeping write is a WARNING when a build really is running,
+    and an ERROR when nothing is -- the log line is the only signal a dropped
+    write has."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.facade = _make_facade(self.test_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def _skip_with_reason(self, reason):
+        with patch.object(self.facade, "acquire_resource", return_value=(False, reason)):
+            with self.assertLogs("services.dev_container_build_lock") as captured:
+                with dev_container_build_lock_if_free_sync("proj", 7, facade=self.facade) as acquired:
+                    self.assertFalse(acquired)
+        return captured
+
+    def test_contention_stays_a_warning(self):
+        captured = self._skip_with_reason("locked_by_issue_42")
+        self.assertEqual(captured.records[0].levelname, "WARNING")
+
+    def test_a_degraded_acquire_is_an_error_naming_the_real_reason(self):
+        captured = self._skip_with_reason("lock_state_unknown_failing_closed")
+        self.assertEqual(captured.records[0].levelname, "ERROR")
+        self.assertIn("lock_state_unknown_failing_closed", captured.output[0])
+        # And does NOT claim a holder exists.
+        self.assertIn("NOT contention", captured.output[0])

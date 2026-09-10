@@ -172,39 +172,63 @@ at all, and are therefore a different shape from every caller above:
     rebuild_project_image() takes this same lock itself and every acquisition
     mints its own holder id (no reentrancy -- see below), it is called with
     lock_held_by_caller=True from inside that wrap; nesting the two would be a
-    genuine self-block, not a reentrant hold.
+    genuine self-block, not a reentrant hold. It passes a shorter timeout than
+    the default and, on a timeout, records the drop in the state file rather
+    than only logging it -- that file is the only feedback channel it has once
+    it has answered the request (see its own comment).
 
-  - pipeline/repair_cycle.py's _finalize_unconfirmed_changes_needed(), which
-    forces the terminal CHANGES_NEEDED -> BLOCKED transition when the env
-    rebuild sub-cycle stops driving it.
   - services/work_execution_state.py's cleanup_stuck_in_progress_states(),
     which reconciles a dev_environment_setup/verifier execution that died
     mid-flight -- five read-then-write points, all reached right after a
     crash/restart.
 
-The last two are OBSERVERS doing single-statement bookkeeping, and giving
-them the blocking context manager would have been the wrong tool twice over.
-Both sit on paths that must not stall: the reconciliation runs during
+That last one is an OBSERVER doing single-statement bookkeeping, and giving
+it the blocking context manager would have been the wrong tool twice over. It
+sits on a path that must not stall: the reconciliation runs during
 orchestrator startup (from main.py, and from inside that project's execution
-state file lock), and right after a restart the previous process's lock is
-routinely still in Redis under its own TTL, so a blocking acquire there does
-not merely wait -- it is *guaranteed* to burn its whole timeout, every time,
-before failing. And waiting buys nothing even when it succeeds: whoever holds
-this lock is by definition the owner of this project's dev-container state
-and is going to write a fresh status of their own, so a bookkeeping write
-that waits out the build only lands stale on top of a newer, better-informed
-result.
-
-So both take dev_container_build_lock_if_free_sync()/_async(): a SINGLE
+state file lock), and a blocking acquire there would hold that file lock for
+the whole wait. So it takes dev_container_build_lock_if_free_sync(): a SINGLE
 non-blocking attempt that yields True when the lock was taken and False when
-it was busy. On False the caller skips its write entirely and says so at
-warning level. That is deliberately not the "never proceed unlocked" rule
-being bent -- the guarded write does not happen at all, which is the safe
-direction here (the live holder's own status write wins) and is recoverable
-either way: a skipped IN_PROGRESS reset is picked up by
-validate_task_can_run()'s staleness check on get_status_updated_at(), and a
-skipped CHANGES_NEEDED -> BLOCKED means a build/verify is actively running
-and about to set a terminal status itself.
+it was not. On False the caller skips its write entirely. That is deliberately
+not the "never proceed unlocked" rule being bent -- the guarded write does not
+happen at all, which is the safe direction here (a live holder's own status
+write wins).
+
+What that skip is NOT is self-healing on its own, and two review rounds on
+#152 were both about writers that assumed it was:
+
+  - A busy acquire does not imply a LIVE holder. Right after a restart the
+    previous process's lock is routinely still in Redis under its own TTL
+    (PipelineLockManager only reclaims it after its 4-hour staleness heuristic
+    or the 7200s TTL), and a dead holder writes nothing, ever. That is exactly
+    the crash-during-build case the reconciliation exists for, so the skip was
+    not occasional there -- it was deterministic. main.py now recovers this
+    resource's orphaned locks at startup, BEFORE
+    cleanup_stuck_in_progress_states() runs, so the acquire succeeds (see
+    ProjectResourceLockManager.recover_orphaned_resource_locks); and when it
+    still does not, that reconciliation leaves its execution record
+    `in_progress` for the next sweep to retry rather than consuming it.
+  - "Not acquired" is not always contention at all. try_acquire_lock() also
+    fails CLOSED on unknown/degraded lock state (both stores unreadable, the
+    YAML-fallback acquire guard unavailable) and refuses a retained lock from
+    a failed run. In none of those is anyone holding a build window, so
+    acquire_failure_is_contention() below classifies the reason and
+    _log_skipped() reports a degraded outcome at ERROR with the real reason
+    rather than narrating a holder that does not exist.
+
+pipeline/repair_cycle.py's _finalize_unconfirmed_changes_needed() was the
+third writer wired to the non-blocking variant, and is now on the BLOCKING one
+with a bounded timeout instead. It forces the terminal CHANGES_NEEDED ->
+BLOCKED transition when the env rebuild sub-cycle stops driving it, and unlike
+the writers above it holds no file lock, is not on a startup path, and its
+whole purpose is that CHANGES_NEEDED has no other owner -- so a skipped write
+there is a project no scheduler will ever touch again, not a bookkeeping blip.
+It also has the one interleaving that makes a busy lock most likely: the
+verifier writes CHANGES_NEEDED from INSIDE its own Claude Code session (see
+prompts/content/agents/dev_environment_verifier/review_task.md Step 5), i.e.
+while this lock is still held for the rest of that session, so the sub-cycle's
+30s poll routinely observes CHANGES_NEEDED inside the holder's window. A
+bounded wait outlasts that tail; a single non-blocking attempt did not.
 
 Holding the lock is also what makes those writers' check-then-act atomic
 rather than merely serialized: each re-reads get_status() INSIDE the lock and
@@ -467,13 +491,59 @@ def dev_container_build_lock_sync(
             _release_and_warn(facade, RESOURCE_NAME, project, holder_id, issue_number)
 
 
+# try_acquire_lock() returns False for reasons that are NOT "a live holder has
+# this right now", and treating all of them as contention was a defect found in
+# review of #152: every one of these means nobody is inside a build window and
+# nobody is going to write a fresher status, so a caller that skips its write on
+# one of them is dropping it for good, while the log line narrates a holder that
+# does not exist.
+#
+#   - lock_state_unknown_failing_closed        (both Redis and YAML reads failed)
+#   - lock_acquire_serialization_timeout       (YAML-fallback acquire guard)
+#   - lock_acquire_serialization_unavailable   (   "        "        "        )
+#   - locked_by_issue_<n>_failed               (retained after a failed run --
+#                                               a durable marker, not a holder)
+#
+# See PipelineLockManager.try_acquire_lock() for each one's own comment.
+_DEGRADED_ACQUIRE_REASONS = frozenset({
+    "lock_state_unknown_failing_closed",
+    "lock_acquire_serialization_timeout",
+    "lock_acquire_serialization_unavailable",
+})
+
+
+def acquire_failure_is_contention(reason: Optional[str]) -> bool:
+    """
+    True when a False from acquire_resource() means a live holder currently owns
+    the build window, rather than a degraded/fail-closed or retained outcome.
+
+    Only `locked_by_issue_<n>` (without the `_failed` retained suffix) is genuine
+    contention. Everything else -- including a reason this module has never seen,
+    which is deliberately NOT assumed to be a holder -- is reported as degraded so
+    the caller and the operator both see the real reason.
+    """
+    if not isinstance(reason, str) or not reason.startswith("locked_by_issue_"):
+        return False
+    return not reason.endswith("_failed")
+
+
 def _log_skipped(project: str, issue_number: Optional[int], reason: str) -> None:
-    logger.warning(
+    if acquire_failure_is_contention(reason):
+        logger.warning(
+            f"'{RESOURCE_NAME}' lock for project {project!r} ({_attribution(issue_number)}) "
+            f"is busy ({reason}) -- skipping this bookkeeping write of the dev container "
+            f"state rather than waiting out a build for it or clobbering the holder's own "
+            f"status. See services/dev_container_build_lock.py's module docstring "
+            f"(\"Bookkeeping writers\")."
+        )
+        return
+    logger.error(
         f"'{RESOURCE_NAME}' lock for project {project!r} ({_attribution(issue_number)}) "
-        f"is busy ({reason}) -- skipping this bookkeeping write of the dev container "
-        f"state rather than waiting out a build for it or clobbering the holder's own "
-        f"status. See services/dev_container_build_lock.py's module docstring "
-        f"(\"Bookkeeping writers\")."
+        f"could not be taken ({reason}) -- this is NOT contention: no build/verify holds "
+        f"this project's container state and nothing else is going to write a fresher "
+        f"status. The bookkeeping write was still skipped (this module never writes "
+        f"unlocked), so this project's dev container state may now be stale. See "
+        f"services/dev_container_build_lock.py's module docstring (\"Bookkeeping writers\")."
     )
 
 

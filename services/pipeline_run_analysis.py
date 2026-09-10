@@ -335,6 +335,16 @@ class PipelineRunAnalysisService:
         `summary`: _already_analyzed() keys off `summary`, so a failure recorded
         here still leaves the run re-analysable rather than permanently marked
         as done.
+
+        Writing it is only half the fix, and the half that closes the operator's
+        loop is the reader: GET /api/pipeline-run/<id>/analysis projects both
+        fields and returns them as an `analysis` payload carrying `error` when
+        there is no summary (services/observability_server.py), which
+        web_ui/src/components/PipelineReports.jsx and
+        web_ui/src/routes/pipeline-run.jsx render. Without that the endpoint
+        collapsed an empty summary to `analysis: null` and the UI showed "No
+        analysis available for this run." — bit for bit the symptom this exists
+        to remove (#152 review). Anything added here needs a reader added there.
         """
         self._merge_into_run_document(
             run_id,

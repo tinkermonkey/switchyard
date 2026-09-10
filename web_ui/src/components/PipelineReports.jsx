@@ -60,6 +60,15 @@ function PipelineAnalysisReport({ analysis }) {
   const projRecs = analysis.projectRecommendations || []
   return (
     <div className="space-y-5">
+      {analysis.error && (
+        <div className="text-xs border rounded px-3 py-2 text-red-500 border-red-700/40 bg-gh-canvas-subtle">
+          <div className="font-semibold mb-0.5">Analysis failed</div>
+          <div className="font-mono text-[10px] break-words">{analysis.error}</div>
+          {analysis.attemptedAt && (
+            <div className="opacity-60 text-[10px] mt-1">Attempted {analysis.attemptedAt}</div>
+          )}
+        </div>
+      )}
       {analysis.summary && (
         <div className="prose prose-invert prose-sm max-w-none text-gh-fg-muted text-xs leading-relaxed
           [&_h1]:text-gh-fg [&_h1]:text-sm [&_h1]:font-semibold [&_h1]:mb-1

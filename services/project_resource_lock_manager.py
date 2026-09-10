@@ -216,6 +216,80 @@ class ProjectResourceLockManager:
             project, self._resource_board(resource_name), issue_number, force=force
         )
 
+    def recover_orphaned_resource_locks(self, resource_name: str) -> int:
+        """
+        Release every currently-held lock for `resource_name`, across all
+        projects. STARTUP ONLY -- see the caller in main.py.
+
+        Every holder of a resource lock is an in-process operation of the
+        orchestrator that took it (a Claude Code session, an image build), so a
+        freshly-started process has no legitimate holders by construction: any
+        lock still present belongs to the process that died. Nothing else frees
+        them -- main.py's stale-lock recovery iterates configured pipeline
+        BOARDS, and a resource lock lives under the reserved board
+        `__resource__{resource_name}` (see RESOURCE_BOARD_PREFIX), so that loop
+        never sees one -- and PipelineLockManager's own reclamation waits out
+        either its 4-hour staleness heuristic or the 7200s Redis TTL. Until this
+        existed, a crash mid-build left the lock live for up to ~2 hours and made
+        services/work_execution_state.py's post-restart dev-container
+        reconciliation a guaranteed no-op in exactly the case it was written for
+        (#152 review).
+
+        A retained lock (marked by mark_lock_failed for deliberate human
+        recovery) is deliberately NOT released: release_resource() refuses it
+        without force, and force is reserved for scripts/release_lock.py's
+        explicit confirmation flow.
+
+        The one caller that can legitimately be holding a resource lock across an
+        orchestrator restart is an admin script (scripts/rebuild_project_images.py,
+        scripts/set_dev_container_verified.py) run by hand at the same moment.
+        That is accepted and logged: the operation itself is not interrupted, it
+        just loses its mutual exclusion for the rest of its run, which is strictly
+        better than every project's reconciliation silently doing nothing after
+        every restart.
+
+        Returns:
+            Number of locks released.
+        """
+        board = self._resource_board(resource_name)
+        released = 0
+        try:
+            locks = self._lock_manager.get_all_locks()
+        except Exception as e:
+            logger.error(f"Could not enumerate locks to recover '{resource_name}' holders: {e}")
+            return 0
+
+        for lock in locks:
+            if lock.board != board or lock.lock_status != 'locked':
+                continue
+            if lock.retained_reason:
+                logger.warning(
+                    f"Leaving retained '{resource_name}' lock for {lock.project} in place "
+                    f"(holder #{lock.locked_by_issue}: {lock.retained_reason}) -- only "
+                    f"scripts/release_lock.py's deliberate recovery flow may clear it"
+                )
+                continue
+            logger.warning(
+                f"Releasing orphaned '{resource_name}' lock for {lock.project} "
+                f"(held by #{lock.locked_by_issue} since {lock.lock_acquired_at}) -- "
+                f"its holder did not survive the previous orchestrator process"
+            )
+            try:
+                if self._lock_manager.release_lock(lock.project, board, lock.locked_by_issue):
+                    released += 1
+                else:
+                    logger.error(
+                        f"Failed to release orphaned '{resource_name}' lock for {lock.project} "
+                        f"(holder #{lock.locked_by_issue})"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error releasing orphaned '{resource_name}' lock for {lock.project}: {e}",
+                    exc_info=True,
+                )
+
+        return released
+
     def get_resource_lock(self, project: str, resource_name: str) -> Optional[PipelineLock]:
         """
         Get current lock state for the named project-scoped resource lock.

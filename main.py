@@ -278,6 +278,23 @@ async def main():
     workspace_manager.prune_epic_worktrees()
     logger.info("Epic worktree prune complete")
 
+    # Release dev_container_build locks left behind by the process that died.
+    # MUST run BEFORE cleanup_stuck_in_progress_states() below: that sweep
+    # reconciles a project's dev container state under this very lock, and a
+    # crash mid-build is both the reason it has work to do AND the reason the
+    # dead holder's lock is still in Redis under its own TTL -- so without this
+    # the reconciliation was a guaranteed no-op in exactly the case it exists
+    # for (#152 review). The board-scoped stale-lock recovery further down never
+    # reaches these: resource locks live under the reserved
+    # `__resource__dev_container_build` board, not a configured pipeline board.
+    logger.info("Recovering orphaned dev_container_build resource locks")
+    from services.dev_container_build_lock import RESOURCE_NAME as DEV_CONTAINER_BUILD_RESOURCE
+    from services.project_resource_lock_manager import ProjectResourceLockManager
+    resource_locks_released = ProjectResourceLockManager().recover_orphaned_resource_locks(
+        DEV_CONTAINER_BUILD_RESOURCE
+    )
+    logger.info(f"Orphaned dev_container_build lock recovery: {resource_locks_released} released")
+
     # Clean up stuck in_progress execution states from interrupted agent runs
     # This now runs AFTER container recovery, so it won't clean up states for recovered containers
     logger.info("Cleaning up stuck in_progress execution states")

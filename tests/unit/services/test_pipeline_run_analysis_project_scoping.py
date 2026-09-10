@@ -157,3 +157,72 @@ class TestFailuresAreRecordedNotDropped:
 
         mock_run.assert_not_awaited()
         service.es.update.assert_not_called()
+
+
+class TestTheRecordedFailureIsRetrievable:
+    """
+    #152 review: writing `analysis_error` is only half the fix. The only surface
+    that serves a run's analysis back --  GET /api/pipeline-run/<id>/analysis --
+    projected four fields, none of them the error, and then short-circuited an
+    empty summary to `analysis: null`. Since _record_analysis_failure()
+    deliberately never writes `summary`, EVERY recorded failure took that branch
+    and the UI rendered "No analysis available for this run." -- bit for bit the
+    symptom the fix was for.
+    """
+
+    def _get(self, source):
+        from services import observability_server
+
+        with patch.object(observability_server, 'es_client') as es:
+            es.search.return_value = (
+                {"hits": {"hits": [{"_source": source}]}} if source is not None
+                else {"hits": {"hits": []}}
+            )
+            client = observability_server.app.test_client()
+            response = client.get('/api/pipeline-run/run-1/analysis')
+            projected = es.search.call_args.kwargs['body']['_source']
+
+        return response.get_json(), projected
+
+    def test_the_error_fields_are_projected(self):
+        """A field absent from `_source` comes back absent no matter what the
+        handler does with it."""
+        _, projected = self._get({"summary": "done", "outcome": "success"})
+
+        assert 'analysis_error' in projected
+        assert 'analysis_attempted_at' in projected
+
+    def test_a_recorded_failure_comes_back_instead_of_a_null_analysis(self):
+        payload, _ = self._get({
+            "summary": "",
+            "analysis_error": "RuntimeError: claude exploded",
+            "analysis_attempted_at": "2026-01-01T00:00:00+00:00",
+        })
+
+        assert payload['success'] is True
+        assert payload['analysis'] is not None
+        assert payload['analysis']['error'] == "RuntimeError: claude exploded"
+        assert payload['analysis']['attemptedAt'] == "2026-01-01T00:00:00+00:00"
+
+    def test_a_run_that_was_never_analysed_is_still_null(self):
+        """The distinction the endpoint could not previously make: 'never ran'
+        must stay null so the UI keeps offering to trigger one."""
+        payload, _ = self._get({"summary": ""})
+
+        assert payload['analysis'] is None
+
+    def test_a_completed_analysis_is_unchanged(self):
+        payload, _ = self._get({
+            "summary": "All good",
+            "outcome": "success",
+            "orchestratorRecommendations": [{"priority": "high", "description": "d"}],
+            "projectRecommendations": [],
+        })
+
+        assert payload['analysis']['summary'] == "All good"
+        assert payload['analysis']['orchestratorRecommendations'][0]['description'] == "d"
+        assert 'error' not in payload['analysis']
+
+    def test_a_missing_run_is_still_null(self):
+        payload, _ = self._get(None)
+        assert payload['analysis'] is None
