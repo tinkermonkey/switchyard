@@ -213,6 +213,41 @@ class GitHubApp:
         hold['suppressed'] = 0
         return None
 
+    def get_graphql_hold_status(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only view of every credential's GraphQL rate-limit hold (#168).
+
+        While a hold is in force this module answers every GraphQL query with
+        None and no network call, so the hold - not either rate-limit bucket -
+        is the state that actually decides whether GraphQL works right now.
+        The PAT leg makes that distinction load-bearing rather than cosmetic:
+        a PAT-credential hold updates NO bucket at all (graphql_request only
+        attributes response headers when the call used the installation token
+        - see `app_headers` there), so a percentage-based check cannot see it.
+        Exposed for /health, which had no machine-readable signal for any of
+        this and reported `degraded: false` for the full hold window.
+
+        Deliberately does NOT call _graphql_hold_remaining(): that clears an
+        expired hold and logs the "hold expired" summary, and a health probe
+        must not consume a state transition the request path is meant to
+        report. An expired-but-uncleared hold is reported as simply not
+        active, with the suppression count it accumulated left intact.
+        """
+        now = time.monotonic()
+        status: Dict[str, Dict[str, Any]] = {}
+        for credential, hold in self._graphql_holds.items():
+            remaining = None
+            if hold['until'] is not None:
+                seconds_left = hold['until'] - now
+                if seconds_left > 0:
+                    remaining = seconds_left
+            status[credential] = {
+                'active': remaining is not None,
+                'remaining_seconds': round(remaining, 1) if remaining is not None else None,
+                'reset_at': hold['reset_at'].isoformat() if hold['reset_at'] else None,
+                'suppressed_requests': hold['suppressed'],
+            }
+        return status
+
     def _start_graphql_hold(self, headers: Optional[Any], errors: Any,
                             credential: str = CREDENTIAL_APP):
         """Begin (or extend) `credential`'s GraphQL rate-limit hold after

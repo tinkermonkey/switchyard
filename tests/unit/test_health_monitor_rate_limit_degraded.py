@@ -56,7 +56,30 @@ def _local_bucket_dict(percentage_used, ever_updated=True):
     }
 
 
-async def _run_check_github(monitor, rate_limit_graphql_info, rate_limit_rest_info, local_client_status=None):
+def _no_holds():
+    """GitHubApp.get_graphql_hold_status()'s shape with neither credential
+    held - the normal case."""
+    return {
+        'app': {'active': False, 'remaining_seconds': None, 'reset_at': None,
+                'suppressed_requests': 0},
+        'pat': {'active': False, 'remaining_seconds': None, 'reset_at': None,
+                'suppressed_requests': 0},
+    }
+
+
+def _hold_on(credential, remaining_seconds=2900.0, suppressed=41):
+    holds = _no_holds()
+    holds[credential] = {
+        'active': True,
+        'remaining_seconds': remaining_seconds,
+        'reset_at': '2026-09-01T01:00:00+00:00',
+        'suppressed_requests': suppressed,
+    }
+    return holds
+
+
+async def _run_check_github(monitor, rate_limit_graphql_info, rate_limit_rest_info,
+                            local_client_status=None, graphql_hold_status=None):
     """Drives check_github() through to its rate-limit/degraded section by
     mocking every earlier gate to succeed, then mocks
     get_shared_rate_limit_status() and get_github_client() for the section
@@ -67,6 +90,15 @@ async def _run_check_github(monitor, rate_limit_graphql_info, rate_limit_rest_in
 
     mock_github_app = Mock()
     mock_github_app.enabled = False
+    # An explicit dict, not a bare Mock attribute: check_github() derives its
+    # "a hold is in force" degraded input from this, and a Mock would take the
+    # whole rate-limit section into its except-handler.
+    if isinstance(graphql_hold_status, Exception):
+        mock_github_app.get_graphql_hold_status.side_effect = graphql_hold_status
+    else:
+        mock_github_app.get_graphql_hold_status.return_value = (
+            _no_holds() if graphql_hold_status is None else graphql_hold_status
+        )
 
     mock_config_manager = Mock()
     mock_config_manager.list_projects.return_value = ['test-project']
@@ -212,6 +244,159 @@ class TestUnavailableFallsBackToLocalClient:
         result = await _run_check_github(monitor, unavailable, unavailable, local_client_status=local_status)
 
         assert result['degraded'] is True
+
+
+class TestDegradedFromAppGraphQLBudget:
+    """#168's other half: the App installation spends its OWN 5000/hr GraphQL
+    budget, and exhausting it left /health reporting healthy/not-degraded for
+    the entire ~50-minute window - the PAT buckets it did consult were
+    untouched, because they are a different quota."""
+
+    @staticmethod
+    def _quiet_shared_view():
+        return {
+            'remaining': 4000, 'limit': 5000, 'percentage_used': 20.0,
+            'reset_time': None, 'last_updated': '2026-09-01T00:00:00+00:00',
+            'never_observed': False, 'unavailable': False, 'stale': False,
+        }
+
+    @staticmethod
+    def _local_status(app_bucket):
+        return {
+            'rate_limit_graphql': _local_bucket_dict(20.0, ever_updated=True),
+            'rate_limit_rest': _local_bucket_dict(5.0, ever_updated=True),
+            'rate_limit_app_graphql': app_bucket,
+            'breaker': {'state': 'closed', 'is_open': False, 'opened_at': None, 'reset_time': None},
+            'stats': {'total_requests': 10, 'failed_requests': 0, 'rate_limited_requests': 0, 'backoff_multiplier': 1.0},
+        }
+
+    @pytest.mark.asyncio
+    async def test_exhausted_app_bucket_degrades(self, monitor):
+        """The regression: PAT buckets quiet, App bucket at 100%."""
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._local_status(
+                _local_bucket_dict(100.0, ever_updated=True)
+            ),
+        )
+
+        assert result['degraded'] is True
+        assert result['api_rate_limit_app_graphql']['percentage_used'] == 100.0
+
+    @pytest.mark.asyncio
+    async def test_pat_only_deployment_does_not_degrade_by_accident(self, monitor):
+        """The App bucket is populated ONLY by real App-credential responses,
+        so on a PAT-only deployment it sits at its 5000/5000 constructor
+        defaults with ever_updated=False. That placeholder must not be read as
+        a measurement in either direction."""
+        never_used = _local_bucket_dict(0.0, ever_updated=False)
+        never_used['percentage_used'] = 99.9  # would degrade if ever_updated were ignored
+
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._local_status(never_used),
+        )
+
+        assert result['degraded'] is False
+
+    @pytest.mark.asyncio
+    async def test_healthy_app_bucket_does_not_degrade(self, monitor):
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._local_status(
+                _local_bucket_dict(12.0, ever_updated=True)
+            ),
+        )
+
+        assert result['degraded'] is False
+
+    @pytest.mark.asyncio
+    async def test_missing_app_bucket_key_does_not_blank_the_section(self, monitor):
+        """An older/stubbed client status without the key must degrade to
+        'no App reading', not take the breaker and call stats down with it."""
+        local = self._local_status(_local_bucket_dict(100.0, ever_updated=True))
+        del local['rate_limit_app_graphql']
+
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=local,
+        )
+
+        assert result['degraded'] is False
+        assert result['api_rate_limit_app_graphql'] is None
+        assert result['circuit_breaker'] is not None
+
+
+class TestDegradedFromGraphQLHold:
+    """A hold, not a percentage, is what actually stops GitHubApp.
+    graphql_request() from making a call - and a hold on the PAT leg updates
+    no bucket at all (only an installation token's response headers are
+    attributed to the App bucket), so a percentage-only test cannot see it."""
+
+    @staticmethod
+    def _quiet_shared_view():
+        return {
+            'remaining': 4000, 'limit': 5000, 'percentage_used': 20.0,
+            'reset_time': None, 'last_updated': '2026-09-01T00:00:00+00:00',
+            'never_observed': False, 'unavailable': False, 'stale': False,
+        }
+
+    @staticmethod
+    def _quiet_local():
+        return {
+            'rate_limit_graphql': _local_bucket_dict(20.0, ever_updated=True),
+            'rate_limit_rest': _local_bucket_dict(5.0, ever_updated=True),
+            'rate_limit_app_graphql': _local_bucket_dict(0.0, ever_updated=False),
+            'breaker': {'state': 'closed', 'is_open': False, 'opened_at': None, 'reset_time': None},
+            'stats': {'total_requests': 10, 'failed_requests': 0, 'rate_limited_requests': 0, 'backoff_multiplier': 1.0},
+        }
+
+    @pytest.mark.asyncio
+    async def test_app_hold_degrades_and_is_reported(self, monitor):
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._quiet_local(),
+            graphql_hold_status=_hold_on('app'),
+        )
+
+        assert result['degraded'] is True
+        assert result['github_app_graphql_holds']['app']['active'] is True
+        assert result['github_app_graphql_holds']['app']['suppressed_requests'] == 41
+
+    @pytest.mark.asyncio
+    async def test_pat_leg_hold_degrades_even_though_no_bucket_moves(self, monitor):
+        """The case a percentage-based check is structurally blind to."""
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._quiet_local(),
+            graphql_hold_status=_hold_on('pat'),
+        )
+
+        assert result['degraded'] is True
+
+    @pytest.mark.asyncio
+    async def test_no_hold_does_not_degrade(self, monitor):
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._quiet_local(),
+        )
+
+        assert result['degraded'] is False
+        assert result['github_app_graphql_holds']['app']['active'] is False
+
+    @pytest.mark.asyncio
+    async def test_hold_read_failure_is_survivable(self, monitor):
+        """A GitHubApp that cannot report holds must leave the rest of the
+        rate-limit section intact rather than blanking it."""
+        result = await _run_check_github(
+            monitor, self._quiet_shared_view(), self._quiet_shared_view(),
+            local_client_status=self._quiet_local(),
+            graphql_hold_status=RuntimeError("boom"),
+        )
+
+        assert result['degraded'] is False
+        assert result['github_app_graphql_holds'] is None
+        assert result['api_rate_limit_graphql'] is not None
 
 
 if __name__ == "__main__":

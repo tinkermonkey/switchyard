@@ -488,3 +488,52 @@ class TestThePatLegIsHeldToo:
 
         assert client.rate_limited_requests == 1
         assert client.rate_limit_app_graphql.ever_updated is False
+
+
+class TestHoldStatusIsReportable:
+    """The hold, not either bucket, is what decides whether this module's
+    GraphQL works while one is in force -- and on the PAT leg it is the ONLY
+    signal, since a PAT-credential response updates no bucket at all. /health
+    reported `degraded: false` for the entire hold window because it had no
+    machine-readable view of this; get_graphql_hold_status() is that view."""
+
+    def test_no_hold_reports_both_credentials_inactive(self):
+        status = _app().get_graphql_hold_status()
+
+        assert status[CREDENTIAL_APP]['active'] is False
+        assert status[CREDENTIAL_PAT]['active'] is False
+        assert status[CREDENTIAL_APP]['remaining_seconds'] is None
+        assert status[CREDENTIAL_APP]['reset_at'] is None
+
+    def test_an_active_hold_reports_its_remaining_time_and_suppression_count(self):
+        app = _app()
+        reset_at = datetime(2026, 9, 1, 1, 0, tzinfo=timezone.utc)
+        _hold(app)['until'] = time.monotonic() + 1800
+        _hold(app)['reset_at'] = reset_at
+        _hold(app)['suppressed'] = 41
+
+        status = app.get_graphql_hold_status()
+
+        assert status[CREDENTIAL_APP]['active'] is True
+        assert 1790 < status[CREDENTIAL_APP]['remaining_seconds'] <= 1800
+        assert status[CREDENTIAL_APP]['reset_at'] == reset_at.isoformat()
+        assert status[CREDENTIAL_APP]['suppressed_requests'] == 41
+        # Independent budgets: the App's exhaustion says nothing about the PAT's.
+        assert status[CREDENTIAL_PAT]['active'] is False
+
+    def test_reading_the_status_does_not_clear_an_expired_hold(self):
+        """Deliberately not routed through _graphql_hold_remaining(): that
+        clears the hold and logs the 'expired, N requests skipped' summary,
+        and a /health probe must not consume a state transition the request
+        path is the one meant to report."""
+        app = _app()
+        _hold(app)['until'] = time.monotonic() - 5
+        _hold(app)['suppressed'] = 7
+
+        status = app.get_graphql_hold_status()
+
+        assert status[CREDENTIAL_APP]['active'] is False
+        assert status[CREDENTIAL_APP]['remaining_seconds'] is None
+        # State untouched -- the next real request still reports the expiry.
+        assert _hold(app)['until'] is not None
+        assert _hold(app)['suppressed'] == 7

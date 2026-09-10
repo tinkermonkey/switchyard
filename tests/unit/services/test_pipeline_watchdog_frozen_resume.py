@@ -43,6 +43,34 @@ class FakeRedis:
     def expire(self, key, ttl):
         pass
 
+class _IssueUnderTest:
+    """A locked_by_issue that matches whichever issue a test passes.
+
+    _cleanup_zombie_run/_actively_resume_run now confirm the issue actually
+    holds the board lock before clearing its retained mark and redispatching:
+    a non-holder has nothing to self-heal (see _self_heal_still_holds_lock).
+    Every test here exercises the holder case and the issue numbers vary per
+    test, so report the lock as held by whichever one is asked about rather
+    than pinning a number in the fixture -- and report it explicitly, so these
+    tests reach the self-heal path deliberately instead of by way of that
+    method's unreadable-lock fail-safe.
+    """
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return 0
+
+    def __repr__(self):
+        return "<issue under test>"
+
+
+def _lock_held_by_issue_under_test():
+    lock = Mock()
+    lock.locked_by_issue = _IssueUnderTest()
+    return lock
+
 
 @pytest.fixture
 def watchdog():
@@ -51,6 +79,9 @@ def watchdog():
     pipeline_run_manager.end_pipeline_run = Mock(return_value=True)
     lock_manager = Mock()
     lock_manager.clear_retained_reason = Mock(return_value=True)
+    lock_manager.get_lock_fail_closed = Mock(
+        return_value=(_lock_held_by_issue_under_test(), True)
+    )
     wd = PipelineWatchdog(
         es_client=Mock(),
         pipeline_run_manager=pipeline_run_manager,

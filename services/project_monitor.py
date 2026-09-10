@@ -10300,6 +10300,54 @@ _Repair cycle initiated by Switchyard_
             )
             return None, 'query_failed'
 
+    def _end_orphaned_run_for_closed_issue(self, project_name: str, board_name: str,
+                                           issue_number: int, column: str) -> bool:
+        """End a closed issue's still-active pipeline run, if it has one.
+
+        Restores the cleanup side effect the closed-issue skip in
+        _find_stalled_issues_for_pipeline() removed (#165 review). A closed
+        issue is never coming back through the pipeline — reopening it
+        re-enqueues it through the normal board paths — so an active run for
+        one is orphaned by definition.
+
+        Returns:
+            True if an active run was found and ended, False otherwise
+            (including on error — this is best-effort cleanup and must never
+            be able to break the stalled-issue scan around it).
+        """
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+
+            pipeline_run_manager = get_pipeline_run_manager()
+            pipeline_run = pipeline_run_manager.get_active_pipeline_run(
+                project=project_name,
+                issue_number=issue_number,
+                board=board_name
+            )
+            if not pipeline_run:
+                return False
+
+            ended = pipeline_run_manager.end_pipeline_run(
+                project=project_name,
+                issue_number=issue_number,
+                reason=f"Issue closed while in column '{column}'",
+                retain_lock=False,
+                board=board_name
+            )
+            if ended:
+                logger.info(
+                    f"Ended orphaned pipeline run {pipeline_run.id[:8]}... for "
+                    f"closed issue #{issue_number} in "
+                    f"{project_name}/{board_name}"
+                )
+            return ended
+        except Exception as e:
+            logger.warning(
+                f"Could not end the orphaned pipeline run for closed issue "
+                f"#{issue_number} in {project_name}/{board_name}: {e}"
+            )
+            return False
+
     def _find_stalled_issues_for_pipeline(self, project_name: str, board_name: str,
                                             cached_items: List[ProjectItem] = None):
         """
@@ -10415,6 +10463,32 @@ _Repair cycle initiated by Switchyard_
                             f"Skipping closed issue #{issue_number} in "
                             f"'{column}' for {project_name}/{board_name} — "
                             f"closed issues are not stalled work"
+                        )
+                        # Skipping the dispatch is not the whole of what the
+                        # old behaviour did. Selecting a closed issue here was
+                        # also the only thing that ever ENDED its orphaned
+                        # pipeline run: the failsafe acquired the lock for it,
+                        # trigger_agent_for_status() hit its CLOSED branch and
+                        # _release_pipeline_lock_and_process_next() called
+                        # end_pipeline_run(). This method selects on a STALE
+                        # active run as well as on no run at all (see the
+                        # decision-event heartbeat check below), so a closed
+                        # issue can genuinely have one — and with nothing
+                        # ending it, it would survive to become a zombie the
+                        # watchdog then tries to self-heal by clearing a
+                        # retained lock this issue never held. Do the cleanup
+                        # here instead, where it is cheap and quiet.
+                        #
+                        # get_active_pipeline_run() first so the steady state
+                        # (closed issue, no run) costs one Redis read per
+                        # sweep and no writes — the point of #165 was to stop
+                        # spending work on closed issues, not to move it.
+                        # retain_lock=False mirrors the pre-change teardown:
+                        # end_pipeline_run() only releases when this issue
+                        # actually holds the lock, so a lock held by a
+                        # different issue is left alone.
+                        self._end_orphaned_run_for_closed_issue(
+                            project_name, board_name, issue_number, column
                         )
                         continue
 

@@ -704,6 +704,21 @@ class PipelineWatchdog:
                         "manually rather than assumed safe."
                     )
                 manual_intervention_reason = fallback_reason
+            elif self_heal and not self._self_heal_still_holds_lock(
+                lock_mgr, project, board, issue_number, "Zombie self-heal"
+            ):
+                # Non-holder: nothing left to self-heal — see the helper's
+                # docstring. Deliberately does NOT set
+                # requires_manual_intervention: the previous behaviour read
+                # clear_retained_reason()'s False as a failed clear, logged an
+                # ERROR, and posted a "the pipeline lock is retained, run
+                # scripts/release_lock.py" comment naming a lock this issue
+                # does not hold — on a closed issue, every time one aged past
+                # zombie_threshold_minutes.
+                logger.info(
+                    f"Zombie self-heal: issue #{issue_number} in {project} "
+                    f"needed no redispatch (run ended, lock not held by it)"
+                )
             elif self_heal:
                 cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
                 redispatched = cleared and self._redispatch_same_issue(project, board, issue_number)
@@ -794,6 +809,64 @@ class PipelineWatchdog:
             logger.debug(f"Could not log cleanup event to observability: {e}")
 
         return not requires_manual_intervention
+
+    def _self_heal_still_holds_lock(self, lock_mgr, project: str, board: str,
+                                    issue_number: int, context: str) -> bool:
+        """
+        Whether `issue_number` still holds the (project, board) pipeline lock.
+
+        Both self-heal branches open with `clear_retained_reason() and
+        _redispatch_same_issue()`, and clear_retained_reason() returns False
+        for two situations the caller then cannot tell apart: a durable write
+        that failed (a real problem) and a lock this issue simply does not
+        hold (nothing to clear). The second was being reported as the first —
+        an ERROR, a mark_lock_failed() that correctly refuses for a
+        non-holder, and a "run scripts/release_lock.py" comment naming a lock
+        nobody holds. A closed issue that ages into the zombie sweep hits that
+        path every time, which is exactly the recurring unactionable ERROR
+        this branch exists to remove.
+
+        A self-heal has nothing left to do for a non-holder: the run has
+        already been ended by the caller, and _redispatch_same_issue() could
+        not run anyway — it calls trigger_agent_for_status() with
+        lock_already_acquired=True, which is only true for the holder. The
+        issue re-enters through the normal queue/failsafe paths once the lock
+        frees, exactly as any other issue waiting on a busy board does.
+
+        Reads fail CLOSED: when lock state is genuinely unknown (both Redis
+        and YAML raised) this returns True so the pre-existing clear/
+        redispatch path still runs and reports its own failure, rather than
+        this method quietly deciding a self-heal was unnecessary.
+        """
+        try:
+            lock, reads_healthy = lock_mgr.get_lock_fail_closed(project, board)
+        except Exception as e:
+            logger.warning(
+                f"{context}: could not read the {project}/{board} pipeline lock "
+                f"while checking issue #{issue_number} (assuming it is still "
+                f"held, so the normal self-heal path runs): {e}"
+            )
+            return True
+
+        if not reads_healthy:
+            logger.warning(
+                f"{context}: lock state for {project}/{board} is unknown (both "
+                f"stores failed) — assuming issue #{issue_number} still holds it"
+            )
+            return True
+
+        holder = lock.locked_by_issue if lock else None
+        if holder == issue_number:
+            return True
+
+        logger.info(
+            f"{context}: issue #{issue_number} in {project} does not hold the "
+            f"'{board}' pipeline lock (current holder: "
+            f"{holder if holder is not None else 'none'}) — its run has been "
+            f"ended and there is nothing to redispatch under a lock it never "
+            f"acquired; leaving it to the normal queue/failsafe paths"
+        )
+        return False
 
     def _redispatch_same_issue(self, project: str, board: str, issue_number: int) -> bool:
         """
@@ -1080,7 +1153,8 @@ class PipelineWatchdog:
         and is now eligible to continue (breaker closed, no container running).
 
         Returns True only if the resume was a genuine clean success
-        (redispatched, or a closed issue's lock cleanly released) — False for
+        (redispatched, a closed issue's lock cleanly released, or the issue
+        did not hold the lock so there was nothing to redispatch) — False for
         every other outcome, including when self.pipeline_run_manager is not
         configured at all. Callers must not count a False return as success.
 
@@ -1195,6 +1269,19 @@ class PipelineWatchdog:
                 self._notify_lock_stuck(
                     project, board, issue_number, pipeline_run_id, retry_count=0,
                     reason=fallback_reason,
+                )
+            elif not self._self_heal_still_holds_lock(
+                lock_mgr, project, board, issue_number, "Active resume"
+            ):
+                # Non-holder: nothing left to resume — same reasoning as
+                # _cleanup_zombie_run's matching branch. A clean outcome, not
+                # a manual-intervention one: the frozen run is ended and the
+                # issue is free to be picked up again through the normal
+                # paths.
+                resume_succeeded = True
+                logger.info(
+                    f"Active resume: issue #{issue_number} in {project} needed "
+                    f"no redispatch (frozen run ended, lock not held by it)"
                 )
             else:
                 cleared = lock_mgr.clear_retained_reason(project, board, issue_number)
