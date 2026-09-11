@@ -38,7 +38,7 @@ def agent_executor():
         return AgentExecutor()
 
 
-def _drift_error():
+def _drift_error(dirty=True, unmerged_commits=None):
     return WorktreeBranchDriftError(
         "Epic worktree for test-project epic #42 at /workspace/.orchestrator/"
         "worktrees/test-project/42 has drifted onto a branch that belongs to no "
@@ -48,7 +48,8 @@ def _drift_error():
         worktree_path='/workspace/.orchestrator/worktrees/test-project/42',
         expected_branch='feature/issue-42-epic',
         found_branch='scratch',
-        dirty=True,
+        dirty=dirty,
+        unmerged_commits=unmerged_commits,
     )
 
 
@@ -147,6 +148,69 @@ class TestADriftedWorktreeBlocksBeforeDispatch:
             for call in harness['tracker'].record_execution_outcome.call_args_list
         ]
         assert outcomes == ['failure']
+
+    @pytest.mark.asyncio
+    async def test_the_comment_does_not_claim_uncommitted_work_that_is_not_there(
+        self, agent_executor
+    ):
+        """reconcile_worktree_branch() returns DRIFTED in four distinct shapes and
+        only one of them is "it holds uncommitted changes" (code review on #163).
+
+        Telling an operator to `git reset --hard` / `git clean -fd` a worktree
+        `git status` reports as clean sends them to run a no-op, conclude the
+        worktree is now fine, release the lock, and hit the identical refusal on
+        the next poll -- while step 3's promise that the block self-clears is
+        false for the shape that has nothing in it to clear."""
+        harness = await _run(
+            agent_executor, _drift_error(dirty=False, unmerged_commits=0)
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'holds uncommitted changes' not in body
+        assert 'nothing uncommitted in it' in body
+        assert 'HEAD could not be moved back' in body
+        # The actionable remedy, not "commit or discard work that is not there".
+        assert 'checkout feature/issue-42-epic' in body
+        assert 'does **not** clear itself' in body
+        assert 'reset --hard' not in body
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_working_tree_is_described_as_unreadable(
+        self, agent_executor
+    ):
+        """dirty is None means `git status --porcelain` itself failed -- most
+        plausibly a stale index.lock left by a killed agent-side git. Asserting
+        uncommitted changes exist is a claim the verdict never made."""
+        harness = await _run(agent_executor, _drift_error(dirty=None))
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'working tree state could not be read' in body
+        assert 'index.lock' in body
+
+    @pytest.mark.asyncio
+    async def test_commits_on_the_drifted_branch_are_named_as_commits(
+        self, agent_executor
+    ):
+        """A clean tree on a branch carrying its own commits is a different thing
+        to go looking for -- and a different recovery -- than a dirty tree."""
+        harness = await _run(
+            agent_executor, _drift_error(dirty=False, unmerged_commits=3)
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert '3 commit(s)' in body
+        assert 'not lost' in body
+        assert 'feature/issue-42-epic..scratch' in body
+
+    @pytest.mark.asyncio
+    async def test_the_dirty_case_keeps_its_wording(self, agent_executor):
+        """The control: the shape the comment was written for is unchanged."""
+        harness = await _run(agent_executor, _drift_error(dirty=True))
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'holds uncommitted changes' in body
+        assert 'reset --hard' in body
+        assert 'restores the epic' in body
 
     @pytest.mark.asyncio
     async def test_an_ordinary_resolution_failure_is_not_escalated_this_way(

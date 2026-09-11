@@ -531,13 +531,17 @@ class PipelineRunManager:
                 retry -- it needs manual inspection first.
             project_workspace.WorktreeBranchDriftError: A RuntimeError subclass
                 (#163) -- the epic's worktree is on a branch belonging to no epic
-                and holds uncommitted work, so this run has no safe branch to
+                and could not be safely restored, so this run has no safe branch to
                 target and nothing may be committed from that directory. Nothing
                 was resolved or persisted and nothing on disk was touched. Like the
                 corrupted-worktree RuntimeError above it does not self-resolve on a
                 retry; unlike it, it is re-derived from the worktree's live state
-                every time, so it disappears of its own accord once the work there
-                is committed or discarded. agent_executor.py's dispatch call site
+                every time, so for the shapes that HAVE work in them (dirty tree,
+                unreadable tree, commits on the drifted branch -- the error's
+                `dirty`/`unmerged_commits` say which) it disappears of its own
+                accord once that work is committed, discarded or merged. The one
+                shape with nothing in it -- the checkout itself failed -- needs a
+                human to move HEAD. agent_executor.py's dispatch call site
                 catches this one specifically to escalate it the way the
                 commit-time wrong-branch refusals escalate (mark_failed plus an
                 issue comment naming the recovery); anywhere it is not caught, the
@@ -689,6 +693,7 @@ class PipelineRunManager:
                 expected_branch=verdict.expected_branch,
                 found_branch=verdict.found_branch,
                 dirty=verdict.dirty,
+                unmerged_commits=verdict.unmerged_commits,
             )
         if verdict.repaired:
             self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)
@@ -764,6 +769,10 @@ class PipelineRunManager:
                     "expected_branch": verdict.expected_branch,
                     "found_branch": verdict.found_branch,
                     "uncommitted": verdict.dirty,
+                    # Alongside `uncommitted`, not folded into it: a clean tree on
+                    # a branch carrying its own commits is a different thing to go
+                    # looking for than a dirty tree (code review on #163).
+                    "unmerged_commits": verdict.unmerged_commits,
                     "status": verdict.status.value,
                     "detail": verdict.detail,
                 },

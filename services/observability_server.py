@@ -4894,9 +4894,10 @@ def get_epic_worktrees():
     shell into the container and run git by hand.
 
     Read-only and lock-free by design (see survey_epic_worktrees()): every field
-    is a snapshot that may already have moved. Runs a couple of short git
-    subprocesses per staged worktree, so it is a diagnostic endpoint, not
-    something to poll tightly.
+    is a snapshot that may already have moved. Runs three or four short, purely
+    local git subprocesses per staged worktree — no fetch, nothing that writes the
+    shared base clone — so it is a diagnostic endpoint, not something to poll
+    tightly.
 
     Query params:
         project: limit the survey to one project.

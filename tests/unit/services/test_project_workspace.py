@@ -925,10 +925,12 @@ class TestPruneUncommittedWorkSkip:
     worktree the marker's own recovery instructions pointed at.
     """
 
-    def _dirty_git(self, porcelain: str):
+    def _dirty_git(self, porcelain: str, head: str = ""):
         def _run(cmd, **kwargs):
             if 'status' in cmd:
                 return _ok(porcelain)
+            if 'rev-parse' in cmd and '--abbrev-ref' in cmd:
+                return _ok(f"{head}\n")
             return _ok()
         return _run
 
@@ -999,6 +1001,64 @@ class TestPruneUncommittedWorkSkip:
 
         assert not clean.exists()
 
+    def test_a_dirty_worktree_on_the_epics_own_branch_is_still_swept(self, manager, tmp_path):
+        """The rule is scoped to the DRIFTED shape, not to "dirty" in general
+        (code review on #163).
+
+        A dirty worktree still on the epic's own branch is an ordinary
+        interrupted run -- a container SIGKILLed by an orchestrator restart --
+        and nothing refuses over it. Keeping it means the next sibling sub-issue
+        reconciles to MATCH, runs on top of the stale tree, and auto_commit's
+        unscoped `git add -A` commits the dead run's leftovers into THAT issue's
+        PR: #143's cross-issue contamination, reached from the other side.
+        Removing it (after _push_local_commits_if_any) and letting the next
+        resolution recreate it from origin is what makes "each epic gets its own
+        fresh worktree" true, and this sweep is the only thing that does it."""
+        _make_base_clone(tmp_path, "my-project")
+        interrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '975'
+        interrupted.mkdir(parents=True)
+        (interrupted / '.git').write_text("gitdir: /fake/base/.git/worktrees/975\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git(" M work.py\n",
+                                               head='feature/issue-975-auth')) as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert not interrupted.exists()
+        # And its commits still got their push-before-removal chance.
+        assert [c for c in mock_run.call_args_list if 'rev-list' in c.args[0]]
+
+    def test_a_dirty_worktree_on_a_branch_belonging_to_no_epic_is_skipped(
+        self, manager, tmp_path
+    ):
+        """The other side of the same rule: this IS what a wrong-branch refusal
+        leaves behind, and it is the only shape the skip exists for."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '976'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/976\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git(" M work.py\n", head='scratch')):
+            manager.prune_epic_worktrees()
+
+        assert drifted.exists()
+
+    def test_a_dirty_worktree_on_another_epics_branch_is_skipped(self, manager, tmp_path):
+        """Epic ownership, not "looks like a feature branch" -- a sibling epic's
+        branch in this epic's worktree is exactly #143's contamination."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '977'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/977\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git(" M work.py\n",
+                                               head='feature/issue-111-other')):
+            manager.prune_epic_worktrees()
+
+        assert drifted.exists()
+
     def test_the_skip_self_clears_once_the_work_is_committed(self, manager, tmp_path):
         """Nothing durable records the skip -- it is re-derived from the live
         working tree every startup, so committing or discarding the work is the
@@ -1053,17 +1113,51 @@ class TestPruneCorruptedWorktreeSkip:
     def test_still_removes_a_genuinely_empty_corrupted_worktree(self, manager, tmp_path):
         """No .git AND nothing in it either -- has nothing to lose, so this
         stays on the normal (pre-existing) removal path rather than being
-        needlessly escalated to manual intervention."""
+        needlessly escalated to manual intervention.
+
+        git is mocked the way REAL git answers for such a directory (code review
+        on #163): `git -C <empty non-repo> status --porcelain` exits 128, and
+        _worktree_has_uncommitted_work() reports that as None, i.e. "has work".
+        Answering rc=0 for every command here is what let the uncommitted-work
+        skip silently swallow this carve-out without any test noticing."""
         _make_base_clone(tmp_path, "my-project")
         empty_corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '961'
         empty_corrupted.mkdir(parents=True)
         assert list(empty_corrupted.iterdir()) == []
 
-        with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.return_value = _ok()
+        def _run(cmd, **kwargs):
+            if str(empty_corrupted) in cmd and ('status' in cmd or 'rev-parse' in cmd):
+                return _fail("fatal: not a git repository")
+            return _ok()
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_run):
             manager.prune_epic_worktrees()
 
         assert not empty_corrupted.exists()
+
+    def test_still_removes_an_orphaned_gitdir_pointer_that_is_otherwise_empty(
+        self, manager, tmp_path
+    ):
+        """`git worktree prune` against the base clone orphans the pointer, so
+        every git command in the directory exits 128 -- which
+        _worktree_has_uncommitted_work() reports as None ("has work"). Without
+        _is_drift_evidence()'s is-this-still-a-worktree gate that made such a
+        directory permanently unprunable, on this startup and every one after
+        it."""
+        _make_base_clone(tmp_path, "my-project")
+        orphaned = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '964'
+        orphaned.mkdir(parents=True)
+        (orphaned / '.git').write_text("gitdir: /nonexistent/.git/worktrees/964\n")
+
+        def _run(cmd, **kwargs):
+            if str(orphaned) in cmd:
+                return _fail("fatal: not a git repository: /nonexistent/.git/worktrees/964")
+            return _ok()
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_run):
+            manager.prune_epic_worktrees()
+
+        assert not orphaned.exists()
 
     def test_non_empty_corrupted_sibling_does_not_protect_other_worktrees(
         self, manager, tmp_path
