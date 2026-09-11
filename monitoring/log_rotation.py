@@ -63,11 +63,29 @@ LOG_MAX_BYTES = _positive_int('LOG_MAX_BYTES', 256 * 1024 * 1024)
 # (backups + 1) * LOG_MAX_BYTES -- 1 GB at the defaults.
 LOG_BACKUP_COUNT = _positive_int('LOG_BACKUP_COUNT', 3)
 
+# The caps above are for the ONE log the orchestrator process writes. They are
+# the wrong caps for a file that exists once per managed checkout: there are 17
+# of those on the live deployment, so `.repair_cycle.log` at the orchestrator
+# default would have a ~17 GB ceiling -- against 309 MB actually on disk today.
+#
+# These logs are also a diagnostic of last resort rather than the primary
+# record (the repair-cycle container's real output goes to its own stdout and
+# to Elasticsearch), so a much smaller window is the right trade. 16 MB x 2 is
+# ~800 MB across every checkout at the worst case.
+#
+# Capped rather than swept by services/data_retention.py: this is a file
+# something is actively appending to, and aging out a live append target just
+# truncates it at an arbitrary moment.
+CHECKOUT_LOG_MAX_BYTES = _positive_int('CHECKOUT_LOG_MAX_BYTES', 16 * 1024 * 1024)
+CHECKOUT_LOG_BACKUP_COUNT = _positive_int('CHECKOUT_LOG_BACKUP_COUNT', 1)
+
 
 def rotating_file_handler(
     path: Path,
     level: Optional[int] = None,
     formatter: Optional[logging.Formatter] = None,
+    max_bytes: Optional[int] = None,
+    backup_count: Optional[int] = None,
 ) -> RotatingFileHandler:
     """A size-capped file handler for `path`, with the caps above applied.
 
@@ -79,11 +97,27 @@ def rotating_file_handler(
     """
     handler = RotatingFileHandler(
         path,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
+        maxBytes=LOG_MAX_BYTES if max_bytes is None else max_bytes,
+        backupCount=LOG_BACKUP_COUNT if backup_count is None else backup_count,
     )
     if level is not None:
         handler.setLevel(level)
     if formatter is not None:
         handler.setFormatter(formatter)
     return handler
+
+
+def checkout_log_handler(
+    path: Path,
+    formatter: Optional[logging.Formatter] = None,
+) -> RotatingFileHandler:
+    """A handler for a log that exists once per managed checkout.
+
+    Same semantics, much smaller caps -- see CHECKOUT_LOG_MAX_BYTES.
+    """
+    return rotating_file_handler(
+        path,
+        formatter=formatter,
+        max_bytes=CHECKOUT_LOG_MAX_BYTES,
+        backup_count=CHECKOUT_LOG_BACKUP_COUNT,
+    )

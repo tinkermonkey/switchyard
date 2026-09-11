@@ -53,37 +53,22 @@ class ProjectMetricsService:
 
     def _ensure_index_template(self):
         """Create ILM policy and index template for project-metrics if they don't exist."""
-        # ILM policy: 30-day retention
+        # ILM policy. PUT unconditionally rather than only-if-absent: the
+        # window comes from config/retention.py's RETENTION_DAYS, and a
+        # get-then-create-if-missing would mean a changed value silently never
+        # reached the data that already exists. put_lifecycle is idempotent.
+        from config.retention import build_ilm_policy, RETENTION_DAYS
         try:
-            self.es.ilm.get_lifecycle(name=PROJECT_METRICS_ILM_POLICY)
-        except NotFoundError:
-            try:
-                self.es.ilm.put_lifecycle(
-                    name=PROJECT_METRICS_ILM_POLICY,
-                    body={
-                        "policy": {
-                            "phases": {
-                                "hot": {
-                                    "min_age": "0ms",
-                                    "actions": {"set_priority": {"priority": 100}},
-                                },
-                                "warm": {
-                                    "min_age": "15d",
-                                    "actions": {"set_priority": {"priority": 50}},
-                                },
-                                "delete": {
-                                    "min_age": "30d",
-                                    "actions": {"delete": {}},
-                                },
-                            }
-                        }
-                    },
-                )
-                logger.info(f"Created ILM policy: {PROJECT_METRICS_ILM_POLICY}")
-            except Exception as e:
-                logger.warning(f"Could not create ILM policy {PROJECT_METRICS_ILM_POLICY}: {e}")
+            self.es.ilm.put_lifecycle(
+                name=PROJECT_METRICS_ILM_POLICY,
+                body=build_ilm_policy(),
+            )
+            logger.info(
+                f"Created/updated ILM policy: {PROJECT_METRICS_ILM_POLICY} "
+                f"({RETENTION_DAYS}-day retention)"
+            )
         except Exception as e:
-            logger.warning(f"Could not check ILM policy {PROJECT_METRICS_ILM_POLICY}: {e}")
+            logger.warning(f"Could not put ILM policy {PROJECT_METRICS_ILM_POLICY}: {e}")
 
         # Index template
         properties = {

@@ -2,6 +2,8 @@
 Elasticsearch schema definitions for pattern detection system
 """
 
+from config.retention import build_ilm_policy
+
 # Elasticsearch index mappings for agent logs
 AGENT_LOGS_MAPPING = {
     "mappings": {
@@ -136,34 +138,12 @@ AGENT_LOGS_TEMPLATE = {
 
 # Lifecycle policy for index rotation (daily indices, 14-day retention)
 # Note: No rollover action since we use date-based index names
-AGENT_LOGS_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {
-                    "set_priority": {
-                        "priority": 100
-                    }
-                }
-            },
-            "warm": {
-                "min_age": "7d",
-                "actions": {
-                    "set_priority": {
-                        "priority": 50
-                    }
-                }
-            },
-            "delete": {
-                "min_age": "14d",
-                "actions": {
-                    "delete": {}
-                }
-            }
-        }
-    }
-}
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+AGENT_LOGS_ILM_POLICY = build_ilm_policy()
 
 
 # Separate mapping for agent lifecycle events
@@ -281,30 +261,12 @@ AGENT_EVENTS_TEMPLATE = {
 
 # ILM policy for OTEL data streams (logs-claude.otel-* and metrics-claude.otel-*)
 # Matches the 14-day retention used by agent-logs-ilm-policy.
-CLAUDE_OTEL_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {
-                    "set_priority": {"priority": 100}
-                }
-            },
-            "warm": {
-                "min_age": "7d",
-                "actions": {
-                    "set_priority": {"priority": 50}
-                }
-            },
-            "delete": {
-                "min_age": "14d",
-                "actions": {
-                    "delete": {}
-                }
-            }
-        }
-    }
-}
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+CLAUDE_OTEL_ILM_POLICY = build_ilm_policy()
 
 # Priority-300 override templates for OTEL data streams.
 # These win over the built-in logs-otel@template / metrics-otel@template (priority 120)
@@ -670,34 +632,12 @@ PROJECT_METRICS_TEMPLATE = {
 
 # ILM policy: 30-day retention (longer than 7-day task metrics;
 # project trends are valuable over time)
-PROJECT_METRICS_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {
-                    "set_priority": {
-                        "priority": 100
-                    }
-                }
-            },
-            "warm": {
-                "min_age": "15d",
-                "actions": {
-                    "set_priority": {
-                        "priority": 50
-                    }
-                }
-            },
-            "delete": {
-                "min_age": "30d",
-                "actions": {
-                    "delete": {}
-                }
-            }
-        }
-    }
-}
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+PROJECT_METRICS_ILM_POLICY = build_ilm_policy()
 
 
 # ─── Test Cycle Analytics ────────────────────────────────────────────────────
@@ -745,24 +685,12 @@ TEST_CYCLE_RECORDS_TEMPLATE = {
 }
 
 # ILM policy: 180-day retention (long enough for meaningful weekly stats)
-TEST_CYCLE_RECORDS_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {"set_priority": {"priority": 100}},
-            },
-            "warm": {
-                "min_age": "90d",
-                "actions": {"set_priority": {"priority": 50}},
-            },
-            "delete": {
-                "min_age": "180d",
-                "actions": {"delete": {}},
-            },
-        }
-    }
-}
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+TEST_CYCLE_RECORDS_ILM_POLICY = build_ilm_policy()
 
 # Rolled-up per-project/test-type stats; single index, updated weekly.
 TEST_CYCLE_STATS_MAPPING = {

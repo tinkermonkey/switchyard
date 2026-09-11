@@ -100,11 +100,12 @@ class RepairCycleRunner:
         # main()): fall back to stdout-only logging instead of crashing.
         log_file = self.project_dir / ".repair_cycle.log"
         try:
-            # Rotating, like every other file handler in this codebase: this one
-            # writes into a PROJECT CHECKOUT that the orchestrator never cleans,
-            # once per repair cycle, appending forever.
-            from monitoring.log_rotation import rotating_file_handler
-            file_handler = rotating_file_handler(log_file)
+            # Rotating, with the PER-CHECKOUT caps rather than the
+            # orchestrator's: this file exists once per managed checkout (17 of
+            # them live), so the orchestrator-wide 256MB x 4 would put a ~17GB
+            # ceiling on one filename. See CHECKOUT_LOG_MAX_BYTES.
+            from monitoring.log_rotation import checkout_log_handler
+            file_handler = checkout_log_handler(log_file)
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             logging.getLogger().addHandler(file_handler)
             logger.info(f"Logging to {log_file}")

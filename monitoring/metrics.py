@@ -48,46 +48,24 @@ class MetricsCollector:
     def _create_index_templates(self):
         """Create index templates for metrics indices with ILM policies"""
         try:
-            # First, create the ILM policy for metrics (7-day retention)
-            ilm_policy = {
-                "policy": {
-                    "phases": {
-                        "hot": {
-                            "min_age": "0ms",
-                            "actions": {
-                                "rollover": {
-                                    "max_age": "1d",
-                                    "max_size": "5gb"
-                                },
-                                "set_priority": {
-                                    "priority": 100
-                                }
-                            }
-                        },
-                        "warm": {
-                            "min_age": "3d",
-                            "actions": {
-                                "set_priority": {
-                                    "priority": 50
-                                }
-                            }
-                        },
-                        "delete": {
-                            "min_age": "7d",
-                            "actions": {
-                                "delete": {}
-                            }
-                        }
-                    }
-                }
-            }
-            
+            # Retention comes from config/retention.py's single RETENTION_DAYS
+            # value, like every other ILM policy and the filesystem sweep.
+            # The rollover action is this family's one genuine difference from
+            # the rest -- these indices roll on size/age as well as on date.
+            from config.retention import build_ilm_policy, RETENTION_DAYS
+            ilm_policy = build_ilm_policy(
+                hot_actions={"rollover": {"max_age": "1d", "max_size": "5gb"}}
+            )
+
             # Create or update ILM policy
             self.es.ilm.put_lifecycle(
                 name="orchestrator-metrics-policy",
                 body=ilm_policy
             )
-            logger.info("Created ILM policy: orchestrator-metrics-policy (7-day retention)")
+            logger.info(
+                f"Created/updated ILM policy: orchestrator-metrics-policy "
+                f"({RETENTION_DAYS}-day retention)"
+            )
             
             # Task metrics template with ILM policy
             task_template = {

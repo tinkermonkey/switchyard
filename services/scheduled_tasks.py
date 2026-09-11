@@ -208,7 +208,11 @@ class ScheduledTasksService:
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
         logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
         logger.info("- Test-cycle stats rollup: Weekly on Sunday at 4 AM")
-        logger.info("- Data retention sweep: Daily at 4:30 AM")
+        from config.retention import RETENTION_DAYS as _retention_days
+        logger.info(
+            f"- Data retention sweep: Daily at 4:30 AM "
+            f"({_retention_days}-day window, shared with Elasticsearch ILM)"
+        )
 
     def stop(self):
         """Stop the scheduler"""

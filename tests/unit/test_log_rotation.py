@@ -16,9 +16,12 @@ from pathlib import Path
 import pytest
 
 from monitoring.log_rotation import (  # noqa: E402
+    CHECKOUT_LOG_BACKUP_COUNT,
+    CHECKOUT_LOG_MAX_BYTES,
     LOG_BACKUP_COUNT,
     LOG_MAX_BYTES,
     _positive_int,
+    checkout_log_handler,
     rotating_file_handler,
 )
 
@@ -155,3 +158,36 @@ class TestNoPlainFileHandlersRemain:
             f"these modules construct an unbounded logging.FileHandler: {offenders}. "
             f"Use monitoring.log_rotation.rotating_file_handler() instead."
         )
+
+
+class TestPerCheckoutCap:
+    """`.repair_cycle.log` exists once per managed checkout, not once per process."""
+
+    def test_the_checkout_cap_is_far_below_the_orchestrator_one(self):
+        """There are 17 checkouts on the live deployment, so the
+        orchestrator-wide 256MB x 4 would put a ~17GB ceiling on a single
+        filename -- against 309MB actually on disk. The whole-fleet worst case
+        at these caps is ~800MB."""
+        fleet = 20
+        orchestrator_ceiling = (LOG_BACKUP_COUNT + 1) * LOG_MAX_BYTES
+        checkout_ceiling = (CHECKOUT_LOG_BACKUP_COUNT + 1) * CHECKOUT_LOG_MAX_BYTES
+
+        assert checkout_ceiling < orchestrator_ceiling
+        assert checkout_ceiling * fleet < orchestrator_ceiling
+
+    def test_the_checkout_handler_applies_those_caps(self, tmp_path, closed_handlers):
+        handler = checkout_log_handler(tmp_path / '.repair_cycle.log')
+        closed_handlers.append(handler)
+
+        assert handler.maxBytes == CHECKOUT_LOG_MAX_BYTES
+        assert handler.backupCount == CHECKOUT_LOG_BACKUP_COUNT
+
+    def test_it_keeps_the_eager_open_the_runner_depends_on(self, tmp_path, closed_handlers):
+        """Same guard as the orchestrator handler: the repair-cycle runner
+        detects an unmounted epic worktree by this raising."""
+        missing = tmp_path / 'never-mounted' / '.repair_cycle.log'
+
+        with pytest.raises(OSError):
+            closed_handlers.append(checkout_log_handler(missing))
+
+        assert not missing.parent.exists()

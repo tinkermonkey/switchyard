@@ -87,17 +87,15 @@ class TestCycleRecorder:
             TEST_CYCLE_STATS_MAPPING,
         )
 
-        # ILM policy
+        # ILM policy. PUT unconditionally rather than only-if-absent: the window
+        # comes from config/retention.py's RETENTION_DAYS, and a
+        # get-then-create-if-missing means a changed value never reaches data
+        # that already exists. put_lifecycle is idempotent.
         try:
-            self.es.ilm.get_lifecycle(name=ILM_POLICY_NAME)
-        except NotFoundError:
-            try:
-                self.es.ilm.put_lifecycle(name=ILM_POLICY_NAME, body=TEST_CYCLE_RECORDS_ILM_POLICY)
-                logger.info(f"Created ILM policy: {ILM_POLICY_NAME}")
-            except Exception as exc:
-                logger.warning(f"Could not create ILM policy {ILM_POLICY_NAME}: {exc}")
+            self.es.ilm.put_lifecycle(name=ILM_POLICY_NAME, body=TEST_CYCLE_RECORDS_ILM_POLICY)
+            logger.info(f"Created/updated ILM policy: {ILM_POLICY_NAME}")
         except Exception as exc:
-            logger.warning(f"Could not check ILM policy {ILM_POLICY_NAME}: {exc}")
+            logger.warning(f"Could not put ILM policy {ILM_POLICY_NAME}: {exc}")
 
         # Index template for records
         try:
@@ -120,6 +118,13 @@ class TestCycleRecorder:
 
         # Stats index (no template needed — single index, fixed name)
         try:
+            # Deliberately NOT ILM-managed, and the only Elasticsearch index
+            # in this codebase that is not. It is a weekly rollup -- one
+            # document per project per week, ~900 a year, so it does not grow
+            # with traffic -- and it exists precisely to outlive the raw
+            # records it summarises. Applying the shared RETENTION_DAYS window
+            # to it would delete the summary on the same day as the data, which
+            # is the one case where the uniform rule is actively wrong.
             if not self.es.indices.exists(index=STATS_INDEX):
                 self.es.indices.create(index=STATS_INDEX, body=TEST_CYCLE_STATS_MAPPING)
                 logger.info(f"Created index: {STATS_INDEX}")

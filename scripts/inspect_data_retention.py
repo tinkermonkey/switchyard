@@ -10,24 +10,24 @@ safe. The same sweep runs automatically each night (services/scheduled_tasks.py,
 4:30 AM); this exists to see what it will do, to run it early after a deploy
 that has a large backlog to clear, and to answer "where did the disk go".
 
-The rules and their reasoning live in services/data_retention.py. Two things
-this deliberately does NOT touch, also explained there:
+Every rule uses the SAME window: config/retention.py's RETENTION_DAYS (30 days
+by default), which is also what every Elasticsearch ILM policy uses. There is
+no per-location number to get wrong.
 
-  * state/execution_history/ -- the empty-output watchdog's corpus. Aging it
-    out is a behaviour change, not housekeeping.
-  * its .yaml.lock sidecars -- 0 bytes each, and deleting one a process holds
-    breaks the mutual exclusion it exists for.
-
-For the two directories with their own mechanisms, look elsewhere:
-orchestrator_data/logs/ is bounded by monitoring/log_rotation.py, and
-state/projects/ backups by config/state_manager.py's STATE_BACKUP_RETENTION
-(see scripts/inspect_project_state.py).
+The rules and their reasoning live in services/data_retention.py. What it does
+NOT sweep, and why, is documented there too -- in short: live state
+(`state/pipeline_locks/`, `state/pipeline_queues/`, `state/dev_containers/`,
+`github_state.yaml`) is cleaned by orphan detection rather than by age (see
+scripts/inspect_project_state.py), lock sidecars are never deleted, and
+`orchestrator_data/logs/` plus each checkout's `.repair_cycle.log` are bounded
+by monitoring/log_rotation.py instead.
 
 Usage:
     python scripts/inspect_data_retention.py
     python scripts/inspect_data_retention.py --json
     python scripts/inspect_data_retention.py --apply
     python scripts/inspect_data_retention.py --root /some/other/orchestrator
+    RETENTION_DAYS=7 python scripts/inspect_data_retention.py
 """
 
 import argparse
@@ -39,7 +39,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from services.data_retention import RETENTION_RULES, sweep  # noqa: E402
+from config.retention import RETENTION_DAYS  # noqa: E402
+from services.data_retention import (  # noqa: E402
+    RETENTION_RULES,
+    WORKSPACE_ROOT,
+    sweep,
+)
 
 
 def _human(num_bytes: int) -> str:
@@ -58,7 +63,7 @@ def report(outcomes, applied: bool) -> None:
 
     for outcome in outcomes:
         rule = outcome.rule
-        print(f"{rule.name}  ({rule.retention_days}d retention)")
+        print(f"{rule.name}  [{rule.root_kind}]")
         print(f"    {rule.description}")
         print(f"    {outcome.path}")
 
@@ -95,6 +100,9 @@ def main() -> int:
                         help='Machine-readable output')
     parser.add_argument('--root', default=None,
                         help='Orchestrator root (default: $ORCHESTRATOR_ROOT or /app)')
+    parser.add_argument('--workspace-root', default=None,
+                        help=f'Workspace root for the rules that live beside the '
+                             f'checkout (default: $WORKSPACE_ROOT or {WORKSPACE_ROOT})')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -102,17 +110,20 @@ def main() -> int:
     root = Path(args.root) if args.root else Path(
         os.environ.get('ORCHESTRATOR_ROOT', '/app')
     )
-    outcomes = sweep(root=root, apply=args.apply)
+    workspace_root = Path(args.workspace_root) if args.workspace_root else None
+    outcomes = sweep(root=root, apply=args.apply, workspace_root=workspace_root)
 
     if args.json:
         print(json.dumps({
             'root': str(root),
+            'workspace_root': str(workspace_root or WORKSPACE_ROOT),
+            'retention_days': RETENTION_DAYS,
             'applied': args.apply,
             'rules': [
                 {
                     'name': o.rule.name,
                     'path': o.path,
-                    'retention_days': o.rule.retention_days,
+                    'root_kind': o.rule.root_kind,
                     'missing': o.missing,
                     'examined': o.examined,
                     'expired': len(o.expired),
@@ -125,6 +136,9 @@ def main() -> int:
         }, indent=2))
     else:
         print(f"Orchestrator root: {root}")
+        print(f"Workspace root:    {workspace_root or WORKSPACE_ROOT}")
+        print(f"Retention window:  {RETENTION_DAYS} days (RETENTION_DAYS) -- the "
+              f"same value every Elasticsearch ILM policy uses")
         print(f"Rules: {len(RETENTION_RULES)}")
         print()
         report(outcomes, applied=args.apply)

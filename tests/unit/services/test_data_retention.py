@@ -17,10 +17,13 @@ from pathlib import Path
 
 import pytest
 
+from config.retention import RETENTION_DAYS  # noqa: E402
 from services.data_retention import (  # noqa: E402
     RETENTION_RULES,
     RetentionRule,
+    _execution_history_records,
     _repair_cycle_issue_dirs,
+    resolve_roots,
     run_scheduled_sweep,
     sweep,
     sweep_rule,
@@ -41,7 +44,6 @@ def _rule(**overrides) -> RetentionRule:
     base = dict(
         name='test_rule',
         relative_path='data/things',
-        retention_days=14,
         entries=lambda root: sorted(p for p in root.glob('*.log') if p.is_file()),
         description='things',
     )
@@ -65,10 +67,10 @@ class TestAgeBoundary:
         """Strictly older-than, so a boundary rounding error keeps rather than
         deletes."""
         now = time.time()
-        edge = _aged_file(tmp_path / 'data/things/edge.log', days_old=14)
-        os.utime(edge, (now - 14 * DAY, now - 14 * DAY))
+        edge = _aged_file(tmp_path / 'data/things/edge.log', days_old=RETENTION_DAYS)
+        os.utime(edge, (now - RETENTION_DAYS * DAY, now - RETENTION_DAYS * DAY))
 
-        outcome = sweep_rule(_rule(retention_days=14), tmp_path, apply=True, now=now)
+        outcome = sweep_rule(_rule(), tmp_path, apply=True, now=now)
 
         assert outcome.removed == []
         assert edge.exists()
@@ -165,7 +167,6 @@ class TestRepairCycleDirectories:
         finished."""
         rule = _rule(
             relative_path='repair_cycles',
-            retention_days=30,
             entries=_repair_cycle_issue_dirs,
         )
         issue_dir = tmp_path / 'repair_cycles/proj/100'
@@ -180,7 +181,6 @@ class TestRepairCycleDirectories:
     def test_an_expired_directory_is_removed_whole(self, tmp_path):
         rule = _rule(
             relative_path='repair_cycles',
-            retention_days=30,
             entries=_repair_cycle_issue_dirs,
         )
         stale = tmp_path / 'repair_cycles/proj/100'
@@ -198,25 +198,70 @@ class TestRepairCycleDirectories:
 
 class TestConfiguredRules:
 
-    def test_execution_history_is_not_swept(self):
-        """Deliberate: it is the empty-output watchdog's corpus and the record
-        that an issue was worked. Ageing it out is a behaviour change, not
-        housekeeping, and its .yaml.lock sidecars must not be deleted at all.
-        If a rule for it is ever added, that decision needs its own review --
-        this assertion is the prompt for it."""
-        paths = [r.relative_path for r in RETENTION_RULES]
-        assert not any('execution_history' in p for p in paths)
+    def test_every_rule_uses_the_one_configured_window(self):
+        """The whole point of this change: there is no per-location number.
+
+        Eleven disagreeing windows is how the metrics JSONL "backup" came to be
+        kept 90 days against an Elasticsearch original deleted after 7."""
+        for rule in RETENTION_RULES:
+            assert rule.retention_days == RETENTION_DAYS, rule.name
+
+    def test_live_state_directories_are_not_swept(self):
+        """Aging these would be destructive, not tidy.
+
+        A pipeline lock, a queue entry, a verified dev-container record and a
+        board's node IDs describe what is true NOW -- none is less valid for
+        being three months old. What they accumulate is entries for projects
+        whose config is gone, and that is orphan detection's job
+        (scripts/inspect_project_state.py), keyed on the config list rather
+        than on a clock."""
+        swept = {r.relative_path for r in RETENTION_RULES}
+        for live in (
+            'state/pipeline_locks',
+            'state/pipeline_queues',
+            'state/dev_containers',
+        ):
+            assert live not in swept, (
+                f"{live} holds live state; age is not a reason to delete from it"
+            )
+
+    def test_execution_history_sweeps_records_but_never_lock_sidecars(self, tmp_path):
+        """0 bytes each, and deleting one a process holds breaks the mutual
+        exclusion it exists to provide."""
+        history = tmp_path / 'state/execution_history'
+        record = _aged_file(history / 'proj_issue_1.yaml', days_old=365)
+        sidecar = _aged_file(history / 'proj_issue_1.yaml.lock', days_old=365, content='')
+
+        entries = list(_execution_history_records(history))
+        assert entries == [record]
+
+        rule = next(r for r in RETENTION_RULES if r.name == 'execution_history')
+        outcome = sweep_rule(rule, tmp_path, apply=True)
+
+        assert outcome.removed == [record]
+        assert sidecar.exists()
+
+    def test_state_backups_are_swept_but_the_live_state_file_is_not(self, tmp_path):
+        """github_state.yaml is the only local record of a project's board and
+        column node IDs. Its point-in-time copies age; it does not."""
+        project = tmp_path / 'state/projects/demo'
+        live = _aged_file(project / 'github_state.yaml', days_old=365)
+        backup = _aged_file(project / 'github_state_backup_20250101_000000.yaml',
+                            days_old=365)
+
+        rule = next(r for r in RETENTION_RULES if r.name == 'state_backups')
+        outcome = sweep_rule(rule, tmp_path, apply=True)
+
+        assert outcome.removed == [backup]
+        assert live.exists()
 
     def test_the_rotating_log_files_are_not_swept_by_this(self):
-        """orchestrator_data/logs/*.log is bounded by monitoring/log_rotation.py.
-        A retention rule over the same files would race the handler that owns
-        them."""
+        """orchestrator_data/logs/*.log and each checkout's .repair_cycle.log are
+        bounded by monitoring/log_rotation.py. A retention rule over the same
+        files would race the handler that owns them, and aging out a live append
+        target just truncates it at an arbitrary moment."""
         paths = [r.relative_path for r in RETENTION_RULES]
         assert 'orchestrator_data/logs' not in paths
-
-    def test_every_rule_has_a_positive_window(self):
-        for rule in RETENTION_RULES:
-            assert rule.retention_days > 0, rule.name
 
     @pytest.mark.parametrize('name', [r.name for r in RETENTION_RULES])
     def test_each_rule_survives_a_sweep_of_an_empty_root(self, name, tmp_path):
@@ -224,33 +269,119 @@ class TestConfiguredRules:
         outcome = sweep_rule(rule, tmp_path, apply=True)
         assert outcome.missing is True
 
+    def test_rule_names_are_unique(self):
+        names = [r.name for r in RETENTION_RULES]
+        assert len(names) == len(set(names))
 
-class TestEnvironmentOverrides:
 
-    def test_a_bad_override_falls_back_rather_than_failing_startup(self, monkeypatch):
+class TestRootResolution:
+    """Two roots, because in the container /app IS /workspace/switchyard."""
+
+    def test_a_scratch_root_moves_the_workspace_rules_too(self, tmp_path):
+        """Otherwise a test or a --root run would sweep the REAL /workspace --
+        which holds every managed project checkout."""
+        roots = resolve_roots(root=tmp_path)
+        assert roots['orchestrator'] == tmp_path
+        assert roots['workspace'] == tmp_path
+
+    def test_the_two_roots_can_be_set_independently(self, tmp_path):
+        roots = resolve_roots(root=tmp_path / 'app', workspace_root=tmp_path / 'ws')
+        assert roots['orchestrator'] == tmp_path / 'app'
+        assert roots['workspace'] == tmp_path / 'ws'
+
+    def test_a_workspace_rooted_rule_sweeps_under_the_workspace_root(self, tmp_path):
+        old = _aged_file(
+            tmp_path / 'ws/.orchestrator/tmp/mcp_config_agent_1.json', days_old=365
+        )
+        fresh = _aged_file(
+            tmp_path / 'ws/.orchestrator/tmp/mcp_config_agent_2.json', days_old=1
+        )
+
+        outcomes = sweep(
+            root=tmp_path / 'app',
+            workspace_root=tmp_path / 'ws',
+            apply=True,
+        )
+
+        by_name = {o.rule.name: o for o in outcomes}
+        assert by_name['agent_launch_scratch'].removed == [old]
+        assert fresh.exists()
+
+
+class TestTheSingleConfiguredValue:
+
+    def test_a_malformed_value_falls_back_rather_than_failing_startup(self, monkeypatch):
         import importlib
-        import services.data_retention as dr
+        import config.retention as retention
 
-        monkeypatch.setenv('METRICS_BACKUP_RETENTION_DAYS', 'not-a-number')
-        reloaded = importlib.reload(dr)
+        monkeypatch.setenv('RETENTION_DAYS', 'not-a-number')
+        reloaded = importlib.reload(retention)
         try:
-            assert reloaded.METRICS_BACKUP_RETENTION_DAYS == 90
+            assert reloaded.RETENTION_DAYS == 30
         finally:
-            monkeypatch.delenv('METRICS_BACKUP_RETENTION_DAYS', raising=False)
-            importlib.reload(dr)
+            monkeypatch.delenv('RETENTION_DAYS', raising=False)
+            importlib.reload(retention)
 
-    def test_a_nonpositive_override_is_refused(self, monkeypatch):
-        """0 would mean "delete everything, always"."""
+    def test_zero_is_refused(self, monkeypatch):
+        """0 means "delete immediately" to ILM and "delete everything" to the
+        file sweep. It must never be reachable by typo."""
         import importlib
-        import services.data_retention as dr
+        import config.retention as retention
 
-        monkeypatch.setenv('CONTAINER_FAILURE_LOG_RETENTION_DAYS', '0')
-        reloaded = importlib.reload(dr)
+        monkeypatch.setenv('RETENTION_DAYS', '0')
+        reloaded = importlib.reload(retention)
         try:
-            assert reloaded.CONTAINER_FAILURE_LOG_RETENTION_DAYS == 14
+            assert reloaded.RETENTION_DAYS == 30
         finally:
-            monkeypatch.delenv('CONTAINER_FAILURE_LOG_RETENTION_DAYS', raising=False)
-            importlib.reload(dr)
+            monkeypatch.delenv('RETENTION_DAYS', raising=False)
+            importlib.reload(retention)
+
+    def test_a_valid_value_reaches_both_halves(self, monkeypatch):
+        import importlib
+        import config.retention as retention
+
+        monkeypatch.setenv('RETENTION_DAYS', '7')
+        reloaded = importlib.reload(retention)
+        try:
+            assert reloaded.RETENTION_DAYS == 7
+            policy = reloaded.build_ilm_policy()
+            assert policy['policy']['phases']['delete']['min_age'] == '7d'
+        finally:
+            monkeypatch.delenv('RETENTION_DAYS', raising=False)
+            importlib.reload(retention)
+
+    def test_the_warm_phase_stays_strictly_below_delete_at_every_window(self, monkeypatch):
+        """Elasticsearch rejects a policy whose phases are not strictly
+        increasing, and a rejected put means NO retention is applied at all --
+        a far worse outcome than losing a performance tier. A hard-coded
+        "warm at 7d" would do exactly that at RETENTION_DAYS=3."""
+        import importlib
+        import config.retention as retention
+
+        try:
+            for days in ('1', '2', '3', '4', '7', '30', '365'):
+                monkeypatch.setenv('RETENTION_DAYS', days)
+                reloaded = importlib.reload(retention)
+                phases = reloaded.build_ilm_policy()['policy']['phases']
+                assert phases['delete']['min_age'] == f'{days}d'
+                if 'warm' in phases:
+                    warm = int(phases['warm']['min_age'].rstrip('d'))
+                    assert 0 < warm < int(days), f"warm={warm} delete={days}"
+        finally:
+            monkeypatch.delenv('RETENTION_DAYS', raising=False)
+            importlib.reload(retention)
+
+    def test_extra_hot_actions_merge_rather_than_replace(self):
+        """The metrics families roll over on size/age as well as on date -- the
+        one genuine difference between any two policies."""
+        from config.retention import build_ilm_policy
+
+        policy = build_ilm_policy(
+            hot_actions={"rollover": {"max_age": "1d", "max_size": "5gb"}}
+        )
+        hot = policy['policy']['phases']['hot']['actions']
+        assert 'rollover' in hot
+        assert hot['set_priority'] == {'priority': 100}
 
 
 class TestScheduledEntryPoint:
@@ -265,3 +396,85 @@ class TestScheduledEntryPoint:
 
         assert not old.exists()
         assert any(o.removed for o in outcomes)
+
+
+class TestElasticsearchParity:
+    """Every ILM policy resolves the same window as the file sweep.
+
+    This is the half that is easy to let rot. A filesystem rule that disagrees
+    with itself is visible in one file; an ILM policy that disagrees with the
+    filesystem lives in a different module, is written as a nested dict, and is
+    only observable by querying a running cluster. Before this, eight policies
+    had hand-written ages of 7d, 14d, 30d and 180d, and ten indices had no
+    policy at all.
+    """
+
+    def _all_policies(self):
+        from monitoring.observability import DECISION_EVENTS_ILM_POLICY
+        from services.agent_container_recovery import REPAIR_CYCLE_RECOVERY_ILM_POLICY
+        from services.pattern_detection_schema import (
+            AGENT_LOGS_ILM_POLICY,
+            CLAUDE_OTEL_ILM_POLICY,
+            PROJECT_METRICS_ILM_POLICY,
+            TEST_CYCLE_RECORDS_ILM_POLICY,
+        )
+        from services.pipeline_run import PIPELINE_RUNS_ILM_POLICY
+
+        return {
+            'decision-events': DECISION_EVENTS_ILM_POLICY,
+            'repair-cycle-recovery': REPAIR_CYCLE_RECOVERY_ILM_POLICY,
+            'agent-logs': AGENT_LOGS_ILM_POLICY,
+            'claude-otel': CLAUDE_OTEL_ILM_POLICY,
+            'project-metrics': PROJECT_METRICS_ILM_POLICY,
+            'test-cycle-records': TEST_CYCLE_RECORDS_ILM_POLICY,
+            'pipeline-runs': PIPELINE_RUNS_ILM_POLICY,
+        }
+
+    def test_every_ilm_policy_deletes_at_the_configured_window(self):
+        for name, policy in self._all_policies().items():
+            actual = policy['policy']['phases']['delete']['min_age']
+            assert actual == f'{RETENTION_DAYS}d', (
+                f"{name} deletes at {actual}, not the configured "
+                f"{RETENTION_DAYS}d"
+            )
+
+    def test_ilm_and_the_file_sweep_agree(self):
+        """The one assertion this whole change exists to make true."""
+        windows = {
+            p['policy']['phases']['delete']['min_age']
+            for p in self._all_policies().values()
+        }
+        windows |= {f'{r.retention_days}d' for r in RETENTION_RULES}
+        assert windows == {f'{RETENTION_DAYS}d'}, (
+            f"Elasticsearch and the filesystem disagree: {sorted(windows)}"
+        )
+
+    def test_no_module_hard_codes_an_ilm_phase_age_any_more(self):
+        """A new literal min_age is how the eleven windows came back last time.
+
+        Scoped to the phase dicts rather than the string "min_age" anywhere, so
+        config/retention.py -- which is where the value legitimately lives --
+        is exempt by path rather than by pattern.
+        """
+        import re
+
+        root = Path(__file__).parent.parent.parent.parent
+        exempt = {'config/retention.py'}
+        offenders = []
+        for source in root.rglob('*.py'):
+            relative = source.relative_to(root)
+            parts = relative.parts
+            if parts[0] in ('tests', '.claude', 'node_modules', 'venv', '.venv'):
+                continue
+            if str(relative) in exempt:
+                continue
+            text = source.read_text(errors='ignore')
+            for match in re.finditer(r'["\']min_age["\']\s*:\s*["\']([^"\']+)["\']', text):
+                if match.group(1) == '0ms':
+                    continue
+                offenders.append(f"{relative}: min_age {match.group(1)}")
+
+        assert offenders == [], (
+            f"hard-coded ILM phase ages found: {offenders}. "
+            f"Use config.retention.build_ilm_policy() instead."
+        )

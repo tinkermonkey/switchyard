@@ -1,33 +1,43 @@
-"""Age-based retention for the orchestrator's write-only data directories.
+"""Age-based retention for everything the orchestrator writes and never reads.
 
-Several directories were written to on every run and never read back or
-cleaned. Measured on the live deployment when this was added:
+The window comes from config/retention.py -- one RETENTION_DAYS value shared
+with every Elasticsearch ILM policy, so the two halves of this system cannot
+drift apart. Before that they had: eight hand-written ILM windows (7d/14d/30d/
+180d), three hand-picked file windows (14d/30d/90d), one count-based rule, ten
+indices with no policy at all, and nine filesystem locations with no sweep.
+The metrics JSONL "backup" was kept 90 days against an Elasticsearch original
+deleted after 7, so for 83 of those days it was backing up nothing.
 
-    orchestrator_data/logs/            9.2 GB   two unrotated log files
-    state/projects/                     31 MB   3,196 state backups, 3,006 stale
-    state/execution_history/            23 MB   4,703 records, oldest Oct 2025
-    orchestrator_data/metrics/         9.5 MB   191 daily files, oldest Nov 2025
-    orchestrator_data/logs/container-
-      failures/                        9.6 MB   76 logs, oldest July
-    orchestrator_data/repair_cycles/   5.0 MB   69 per-run scratch directories
+HISTORY AGES. LIVE STATE DOES NOT.
+----------------------------------
+Every rule below covers an ARTIFACT: something written once, describing a
+moment that has passed. Those age out.
 
-The logs are handled by monitoring/log_rotation.py and the state backups by
-config/state_manager.py's STATE_BACKUP_RETENTION. This module covers the rest
--- the three whose contents are transient by nature.
+Four directories deliberately have no rule, because they describe what is true
+*now*, and a lock file is no less valid for being three months old:
 
-WHAT IS DELIBERATELY NOT HERE
------------------------------
-`state/execution_history/` is the empty-output watchdog's corpus and the record
-that an issue was worked at all, so an age sweep over it is a behaviour change,
-not housekeeping, and it belongs behind its own decision. Its 4,703 sidecar
-`.yaml.lock` files are not swept either: they are 0 bytes (inodes, not space)
-and deleting one that a process currently holds breaks the mutual exclusion it
-exists to provide.
+    state/pipeline_locks/          who holds which board lock
+    state/pipeline_queues/         what is waiting to run
+    state/dev_containers/          which image is verified for which project
+    state/projects/*/github_state.yaml
+                                   board and column node IDs
 
-Everything here is age-based rather than count-based, because these are
-diagnostic artifacts whose usefulness is a function of how long ago the
-incident was, not of how many happened.
+Deleting any of those by age would be destructive, not tidy. What they
+accumulate is ORPHANS -- entries for projects whose config is gone -- and that
+is scripts/inspect_project_state.py's job, keyed on the config list rather than
+on a clock.
+
+Two more exclusions, for their own reasons:
+
+  * state/execution_history/*.yaml.lock -- 0 bytes each, so they cost inodes
+    and not space, and deleting one a process currently holds breaks the mutual
+    exclusion it exists to provide. Same for the .lock sidecars under
+    state/pipeline_locks/ and state/pipeline_queues/.
+  * <checkout>/.repair_cycle.log -- a live append target. Bounded by
+    monitoring/log_rotation.py's per-checkout cap instead, since aging out a
+    file something is writing to just truncates it at an arbitrary moment.
 """
+
 
 import logging
 import os
@@ -40,57 +50,46 @@ from typing import Callable, Iterable, List, Optional
 logger = logging.getLogger(__name__)
 
 
-def _positive_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        logger.warning(f"Ignoring unparseable {name}={raw!r}, using {default}")
-        return default
-    if value <= 0:
-        logger.warning(f"Ignoring non-positive {name}={raw!r}, using {default}")
-        return default
-    return value
+from config.retention import RETENTION_DAYS  # noqa: E402
 
 
-# Per-container diagnostic logs, written only when an agent container fails.
-# Long enough to cover "what happened last week", which is the only question
-# they answer.
-CONTAINER_FAILURE_LOG_RETENTION_DAYS = _positive_int(
-    'CONTAINER_FAILURE_LOG_RETENTION_DAYS', 14
-)
-
-# Per-run scratch for a repair-cycle container: the context file it is handed at
-# launch and the result it writes back. Read once, by that container, during
-# that run. Kept a month so a recent cycle can still be reconstructed by hand.
-REPAIR_CYCLE_SCRATCH_RETENTION_DAYS = _positive_int(
-    'REPAIR_CYCLE_SCRATCH_RETENTION_DAYS', 30
-)
-
-# Local JSONL mirror of the task/quality metrics that also go to Elasticsearch,
-# where the same data is already under ILM. This is the backup copy, so it
-# outlives the ES retention on purpose, but not by nine months.
-METRICS_BACKUP_RETENTION_DAYS = _positive_int('METRICS_BACKUP_RETENTION_DAYS', 90)
+# Where the workspace root is, for the locations that live beside the
+# orchestrator checkout rather than inside it (`/workspace/.orchestrator`,
+# `/workspace/<project>/`). In the container /app IS /workspace/switchyard, so
+# this cannot be derived from ORCHESTRATOR_ROOT alone.
+WORKSPACE_ROOT = os.environ.get('WORKSPACE_ROOT', '/workspace')
 
 
 @dataclass(frozen=True)
 class RetentionRule:
-    """One directory, what counts as an entry in it, and how long entries live.
+    """One directory and what counts as an entry in it.
 
-    `entries` returns the things to age out, which are files in two of the
-    three cases and directories in the third -- hence the explicit `remove`
-    rather than assuming unlink().
+    There is no per-rule window: every rule ages at config/retention.py's
+    RETENTION_DAYS. That is the whole point -- a `retention_days` field here
+    would be an invitation to give one location a different number, which is
+    how the eleven disagreeing windows this replaced came about.
+
+    `entries` returns the things to age out, which are files for most rules and
+    directories for two of them -- hence the explicit `_remove()` rather than
+    assuming unlink().
+
+    `root_kind` selects which root `relative_path` hangs off: 'orchestrator'
+    for ORCHESTRATOR_ROOT (/app) and 'workspace' for WORKSPACE_ROOT
+    (/workspace). In the container /app IS /workspace/switchyard, so the two
+    cannot be derived from one another.
     """
     name: str
     relative_path: str
-    retention_days: int
     entries: Callable[[Path], Iterable[Path]]
     description: str
+    root_kind: str = 'orchestrator'
+
+    @property
+    def retention_days(self) -> int:
+        return RETENTION_DAYS
 
     def age_cutoff(self, now: float) -> float:
-        return now - (self.retention_days * 86400)
+        return now - (RETENTION_DAYS * 86400)
 
 
 def _files_matching(pattern: str) -> Callable[[Path], Iterable[Path]]:
@@ -99,40 +98,111 @@ def _files_matching(pattern: str) -> Callable[[Path], Iterable[Path]]:
     return _entries
 
 
-def _repair_cycle_issue_dirs(root: Path) -> Iterable[Path]:
-    """`repair_cycles/<project>/<issue>/` -- the per-run unit, not the project.
+def _dirs_two_levels_down(root: Path) -> Iterable[Path]:
+    """`<root>/<a>/<b>/` -- the per-run unit, not the per-project container.
 
-    Removing a whole project directory would delete the scratch for cycles that
-    are still recent; the issue directory is the thing a single run owns.
+    Used for repair_cycles/<project>/<issue>/. Removing a whole project
+    directory would take the scratch for cycles that are still recent with it.
     """
     return sorted(
-        issue_dir
-        for project_dir in root.iterdir() if project_dir.is_dir()
-        for issue_dir in project_dir.iterdir() if issue_dir.is_dir()
+        leaf
+        for parent in root.iterdir() if parent.is_dir()
+        for leaf in parent.iterdir() if leaf.is_dir()
     )
+
+
+# Kept as an alias: the name says what it is for at the one call site, and
+# tests reference it.
+_repair_cycle_issue_dirs = _dirs_two_levels_down
+
+
+def _files_matching_nested(pattern: str) -> Callable[[Path], Iterable[Path]]:
+    """Like _files_matching but recursive, for per-project subdirectories."""
+    def _entries(root: Path) -> Iterable[Path]:
+        return sorted(p for p in root.rglob(pattern) if p.is_file())
+    return _entries
+
+
+def _execution_history_records(root: Path) -> Iterable[Path]:
+    """Execution-history YAML only -- never the .yaml.lock sidecars.
+
+    Safe to age at RETENTION_DAYS because every consumer of these records works
+    on a far shorter horizon: the empty-output watchdog skips anything older
+    than _WATCHDOG_MAX_RECORD_AGE_HOURS (24h), was_recent_programmatic_change()
+    uses a 60-second window, and record_execution_start()'s in-progress guard
+    only cares about entries that have not finished. Nothing reads a record
+    from last month.
+
+    The sidecars are excluded by construction rather than by a later filter:
+    glob('*.yaml') would otherwise also need a name check, and getting that
+    wrong deletes a lock some process is holding.
+    """
+    return sorted(p for p in root.glob('*.yaml') if p.is_file())
 
 
 RETENTION_RULES = (
     RetentionRule(
         name='container_failure_logs',
         relative_path='orchestrator_data/logs/container-failures',
-        retention_days=CONTAINER_FAILURE_LOG_RETENTION_DAYS,
+        root_kind='orchestrator',
         entries=_files_matching('*.log'),
         description='per-container diagnostic logs from failed agent runs',
     ),
     RetentionRule(
         name='repair_cycle_scratch',
         relative_path='orchestrator_data/repair_cycles',
-        retention_days=REPAIR_CYCLE_SCRATCH_RETENTION_DAYS,
-        entries=_repair_cycle_issue_dirs,
+        root_kind='orchestrator',
+        entries=_dirs_two_levels_down,
         description='per-run repair-cycle context/result files',
     ),
     RetentionRule(
         name='metrics_backup',
         relative_path='orchestrator_data/metrics',
-        retention_days=METRICS_BACKUP_RETENTION_DAYS,
+        root_kind='orchestrator',
         entries=_files_matching('*.jsonl'),
         description='local JSONL mirror of metrics already in Elasticsearch',
+    ),
+    RetentionRule(
+        name='medic_advisor_reports',
+        relative_path='orchestrator_data/medic/advisor_reports',
+        root_kind='orchestrator',
+        entries=_files_matching_nested('*.md'),
+        description='per-project advisor reports',
+    ),
+    RetentionRule(
+        name='conversational_sessions',
+        relative_path='state/conversational_sessions',
+        root_kind='orchestrator',
+        entries=_files_matching('*.yaml'),
+        description='threaded-conversation state for a single issue',
+    ),
+    RetentionRule(
+        name='execution_history',
+        relative_path='state/execution_history',
+        root_kind='orchestrator',
+        entries=_execution_history_records,
+        description='per-issue execution records (NOT their .lock sidecars)',
+    ),
+    RetentionRule(
+        name='state_backups',
+        relative_path='state/projects',
+        root_kind='orchestrator',
+        entries=_files_matching_nested('github_state_backup_*.yaml'),
+        description='point-in-time copies of a project\'s github_state.yaml',
+    ),
+    RetentionRule(
+        name='agent_launch_scratch',
+        relative_path='.orchestrator/tmp',
+        root_kind='workspace',
+        entries=_files_matching('mcp_config_*.json'),
+        description='per-agent-launch MCP config files',
+    ),
+    RetentionRule(
+        name='pipeline_context_scratch',
+        relative_path='.orchestrator/tmp/pipeline_context',
+        root_kind='workspace',
+        entries=_dirs_two_levels_down,
+        description='per-run pipeline stage-output fallback copies',
     ),
 )
 
@@ -232,21 +302,48 @@ def sweep_rule(
     return outcome
 
 
+def resolve_roots(
+    root: Optional[Path] = None,
+    workspace_root: Optional[Path] = None,
+) -> dict:
+    """The two roots rules hang off, with overrides for tests and the script."""
+    orchestrator = Path(root) if root is not None else Path(
+        os.environ.get('ORCHESTRATOR_ROOT', '/app')
+    )
+    if workspace_root is not None:
+        workspace = Path(workspace_root)
+    elif root is not None:
+        # A caller that pointed us at a scratch orchestrator root means the
+        # workspace-rooted rules to land under it too -- otherwise a test or a
+        # --root run would sweep the REAL /workspace.
+        workspace = Path(root)
+    else:
+        workspace = Path(WORKSPACE_ROOT)
+    return {'orchestrator': orchestrator, 'workspace': workspace}
+
+
 def sweep(
     root: Optional[Path] = None,
     apply: bool = False,
     rules: Iterable[RetentionRule] = RETENTION_RULES,
     now: Optional[float] = None,
+    workspace_root: Optional[Path] = None,
 ) -> List[RuleOutcome]:
     """Run every retention rule. Never raises; failures land in the outcomes."""
-    if root is None:
-        root = Path(os.environ.get('ORCHESTRATOR_ROOT', '/app'))
-    return [sweep_rule(rule, Path(root), apply=apply, now=now) for rule in rules]
+    roots = resolve_roots(root, workspace_root)
+    return [
+        sweep_rule(rule, roots[rule.root_kind], apply=apply, now=now)
+        for rule in rules
+    ]
 
 
-def run_scheduled_sweep(root: Optional[Path] = None) -> List[RuleOutcome]:
+def run_scheduled_sweep(
+    root: Optional[Path] = None,
+    workspace_root: Optional[Path] = None,
+) -> List[RuleOutcome]:
     """Entry point for the daily job in services/scheduled_tasks.py."""
-    outcomes = sweep(root=root, apply=True)
+    logger.info(f"Data retention sweep starting -- {RETENTION_DAYS}-day window")
+    outcomes = sweep(root=root, apply=True, workspace_root=workspace_root)
     for outcome in outcomes:
         if outcome.missing:
             logger.debug(f"Retention: {outcome.rule.name}: {outcome.path} absent, nothing to do")
