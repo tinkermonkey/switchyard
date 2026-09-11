@@ -80,12 +80,58 @@ class TestFileHandlerSemanticsArePreserved:
 
 class TestBounding:
 
+    def test_the_default_handler_actually_carries_the_module_caps(
+        self, tmp_path, closed_handlers
+    ):
+        """The `None` branch -- which is what BOTH production call sites use.
+
+        Every other test here either passes explicit caps or overrides them
+        after construction, so replacing the defaults with `maxBytes=0`
+        (RotatingFileHandler's "never rotate", i.e. the 8.6GB file straight
+        back) passed the entire file. The wiring has to be asserted, not just
+        the arithmetic on the constants.
+        """
+        handler = rotating_file_handler(tmp_path / 'default.log')
+        closed_handlers.append(handler)
+
+        assert handler.maxBytes == LOG_MAX_BYTES > 0, \
+            "maxBytes=0 means never rotate -- the default must be a real cap"
+        assert handler.backupCount == LOG_BACKUP_COUNT > 0
+
+    def test_rotation_failure_is_reported_once_rather_than_swallowed(
+        self, tmp_path, closed_handlers, caplog
+    ):
+        """logging swallows emit-time errors into a stderr traceback.
+
+        For a rotation failure that is the worst default available: the file
+        goes unbounded again -- the exact thing this module exists to prevent
+        -- and the only evidence is unparseable noise on stdout.
+        """
+        handler = rotating_file_handler(tmp_path / 'failing.log', max_bytes=50, backup_count=1)
+        closed_handlers.append(handler)
+        handler.setFormatter(logging.Formatter('%(message)s'))
+        handler.doRollover = lambda: (_ for _ in ()).throw(OSError("no space left on device"))
+
+        raising = logging.raiseExceptions
+        logging.raiseExceptions = False   # keep stdlib's stderr traceback out of the run
+        try:
+            with caplog.at_level(logging.ERROR, logger='monitoring.log_rotation'):
+                for i in range(5):
+                    handler.emit(logging.LogRecord(
+                        'test', logging.INFO, __file__, i, 'x' * 60, None, None
+                    ))
+        finally:
+            logging.raiseExceptions = raising
+
+        errors = [r for r in caplog.records if 'rotation failed' in r.getMessage().lower()]
+        assert len(errors) == 1, \
+            f"expected exactly one report, not none and not one per record: {len(errors)}"
+        assert 'UNBOUNDED' in errors[0].getMessage()
+
     def test_writing_past_the_cap_rotates_instead_of_growing(self, tmp_path, closed_handlers):
         path = tmp_path / 'bounded.log'
-        handler = rotating_file_handler(path)
+        handler = rotating_file_handler(path, max_bytes=200, backup_count=2)
         closed_handlers.append(handler)
-        handler.maxBytes = 200
-        handler.backupCount = 2
         handler.setFormatter(logging.Formatter('%(message)s'))
 
         for i in range(200):
@@ -151,7 +197,17 @@ class TestNoPlainFileHandlersRemain:
             if parts[0] in ('tests', '.claude', 'node_modules', 'venv', '.venv'):
                 continue
             text = source.read_text(errors='ignore')
-            if re.search(r'(?<!Rotating)\blogging\.FileHandler\s*\(', text):
+            # `\bFileHandler\s*\(` rather than `logging\.FileHandler\s*\(`:
+            # the word boundary already excludes RotatingFileHandler and
+            # friends (no boundary between `g` and `F`), while catching the
+            # aliased and bare-import spellings -- `from logging import
+            # FileHandler; FileHandler(path)` and `_l = logging;
+            # _l.FileHandler(path)` both walked straight past the narrower
+            # pattern. A guard that only stops the obvious spelling of the
+            # mistake is not much of a guard.
+            if re.search(r'\bFileHandler\s*\(', text):
+                offenders.append(str(relative))
+            elif re.search(r'from\s+logging\s+import\s+[^\n]*\bFileHandler\b', text):
                 offenders.append(str(relative))
 
         assert offenders == [], (

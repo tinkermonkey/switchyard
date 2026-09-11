@@ -80,6 +80,46 @@ CHECKOUT_LOG_MAX_BYTES = _positive_int('CHECKOUT_LOG_MAX_BYTES', 16 * 1024 * 102
 CHECKOUT_LOG_BACKUP_COUNT = _positive_int('CHECKOUT_LOG_BACKUP_COUNT', 1)
 
 
+class _ReportingRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that says so, once, when rotation stops working.
+
+    logging swallows every exception raised while emitting: `handleError`
+    prints a bare traceback to stderr and carries on. For a rotation failure
+    that is the worst possible default. `doRollover` closes the stream before
+    renaming, so a failed rename (disk full, a cross-device bind mount, a
+    rotated file held open) leaves the handler reopening the base file and
+    re-attempting the doomed rollover on every subsequent record -- i.e. the
+    file goes unbounded again, which is the exact 8.6 GB failure this module
+    exists to prevent, and the only evidence is unparseable tracebacks
+    interleaved into container stdout.
+
+    Reported once per handler rather than per record, and reset by a rollover
+    that later succeeds, so a recurrence is still news.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._rotation_failure_reported = False
+
+    def doRollover(self):
+        super().doRollover()
+        self._rotation_failure_reported = False
+
+    def handleError(self, record):
+        if not self._rotation_failure_reported:
+            # Set first: logging.error() below routes through the root logger,
+            # which may well own this very handler. The flag makes that at most
+            # one extra pass rather than unbounded recursion.
+            self._rotation_failure_reported = True
+            logging.getLogger(__name__).error(
+                f"Log rotation failed for {self.baseFilename} -- this file is "
+                f"now effectively UNBOUNDED. Check free space and permissions "
+                f"on its directory.",
+                exc_info=True,
+            )
+        super().handleError(record)
+
+
 def rotating_file_handler(
     path: Path,
     level: Optional[int] = None,
@@ -95,7 +135,7 @@ def rotating_file_handler(
     an epic worktree that was never mounted. Creating the tree here would turn
     that detection into a stray directory inside a project checkout.
     """
-    handler = RotatingFileHandler(
+    handler = _ReportingRotatingFileHandler(
         path,
         maxBytes=LOG_MAX_BYTES if max_bytes is None else max_bytes,
         backupCount=LOG_BACKUP_COUNT if backup_count is None else backup_count,

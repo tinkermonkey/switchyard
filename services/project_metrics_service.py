@@ -57,18 +57,28 @@ class ProjectMetricsService:
         # window comes from config/retention.py's RETENTION_DAYS, and a
         # get-then-create-if-missing would mean a changed value silently never
         # reached the data that already exists. put_lifecycle is idempotent.
-        from config.retention import build_ilm_policy, RETENTION_DAYS
+        from config.retention import (
+            MONTHLY_INDEX_PERIOD_DAYS,
+            RETENTION_DAYS,
+            build_ilm_policy,
+        )
         try:
             self.es.ilm.put_lifecycle(
                 name=PROJECT_METRICS_ILM_POLICY,
-                body=build_ilm_policy(),
+                # Monthly indices -- see config/retention.py:delete_phase_days().
+                body=build_ilm_policy(index_period_days=MONTHLY_INDEX_PERIOD_DAYS),
             )
             logger.info(
                 f"Created/updated ILM policy: {PROJECT_METRICS_ILM_POLICY} "
                 f"({RETENTION_DAYS}-day retention)"
             )
         except Exception as e:
-            logger.warning(f"Could not put ILM policy {PROJECT_METRICS_ILM_POLICY}: {e}")
+            logger.error(
+                f"Could not put ILM policy {PROJECT_METRICS_ILM_POLICY}: {e}. "
+                f"project-metrics-* has no retention until the next restart "
+                f"puts it successfully.",
+                exc_info=True,
+            )
 
         # Index template
         properties = {

@@ -24,6 +24,8 @@ from typing import Any, Optional
 
 from elasticsearch import Elasticsearch, NotFoundError
 
+from config.retention import RETENTION_DAYS
+
 logger = logging.getLogger(__name__)
 
 INDEX_PREFIX = "orchestrator-test-cycle-records"
@@ -95,7 +97,12 @@ class TestCycleRecorder:
             self.es.ilm.put_lifecycle(name=ILM_POLICY_NAME, body=TEST_CYCLE_RECORDS_ILM_POLICY)
             logger.info(f"Created/updated ILM policy: {ILM_POLICY_NAME}")
         except Exception as exc:
-            logger.warning(f"Could not put ILM policy {ILM_POLICY_NAME}: {exc}")
+            logger.error(
+                f"Could not put ILM policy {ILM_POLICY_NAME}: {exc}. "
+                f"{INDEX_PREFIX}-* has no retention until the next restart "
+                f"puts it successfully.",
+                exc_info=True,
+            )
 
         # Index template for records
         try:
@@ -178,25 +185,30 @@ class TestCycleRecorder:
         self,
         project_filter: str | None = None,
         run_stats_after: bool = True,
-        lookback_days: int = 7,
+        lookback_days: int = RETENTION_DAYS,
     ) -> dict[str, Any]:
         """
         Discover all completed repair cycles in decision-events-* and write
         iteration records for any that are not yet in orchestrator-test-cycle-records-*.
 
-        Because decision-events-* has 7-day ILM retention, `lookback_days` is
-        capped at 7.  The recorder is idempotent, so re-running for already-recorded
+        `lookback_days` is capped at the source index's own retention, because
+        asking for more than that returns silence rather than an error -- there
+        is simply nothing there. That cap used to be a hard-coded 7 matching a
+        hard-coded ILM window; both now come from config/retention.py, so the
+        clamp cannot drift away from what decision-events-* actually keeps.
+
+        The recorder is idempotent, so re-running for already-recorded
         pipeline runs is safe (it just overwrites with identical data).
 
         Args:
             project_filter: Restrict backfill to a single project name.
             run_stats_after: Run the weekly stats rollup after backfilling (default True).
-            lookback_days: How far back to search (max 7, default 7).
+            lookback_days: How far back to search (capped at RETENTION_DAYS).
 
         Returns:
             dict with keys: discovered, already_recorded, newly_recorded, failed, errors
         """
-        lookback_days = min(lookback_days, 7)
+        lookback_days = min(lookback_days, RETENTION_DAYS)
         since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
 
         logger.info(

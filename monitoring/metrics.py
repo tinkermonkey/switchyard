@@ -128,7 +128,12 @@ class MetricsCollector:
             self._create_initial_indices()
             
         except Exception as e:
-            logger.warning(f"Failed to create index templates or ILM policy: {e}")
+            logger.error(
+                f"Failed to create index templates or ILM policy: {e}. "
+                f"orchestrator-*-metrics may have no retention until the next "
+                f"restart.",
+                exc_info=True,
+            )
     
     def _create_initial_indices(self):
         """Create initial write indices with aliases for ILM rollover"""

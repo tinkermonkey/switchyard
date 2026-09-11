@@ -191,6 +191,18 @@ async def main():
     root_logger.info("=== Orchestrator starting up ===")
     root_logger.info("Zombie process reaper enabled (SIGCHLD handler registered)")
 
+    # One line naming the window and the two roots everything is measured
+    # against. RETENTION_DAYS reaches the container through docker-compose, and
+    # both roots default silently when unset -- so "what is actually configured"
+    # has to be observable at boot rather than inferred from .env.
+    from config.retention import describe as _describe_retention
+    from services.data_retention import resolve_roots as _retention_roots
+    _roots = _retention_roots()
+    root_logger.info(
+        f"{_describe_retention()}; orchestrator root {_roots['orchestrator']}, "
+        f"workspace root {_roots['workspace']}"
+    )
+
     metrics = MetricsCollector()
 
     # Initialize task queue with Redis

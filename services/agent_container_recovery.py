@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # free outcome away and pushed the container onto the in-flight path instead.
 _COMMIT_JOIN_FLOOR_SECONDS = 60.0
 
-# ILM Policy for repair cycle recovery metrics (7-day retention)
+# ILM Policy for repair-cycle-recovery-%Y.%m.%d (daily indices).
 # Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
 # by default), so Elasticsearch and the filesystem sweep in
 # services/data_retention.py cannot disagree -- and a change takes effect on data

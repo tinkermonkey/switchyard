@@ -38,6 +38,7 @@ class TestSchedulerLifecycle:
 
         assert 'cleanup_orphaned_branches' in job_ids
         assert 'check_stale_branches' in job_ids
+        assert 'data_retention' in job_ids
 
         # Cleanup
         scheduled_tasks_service.stop()
@@ -161,6 +162,43 @@ class TestScheduledJobConfiguration:
 
         # Cleanup
         scheduled_tasks_service.stop()
+
+    @pytest.mark.asyncio
+    async def test_data_retention_job_schedule(self, scheduled_tasks_service):
+        """The nightly sweep must be registered, and must tolerate being late.
+
+        APScheduler's default misfire grace is one second, so a restart or a
+        blocked event loop at 04:30:00 drops the run entirely -- with no
+        catch-up and no record. An hour-late housekeeping sweep is still a
+        useful one, and the failure mode it replaces (never runs, looks
+        identical to "nothing to delete") is exactly what this PR exists to
+        stop happening.
+        """
+        scheduled_tasks_service.start()
+
+        job = scheduled_tasks_service.scheduler.get_job('data_retention')
+
+        assert job is not None, "the daily retention sweep is not scheduled"
+        assert job.func == scheduled_tasks_service._apply_data_retention
+        assert str(job.trigger.fields[5]) == '4'    # hour
+        assert str(job.trigger.fields[6]) == '30'   # minute
+        assert job.misfire_grace_time >= 3600
+        assert job.coalesce is True
+
+        scheduled_tasks_service.stop()
+
+    def test_a_failing_sweep_never_escapes_the_job(self, scheduled_tasks_service, caplog):
+        """Housekeeping, and nothing depends on it having run -- so a failure
+        in here must not be allowed to take the scheduler down with it."""
+        import logging
+
+        with patch('services.data_retention.run_scheduled_sweep',
+                   side_effect=RuntimeError('boom')):
+            with caplog.at_level(logging.ERROR):
+                scheduled_tasks_service._apply_data_retention()   # must not raise
+
+        assert any('data retention' in r.getMessage().lower() for r in caplog.records), \
+            "a swallowed failure must at least be reported at ERROR"
 
 
 class TestCleanupTask:

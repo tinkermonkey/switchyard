@@ -42,6 +42,7 @@ Two more exclusions, for their own reasons:
 import logging
 import os
 import shutil
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,12 +78,19 @@ class RetentionRule:
     for ORCHESTRATOR_ROOT (/app) and 'workspace' for WORKSPACE_ROOT
     (/workspace). In the container /app IS /workspace/switchyard, so the two
     cannot be derived from one another.
+
+    `keep` is an optional last-chance veto, consulted ONLY for entries that
+    have already been found to be past the window. That ordering is the point:
+    it keeps a per-entry cost (parsing a YAML file, say) proportional to what
+    is about to be deleted rather than to what is on disk, and it means a
+    directory that is already bounded costs exactly one readdir.
     """
     name: str
     relative_path: str
     entries: Callable[[Path], Iterable[Path]]
     description: str
     root_kind: str = 'orchestrator'
+    keep: Optional[Callable[[Path], bool]] = None
 
     @property
     def retention_days(self) -> int:
@@ -96,6 +104,18 @@ def _files_matching(pattern: str) -> Callable[[Path], Iterable[Path]]:
     def _entries(root: Path) -> Iterable[Path]:
         return sorted(p for p in root.glob(pattern) if p.is_file())
     return _entries
+
+
+def _dirs_one_level_down(root: Path) -> Iterable[Path]:
+    """`<root>/<a>/` -- for the scratch trees keyed directly by run.
+
+    Used for .orchestrator/tmp/pipeline_context/<issue>_<run-prefix>/, whose
+    contents are files (initial_request.md, <agent>_output.md, ...) rather than
+    a further level of directories. Getting this depth wrong is silent: the
+    wrong selector simply returns nothing and the rule reports a clean
+    directory forever. See services/pipeline_context_writer.py:setup().
+    """
+    return sorted(child for child in root.iterdir() if child.is_dir())
 
 
 def _dirs_two_levels_down(root: Path) -> Iterable[Path]:
@@ -126,18 +146,81 @@ def _files_matching_nested(pattern: str) -> Callable[[Path], Iterable[Path]]:
 def _execution_history_records(root: Path) -> Iterable[Path]:
     """Execution-history YAML only -- never the .yaml.lock sidecars.
 
-    Safe to age at RETENTION_DAYS because every consumer of these records works
-    on a far shorter horizon: the empty-output watchdog skips anything older
-    than _WATCHDOG_MAX_RECORD_AGE_HOURS (24h), was_recent_programmatic_change()
-    uses a 60-second window, and record_execution_start()'s in-progress guard
-    only cares about entries that have not finished. Nothing reads a record
-    from last month.
-
     The sidecars are excluded by construction rather than by a later filter:
     glob('*.yaml') would otherwise also need a name check, and getting that
     wrong deletes a lock some process is holding.
+
+    WHY 30 DAYS IS SAFE HERE, given that some readers have no time bound at all
+    ---------------------------------------------------------------------------
+    The file is per-ISSUE and is rewritten whole on every execution start,
+    outcome, task-id stamp and status change (WorkExecutionStateTracker
+    .save_state), so its mtime is the last time anything happened to that
+    issue. An issue still being worked cannot expire, however old its first
+    record is. Expiry means "this issue has been untouched for a month".
+
+    The short-horizon readers are genuinely short-horizon: the empty-output
+    watchdog gates on _WATCHDOG_MAX_RECORD_AGE_HOURS (24h) before it does
+    anything but parse, and was_recent_programmatic_change() uses a 60-second
+    window over status_changes.
+
+    The readers with NO time bound are the ones worth naming, because the
+    argument has to be made for them rather than against their existence:
+
+      * should_execute_work() -- the dedup gate. A missing file reads as
+        "first_execution", so deleting a record makes an untouched issue
+        dispatchable again. Backstopped by _rescan_boards_for_stalled_items()'s
+        has_existing_output check, which scans GitHub for the agent's own
+        completion comment and does not expire; and by the fact that the normal
+        poll loop only dispatches on a board diff, which is a fresh reason to
+        run regardless of history.
+      * ProjectMonitor's startup last_state seeding, and get_last_execution()
+        on the lock-holding path -- both degrade to "no prior run", which is
+        the conservative direction for everything except a feedback_listening
+        conversation that has idled longer than the window with no writes. That
+        one is a real if narrow exposure; it is bounded by the same
+        RETENTION_DAYS on its pipeline-run document either way.
+
+    What is NOT safe to delete is a record whose last execution is still
+    in_progress: that is live state by this module's own rule, and removing it
+    flips has_active_execution() from True to False under a container that may
+    still be running. Hence the `keep` predicate on the rule -- see
+    _execution_still_running().
     """
     return sorted(p for p in root.glob('*.yaml') if p.is_file())
+
+
+def _execution_still_running(path: Path) -> bool:
+    """True if this execution record's last entry has not finished.
+
+    Applied only to records already past the window, so the YAML parse costs
+    nothing on a directory that is already bounded. Anything unreadable counts
+    as still running: "I could not tell" must resolve to keeping the file, the
+    same way an unstattable entry does.
+
+    A genuinely stuck in_progress entry is not kept forever -- it is resolved
+    by cleanup_stuck_in_progress_states() / abandon_stale_in_progress_entries(),
+    and resolving it rewrites the file, after which it ages normally.
+    """
+    try:
+        import yaml
+        with open(path) as handle:
+            state = yaml.safe_load(handle)
+    except Exception as e:
+        logger.warning(
+            f"Retention: could not read {path} to check for a running "
+            f"execution; keeping it: {e}"
+        )
+        return True
+    if not isinstance(state, dict):
+        # Parsed fine and is not a record -- that is a definite answer, unlike
+        # a parse failure, so it does not get the benefit of the doubt. (Its
+        # own callers already treat an unreadable record as empty state.)
+        return False
+    history = state.get('execution_history') or []
+    if not isinstance(history, list) or not history:
+        return False
+    last = history[-1]
+    return isinstance(last, dict) and last.get('outcome') == 'in_progress'
 
 
 RETENTION_RULES = (
@@ -181,6 +264,7 @@ RETENTION_RULES = (
         relative_path='state/execution_history',
         root_kind='orchestrator',
         entries=_execution_history_records,
+        keep=_execution_still_running,
         description='per-issue execution records (NOT their .lock sidecars)',
     ),
     RetentionRule(
@@ -201,7 +285,7 @@ RETENTION_RULES = (
         name='pipeline_context_scratch',
         relative_path='.orchestrator/tmp/pipeline_context',
         root_kind='workspace',
-        entries=_dirs_two_levels_down,
+        entries=_dirs_one_level_down,
         description='per-run pipeline stage-output fallback copies',
     ),
 )
@@ -214,6 +298,7 @@ class RuleOutcome:
     examined: int = 0
     expired: List[Path] = field(default_factory=list)
     removed: List[Path] = field(default_factory=list)
+    kept_live: int = 0
     bytes_removed: int = 0
     errors: List[str] = field(default_factory=list)
     missing: bool = False
@@ -234,12 +319,27 @@ def _entry_mtime(path: Path) -> Optional[float]:
     A repair-cycle directory gets its context file at launch and its result
     file at the end; aging it from the older of the two would expire a run
     while it is arguably still interesting.
+
+    A child that cannot be stat'd makes the whole directory UNDATABLE (None),
+    rather than being quietly dropped from the max. Path.is_file() swallows
+    OSError and answers False, so the obvious spelling of this loop silently
+    excludes exactly the file most likely to matter -- the newest one, written
+    by an agent container under a different uid into mounted scratch. The
+    caller's "could not date it, leave it alone" branch only protects anything
+    if this function is willing to say it could not tell.
     """
     try:
-        if path.is_dir():
-            mtimes = [p.stat().st_mtime for p in path.rglob('*') if p.is_file()]
-            return max(mtimes) if mtimes else path.stat().st_mtime
-        return path.stat().st_mtime
+        if not path.is_dir():
+            return path.stat().st_mtime
+        mtimes = []
+        for child in path.rglob('*'):
+            try:
+                info = child.stat()
+            except OSError:
+                return None
+            if stat.S_ISREG(info.st_mode):
+                mtimes.append(info.st_mtime)
+        return max(mtimes) if mtimes else path.stat().st_mtime
     except OSError:
         return None
 
@@ -270,7 +370,11 @@ def sweep_rule(
 
     try:
         entries = list(rule.entries(directory))
-    except OSError as e:
+    except Exception as e:
+        # Deliberately not just OSError. sweep() promises never to raise, and
+        # the caller is an unattended nightly job -- a rule whose selector has
+        # a bug in it must cost that one rule, not every rule after it in the
+        # tuple.
         outcome.errors.append(f"could not list {directory}: {e}")
         return outcome
 
@@ -285,6 +389,19 @@ def sweep_rule(
         if mtime >= cutoff:
             continue
 
+        if rule.keep is not None:
+            try:
+                if rule.keep(entry):
+                    outcome.kept_live += 1
+                    continue
+            except Exception as e:
+                outcome.errors.append(
+                    f"could not decide whether {entry} is still live, "
+                    f"leaving it alone: {e}"
+                )
+                outcome.kept_live += 1
+                continue
+
         outcome.expired.append(entry)
         size = _entry_size(entry)
         if not apply:
@@ -292,7 +409,7 @@ def sweep_rule(
             continue
         try:
             _remove(entry)
-        except OSError as e:
+        except Exception as e:
             # Per entry, so one undeletable file does not abandon the sweep.
             outcome.errors.append(f"could not remove {entry}: {e}")
             continue
@@ -306,20 +423,57 @@ def resolve_roots(
     root: Optional[Path] = None,
     workspace_root: Optional[Path] = None,
 ) -> dict:
-    """The two roots rules hang off, with overrides for tests and the script."""
-    orchestrator = Path(root) if root is not None else Path(
-        os.environ.get('ORCHESTRATOR_ROOT', '/app')
-    )
+    """The two roots rules hang off, with overrides for tests and the script.
+
+    An ORCHESTRATOR_ROOT env override carries the workspace rules with it for
+    exactly the same reason an explicit `root=` does. The test suite is
+    required to run with ORCHESTRATOR_ROOT pointed at scratch (issue #181), and
+    without this a test that called sweep() with no arguments would sweep its
+    own scratch tree for the orchestrator rules and the REAL /workspace -- which
+    holds every managed project checkout -- for the other two. Only a
+    deployment that has set neither gets the production defaults.
+    """
+    env_root = os.environ.get('ORCHESTRATOR_ROOT')
+    env_workspace = os.environ.get('WORKSPACE_ROOT')
+
+    if root is not None:
+        orchestrator = Path(root)
+    elif env_root:
+        orchestrator = Path(env_root)
+    else:
+        orchestrator = Path('/app')
+
     if workspace_root is not None:
         workspace = Path(workspace_root)
-    elif root is not None:
-        # A caller that pointed us at a scratch orchestrator root means the
-        # workspace-rooted rules to land under it too -- otherwise a test or a
-        # --root run would sweep the REAL /workspace.
-        workspace = Path(root)
+    elif env_workspace:
+        workspace = Path(env_workspace)
+    elif root is not None or env_root:
+        # Pointed at a scratch orchestrator root and given no workspace of its
+        # own: land the workspace-rooted rules under it too, rather than
+        # reaching out to the real /workspace.
+        workspace = orchestrator
     else:
         workspace = Path(WORKSPACE_ROOT)
     return {'orchestrator': orchestrator, 'workspace': workspace}
+
+
+# Roots a sweep must never delete from while running under pytest. Any test
+# that resolves to one of these has lost its isolation, and the right outcome
+# is a loud test failure rather than a production directory being emptied.
+_PROTECTED_ROOTS = (Path('/app'), Path('/workspace'), Path('/'))
+
+
+def _refuse_unisolated_apply(roots: dict) -> None:
+    if not os.environ.get('PYTEST_CURRENT_TEST'):
+        return
+    for kind, resolved in roots.items():
+        if Path(resolved) in _PROTECTED_ROOTS:
+            raise RuntimeError(
+                f"Refusing to apply retention to the {kind} root {resolved} "
+                f"from inside a test. Pass root=/workspace_root= explicitly, or "
+                f"set ORCHESTRATOR_ROOT/WORKSPACE_ROOT to a scratch directory. "
+                f"This deletes real data on the live deployment."
+            )
 
 
 def sweep(
@@ -331,6 +485,8 @@ def sweep(
 ) -> List[RuleOutcome]:
     """Run every retention rule. Never raises; failures land in the outcomes."""
     roots = resolve_roots(root, workspace_root)
+    if apply:
+        _refuse_unisolated_apply(roots)
     return [
         sweep_rule(rule, roots[rule.root_kind], apply=apply, now=now)
         for rule in rules
@@ -341,8 +497,20 @@ def run_scheduled_sweep(
     root: Optional[Path] = None,
     workspace_root: Optional[Path] = None,
 ) -> List[RuleOutcome]:
-    """Entry point for the daily job in services/scheduled_tasks.py."""
-    logger.info(f"Data retention sweep starting -- {RETENTION_DAYS}-day window")
+    """Entry point for the daily job in services/scheduled_tasks.py.
+
+    Logs a closing summary at INFO unconditionally. That is the point of it: a
+    sweep that finds none of its directories -- a wrong root, a changed layout,
+    an unmounted volume -- otherwise produces exactly the same log output as a
+    healthy night with nothing to delete, which means retention can be entirely
+    broken for months and read as working.
+    """
+    roots = resolve_roots(root, workspace_root)
+    logger.info(
+        f"Data retention sweep starting -- {RETENTION_DAYS}-day window, "
+        f"orchestrator root {roots['orchestrator']}, "
+        f"workspace root {roots['workspace']}"
+    )
     outcomes = sweep(root=root, apply=True, workspace_root=workspace_root)
     for outcome in outcomes:
         if outcome.missing:
@@ -362,4 +530,33 @@ def run_scheduled_sweep(
             )
         for error in outcome.errors:
             logger.warning(f"Retention: {outcome.rule.name}: {error}")
+
+    present = [o for o in outcomes if not o.missing]
+    if not present:
+        logger.error(
+            f"Data retention sweep found NONE of its {len(outcomes)} directories "
+            f"under {roots['orchestrator']} / {roots['workspace']}. Retention is "
+            f"not running. Checked: {[o.path for o in outcomes]}"
+        )
+
+    # One undeletable file is noise; a rule where EVERY expired entry failed is
+    # a mount or permissions problem, and reporting it as N warnings buries the
+    # one fact that matters.
+    for outcome in present:
+        attempted = len(outcome.expired)
+        if attempted and not outcome.removed:
+            logger.error(
+                f"Retention: {outcome.rule.name}: all {attempted} expired entries "
+                f"failed to delete under {outcome.path} -- this is systemic "
+                f"(permissions or mount), not per-file. First: "
+                f"{outcome.errors[0] if outcome.errors else 'no error recorded'}"
+            )
+
+    logger.info(
+        f"Data retention sweep complete: {len(present)}/{len(outcomes)} directories "
+        f"present, {sum(len(o.removed) for o in outcomes)} entries removed "
+        f"({sum(o.bytes_removed for o in outcomes) / 1024 / 1024:.1f}MB), "
+        f"{sum(o.kept_live for o in outcomes)} kept as still live, "
+        f"{sum(len(o.errors) for o in outcomes)} errors"
+    )
     return outcomes

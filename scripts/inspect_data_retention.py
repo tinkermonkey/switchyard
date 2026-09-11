@@ -43,6 +43,7 @@ from config.retention import RETENTION_DAYS  # noqa: E402
 from services.data_retention import (  # noqa: E402
     RETENTION_RULES,
     WORKSPACE_ROOT,
+    resolve_roots,
     sweep,
 )
 
@@ -107,16 +108,26 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-    root = Path(args.root) if args.root else Path(
-        os.environ.get('ORCHESTRATOR_ROOT', '/app')
+    # Let resolve_roots() do the defaulting, and report what it resolved
+    # rather than reconstructing it. Materialising the ORCHESTRATOR_ROOT
+    # default here instead made `root` non-None on every run, which sent
+    # resolve_roots() down its "a scratch root moves the workspace rules too"
+    # branch -- so a plain no-argument run silently looked for the workspace
+    # rules under /app, found nothing, and printed "Workspace root: /workspace"
+    # above the result. A preview tool that does not preview the nightly job,
+    # and says otherwise.
+    roots = resolve_roots(
+        Path(args.root) if args.root else None,
+        Path(args.workspace_root) if args.workspace_root else None,
     )
-    workspace_root = Path(args.workspace_root) if args.workspace_root else None
+    root = roots['orchestrator']
+    workspace_root = roots['workspace']
     outcomes = sweep(root=root, apply=args.apply, workspace_root=workspace_root)
 
     if args.json:
         print(json.dumps({
             'root': str(root),
-            'workspace_root': str(workspace_root or WORKSPACE_ROOT),
+            'workspace_root': str(workspace_root),
             'retention_days': RETENTION_DAYS,
             'applied': args.apply,
             'rules': [
@@ -136,7 +147,7 @@ def main() -> int:
         }, indent=2))
     else:
         print(f"Orchestrator root: {root}")
-        print(f"Workspace root:    {workspace_root or WORKSPACE_ROOT}")
+        print(f"Workspace root:    {workspace_root}")
         print(f"Retention window:  {RETENTION_DAYS} days (RETENTION_DAYS) -- the "
               f"same value every Elasticsearch ILM policy uses")
         print(f"Rules: {len(RETENTION_RULES)}")

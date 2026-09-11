@@ -15,7 +15,7 @@ from datetime import datetime
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
-from config.retention import build_ilm_policy
+from config.retention import RETENTION_DAYS, build_ilm_policy
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ else
 end
 """
 
-# ILM Policy for pipeline runs (7-day retention)
+# ILM Policy for pipeline-runs-%Y-%m-%d (daily indices).
 # Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
 # by default), so Elasticsearch and the filesystem sweep in
 # services/data_retention.py cannot disagree -- and a change takes effect on data
@@ -186,12 +186,15 @@ class PipelineRunManager:
             return
 
         try:
-            # Create ILM policy for pipeline runs (7-day retention)
+            # Create/update the ILM policy for pipeline runs
             self.es.ilm.put_lifecycle(
                 name="pipeline-runs-ilm-policy",
                 body=PIPELINE_RUNS_ILM_POLICY
             )
-            logger.info("Created/updated ILM policy: pipeline-runs-ilm-policy (7-day retention)")
+            logger.info(
+                f"Created/updated ILM policy: pipeline-runs-ilm-policy "
+                f"({RETENTION_DAYS}-day retention)"
+            )
 
             # Create index template for pipeline runs
             self.es.indices.put_index_template(

@@ -72,6 +72,12 @@ def _resolve_retention_days() -> int:
 RETENTION_DAYS = _resolve_retention_days()
 RETENTION_SECONDS = RETENTION_DAYS * 86400
 
+# The span of data one index holds, for the families that name an index per
+# calendar month (`...-%Y.%m`). Passed as build_ilm_policy(index_period_days=)
+# so those indices are not deleted while still being written to -- see
+# delete_phase_days(). 31 rather than 30 so the longest month still clears.
+MONTHLY_INDEX_PERIOD_DAYS = 31
+
 
 def warm_phase_days() -> int:
     """When an index moves to the warm phase.
@@ -86,16 +92,50 @@ def warm_phase_days() -> int:
     return max(1, RETENTION_DAYS // 4)
 
 
+def delete_phase_days(index_period_days: int = 0) -> int:
+    """How old an INDEX must be before ILM may delete it.
+
+    Not the same number as RETENTION_DAYS, and the difference matters.
+
+    Without a rollover action ILM ages an index from its creation date, not
+    from the age of the documents inside it. For a daily index that is the same
+    thing to within a day. For a MONTHLY index -- which is what
+    `orchestrator-test-cycle-records-%Y.%m`, `agent-execution-summaries-%Y.%m`,
+    `token-metrics-*-%Y.%m` and `project-metrics-%Y.%m` all are -- it is not:
+    `...-2026.03` is created on 1 March and turns 30 days old on 31 March,
+    taking that morning's writes with it. Effective retention would oscillate
+    between roughly zero and RETENTION_DAYS instead of holding at it, and a
+    "30-day window" that deletes three-day-old records is the same class of
+    quiet untruth this module exists to remove.
+
+    So a family declares the span of data ONE of its indices holds, and the
+    delete age becomes that span plus the window. Documents then live at least
+    RETENTION_DAYS, and at most RETENTION_DAYS + the index period. Erring long
+    is deliberate: over-retention costs disk, under-retention loses data from
+    inside the window we promised to keep it for.
+
+    There is still exactly one configured number. `index_period_days` is a
+    property of how a family names its indices, not a retention decision, and
+    it is 0 for anything that rolls over or writes one index per day.
+    """
+    return RETENTION_DAYS + max(0, index_period_days)
+
+
 def build_ilm_policy(
     hot_actions: Optional[Dict[str, Any]] = None,
     warm_priority: int = 50,
     hot_priority: int = 100,
+    index_period_days: int = 0,
 ) -> Dict[str, Any]:
     """The one ILM policy body, used for every index family.
 
     `hot_actions` merges into the hot phase for the families that roll over on
-    size/age as well as on date (the metrics indices), which is the only
-    respect in which any of them differed.
+    size/age as well as on date (the metrics indices, and the OTEL data
+    streams, which cannot be aged out at all without one).
+
+    `index_period_days` is the span of data a single index of this family
+    holds -- see delete_phase_days(). 0 for daily or rolled-over indices, ~31
+    for the monthly ones.
 
     The warm phase is omitted entirely when the window is too short for it to
     sit strictly between hot and delete. Emitting `warm.min_age == delete
@@ -104,6 +144,7 @@ def build_ilm_policy(
     having no retention applied at all.
     """
     warm_days = warm_phase_days()
+    delete_days = delete_phase_days(index_period_days)
 
     phases: Dict[str, Any] = {
         "hot": {
@@ -114,14 +155,29 @@ def build_ilm_policy(
     if hot_actions:
         phases["hot"]["actions"].update(hot_actions)
 
-    if warm_days < RETENTION_DAYS:
+    if warm_days < delete_days:
         phases["warm"] = {
             "min_age": f"{warm_days}d",
-            "actions": {"set_priority": {"priority": warm_priority}},
+            "actions": {
+                "set_priority": {"priority": warm_priority},
+                # ILM injects a `migrate` action into the warm phase unless it
+                # is explicitly disabled, and migrate BLOCKS until every shard
+                # copy is active. On a single-node cluster any index with
+                # replicas > 0 is permanently yellow, so migrate waits forever
+                # and the index never reaches the delete phase at all -- which
+                # is how the two claude-otel data streams sat in
+                # `warm/migrate/check-migration` for two months, unaged, while
+                # their policy claimed a 14-day window. There are no data tiers
+                # to migrate between here, and warm is a performance tier
+                # rather than a retention decision, so switching it off costs
+                # nothing and removes the only way this policy can silently
+                # stall short of deleting anything.
+                "migrate": {"enabled": False},
+            },
         }
 
     phases["delete"] = {
-        "min_age": f"{RETENTION_DAYS}d",
+        "min_age": f"{delete_days}d",
         "actions": {"delete": {}},
     }
 

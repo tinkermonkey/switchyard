@@ -187,6 +187,12 @@ class ScheduledTasksService:
             trigger=CronTrigger(hour=4, minute=30),
             id='data_retention',
             name='Age out container-failure logs, repair-cycle scratch, metrics backups',
+            # APScheduler's default grace is one second, so a restart or a
+            # blocked event loop at 04:30:00 drops the run silently and nothing
+            # catches up. An hour late is still a useful housekeeping sweep,
+            # and coalesce collapses a backlog into one run rather than nine.
+            misfire_grace_time=3600,
+            coalesce=True,
             replace_existing=True
         )
 
@@ -208,11 +214,8 @@ class ScheduledTasksService:
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
         logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
         logger.info("- Test-cycle stats rollup: Weekly on Sunday at 4 AM")
-        from config.retention import RETENTION_DAYS as _retention_days
-        logger.info(
-            f"- Data retention sweep: Daily at 4:30 AM "
-            f"({_retention_days}-day window, shared with Elasticsearch ILM)"
-        )
+        from config.retention import describe as _describe_retention
+        logger.info(f"- Data retention sweep: Daily at 4:30 AM -- {_describe_retention()}")
 
     def stop(self):
         """Stop the scheduler"""

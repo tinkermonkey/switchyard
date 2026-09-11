@@ -23,7 +23,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional
-from elasticsearch import Elasticsearch, NotFoundError
+from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
 
 logger = logging.getLogger(__name__)
@@ -209,17 +209,32 @@ class TokenMetricsService:
         # neither the Elasticsearch side nor the filesystem side.
         # agent-execution-summaries-* was the one that mattered: 8,010 documents
         # with no expiry, 202 of them for a project that had been deleted.
-        from config.retention import build_ilm_policy, RETENTION_DAYS
+        from config.retention import (
+            MONTHLY_INDEX_PERIOD_DAYS,
+            RETENTION_DAYS,
+            build_ilm_policy,
+        )
         try:
+            # Monthly indices (`<prefix>-%Y.%m`), so the delete age is the
+            # window plus one index period -- ILM ages an un-rolled index from
+            # its creation date, so a flat 30d would delete March's index on
+            # 31 March along with that morning's writes. See
+            # config/retention.py:delete_phase_days().
             self.es.ilm.put_lifecycle(
-                name=TOKEN_METRICS_ILM_POLICY, body=build_ilm_policy()
+                name=TOKEN_METRICS_ILM_POLICY,
+                body=build_ilm_policy(index_period_days=MONTHLY_INDEX_PERIOD_DAYS),
             )
             logger.info(
                 f"Created/updated ILM policy: {TOKEN_METRICS_ILM_POLICY} "
                 f"({RETENTION_DAYS}-day retention)"
             )
         except Exception as e:
-            logger.warning(f"Could not put ILM policy {TOKEN_METRICS_ILM_POLICY}: {e}")
+            logger.error(
+                f"Could not put ILM policy {TOKEN_METRICS_ILM_POLICY}: {e}. "
+                f"These four index families have NO retention until the next "
+                f"orchestrator restart puts it successfully.",
+                exc_info=True,
+            )
 
         for prefix, template_name, priority, properties in templates:
             # PUT unconditionally, not only-if-absent. These templates already
@@ -242,6 +257,30 @@ class TokenMetricsService:
                 logger.debug(f"Created/updated index template: {template_name}")
             except Exception as e:
                 logger.warning(f"Could not put index template {template_name}: {e}")
+
+            # An index template applies at index CREATION only, so the template
+            # above reaches nothing that already exists. These families are
+            # monthly and have been written since July with no policy at all,
+            # which is the entire reason this block was added -- putting the
+            # template and stopping would leave every one of those 8,010
+            # documents exactly as unmanaged as before, while logging that the
+            # policy had been applied. Adopt the existing indices explicitly.
+            try:
+                self.es.indices.put_settings(
+                    index=f"{prefix}-*",
+                    body={"index.lifecycle.name": TOKEN_METRICS_ILM_POLICY},
+                    ignore_unavailable=True,
+                )
+                logger.debug(
+                    f"Attached {TOKEN_METRICS_ILM_POLICY} to existing {prefix}-* indices"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Could not attach {TOKEN_METRICS_ILM_POLICY} to existing "
+                    f"{prefix}-* indices; anything written before this deploy "
+                    f"will never be aged out: {e}",
+                    exc_info=True,
+                )
 
     def find_oldest_event_hours_ago(self) -> int:
         """
