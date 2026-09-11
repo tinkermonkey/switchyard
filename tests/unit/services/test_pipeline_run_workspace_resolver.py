@@ -577,3 +577,122 @@ class TestResolveWorkspaceBranchDivergence:
 
         assert result.branch_name == "feature/issue-42-actually-on-disk"
         assert result.project_dir == "/workspace/.orchestrator/worktrees/context-studio/42"
+
+
+class TestResolveWorkspaceRefusesToAdoptDrift:
+    """
+    #163. resolve_workspace()'s re-derivation used to UNCONDITIONALLY replace
+    branch_name with whatever the worktree's HEAD said, which made it the last
+    adopt-whatever-git-says path in the orchestrator after #149 hardened the three
+    commit paths.
+
+    Those paths refuse to commit onto a branch that is not this dispatch's target
+    and leave the agent's work uncommitted on disk. Nothing repaired the drift, so
+    the NEXT dispatch -- a fresh PipelineRun, past the idempotency guard, served
+    the same worktree by get_or_create_epic_worktree()'s cache-hit path -- came
+    through here and adopted the drifted branch as its OWN expectation. Its
+    verification then compared the drift against itself, passed, and committed both
+    issues' work onto it: #143, deferred by exactly one dispatch.
+
+    A branch belonging to no epic is never adopted now. Clean drift is repaired;
+    dirty drift refuses the dispatch and leaves the work exactly where it is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_dirty_drifted_worktree_refuses_instead_of_adopting_the_drift(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import WorktreeBranchDriftError, workspace_manager
+
+        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name',
+                           return_value="feature/issue-42-epic"), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
+             patch.object(workspace_manager, '_current_worktree_branch',
+                           return_value="scratch"), \
+             patch.object(workspace_manager, '_worktree_has_uncommitted_work',
+                           return_value=True), \
+             patch.object(workspace_manager, '_restore_worktree_branch') as mock_restore:
+
+            with pytest.raises(WorktreeBranchDriftError) as excinfo:
+                await pipeline_run_manager.resolve_workspace(
+                    pipeline_run, mock_github_integration, workspace_type='issues'
+                )
+
+        assert excinfo.value.found_branch == "scratch"
+        assert excinfo.value.expected_branch == "feature/issue-42-epic"
+        assert excinfo.value.dirty is True
+        # HEAD is not moved over somebody's uncommitted work.
+        mock_restore.assert_not_called()
+        # And the run stays UNRESOLVED, so a later attempt (once a human has
+        # committed or discarded the work) re-resolves from scratch rather than
+        # short-circuiting on the idempotency guard over a half-written resolution.
+        assert pipeline_run.branch_name is None
+        assert pipeline_run.project_dir is None
+        assert pipeline_run.epic_id is None
+
+    @pytest.mark.asyncio
+    async def test_a_clean_drifted_worktree_is_repaired_and_the_dispatch_proceeds(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        """A quarantine would have wedged the epic here. There is nothing in the
+        worktree to preserve and nothing to decide, so HEAD goes back and the run
+        targets the epic's own branch."""
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import workspace_manager
+
+        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name',
+                           return_value="feature/issue-42-epic"), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
+             patch.object(workspace_manager, '_current_worktree_branch',
+                           return_value="scratch"), \
+             patch.object(workspace_manager, '_worktree_has_uncommitted_work',
+                           return_value=False), \
+             patch.object(workspace_manager, '_restore_worktree_branch',
+                           return_value=True) as mock_restore:
+
+            result = await pipeline_run_manager.resolve_workspace(
+                pipeline_run, mock_github_integration, workspace_type='issues'
+            )
+
+        mock_restore.assert_called_once()
+        assert result.branch_name == "feature/issue-42-epic"
+        assert result.project_dir == "/workspace/.orchestrator/worktrees/context-studio/42"
+
+    @pytest.mark.asyncio
+    async def test_a_drift_verdict_is_emitted_as_a_decision_event(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration
+    ):
+        """#163 item 5: a drift that stops an epic has to be findable somewhere
+        other than a container log line."""
+        from monitoring.observability import EventType
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import WorktreeBranchDriftError, workspace_manager
+
+        obs = MagicMock()
+        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name',
+                           return_value="feature/issue-42-epic"), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
+             patch.object(workspace_manager, '_current_worktree_branch',
+                           return_value="scratch"), \
+             patch.object(workspace_manager, '_worktree_has_uncommitted_work',
+                           return_value=True), \
+             patch('monitoring.observability.get_observability_manager', return_value=obs):
+
+            with pytest.raises(WorktreeBranchDriftError):
+                await pipeline_run_manager.resolve_workspace(
+                    pipeline_run, mock_github_integration, workspace_type='issues'
+                )
+
+        obs.emit.assert_called_once()
+        assert obs.emit.call_args[0][0] is EventType.WORKTREE_BRANCH_DRIFT_DETECTED
+        payload = obs.emit.call_args[0][4]
+        assert payload['found_branch'] == "scratch"
+        assert payload['expected_branch'] == "feature/issue-42-epic"
+        assert payload['worktree_path'] == "/workspace/.orchestrator/worktrees/context-studio/42"

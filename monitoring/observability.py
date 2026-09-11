@@ -260,6 +260,13 @@ class EventType(Enum):
     BRANCH_CONFLICT_DETECTED = "branch_conflict_detected"
     BRANCH_STALE_DETECTED = "branch_stale_detected"
     BRANCH_SELECTION_ESCALATED = "branch_selection_escalated"
+    # An epic worktree found on a branch belonging to no epic -- an agent
+    # container's own git having moved HEAD in the bind-mounted directory (#163).
+    # DETECTED means the dispatch was refused over it (uncommitted work was left
+    # exactly where it is); REPAIRED means the tree was clean, so HEAD was simply
+    # put back and the dispatch continued.
+    WORKTREE_BRANCH_DRIFT_DETECTED = "worktree_branch_drift_detected"
+    WORKTREE_BRANCH_DRIFT_REPAIRED = "worktree_branch_drift_repaired"
 
     # Issue Management
     SUB_ISSUE_CREATED = "sub_issue_created"
@@ -536,6 +543,8 @@ class ObservabilityManager:
             EventType.BRANCH_CONFLICT_DETECTED,
             EventType.BRANCH_STALE_DETECTED,
             EventType.BRANCH_SELECTION_ESCALATED,
+            EventType.WORKTREE_BRANCH_DRIFT_DETECTED,
+            EventType.WORKTREE_BRANCH_DRIFT_REPAIRED,
             # Issue Management
             EventType.SUB_ISSUE_CREATED,
             EventType.SUB_ISSUE_CREATION_FAILED,

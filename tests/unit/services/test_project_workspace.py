@@ -802,8 +802,19 @@ class TestPruneEpicWorktrees:
         orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '901'
         orphan.mkdir(parents=True)
 
-        with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.return_value = _fail("git worktree remove failed")
+        # `git status --porcelain` answers cleanly (this worktree is a removal
+        # candidate); every other git command fails. Narrowed from a blanket
+        # "every subprocess fails" when #163's uncommitted-work skip landed:
+        # this test is about the sweep surviving a failed `git worktree remove`,
+        # and an unreadable `git status` is a different case with a deliberately
+        # different answer (skip, never remove -- see
+        # test_prune_skips_a_worktree_whose_status_cannot_be_read).
+        def _git(cmd, **kwargs):
+            if 'status' in cmd:
+                return _ok("")
+            return _fail("git worktree remove failed")
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_git):
             manager.prune_epic_worktrees()
 
         # Falls back to removing the directory directly even if git fails
@@ -896,6 +907,118 @@ class TestIsCorruptedNonEmptyWorktree:
 
         with patch.object(Path, 'iterdir', side_effect=NotADirectoryError("not a directory")):
             assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(target) is False
+
+
+class TestPruneUncommittedWorkSkip:
+    """#163: the designed half of prune_epic_worktrees()' interaction with
+    #149's commit-time branch verification.
+
+    A wrong-branch refusal deliberately leaves the agent's work UNCOMMITTED on
+    disk for a human to inspect. This sweep force-removed exactly that work on
+    the next restart: _push_local_commits_if_any() saves local COMMITS and has
+    no answer at all for a dirty working tree, so for this shape the sweep's
+    whole "safe to remove, cheaply recreated" premise is false -- the same
+    reason the corrupted-worktree case below is skipped.
+
+    That is what wedged the previous attempt at this fix: a marker written as a
+    worktree SIBLING to survive this sweep, while the sweep force-removed the
+    worktree the marker's own recovery instructions pointed at.
+    """
+
+    def _dirty_git(self, porcelain: str):
+        def _run(cmd, **kwargs):
+            if 'status' in cmd:
+                return _ok(porcelain)
+            return _ok()
+        return _run
+
+    def test_skips_a_worktree_with_uncommitted_changes(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "my-project")
+        dirty = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '970'
+        dirty.mkdir(parents=True)
+        (dirty / '.git').write_text("gitdir: /fake/base/.git/worktrees/970\n")
+        (dirty / 'the_agents_work.py').write_text("# uncommitted, refused over\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git(" M the_agents_work.py\n")) as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert dirty.exists()
+        assert (dirty / 'the_agents_work.py').read_text() == "# uncommitted, refused over\n"
+        # Not even attempted -- and _push_local_commits_if_any() must not have run
+        # either, since it cannot preserve any of this.
+        assert [c for c in mock_run.call_args_list if 'remove' in c.args[0]] == []
+        assert [c for c in mock_run.call_args_list if 'push' in c.args[0]] == []
+
+    def test_counts_untracked_files_as_work_worth_keeping(self, manager, tmp_path):
+        """A brand-new source file an agent wrote and never got to commit shows up
+        only as '??' -- the exact work this rule exists to protect."""
+        _make_base_clone(tmp_path, "my-project")
+        dirty = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '971'
+        dirty.mkdir(parents=True)
+        (dirty / '.git').write_text("gitdir: /fake/base/.git/worktrees/971\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git("?? brand_new_module.py\n")):
+            manager.prune_epic_worktrees()
+
+        assert dirty.exists()
+
+    def test_skips_a_worktree_whose_status_cannot_be_read(self, manager, tmp_path):
+        """Unanswerable resolves to the non-destructive answer: guessing "clean"
+        is the only one of the two guesses that can destroy something."""
+        _make_base_clone(tmp_path, "my-project")
+        unreadable = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '972'
+        unreadable.mkdir(parents=True)
+        (unreadable / '.git').write_text("gitdir: /fake/base/.git/worktrees/972\n")
+        (unreadable / 'maybe_precious.py').write_text("# unknown\n")
+
+        def _run(cmd, **kwargs):
+            if 'status' in cmd:
+                return _fail("fatal: not a git repository")
+            return _ok()
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_run):
+            manager.prune_epic_worktrees()
+
+        assert unreadable.exists()
+        assert (unreadable / 'maybe_precious.py').exists()
+
+    def test_still_removes_a_clean_worktree(self, manager, tmp_path):
+        """The control: this rule must not turn the sweep into a no-op. A clean
+        worktree is the case the sweep's whole design is justified by -- cheaply
+        recreated on the next resolution, nothing to lose."""
+        _make_base_clone(tmp_path, "my-project")
+        clean = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '973'
+        clean.mkdir(parents=True)
+        (clean / '.git').write_text("gitdir: /fake/base/.git/worktrees/973\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git("")):
+            manager.prune_epic_worktrees()
+
+        assert not clean.exists()
+
+    def test_the_skip_self_clears_once_the_work_is_committed(self, manager, tmp_path):
+        """Nothing durable records the skip -- it is re-derived from the live
+        working tree every startup, so committing or discarding the work is the
+        whole of the recovery. There is no quarantine to clear."""
+        _make_base_clone(tmp_path, "my-project")
+        worktree = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '974'
+        worktree.mkdir(parents=True)
+        (worktree / '.git').write_text("gitdir: /fake/base/.git/worktrees/974\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git(" M work.py\n")):
+            manager.prune_epic_worktrees()
+        assert worktree.exists()
+
+        # Same directory, same sweep, nothing cleared by hand -- only the working
+        # tree changed.
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git("")):
+            manager.prune_epic_worktrees()
+        assert not worktree.exists()
 
 
 class TestPruneCorruptedWorktreeSkip:

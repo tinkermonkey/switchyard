@@ -529,6 +529,19 @@ class PipelineRunManager:
                 method's own docstring for why. Unlike a transient `worktree add`
                 failure, this one is not expected to self-resolve on a plain
                 retry -- it needs manual inspection first.
+            project_workspace.WorktreeBranchDriftError: A RuntimeError subclass
+                (#163) -- the epic's worktree is on a branch belonging to no epic
+                and holds uncommitted work, so this run has no safe branch to
+                target and nothing may be committed from that directory. Nothing
+                was resolved or persisted and nothing on disk was touched. Like the
+                corrupted-worktree RuntimeError above it does not self-resolve on a
+                retry; unlike it, it is re-derived from the worktree's live state
+                every time, so it disappears of its own accord once the work there
+                is committed or discarded. agent_executor.py's dispatch call site
+                catches this one specifically to escalate it the way the
+                commit-time wrong-branch refusals escalate (mark_failed plus an
+                issue comment naming the recovery); anywhere it is not caught, the
+                generic handling described below is still correct.
 
         This method deliberately does not swallow any of these exceptions itself --
         a caller wiring this into real dispatch must let them reach whatever failure
@@ -557,7 +570,7 @@ class PipelineRunManager:
             return pipeline_run
 
         from services.feature_branch_manager import feature_branch_manager
-        from services.project_workspace import workspace_manager
+        from services.project_workspace import WorktreeBranchDriftError, workspace_manager
 
         # Code review correction (issue #122): this used to hard-fail on no
         # resolvable parent for workspace_type == 'issues', reasoning that
@@ -626,22 +639,66 @@ class PipelineRunManager:
         # actually on a different branch than branch_name requested (e.g. after an
         # orchestrator restart with an empty in-memory cache -- see its own "Adopting
         # pre-existing epic worktree" warning). It logs that mismatch internally but only
-        # returns a bare Path, not the branch it actually settled on. Re-derive the real
-        # branch directly from the worktree, using the same best-effort check
-        # get_or_create_epic_worktree() itself uses internally, rather than trusting the
-        # locally-resolved branch_name blindly -- persisting a branch_name that doesn't
-        # match what's actually checked out at project_dir would silently mis-target any
-        # later git push/PR-base operation that trusts this field.
-        actual_branch = await asyncio.to_thread(
-            workspace_manager._current_worktree_branch, project_dir
+        # returns a bare Path, not the branch it actually settled on. Reconcile the real
+        # branch directly against the worktree rather than trusting the locally-resolved
+        # branch_name blindly -- persisting a branch_name that doesn't match what's
+        # actually checked out at project_dir would silently mis-target any later git
+        # push/PR-base operation that trusts this field.
+        #
+        # This used to be a bare _current_worktree_branch() read whose result
+        # UNCONDITIONALLY replaced branch_name, which made it the last
+        # adopt-whatever-git-says path in the orchestrator after #149 hardened the
+        # three commit paths (#163). Those paths refuse to commit onto a branch that
+        # is not this dispatch's target and leave the work uncommitted on disk -- but
+        # nothing repaired the drift, so the NEXT dispatch is a fresh PipelineRun that
+        # took this line, adopted the drifted branch as its own expectation, and then
+        # passed its own verification comparing the drift against itself: #143's
+        # wrong-branch commit, deferred by exactly one dispatch and now carrying two
+        # issues' work.
+        #
+        # reconcile_worktree_branch() draws the line where it belongs -- a branch that
+        # belongs to this EPIC is adopted exactly as before; one that belongs to no
+        # epic is drift, repaired when the tree is clean and refused when it is not.
+        # It writes nothing durable, so the refusal clears itself as soon as the
+        # worktree is sane again. See its docstring for all four verdicts.
+        verdict = await workspace_manager.reconcile_worktree_branch_off_loop(
+            pipeline_run.project,
+            epic_id,
+            project_dir,
+            branch_name,
+            issue_number=pipeline_run.issue_number,
+            checkout_lock_timeout_seconds=checkout_lock_timeout_seconds,
         )
-        if actual_branch and actual_branch != branch_name:
+        if verdict.drifted:
+            self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)
+            logger.error(
+                f"Refusing to resolve a workspace for pipeline run {pipeline_run.id} "
+                f"({pipeline_run.project} epic #{epic_id}): {verdict.detail}"
+            )
+            # Raised BEFORE any of pipeline_run's fields are set, so this run stays
+            # unresolved and a later attempt (once a human has committed or
+            # discarded the work) re-resolves from scratch rather than hitting the
+            # idempotency guard on a half-written resolution.
+            raise WorktreeBranchDriftError(
+                f"Epic worktree for {pipeline_run.project} epic #{epic_id} at "
+                f"{project_dir} has drifted onto a branch that belongs to no epic. "
+                f"{verdict.detail}",
+                project_name=pipeline_run.project,
+                epic_id=str(epic_id),
+                worktree_path=str(project_dir),
+                expected_branch=verdict.expected_branch,
+                found_branch=verdict.found_branch,
+                dirty=verdict.dirty,
+            )
+        if verdict.repaired:
+            self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)
+        if verdict.branch and verdict.branch != branch_name:
             logger.warning(
                 f"Resolved branch_name={branch_name!r} for pipeline run {pipeline_run.id} "
-                f"but the epic worktree at {project_dir} is actually on {actual_branch!r} -- "
-                "persisting the worktree's real branch instead."
+                f"but the epic worktree at {project_dir} is actually on "
+                f"{verdict.branch!r} -- persisting the worktree's real branch instead."
             )
-            branch_name = actual_branch
+        branch_name = verdict.branch or branch_name
 
         pipeline_run.branch_name = branch_name
         pipeline_run.project_dir = str(project_dir)
@@ -665,6 +722,55 @@ class PipelineRunManager:
             f"project_dir={pipeline_run.project_dir}"
         )
         return pipeline_run
+
+    def _emit_worktree_drift_event(
+        self,
+        pipeline_run: 'PipelineRun',
+        epic_id: str,
+        project_dir,
+        verdict,
+    ) -> None:
+        """Publish a worktree branch-drift verdict as a decision event (#163).
+
+        A drift that stops an epic, and a repair that quietly saved one, both need
+        to be findable somewhere other than a container log line -- #163 item 5.
+        Emitted for the DRIFTED and REPAIRED verdicts only: MATCH is the normal
+        case, and EPIC_BRANCH/UNKNOWN keep their pre-existing log-only treatment
+        because neither changed anything or blocked anything.
+
+        Never raises: an observability failure must not be what decides whether a
+        dispatch proceeds.
+        """
+        try:
+            from monitoring.observability import get_observability_manager, EventType
+            from services.project_workspace import WorktreeBranchStatus
+
+            event_type = (
+                EventType.WORKTREE_BRANCH_DRIFT_REPAIRED
+                if verdict.status is WorktreeBranchStatus.REPAIRED
+                else EventType.WORKTREE_BRANCH_DRIFT_DETECTED
+            )
+            get_observability_manager().emit(
+                event_type,
+                "workspace_resolution",
+                pipeline_run.id,
+                pipeline_run.project,
+                {
+                    "pipeline_run_id": pipeline_run.id,
+                    "issue_number": pipeline_run.issue_number,
+                    "board": pipeline_run.board,
+                    "epic_id": str(epic_id),
+                    "worktree_path": str(project_dir),
+                    "expected_branch": verdict.expected_branch,
+                    "found_branch": verdict.found_branch,
+                    "uncommitted": verdict.dirty,
+                    "status": verdict.status.value,
+                    "detail": verdict.detail,
+                },
+                pipeline_run_id=pipeline_run.id
+            )
+        except Exception as e:
+            logger.error(f"Failed to emit worktree branch drift event: {e}", exc_info=True)
 
     def get_recent_pipeline_run_id(
         self,

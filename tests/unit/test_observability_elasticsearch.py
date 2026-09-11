@@ -845,6 +845,7 @@ class TestEventTypeCompleteness:
             'task_queued', 'task_dequeued', 'task_priority_changed', 'task_cancelled',
             'branch_selected', 'branch_created', 'branch_reused', 'branch_conflict_detected',
             'branch_stale_detected', 'branch_selection_escalated',
+            'worktree_branch_drift_detected', 'worktree_branch_drift_repaired',
             'result_persistence_failed', 'fallback_storage_used',
             'output_validation_failed', 'empty_output_detected', 'container_result_recovered',
             'repair_cycle_started', 'repair_cycle_iteration',

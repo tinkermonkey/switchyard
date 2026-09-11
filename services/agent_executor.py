@@ -388,6 +388,27 @@ class AgentExecutor:
                             error=resolve_err,
                             what="Workspace resolution",
                         )
+                        # A drifted epic worktree (#163) is the same condition the
+                        # commit-time refusals escalate over -- the worktree is on a
+                        # branch that belongs to no epic and holds work nobody has
+                        # claimed -- just caught BEFORE an agent runs against it
+                        # rather than after. Route it to the same escalation so an
+                        # operator gets the same comment and the board's lock is
+                        # retained on the first occurrence, instead of three more
+                        # dispatches piling work into the same drifted directory on
+                        # the way to MAX_CONSECUTIVE_DISPATCH_FAILURES.
+                        from services.project_workspace import WorktreeBranchDriftError
+                        if isinstance(resolve_err, WorktreeBranchDriftError):
+                            await self._handle_wrong_branch_refusal(
+                                project_name=project_name,
+                                task_context=task_context,
+                                pipeline_run_id=pipeline_run_id,
+                                error_detail=str(resolve_err),
+                                expected_branch=resolve_err.expected_branch,
+                                current_branch=resolve_err.found_branch,
+                                worktree_dir=resolve_err.worktree_path,
+                                pre_dispatch=True,
+                            )
                         raise
                     epic_id = pipeline_run_for_workspace.epic_id
                     epic_branch_name = pipeline_run_for_workspace.branch_name
@@ -2369,49 +2390,81 @@ class AgentExecutor:
         error_detail: str,
         expected_branch: Optional[str],
         current_branch: Optional[str],
-        unverifiable: bool = False
+        unverifiable: bool = False,
+        worktree_dir: Optional[str] = None,
+        pre_dispatch: bool = False
     ):
         """
-        Escalate a commit path that refused because it could not confirm the
-        workspace is on this dispatch's own branch, and raise so the run is not
-        recorded as a success. Covers both verdicts _verify_finalize_branch() can
+        Escalate a refusal to work against a workspace that could not be confirmed
+        to be on this dispatch's own branch, and raise so the run is not recorded
+        as a success. Covers both verdicts _verify_finalize_branch() can
         return -- a confirmed wrong branch, and a branch that could not be read at
         all -- plus the same two from _verify_failsafe_branch(), whose refusal was
-        otherwise silent at every one of its call sites (#149 WI-4 review).
+        otherwise silent at every one of its call sites (#149 WI-4 review), plus
+        (#163) resolve_workspace()'s pre-dispatch WorktreeBranchDriftError.
 
         Scoped deliberately to THIS run: mark_failed() retains the board's pipeline
-        lock and the agent's work is left uncommitted on disk, but nothing durable
-        is written that could block a future dispatch. The drift IS still on disk
-        afterwards and nothing repairs it, so the next dispatch for the same epic
-        can re-derive the drifted branch as its own expectation -- tracked as #163,
-        which is where a durable quarantine (or a repair) belongs once it has an
-        operator-facing way to be inspected and cleared.
+        lock and the work already on disk is left uncommitted, but nothing durable
+        is written that could block a future dispatch. Since #163 the drift no
+        longer survives unnoticed either: resolve_workspace() reconciles the epic
+        worktree's HEAD against a branch expectation derived outside that
+        directory's ambient git state on EVERY dispatch, repairing it when the tree
+        is clean and refusing here when it is not -- so the next dispatch can no
+        longer adopt the drifted branch as its own expectation. That refusal is
+        re-derived from the worktree's live state each time rather than recorded
+        anywhere, so it clears itself the moment the work below is committed or
+        discarded; there is no quarantine to clear.
+
+        Args:
+            worktree_dir: The directory the refusal is about, when the caller knows
+                it independently of task_context -- the pre-dispatch case, where
+                resolution failed before task_context['project_dir'] was set.
+            pre_dispatch: True when the refusal happened BEFORE the agent ran, which
+                changes only how the comment describes what is on disk (nobody's
+                work was produced by this run; what is sitting there is an earlier
+                one's).
 
         Always raises NonRetryableAgentError.
         """
+        project_dir = worktree_dir or task_context.get('project_dir', '<worktree>')
         heading = (
             "## ❌ Branch Unverifiable — Pipeline Blocked" if unverifiable
             else "## ❌ Wrong Branch — Pipeline Blocked"
         )
-        summary = (
-            "The agent completed its work, but the workspace's checked-out branch "
-            "could not be read, so nothing was staged, committed, pushed, or turned "
-            "into a PR. The changes are still sitting uncommitted on disk."
-            if unverifiable else
-            "The agent completed its work, but the workspace was **not on this "
-            "issue's branch** at commit time, so nothing was staged, committed, "
-            "pushed, or turned into a PR. The changes are still sitting uncommitted "
-            "on disk."
-        )
+        if pre_dispatch:
+            summary = (
+                "This issue's epic worktree is checked out on a branch that belongs "
+                "to no epic, and it holds uncommitted changes, so **no agent was "
+                "dispatched**. Running one would have worked on top of somebody "
+                "else's uncommitted work and then committed all of it to the wrong "
+                "branch. Nothing on disk was touched."
+            )
+        elif unverifiable:
+            summary = (
+                "The agent completed its work, but the workspace's checked-out branch "
+                "could not be read, so nothing was staged, committed, pushed, or turned "
+                "into a PR. The changes are still sitting uncommitted on disk."
+            )
+        else:
+            summary = (
+                "The agent completed its work, but the workspace was **not on this "
+                "issue's branch** at commit time, so nothing was staged, committed, "
+                "pushed, or turned into a PR. The changes are still sitting uncommitted "
+                "on disk."
+            )
 
         def _wrong_branch_comment(lock_status_line: str, board_name: str) -> str:
             steps = "\n".join([
-                f"1. Inspect the worktree at "
-                f"`{task_context.get('project_dir', '<worktree>')}` and preserve "
-                "anything worth keeping (`git status`, `git diff`).",
-                f"2. Restore the epic's branch: "
-                f"`git checkout {expected_branch or '<branch>'}`.",
-                f"3. Run `python scripts/release_lock.py --project {project_name} "
+                f"1. See what is there: `python scripts/inspect_epic_worktrees.py "
+                f"--project {project_name}` (reports every epic worktree's branch, "
+                "whether it has drifted, and what is uncommitted in it).",
+                f"2. Inspect the worktree at `{project_dir}` and preserve anything "
+                "worth keeping (`git status`, `git diff`) — commit it onto "
+                f"`{expected_branch or '<branch>'}` yourself, or discard it with "
+                "`git reset --hard` / `git clean -fd` and let the pipeline redo it.",
+                "3. Nothing else needs clearing: once that worktree is clean, the "
+                "next dispatch restores the epic's branch on its own.",
+                f"4. Run `python scripts/release_lock.py --project {project_name} "
                 f"--board \"{board_name}\" --issue "
                 f"{task_context.get('issue_number')}` to release the pipeline lock "
                 "once ready to continue — see below for whether it is actually "

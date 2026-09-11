@@ -7,6 +7,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -212,6 +213,90 @@ def resolve_setup_queue(
             to_queue.append(project_name)
 
     return to_queue
+
+
+class WorktreeBranchStatus(Enum):
+    """What reconcile_worktree_branch() found in an epic's worktree, and what it did.
+
+    The distinction that matters is EPIC_BRANCH vs DRIFTED, and it is deliberately
+    NOT "does HEAD equal the branch this run resolved" (#163). An epic worktree can
+    legitimately sit on a branch other than the one a fresh resolution just derived
+    -- get_or_create_epic_worktree() adopts a pre-existing worktree across a restart
+    and keeps its real branch, and resolve_epic_branch_name()'s listing can name a
+    different branch of the SAME epic than the one actually checked out. Both of
+    those are still this epic's own branch, and adopting them is correct.
+
+    What is never correct is adopting a branch that belongs to no epic (or to a
+    different one): that is an agent container's own git having moved HEAD inside
+    the bind-mounted worktree (`git switch -c scratch`), which is exactly the drift
+    #149's commit-time verification refuses over. Adopting it makes the NEXT
+    dispatch's expectation equal to the drift, so its own verification passes and it
+    commits both issues' work onto the drifted branch -- #143's outcome, deferred by
+    one dispatch.
+    """
+
+    MATCH = "match"              # HEAD is already on the branch this run resolved
+    EPIC_BRANCH = "epic_branch"  # HEAD is on a different branch that still belongs to this epic
+    REPAIRED = "repaired"        # HEAD had drifted off the epic, the tree was clean, HEAD was restored
+    DRIFTED = "drifted"          # HEAD has drifted off the epic and could not be restored safely
+    UNKNOWN = "unknown"          # HEAD could not be read at all
+
+
+@dataclass
+class WorktreeBranchVerdict:
+    """reconcile_worktree_branch()'s answer.
+
+    `branch` is the only field a routine caller needs: the branch that directory is
+    actually on and that this run may therefore target. It is None only for
+    DRIFTED, where there is no safe answer and the caller must not proceed.
+    """
+
+    status: WorktreeBranchStatus
+    branch: Optional[str]
+    expected_branch: Optional[str]
+    found_branch: Optional[str]
+    dirty: Optional[bool]
+    detail: str
+
+    @property
+    def drifted(self) -> bool:
+        return self.status is WorktreeBranchStatus.DRIFTED
+
+    @property
+    def repaired(self) -> bool:
+        return self.status is WorktreeBranchStatus.REPAIRED
+
+
+class WorktreeBranchDriftError(RuntimeError):
+    """An epic worktree is on a branch belonging to no epic and could not be
+    restored, so this dispatch has no safe branch to target (#163).
+
+    Carries no durable state and writes nothing to disk: it is re-derived from the
+    worktree's live HEAD and working tree on every resolution, so it cannot outlive
+    the drift it describes and there is nothing for an operator to "clear". The
+    recovery is to make the worktree sane again (commit the work onto the epic's
+    branch, or discard it) -- `python scripts/inspect_epic_worktrees.py` reports
+    exactly which worktrees are in this state and what is uncommitted in them --
+    after which the very next dispatch resolves normally.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        project_name: str,
+        epic_id: str,
+        worktree_path: str,
+        expected_branch: Optional[str],
+        found_branch: Optional[str],
+        dirty: Optional[bool],
+    ):
+        super().__init__(message)
+        self.project_name = project_name
+        self.epic_id = epic_id
+        self.worktree_path = worktree_path
+        self.expected_branch = expected_branch
+        self.found_branch = found_branch
+        self.dirty = dirty
 
 
 class ProjectWorkspaceManager:
@@ -1453,6 +1538,308 @@ class ProjectWorkspaceManager:
             return None
 
     @staticmethod
+    def _worktree_has_uncommitted_work(worktree_path: Path) -> Optional[bool]:
+        """Best-effort `git status --porcelain` on an existing worktree.
+
+        Returns True (anything staged, modified or untracked), False (genuinely
+        clean) or None when the check itself could not be completed -- never
+        raises. Untracked files count: a brand-new source file an agent wrote and
+        never got to commit is exactly the work this question is asked to protect.
+
+        None is NOT "clean". Both callers treat it as "assume there is work here":
+        reconcile_worktree_branch() refuses to move HEAD over it, and
+        _prune_project_staging() refuses to force-remove it. Guessing "clean" on an
+        unanswerable question is the only one of the two answers that can destroy
+        something.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'status', '--porcelain'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Could not determine whether {worktree_path} has uncommitted "
+                    f"work (git status rc={result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+                return None
+            return bool(result.stdout.strip())
+        except Exception as e:
+            logger.warning(
+                f"Could not determine whether {worktree_path} has uncommitted work: {e}"
+            )
+            return None
+
+    @staticmethod
+    def _branch_belongs_to_epic(branch_name: Optional[str], epic_id: str) -> bool:
+        """True if branch_name is one of THIS epic's own branches.
+
+        The single rule separating "a different branch of this epic, adopt it" from
+        "drift, never adopt it" (see WorktreeBranchStatus). Delegates to
+        FeatureBranchManager rather than re-deriving the naming scheme here, so the
+        two cannot drift apart: that class both generates epic branch names
+        (create_feature_branch_name) and discovers existing ones
+        (resolve_epic_branch_name) by the same parse.
+        """
+        if not branch_name:
+            return False
+        from services.feature_branch_manager import feature_branch_manager
+
+        return feature_branch_manager.branch_belongs_to_epic(branch_name, epic_id)
+
+    @staticmethod
+    def _restore_worktree_branch(worktree_path: Path, expected_branch: str) -> bool:
+        """Best-effort `git checkout` of expected_branch in an existing worktree.
+
+        Only ever called for a worktree the caller has already confirmed CLEAN, so
+        there is nothing in it to lose or to carry across: this either moves HEAD
+        onto a branch that already exists locally, or changes nothing at all.
+
+        Deliberately narrow -- no -b, no -B, no --force, no fetch:
+
+          * The branch must already exist locally. Creating it here would invent a
+            second branch for an epic that may already have one, and the realistic
+            reason it does not exist is that expected_branch is
+            create_feature_branch_name()'s generated fallback for an epic whose real
+            branch is named something else -- in which case moving HEAD there is
+            wrong, not a repair.
+          * A checkout that git refuses (most plausibly: the branch is checked out
+            in another worktree, which _free_branch_from_base_clone exists for) is
+            reported as a failed repair, never forced.
+
+        Returns True only when HEAD is confirmed to be on expected_branch afterward.
+        """
+        try:
+            exists = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-parse', '--verify', '--quiet',
+                 f'refs/heads/{expected_branch}'],
+                capture_output=True, text=True, timeout=10
+            )
+            if exists.returncode != 0:
+                logger.warning(
+                    f"Cannot restore {worktree_path} to {expected_branch!r}: no such "
+                    "local branch."
+                )
+                return False
+
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'checkout', expected_branch],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Could not restore {worktree_path} to {expected_branch!r}: "
+                    f"{result.stderr.strip()}"
+                )
+                return False
+        except Exception as e:
+            logger.warning(
+                f"Could not restore {worktree_path} to {expected_branch!r}: {e}"
+            )
+            return False
+
+        # Confirmed from git, not assumed from a zero exit status -- the whole
+        # point of this method is to stop trusting an unverified branch.
+        return ProjectWorkspaceManager._current_worktree_branch(worktree_path) == expected_branch
+
+    def reconcile_worktree_branch(
+        self,
+        project_name: str,
+        epic_id: str,
+        worktree_path,
+        expected_branch: Optional[str],
+        issue_number: Optional[int] = None,
+        checkout_lock_timeout_seconds: Optional[float] = None,
+    ) -> WorktreeBranchVerdict:
+        """Decide which branch an already-resolved epic worktree may be worked on,
+        repairing HEAD when that is provably safe and refusing when it is not (#163).
+
+        MUST NOT be called from the event-loop thread -- it takes this epic's
+        serializer, whose wait is budgeted exactly as get_or_create_epic_worktree()'s
+        is. Use reconcile_worktree_branch_off_loop() from a coroutine.
+
+        Called by PipelineRunManager.resolve_workspace() immediately after
+        get_or_create_epic_worktree() returns, in place of the unconditional
+        "whatever git says is now this run's branch" override it used to do there.
+        That override was the last adopt-what-git-says path left after #149 hardened
+        the three commit paths: a refusal leaves the drift on disk, and the next
+        dispatch re-derived it as its OWN expectation, so its verification compared
+        the drift against itself and passed.
+
+        The four outcomes, and why each is the answer:
+
+          * MATCH / EPIC_BRANCH -- HEAD is on this epic's own branch. Adopted
+            exactly as before (EPIC_BRANCH also refreshes the tracked-branch map so
+            it stops naming a branch this worktree is no longer on).
+          * REPAIRED -- HEAD is off the epic but the working tree is CLEAN, so
+            there is nothing to preserve and nothing to decide: put HEAD back on the
+            expected branch and let the dispatch proceed. This is the case a
+            quarantine would have wedged an epic over for no gain.
+          * DRIFTED -- HEAD is off the epic and the tree is dirty (or its state is
+            unreadable, or the expected branch could not be checked out). The
+            agent's uncommitted work is left exactly where it is: committing it to
+            the drifted branch is #143, committing it to the epic's branch without a
+            human confirming whose work it is is worse, and discarding it is
+            unrecoverable. The caller refuses the dispatch instead.
+          * UNKNOWN -- HEAD could not be read at all (detached, or a git failure).
+            Behaviour is unchanged from before this method existed: the caller keeps
+            the branch it resolved, and #149's commit-time verification is still
+            there to refuse over an unreadable HEAD at the point it would matter.
+            Deliberately not a refusal: _current_worktree_branch() is documented
+            best-effort and returns None for transient subprocess failures too, and
+            turning those into blocked dispatches would be a new failure mode in
+            exchange for a check that already exists downstream.
+
+        Nothing durable is written in any of them. DRIFTED is re-derived from the
+        worktree's live HEAD and working tree on every single resolution, so it
+        clears itself the moment a human commits or discards the work -- there is no
+        marker to go stale, nothing for prune_epic_worktrees() to destroy, and no
+        "clear the quarantine" step to forget. What DOES have to hold up its end is
+        that prune must not force-remove the uncommitted work this refusal is
+        preserving; see the uncommitted-work skip in _prune_project_staging().
+
+        Scope is the worktree, which is per-epic, so a DRIFTED verdict blocks that
+        epic's issues and no others. That is not a choice about blast radius so much
+        as a description of the thing that is broken: every sibling sub-issue of the
+        epic works in this same directory.
+
+        Args:
+            project_name: Project the worktree belongs to.
+            epic_id: Epic the worktree is scoped to -- also what decides whether the
+                branch found on disk is this epic's own (see _branch_belongs_to_epic).
+            worktree_path: The resolved worktree directory.
+            expected_branch: The branch this dispatch resolved for the epic,
+                independently of the worktree's ambient git state.
+            issue_number: The dispatching issue, for the serializer's attribution --
+                see get_or_create_epic_worktree()'s own issue_number docs.
+            checkout_lock_timeout_seconds: As get_or_create_epic_worktree().
+
+        Returns:
+            A WorktreeBranchVerdict. Never raises for a drifted or unreadable
+            worktree -- the verdict says so and the caller decides.
+
+        Raises:
+            ProjectCheckoutLockTimeoutError: another call for this same epic held
+                its serializer for the whole acquire budget. Nothing was read or
+                checked out. Routed as contention, not failure, by every caller
+                (services/resource_lock_errors.is_lock_timeout_error()).
+        """
+        worktree_path = Path(worktree_path)
+        key = (project_name, str(epic_id))
+        lock_issue_number = self._resolve_epic_lock_issue_number(epic_id, issue_number)
+        lock_timeout_seconds = self._resolve_checkout_lock_timeout(
+            project_name, epic_id, lock_issue_number, checkout_lock_timeout_seconds,
+            operation='reconcile_worktree_branch',
+        )
+
+        # This epic's own serializer, the same one get_or_create_epic_worktree()
+        # and cleanup_epic_worktree() take: a repair MOVES HEAD in a directory
+        # sibling dispatches of this epic share, so it must not run while one of
+        # them is mid-creation/adoption/teardown of the same worktree. The
+        # project_checkout lock is deliberately NOT taken: a checkout inside an
+        # already-registered worktree writes that worktree's own index and its
+        # per-worktree admin dir, not the base clone's refs -- unlike
+        # _add_epic_worktree(), which fetches into and pushes from the base clone.
+        with self._epic_worktree_key_lock_held(
+            key, project_name, epic_id, lock_issue_number, lock_timeout_seconds
+        ):
+            found_branch = self._current_worktree_branch(worktree_path)
+
+            if found_branch is None:
+                return WorktreeBranchVerdict(
+                    status=WorktreeBranchStatus.UNKNOWN,
+                    branch=expected_branch,
+                    expected_branch=expected_branch,
+                    found_branch=None,
+                    dirty=None,
+                    detail=(
+                        f"Could not read the checked-out branch in {worktree_path} "
+                        "(detached HEAD, or git could not be run); keeping the "
+                        f"resolved branch {expected_branch!r}."
+                    ),
+                )
+
+            if expected_branch and found_branch == expected_branch:
+                return WorktreeBranchVerdict(
+                    status=WorktreeBranchStatus.MATCH,
+                    branch=found_branch,
+                    expected_branch=expected_branch,
+                    found_branch=found_branch,
+                    dirty=None,
+                    detail=f"{worktree_path} is on the resolved branch {found_branch!r}.",
+                )
+
+            if not expected_branch or self._branch_belongs_to_epic(found_branch, epic_id):
+                with self._epic_worktree_lock:
+                    self._epic_worktree_branches[key] = found_branch
+                return WorktreeBranchVerdict(
+                    status=WorktreeBranchStatus.EPIC_BRANCH,
+                    branch=found_branch,
+                    expected_branch=expected_branch,
+                    found_branch=found_branch,
+                    dirty=None,
+                    detail=(
+                        f"{worktree_path} is on {found_branch!r} rather than the "
+                        f"resolved {expected_branch!r}, but that branch belongs to "
+                        f"epic #{epic_id} -- using the worktree's real branch."
+                    ),
+                )
+
+            dirty = self._worktree_has_uncommitted_work(worktree_path)
+            if dirty is not False:
+                return WorktreeBranchVerdict(
+                    status=WorktreeBranchStatus.DRIFTED,
+                    branch=None,
+                    expected_branch=expected_branch,
+                    found_branch=found_branch,
+                    dirty=dirty,
+                    detail=(
+                        f"{worktree_path} is on {found_branch!r}, which belongs to no "
+                        f"epic (expected {expected_branch!r} for epic #{epic_id}), and "
+                        + (
+                            "holds uncommitted changes"
+                            if dirty
+                            else "its working tree state could not be read"
+                        )
+                        + " -- HEAD was left untouched and nothing was committed."
+                    ),
+                )
+
+            if self._restore_worktree_branch(worktree_path, expected_branch):
+                with self._epic_worktree_lock:
+                    self._epic_worktree_branches[key] = expected_branch
+                return WorktreeBranchVerdict(
+                    status=WorktreeBranchStatus.REPAIRED,
+                    branch=expected_branch,
+                    expected_branch=expected_branch,
+                    found_branch=found_branch,
+                    dirty=False,
+                    detail=(
+                        f"{worktree_path} had drifted onto {found_branch!r} with a "
+                        f"clean working tree; HEAD restored to {expected_branch!r}."
+                    ),
+                )
+
+            return WorktreeBranchVerdict(
+                status=WorktreeBranchStatus.DRIFTED,
+                branch=None,
+                expected_branch=expected_branch,
+                found_branch=found_branch,
+                dirty=False,
+                detail=(
+                    f"{worktree_path} is on {found_branch!r}, which belongs to no epic "
+                    f"(expected {expected_branch!r} for epic #{epic_id}); the working "
+                    "tree is clean but HEAD could not be restored to that branch."
+                ),
+            )
+
+    async def reconcile_worktree_branch_off_loop(self, *args, **kwargs) -> WorktreeBranchVerdict:
+        """reconcile_worktree_branch(), run off the event loop on the dedicated
+        epic-worktree pool -- see get_project_dir_off_loop()."""
+        return await self._off_loop(self.reconcile_worktree_branch, *args, **kwargs)
+
+    @staticmethod
     def _push_stray_branch_if_ahead(base_repo_dir: Path, branch_name: str) -> None:
         """Best-effort push of a local branch ref that might hold real unpushed
         commits, before `worktree add -B` is about to reset it.
@@ -2050,6 +2437,112 @@ class ProjectWorkspaceManager:
             else:
                 self._worktree_paths_in_use.pop(key, None)
 
+    def survey_epic_worktrees(self, project_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Read-only report of every epic worktree currently staged on disk.
+
+        The operator entry point behind `scripts/inspect_epic_worktrees.py` and the
+        observability server's /api/epic-worktrees (#163). A refusal that stops an
+        epic has to be inspectable without shelling into the container and running
+        git by hand, and a prune skip that keeps a directory alive indefinitely has
+        to be visible somewhere other than a startup log line -- this answers both
+        with the same survey.
+
+        Strictly read-only and takes no locks: it runs from a separate process (the
+        script) and from a web request handler (the endpoint), where this process's
+        per-epic serializer would mean nothing anyway, and where blocking on an
+        epic's ~3h acquire budget would be far worse than a racy reading. Every
+        field is therefore a snapshot that may already have moved; that is the right
+        trade for a diagnostic, and it is why nothing here writes.
+
+        Args:
+            project_name: Limit the survey to one project (default: every project
+                with a staging directory).
+
+        Returns:
+            One dict per worktree directory found, each with: project, epic_id,
+            path, current_branch, expected_branch, belongs_to_epic, drifted,
+            uncommitted (True/False/None for unreadable), uncommitted_files (the
+            porcelain lines, capped), and prune_skipped (whether the startup sweep's
+            uncommitted-work rule would leave it alone). Empty when nothing is
+            staged. Never raises.
+        """
+        from services.feature_branch_manager import feature_branch_manager
+
+        staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
+        rows: List[Dict[str, Any]] = []
+        try:
+            if not staging_root.is_dir():
+                return rows
+            project_stagings = sorted(staging_root.iterdir())
+        except OSError as e:
+            logger.warning(f"Failed to list epic worktree staging root {staging_root}: {e}")
+            return rows
+
+        for project_staging in project_stagings:
+            if not project_staging.is_dir():
+                continue
+            if project_name and project_staging.name != project_name:
+                continue
+            try:
+                worktree_paths = sorted(project_staging.iterdir())
+            except OSError as e:
+                logger.warning(f"Failed to list epic worktrees under {project_staging}: {e}")
+                continue
+
+            for worktree_path in worktree_paths:
+                if not worktree_path.is_dir():
+                    continue
+                epic_id = worktree_path.name
+                current_branch = self._current_worktree_branch(worktree_path)
+                try:
+                    expected_branch = feature_branch_manager.resolve_epic_branch_name(
+                        project_staging.name, epic_id
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not resolve the expected branch for "
+                        f"{project_staging.name} epic #{epic_id}: {e}"
+                    )
+                    expected_branch = None
+                belongs = self._branch_belongs_to_epic(current_branch, epic_id)
+                uncommitted = self._worktree_has_uncommitted_work(worktree_path)
+                rows.append({
+                    'project': project_staging.name,
+                    'epic_id': epic_id,
+                    'path': str(worktree_path),
+                    'current_branch': current_branch,
+                    'expected_branch': expected_branch,
+                    'belongs_to_epic': belongs,
+                    # Matches reconcile_worktree_branch()'s own rule: an unreadable
+                    # HEAD is UNKNOWN there, not drift, so it is not drift here.
+                    'drifted': bool(current_branch) and not belongs,
+                    'uncommitted': uncommitted,
+                    'uncommitted_files': self._uncommitted_file_summary(worktree_path),
+                    'prune_skipped': uncommitted is not False,
+                })
+
+        return rows
+
+    @staticmethod
+    def _uncommitted_file_summary(worktree_path: Path, limit: int = 20) -> List[str]:
+        """The first `limit` porcelain lines of a worktree's uncommitted changes.
+
+        Diagnostic detail for survey_epic_worktrees() only -- capped because the
+        answer an operator needs from it is "what kind of work is sitting here",
+        not a full file listing, and this feeds an HTTP response. Empty list on any
+        failure; never raises.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'status', '--porcelain'],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return []
+            return [line for line in result.stdout.splitlines() if line.strip()][:limit]
+        except Exception:
+            return []
+
     def _prune_project_staging(self, project_staging: Path, running_mount_sources: set) -> None:
         """One project's half of prune_epic_worktrees()'s sweep, run with that
         project's project_checkout lock HELD.
@@ -2175,6 +2668,42 @@ class ProjectWorkspaceManager:
                 )
                 continue
 
+            # Fourth skip rule (#163), and the one that makes a wrong-branch
+            # refusal survivable: a worktree with uncommitted changes is left
+            # alone. _push_local_commits_if_any() below pushes COMMITS -- it has
+            # no answer at all for a dirty working tree, so for that case this
+            # sweep's whole "safe to remove, cheaply recreated" premise is just
+            # false, exactly as it is for the corrupted case above.
+            #
+            # This is the designed half of the prune interaction #163 asks for,
+            # stated as a rule rather than arranged as a side effect of some
+            # marker file's placement: #149's commit paths refuse over a drifted
+            # branch and DELIBERATELY leave the agent's work uncommitted on disk
+            # for a human to inspect, and the previous version of this sweep
+            # force-removed precisely that work on the next restart -- destroying
+            # what the refusal preserved, and leaving the epic blocked on a
+            # condition whose evidence no longer existed. The other direction
+            # holds too, and needs no code: the block is re-derived from the live
+            # working tree on every resolution (reconcile_worktree_branch()), so
+            # once a human commits or discards the work this skip stops applying
+            # and the ordinary sweep collects the worktree again. Nothing durable
+            # outlives the drift.
+            #
+            # An unreadable status counts as "has work" -- see
+            # _worktree_has_uncommitted_work() for why the unanswerable case
+            # resolves to the non-destructive answer.
+            if self._worktree_has_uncommitted_work(worktree_path) is not False:
+                logger.warning(
+                    f"Skipping prune of {worktree_path} -- it has uncommitted "
+                    "changes (or their state could not be read), which this sweep "
+                    "cannot preserve: _push_local_commits_if_any() only saves "
+                    "commits. This is the state a wrong-branch refusal leaves "
+                    "behind. Inspect it with `python scripts/inspect_epic_worktrees.py`, "
+                    "then commit or discard the work; the next startup's sweep "
+                    "collects it once it is clean."
+                )
+                continue
+
             self._push_local_commits_if_any(worktree_path)
             try:
                 subprocess.run(
@@ -2255,14 +2784,27 @@ class ProjectWorkspaceManager:
         transparently recreated (fetch + worktree add, cheap) the next time
         get_project_dir()/get_or_create_epic_worktree() is called for that
         epic, and _push_local_commits_if_any() below is a real safety net for
-        it (anything genuinely uncommitted gets a chance to reach origin
-        first). A THIRD case, added after code review found this sweep was an
+        its local COMMITS (they get a chance to reach origin first). A THIRD
+        case, added after code review found this sweep was an
         unprotected second path to the same risk get_or_create_epic_worktree()
         guards against: a non-empty worktree with NO .git at all (corrupted)
         is explicitly skipped rather than force-removed -- _push_local_commits_
         if_any() is a no-op with no .git to run git commands against, so the
         "cheap, no real loss" assumption this paragraph otherwise relies on
         does not hold for it.
+
+        A FOURTH case (#163), for the same reason as the third and with the
+        same shape: a worktree holding UNCOMMITTED changes is skipped, because
+        _push_local_commits_if_any() saves commits and has no answer at all for
+        a dirty working tree. This is the designed interaction between this
+        sweep and #149's commit-time branch verification, which refuses over a
+        drifted branch and deliberately leaves the agent's work uncommitted on
+        disk for a human: without this rule the next restart force-removed
+        exactly the work the refusal preserved. It costs one `git status
+        --porcelain` per candidate worktree, and it self-clears -- the moment
+        the work is committed or discarded, the worktree is an ordinary
+        removal candidate again. See the rule's own comment below, and
+        reconcile_worktree_branch() for the other half of #163.
 
         The project_checkout lock, and why it is per-project and non-blocking
         ----------------------------------------------------------------------
