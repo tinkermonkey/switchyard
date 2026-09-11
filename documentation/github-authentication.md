@@ -1,6 +1,8 @@
 # GitHub authentication
 
-Switchyard uses two distinct GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Both are supported simultaneously, and the system selects between them at runtime based on availability. Understanding why both exist, what each provides, and how the system manages them is necessary for operating and troubleshooting the orchestrator.
+Switchyard supports two GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Either can be used alone, or both together. `GITHUB_CREDENTIAL_PREFERENCE` selects which one `GitHubAPIClient` routes its own calls through (`pat` by default), with fallback to the other when the preferred one is unavailable.
+
+Running **App-only** is supported, and is the right configuration for an organization that restricts personal access tokens. It requires an organization-owned app — see "Account type determines Projects v2 access".
 
 ## Why multiple authentication methods
 
@@ -12,11 +14,11 @@ This was established by a scope-ordering probe rather than by reading the docs. 
 
 The GitHub App remains preferred for Discussions (bot identity, separate rate-limit budget), but it is no longer believed to be strictly required.
 
-`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured. If the App is not configured, `_execute_graphql` falls back to a PAT-authenticated GraphQL call, which will succeed for read queries but fail for write mutations with a permission error. Any orchestrator workflow that creates or comments on Discussions requires a GitHub App.
+`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured, and `_execute_graphql` falls back to a PAT-authenticated GraphQL call when it is not. Given the finding above, that fallback is expected to work for writes as well as reads, though the App remains the preferred path.
 
 Beyond Discussions, the GitHub App provides two additional benefits: actions appear as `orchestrator-bot[bot]` rather than as the PAT owner's personal account, and the rate limit is per-installation (5,000 requests per hour for this installation) rather than shared across all applications using the same user token.
 
-The system supports both simultaneously so that operators can start with a PAT for initial setup, then add the GitHub App when Discussions functionality is needed. The GitHub App is always preferred when configured; the PAT serves as fallback for everything except Discussions write mutations.
+Supporting both lets operators start with a PAT for initial setup and add the GitHub App later, or run App-only from the start. Note that the App's advantages are real but bounded: bot identity, a separate rate-limit budget, and short-lived credentials rather than a long-lived one.
 
 ## Personal Access Token
 
@@ -28,7 +30,7 @@ The `.env.example` specifies the following scopes for `GITHUB_TOKEN`:
 - `project` — read/write access to GitHub Projects v2 boards
 - `admin:repo_hook` — create and manage webhooks
 
-The `project` scope is essential. Without it, the reconciliation loop that creates and manages Kanban board columns will fail silently or with permission errors.
+The `project` scope is essential, and its absence fails **silently**: a Projects v2 query made without it returns an empty, successful result rather than an error, which board reconciliation would read as "no board exists" before creating a duplicate of every board. `services/github_capabilities.py` therefore checks the credential's grant (`x-oauth-scopes` for a PAT, installation permissions for an app) at startup, and `services/github_project_manager.py` skips reconciliation entirely rather than run it blind.
 
 ### Environment variable
 
@@ -77,9 +79,11 @@ GitHub App authentication is a two-step process.
 
 **Step 1: Generate a JWT.** The orchestrator signs a JWT using the app's RSA private key. The JWT payload contains:
 
-- `iat`: current Unix timestamp (issued at)
-- `exp`: current timestamp plus 600 seconds (10-minute expiry)
+- `iat`: current Unix timestamp **minus 60 seconds**
+- `exp`: current timestamp plus 540 seconds
 - `iss`: the numeric app ID
+
+`iat` is backdated so clock drift between the host and GitHub cannot fail the `iat` claim check, which surfaces as a 401 on the token exchange reported only as "Failed to get installation token". GitHub caps a JWT's lifetime at 10 minutes measured from `iat`, so `exp` is set to +540 to keep `exp - iat` at exactly 600 seconds.
 
 The JWT is signed with the `RS256` algorithm. This JWT authenticates the app itself, not the installation.
 
@@ -187,7 +191,15 @@ The following steps create and configure the GitHub App that the orchestrator us
 
 ### 1. Create the app
 
-Navigate to `https://github.com/settings/apps/new` (personal account) or `https://github.com/organizations/<org>/settings/apps/new` (organization).
+**Who should own the app.** If the app needs to manage Projects v2 boards, it must be owned by and installed on an **organization**:
+
+```
+https://github.com/organizations/<org>/settings/apps/new
+```
+
+An app owned by a personal account cannot reach Projects v2 at all — see "Account type determines Projects v2 access" below. App creation lives under the org's **Settings → Developer settings → GitHub Apps → New GitHub App**, which is a different page from the org's "GitHub Apps" installed-apps list (the one showing Marketplace / My apps). An app created on a personal account by mistake can be moved with **Transfer ownership** at the bottom of its settings page, which preserves the app ID and existing private keys.
+
+For a deployment that does not manage boards, a personal-account app (`https://github.com/settings/apps/new`) is sufficient.
 
 Set:
 - **App name**: a unique name, e.g., `orchestrator-bot`
@@ -195,26 +207,57 @@ Set:
 - **Webhook**: disable (uncheck "Active") unless you intend to use webhook delivery
 - **Where can this GitHub App be installed?**: "Only on this account"
 
+Note that "Only on this account" means the owning account. On a personal-account app it therefore excludes every organization, and the org will not appear as an option at install time.
+
 ### 2. Configure permissions
 
 Under "Repository permissions", set:
 
-| Permission | Level |
-|---|---|
-| Contents | Read and write |
-| Issues | Read and write |
-| Pull requests | Read and write |
-| Projects | Read and write (requires organization-level permission) |
-| Discussions | Read and write |
-| Metadata | Read-only (mandatory) |
+| Permission | Level | Needed for |
+|---|---|---|
+| Contents | Read and write | repository access; also required to *link* a new board to a repository |
+| Issues | Read and write | issue comments, labels, board cards |
+| Pull requests | Read and write | PR creation and the review cycle |
+| Discussions | Read and write | the `planning_design` pipeline (`workspace: discussions`) |
+| Metadata | Read-only | mandatory for every app |
 
-Under "Organization permissions" (if using an org):
+Under "Organization permissions":
 
-| Permission | Level |
-|---|---|
-| Projects | Read and write |
+| Permission | Level | Needed for |
+|---|---|---|
+| Projects | Read and write | **Projects v2 boards** |
+
+**Do not confuse the two "Projects" permissions.** Both appear in the UI under that single word, in separate sections of the same page:
+
+- **Repository permissions → Projects** is labelled "Manage classic projects within a repository". It governs *classic* project boards and grants no Projects v2 access whatsoever. Granting it in place of the organization permission is a silent no-op for this orchestrator.
+- **Organization permissions → Projects** is the one that governs Projects v2, and the one board reconciliation requires.
 
 No event subscriptions are required unless the app will receive webhooks.
+
+Changing an app's permissions after installation does not apply them retroactively: the installation keeps its previously accepted set until the owning account approves the new one (a banner appears at `https://github.com/settings/installations`). The two can be compared directly — `GET /app` reports what the registration *requests*, `GET /app/installations/{id}` what the installation has *accepted*. If those disagree, an approval is pending; if the registration itself lacks the permission, the change was never saved.
+
+### Account type determines Projects v2 access
+
+A GitHub App can only reach Projects v2 owned by an **organization**. There is no equivalent permission for boards owned by a personal account, and an app installed on a personal account does not receive that account's `projectsV2` even for boards linked to repositories the app can otherwise access.
+
+This is the practical constraint on running without a PAT: board management requires an org-owned app installed on the org that owns the boards. Everything else the orchestrator does — issues, pull requests, discussions, repository contents — works from a personal-account app.
+
+### Verified configuration
+
+The six permissions above were verified end to end against an organization-owned app installed on an organization, reading a **private** Projects v2 board:
+
+| Check | Result |
+|---|---|
+| Token carries `organization_projects: write` | pass |
+| App sees the private board exists | pass |
+| App reads the board's **items** | pass |
+| App resolves item content inside a private repository | pass |
+| App creates a board (what reconciliation does) | pass |
+| App reads the Status field's options (column configuration) | pass |
+
+`gh project list --owner <org>` through `GitHubAPIClient.gh_cli()` returns the org's boards on this configuration. The same command returns an empty, successful result — no error — when the Projects permission is absent, which is the failure the reconciliation guard in `services/github_project_manager.py` exists to catch.
+
+Note that `Workflows` is not in the list. It is not required by anything the orchestrator does, and omitting it keeps the permission request smaller.
 
 ### 3. Generate a private key
 
@@ -227,6 +270,8 @@ The app ID is shown at the top of the app settings page as a numeric value, e.g.
 ### 5. Install the app
 
 Navigate to the app's settings page and click "Install App". Select the organization or account and choose which repositories the app can access. After installation, the URL will contain the installation ID: `https://github.com/settings/installations/<installation_id>`.
+
+The installation ID can also be recovered from the app's own credentials without visiting the UI — `GET /app/installations`, authenticated with the app JWT, lists every installation with its ID, account and accepted permissions.
 
 ### 6. Configure environment variables
 
