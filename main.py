@@ -176,9 +176,12 @@ async def main():
         try:
             log_dir = Path("orchestrator_data/logs")
             log_dir.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(log_dir / 'orchestrator_all.log')
-            file_handler.setLevel(logging.INFO)
-            file_handler.setFormatter(json_formatter)
+            from monitoring.log_rotation import rotating_file_handler
+            file_handler = rotating_file_handler(
+                log_dir / 'orchestrator_all.log',
+                level=logging.INFO,
+                formatter=json_formatter,
+            )
             root_logger.addHandler(file_handler)
         except Exception as e:
             # Log to console if file logging setup fails

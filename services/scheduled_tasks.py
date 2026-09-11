@@ -178,6 +178,18 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Age out the write-only data directories - daily at 4:30 AM.
+        # Daily rather than weekly because the point is to keep these bounded
+        # at all times, not to reclaim a lot at once; a daily sweep of a
+        # already-bounded directory is a no-op that costs one readdir.
+        self.scheduler.add_job(
+            self._apply_data_retention,
+            trigger=CronTrigger(hour=4, minute=30),
+            id='data_retention',
+            name='Age out container-failure logs, repair-cycle scratch, metrics backups',
+            replace_existing=True
+        )
+
         self.scheduler.start()
         self.running = True
         logger.info("Scheduled tasks service started")
@@ -196,6 +208,7 @@ class ScheduledTasksService:
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
         logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
         logger.info("- Test-cycle stats rollup: Weekly on Sunday at 4 AM")
+        logger.info("- Data retention sweep: Daily at 4:30 AM")
 
     def stop(self):
         """Stop the scheduler"""
@@ -1193,6 +1206,19 @@ class ScheduledTasksService:
             logger.info("Docker disk cleanup complete")
         except Exception as e:
             logger.error(f"Error in Docker disk cleanup: {e}", exc_info=True)
+
+    def _apply_data_retention(self):
+        """Age out the write-only data directories.
+
+        Wrapped rather than scheduled directly so a failure in here can never
+        take the scheduler down -- this is housekeeping, and nothing else
+        depends on it having run.
+        """
+        try:
+            from services.data_retention import run_scheduled_sweep
+            run_scheduled_sweep()
+        except Exception as e:
+            logger.error(f"Error in data retention sweep: {e}", exc_info=True)
 
     def _run_test_cycle_stats(self):
         """Run weekly test-cycle duration stats rollup."""

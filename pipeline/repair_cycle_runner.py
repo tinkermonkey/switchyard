@@ -100,7 +100,11 @@ class RepairCycleRunner:
         # main()): fall back to stdout-only logging instead of crashing.
         log_file = self.project_dir / ".repair_cycle.log"
         try:
-            file_handler = logging.FileHandler(log_file, mode='a')
+            # Rotating, like every other file handler in this codebase: this one
+            # writes into a PROJECT CHECKOUT that the orchestrator never cleans,
+            # once per repair cycle, appending forever.
+            from monitoring.log_rotation import rotating_file_handler
+            file_handler = rotating_file_handler(log_file)
             file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
             logging.getLogger().addHandler(file_handler)
             logger.info(f"Logging to {log_file}")
