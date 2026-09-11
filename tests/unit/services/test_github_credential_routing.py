@@ -62,8 +62,7 @@ class TestCredentialPreference:
     def test_app_preference_resolves_to_app_when_app_is_configured(self, client):
         os.environ[CREDENTIAL_PREFERENCE_ENV] = 'app'
         app = MagicMock(enabled=True)
-        with patch.dict('sys.modules'), \
-             patch('services.github_app.github_app', app):
+        with patch('services.github_app.github_app', app):
             assert client._resolve_credential() == CREDENTIAL_APP
 
     def test_app_preference_falls_back_when_app_is_not_configured(self, client):
@@ -136,21 +135,33 @@ class TestBucketGrid:
             assert pat_key != app_key
 
     def test_get_status_exposes_the_new_bucket_and_credential(self, client):
+        os.environ.pop(CREDENTIAL_PREFERENCE_ENV, None)
         status = client.get_status()
         assert 'rate_limit_app_rest' in status
-        assert status['credential'] in (CREDENTIAL_PAT, CREDENTIAL_APP)
-        assert status['credential_preference'] in (CREDENTIAL_PAT, CREDENTIAL_APP)
+        # Concrete values under a known preference -- `in (PAT, APP)` is true
+        # for every value the method can return and asserts nothing.
+        assert status['credential'] == CREDENTIAL_PAT
+        assert status['credential_preference'] == CREDENTIAL_PAT
 
 
 class TestAlarms:
     def test_never_populated_buckets_do_not_alarm(self, client):
         """Unused buckets sit at the 5000/5000 constructor defaults; alarming
         on them would report a healthy budget for a credential that is never
-        used, burying real alarms in noise."""
+        used, burying real alarms in noise.
+
+        Primes an EXHAUSTED-looking bucket while leaving ever_updated False, so
+        this actually exercises the guard. Asserting on a pristine bucket would
+        pass with the guard deleted -- 5000 remaining alarms at no level."""
+        client.rate_limit_app_rest.remaining = 5
+        client.rate_limit_app_rest.limit = 6000
+        assert client.rate_limit_app_rest.ever_updated is False
+
         client._last_alarm_check_at = None
         with patch('services.github_api_client.logger') as log:
             client.alarm_if_needed()
         assert not log.critical.called
+        assert not log.error.called
 
     def test_exhausted_app_bucket_alarms_with_its_own_label(self, client):
         client._update_rate_limit_from_http_headers(
@@ -248,13 +259,15 @@ class TestProjectsV2Guard:
         assert ok is False
 
     def test_pat_with_project_scope_is_allowed(self):
-        result = MagicMock(stdout="HTTP/2 200\nx-oauth-scopes: repo, project\n\n{}")
+        result = MagicMock(returncode=0, stderr='',
+                           stdout="HTTP/2 200\nx-oauth-scopes: repo, project\n\n{}")
         with patch('subprocess.run', return_value=result):
             ok, _ = self._probe(CREDENTIAL_PAT, False, True)
         assert ok is True
 
     def test_pat_without_project_scope_is_denied(self):
-        result = MagicMock(stdout="HTTP/2 200\nx-oauth-scopes: repo, read:org\n\n{}")
+        result = MagicMock(returncode=0, stderr='',
+                           stdout="HTTP/2 200\nx-oauth-scopes: repo, read:org\n\n{}")
         with patch('subprocess.run', return_value=result):
             ok, detail = self._probe(CREDENTIAL_PAT, False, True)
         assert ok is False
@@ -263,9 +276,203 @@ class TestProjectsV2Guard:
     def test_fine_grained_pat_reporting_no_scopes_is_not_blocked(self):
         """A fine-grained PAT sends no x-oauth-scopes header at all. It may
         well have Projects access; this probe simply cannot prove it, and must
-        not block reconciliation on a check that does not apply."""
-        result = MagicMock(stdout="HTTP/2 200\ncontent-type: application/json\n\n{}")
+        not block reconciliation on a check that does not apply.
+
+        Reachable ONLY on a successful call -- see the failure test below."""
+        result = MagicMock(returncode=0, stderr='',
+                           stdout="HTTP/2 200\ncontent-type: application/json\n\n{}")
         with patch('subprocess.run', return_value=result):
             ok, detail = self._probe(CREDENTIAL_PAT, False, True)
         assert ok is True
-        assert 'not verified' in detail
+        assert 'NOT VERIFIED' in detail
+
+    def test_a_failed_probe_fails_closed_rather_than_open(self):
+        """The regression that matters most here.
+
+        A failed `gh api user` -- revoked token, 403, SSO not authorised, no
+        network, gh missing -- produces empty stdout and therefore no
+        x-oauth-scopes header, which is textually identical to a fine-grained
+        PAT. Treating the two the same meant every one of those errors reported
+        'this credential can write Projects v2': a guard against a silently
+        destructive operation returning success precisely when it had learned
+        nothing."""
+        result = MagicMock(returncode=1, stdout='',
+                           stderr='HTTP 401: Bad credentials')
+        with patch('subprocess.run', return_value=result):
+            ok, detail = self._probe(CREDENTIAL_PAT, False, True)
+        assert ok is False
+        assert 'could not verify' in detail.lower()
+        assert 'Bad credentials' in detail
+
+    def test_probe_runs_as_the_routed_credential(self):
+        """The probe answers for the ACTIVE credential, so it must run as it --
+        answering for a different token than reconciliation will use is the
+        same class of mistake as discovering boards on one credential and
+        creating them with another."""
+        result = MagicMock(returncode=0, stderr='',
+                           stdout="HTTP/2 200\nx-oauth-scopes: repo, project\n\n{}")
+        with patch('subprocess.run', return_value=result) as run, \
+             patch('services.github_api_client.routed_gh_env',
+                   return_value={'GH_TOKEN': 'routed'}) as routed:
+            self._probe(CREDENTIAL_PAT, False, True)
+        assert routed.called
+        assert run.call_args.kwargs['env'] == {'GH_TOKEN': 'routed'}
+
+
+# ------------------------------------------- regression: the execution paths
+#
+# The original tests here covered the HELPERS and not the PATHS, which is
+# exactly how the graphql-response bucket bug below reached review: every
+# bucket-selection site was tested except the one that was wrong.
+
+class TestGraphqlResponseBodyBucket:
+    """`_update_rate_limit_from_graphql_response` must select by credential.
+
+    It accepted a `credential` argument and ignored it, hardcoding the PAT
+    bucket and the PAT Redis key. Reachable from graphql()'s `if not headers:`
+    fallback, so an App call whose --include headers didn't parse published App
+    spend under the key other processes read as the PAT budget -- #168's bug,
+    on the one bucket path with no test.
+    """
+
+    BODY = {'extensions': {'cost': {'rateLimit': {
+        'remaining': 222, 'limit': 6000, 'resetAt': '2026-01-01T00:00:00Z'}}}}
+
+    def test_app_response_body_updates_the_app_bucket(self, client):
+        with patch.object(client, '_mirror_rate_limit_to_redis') as mirror:
+            client._update_rate_limit_from_graphql_response(self.BODY, CREDENTIAL_APP)
+
+        assert client.rate_limit_app_graphql.remaining == 222
+        assert client.rate_limit_app_graphql.resource_type == 'graphql_app'
+        assert client.rate_limit_graphql.ever_updated is False, \
+            "App reading contaminated the PAT bucket"
+        assert mirror.call_args[0][1] == RATE_LIMIT_REDIS_KEYS_APP['graphql'], \
+            "App reading published under the PAT's cross-process Redis key"
+
+    def test_pat_response_body_still_updates_the_pat_bucket(self, client):
+        with patch.object(client, '_mirror_rate_limit_to_redis') as mirror:
+            client._update_rate_limit_from_graphql_response(self.BODY)
+
+        assert client.rate_limit_graphql.remaining == 222
+        assert client.rate_limit_app_graphql.ever_updated is False
+        assert mirror.call_args[0][1] == RATE_LIMIT_REDIS_KEYS['graphql']
+
+
+class TestCredentialReachesTheSubprocess:
+    """`env=call_env` is threaded independently into three call sites. Testing
+    `_auth_env` in isolation leaves all three free to drop it silently."""
+
+    def _app_client(self, client):
+        os.environ[CREDENTIAL_PREFERENCE_ENV] = 'app'
+        app = MagicMock(enabled=True)
+        app.get_installation_token.return_value = 'ghs_installation'
+        return app
+
+    def test_graphql_passes_the_routed_env_to_subprocess(self, client):
+        app = self._app_client(client)
+        done = MagicMock(returncode=0, stdout='{"data":{}}', stderr='')
+        with patch('services.github_app.github_app', app),              patch('subprocess.run', return_value=done) as run:
+            client.graphql('query{viewer{login}}')
+        assert run.call_args.kwargs['env']['GH_TOKEN'] == 'ghs_installation'
+
+    def test_rest_passes_the_routed_env_to_subprocess(self, client):
+        app = self._app_client(client)
+        done = MagicMock(returncode=0, stdout='{}', stderr='')
+        with patch('services.github_app.github_app', app),              patch('subprocess.run', return_value=done) as run:
+            client.rest('GET', '/user')
+        assert run.call_args.kwargs['env']['GH_TOKEN'] == 'ghs_installation'
+
+    def test_gh_cli_passes_the_routed_env_to_subprocess(self, client):
+        """The board path -- every Projects v2 operation goes through here."""
+        app = self._app_client(client)
+        done = MagicMock(returncode=0, stdout='{}', stderr='')
+        with patch('services.github_app.github_app', app),              patch('subprocess.run', return_value=done) as run:
+            client.gh_cli(['gh', 'project', 'list', '--owner', 'acme'])
+        assert run.call_args.kwargs['env']['GH_TOKEN'] == 'ghs_installation'
+        assert 'GITHUB_TOKEN' not in run.call_args.kwargs['env']
+
+
+class TestHttpAuthorizationScheme:
+    """An installation token is a Bearer credential. The PR comment says
+    getting this wrong is 'a 401 on every App-routed HTTP call', and nothing
+    asserted it."""
+
+    def _response(self):
+        r = MagicMock(status_code=200, headers={})
+        r.json.return_value = {}
+        return r
+
+    def test_app_token_uses_bearer(self, client):
+        os.environ[CREDENTIAL_PREFERENCE_ENV] = 'app'
+        app = MagicMock(enabled=True)
+        app.get_installation_token.return_value = 'ghs_x'
+        with patch('services.github_app.github_app', app),              patch('requests.get', return_value=self._response()) as get:
+            client.http_request('GET', 'https://api.github.com/user')
+        assert get.call_args.kwargs['headers']['Authorization'] == 'Bearer ghs_x'
+
+    def test_pat_uses_the_token_scheme(self, client):
+        os.environ.pop(CREDENTIAL_PREFERENCE_ENV, None)
+        with patch.dict(os.environ, {'GH_TOKEN': 'ghp_y'}),              patch('requests.get', return_value=self._response()) as get:
+            client.http_request('GET', 'https://api.github.com/user')
+        assert get.call_args.kwargs['headers']['Authorization'] == 'token ghp_y'
+
+    def test_app_fallback_to_pat_is_attributed_to_the_pat_bucket(self, client):
+        """The fallback clause of the accounting invariant, end to end."""
+        os.environ[CREDENTIAL_PREFERENCE_ENV] = 'app'
+        app = MagicMock(enabled=True)
+        app.get_installation_token.return_value = None  # mint fails
+
+        r = MagicMock(status_code=200, headers={
+            'x-ratelimit-limit': '5000', 'x-ratelimit-remaining': '4321',
+            'x-ratelimit-reset': '1789070000'})
+        r.json.return_value = {}
+
+        with patch('services.github_app.github_app', app),              patch.dict(os.environ, {'GH_TOKEN': 'ghp_real'}),              patch.object(client, '_mirror_rate_limit_to_redis'),              patch('requests.get', return_value=r):
+            client.http_request('GET', 'https://api.github.com/user')
+
+        assert client.rate_limit_rest.remaining == 4321
+        assert client.rate_limit_app_rest.ever_updated is False, \
+            "PAT spend was attributed to the App bucket"
+
+
+class TestRoutedGhEnvHelper:
+    """Credential routing that covers only GitHubAPIClient's own four methods
+    is not credential routing: board DISCOVERY runs through raw `gh`
+    subprocesses elsewhere, and a board this credential cannot see is
+    indistinguishable from one that does not exist."""
+
+    def test_returns_the_routed_token(self):
+        from services.github_api_client import routed_gh_env
+
+        os.environ[CREDENTIAL_PREFERENCE_ENV] = 'app'
+        app = MagicMock(enabled=True)
+        app.get_installation_token.return_value = 'ghs_routed'
+        with patch('services.github_app.github_app', app):
+            env = routed_gh_env()
+        assert env['GH_TOKEN'] == 'ghs_routed'
+
+    def test_never_raises(self):
+        """Falls back to the ambient environment, i.e. pre-routing behaviour."""
+        from services.github_api_client import routed_gh_env
+
+        with patch('services.github_api_client.get_github_client',
+                   side_effect=RuntimeError('boom')):
+            env = routed_gh_env()
+        assert isinstance(env, dict)
+
+    def test_board_discovery_uses_it(self):
+        """get_projects_list_for_owner is the read whose empty result triggers
+        board creation."""
+        import inspect
+        import services.github_owner_utils as owner_utils
+
+        src = inspect.getsource(owner_utils)
+        assert src.count('env=routed_gh_env()') >= 2, (
+            "board discovery queries must run as the routed credential")
+
+    def test_board_verification_uses_it(self):
+        import inspect
+        import services.github_project_manager as gpm
+
+        src = inspect.getsource(gpm)
+        assert 'env=routed_gh_env()' in src

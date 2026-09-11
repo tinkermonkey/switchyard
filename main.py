@@ -19,7 +19,10 @@ from monitoring.metrics import MetricsCollector
 from task_queue.task_manager import TaskQueue
 from claude.session_manager import ClaudeSessionManager
 from monitoring.health_monitor import HealthMonitor
-from services.github_project_manager import GitHubProjectManager
+from services.github_project_manager import (
+    GitHubProjectManager,
+    ProjectsPermissionUnavailable,
+)
 from services.project_monitor import ProjectMonitor, register_project_monitor
 from services.project_workspace import workspace_manager
 from services.scheduled_tasks import get_scheduled_tasks_service
@@ -662,6 +665,16 @@ async def main():
     # Reconcile all visible (non-hidden) projects on startup
     # Hidden projects (like test-project) are excluded from normal operations
     projects = config_manager.list_visible_projects()
+
+    # Counted across the whole loop, unlike failure_count below, which is reset
+    # on every iteration. That reset is issue #192's ("the 'all projects failed
+    # to reconcile' guard can never fire") and is deliberately left alone here
+    # -- it belongs to that issue, not this one. The practical consequence for
+    # THIS counter is why it lives out here: a Projects-permission refusal is
+    # credential-global, so it applies to every project at once and only a
+    # loop-scoped total says anything meaningful about it.
+    projects_permission_skips = 0
+
     for project_name in projects:
         failure_count = 0
         # Always verify boards exist in GitHub, even if config hasn't changed
@@ -686,7 +699,22 @@ async def main():
             continue
 
         # Always run reconciliation - it will discover existing boards if they exist
-        success = await github_project_manager.reconcile_project(project_name)
+        try:
+            success = await github_project_manager.reconcile_project(project_name)
+        except ProjectsPermissionUnavailable as e:
+            # NOT a failure: the credential cannot write Projects v2, which is
+            # credential-global and therefore true for every project at once.
+            # Counting it would make failure_count == len(projects) hold by
+            # construction and exit(1) below, turning a missing permission into
+            # a boot crash-loop -- when the correct behaviour is to leave boards
+            # alone and keep issues, PRs, discussions and agent dispatch running.
+            logger.log_error(
+                f"SKIPPING board reconciliation for '{project_name}': {e} "
+                f"The orchestrator will continue running; grant the permission "
+                f"and restart to resume board management."
+            )
+            projects_permission_skips += 1
+            continue
         if not success:
             logger.log_error(f"Failed to reconcile project '{project_name}' - GitHub project management is not working")
             failure_count += 1
@@ -716,6 +744,14 @@ async def main():
             )
     except Exception as e:
         logger.log_warning(f"Could not check for orphaned project state: {e}")
+
+    if projects_permission_skips:
+        logger.log_error(
+            f"Board reconciliation was skipped for {projects_permission_skips} of "
+            f"{len(projects)} project(s): the active GitHub credential cannot write "
+            f"Projects v2. Boards will not be created or updated until that "
+            f"permission is granted, but every other pipeline stage continues to run."
+        )
 
     # If all of the projects failed to reconcile, exit
     if failure_count == len(projects) and failure_count > 0:

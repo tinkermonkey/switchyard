@@ -15,6 +15,7 @@ import asyncio
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from functools import lru_cache, wraps
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+from services.github_api_client import routed_gh_env
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +213,7 @@ def get_owner_type(owner_login: str) -> Optional[OwnerType]:
         github_client = get_github_client()
         result = subprocess.run(
             ['gh', 'api', f'/users/{owner_login}', '--jq', '.type'],
+            env=routed_gh_env(),
             capture_output=True,
             text=True,
             timeout=15,
@@ -1183,7 +1185,12 @@ def get_projects_list_for_owner(owner_login: str) -> Optional[list]:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                check=True
+                check=True,
+                # Routed credential (WI-2): this is the board DISCOVERY read
+                # whose empty result triggers board creation. Running it on the
+                # ambient credential while creation runs on the routed one is
+                # how a permission-shaped empty list becomes a duplicate board.
+                env=routed_gh_env(),
             )
 
             data = json.loads(result.stdout)
@@ -1213,7 +1220,12 @@ def get_projects_list_for_owner(owner_login: str) -> Optional[list]:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                check=True
+                check=True,
+                # Routed credential (WI-2): this is the board DISCOVERY read
+                # whose empty result triggers board creation. Running it on the
+                # ambient credential while creation runs on the routed one is
+                # how a permission-shaped empty list becomes a duplicate board.
+                env=routed_gh_env(),
             )
 
             data = json.loads(result.stdout)

@@ -410,10 +410,12 @@ class GitHubAPIClient:
         # every `gh`-CLI call in this client spends. Conflating them is the
         # exact confusion #168 records - `gh api rate_limit` from a shell reads
         # 5000/5000 off the PAT while the App is fully exhausted - so the App's
-        # readings get their own bucket and their own /health field. Not
-        # mirrored to Redis: the App client only runs in-process with the
-        # orchestrator (github_discussions, human_feedback_loop, review_cycle,
-        # pr_review_stage), so there is no other process to publish it for.
+        # readings get their own bucket and their own /health field. Mirrored
+        # to Redis under RATE_LIMIT_REDIS_KEYS_APP, deliberately separate from
+        # the two PAT keys other processes read as "the PAT budget" -- before
+        # this client could itself spend the App credential, the App bucket was
+        # fed only by github_app.py's own in-process traffic and had no other
+        # process to publish for.
         self.rate_limit_app_graphql = GitHubRateLimitStatus()
         self.rate_limit_app_graphql.resource_type = "graphql_app"
 
@@ -428,8 +430,11 @@ class GitHubAPIClient:
         # Index over the same four objects above - ALIASES, not copies, and
         # deliberately not properties: every existing reader
         # (monitoring/health_monitor.py, get_status(), the #168 accounting
-        # tests) keeps reading the plain attributes, and assignment to them
-        # keeps working. Bucket identity is (credential, resource); the
+        # tests) keeps reading the plain attributes. Note these are read-only
+        # by convention, not by construction: _buckets is built once here, so
+        # REASSIGNING one of these names (as opposed to mutating the object it
+        # points at) would desynchronise the index from the attribute. Nothing
+        # does, and nothing should. Bucket identity is (credential, resource); the
         # credential half is the thing #168's fix established and WI-3
         # generalises, so nothing may select a bucket by transport alone.
         self._buckets = {
@@ -860,7 +865,12 @@ class GitHubAPIClient:
             logger.debug(f"Executing HTTP {method} {url} (usage: {usage_percent:.1f}%)")
             
             # Prepare headers with authentication
-            request_headers = headers or {}
+            # Copy, never alias. The retry path below passes `headers` back in,
+            # so mutating a caller-supplied dict with our Authorization made the
+            # retry take the "caller supplied it" branch -- skipping the fresh
+            # mint WI-6 exists for, and keeping a credential label for a token
+            # this client never chose.
+            request_headers = dict(headers) if headers else {}
             if 'Accept' not in request_headers:
                 request_headers['Accept'] = 'application/vnd.github.v3+json'
             
@@ -872,14 +882,24 @@ class GitHubAPIClient:
                 # App-preference call fell back to the PAT.
                 token, credential = self._resolve_token(credential)
                 if token:
-                    # Installation tokens ("ghs_...") are Bearer credentials;
-                    # the legacy "token" scheme works for PATs only. Getting
-                    # this wrong is a 401 on every App-routed HTTP call.
+                    # Bearer is the documented scheme for installation
+                    # tokens. GitHub does also accept the legacy "token"
+                    # scheme for them, so this is convention rather than a
+                    # hard requirement -- but matching the documented form
+                    # keeps this consistent with github_app.py's own requests.
                     scheme = 'Bearer' if credential == CREDENTIAL_APP else 'token'
                     request_headers['Authorization'] = f'{scheme} {token}'
                 else:
                     credential = CREDENTIAL_PAT
                     logger.warning("No GitHub token found in environment variables")
+            else:
+                # The caller authenticated this request itself, so we do not
+                # know which credential's budget it spends and must not guess.
+                # Attributing it to the resolved PREFERENCE (which is what
+                # happened before) files another credential's spend into the
+                # App bucket -- the misattribution this client's whole bucket
+                # grid exists to prevent. None means "do not account".
+                credential = None
             
             # Execute request based on method
             if method.upper() == 'GET':
@@ -898,8 +918,11 @@ class GitHubAPIClient:
             self.total_requests += 1
             self._record_request('http', True)
             
-            # Extract rate limit from response headers
-            self._update_rate_limit_from_http_headers(response.headers, credential)
+            # Extract rate limit from response headers. Skipped entirely for a
+            # caller-authenticated request (credential is None) -- no reading is
+            # better than a reading filed against the wrong budget.
+            if credential is not None:
+                self._update_rate_limit_from_http_headers(response.headers, credential)
             
             # Check for rate limit error
             if response.status_code == 403:
@@ -992,22 +1015,35 @@ class GitHubAPIClient:
             
             # Update rate limit if we found it
             if rl:
-                self.rate_limit_graphql.remaining = rl.get('remaining', self.rate_limit_graphql.remaining)
-                self.rate_limit_graphql.limit = rl.get('limit', self.rate_limit_graphql.limit)
+                # Bucket selected from the credential this call was made on,
+                # exactly as the two header-based updaters do. This method took
+                # `credential` and ignored it in the first cut of #198's sibling
+                # work (WI-3), writing App readings into the PAT bucket AND
+                # publishing them to the PAT's cross-process Redis key -- #168's
+                # bug verbatim, on the one bucket-selection path that had no
+                # test. Selecting by transport alone is never correct here.
+                bucket = self._bucket(credential, 'graphql')
+                is_app = credential == CREDENTIAL_APP
+
+                bucket.remaining = rl.get('remaining', bucket.remaining)
+                bucket.limit = rl.get('limit', bucket.limit)
                 reset_at = rl.get('resetAt')
                 if reset_at:
                     # Parse ISO format datetime
-                    self.rate_limit_graphql.reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
-                self.rate_limit_graphql.resource_type = "graphql"
-                self.rate_limit_graphql.last_updated = datetime.now()
-                self.rate_limit_graphql.ever_updated = True
+                    bucket.reset_time = datetime.fromisoformat(reset_at.replace('Z', '+00:00'))
+                bucket.resource_type = "graphql_app" if is_app else "graphql"
+                bucket.last_updated = datetime.now()
+                bucket.ever_updated = True
 
                 logger.debug(
-                    f"Rate limit update (GraphQL): {self.rate_limit_graphql.remaining}/{self.rate_limit_graphql.limit} "
-                    f"({self.rate_limit_graphql.get_percentage_used():.1f}% used)"
+                    f"Rate limit update (GraphQL{'/app' if is_app else ''}): "
+                    f"{bucket.remaining}/{bucket.limit} "
+                    f"({bucket.get_percentage_used():.1f}% used)"
                 )
 
-                self._mirror_rate_limit_to_redis(self.rate_limit_graphql, RATE_LIMIT_REDIS_KEYS['graphql'])
+                self._mirror_rate_limit_to_redis(
+                    bucket, self._redis_key_for(credential, 'graphql')
+                )
                 self.alarm_if_needed()
         except Exception as e:
             logger.debug(f"Could not extract rate limit from response: {e}")
@@ -1274,7 +1310,7 @@ class GitHubAPIClient:
     #       spending the App budget is exactly the cross-credential confusion
     #       #168 documents.
     #
-    #   _auth_env() / _auth_token() - what is that credential's value right
+    #   _auth_env() / _resolve_token() - what is that credential's value right
     #       now? Mints/refreshes, so it must run LATE, immediately before the
     #       subprocess/HTTP call and AFTER the throttle sleeps (WI-6). An
     #       installation token lives one hour; the >95% branch sleeps 30s and
@@ -1290,10 +1326,15 @@ class GitHubAPIClient:
             CREDENTIAL_PREFERENCE_ENV, DEFAULT_CREDENTIAL_PREFERENCE
         ).strip().lower()
         if pref not in (CREDENTIAL_APP, CREDENTIAL_PAT):
-            logger.warning(
-                f"Unrecognised {CREDENTIAL_PREFERENCE_ENV}={pref!r}; "
-                f"falling back to {DEFAULT_CREDENTIAL_PREFERENCE!r}"
-            )
+            # Debounced on the value: this runs per API call and per
+            # get_status(), so an unrecognised setting would otherwise log on
+            # every single GitHub operation for the life of the process.
+            if pref != getattr(self, '_warned_bad_preference', None):
+                logger.warning(
+                    f"Unrecognised {CREDENTIAL_PREFERENCE_ENV}={pref!r}; "
+                    f"falling back to {DEFAULT_CREDENTIAL_PREFERENCE!r}"
+                )
+                self._warned_bad_preference = pref
             return DEFAULT_CREDENTIAL_PREFERENCE
         return pref
 
@@ -1459,11 +1500,25 @@ class GitHubAPIClient:
         # This is the path every Projects v2 board operation takes (see
         # services/github_project_manager.py), so it is the single most
         # important call site for credential routing (WI-2).
+        #
+        # KNOWN GAP, worth knowing before trusting the App buckets: this method
+        # builds no `--include` and parses no headers, so it contributes NO
+        # rate-limit readings to any bucket -- it never has. On an App-routed
+        # deployment the highest-volume consumer of the App's budget is
+        # therefore invisible to the accounting, the App buckets can stay at
+        # their constructor defaults with ever_updated False, and
+        # alarm_if_needed() skips exactly those. Fixing it means adding
+        # --include here and routing the parse through
+        # _update_rate_limit_from_*; out of scope for WI-2, which is about
+        # which credential is spent, not about measuring it.
         credential = self._resolve_credential()
 
         try:
             logger.debug(f"Executing GitHub CLI: {' '.join(cmd)}")
-            call_env, credential = self._auth_env(credential)  # WI-6: mint late
+            # `_` not `credential`: nothing downstream in this method reads it
+            # (see the KNOWN GAP above). Keeping the name bound would imply an
+            # accounting consequence that does not happen here.
+            call_env, _ = self._auth_env(credential)  # WI-6: mint late
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=30, check=True,
                 env=call_env,
@@ -1822,6 +1877,42 @@ class GitHubAPIClient:
 
 # Global client instance
 _github_client: Optional[GitHubAPIClient] = None
+
+
+def routed_gh_env() -> Dict[str, str]:
+    """Environment for a raw `gh` subprocess, authenticated as the credential
+    this deployment routes through (WI-2).
+
+    For the `gh` call sites that legitimately do NOT go through
+    GitHubAPIClient's own graphql()/rest()/gh_cli() -- board discovery in
+    services/github_owner_utils.py, board verification and diagnostics in
+    services/github_project_manager.py, the scope probe in
+    services/github_capabilities.py. Those keep their own error handling,
+    circuit breaker and caching; only the credential is supplied here.
+
+    Why this exists at all: credential routing that covers only the four
+    methods on this class is not credential routing. Board CREATION went
+    through gh_cli() and so ran on the routed credential, while the discovery
+    read whose empty result triggers that creation ran on the ambient one. A
+    Projects query made without the Projects permission returns an empty,
+    SUCCESSFUL result, so a deployment could validate one credential, discover
+    with a second that cannot see the boards, and create duplicates with the
+    first. Any `gh` call whose result feeds a decision about boards has to run
+    as the same credential the decision is attributed to.
+
+    Never raises: falls back to a copy of the ambient environment, which is
+    exactly the pre-routing behaviour.
+    """
+    try:
+        client = get_github_client()
+        env, _ = client._auth_env(client._resolve_credential())
+        return env
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            f"Could not build routed gh environment ({e}); using the ambient "
+            f"environment for this call"
+        )
+        return os.environ.copy()
 
 
 def get_github_client() -> GitHubAPIClient:

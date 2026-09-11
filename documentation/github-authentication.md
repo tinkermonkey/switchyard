@@ -1,8 +1,8 @@
 # GitHub authentication
 
-Switchyard supports two GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Either can be used alone, or both together. `GITHUB_CREDENTIAL_PREFERENCE` selects which one `GitHubAPIClient` routes its own calls through (`pat` by default), with fallback to the other when the preferred one is unavailable.
+Switchyard supports two GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Either can be used alone, or both together. `GITHUB_CREDENTIAL_PREFERENCE` selects which one `GitHubAPIClient` routes its own calls through (`pat` by default). The fallback is one-directional: an `app` preference falls back to the PAT when the App is unavailable, but a `pat` preference never falls back to the App.
 
-Running **App-only** is supported, and is the right configuration for an organization that restricts personal access tokens. It requires an organization-owned app — see "Account type determines Projects v2 access".
+Running **App-only** is supported, and is the right configuration for an organization that restricts personal access tokens. If it manages Projects v2 boards it requires an organization-owned app — see "Account type determines Projects v2 access". A deployment that does not manage boards can use a personal-account app.
 
 ## Why multiple authentication methods
 
@@ -129,7 +129,7 @@ This means a PAT in `GITHUB_TOKEN` functions as a fallback for any call made thr
 
 ### In `github_api_client.py`
 
-`GitHubAPIClient` does not use `GitHubApp` directly. Its three execution paths — `graphql`, `rest`, and `gh_cli` — invoke the GitHub CLI (`gh api graphql`, `gh api`, arbitrary `gh` commands). The CLI inherits authentication from the environment: it reads `GH_TOKEN` then `GITHUB_TOKEN`, and if `gh auth login` has been run, it uses the stored credential. The `http_request` method makes direct HTTP calls and applies the same env-var lookup (`GH_TOKEN` or `GITHUB_TOKEN`) when building the `Authorization` header.
+`GitHubAPIClient` has four execution paths: `graphql`, `rest` and `gh_cli` invoke the GitHub CLI, and `http_request` makes direct HTTP calls. All four are credential-routed — the CLI no longer inherits ambient authentication, because each call is given an explicitly constructed environment.
 
 `GitHubAPIClient` resolves its credential per call rather than reading a static environment variable. The `GITHUB_CREDENTIAL_PREFERENCE` environment variable selects which:
 
@@ -144,6 +144,16 @@ Setting `GITHUB_TOKEN` to an installation token manually does not work: installa
 
 `GitHubAPIClient` (`services/github_api_client.py`) is the centralized gateway for all API interactions that need rate limit awareness. It wraps the GitHub CLI and direct HTTP calls with two cross-cutting behaviors.
 
+### Board reconciliation is refused, not attempted, without Projects write access
+
+A Projects v2 query made with a credential lacking the permission returns an empty, successful result rather than an error. Board reconciliation would read that as "no board exists" and create a duplicate of every configured board, on every startup.
+
+`services/github_capabilities.py` therefore checks the credential's **grant** — installation permissions for an app, `x-oauth-scopes` for a PAT — rather than trying to list boards, because listing cannot distinguish "none" from "not permitted". If the check fails, or cannot be performed at all, `reconcile_project()` raises `ProjectsPermissionUnavailable` and the startup loop skips board management for that project while leaving every other pipeline stage running. It is a skip, not a fatal error: the orchestrator keeps going and logs why.
+
+One case passes without being verified: a fine-grained PAT reports no scopes header, so the check cannot prove anything either way and allows reconciliation with a `NOT VERIFIED` warning. A *failed* check — a revoked token, a 403, no network — fails closed instead.
+
+Every `gh` call whose result feeds a decision about boards runs as the routed credential, including the discovery reads in `services/github_owner_utils.py` that are not made through `GitHubAPIClient`. Discovering boards with one credential and creating them with another reintroduces the duplicate-board failure this guard exists to prevent.
+
 ### Credential-scoped rate limit buckets
 
 A rate-limit reading belongs to the *(credential, resource)* pair whose budget was actually spent, never to the transport that produced it. `GitHubAPIClient` therefore keeps four buckets — PAT/GraphQL, PAT/REST, App/GraphQL, App/REST — and selects among them using the credential a call ended up on, including when an App-preference call fell back to the PAT.
@@ -157,18 +167,19 @@ App readings mirror to their own Redis keys (`github:rate_limit:{rest,graphql}:a
 - HTTP response headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset`, `x-ratelimit-resource`) after each `http_request` call
 - The `extensions.cost.rateLimit` or `data.rateLimit` fields in GraphQL responses
 
-On startup, a background daemon thread waits 5 seconds and then queries the GraphQL `rateLimit` field to populate accurate values rather than starting with defaults. A second background thread repeats this query every 300 seconds.
+Buckets are populated only from `x-ratelimit-*` headers on real API responses. There is no periodic poll — one existed and was removed (issue #103 follow-up) because `/rate_limit` returned bogus always-full data. A consequence worth knowing when debugging: a credential this deployment never uses keeps its bucket at the 5000/5000 constructor defaults with `ever_updated == False`, and alarms deliberately skip such buckets. `gh_cli` also contributes no readings at all (it parses no headers), so on an App-routed deployment the board traffic is invisible to this accounting.
 
 When usage exceeds thresholds, the client inserts blocking sleeps before executing requests:
 
 | Usage threshold | Action |
 |---|---|
 | Above 80% | Log warning, no delay |
+| Above 95% (GraphQL/REST buckets) | Log warning |
 | Above 90% | Sleep 10 seconds before request |
 | Above 95% | Sleep 30 seconds before request |
 | Limit hit | Trip circuit breaker |
 
-An alarm is logged at critical level when fewer than 100 points remain, error level below 250, warning above 90%, and info above 80%.
+An alarm is logged at critical level when fewer than 100 points remain, error level below 250, and warning above 95% and above 90% and above 80%. Buckets that have never been populated by a real response are skipped, so an unused credential does not report a spuriously healthy budget.
 
 ### Circuit breaker
 

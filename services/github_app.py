@@ -38,8 +38,11 @@ RATE_LIMIT_HOLD_MAX_SECONDS = 3600
 # every discussions / human_feedback_loop / review_cycle / pr_review_stage
 # query through it, and without a hold each one logs its own ERROR: the same
 # 484-lines-in-three-hours burst #168 reports, just on the other credential.
-CREDENTIAL_APP = 'app'
-CREDENTIAL_PAT = 'pat'
+# Imported rather than redefined (#191 review): this module and
+# github_api_client both name the credential a call was made on, and duplicate
+# literals had already drifted -- the two label maps disagreed on what to call
+# the PAT. services/github_app_credentials.py is the single definition.
+from services.github_app_credentials import CREDENTIAL_APP, CREDENTIAL_PAT
 _CREDENTIAL_LABELS = {
     CREDENTIAL_APP: 'GitHub App',
     CREDENTIAL_PAT: 'PAT fallback',
@@ -131,7 +134,12 @@ class GitHubApp:
             }
 
             url = f'https://api.github.com/app/installations/{self.installation_id}/access_tokens'
-            response = requests.post(url, headers=headers)
+            # Timeout is not optional now that credential routing puts this on
+            # the path of every App-routed API call (#191 review): a hang here
+            # blocks the calling operation indefinitely, past the 30s subprocess
+            # timeouts the routing design leans on, and a hang produces no log
+            # line and runs no error path.
+            response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
 
             data = response.json()
@@ -152,10 +160,14 @@ class GitHubApp:
     def get_installation_permissions(self) -> Optional[dict]:
         """Permissions this installation granted, e.g. {'issues': 'write', ...}.
 
-        Returns None when the App isn't configured or a token has never been
-        minted - callers must treat that as "unknown", not as "denied", since
-        an unconfigured App simply means this deployment authenticates some
-        other way.
+        Returns None when the App isn't configured, or when minting a token to
+        read the permissions from FAILS. It does not return None merely because
+        no token has been minted yet -- that case mints on demand below.
+
+        The failure case matters: a transient token-exchange error (network
+        blip, GitHub 5xx, clock skew) is indistinguishable here from a
+        deliberately unconfigured App, and the caller treats None as a hard
+        denial. The underlying error is logged by get_installation_token().
         """
         if not self.enabled:
             return None

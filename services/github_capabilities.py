@@ -59,7 +59,6 @@ class GitHubCapabilities:
         # token in GH_TOKEN, so credential identity has to be asked for
         # directly rather than inferred from that probe.
         from services.github_api_client import get_github_client
-        from services.github_app_credentials import CREDENTIAL_APP
         try:
             active_credential = get_github_client()._resolve_credential()
         except Exception as e:
@@ -99,6 +98,16 @@ class GitHubCapabilities:
             )
         if not github_app_enabled:
             self._warnings.append("GitHub App not configured - discussions and advanced GraphQL features unavailable")
+        if projects_write and 'NOT VERIFIED' in (projects_detail or ''):
+            # The highest-residual-risk outcome: the guard passed without having
+            # verified anything. Previously silent -- an operator could not tell
+            # "verified" from "gave up and waved it through", which is exactly
+            # the ambiguity this whole guard exists to remove.
+            self._warnings.append(
+                f"Projects v2 write access could NOT be verified for the active "
+                f"credential ({projects_detail}). Board reconciliation will proceed "
+                f"unchecked; if boards are being duplicated, this is why."
+            )
         if not projects_write:
             self._warnings.append(
                 f"CRITICAL: the active GitHub credential cannot write Projects v2 "
@@ -149,10 +158,27 @@ class GitHubCapabilities:
                 perms = github_app.get_installation_permissions()
             except Exception as e:
                 return False, f"could not read GitHub App installation permissions: {e}"
-            if perms is None:
-                return False, "GitHub App installation permissions unavailable"
+            if not isinstance(perms, dict):
+                # Covers None (unconfigured, or the mint that would have
+                # populated it failed) and any non-dict surprise, which would
+                # otherwise escape as an AttributeError from .items() below and
+                # surface as an unexplained reconciliation failure rather than
+                # a credential diagnostic.
+                return False, (
+                    "GitHub App installation permissions unavailable -- the App "
+                    "is not configured, or minting a token to read them failed. "
+                    "If the App IS configured, check the preceding log lines for "
+                    "a token-exchange error; this can be transient."
+                )
             project_perms = {k: v for k, v in perms.items() if 'project' in k.lower()}
-            writable = [k for k, v in project_perms.items() if v != 'read']
+            # Allowlist, not blocklist. `v != 'read'` treated None, '', 'READ'
+            # and any value GitHub introduces later as WRITABLE -- the opposite
+            # of this module's own stance two lines down, where an unknown
+            # permission set is denied rather than assumed.
+            writable = [
+                k for k, v in project_perms.items()
+                if isinstance(v, str) and v.lower() in ('write', 'admin')
+            ]
             if writable:
                 return True, f"GitHub App grants {', '.join(sorted(writable))}"
             return False, (
@@ -167,24 +193,56 @@ class GitHubCapabilities:
 
         try:
             import subprocess
+            from services.github_api_client import routed_gh_env
+
             result = subprocess.run(
                 ['gh', 'api', '--include', '-X', 'GET', 'user'],
                 capture_output=True, text=True, timeout=15,
-            )
-            scopes_line = next(
-                (ln for ln in result.stdout.splitlines()
-                 if ln.lower().startswith('x-oauth-scopes:')),
-                None,
+                # Routed credential (WI-2): this probe's whole purpose is to
+                # report what the ACTIVE credential can do. Running it on the
+                # ambient environment would answer for a different token than
+                # the one board reconciliation will use -- which is the same
+                # class of mistake as discovering boards on one credential and
+                # creating them with another.
+                env=routed_gh_env(),
             )
         except Exception as e:
             return False, f"could not read PAT scopes: {e}"
 
+        # The returncode check is what separates the two reasons this probe can
+        # find no scopes header, which demand OPPOSITE answers:
+        #
+        #   * the call failed (401 on a revoked token, 403, SSO not authorised,
+        #     network error, gh missing) -> we could not ask the question, so
+        #     the guard must fail CLOSED. Without this check every one of those
+        #     produced empty stdout, no header, and a permissive "True" -- a
+        #     guard against a silently destructive operation reporting success
+        #     precisely when it had learned nothing.
+        #   * the call SUCCEEDED and simply carries no x-oauth-scopes header ->
+        #     a fine-grained PAT, which does not report scopes at all. It may
+        #     well have Projects access; this probe cannot prove it either way,
+        #     and blocking reconciliation on a check that does not apply to the
+        #     token type would be a regression for those deployments.
+        if result.returncode != 0:
+            stderr = (result.stderr or '').strip().splitlines()
+            detail = stderr[-1] if stderr else f"exit code {result.returncode}"
+            return False, (
+                f"could not verify PAT scopes -- `gh api user` failed ({detail}). "
+                f"Treating as unable to write Projects v2: the check could not be "
+                f"performed, which is not the same as passing it."
+            )
+
+        scopes_line = next(
+            (ln for ln in result.stdout.splitlines()
+             if ln.lower().startswith('x-oauth-scopes:')),
+            None,
+        )
+
         if scopes_line is None:
-            # A fine-grained PAT reports no x-oauth-scopes header at all. It
-            # may well have Projects access, but this probe cannot prove it -
-            # report unknown-but-allowed rather than blocking reconciliation on
-            # a check that does not apply to this token type.
-            return True, "PAT scopes not reported (fine-grained token?) - not verified"
+            # Reached only on a SUCCESSFUL call (see above) -- a fine-grained
+            # PAT. Allowed, but explicitly marked unverified so the caller can
+            # say so rather than implying the guard checked something.
+            return True, "PAT scopes not reported (fine-grained token) - NOT VERIFIED"
 
         scopes = {sc.strip() for sc in scopes_line.split(':', 1)[1].split(',')}
         if 'project' in scopes:
