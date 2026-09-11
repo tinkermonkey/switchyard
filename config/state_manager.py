@@ -38,6 +38,33 @@ logger = logging.getLogger(__name__)
 # value exists to remove.
 
 
+def orchestrator_state_root() -> Path:
+    """The `state/` tree this process owns.
+
+    ORCHESTRATOR_ROOT first, matching the eight other modules that derive a
+    state path (dev_container_state, work_execution_state, pipeline_queue_
+    manager, pipeline_lock_manager, pipeline_semaphore_manager,
+    conversational_session_state, scheduled_tasks, data_retention). This module
+    and state_management/pr_review_state_manager.py were the only two that did
+    not, and they derived from `Path(__file__).parent.parent` instead -- which
+    resolves to whatever checkout the code was imported from.
+
+    That is #181: the documented way to run the unit suite is `pytest
+    tests/unit` from the repository root, and on the deployment the repository
+    root IS the directory bind-mounted at /app. So the suite wrote its fixtures
+    into the live state tree, and the production watchdog then did real work on
+    them -- 17 files observed reappearing after a verified-clean deletion, all
+    timestamped to a test run rather than to the orchestrator.
+
+    Pointing ORCHESTRATOR_ROOT elsewhere now moves ALL of it, which is what
+    tests/conftest.py relies on.
+    """
+    root = os.environ.get('ORCHESTRATOR_ROOT')
+    if root:
+        return Path(root) / "state"
+    return Path(__file__).parent.parent / "state"
+
+
 @dataclass
 class GitHubColumn:
     """GitHub project column state"""
@@ -97,7 +124,7 @@ class GitHubStateManager:
             config_manager: Configuration manager instance
         """
         if state_root is None:
-            state_root = Path(__file__).parent.parent / "state"
+            state_root = orchestrator_state_root()
 
         self.state_root = Path(state_root)
         self.projects_state_dir = self.state_root / "projects"

@@ -49,7 +49,7 @@ from tests.conftest import (
     TEST_SERVICE_CONNECT_TIMEOUT,
     TEST_SERVICE_OP_TIMEOUT,
     _bound_service_client_timeouts,
-    _default_orchestrator_root_outside_the_container,
+    _redirect_orchestrator_root_to_scratch,
     _may_purge_service_data,
     _patch_init_defaults,
     _refuse_to_resolve_compose_service_hostnames,
@@ -241,30 +241,55 @@ class TestTheGuardItself:
 
 class TestOrchestratorRootDefault:
 
-    def test_it_leaves_the_container_alone(self):
-        """Inside the orchestrator container /app/state IS the state directory
-        those modules are supposed to read; redirecting it would change what
-        every container-run test sees."""
+    def test_it_redirects_INSIDE_the_container_too(self):
+        """The #181 fix, and the reversal of this test's previous assertion.
+
+        It used to assert the opposite -- that a container run was left alone,
+        on the reasoning that "/app/state IS the state directory those modules
+        are supposed to read". That reasoning was backwards: the documented way
+        to run this suite is `pytest tests/unit` from the repository root, and
+        on the deployment the repository root IS the directory bind-mounted at
+        /app. So the suite wrote its fixtures into the LIVE state tree and the
+        production watchdog did real work on them -- 17 files observed
+        reappearing after a verified-clean deletion, each timestamped to a test
+        run rather than to the orchestrator.
+        """
         with patch('tests.conftest.running_in_orchestrator_container', return_value=True), \
                 patch.dict(os.environ, {}, clear=False):
             os.environ.pop('ORCHESTRATOR_ROOT', None)
-            _default_orchestrator_root_outside_the_container()
+            os.environ.pop('SWITCHYARD_TEST_STATE_ROOT', None)
+            _redirect_orchestrator_root_to_scratch()
+            root = os.environ.get('ORCHESTRATOR_ROOT')
 
-            assert 'ORCHESTRATOR_ROOT' not in os.environ
+        assert root, "a container run must still get a scratch root"
+        assert root != '/app'
+        assert os.path.isdir(root) and os.access(root, os.W_OK)
 
     def test_it_gives_a_host_run_somewhere_writable(self):
         with patch('tests.conftest.running_in_orchestrator_container', return_value=False), \
                 patch.dict(os.environ, {}, clear=False):
             os.environ.pop('ORCHESTRATOR_ROOT', None)
-            _default_orchestrator_root_outside_the_container()
+            os.environ.pop('SWITCHYARD_TEST_STATE_ROOT', None)
+            _redirect_orchestrator_root_to_scratch()
             root = os.environ['ORCHESTRATOR_ROOT']
 
         assert os.path.isdir(root)
         assert os.access(root, os.W_OK)
 
+    def test_the_escape_hatch_is_honoured(self):
+        """SWITCHYARD_TEST_STATE_ROOT, for a run that genuinely wants a
+        specific tree. No test needs it today; it exists so that needing it
+        later is a one-liner rather than a reason to revert the redirect."""
+        with patch('tests.conftest.running_in_orchestrator_container', return_value=True), \
+                patch.dict(os.environ, {'SWITCHYARD_TEST_STATE_ROOT': '/tmp/chosen-tree'}):
+            os.environ.pop('ORCHESTRATOR_ROOT', None)
+            _redirect_orchestrator_root_to_scratch()
+
+            assert os.environ['ORCHESTRATOR_ROOT'] == '/tmp/chosen-tree'
+
     def test_an_explicit_value_wins(self):
         with patch('tests.conftest.running_in_orchestrator_container', return_value=False), \
                 patch.dict(os.environ, {'ORCHESTRATOR_ROOT': '/somewhere/chosen'}):
-            _default_orchestrator_root_outside_the_container()
+            _redirect_orchestrator_root_to_scratch()
 
             assert os.environ['ORCHESTRATOR_ROOT'] == '/somewhere/chosen'

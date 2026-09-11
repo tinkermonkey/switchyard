@@ -5,6 +5,7 @@ Provides fluent interfaces for building complex test objects
 without verbose setup code in every test.
 """
 
+import threading
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from services.review_cycle import ReviewCycleState
@@ -372,3 +373,99 @@ class TaskContextBuilder:
     def build(self) -> Dict[str, Any]:
         """Build the task context dictionary"""
         return self._context
+
+
+class RecordedThread:
+    """A `threading.Thread` stand-in that records instead of running.
+
+    `services/project_monitor.py::_start_review_cycle_for_issue` ends by
+    spawning a daemon thread that runs a REAL review cycle. Two test files
+    drive that method past its pipeline-lock gate to assert on the gate, and
+    both used to let the thread actually start: it kept running into whatever
+    test came next, connecting to Redis, writing to Elasticsearch and taking
+    file locks under a relative `state/projects/<project>/...` path while
+    unrelated tests were asserting (#186). Nondeterministic timing, which makes
+    it exactly the kind of thing that produces chunk-dependent results.
+
+    Patch it in where the gate is exercised:
+
+        with patch('threading.Thread', RecordedThread):
+            ...
+        assert RecordedThread.started, "the gate should have started a cycle"
+
+    The gate's own behaviour is unchanged -- it still constructs a thread and
+    calls start() -- so what the test is actually checking is not weakened.
+    """
+
+    instances: list = []
+
+    def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None, **extra):
+        self.target = target
+        self.daemon = daemon
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.name = name
+        self.did_start = False
+        RecordedThread.instances.append(self)
+
+    def start(self):
+        self.did_start = True
+
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return False
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+
+    @classmethod
+    def started(cls) -> int:
+        return sum(1 for t in cls.instances if t.did_start)
+
+
+class JoinableThread(threading.Thread):
+    """A real `threading.Thread` that a test can find again and join.
+
+    `RecordedThread` is for tests asserting on a gate -- they do not want the
+    body to run at all. A few tests do want it: they are testing what the
+    thread's closure can see. Those still must not let it outlive them, and
+    `_start_review_cycle_for_issue` does not return its thread, so there is
+    nothing to join without this.
+
+        with patch('threading.Thread', JoinableThread):
+            ...
+        JoinableThread.join_all(timeout=5)
+    """
+
+    instances: list = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        JoinableThread.instances.append(self)
+
+    @classmethod
+    def reset(cls):
+        cls.instances = []
+
+    @classmethod
+    def join_all(cls, timeout: float = 5.0):
+        """Join every thread this class started, and report any that will not.
+
+        Raises rather than warning: a thread that ignores a 5s join is a
+        thread that is going to keep running inside the next test, which is
+        the whole problem (#186).
+        """
+        stuck = []
+        for thread in cls.instances:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                stuck.append(thread.name)
+        cls.reset()
+        if stuck:
+            raise AssertionError(
+                f"threads did not finish within {timeout}s and will run on "
+                f"into later tests: {stuck}"
+            )

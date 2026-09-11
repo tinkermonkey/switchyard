@@ -8,6 +8,7 @@ import pytest
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, Any
 
@@ -229,24 +230,46 @@ def _patch_init_defaults(cls, **defaults):
     cls.__init__ = bounded_init
 
 
-def _default_orchestrator_root_outside_the_container():
+def _redirect_orchestrator_root_to_scratch():
     """
-    Point ORCHESTRATOR_ROOT at a scratch directory when /app is absent, so the
-    modules that derive a state directory from it import cleanly on a host.
+    Point ORCHESTRATOR_ROOT at a scratch directory for EVERY test run, so the
+    suite cannot write into a real `state/` tree.
 
-    services/dev_container_state.py and services/work_execution_state.py both
-    construct their singleton at import time, and that constructor does
-    `Path(os.environ.get('ORCHESTRATOR_ROOT', '/app')) / "state" / ...` followed
-    by mkdir(parents=True) -- which fails on any machine without a writable
-    /app. Three test files worked around that by assigning a MagicMock into
-    sys.modules at module scope and never removing it; see
-    tests/unit/test_pr_review_phase_recovery.py (#133) for what that cost.
+    Off-container: services/dev_container_state.py and
+    services/work_execution_state.py construct their singleton at import time,
+    and that constructor does `Path(os.environ.get('ORCHESTRATOR_ROOT', '/app'))
+    / "state" / ...` followed by mkdir(parents=True) -- which fails on any
+    machine without a writable /app. Three test files worked around that by
+    assigning a MagicMock into sys.modules at module scope and never removing
+    it; see tests/unit/test_pr_review_phase_recovery.py (#133) for what that
+    cost.
 
-    Deliberately only when /app is absent: inside the orchestrator container
-    /app/state is the real state directory those modules are supposed to read,
-    and redirecting it would change what every container-run test sees.
+    ON-container (#181): this used to return early, reasoning that "/app/state
+    IS the state directory those modules are supposed to read". That was
+    backwards. The documented way to run this suite is `pytest tests/unit` from
+    the repository root, and on the deployment the repository root IS the
+    directory bind-mounted at /app -- so the suite wrote its fixtures into the
+    LIVE state tree and the production watchdog then did real work on them.
+    Seventeen files were observed reappearing after a verified-clean deletion,
+    every one timestamped to a test run rather than to the orchestrator.
+
+    No test needs the live tree: each either builds its own manager against
+    tmp_path or exercises a singleton whose content it also wrote, and a test
+    asserting on whatever the deployment happens to hold right now would be
+    untrustworthy anyway. SWITCHYARD_TEST_STATE_ROOT is the escape hatch if one
+    ever genuinely does.
+
+    An explicitly-set ORCHESTRATOR_ROOT still wins, so the invocation in
+    CLAUDE.md (`docker exec -e ORCHESTRATOR_ROOT=/tmp/... ... pytest`) is
+    unchanged -- it is simply no longer the only thing standing between the
+    suite and production.
     """
-    if running_in_orchestrator_container() or os.environ.get('ORCHESTRATOR_ROOT'):
+    if os.environ.get('ORCHESTRATOR_ROOT'):
+        return
+
+    override = os.environ.get('SWITCHYARD_TEST_STATE_ROOT')
+    if override:
+        os.environ['ORCHESTRATOR_ROOT'] = override
         return
 
     import tempfile
@@ -395,11 +418,42 @@ def _install_a_mock_backed_pipeline_run_manager_singleton():
 # any guard existed. What they have to beat is this module's own first-party
 # imports, not the first test module -- and nothing above this block imports
 # first-party code, only socket/redis/elasticsearch/tempfile.
+def _stop_the_background_call_trace_summarizer():
+    """Keep GitHubAPIClient's housekeeping thread out of the test process (#186).
+
+    `GitHubAPIClient.__init__` starts a `while True: sleep(300)` daemon thread
+    per instance to summarize and trim its call-trace buffer. Production builds
+    one client, so one thread. The suite builds one per fixture, and every one
+    of them outlives its test and goes on mutating shared state inside every
+    later test.
+
+    Patched here rather than per file because three separate files had already
+    forgotten it -- test_github_api_rate_limit_redis_mirror.py (29 threads),
+    test_git_workflow_manager.py and test_github_api_rate_limit_buckets.py --
+    while test_github_app_rate_limit_accounting.py patches it at all six of its
+    construction sites. That ratio is the argument: this is a property of the
+    constructor, not of any one test's setup.
+
+    Nothing under test depends on it. It does nothing at all within a 5-minute
+    window and no test runs that long, and the method it would call,
+    _summarize_and_cleanup_call_traces(), is exercised directly where it
+    matters.
+    """
+    try:
+        from services.github_api_client import GitHubAPIClient
+    except Exception as e:  # pragma: no cover - import shape, not behaviour
+        logger.debug(f"Could not neutralise the call-trace summarizer: {e}")
+        return
+
+    GitHubAPIClient._start_call_trace_summarizer = lambda self: None
+
+
 _refuse_to_resolve_compose_service_hostnames()
 _bound_service_client_timeouts()
-_default_orchestrator_root_outside_the_container()
+_redirect_orchestrator_root_to_scratch()
 _clear_deployment_tuning_env_vars()
 _install_a_disabled_observability_singleton()
+_stop_the_background_call_trace_summarizer()
 _install_a_mock_backed_pipeline_run_manager_singleton()
 
 
@@ -509,7 +563,7 @@ def pytest_collection_finish(session):
     result depended on how it was chunked.
 
     The root cause is fixed at source (see
-    _default_orchestrator_root_outside_the_container), so this exists to keep it
+    _redirect_orchestrator_root_to_scratch), so this exists to keep it
     fixed: any new file that reaches for the same workaround shows up as one
     named test failure rather than as somebody else's inexplicable TypeError.
     """
@@ -1164,3 +1218,81 @@ def _purge_redis():
             logger.warning(f"Test-data purge: rate-limit key cleanup failed: {e}")
     except Exception as e:
         logger.warning(f"Test-data purge: Redis cleanup skipped: {e}")
+
+
+# ============================================================================
+# Leaked-thread detection (#186)
+# ============================================================================
+
+# How long a thread started during a test may take to finish after it ends.
+# Generous on purpose: the point is to catch threads that run FOREVER, not to
+# police a slow teardown.
+LEAKED_THREAD_GRACE_SECONDS = float(
+    os.environ.get('SWITCHYARD_TEST_THREAD_GRACE', '2.0')
+)
+
+# Worker threads of process-global ThreadPoolExecutors, which are created
+# lazily on first use and then live for the rest of the session BY DESIGN.
+# Whichever test happens to touch the pool first appears to "start" them, but
+# they are a singleton's workers, not that test's leak -- and the pools exist
+# precisely so that lock waits do not run on the caller's thread
+# (services/project_workspace.py's _get_epic_worktree_executor, and #151/WI-6
+# for why they are separate pools).
+PERSISTENT_POOL_THREAD_PREFIXES = ('epic-worktree', 'project-init')
+
+
+@pytest.fixture(autouse=True)
+def _fail_on_leaked_threads(request):
+    """Fail a test that leaves a thread of its own still running.
+
+    `_start_review_cycle_for_issue` ends by spawning a daemon thread that runs
+    a real review cycle. Two test files drove it past its pipeline-lock gate
+    and never joined the thread, so the cycle kept running into whatever test
+    came next -- connecting to Redis, indexing to Elasticsearch, and taking
+    file locks under a RELATIVE `state/projects/<project>/...` path while
+    unrelated tests were asserting. It surfaced only as a stray log line inside
+    an unrelated test's captured output, and its timing was nondeterministic --
+    precisely the shape that makes a suite's result depend on how it was
+    chunked (#186, #133, #180).
+
+    Daemon threads are both the dangerous ones and the easy ones to miss:
+    nothing joins them and the process exits regardless, so without this the
+    only symptom is somebody else's inexplicable failure weeks later. Adding
+    this guard immediately surfaced a second, unrelated leak nobody had filed
+    -- GitHubAPIClient's call-trace summarizer, 29 threads from one file.
+
+    Opt out with `@pytest.mark.allow_thread_leak` for a test that deliberately
+    leaves something running. There are none today, and a new one should have
+    to say so out loud.
+    """
+    if request.node.get_closest_marker('allow_thread_leak'):
+        yield
+        return
+
+    import threading
+    before = {t.ident for t in threading.enumerate()}
+
+    yield
+
+    deadline = time.monotonic() + LEAKED_THREAD_GRACE_SECONDS
+    while True:
+        leaked = [
+            t for t in threading.enumerate()
+            if t.ident not in before
+            and t.is_alive()
+            and not t.name.startswith(PERSISTENT_POOL_THREAD_PREFIXES)
+        ]
+        if not leaked or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+
+    if leaked:
+        described = ', '.join(f"{t.name}(daemon={t.daemon})" for t in leaked)
+        pytest.fail(
+            f"{len(leaked)} thread(s) started by this test were still running "
+            f"{LEAKED_THREAD_GRACE_SECONDS}s after it finished: {described}. "
+            f"A thread that outlives its test does real work inside later "
+            f"tests -- see #186. Join it, patch it out (see "
+            f"tests.utils.builders.RecordedThread), or mark the test "
+            f"@pytest.mark.allow_thread_leak if the leak is deliberate."
+        )

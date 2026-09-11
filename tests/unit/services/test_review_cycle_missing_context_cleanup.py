@@ -13,6 +13,8 @@ mirrors the cleanup pattern already used by the sibling "skip work" branch in
 """
 from unittest.mock import Mock, patch
 
+from tests.utils.builders import RecordedThread
+
 import pytest
 
 from config.manager import ConfigManager
@@ -91,11 +93,16 @@ class TestMissingContextCleansUpImmediately:
              patch.object(project_monitor, 'get_previous_stage_context', return_value='## Previous Work\n\nSome real output'), \
              patch.object(project_monitor.pipeline_run_manager, 'get_or_create_pipeline_run',
                            return_value=(Mock(id='run-1'), False)), \
-             patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr:
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager') as mock_get_lock_mgr, \
+             patch('threading.Thread', RecordedThread):
             mock_lock_manager = Mock()
             mock_lock_manager.try_acquire_lock.return_value = (True, 'acquired')
             mock_get_lock_mgr.return_value = mock_lock_manager
 
+            # RecordedThread, not the real one (#186). This is the ONE test in
+            # this file that reaches the grant path, so it is the one that used
+            # to leave a real review cycle running into everything after it.
+            RecordedThread.reset()
             project_monitor._start_review_cycle_for_issue(
                 project_name='rounds',
                 board_name='SDLC Execution',
@@ -109,3 +116,6 @@ class TestMissingContextCleansUpImmediately:
             )
 
         project_monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+        # ...and the happy path really did get as far as launching the cycle,
+        # which is what makes "end_pipeline_run was not called" meaningful.
+        assert RecordedThread.started() == 1

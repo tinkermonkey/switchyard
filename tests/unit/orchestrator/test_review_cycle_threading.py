@@ -13,6 +13,8 @@ if not os.path.isdir('/app'):
 
 import asyncio
 import threading
+
+from tests.utils.builders import JoinableThread
 import time
 from unittest.mock import Mock, patch, AsyncMock, MagicMock, call
 from tests.unit.orchestrator.mocks import MockGitHubAPI
@@ -146,7 +148,16 @@ class TestReviewCycleThreading:
             # Check if pipeline_run_id is in kwargs
             if 'pipeline_run_id' in kwargs and kwargs['pipeline_run_id'] == 'run-2001':
                 pipeline_run_accessed.set()
-            return ('Development', True)
+            # Unwind the thread here rather than returning a result (#186).
+            # This test's subject is what the closure can SEE; everything the
+            # thread does after this point is progression/teardown against
+            # mocks, and it does not terminate -- the thread was still alive
+            # 5s later, and before the leaked-thread guard it simply ran on
+            # into whatever test came next. CancellationError is the one
+            # unwind run_cycle_in_thread treats as a deliberate stop rather
+            # than a crash, so no failure bookkeeping is triggered either.
+            from services.cancellation import CancellationError
+            raise CancellationError('test: closure captured, stopping the cycle')
         
         mock_lock_mgr = Mock()
         mock_lock_mgr.try_acquire_lock.return_value = (True, 'acquired')
@@ -164,8 +175,15 @@ class TestReviewCycleThreading:
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr), \
              patch('services.github_integration.GitHubIntegration', return_value=mock_gh_integration), \
              patch('services.git_workflow_manager.git_workflow_manager', mock_gwm), \
-             patch('services.project_workspace.workspace_manager') as mock_wsm:
+             patch('services.project_workspace.workspace_manager') as mock_wsm, \
+             patch('threading.Thread', JoinableThread):
 
+            # JoinableThread, not the real one (#186). This test WANTS the
+            # thread body to run -- it is asserting on what the closure can
+            # see -- but _start_review_cycle_for_issue does not return its
+            # thread, so there was nothing to join and the cycle carried on
+            # into whatever test ran next.
+            JoinableThread.reset()
             mock_wsm.get_project_dir.return_value = '/workspace/test-project'
 
             from services.project_monitor import ProjectMonitor
@@ -233,6 +251,9 @@ class TestReviewCycleThreading:
             
             # Assert: Thread was able to access pipeline_run.id
             assert pipeline_run_accessed.is_set(), "pipeline_run.id was not accessible in the thread"
+
+            # ...and it does not outlive this test.
+            JoinableThread.join_all(timeout=5)
     
     def test_review_cycle_thread_handles_missing_previous_output(
         self,
