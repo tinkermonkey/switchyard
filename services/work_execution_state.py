@@ -34,6 +34,62 @@ _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp a
 # Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
 _WATCHDOG_MAX_RECORD_AGE_HOURS = 24
 
+# The empty-output watchdog's own retry budget, and why it is held strictly BELOW
+# project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES (#166 review).
+#
+# Each watchdog rewrite turns THIS record's trailing 'success' into a trailing
+# 'failure' for the same (column, agent) -- it rewrites in place rather than
+# appending -- and a trailing 'failure' for a (column, agent) is exactly what
+# count_consecutive_failures() accumulates. So N watchdog rewrites in a row produce
+# N consecutive dispatch failures with nothing between them. Both budgets defaulted
+# to 3, which meant the last redispatch the watchdog was allowed to invite was also
+# the one that tripped project_monitor's mark_failed() -- NOT a plain release: the
+# board's pipeline lock stays held, durably marked retained-due-to-failure, so every
+# sibling issue on that board is blocked until a human runs scripts/release_lock.py.
+# One issue the gate was systematically wrong about therefore took the whole board
+# offline in about three sweeps (~45 minutes). Strictly below means the budget stops
+# the loop first and the blast radius stays the one record.
+#
+# Overridable with WATCHDOG_MAX_RETRIES, but the override is clamped to the same
+# ceiling -- see _watchdog_max_retries(); a bigger number is not a configuration
+# choice, it is the escalation path reopening.
+_WATCHDOG_MAX_RETRIES = 2
+
+
+def _watchdog_max_retries() -> int:
+    """WATCHDOG_MAX_RETRIES, clamped strictly below the dispatch-failure budget.
+
+    Reads project_monitor's constant rather than restating it so the two cannot
+    drift apart again; the import is local because project_monitor imports this
+    module back (lazily, from inside its own functions) and pulls in most of the
+    orchestrator with it. An unreadable constant falls back to the module default,
+    which already satisfies the relationship.
+    """
+    import os
+
+    raw = os.environ.get('WATCHDOG_MAX_RETRIES')
+    try:
+        configured = int(raw) if raw is not None else _WATCHDOG_MAX_RETRIES
+    except (TypeError, ValueError):
+        logger.warning(
+            f"WATCHDOG_MAX_RETRIES={raw!r} is not an integer -- "
+            f"using {_WATCHDOG_MAX_RETRIES}"
+        )
+        configured = _WATCHDOG_MAX_RETRIES
+
+    try:
+        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
+        ceiling = MAX_CONSECUTIVE_DISPATCH_FAILURES - 1
+    except Exception as e:
+        logger.debug(
+            f"Could not read MAX_CONSECUTIVE_DISPATCH_FAILURES ({e}) -- "
+            f"capping the watchdog budget at {_WATCHDOG_MAX_RETRIES}"
+        )
+        ceiling = _WATCHDOG_MAX_RETRIES
+
+    return max(1, min(configured, ceiling))
+
+
 # How much of a workspace the empty-output gate reads before it gives up and
 # declines the record (#166). `gh api` is called with no --paginate, so a page is
 # all this gate ever sees: the issue endpoint is bounded with per_page + since,
@@ -196,8 +252,28 @@ def _classify_output_evidence(entries, agent: str, anchor: datetime) -> str:
     return evidence
 
 
+def _page_holds_every_node(total_count, nodes) -> bool:
+    """Did a `last: N` GraphQL page return its connection in FULL?
+
+    Stricter than _newest_page_covers_window() below, and the only honest test
+    wherever the nodes carry children the same query only fetched for the nodes it
+    got back (#166 review). A dropped Discussion comment takes its whole reply
+    thread with it, and a reply posted today can hang off a comment created months
+    ago -- so the comment-level createdAt test says nothing about whether the
+    window is covered. An absent or unparseable totalCount answers False, which the
+    caller turns into "leaving the record alone".
+    """
+    try:
+        return int(total_count) <= len(nodes)
+    except (TypeError, ValueError):
+        return False
+
+
 def _newest_page_covers_window(total_count, nodes, anchor: datetime) -> bool:
     """Does a `last: N` GraphQL page provably hold every node created since `anchor`?
+
+    Only sound for LEAF connections -- see _page_holds_every_node() for why a
+    connection whose nodes carry unfetched children needs the stricter test.
 
     GitHub orders connections oldest-first, so `last` returns the tail: anything
     dropped is older than nodes[0]. The page therefore covers the window when
@@ -586,25 +662,37 @@ class WorkExecutionStateTracker:
         # record is then never looked at again, because the sweep only ever examines
         # a state file whose LAST record is 'success'. Without this the counter on
         # any record is only ever 0 or 1 and _should_retry_failed_execution()'s
-        # `>= WATCHDOG_MAX_RETRIES` can never bind, so a systematic false "no output"
-        # for one issue loops sweep -> rewrite -> redispatch -> success -> rewrite
-        # every 15 minutes until project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES
-        # fires mark_failed() and durably retains the board lock -- exactly the blast
-        # radius the budget exists to bound.
+        # `>= _watchdog_max_retries()` can never bind, so a systematic false "no
+        # output" for one issue loops sweep -> rewrite -> redispatch -> success ->
+        # rewrite every 15 minutes until project_monitor's
+        # MAX_CONSECUTIVE_DISPATCH_FAILURES fires mark_failed() and durably retains
+        # the board lock -- exactly the blast radius the budget exists to bound, and
+        # the reason _watchdog_max_retries() is clamped strictly below it.
         #
-        # Scoped to the IMMEDIATELY preceding record for this same (column, agent),
-        # and only when the watchdog is what ended it: a redispatch that then
-        # genuinely posts leaves an ordinary 'success' as the last record, so the
-        # next unrelated start begins at zero again rather than inheriting a budget
-        # spent months ago.
-        if history:
-            previous = history[-1]
-            if (previous.get('watchdog_retry_triggered')
-                    and previous.get('column') == column
-                    and previous.get('agent') == agent):
-                carried = previous.get('watchdog_retry_count', 0)
-                if carried:
-                    execution['watchdog_retry_count'] = carried
+        # Scoped to the last record for this same (column, agent), and only when the
+        # watchdog is what ended it: a redispatch that then genuinely posts leaves an
+        # ordinary 'success' as that record, so the next unrelated start begins at
+        # zero again rather than inheriting a budget spent months ago.
+        #
+        # The lookback searches BACKWARD for this (column, agent) rather than testing
+        # history[-1] (#166 review). A state file is per (project, issue) and holds
+        # records for every column, agent and board that issue has ever touched, so
+        # any interleaved record -- the other board of an issue live on two of them,
+        # pipeline_progression.record_execution_start(), review_cycle's direct
+        # dispatch -- landed between the rewrite and the redispatch and reset the
+        # carried budget to zero, which is precisely the condition this block exists
+        # to prevent.
+        previous = next(
+            (
+                entry for entry in reversed(history)
+                if entry.get('column') == column and entry.get('agent') == agent
+            ),
+            None
+        )
+        if previous and previous.get('watchdog_retry_triggered'):
+            carried = previous.get('watchdog_retry_count', 0)
+            if carried:
+                execution['watchdog_retry_count'] = carried
 
         history.append(execution)
         state['current_status'] = column
@@ -1734,10 +1822,9 @@ class WorkExecutionStateTracker:
         Returns:
             (should_retry, reason) tuple
         """
-        import os
-
-        # Check 1: Retry limit
-        max_retries = int(os.environ.get('WATCHDOG_MAX_RETRIES', '3'))
+        # Check 1: Retry limit -- see _watchdog_max_retries() for why the
+        # configured value is capped below MAX_CONSECUTIVE_DISPATCH_FAILURES.
+        max_retries = _watchdog_max_retries()
         retry_count = execution.get('watchdog_retry_count', 0)
 
         if retry_count >= max_retries:
@@ -1906,6 +1993,253 @@ class WorkExecutionStateTracker:
         return self._should_retry_failed_execution(
             project_name, issue_number, agent, column, last_execution
         )
+
+    def _watchdog_board_lock_blocks_retry(
+        self, project_name: str, issue_number: int, project_config, execution: dict
+    ) -> bool:
+        """PROTECTION 2: is this execution's board locked by a DIFFERENT issue?
+
+        Returns True when the record must be left alone.
+
+        Extracted from the sweep so both of its passes run the identical check
+        (#166 review). The collection pass answers it, and
+        _rewrite_verified_empty_execution() answers it AGAIN immediately before
+        the rewrite -- the GitHub verification between the two holds no lock and
+        is serial over every candidate, so a phase-1 answer can be many minutes
+        stale by the time it is acted on.
+
+        Found in #57 review: this previously did
+        project_config.get('pipelines', {}).get('enabled', []) on a ProjectConfig
+        dataclass (which has no .get() at all -- `pipelines` is a plain
+        `List[ProjectPipeline]` attribute) and called lock_manager.get_lock_status(...),
+        a method that doesn't exist on PipelineLockManager -- both raised
+        AttributeError on every single invocation, silently swallowed by the except
+        below exactly like PROTECTION 3's own dead get_pipeline_queue() import,
+        making this protection a permanent no-op too. Separately, the inner
+        `continue` only continued the `for pipeline_config` loop, not the outer
+        per-state-file loop -- even with a real API call, it would not actually have
+        skipped this execution. Fixed to use the real ProjectPipeline.board_name
+        attribute and PipelineLockManager.get_lock_holder(), and to use the same
+        locked-flag + break + early-return shape PROTECTION 3 already gets right.
+        """
+        from services.pipeline_lock_manager import get_pipeline_lock_manager
+
+        try:
+            lock_manager = get_pipeline_lock_manager()
+
+            # Scope the lock check to the board this stuck execution
+            # actually ran on (#144). A lock held on some OTHER board of
+            # the same project says nothing about whether THIS execution
+            # is safe to retry: issue #10 stuck on a completely idle
+            # sdlc_execution board was being skipped every sweep because
+            # issue #20 was legitimately working on planning_design.
+            #
+            # Two cases fall back to the original every-board behavior,
+            # and both are deliberate:
+            #   - no board recorded at all (every record written before
+            #     record_execution_start() started carrying board_name,
+            #     plus the crash-recovery record record_execution_outcome()
+            #     synthesises when it finds no matching in_progress
+            #     entry, plus the dispatch paths with no board in scope);
+            #   - a board recorded that is no longer one of this
+            #     project's configured boards (a board rename, or the
+            #     'system' pseudo-board some task contexts carry).
+            # The second case MUST NOT be trusted as-is: get_lock_holder
+            # on an unknown board name is not an error, both stores
+            # simply have no entry and it returns None, which would turn
+            # this protection into a guaranteed no-op -- strictly weaker
+            # than the pre-#144 behavior it replaced, rather than more
+            # conservative than it.
+            #
+            # The fallback is genuinely conservative, not free: a board
+            # lock is held for the life of a pipeline run (up to
+            # LOCK_TTL_SECONDS, 2h), so a record without a usable board
+            # reproduces #144 -- skipped every sweep while ANY other
+            # board of the project stays busy -- for as long as that lock
+            # lives, not just until the next sweep. That is accepted
+            # because it only defers: no retry budget is consumed, the
+            # record stays 'success' and is re-examined on every sweep,
+            # and the issue is picked up as soon as the other board frees
+            # up. Everything already on disk before this change lands is
+            # in exactly that state.
+            configured_boards = [
+                board for board in (
+                    getattr(pipeline_config, 'board_name', None)
+                    for pipeline_config in getattr(project_config, 'pipelines', None) or []
+                ) if board
+            ]
+            recorded_board = execution.get('board_name')
+            if recorded_board and recorded_board in configured_boards:
+                boards_to_check = [recorded_board]
+            else:
+                if recorded_board:
+                    logger.warning(
+                        f"Watchdog: {project_name}/#{issue_number} recorded board "
+                        f"'{recorded_board}', which is not one of this project's "
+                        f"configured boards ({configured_boards}) -- falling back to "
+                        f"checking every board rather than trusting a name no lock "
+                        f"is ever keyed on"
+                    )
+                boards_to_check = configured_boards
+
+            locked_by_another_issue = False
+            for board_name in boards_to_check:
+                # Fail-closed read (#150): get_lock_holder() goes through
+                # get_lock(), which drops the health flag both stores
+                # return, and those stores swallow their own exceptions --
+                # so Redis down + an unreadable YAML lock file surfaced
+                # here as "no holder", i.e. exactly the same answer as an
+                # idle board, and this protection cheerfully marked the
+                # execution for retry onto a board another issue was
+                # actively holding.
+                holder_issue, reads_healthy = lock_manager.get_lock_holder_fail_closed(
+                    project_name, board_name
+                )
+                if not reads_healthy:
+                    logger.warning(
+                        f"Watchdog: Skipping {project_name}/#{issue_number}: lock state "
+                        f"for board '{board_name}' could not be read from either store "
+                        f"-- assuming locked rather than deciding on unverified data"
+                    )
+                    locked_by_another_issue = True
+                    break
+                # CRITICAL fix (found in #58 review): this must only
+                # skip when the lock is held by a DIFFERENT issue.
+                # The original version fired for ANY holder,
+                # including this exact issue holding its own
+                # lock -- which is the common case right after an
+                # issue finishes a stage (locks release only at
+                # specific exit columns, not after every stage),
+                # so this protection was skipping almost every
+                # retry check, not just the ones actually racing
+                # a different issue's in-progress work.
+                if holder_issue and holder_issue != issue_number:
+                    logger.debug(
+                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                        f"board '{board_name}' locked by issue #{holder_issue}"
+                    )
+                    locked_by_another_issue = True
+                    break
+
+            if locked_by_another_issue:
+                return True
+        except (AttributeError, TypeError) as e:
+            # A coding bug, not a transient outage -- and precisely the
+            # shape (.get() on a dataclass, a method that doesn't exist)
+            # that kept this protection a silent permanent no-op until
+            # #57/#58 (#140 item 31). Surfaced distinctly from the
+            # transient case below, and loudly, so the next one can't
+            # hide the same way.
+            #
+            # Both handlers fall THROUGH to PROTECTION 3 rather than
+            # skipping this issue -- the opposite posture to
+            # services/pipeline_watchdog.py, which bails out on a check
+            # it can't verify, and deliberately so. That watchdog ends
+            # the run and releases its board lock, so acting on a bad
+            # answer there produces a genuinely concurrent second
+            # container; this sweep only rewrites a state record, and the
+            # redispatch it invites still goes through project_monitor,
+            # which takes the board's pipeline lock and consults the
+            # queue itself. Failing closed here would instead let one
+            # permanent coding bug silently freeze the un-sticking
+            # watchdog for every issue, which is the failure mode #57/#58
+            # already cost us twice. The narrower "lock state is
+            # unreadable" case above IS failed closed, because there the
+            # check itself worked and told us it doesn't know.
+            logger.error(
+                f"Watchdog: PROTECTION 2 (pipeline lock) failed for "
+                f"{project_name}/#{issue_number} with a programming error "
+                f"-- this protection is not working, continuing without it: {e}",
+                exc_info=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"Watchdog: Could not check pipeline lock for "
+                f"{project_name}/#{issue_number} -- PROTECTION 2 skipped: {e}"
+            )
+
+        return False
+
+    def _watchdog_queue_blocks_retry(
+        self, project_name: str, issue_number: int, project_config,
+        queue_manager_cache: dict
+    ) -> bool:
+        """PROTECTION 3: is this issue already waiting or active in a pipeline queue?
+
+        Returns True when the record must be left alone.
+
+        Extracted alongside _watchdog_board_lock_blocks_retry() and re-run for the
+        same reason (#166 review) -- and this one PROTECTION 1 cannot stand in for:
+        an issue sitting 'waiting' in a PipelineQueueManager queue has no execution
+        record at all, because record_execution_start() runs at dispatch time, after
+        the enqueue. A rewrite decided minutes earlier would land on a record whose
+        dispatch is already queued.
+        """
+        # Issue #57: this used to import a nonexistent
+        # get_pipeline_queue() (only get_pipeline_queue_manager
+        # (project, board) / PipelineQueueManager actually exist in
+        # services/pipeline_queue_manager.py), so this protection
+        # was a silent no-op -- the ImportError was swallowed by
+        # the broad except below and only ever logged at debug
+        # level. Implemented properly now that the queue manager
+        # exposes get_issue_status(): skip retry-marking if the
+        # issue is already 'waiting' or 'active' in the queue for
+        # any of its pipelines' boards -- it's already about to be
+        # (or currently being) legitimately processed, so marking
+        # it 'failure' here to force a retry would race with that.
+        try:
+            from services.pipeline_queue_manager import get_pipeline_queue_manager
+
+            already_queued_or_active = False
+            # Uses the project_config the caller fetched once -- see the sweep's
+            # call site for why it is not re-read here.
+            #
+            # Deliberately still checks EVERY board, unlike PROTECTION 2
+            # above: this asks "is this issue already queued anywhere",
+            # and an issue very often sits in a different board's queue
+            # from the one its last execution ran on (that's what a
+            # board-to-board handoff looks like). Narrowing this one to
+            # the recorded board would make the watchdog mark an issue
+            # for retry while it is legitimately queued elsewhere.
+            for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
+                board_name = getattr(pipeline_cfg, 'board_name', None)
+                if not board_name:
+                    continue
+                queue_manager = queue_manager_cache.get((project_name, board_name))
+                if queue_manager is None:
+                    queue_manager = get_pipeline_queue_manager(project_name, board_name)
+                    queue_manager_cache[(project_name, board_name)] = queue_manager
+                queue_status = queue_manager.get_issue_status(issue_number)
+                if queue_status in ('waiting', 'active'):
+                    logger.debug(
+                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
+                        f"already '{queue_status}' in pipeline queue for board '{board_name}'"
+                    )
+                    already_queued_or_active = True
+                    break
+
+            if already_queued_or_active:
+                return True
+        except (AttributeError, TypeError, ImportError) as e:
+            # See PROTECTION 2's matching handler (#140 item 31) --
+            # including why both of these log and fall through rather
+            # than skipping the issue. ImportError is in the list here
+            # because that is literally how this protection was dead
+            # before #57 -- an import of a function that never existed,
+            # logged at debug and never noticed.
+            logger.error(
+                f"Watchdog: PROTECTION 3 (queue status) failed for "
+                f"{project_name}/#{issue_number} with a programming error "
+                f"-- this protection is not working, continuing without it: {e}",
+                exc_info=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"Watchdog: Could not check queue status for "
+                f"{project_name}/#{issue_number} -- PROTECTION 3 skipped: {e}"
+            )
+
+        return False
 
     def detect_and_retry_empty_successful_executions(self) -> int:
         """
@@ -2083,37 +2417,17 @@ class WorkExecutionStateTracker:
                         )
                         continue
 
-                    # PROTECTION 2: Check pipeline lock
+                    # PROTECTION 2 (pipeline lock) and PROTECTION 3 (queue status)
+                    # both live in helpers now, because the rewrite pass below re-runs
+                    # them -- see _watchdog_board_lock_blocks_retry().
                     #
-                    # Found in #57 review: this previously did
-                    # project_config.get('pipelines', {}).get('enabled', [])
-                    # on a ProjectConfig dataclass (which has no .get() at
-                    # all -- `pipelines` is a plain `List[ProjectPipeline]`
-                    # attribute) and called lock_manager.get_lock_status(...),
-                    # a method that doesn't exist on PipelineLockManager --
-                    # both raised AttributeError on every single invocation,
-                    # silently swallowed by the except below exactly like
-                    # PROTECTION 3's own dead get_pipeline_queue() import
-                    # (fixed above in this same commit), making this
-                    # protection a permanent no-op too. Separately, the inner
-                    # `continue` only continued the `for pipeline_config`
-                    # loop, not the outer per-state-file loop -- even with a
-                    # real API call, it would not actually have skipped this
-                    # execution. Fixed to use the real
-                    # ProjectPipeline.board_name attribute and
-                    # PipelineLockManager.get_lock_holder(), and to use the
-                    # same locked-flag + break + outer-continue shape
-                    # PROTECTION 3 already gets right.
-                    #
-                    # Fetches project_config once, shared with PROTECTION 3
-                    # below (found in #58 review: each protection previously
-                    # called config_manager.get_project_config(project_name)
-                    # separately for the same project in the same loop
-                    # iteration -- get_project_config() re-reads and
-                    # re-parses the project's YAML from disk on every call,
-                    # no caching, so this was a redundant disk read + parse
-                    # every single state-file iteration).
-                    from services.pipeline_lock_manager import get_pipeline_lock_manager
+                    # project_config is fetched once here and shared with both of them
+                    # and with PROTECTION 4 (found in #58 review: each protection
+                    # previously called config_manager.get_project_config(project_name)
+                    # separately for the same project in the same loop iteration --
+                    # get_project_config() re-reads and re-parses the project's YAML
+                    # from disk on every call, no caching, so this was a redundant disk
+                    # read + parse every single state-file iteration).
                     from config.manager import config_manager
 
                     if project_name in project_config_cache:
@@ -2142,205 +2456,15 @@ class WorkExecutionStateTracker:
                                 f"-- PROTECTION 2/3 degraded for this state file: {e}"
                             )
 
-                    try:
-                        lock_manager = get_pipeline_lock_manager()
+                    if self._watchdog_board_lock_blocks_retry(
+                        project_name, issue_number, project_config, last_exec
+                    ):
+                        continue
 
-                        # Scope the lock check to the board this stuck execution
-                        # actually ran on (#144). A lock held on some OTHER board of
-                        # the same project says nothing about whether THIS execution
-                        # is safe to retry: issue #10 stuck on a completely idle
-                        # sdlc_execution board was being skipped every sweep because
-                        # issue #20 was legitimately working on planning_design.
-                        #
-                        # Two cases fall back to the original every-board behavior,
-                        # and both are deliberate:
-                        #   - no board recorded at all (every record written before
-                        #     record_execution_start() started carrying board_name,
-                        #     plus the crash-recovery record record_execution_outcome()
-                        #     synthesises when it finds no matching in_progress
-                        #     entry, plus the dispatch paths with no board in scope);
-                        #   - a board recorded that is no longer one of this
-                        #     project's configured boards (a board rename, or the
-                        #     'system' pseudo-board some task contexts carry).
-                        # The second case MUST NOT be trusted as-is: get_lock_holder
-                        # on an unknown board name is not an error, both stores
-                        # simply have no entry and it returns None, which would turn
-                        # this protection into a guaranteed no-op -- strictly weaker
-                        # than the pre-#144 behavior it replaced, rather than more
-                        # conservative than it.
-                        #
-                        # The fallback is genuinely conservative, not free: a board
-                        # lock is held for the life of a pipeline run (up to
-                        # LOCK_TTL_SECONDS, 2h), so a record without a usable board
-                        # reproduces #144 -- skipped every sweep while ANY other
-                        # board of the project stays busy -- for as long as that lock
-                        # lives, not just until the next sweep. That is accepted
-                        # because it only defers: no retry budget is consumed, the
-                        # record stays 'success' and is re-examined on every sweep,
-                        # and the issue is picked up as soon as the other board frees
-                        # up. Everything already on disk before this change lands is
-                        # in exactly that state.
-                        configured_boards = [
-                            board for board in (
-                                getattr(pipeline_config, 'board_name', None)
-                                for pipeline_config in getattr(project_config, 'pipelines', None) or []
-                            ) if board
-                        ]
-                        recorded_board = last_exec.get('board_name')
-                        if recorded_board and recorded_board in configured_boards:
-                            boards_to_check = [recorded_board]
-                        else:
-                            if recorded_board:
-                                logger.warning(
-                                    f"Watchdog: {project_name}/#{issue_number} recorded board "
-                                    f"'{recorded_board}', which is not one of this project's "
-                                    f"configured boards ({configured_boards}) -- falling back to "
-                                    f"checking every board rather than trusting a name no lock "
-                                    f"is ever keyed on"
-                                )
-                            boards_to_check = configured_boards
-
-                        locked_by_another_issue = False
-                        for board_name in boards_to_check:
-                            # Fail-closed read (#150): get_lock_holder() goes through
-                            # get_lock(), which drops the health flag both stores
-                            # return, and those stores swallow their own exceptions --
-                            # so Redis down + an unreadable YAML lock file surfaced
-                            # here as "no holder", i.e. exactly the same answer as an
-                            # idle board, and this protection cheerfully marked the
-                            # execution for retry onto a board another issue was
-                            # actively holding.
-                            holder_issue, reads_healthy = lock_manager.get_lock_holder_fail_closed(
-                                project_name, board_name
-                            )
-                            if not reads_healthy:
-                                logger.warning(
-                                    f"Watchdog: Skipping {project_name}/#{issue_number}: lock state "
-                                    f"for board '{board_name}' could not be read from either store "
-                                    f"-- assuming locked rather than deciding on unverified data"
-                                )
-                                locked_by_another_issue = True
-                                break
-                            # CRITICAL fix (found in #58 review): this must only
-                            # skip when the lock is held by a DIFFERENT issue.
-                            # The original version fired for ANY holder,
-                            # including this exact issue holding its own
-                            # lock -- which is the common case right after an
-                            # issue finishes a stage (locks release only at
-                            # specific exit columns, not after every stage),
-                            # so this protection was skipping almost every
-                            # retry check, not just the ones actually racing
-                            # a different issue's in-progress work.
-                            if holder_issue and holder_issue != issue_number:
-                                logger.debug(
-                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                    f"board '{board_name}' locked by issue #{holder_issue}"
-                                )
-                                locked_by_another_issue = True
-                                break
-
-                        if locked_by_another_issue:
-                            continue
-                    except (AttributeError, TypeError) as e:
-                        # A coding bug, not a transient outage -- and precisely the
-                        # shape (.get() on a dataclass, a method that doesn't exist)
-                        # that kept this protection a silent permanent no-op until
-                        # #57/#58 (#140 item 31). Surfaced distinctly from the
-                        # transient case below, and loudly, so the next one can't
-                        # hide the same way.
-                        #
-                        # Both handlers fall THROUGH to PROTECTION 3 rather than
-                        # skipping this issue -- the opposite posture to
-                        # services/pipeline_watchdog.py, which bails out on a check
-                        # it can't verify, and deliberately so. That watchdog ends
-                        # the run and releases its board lock, so acting on a bad
-                        # answer there produces a genuinely concurrent second
-                        # container; this sweep only rewrites a state record, and the
-                        # redispatch it invites still goes through project_monitor,
-                        # which takes the board's pipeline lock and consults the
-                        # queue itself. Failing closed here would instead let one
-                        # permanent coding bug silently freeze the un-sticking
-                        # watchdog for every issue, which is the failure mode #57/#58
-                        # already cost us twice. The narrower "lock state is
-                        # unreadable" case above IS failed closed, because there the
-                        # check itself worked and told us it doesn't know.
-                        logger.error(
-                            f"Watchdog: PROTECTION 2 (pipeline lock) failed for "
-                            f"{project_name}/#{issue_number} with a programming error "
-                            f"-- this protection is not working, continuing without it: {e}",
-                            exc_info=True
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Watchdog: Could not check pipeline lock for "
-                            f"{project_name}/#{issue_number} -- PROTECTION 2 skipped: {e}"
-                        )
-
-                    # PROTECTION 3: Check queue state
-                    #
-                    # Issue #57: this used to import a nonexistent
-                    # get_pipeline_queue() (only get_pipeline_queue_manager
-                    # (project, board) / PipelineQueueManager actually exist in
-                    # services/pipeline_queue_manager.py), so this protection
-                    # was a silent no-op -- the ImportError was swallowed by
-                    # the broad except below and only ever logged at debug
-                    # level. Implemented properly now that the queue manager
-                    # exposes get_issue_status(): skip retry-marking if the
-                    # issue is already 'waiting' or 'active' in the queue for
-                    # any of its pipelines' boards -- it's already about to be
-                    # (or currently being) legitimately processed, so marking
-                    # it 'failure' here to force a retry would race with that.
-                    try:
-                        from services.pipeline_queue_manager import get_pipeline_queue_manager
-
-                        already_queued_or_active = False
-                        # Reuses project_config fetched once above PROTECTION 2 --
-                        # see the comment there.
-                        #
-                        # Deliberately still checks EVERY board, unlike PROTECTION 2
-                        # above: this asks "is this issue already queued anywhere",
-                        # and an issue very often sits in a different board's queue
-                        # from the one its last execution ran on (that's what a
-                        # board-to-board handoff looks like). Narrowing this one to
-                        # the recorded board would make the watchdog mark an issue
-                        # for retry while it is legitimately queued elsewhere.
-                        for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
-                            board_name = getattr(pipeline_cfg, 'board_name', None)
-                            if not board_name:
-                                continue
-                            queue_manager = queue_manager_cache.get((project_name, board_name))
-                            if queue_manager is None:
-                                queue_manager = get_pipeline_queue_manager(project_name, board_name)
-                                queue_manager_cache[(project_name, board_name)] = queue_manager
-                            queue_status = queue_manager.get_issue_status(issue_number)
-                            if queue_status in ('waiting', 'active'):
-                                logger.debug(
-                                    f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                                    f"already '{queue_status}' in pipeline queue for board '{board_name}'"
-                                )
-                                already_queued_or_active = True
-                                break
-
-                        if already_queued_or_active:
-                            continue
-                    except (AttributeError, TypeError, ImportError) as e:
-                        # See PROTECTION 2's matching handler (#140 item 31) --
-                        # including why both of these log and fall through rather
-                        # than skipping the issue. ImportError is in the list here
-                        # because that is literally how this protection was dead
-                        # before #57 -- an import of a function that never existed,
-                        # logged at debug and never noticed.
-                        logger.error(
-                            f"Watchdog: PROTECTION 3 (queue status) failed for "
-                            f"{project_name}/#{issue_number} with a programming error "
-                            f"-- this protection is not working, continuing without it: {e}",
-                            exc_info=True
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Watchdog: Could not check queue status for "
-                            f"{project_name}/#{issue_number} -- PROTECTION 3 skipped: {e}"
-                        )
+                    if self._watchdog_queue_blocks_retry(
+                        project_name, issue_number, project_config, queue_manager_cache
+                    ):
+                        continue
 
                     # PROTECTION 4: Check execution eligibility
                     agent = last_exec.get('agent')
@@ -2407,11 +2531,20 @@ class WorkExecutionStateTracker:
                     # and surfaces as an unexplained polling stall rather than as an
                     # error. It cost nothing before #166 only because the gate returned
                     # before its first network call on every production record.
+                    #
+                    # project_config/agent/column ride along so the rewrite pass can
+                    # re-run PROTECTIONS 2/3/4 without re-reading the project's YAML
+                    # or re-deriving them from a record it re-reads anyway (#166
+                    # review): every protection except PROTECTION 1 was answered once
+                    # here and then acted on minutes later.
                     candidates.append({
                         'state_file': state_file,
                         'project_name': project_name,
                         'issue_number': issue_number,
                         'execution': last_exec,
+                        'project_config': project_config,
+                        'agent': agent,
+                        'column': column,
                     })
 
             except Exception as e:
@@ -2437,7 +2570,9 @@ class WorkExecutionStateTracker:
                     )
                     continue
 
-                if self._rewrite_verified_empty_execution(state_file, candidate):
+                if self._rewrite_verified_empty_execution(
+                    state_file, candidate, queue_manager_cache
+                ):
                     retried_count += 1
 
             except Exception as e:
@@ -2448,7 +2583,9 @@ class WorkExecutionStateTracker:
 
         return retried_count
 
-    def _rewrite_verified_empty_execution(self, state_file, candidate: dict) -> bool:
+    def _rewrite_verified_empty_execution(
+        self, state_file, candidate: dict, queue_manager_cache: dict = None
+    ) -> bool:
         """Rewrite one verified-empty 'success' record to 'failure', under the lock.
 
         The second half of the sweep's two-phase shape. The GitHub verification that
@@ -2456,10 +2593,30 @@ class WorkExecutionStateTracker:
         the record it was about may have moved on: an outcome recorded, a fresh
         dispatch appended, another sweep's rewrite. The re-read here closes that
         window -- it re-establishes that the last record is still the same 'success'
-        entry (timestamp + agent + column identify it) and re-runs PROTECTION 1
-        before rewriting. Anything else means the verification answered a question
-        about a state that no longer exists, and the record is left for the next
-        sweep rather than rewritten on a stale answer.
+        entry (timestamp + agent + column identify it). Anything else means the
+        verification answered a question about a state that no longer exists, and the
+        record is left for the next sweep rather than rewritten on a stale answer.
+
+        EVERY protection is re-run here, not just PROTECTION 1 (#166 review). The
+        first version re-ran PROTECTION 1 alone, on the theory that a state worth
+        skipping would show up as an in_progress entry -- and none of the other three
+        does. PROTECTION 3's whole subject is an issue sitting 'waiting' in a queue,
+        which has no execution record at all until dispatch time; PROTECTION 4 refuses
+        on a closed issue, a card a human moved, and a pipeline run that ended, none
+        of which touch this file either. The window is not small: phase 2 is serial
+        over every candidate and each one can spend minutes inside `gh` (30s
+        rate-limit sleeps, a 30s subprocess timeout, a 2/4/8s retry ladder), so the
+        last candidate's rewrite can land 15-20 minutes after its eligibility check.
+        Acting on a stale answer there writes a spurious 'failure', and
+        count_consecutive_failures() accumulates those straight toward
+        project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES -- whose terminal state is
+        mark_failed() with the board's lock durably retained, i.e. exactly the blast
+        radius #166 set out to bound.
+
+        PROTECTION 4 runs BEFORE the lock is taken, because it makes its own GraphQL
+        call and holding this issue's flock across a GitHub call is what the two-phase
+        split exists to avoid. PROTECTIONS 1/2/3 are local/Redis reads and run inside
+        it, as tight to the write as they can be.
 
         Returns True only when the record was actually rewritten.
         """
@@ -2468,6 +2625,25 @@ class WorkExecutionStateTracker:
         project_name = candidate['project_name']
         issue_number = candidate['issue_number']
         verified = candidate['execution']
+        agent = candidate.get('agent') or verified.get('agent')
+        column = candidate.get('column') or verified.get('column')
+        project_config = candidate.get('project_config')
+        if queue_manager_cache is None:
+            queue_manager_cache = {}
+
+        # PROTECTION 4 again, unlocked -- see the docstring. Its Check 1 (the retry
+        # budget) short-circuits before it touches GitHub, so a record that has
+        # already spent its budget costs nothing here.
+        should_retry, reason = self._should_retry_failed_execution(
+            project_name, issue_number, agent, column, verified,
+            project_config=project_config
+        )
+        if not should_retry:
+            logger.debug(
+                f"Watchdog: {project_name}/#{issue_number} stopped being eligible while "
+                f"its GitHub output was being verified: {reason}"
+            )
+            return False
 
         lock_file = state_file.with_suffix(state_file.suffix + '.lock')
         with file_lock(lock_file):
@@ -2500,6 +2676,19 @@ class WorkExecutionStateTracker:
                     f"Watchdog: Skipping {project_name}/#{issue_number}: work started "
                     f"while its GitHub output was being verified"
                 )
+                return False
+
+            # PROTECTIONS 2 and 3 again, for the same reason -- see the docstring.
+            # Both read local/Redis state, so unlike PROTECTION 4 above they are cheap
+            # enough to answer with the lock in hand.
+            if self._watchdog_board_lock_blocks_retry(
+                project_name, issue_number, project_config, last_exec
+            ):
+                return False
+
+            if self._watchdog_queue_blocks_retry(
+                project_name, issue_number, project_config, queue_manager_cache
+            ):
                 return False
 
             # ALL PROTECTIONS PASSED - Safe to mark for retry
@@ -2975,11 +3164,18 @@ class WorkExecutionStateTracker:
             )
             return _OUTPUT_EVIDENCE_UNVERIFIABLE
 
-        if not _newest_page_covers_window(comments.get('totalCount'), nodes, anchor):
+        # The strict test, not _newest_page_covers_window() (#166 review). A clipped
+        # comments page cannot vouch for the window no matter how old its own oldest
+        # node is, because the replies on the comments it dropped were never
+        # requested -- and a threaded reply is exactly where a human_feedback_loop
+        # response lands, on a thread whose root comment may be months old. A long
+        # epic Discussion that crosses 100 top-level comments would otherwise report
+        # a confident "no output" on every single sweep.
+        if not _page_holds_every_node(comments.get('totalCount'), nodes):
             logger.warning(
                 f"Watchdog: Discussion {discussion_id} for {project_name}/#{issue_number} "
-                f"has more comments than one page and the page does not reach back to "
-                f"{anchor.isoformat()} -- leaving the record alone"
+                f"has more comments than one page, so the replies on the ones it dropped "
+                f"were never read -- leaving the record alone"
             )
             return _OUTPUT_EVIDENCE_UNVERIFIABLE
 

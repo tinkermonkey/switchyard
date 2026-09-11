@@ -16,7 +16,7 @@ if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
 import yaml
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, call, patch, mock_open
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,11 +28,13 @@ with tempfile.TemporaryDirectory() as _tmpdir:
     with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
         from services.work_execution_state import (
             WorkExecutionStateTracker,
+            _watchdog_max_retries,
             _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES,
             _WATCHDOG_UNATTRIBUTABLE_AGENTS,
         )
 
 from config.manager import ProjectConfig
+from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
 
 
 # The allowlist, spelled out here rather than imported. Every dispatch path named
@@ -1292,9 +1294,8 @@ class TestGitHubOutputVerification:
             ) is True
 
     def test_a_truncated_discussion_page_is_unverifiable(self, tracker):
-        """`last: 100` drops the OLDEST comments, so the page covers the window
-        only when its own first node already predates the anchor. A page whose
-        oldest node is newer than the anchor may have dropped the agent's."""
+        """`last: 100` drops the OLDEST comments, and the query only ever asked for
+        replies on the comments it got back."""
         payload = self._discussion_payload([
             (_iso(minutes_ago=50), 'a later human comment', []),
         ])
@@ -1311,14 +1312,41 @@ class TestGitHubOutputVerification:
                 'test-project', 123, self._execution(column='Research')
             ) is True
 
-    def test_a_discussion_page_that_reaches_past_the_anchor_is_enough(self, tracker):
-        """The same truncation, but the page's oldest node predates the execution
-        -- everything dropped is older still, so nothing in the window is missing
-        and the gate may answer for real."""
+    def test_a_truncated_page_whose_own_nodes_predate_the_anchor_is_still_unverifiable(
+        self, tracker
+    ):
+        """REGRESSION (#166 review): the comment-level createdAt test used to let a
+        clipped page through -- 'everything dropped is older than nodes[0], which is
+        already older than the anchor'. That reasoning holds for the dropped COMMENTS
+        and for nothing else. Threaded replies are where a human_feedback_loop
+        response lands, and a reply posted minutes ago can hang off a comment created
+        months ago; the replies on the dropped comments were never requested at all.
+        A long epic Discussion past 100 top-level comments therefore answered a
+        confident 'no output' on every single sweep, which is the systematic
+        wrongness the rest of the watchdog's budgets are sized against."""
         payload = self._discussion_payload([
             (_iso(minutes_ago=600), 'an older human comment', []),
         ])
         payload['node']['comments']['totalCount'] = 500
+
+        gh_client = MagicMock()
+        gh_client.rest.return_value = (True, [])
+        gh_client.graphql.return_value = (True, payload)
+
+        with self._gate_environment(
+            gh_client, workspace_type='discussions', discussion_id='D_kwDO123'
+        ):
+            assert tracker._has_github_output(
+                'test-project', 123, self._execution(column='Research')
+            ) is True
+
+    def test_a_complete_discussion_page_is_enough(self, tracker):
+        """The page returned the connection in full (totalCount == len(nodes)), so
+        nothing -- comment or reply -- was dropped and the gate may answer for real."""
+        payload = self._discussion_payload([
+            (_iso(minutes_ago=600), 'an older human comment', []),
+        ])
+        assert payload['node']['comments']['totalCount'] == 1
 
         gh_client = MagicMock()
         gh_client.rest.return_value = (True, [])
@@ -1666,8 +1694,13 @@ class TestProtection2BoardScoping:
         retried_count = self._run(tracker, mock_lock_manager)
 
         assert retried_count == 1
-        # Scoped: only the execution's own board was consulted at all.
-        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with('test-project', 'SDLC Execution')
+        # Scoped: only the execution's own board was consulted at all. Twice, once
+        # per sweep pass -- the rewrite pass re-runs every protection rather than
+        # acting on a phase-1 answer that may be many minutes old (#166 review).
+        assert mock_lock_manager.get_lock_holder_fail_closed.call_args_list == [
+            call('test-project', 'SDLC Execution'),
+            call('test-project', 'SDLC Execution'),
+        ]
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'failure'
 
@@ -1790,11 +1823,14 @@ class TestQueueManagerCachedPerSweep:
                                     retried_count = tracker.detect_and_retry_empty_successful_executions()
 
         assert retried_count == 2
-        # One manager for the one board, reused across both state files...
+        # One manager for the one board, reused across both state files AND across
+        # both sweep passes -- the cache is handed to the rewrite pass rather than
+        # rebuilt there (#166 review).
         factory.assert_called_once_with('test-project', 'SDLC Execution')
         # ...but the queue itself is still re-read per check, never snapshotted:
-        # PROTECTION 3 is a race guard and must not act on a stale view.
-        assert mock_queue_manager.get_issue_status.call_count == 2
+        # PROTECTION 3 is a race guard and must not act on a stale view. Two state
+        # files x two passes (collection, then again immediately before the rewrite).
+        assert mock_queue_manager.get_issue_status.call_count == 4
 
 
 class TestProtectionFailureVisibility:
@@ -2115,9 +2151,11 @@ class TestRecordExecutionStartBoardName:
         retried_count = TestProtection2BoardScoping._run(tracker, mock_lock_manager)
 
         assert retried_count == 1
-        mock_lock_manager.get_lock_holder_fail_closed.assert_called_once_with(
-            'test-project', 'SDLC Execution'
-        )
+        # Once per sweep pass -- see TestProtection2BoardScoping.
+        assert mock_lock_manager.get_lock_holder_fail_closed.call_args_list == [
+            call('test-project', 'SDLC Execution'),
+            call('test-project', 'SDLC Execution'),
+        ]
 
     def test_the_crash_recovery_record_has_no_board_and_gets_the_fallback(
         self, tracker, temp_state_dir
@@ -2149,7 +2187,12 @@ class TestRecordExecutionStartBoardName:
             call.args[1]
             for call in mock_lock_manager.get_lock_holder_fail_closed.call_args_list
         ]
-        assert checked == ['Planning Design', 'SDLC Execution']
+        # Both boards, because the record carries none -- twice over, once per
+        # sweep pass (#166 review).
+        assert checked == [
+            'Planning Design', 'SDLC Execution',
+            'Planning Design', 'SDLC Execution',
+        ]
 
     def test_board_name_is_omitted_rather_than_written_as_none(self, tracker):
         """An explicit None would be indistinguishable from a board recorded as
@@ -3423,10 +3466,16 @@ class TestTheGateDoesNotRunUnderTheStateFileLock:
                 }],
             }, f)
 
-        rewritten = tracker._rewrite_verified_empty_execution(
-            state_file,
-            {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
-        )
+        # PROTECTION 4 is stubbed eligible so the identity check is what answers
+        # here -- the re-check runs first and would otherwise refuse for its own
+        # (unrelated) reason, passing this test for the wrong reason.
+        with patch.object(
+            tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+        ):
+            rewritten = tracker._rewrite_verified_empty_execution(
+                state_file,
+                {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
+            )
 
         assert rewritten is False
         with open(state_file) as f:
@@ -3461,14 +3510,213 @@ class TestTheGateDoesNotRunUnderTheStateFileLock:
                 ],
             }, f)
 
-        rewritten = tracker._rewrite_verified_empty_execution(
-            state_file,
-            {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
-        )
+        # Stubbed eligible for the same reason as the test above: PROTECTION 1 is
+        # what this test is about.
+        with patch.object(
+            tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
+        ):
+            rewritten = tracker._rewrite_verified_empty_execution(
+                state_file,
+                {'project_name': 'test-project', 'issue_number': 123, 'execution': verified},
+            )
 
         assert rewritten is False
         with open(state_file) as f:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
+
+
+class TestEveryProtectionIsRecheckedBeforeTheRewrite:
+    """#166 review: the sweep collects candidates under each state file's lock and
+    then verifies them against GitHub with no lock held, serially, every candidate
+    able to spend minutes inside `gh` (30s rate-limit sleeps, a 30s subprocess
+    timeout, a 2/4/8s retry ladder). The first version re-ran PROTECTION 1 alone
+    before rewriting, so PROTECTIONS 2, 3 and 4 were acted on from an answer that
+    could be 15-20 minutes stale -- and PROTECTION 1 cannot stand in for any of
+    them: a queued issue, a closed issue, a card a human moved and a pipeline run
+    that ended all leave no in_progress entry behind. Each spurious 'failure' feeds
+    count_consecutive_failures() straight toward MAX_CONSECUTIVE_DISPATCH_FAILURES,
+    whose terminal state retains the whole board's pipeline lock.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _run(tracker, lock_manager=None, queue_manager=None,
+             should_retry=None, during_verification=None):
+        """One sweep over the tmpdir, with the verification step stubbed to "no
+        output" and an optional callback fired while it is running -- i.e. exactly
+        in the window the two-phase split opens."""
+        if lock_manager is None:
+            lock_manager = MagicMock()
+            lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        if queue_manager is None:
+            queue_manager = MagicMock()
+            queue_manager.get_issue_status.return_value = None
+        if should_retry is None:
+            should_retry = lambda *a, **k: (True, 'eligible')
+
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        def _verify(*args, **kwargs):
+            if during_verification:
+                during_verification()
+            return False
+
+        with patch.object(tracker, '_should_retry_failed_execution',
+                          side_effect=should_retry), \
+             patch.object(tracker, '_has_github_output', side_effect=_verify), \
+             patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=lock_manager), \
+             patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
+                   return_value=queue_manager):
+            mock_config_manager.get_project_config.return_value = project_config
+            return tracker.detect_and_retry_empty_successful_executions()
+
+    @staticmethod
+    def _outcome(state_file):
+        with open(state_file) as f:
+            return yaml.safe_load(f)['execution_history'][-1]['outcome']
+
+    def test_the_baseline_still_rewrites(self, tracker, temp_state_dir):
+        """Control: with nothing changing under it, the sweep still does its job."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+
+        assert self._run(tracker) == 1
+        assert self._outcome(state_file) == 'failure'
+
+    def test_an_issue_queued_during_verification_is_not_rewritten(
+        self, tracker, temp_state_dir
+    ):
+        """PROTECTION 3. An issue enqueued while this sweep was talking to GitHub
+        has no execution record at all -- record_execution_start() runs at dispatch
+        time, after the enqueue -- so PROTECTION 1's re-run cannot see it."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+
+        def _enqueue_it():
+            queue_manager.get_issue_status.return_value = 'waiting'
+
+        assert self._run(
+            tracker, queue_manager=queue_manager, during_verification=_enqueue_it
+        ) == 0
+        assert self._outcome(state_file) == 'success'
+
+    def test_a_board_lock_taken_during_verification_is_not_rewritten(
+        self, tracker, temp_state_dir
+    ):
+        """PROTECTION 2. A different issue took this board's pipeline lock while
+        the gate was running."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+
+        def _another_issue_takes_the_lock():
+            lock_manager.get_lock_holder_fail_closed.return_value = (999, True)
+
+        assert self._run(
+            tracker, lock_manager=lock_manager,
+            during_verification=_another_issue_takes_the_lock
+        ) == 0
+        assert self._outcome(state_file) == 'success'
+
+    def test_an_issue_that_stopped_being_eligible_is_not_rewritten(
+        self, tracker, temp_state_dir
+    ):
+        """PROTECTION 4, which is the one that answers 'the pipeline run ended',
+        'a human closed the issue' and 'the card moved' -- none of which touch the
+        state file, so nothing else in the rewrite pass would notice."""
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        answers = iter([(True, 'eligible'), (False, 'no_active_pipeline_run')])
+
+        assert self._run(tracker, should_retry=lambda *a, **k: next(answers)) == 0
+        assert self._outcome(state_file) == 'success'
+
+    def test_the_eligibility_recheck_runs_with_no_state_file_lock_held(
+        self, tracker, temp_state_dir
+    ):
+        """_should_retry_failed_execution() makes its own GraphQL call, and holding
+        this issue's flock across a GitHub call is the whole thing the two-phase
+        split exists to avoid -- every record_execution_start()/outcome() for the
+        issue queues behind it, several from async callers on the event loop. flock
+        is per open-file-description, so a second fd in this same process proves it:
+        it would fail to take the lock if the rewrite pass were holding it."""
+        import fcntl
+
+        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
+        lock_file = state_file.with_suffix(state_file.suffix + '.lock')
+        held_during = []
+
+        def _lock_is_taken():
+            fd = os.open(str(lock_file), os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return False
+            except OSError:
+                return True
+            finally:
+                os.close(fd)
+
+        calls = []
+
+        def _answer(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:  # the rewrite pass's re-check
+                held_during.append(_lock_is_taken())
+            return (True, 'eligible')
+
+        assert self._run(tracker, should_retry=_answer) == 1
+        assert held_during == [False]
+
+
+class TestTheWatchdogBudgetStaysBelowTheDispatchBudget:
+    """#166 review. Each watchdog rewrite turns this record's trailing 'success'
+    into a trailing 'failure' for the same (column, agent) -- it rewrites in place
+    rather than appending -- which is exactly what count_consecutive_failures()
+    accumulates. Both budgets defaulted to 3, so the last redispatch the watchdog
+    was allowed to invite was also the one that tripped project_monitor's
+    mark_failed(): NOT a plain release, the board's pipeline lock stays held and
+    durably marked retained-due-to-failure, blocking every sibling issue on that
+    board until a human runs scripts/release_lock.py. One issue the gate is
+    systematically wrong about took the whole board offline in ~3 sweeps.
+    """
+
+    def test_the_default_is_strictly_below_the_dispatch_failure_budget(self):
+        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('WATCHDOG_MAX_RETRIES', None)
+            assert _watchdog_max_retries() < MAX_CONSECUTIVE_DISPATCH_FAILURES
+
+    def test_an_override_cannot_raise_it_back_onto_the_dispatch_budget(self):
+        """Configuring the two to converge again is not a configuration choice, it
+        is the escalation path reopening -- so the override is clamped, not obeyed."""
+        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
+
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': '99'}):
+            assert _watchdog_max_retries() == MAX_CONSECUTIVE_DISPATCH_FAILURES - 1
+
+    def test_a_smaller_override_is_still_honored(self):
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': '1'}):
+            assert _watchdog_max_retries() == 1
+
+    def test_an_unparseable_override_falls_back_rather_than_raising(self):
+        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
+
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': 'three'}):
+            assert 1 <= _watchdog_max_retries() < MAX_CONSECUTIVE_DISPATCH_FAILURES
 
 
 class TestWatchdogRetryBudgetSurvivesTheRedispatch:
@@ -3478,7 +3726,7 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
     sweep never looks at a state file whose last record is not 'success' -- so
     that record is never read again. The redispatch it invites appends a brand-new
     entry carrying nothing, which meant the count on any record was only ever 0 or
-    1 and _should_retry_failed_execution()'s `>= 3` was unreachable. What actually
+    1 and _should_retry_failed_execution()'s limit was unreachable. What actually
     stopped a false-positive loop was project_monitor's
     MAX_CONSECUTIVE_DISPATCH_FAILURES, whose terminal state is mark_failed() with
     the board's pipeline lock durably retained.
@@ -3554,9 +3802,46 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
 
         assert 'watchdog_retry_count' not in self._last(tracker)
 
-    def test_three_rewrites_in_a_row_exhaust_the_budget(self, tracker):
+    def test_the_count_survives_an_interleaved_record_for_another_agent(self, tracker):
+        """REGRESSION (#166 review): the lookback read history[-1] and only THEN
+        tested column/agent, i.e. "the last record in the whole file, if it happens
+        to be this pair" rather than "the last record for this pair". A state file
+        is per (project, issue) and holds records for every column, agent and board
+        the issue has ever touched, so an issue live on two boards -- or a
+        pipeline_progression / review_cycle dispatch -- appended an unrelated entry
+        between the rewrite and the redispatch and silently reset the budget to
+        zero, which is exactly the condition the carry was added to prevent."""
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+        state = tracker.load_state('test-project', 123)
+        state['execution_history'][-1].update({
+            'outcome': 'failure',
+            'watchdog_retry_triggered': True,
+            'watchdog_retry_count': 2,
+        })
+        tracker.save_state('test-project', 123, state)
+
+        # The other board of the same issue dispatches first.
+        tracker.record_execution_start(
+            issue_number=123, column='Research', agent='business_analyst',
+            trigger_source='pipeline_progression', project_name='test-project',
+        )
+
+        tracker.record_execution_start(
+            issue_number=123, column='In Progress', agent='test-agent',
+            trigger_source='board_dispatch', project_name='test-project',
+        )
+
+        assert self._last(tracker)['watchdog_retry_count'] == 2
+
+    def test_the_budget_is_exhausted_before_the_dispatch_failure_budget(self, tracker):
         """The end-to-end guarantee the budget is supposed to give: sweep,
-        redispatch, sweep, redispatch, sweep -- and the fourth sweep refuses."""
+        redispatch, sweep, redispatch -- and the third sweep refuses, one rewrite
+        short of the three consecutive 'failure' records that would trip
+        project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES and durably retain the
+        board's lock."""
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
         project_config = ProjectConfig(
@@ -3617,7 +3902,7 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
 
         dispatch_and_succeed()
 
-        for expected in (1, 2, 3):
+        for expected in (1, 2):
             with sweep_environment():
                 # PROTECTION 4 stubbed only for the rewrites; the final sweep runs
                 # the real check, which is where the budget is enforced.
@@ -3626,6 +3911,12 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
                 ):
                     assert tracker.detect_and_retry_empty_successful_executions() == 1
             assert self._last(tracker)['watchdog_retry_count'] == expected
+            # The rewrite is in place, so this is also what project_monitor sees
+            # when it decides between redispatching and mark_failed().
+            assert tracker.count_consecutive_failures(
+                'test-project', 123, 'In Progress', 'test-agent'
+            ) == expected
+            assert expected < MAX_CONSECUTIVE_DISPATCH_FAILURES
             dispatch_and_succeed()
             assert self._last(tracker)['watchdog_retry_count'] == expected
 
@@ -3635,6 +3926,13 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
             assert tracker.detect_and_retry_empty_successful_executions() == 0
 
         assert self._last(tracker)['outcome'] == 'success'
+        # And the point of stopping there: across the whole run the watchdog wrote
+        # fewer 'failure' records than MAX_CONSECUTIVE_DISPATCH_FAILURES, so no
+        # sequence of its rewrites can reach mark_failed() and durably retain the
+        # board's pipeline lock.
+        history = tracker.load_state('test-project', 123)['execution_history']
+        failures = [e for e in history if e.get('watchdog_retry_triggered')]
+        assert len(failures) < MAX_CONSECUTIVE_DISPATCH_FAILURES
 
 
 class TestRedisRecoveredOutcomesAreMarked:

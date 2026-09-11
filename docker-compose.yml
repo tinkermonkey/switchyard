@@ -61,7 +61,7 @@ services:
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
       - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-1}
       # Watchdog retry configuration
-      - WATCHDOG_MAX_RETRIES=${WATCHDOG_MAX_RETRIES:-3}
+      - WATCHDOG_MAX_RETRIES=${WATCHDOG_MAX_RETRIES:-2}
       # Worker pool configuration
       # Set to 1 for single-threaded (default), 2-8 for multi-threaded parallel execution
       # Recommended: 2-3 workers for multi-project deployments
