@@ -24,14 +24,14 @@ Two conditions are worth an operator's attention:
     anywhere in six and nine months respectively.
 
   * BACKUP CHURN -- `github_state_backup_*.yaml` files. Reconciliation writes
-    one per project per run and, before STATE_BACKUP_RETENTION existed, never
-    deleted one. Nothing has ever read one. 3,196 of them / 31MB had
-    accumulated, 612 for a single project.
+    one per project per run and nothing has ever read one; 3,196 of them / 31MB
+    had accumulated, 612 for a single project. Counted here for visibility, but
+    aged out by the shared retention sweep -- see
+    scripts/inspect_data_retention.py, which owns every age-based rule so that
+    no two places can hold different opinions about the same files.
 
 Removal is opt-in, one project at a time, with the name typed out
 (`--remove-orphan NAME`), and it refuses any name that still has a config.
-Backup pruning (`--prune-backups`) applies the same retention the orchestrator
-now applies on its own, and is safe to run at any time.
 
 Decommissioning a project fully is more than this script: drain its queued
 Redis tasks, release its pipeline locks (scripts/release_lock.py), remove its
@@ -43,8 +43,6 @@ Usage:
     python scripts/inspect_project_state.py
     python scripts/inspect_project_state.py --json
     python scripts/inspect_project_state.py --orphans-only
-    python scripts/inspect_project_state.py --prune-backups
-    python scripts/inspect_project_state.py --prune-backups --keep 5
     python scripts/inspect_project_state.py --remove-orphan agent_team_ansible
 """
 
@@ -56,7 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config.state_manager import state_manager, STATE_BACKUP_RETENTION  # noqa: E402
+from config.state_manager import state_manager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +108,6 @@ def collect() -> dict:
                 'backup_count': len(backups),
                 'newest_backup': backups[0].name if backups else None,
                 'oldest_backup': backups[-1].name if backups else None,
-                'prunable_backups': max(0, len(backups) - STATE_BACKUP_RETENTION),
                 'size_bytes': _dir_size_bytes(project_dir),
             })
 
@@ -118,11 +115,9 @@ def collect() -> dict:
         'state_root': str(state_manager.state_root),
         'config_dir': str(getattr(state_manager.config_manager, 'projects_dir', '?')),
         'configured_count': len(_configured_projects()),
-        'retention': STATE_BACKUP_RETENTION,
         'projects': entries,
         'orphaned': sorted(orphaned),
         'total_backups': sum(e['backup_count'] for e in entries),
-        'total_prunable': sum(e['prunable_backups'] for e in entries),
         'total_size_bytes': sum(e['size_bytes'] for e in entries),
     }
 
@@ -131,8 +126,6 @@ def report(data: dict, orphans_only: bool) -> None:
     print(f"State root:  {data['state_root']}")
     print(f"Config dir:  {data['config_dir']} "
           f"({data['configured_count']} project config(s))")
-    print(f"Backup retention: {data['retention']} per project "
-          f"(STATE_BACKUP_RETENTION)")
     if not data['configured_count']:
         # Without this the report below silently says "nothing is orphaned",
         # which is true but for the wrong reason and hides that the run was
@@ -158,15 +151,14 @@ def report(data: dict, orphans_only: bool) -> None:
         flag = 'ORPHANED' if e['orphaned'] else '        '
         missing = '' if e['has_github_state'] else '  (no github_state.yaml)'
         print(f"  {flag}  {e['project']:<{width}}  "
-              f"backups={e['backup_count']:>4} "
-              f"(prunable {e['prunable_backups']:>4})  "
+              f"backups={e['backup_count']:>4}  "
               f"{_human(e['size_bytes']):>8}{missing}")
 
     print()
     print(f"{len(data['orphaned'])} orphaned, "
-          f"{data['total_backups']} backups "
-          f"({data['total_prunable']} prunable), "
+          f"{data['total_backups']} backups, "
           f"{_human(data['total_size_bytes'])} total")
+    print("Backups are aged out by scripts/inspect_data_retention.py.")
 
     if data['orphaned']:
         print()
@@ -176,19 +168,6 @@ def report(data: dict, orphans_only: bool) -> None:
         for name in data['orphaned']:
             print(f"    python scripts/inspect_project_state.py "
                   f"--remove-orphan {name}")
-
-
-def prune_backups(keep: int) -> int:
-    total = 0
-    for project_dir in sorted(state_manager.projects_state_dir.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        deleted = state_manager.prune_state_backups(project_dir.name, keep=keep)
-        if deleted:
-            print(f"  {project_dir.name}: removed {len(deleted)} backup(s)")
-            total += len(deleted)
-    print(f"Removed {total} backup file(s), keeping the {keep} newest per project.")
-    return total
 
 
 def remove_orphan(name: str) -> int:
@@ -247,11 +226,6 @@ def main() -> int:
                         help='Machine-readable output (report only)')
     parser.add_argument('--orphans-only', action='store_true',
                         help='Only list state with no matching config')
-    parser.add_argument('--prune-backups', action='store_true',
-                        help='Delete backups beyond the retention limit')
-    parser.add_argument('--keep', type=int, default=None,
-                        help=f'Backups to keep per project with --prune-backups '
-                             f'(default: {STATE_BACKUP_RETENTION})')
     parser.add_argument('--remove-orphan', metavar='NAME',
                         help='Remove ONE orphaned project state directory')
     args = parser.parse_args()
@@ -260,11 +234,6 @@ def main() -> int:
 
     if args.remove_orphan:
         return remove_orphan(args.remove_orphan)
-
-    if args.prune_backups:
-        keep = STATE_BACKUP_RETENTION if args.keep is None else max(0, args.keep)
-        prune_backups(keep)
-        return 0
 
     data = collect()
     if args.json:

@@ -11,11 +11,14 @@ notice, both found on the live deployment (#175's siblings):
     `agent_team_ansible` and `switchyard`, six and nine months untouched. The
     orchestrator had no opinion about them at all, in either direction.
 
-The answer taken here is: bound the backups automatically, report the orphans
-loudly, and remove them only when an operator types the name. Removing state
-on its own is not safe -- a config can go missing without the project being
-decommissioned, and a reconciliation that cannot see an existing board creates
-a duplicate rather than adopting it.
+The answer taken here is: report the orphans loudly and remove them only when
+an operator types the name. Removing state on its own is not safe -- a config
+can go missing without the project being decommissioned, and a reconciliation
+that cannot see an existing board creates a duplicate rather than adopting it.
+
+The backups are aged out by the shared retention sweep
+(services/data_retention.py) on config/retention.py's single RETENTION_DAYS
+window -- not bounded here, and deliberately not by count. See TestBackups.
 """
 
 from pathlib import Path
@@ -25,7 +28,7 @@ import pytest
 
 yaml = pytest.importorskip("yaml")
 
-from config.state_manager import GitHubStateManager, STATE_BACKUP_RETENTION  # noqa: E402
+from config.state_manager import GitHubStateManager  # noqa: E402
 
 
 def _manager(tmp_path: Path, configured_projects=(), declared_names=None):
@@ -62,31 +65,34 @@ def _seed_backups(manager: GitHubStateManager, project: str, stamps) -> None:
         (project_dir / f"github_state_backup_{stamp}.yaml").write_text("{}\n")
 
 
-class TestBackupRetention:
+class TestBackups:
+    """Backups accumulate here and are aged out by the shared retention sweep.
 
-    def test_backup_state_keeps_only_the_retention_limit(self, tmp_path):
+    They used to be bounded by COUNT ("keep the 10 newest"), which is not
+    aging at all -- ten backups is four days on a busy project and nine months
+    on a quiet one, and it would have deleted backups from inside the retention
+    window that services/data_retention.py intends to keep. Two mechanisms with
+    two answers for the same files is what the single RETENTION_DAYS value
+    exists to prevent, so the count rule is gone and only listing remains.
+    """
+
+    def test_backup_state_writes_a_copy_and_leaves_the_rest_alone(self, tmp_path):
         manager = _manager(tmp_path, ['proj'])
         _seed_state(manager, 'proj')
-        _seed_backups(manager, 'proj', [
-            f"2026010{d}_120000" for d in range(1, 10)
-        ] + [f"2026011{d}_120000" for d in range(0, 9)])
+        _seed_backups(manager, 'proj', [f"2026010{d}_120000" for d in range(1, 10)])
 
-        assert len(manager.list_state_backups('proj')) == 18
         manager.backup_state('proj')
 
-        remaining = manager.list_state_backups('proj')
-        assert len(remaining) == STATE_BACKUP_RETENTION
+        assert len(manager.list_state_backups('proj')) == 10, \
+            "nothing is pruned on write -- ageing is the sweep's job"
 
-    def test_the_newest_backups_are_the_ones_kept(self, tmp_path):
-        """Ordered by the timestamp in the NAME, not by mtime.
-
-        backup_state() writes with shutil.copy2, which preserves the source
+    def test_backups_are_listed_newest_first_by_NAME_not_mtime(self, tmp_path):
+        """backup_state() writes with shutil.copy2, which preserves the source
         file's mtime rather than recording when the copy was taken -- so every
         backup of an unchanged state file shares one mtime and mtime order
-        carries no information. Seeded here with all mtimes equal on purpose.
-        """
+        carries no information. Seeded with all mtimes equal on purpose."""
         manager = _manager(tmp_path, ['proj'])
-        stamps = [f"2026030{d}_090000" for d in range(1, 9)]
+        stamps = [f"2026030{d}_090000" for d in range(1, 6)]
         _seed_backups(manager, 'proj', stamps)
 
         project_dir = manager.projects_state_dir / 'proj'
@@ -94,52 +100,20 @@ class TestBackupRetention:
             import os
             os.utime(path, (1_700_000_000, 1_700_000_000))
 
-        manager.prune_state_backups('proj', keep=3)
+        names = [p.name for p in manager.list_state_backups('proj')]
 
-        kept = sorted(p.name for p in manager.list_state_backups('proj'))
-        assert kept == [
-            'github_state_backup_20260306_090000.yaml',
-            'github_state_backup_20260307_090000.yaml',
-            'github_state_backup_20260308_090000.yaml',
-        ]
+        assert names == [f"github_state_backup_{s}.yaml" for s in reversed(stamps)]
 
-    def test_pruning_never_touches_the_live_state_file(self, tmp_path):
-        manager = _manager(tmp_path, ['proj'])
-        state_file = _seed_state(manager, 'proj')
-        _seed_backups(manager, 'proj', [f"2026020{d}_100000" for d in range(1, 9)])
-
-        manager.prune_state_backups('proj', keep=0)
-
-        assert state_file.exists()
-        assert manager.list_state_backups('proj') == []
-
-    def test_pruning_an_unknown_project_is_a_no_op(self, tmp_path):
+    def test_listing_an_unknown_project_is_a_no_op(self, tmp_path):
         manager = _manager(tmp_path)
-        assert manager.prune_state_backups('never-existed') == []
+        assert manager.list_state_backups('never-existed') == []
 
-    def test_a_backup_that_cannot_be_deleted_does_not_abort_the_sweep(
-        self, tmp_path, monkeypatch
-    ):
-        """This runs inside reconciliation; it must never be why one fails."""
-        manager = _manager(tmp_path, ['proj'])
-        _seed_backups(manager, 'proj', [f"2026040{d}_110000" for d in range(1, 6)])
+    def test_the_count_based_rule_is_gone(self):
+        """Pinned so it cannot come back alongside the age-based sweep."""
+        import config.state_manager as sm
 
-        real_unlink = Path.unlink
-        calls = {'n': 0}
-
-        def flaky_unlink(self, *a, **kw):
-            calls['n'] += 1
-            if calls['n'] == 1:
-                raise OSError("permission denied")
-            return real_unlink(self, *a, **kw)
-
-        monkeypatch.setattr(Path, 'unlink', flaky_unlink)
-
-        deleted = manager.prune_state_backups('proj', keep=1)
-
-        assert len(deleted) == 3, "the sweep continued past the failure"
-        assert len(manager.list_state_backups('proj')) == 2, \
-            "the undeletable one is still there, and that is fine"
+        assert not hasattr(sm, 'STATE_BACKUP_RETENTION')
+        assert not hasattr(sm.GitHubStateManager, 'prune_state_backups')
 
 
 class TestOrphanedState:
@@ -240,6 +214,7 @@ class TestOperatorScript:
         by_name = {e['project']: e for e in data['projects']}
         assert by_name['gone']['orphaned'] is True
         assert by_name['gone']['backup_count'] == 6
+        assert 'prunable_backups' not in by_name['gone']
         assert by_name['live-project']['orphaned'] is False
         assert data['orphaned'] == ['gone']
 

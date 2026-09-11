@@ -21,22 +21,17 @@ from .manager import ConfigManager, ProjectConfig, WorkflowTemplate
 
 logger = logging.getLogger(__name__)
 
-# How many github_state_backup_*.yaml files to keep per project.
+# Backup retention is NOT declared here. It is age-based, comes from
+# config/retention.py's single RETENTION_DAYS value, and is applied by the
+# nightly sweep in services/data_retention.py -- the same window every
+# Elasticsearch ILM policy uses.
 #
-# backup_state() is called once per project per reconciliation, and
-# reconciliation runs on every orchestrator start and whenever a project's
-# state goes stale (RECONCILIATION_FRESHNESS_HOURS, 4h by default). Nothing
-# has ever deleted one, and -- more to the point -- nothing has ever READ one:
-# `github_state_backup_` appears exactly twice in the codebase, both in the
-# write below. They are a safety net for a human, not an input to any code
-# path, so the useful number of them is small and recent.
-#
-# Left unbounded they became the bulk of state/: 3,196 files / 31MB on the
-# live deployment when this was added, 612 of them for a single project, the
-# oldest 9 months old. That is also what made the two config-less project
-# state directories (#175's siblings) look substantial when their actual
-# content is one github_state.yaml each.
-STATE_BACKUP_RETENTION = max(1, int(os.environ.get('STATE_BACKUP_RETENTION', '10')))
+# An earlier version of this bounded backups by COUNT ("keep the 10 newest"),
+# which is not aging: ten backups is four days on a busy project and nine
+# months on a quiet one, and it would have deleted backups from inside the
+# retention window that the sweep intends to keep. Two mechanisms with two
+# different answers for the same files is exactly the situation the single
+# value exists to remove.
 
 
 @dataclass
@@ -491,8 +486,9 @@ class GitHubStateManager:
     def backup_state(self, project_name: str) -> str:
         """Create a backup of project state and return backup path.
 
-        Retains at most STATE_BACKUP_RETENTION backups per project, oldest
-        deleted first. See that constant for why these are bounded.
+        Unbounded here on purpose: these are aged out by the shared retention
+        sweep (services/data_retention.py), not pruned on write. See the note
+        beside the imports.
         """
         state_file = self._get_project_state_file(project_name)
         if not state_file.exists():
@@ -504,8 +500,6 @@ class GitHubStateManager:
         import shutil
         shutil.copy2(state_file, backup_file)
         logger.info(f"Created state backup: {backup_file}")
-
-        self.prune_state_backups(project_name)
         return str(backup_file)
 
     def list_state_backups(self, project_name: str) -> List[Path]:
@@ -525,30 +519,6 @@ class GitHubStateManager:
             key=lambda p: p.name,
             reverse=True,
         )
-
-    def prune_state_backups(self, project_name: str, keep: Optional[int] = None) -> List[Path]:
-        """Delete all but the `keep` newest backups. Returns what was deleted.
-
-        Best-effort per file: a backup that cannot be deleted is logged and
-        skipped rather than aborting the sweep, because this runs inside
-        reconciliation and must never be the reason a project fails to
-        reconcile.
-        """
-        keep = STATE_BACKUP_RETENTION if keep is None else max(0, keep)
-        backups = self.list_state_backups(project_name)
-        deleted = []
-        for stale in backups[keep:]:
-            try:
-                stale.unlink()
-                deleted.append(stale)
-            except OSError as e:
-                logger.warning(f"Could not remove stale state backup {stale}: {e}")
-        if deleted:
-            logger.info(
-                f"Pruned {len(deleted)} state backup(s) for {project_name}, "
-                f"keeping the {min(keep, len(backups))} newest"
-            )
-        return deleted
 
     def list_orphaned_project_state(self) -> List[str]:
         """Project state directories that no project config claims.
