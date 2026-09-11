@@ -301,8 +301,25 @@ class ObservabilityEvent:
     execution_type: str = ""
 
     def to_json(self) -> str:
-        """Serialize to JSON for Redis pub/sub"""
-        return json.dumps(asdict(self))
+        """Serialize to JSON for Redis pub/sub.
+
+        `default=str` because `data` is an open dict assembled by ~90 emit
+        sites out of task context, agent config and pipeline state. Anything
+        that is not JSON-native there -- a Path, a datetime, an Enum, a
+        dataclass, a config object -- used to raise TypeError out of
+        ObservabilityManager.emit(), which is called INLINE on the dispatch
+        path and does not guard this call. So one unexpected value in a
+        telemetry payload aborted the agent run it was describing.
+
+        Reached by four tests in tests/unit/test_workspace_contexts.py, which
+        pass a MagicMock agent_config into emit_agent_initialized() and got a
+        TypeError out of execute_agent() -- a mock standing in for exactly the
+        "some object nobody expected" case. Stringifying is the right trade
+        for an observability envelope: the event is still emitted, still
+        indexed, and still searchable, and from_json() already tolerates
+        fields it does not recognise.
+        """
+        return json.dumps(asdict(self), default=str)
 
     @classmethod
     def from_json(cls, json_str: str) -> 'ObservabilityEvent':
@@ -329,6 +346,17 @@ class ObservabilityManager:
         self.es = elasticsearch_client
 
         if not enabled:
+            # self.redis assigned BEFORE the early return, not after it. A
+            # disabled manager used to have no `redis` attribute at all, so
+            # every `if not self.redis` guard in this class was an
+            # AttributeError rather than a short-circuit on one -- reachable
+            # only because emit() happens to return on `not self.enabled`
+            # first. tests/conftest.py now installs a disabled manager as the
+            # process-wide singleton, which puts one in the path of every
+            # unit test, so the latent version of this is no longer acceptable.
+            # monitoring/decision_analytics.py:97 (`redis_client or
+            # self.obs.redis`) is the reader that would hit it first.
+            self.redis = None
             logger.info("Observability disabled")
             return
 
@@ -428,12 +456,21 @@ class ObservabilityManager:
                         f"ES backup buffer full ({self._ES_BACKUP_MAX} items); dropping event for index {index}"
                     )
                     return
+                # default=str for the same reason to_json() has it. emit()'s
+                # documents are normalized before they get here, but _es_write
+                # is a general helper and this dumps() is the LAST step before
+                # the only durable copy of a failed document: without it an
+                # unserialisable value raised TypeError into the enclosing
+                # `except Exception`, which logged "Failed to push event to ES
+                # backup buffer" -- naming Redis as the culprit for what was
+                # actually a serialisation problem, while the event was lost
+                # from Elasticsearch AND from the buffer meant to save it.
                 payload = json.dumps({
                     "index": index,
                     "document": document,
                     "doc_id": doc_id,
                     "failed_at": utc_isoformat(),
-                })
+                }, default=str)
                 self.redis.lpush(self._ES_BACKUP_KEY, payload)
             except Exception as redis_exc:
                 logger.error(f"Failed to push event to ES backup buffer: {redis_exc}")
@@ -624,7 +661,42 @@ class ObservabilityManager:
             execution_type=execution_type
         )
 
-        event_json = event.to_json()
+        try:
+            event_json = event.to_json()
+        except Exception as e:
+            # Deliberately `Exception`, not (TypeError, ValueError). to_json()
+            # is json.dumps(asdict(self), default=str), and it is `asdict()` --
+            # which runs FIRST and deep-copies every value in `data` -- that
+            # raises, not json.dumps. What it raises is whatever the value's
+            # __deepcopy__/__reduce_ex__ raises, and measured against this
+            # dataclass that is not one family:
+            #
+            #   circular dict/list             -> RecursionError
+            #   threading.Lock / socket        -> TypeError (cannot pickle)
+            #   generator                      -> TypeError (cannot pickle)
+            #   object whose __str__ raises    -> that object's exception
+            #   object whose __deepcopy__ rais -> that object's exception
+            #
+            # Only the TypeErrors were caught by the narrower tuple, so the two
+            # cases this guard was written for -- a cycle, and a __str__ that
+            # raises -- both still propagated. `data` is an open dict filled by
+            # ~90 emit sites out of task context, agent config and pipeline
+            # state, so the set of exception types reachable here is not
+            # enumerable in advance; the only safe rule is that NOTHING from a
+            # telemetry envelope reaches the dispatch path.
+            #
+            # Losing one telemetry event is strictly better than aborting the
+            # dispatch it was describing, which is what this unguarded call used
+            # to do. Logged at ERROR with the event type so it is not silent: a
+            # recurring line here means some emit site is putting a genuinely
+            # unserialisable object in `data`.
+            logger.error(
+                f"Could not serialise {event_type.value} event for "
+                f"{agent}/{project} (task {task_id}); dropping this event "
+                f"rather than failing the caller: {e}",
+                exc_info=True,
+            )
+            return
 
         # Redis pub/sub + stream (independent of ES)
         try:
@@ -640,6 +712,25 @@ class ObservabilityManager:
             logger.error(f"Failed to publish event to Redis: {e}")
 
         # ES indexing (independent of Redis)
+        #
+        # Built from the NORMALIZED payload, not from the raw `data` dict.
+        # `default=str` on to_json() only normalizes what goes to Redis; the ES
+        # document used to be re-assembled from `data` itself, so the very
+        # values that fix was written for -- a Path, a datetime, an Enum, a
+        # MagicMock -- reached es.index() untouched and the client raised
+        # SerializationError.
+        #
+        # That is not a wash, it is worse than the crash it replaced, because
+        # es_index_with_retry() catches Exception and cannot tell permanent
+        # from transient: it retried a SerializationError five times with
+        # time.sleep(2, 4, 8, 16) -- 30 REAL seconds, synchronously, on the
+        # dispatch path -- and then dropped the document anyway. Measured with
+        # a single Path in `data`: 5 attempts, [2, 4, 8, 16].
+        #
+        # Round-tripping the envelope keeps the two transports byte-identical
+        # by construction, so Redis and Elasticsearch can never again disagree
+        # about what this event was, and makes to_json()'s promise ("still
+        # emitted, still indexed, still searchable") actually true.
         es_doc_base = {
             'timestamp': event.timestamp,
             'event_type': event.event_type,
@@ -648,7 +739,7 @@ class ObservabilityManager:
             'project': project,
             'pipeline_run_id': pipeline_run_id,
             'execution_type': execution_type,
-            **data
+            **json.loads(event_json).get('data', {})
         }
 
         if self.es and self._is_decision_event(event_type):

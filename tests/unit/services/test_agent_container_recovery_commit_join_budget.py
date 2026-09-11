@@ -320,9 +320,25 @@ class TestSharedJoinBudget:
         run_manager.get_active_pipeline_run.return_value = active_run
 
         with patch('config.manager.config_manager') as mock_config, \
-             patch('services.pipeline_run.PipelineRunManager', return_value=run_manager):
+             patch('services.pipeline_run.PipelineRunManager', return_value=run_manager), \
+             patch('elasticsearch.Elasticsearch') as mock_es_class:
+            # This test drives the REAL recover_or_cleanup_repair_cycle_containers(),
+            # whose tail block builds its own `Elasticsearch(['http://elasticsearch:9200'])`
+            # -- inside the orchestrator container, the live cluster -- and then
+            # PUTs repair-cycle-recovery-ilm-policy and
+            # repair-cycle-recovery-template and indexes a metrics document built
+            # from THIS TEST's fabricated container counts into
+            # repair-cycle-recovery-<today>. Measured: one `pytest tests/unit`
+            # performed exactly those three writes, from exactly this test.
+            #
+            # The client is imported inside the function, so the patch target is
+            # the source module rather than services.agent_container_recovery.
             mock_config.get_agent.return_value = MagicMock(timeout=10800)
             recovery.recover_or_cleanup_repair_cycle_containers()
+
+        # The metrics block ran against a mock instead of being skipped, so the
+        # patch is holding the writes rather than an exception swallowing them.
+        assert mock_es_class.called
 
         calls = recovery._process_completed_repair_cycle.call_args_list
         assert len(calls) == 4, (

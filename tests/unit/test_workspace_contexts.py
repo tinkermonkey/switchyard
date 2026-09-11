@@ -205,6 +205,27 @@ class TestIssuesWorkspaceContext:
             mock_config.get_project_agent_config.return_value = {}
 
             mock_fbm.get_current_branch = AsyncMock(return_value='feature/test-branch')
+            # IssuesWorkspaceContext.finalize_execution() awaits this, and in
+            # production it IS async -- so a plain MagicMock attribute was an
+            # incomplete fixture, not a workaround. Left that way it returns a
+            # MagicMock, `await` raises TypeError, and execute_agent()'s handler
+            # falls through to the FAILSAFE commit path, which constructs a real
+            # GitHubIntegration from the mocked project config and POSTs a live
+            # comment to test/test#123 with the container's real credentials
+            # before _handle_wrong_branch_refusal() raises
+            # NonRetryableAgentError.
+            #
+            # To be precise about what that cost, because the first draft of
+            # this comment was not: the test does NOT silently pass while doing
+            # it. Measured by deleting this AsyncMock and re-running the file:
+            # test_issues_workspace_uses_git_directory and
+            # test_issues_workspace_finalizes_feature_branch both FAIL, because
+            # the raise happens before their assertions are reached. The damage
+            # is the live GitHub write on the way to that failure, not a false
+            # green.
+            mock_fbm.finalize_feature_branch_work = AsyncMock(
+                return_value={'success': True, 'pr_url': 'https://github.com/org/repo/pull/1'}
+            )
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -223,6 +244,19 @@ class TestIssuesWorkspaceContext:
             # ended up as the working directory used for branch verification.
             assert task_context['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/123'
             mock_fbm.prepare_feature_branch.assert_not_called()
+
+            # ...and that the COMMIT went to the same place. work_dir only
+            # infers it; issue #122 is specifically about
+            # finalize_feature_branch_work() falling back to the shared base
+            # clone when project_dir_override is None, which has none of the
+            # agent's changes. Assertable now that the mock is an AsyncMock
+            # rather than a plain attribute whose await raised -- which is how
+            # this test previously reached the failsafe path with its own
+            # assertion still green.
+            finalize_kwargs = mock_fbm.finalize_feature_branch_work.call_args.kwargs
+            assert finalize_kwargs['project_dir_override'] == \
+                '/workspace/.orchestrator/worktrees/test-project/123'
+            assert finalize_kwargs['expected_branch'] == 'feature/test-branch'
 
 
 class TestDiscussionsWorkspaceContext:
@@ -410,6 +444,11 @@ class TestWorkspaceContextBehaviorEquivalence:
                  patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm):
 
                 mock_fbm.get_current_branch = AsyncMock(return_value='feature/test')
+                # Awaited by IssuesWorkspaceContext.finalize_execution() -- see
+                # the equivalent note in test_issues_workspace_uses_git_directory.
+                mock_fbm.finalize_feature_branch_work = AsyncMock(
+                    return_value={'success': True, 'pr_url': 'https://github.com/org/repo/pull/1'}
+                )
                 mock_config.get_project_config.return_value = MagicMock(
                     github={'org': 'test-org', 'repo': 'test-repo'}
                 )

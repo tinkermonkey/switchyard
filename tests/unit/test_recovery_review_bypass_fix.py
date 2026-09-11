@@ -133,9 +133,18 @@ class TestPipelineRunCancellationSignal:
         mock_es = MagicMock()
         mock_es.search.return_value = {'hits': {'total': {'value': 0}, 'hits': []}}
 
-        manager = PipelineRunManager()
-        manager.redis = mock_redis
-        manager.es = mock_es
+        # Injected, NOT assigned after the fact. PipelineRunManager.__init__
+        # builds a live redis.Redis(host='redis') and
+        # Elasticsearch("http://elasticsearch:9200") when it is given neither,
+        # and then calls _setup_elasticsearch() before returning -- so
+        # `PipelineRunManager()` followed by `manager.es = mock_es` had already
+        # PUT pipeline-runs-ilm-policy and pipeline-runs-template into the
+        # deployment's cluster by the time the mocks were attached. Same reason
+        # tests/conftest.py injects clients into the singleton it installs.
+        manager = PipelineRunManager(
+            redis_client=mock_redis,
+            elasticsearch_client=mock_es,
+        )
         return manager
 
     def test_end_pipeline_run_sets_cancellation_signal(self):

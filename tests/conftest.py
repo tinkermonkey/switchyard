@@ -253,20 +253,154 @@ def _default_orchestrator_root_outside_the_container():
     os.environ['ORCHESTRATOR_ROOT'] = tempfile.mkdtemp(prefix='switchyard-test-root-')
 
 
-# The three guards above install at IMPORT time, not from pytest_configure,
-# and that ordering is load-bearing (found in review). pytest_configure is a
-# hook on this module, so by the time it fires this module's body has already
-# run -- including the two test-utility imports just below, which reach
-# services.review_cycle, which calls get_observability_manager() at import
-# time and builds both a Redis and an Elasticsearch client. Installed from
-# pytest_configure the guards arrived one full unbounded resolver+retry round
-# trip too late: `import tests.utils.builders` alone measured 5.0s on a host,
-# logging "Failed to connect to Redis for observability: Error -3 connecting
-# to redis:6379" before any guard existed. What they have to beat is this
-# module's own first-party imports, not the first test module.
+DEPLOYMENT_TUNING_ENV_VARS = (
+    'USE_BATCHED_BOARD_QUERIES',
+    'WATCHDOG_MAX_RETRIES',
+    'WATCHDOG_MAX_RECORD_AGE_HOURS',
+    'RECONCILIATION_FRESHNESS_HOURS',
+    'TOKEN_METRICS_INTERVAL_HOURS',
+    'PROGRAMMATIC_CHANGE_WINDOW_SECONDS',
+    'DOCKER_SOCKET_ACCESS_MAX_CONCURRENT',
+    'DOCKER_SOCKET_ACCESS_MAX_WAIT_SECONDS',
+)
+
+
+def _clear_deployment_tuning_env_vars():
+    """
+    Remove the deployment's rollout/tuning knobs so unit tests see the code's
+    own defaults.
+
+    These are set on the orchestrator container by docker-compose, and the
+    documented way to run this suite is inside that container -- so a test
+    asserting "this feature is off unless someone turns it on" was really
+    asserting "this feature is off on whatever machine happens to run me".
+    USE_BATCHED_BOARD_QUERIES=true is set there today, and it failed
+    test_project_monitor_batched_polling.py::test_defaults_off and
+    test_project_monitor_failsafe_batching.py::TestFailsafeBatchedGathering
+    Unflagged in the container while both passed on a host.
+
+    An explicit list, not a pattern or a blanket scrub. Credentials, service
+    hostnames and ORCHESTRATOR_ROOT are deliberately NOT in it: tests that
+    need them need the real ones, and the guards above already handle the
+    hostnames. Only knobs whose *default value* is itself under test belong
+    here -- a test that wants one set uses patch.dict, as
+    test_enabled_via_env_var already does.
+    """
+    for name in DEPLOYMENT_TUNING_ENV_VARS:
+        os.environ.pop(name, None)
+
+
+def _install_a_disabled_observability_singleton():
+    """
+    Stop the suite writing telemetry into the deployment's Elasticsearch.
+
+    get_observability_manager() lazily builds ObservabilityManager(enabled=True),
+    which connects to REDIS_HOST/ELASTICSEARCH_HOST -- inside the orchestrator
+    container those are the LIVE services. Any test that reaches an emit() then
+    publishes to the real event stream and indexes a document into the real
+    agent-events-*/decision-events-* indices. Those documents are built from
+    whatever the test passed in, so they are not merely extra: they are wrong.
+
+    It is also slow in a way that reads as a hang. es_index_with_retry() retries
+    5 times with 2/4/8/16s backoff, so one rejected document costs 30 seconds of
+    time.sleep() inside a test. Four tests in test_workspace_contexts.py were
+    paying exactly that -- 150s for a 10-test file.
+
+    enabled=False short-circuits emit() on its first line and skips client
+    construction entirely, so this is also strictly faster than connecting.
+
+    Tests that actually exercise indexing are unaffected: they construct their
+    own ObservabilityManager with mock redis/es clients (see
+    tests/unit/test_observability_elasticsearch.py) rather than going through
+    this singleton. Anything that wants to assert on emits through the
+    singleton should patch it, which the fixtures that care already do.
+    """
+    import monitoring.observability as observability
+    observability._observability_manager = observability.ObservabilityManager(
+        enabled=False
+    )
+
+
+def _install_a_mock_backed_pipeline_run_manager_singleton():
+    """
+    Stop the suite mutating the deployment's Elasticsearch *schema*, which the
+    observability guard above does not cover.
+
+    services.pipeline_run._pipeline_run_manager is a SECOND, independent
+    get-or-create module global, so disabling the observability singleton does
+    nothing for it. PipelineRunManager.__init__ builds its own
+    redis.Redis(host='redis') and Elasticsearch("http://elasticsearch:9200")
+    and then calls _setup_elasticsearch() EAGERLY -- two unconditional writes
+    to the live cluster before the object is even returned:
+
+        es.ilm.put_lifecycle(name="pipeline-runs-ilm-policy", ...)
+        es.indices.put_index_template(name="pipeline-runs-template", ...)
+
+    and ProjectMonitor.__init__ calls get_pipeline_run_manager(), so merely
+    CONSTRUCTING a ProjectMonitor in a unit test performed them. Verified
+    against the live cluster before this guard existed: importing
+    tests.conftest and constructing one ProjectMonitor put
+    pipeline-runs-ilm-policy.
+
+    This is worse than the junk documents the observability guard stops.
+    Those are rows in a date-rolled index; this is the cluster's retention
+    POLICY and index template. It writes whatever the constant in the
+    checked-out tree happens to say -- so a test run from any branch silently
+    republishes that branch's retention settings over production's, and #186
+    proposes making the policy body depend on a RETENTION_DAYS env var, at
+    which point a test run would rewrite production retention to whatever the
+    runner's environment happened to hold.
+
+    Mock clients rather than enabled=False, because PipelineRunManager has no
+    such flag and its methods dereference self.redis/self.es unconditionally.
+    Configured to read as an EMPTY deployment (no active runs) rather than as
+    bare MagicMocks: a MagicMock redis.get() returns a truthy Mock that the
+    manager then tries to json.loads(). Empty is also closer to what a test
+    should see than what it saw before -- which was the live deployment's real
+    pipeline runs.
+
+    Tests that exercise PipelineRunManager itself are unaffected: they either
+    patch get_pipeline_run_manager (most of tests/unit/), patch the Redis and
+    Elasticsearch classes in the module (tests/integration/
+    test_pipeline_run_completion.py), or pass their own clients to the
+    constructor.
+    """
+    from unittest.mock import MagicMock
+    import services.pipeline_run as pipeline_run
+
+    es = MagicMock()
+    es.search.return_value = {'hits': {'total': {'value': 0}, 'hits': []}}
+    redis_client = MagicMock()
+    redis_client.get.return_value = None
+    redis_client.hget.return_value = None
+    redis_client.hgetall.return_value = {}
+    redis_client.exists.return_value = 0
+
+    pipeline_run._pipeline_run_manager = pipeline_run.PipelineRunManager(
+        redis_client=redis_client,
+        elasticsearch_client=es,
+    )
+
+
+# All six guards install at IMPORT time, not from pytest_configure, and that
+# ordering is load-bearing (found in review). pytest_configure is a hook on this
+# module, so by the time it fires this module's body has already run --
+# including the two test-utility imports just below, which reach
+# services.review_cycle, whose module scope constructs ReviewCycleExecutor() and
+# so calls get_observability_manager() at import time, building both a Redis and
+# an Elasticsearch client. Installed from pytest_configure the guards arrived
+# one full unbounded resolver+retry round trip too late: `import
+# tests.utils.builders` alone measured 5.0s on a host, logging "Failed to
+# connect to Redis for observability: Error -3 connecting to redis:6379" before
+# any guard existed. What they have to beat is this module's own first-party
+# imports, not the first test module -- and nothing above this block imports
+# first-party code, only socket/redis/elasticsearch/tempfile.
 _refuse_to_resolve_compose_service_hostnames()
 _bound_service_client_timeouts()
 _default_orchestrator_root_outside_the_container()
+_clear_deployment_tuning_env_vars()
+_install_a_disabled_observability_singleton()
+_install_a_mock_backed_pipeline_run_manager_singleton()
 
 
 # Import test utilities
