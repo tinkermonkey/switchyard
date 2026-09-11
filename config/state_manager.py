@@ -21,6 +21,23 @@ from .manager import ConfigManager, ProjectConfig, WorkflowTemplate
 
 logger = logging.getLogger(__name__)
 
+# How many github_state_backup_*.yaml files to keep per project.
+#
+# backup_state() is called once per project per reconciliation, and
+# reconciliation runs on every orchestrator start and whenever a project's
+# state goes stale (RECONCILIATION_FRESHNESS_HOURS, 4h by default). Nothing
+# has ever deleted one, and -- more to the point -- nothing has ever READ one:
+# `github_state_backup_` appears exactly twice in the codebase, both in the
+# write below. They are a safety net for a human, not an input to any code
+# path, so the useful number of them is small and recent.
+#
+# Left unbounded they became the bulk of state/: 3,196 files / 31MB on the
+# live deployment when this was added, 612 of them for a single project, the
+# oldest 9 months old. That is also what made the two config-less project
+# state directories (#175's siblings) look substantial when their actual
+# content is one github_state.yaml each.
+STATE_BACKUP_RETENTION = max(1, int(os.environ.get('STATE_BACKUP_RETENTION', '10')))
+
 
 @dataclass
 class GitHubColumn:
@@ -472,7 +489,11 @@ class GitHubStateManager:
             logger.info(f"Cleaned up state for project {project_name}")
 
     def backup_state(self, project_name: str) -> str:
-        """Create a backup of project state and return backup path"""
+        """Create a backup of project state and return backup path.
+
+        Retains at most STATE_BACKUP_RETENTION backups per project, oldest
+        deleted first. See that constant for why these are bounded.
+        """
         state_file = self._get_project_state_file(project_name)
         if not state_file.exists():
             return ""
@@ -483,7 +504,119 @@ class GitHubStateManager:
         import shutil
         shutil.copy2(state_file, backup_file)
         logger.info(f"Created state backup: {backup_file}")
+
+        self.prune_state_backups(project_name)
         return str(backup_file)
+
+    def list_state_backups(self, project_name: str) -> List[Path]:
+        """This project's backups, newest first.
+
+        Ordered by the timestamp in the FILENAME, not by mtime: the files are
+        written with copy2, which preserves the source's mtime rather than
+        recording when the backup was taken, so every backup of an unchanged
+        state file carries the same mtime and mtime order says nothing about
+        backup order. The name is the only record of when each was made.
+        """
+        project_dir = self.projects_state_dir / project_name
+        if not project_dir.is_dir():
+            return []
+        return sorted(
+            project_dir.glob("github_state_backup_*.yaml"),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+
+    def prune_state_backups(self, project_name: str, keep: Optional[int] = None) -> List[Path]:
+        """Delete all but the `keep` newest backups. Returns what was deleted.
+
+        Best-effort per file: a backup that cannot be deleted is logged and
+        skipped rather than aborting the sweep, because this runs inside
+        reconciliation and must never be the reason a project fails to
+        reconcile.
+        """
+        keep = STATE_BACKUP_RETENTION if keep is None else max(0, keep)
+        backups = self.list_state_backups(project_name)
+        deleted = []
+        for stale in backups[keep:]:
+            try:
+                stale.unlink()
+                deleted.append(stale)
+            except OSError as e:
+                logger.warning(f"Could not remove stale state backup {stale}: {e}")
+        if deleted:
+            logger.info(
+                f"Pruned {len(deleted)} state backup(s) for {project_name}, "
+                f"keeping the {min(keep, len(backups))} newest"
+            )
+        return deleted
+
+    def list_orphaned_project_state(self) -> List[str]:
+        """Project state directories that no project config claims.
+
+        The answer to "what happens to a project's state when its config is
+        removed" is: nothing happens, and that is deliberate. A config can go
+        missing for reasons that are not a decommission -- an unmounted volume,
+        a half-finished rename, a file removed to pause a project for an
+        afternoon -- and github_state.yaml is the only local record of that
+        project's board and column node IDs. Deleting it costs a full
+        reconciliation against GitHub to rebuild, and reconciliation that
+        cannot see an existing board CREATES a duplicate of it.
+
+        So this reports and never removes. scripts/inspect_project_state.py is
+        the operator entry point that can remove, one project at a time, with
+        the name typed out.
+        """
+        if not self.projects_state_dir.exists():
+            return []
+
+        try:
+            stems = self.config_manager.list_projects()
+        except Exception as e:
+            # Without a trustworthy config list every directory looks orphaned,
+            # and reporting all of them is worse than reporting none.
+            logger.warning(
+                f"Could not list configured projects, skipping orphaned-state "
+                f"detection: {e}"
+            )
+            return []
+
+        if not stems:
+            # An empty config list is not "every project was decommissioned",
+            # it is "I cannot see the configs" -- and the two are
+            # indistinguishable from here. `config/projects/` is gitignored as
+            # a DIRECTORY, so every git worktree and every fresh checkout sees
+            # zero of them; so does a deployment whose config volume failed to
+            # mount. Reporting on that reading told an operator that all 20
+            # live projects were orphaned and printed a removal command for
+            # each, which is the single worst output this function can produce.
+            logger.warning(
+                "No project configs found at all, skipping orphaned-state "
+                "detection: an empty config/projects/ means the configs are "
+                "not visible from here (it is gitignored as a directory), not "
+                "that every project has been decommissioned."
+            )
+            return []
+
+        # A config's FILENAME and its declared project.name are two different
+        # strings that are merely usually equal, and the state directory is
+        # named after the declared name. Claiming a directory under both spellings
+        # is the safe direction: the cost of missing an orphan is a line of
+        # output nobody reads, and the cost of a false positive is an operator
+        # deleting the live board state of a project that is perfectly fine.
+        configured = set(stems)
+        for stem in stems:
+            try:
+                project_config = self.config_manager.get_project_config(stem)
+            except Exception:
+                continue
+            declared = getattr(project_config, 'name', None)
+            if declared:
+                configured.add(declared)
+
+        return sorted(
+            d.name for d in self.projects_state_dir.iterdir()
+            if d.is_dir() and d.name not in configured
+        )
 
     def link_issue_to_discussion(self, project_name: str, issue_number: int, discussion_id: str):
         """Create bidirectional link between issue and discussion"""

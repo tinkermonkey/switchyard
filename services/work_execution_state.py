@@ -156,6 +156,27 @@ _OUTPUT_EVIDENCE_RANK = {
 #     posted its summary. That is the 29-of-30 failure mode this gate was split
 #     out of #150 to avoid, and it is 2,053 of 4,566 last-record successes -- so
 #     this exclusion is also the watchdog's largest blind spot, tracked in #188.
+#
+#     #188 IS NOW ROOT-CAUSED AND FIXED, AND THIS EXCLUSION STILL HAS TO STAY.
+#     Read that carefully before deleting the line below. The silence was never
+#     structural: GitHubIntegration resolved its repo owner from the GITHUB_ORG
+#     environment variable alone, ignoring the owner every caller passes from
+#     project config, and services/project_monitor.py does not set that variable
+#     on the repair-cycle container it launches. So every GitHub call made from
+#     inside a repair cycle addressed `/repos/None/<repo>/...`, 404'd, and logged
+#     it to a --rm container's discarded stdout. Both halves are fixed now, and
+#     a repair cycle's agent runs post signed comments like any other dispatch.
+#
+#     But every record ALREADY ON DISK was written while they did not. Adding
+#     'repair_cycle_test' to this set today would hand the watchdog 2,053
+#     historical successes that genuinely have no comment to find and let it
+#     redispatch all of them -- the exact outcome the exclusion exists to
+#     prevent, arrived at from the opposite direction. The gate anchors on each
+#     record's own start time, so records written after the fix will verify on
+#     their own merits; this becomes safe once the corpus is post-fix, and the
+#     way to establish that is the dry-run harness (scripts/dry_run_state_sweep.py),
+#     not this comment. Until then it stays declined, which costs nothing that
+#     was not already being paid.
 #   * 'manual'. project_monitor keeps it for its two WRAPPER stages only
 #     (pr_review_stage at project_monitor.py:~7992, the repair cycle at ~8623),
 #     which record an outcome under a name their sub-run does not post under.

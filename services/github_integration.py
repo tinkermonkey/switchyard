@@ -42,9 +42,58 @@ class GitHubIntegration:
     """Handles GitHub API interactions for agent collaboration"""
 
     def __init__(self, repo_owner: Optional[str] = None, repo_name: Optional[str] = None):
-        self.github_org = os.environ.get('GITHUB_ORG')
-        self.repo_owner = repo_owner or self.github_org
+        # The owner is resolved ONCE, and the explicitly-passed value wins.
+        #
+        # This used to be two fields with two different resolutions:
+        # `github_org` read the global GITHUB_ORG environment variable and
+        # nothing else, while `repo_owner` preferred the caller's value and only
+        # fell back to the env var. Every real call site passes the owner from
+        # project config -- GitHubIntegration(repo_owner=project_config.github
+        # ['org'], ...) -- and yet 14 of the 20 uses in this class, including
+        # every REST endpoint it builds, read `github_org`. So the caller's
+        # owner was accepted and then ignored.
+        #
+        # That is invisible wherever GITHUB_ORG happens to be set to the right
+        # org, which is why it survived: docker-compose sets it on the
+        # orchestrator container. It is NOT set on the repair-cycle container
+        # (services/project_monitor.py launches that one with its own explicit
+        # -e list), so every GitHub call made from inside a repair cycle built
+        # `/repos/None/<repo>/...` and failed -- silently, because the repair
+        # container's logs go to its own stdout and it is started with --rm.
+        #
+        # Measured consequence (#188): a repair cycle's inner agent runs post
+        # nothing. documentation_robotics#909 recorded 23 agent calls and not
+        # one signed comment; context-studio#1224 recorded 3 and none. The
+        # cycle's own summary comments DO appear on the issue because
+        # project_monitor posts those from the orchestrator process, which has
+        # the env var -- which is exactly what made this look like a deliberate
+        # design ("repair cycles only post a summary") rather than a bug.
+        # Because those executions then have no attributable GitHub output, the
+        # empty-output watchdog had to decline to verify them at all, making
+        # 2,053 of 4,566 success records -- 45% -- its blind spot.
+        #
+        # #131 is the same defect seen from the other side: get_parent_issue()
+        # sends `github_org` as the GraphQL owner while caching on
+        # `repo_owner`, so a project in a different org than GITHUB_ORG queries
+        # the wrong owner and caches under the right one. Collapsing the two
+        # fields fixes that by construction.
+        #
+        # `github_org` is retained as a name because callers outside this class
+        # read it (services/feature_branch_manager.py among them); it is now an
+        # alias for the same resolved value, not a second source of truth.
+        self.repo_owner = repo_owner or os.environ.get('GITHUB_ORG')
+        self.github_org = self.repo_owner
         self.repo_name = repo_name
+
+        if not self.repo_owner:
+            # Not fatal here: construction is not where the damage happens, and
+            # raising would take down callers that never go on to build an
+            # endpoint. _repo_path() refuses at the point of use instead.
+            logger.error(
+                "GitHubIntegration constructed with no repo owner: none was "
+                "passed and GITHUB_ORG is unset. Every API call made through "
+                "this instance will fail; pass repo_owner from project config."
+            )
 
         # Try to use GitHub App auth, fall back to PAT
         from services.github_app_auth import get_github_app_auth
@@ -56,6 +105,34 @@ class GitHubIntegration:
         else:
             logger.warning("Using Personal Access Token authentication")
             self.auth_type = "pat"
+
+    def _repo_path(self, repo: Optional[str] = None) -> str:
+        """Build the ``owner/repo`` fragment every API call in this class needs.
+
+        Refuses to build one from an unresolved owner. The literal string
+        "None" is a perfectly well-formed path segment, so `/repos/None/<repo>`
+        reaches GitHub, comes back 404, and is reported as an ordinary failed
+        API call -- indistinguishable in a log from a deleted repository or a
+        permissions problem. That is how #188 stayed open: the failure was
+        happening on every repair cycle, in a container whose logs are
+        discarded, and it looked like a GitHub-side 404 wherever it WAS
+        visible. Raising here turns a misconfiguration into one loud error at
+        the point of use instead.
+        """
+        repo_name = repo or self.repo_name
+        if not self.repo_owner:
+            raise ValueError(
+                f"Cannot address repository {repo_name!r}: no GitHub owner is "
+                f"resolved for this GitHubIntegration. Pass repo_owner (from "
+                f"project_config.github['org']) or set GITHUB_ORG in the "
+                f"process environment."
+            )
+        if not repo_name:
+            raise ValueError(
+                f"Cannot address a repository under owner {self.repo_owner!r}: "
+                f"no repo name was passed and this GitHubIntegration has none."
+            )
+        return f"{self.repo_owner}/{repo_name}"
 
     def _get_gh_env(self) -> dict:
         """Get environment variables for gh CLI, using GitHub App token if available"""
@@ -133,7 +210,7 @@ class GitHubIntegration:
         """
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}/comments"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{issue_number}/comments"
 
             chunks = self._split_oversized_comment(comment)
             if len(chunks) > 1:
@@ -176,7 +253,7 @@ class GitHubIntegration:
                     title=_extract_comment_title(comment),
                     body=comment,
                     project=repo_name,
-                    repo=f"{self.github_org}/{repo_name}",
+                    repo=self._repo_path(repo_name),
                     comment_id=str(first_result.get('id', '')),
                     comment_url=first_result.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
@@ -199,7 +276,7 @@ class GitHubIntegration:
         try:
             repo_name = repo or self.repo_name
             # PR comments are posted to issues endpoint (PRs are issues in GitHub API)
-            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{pr_number}/comments"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{pr_number}/comments"
 
             chunks = self._split_oversized_comment(comment)
             if len(chunks) > 1:
@@ -240,7 +317,7 @@ class GitHubIntegration:
                     title=_extract_comment_title(comment),
                     body=comment,
                     project=repo_name,
-                    repo=f"{self.github_org}/{repo_name}",
+                    repo=self._repo_path(repo_name),
                     comment_id=str(first_result.get('id', '')),
                     comment_url=first_result.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
@@ -265,7 +342,7 @@ class GitHubIntegration:
         """Create a formal PR review using REST API with rate limiting"""
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self.github_org}/{repo_name}/pulls/{pr_number}/reviews"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/pulls/{pr_number}/reviews"
             
             # Map review_type to GitHub API event
             event_map = {
@@ -296,7 +373,7 @@ class GitHubIntegration:
                     title=f"PR Review ({review_type}): {_extract_comment_title(body)}",
                     body=body,
                     project=repo_name,
-                    repo=f"{self.github_org}/{repo_name}",
+                    repo=self._repo_path(repo_name),
                     comment_id=str(response.get('id', '')),
                     comment_url=response.get('html_url'),
                     pipeline_run_id=pipeline_run_id,
@@ -314,7 +391,7 @@ class GitHubIntegration:
         """Get issue details using REST API with rate limiting"""
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{issue_number}"
             
             success, response = get_github_client().rest(
                 method='GET',
@@ -334,7 +411,7 @@ class GitHubIntegration:
     async def has_agent_processed_issue(self, issue_number: int, agent_name: str, repo: Optional[str] = None) -> bool:
         """Check if an agent has already processed this issue by looking for its signature in comments"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_arg = self._repo_path(repo) if repo else ""
 
             cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'comments']
 
@@ -454,7 +531,7 @@ class GitHubIntegration:
         """Get comments that mention @orchestrator-bot for feedback using REST API with rate limiting"""
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self.github_org}/{repo_name}/issues/{issue_number}/comments"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{issue_number}/comments"
             
             success, response = get_github_client().rest(
                 method='GET',
@@ -523,7 +600,7 @@ class GitHubIntegration:
         """Get pull request details using REST API with rate limiting"""
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self.github_org}/{repo_name}/pulls/{pr_number}"
+            endpoint = f"/repos/{self._repo_path(repo_name)}/pulls/{pr_number}"
             
             success, response = get_github_client().rest(
                 method='GET',
@@ -558,7 +635,7 @@ class GitHubIntegration:
             PR details dict if found, None otherwise
         """
         try:
-            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+            repo_arg = self._repo_path()
 
             # Use gh CLI to list PRs for this branch
             cmd = [
@@ -608,7 +685,7 @@ class GitHubIntegration:
     async def add_issue_label(self, issue_number: int, labels: List[str], repo: Optional[str] = None):
         """Add labels to an issue"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_arg = self._repo_path(repo) if repo else ""
 
             for label in labels:
                 cmd = ['gh', 'issue', 'edit', str(issue_number), '--add-label', label]
@@ -631,7 +708,7 @@ class GitHubIntegration:
     ) -> Dict[str, Any]:
         """Create a new issue from agent work"""
         try:
-            repo_arg = f"{self.github_org}/{repo}" if repo else ""
+            repo_arg = self._repo_path(repo) if repo else ""
 
             cmd = ['gh', 'issue', 'create', '--title', title, '--body', body]
 
@@ -837,7 +914,7 @@ class GitHubIntegration:
                 }
 
             # No existing PR - create new one
-            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+            repo_arg = self._repo_path()
 
             cmd = [
                 'gh', 'pr', 'create',
@@ -903,7 +980,7 @@ class GitHubIntegration:
     async def update_pr_body(self, pr_number: int, body: str) -> bool:
         """Update PR description"""
         try:
-            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+            repo_arg = self._repo_path()
 
             cmd = [
                 'gh', 'pr', 'edit', str(pr_number),
@@ -941,7 +1018,7 @@ class GitHubIntegration:
         Returns:
             True if successfully marked ready, False otherwise
         """
-        repo_arg = f"{self.repo_owner}/{self.repo_name}"
+        repo_arg = self._repo_path()
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -1007,7 +1084,7 @@ class GitHubIntegration:
     async def delete_branch(self, branch_name: str) -> bool:
         """Delete a remote branch"""
         try:
-            repo_arg = f"{self.repo_owner}/{self.repo_name}"
+            repo_arg = self._repo_path()
 
             cmd = [
                 'gh', 'api',
