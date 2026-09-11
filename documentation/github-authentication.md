@@ -8,13 +8,20 @@ Running **App-only** is supported, and is the right configuration for an organiz
 
 A PAT is the simplest way to authenticate and covers most GitHub API operations — issues, pull requests, code, and comments. It requires no setup beyond creating a token and setting an environment variable.
 
-Historically this codebase treated Discussions writes as App-only. That is **not** correct against the current API: a classic PAT carrying `repo` passes the scope gate for `createDiscussion`, `addDiscussionComment` and `updateDiscussion`.
+Historically this codebase treated Discussions writes as App-only, on the grounds that no PAT scope grants them. **That is not correct against the current API.** Both credentials were verified with real writes against a throwaway repository:
 
-This was established by a scope-ordering probe rather than by reading the docs. GitHub evaluates token scopes *before* resolving node IDs — a mutation the token lacks scope for returns `INSUFFICIENT_SCOPES` even when handed a bogus node ID, whereas all three Discussions mutations returned only `NOT_FOUND` on the bogus node. That proves the scope gate passed. The repository-permission gate is evaluated later, against a real node, so it is not covered by that probe.
+| Mutation | PAT | GitHub App |
+|---|---|---|
+| `createDiscussion` | pass | pass |
+| `addDiscussionComment` | pass | pass |
 
-The GitHub App remains preferred for Discussions (bot identity, separate rate-limit budget), but it is no longer believed to be strictly required.
+The PAT's discussion was authored by the token owner; the App's by the app's bot identity. Both were then deleted.
 
-`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured, and `_execute_graphql` falls back to a PAT-authenticated GraphQL call when it is not. Given the finding above, that fallback is expected to work for writes as well as reads, though the App remains the preferred path.
+The PAT used carries `repo` **and** `write:discussion`, so this establishes that such a token works — not which of the two scopes is load-bearing. `write:discussion` is documented as covering *team* discussions rather than repository Discussions, which points at `repo`, but that has not been isolated. A deployment provisioning a minimal token should grant both until it has tested otherwise.
+
+The GitHub App is still preferred for Discussions — bot identity and a separate rate-limit budget — but it is not required.
+
+`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured, and `_execute_graphql` falls back to a PAT-authenticated GraphQL call when it is not. That fallback works for writes as well as reads.
 
 Beyond Discussions, the GitHub App provides two additional benefits: actions appear as `orchestrator-bot[bot]` rather than as the PAT owner's personal account, and the rate limit is per-installation (5,000 requests per hour for this installation) rather than shared across all applications using the same user token.
 
@@ -47,7 +54,7 @@ With a PAT configured and no GitHub App, all API operations proceed through the 
 - All comments and actions appear as the token owner's user account
 - Rate limit is shared across all applications using the same token
 - PAT tokens do not expire by default but can be revoked at any time; revocation immediately breaks all orchestrator operations
-- Discussions writes are believed to work with the `repo` scope (see "Why multiple authentication methods" above); the App is still preferred for bot identity and a separate quota
+- Discussions writes DO work from a PAT (verified — see "Why multiple authentication methods" above); the App is still preferred for bot identity and a separate quota
 
 ## GitHub App
 
@@ -254,10 +261,13 @@ The six permissions above were verified end to end against an organization-owned
 | App resolves item content inside a private repository | pass |
 | App creates a board (what reconciliation does) | pass |
 | App reads the Status field's options (column configuration) | pass |
+| App creates a discussion and comments on it | pass |
 
 `gh project list --owner <org>` through `GitHubAPIClient.gh_cli()` returns the org's boards on this configuration. The same command returns an empty, successful result — no error — when the Projects permission is absent, which is the failure the reconciliation guard in `services/github_project_manager.py` exists to catch.
 
 Note that `Workflows` is not in the list. It is not required by anything the orchestrator does, and omitting it keeps the permission request smaller.
+
+With these six permissions an organization-owned app covers every GitHub operation the orchestrator performs, including Discussions — so **App-only needs no PAT at all**. The organization's default discussion categories include `Ideas`, which is what `config/foundations/pipelines.yaml` sets as the `planning_design` pipeline's `discussion_category`; no extra setup is needed for that pipeline.
 
 ### 3. Generate a private key
 
