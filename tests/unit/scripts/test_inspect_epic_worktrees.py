@@ -148,3 +148,51 @@ class TestAnUnanswerableLivenessCheckIsNotPromisedToSelfResolve:
         out = capsys.readouterr().out
         assert 'does NOT resolve on its own' in out
         assert 'docker ps' in out
+
+
+class TestALiveContainerOverWorkIsNotPromisedToSelfResolve:
+    """Liveness says the directory must not be TOUCHED; it does not say the block
+    lifts when that container exits. Only a live container over a directory
+    holding nothing of its own is cleared by its own exit -- over a dirty tree or
+    over commits the epic's branch does not have, the work is still there
+    afterwards and nothing commits it on the way out (code review on #163). The
+    row printed "unmerged: 3 commit(s) not on the epic's branch" and then, two
+    lines later, "this resolves on its own once that container exits"."""
+
+    def test_commits_of_its_own_are_not_reported_as_self_resolving(self, capsys):
+        _print_row(_row(unmerged_commits=3, container_live=True, prune_skipped=True))
+
+        out = capsys.readouterr().out
+        assert 'this resolves on its own' not in out
+        assert 'does NOT resolve on its own' in out
+        assert '3 commit(s) not on the epic' in out
+        # ...and still no mutating command while something is writing in there.
+        assert 'unblock it' not in out
+        assert 'reset --hard' not in out
+
+    def test_a_dirty_tree_under_a_live_container_is_not_either(self, capsys):
+        _print_row(_row(
+            container_live=True, uncommitted=True,
+            uncommitted_files=[' M work.py'], prune_skipped=True,
+        ))
+
+        out = capsys.readouterr().out
+        assert 'this resolves on its own' not in out
+        assert 'nothing else to run' not in out
+        assert 're-run this script' in out
+
+    def test_an_unreadable_tree_under_a_live_container_is_not_either(self, capsys):
+        """`uncommitted` is None -- the working tree could not be read -- which
+        reconcile treats as "there is something here", not as clean."""
+        _print_row(_row(container_live=True, uncommitted=None, prune_skipped=True))
+
+        out = capsys.readouterr().out
+        assert 'this resolves on its own' not in out
+
+    def test_an_empty_worktree_under_a_live_container_still_self_resolves(self, capsys):
+        """The control: this is the one shape that genuinely needs no human."""
+        _print_row(_row(container_live=True))
+
+        out = capsys.readouterr().out
+        assert 'this resolves on its own once that container exits' in out
+        assert 'nothing else to run' in out

@@ -4913,9 +4913,11 @@ def get_epic_worktrees():
             'total': len(worktrees),
             'drifted': sum(1 for w in worktrees if w['drifted']),
             'prune_skipped': sum(1 for w in worktrees if w['prune_skipped']),
-            # A drifted worktree a container is still inside needs no operator
-            # action at all and must not be touched — the opposite recovery to
-            # every other clean-drift shape (code review on #163).
+            # A drifted worktree a container is still inside must not be touched —
+            # the opposite recovery to every other clean-drift shape (code review
+            # on #163). It needs no operator action at all only when the row's
+            # uncommitted/unmerged fields say it holds nothing of its own; a
+            # container that was mid-edit leaves that work behind when it exits.
             'container_live': sum(
                 1 for w in worktrees
                 if w['drifted'] and w.get('container_live') is True

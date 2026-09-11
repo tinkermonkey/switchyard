@@ -35,9 +35,13 @@ HEAD and working tree on every dispatch. Most of them stop applying the moment
 the work in that directory is committed, discarded or merged; a clean, empty
 worktree whose HEAD simply could not be moved back needs a `git checkout` by
 hand. The one shape that needs NO action at all is a drifted worktree an agent
-container is still running inside — it is reported as LIVE CONTAINER, it resolves
-by itself when that container exits, and the `git checkout` the other clean
-shapes want would rewrite the tree underneath the running agent. The recovery is
+container is still running inside AND holding nothing of its own — it is reported
+as LIVE CONTAINER, it resolves by itself when that container exits, and the `git
+checkout` the other clean shapes want would rewrite the tree underneath the
+running agent. A live container over uncommitted changes or over commits the
+epic's branch does not have is reported as LIVE CONTAINER too, for the same
+do-not-touch reason, but that one does NOT resolve on its exit: the work is still
+there afterwards and still needs a human. The recovery is
 therefore ordinary git, run against the path this script prints, followed by
 scripts/release_lock.py for the board's retained pipeline lock — the commands are
 printed alongside each finding.
@@ -79,6 +83,22 @@ def _is_problem(row: dict) -> bool:
     return bool(row['drifted']) or bool(row['prune_skipped'])
 
 
+def _holds_work(row: dict) -> bool:
+    """Whether this directory holds something that outlives a live writer.
+
+    A clean tree with no commits of its own is the only shape a container's exit
+    clears by itself. Anything else -- uncommitted changes, an unreadable working
+    tree, commits the epic's branch does not have -- is still sitting there when
+    that container is gone, and nothing commits it on the way out: the container's
+    own auto-commit is refused for the very reason the dispatch was (code review
+    on #163). unmerged_commits is only computed for a drifted row, so it decides
+    nothing for the rest.
+    """
+    if row['uncommitted'] is not False:
+        return True
+    return bool(row['drifted']) and row['unmerged_commits'] != 0
+
+
 def _describe_unmerged(row: dict) -> str:
     if row['unmerged_commits'] is None:
         return "unknown"
@@ -112,25 +132,41 @@ def _print_row(row: dict) -> None:
             "nothing the epic's branch does not (clean tree, no commits of its own)."
         )
     if row['drifted'] and row.get('container_live') is not False:
-        # The one drift shape with no operator action at all, and the one where
-        # the move-HEAD advice below would be actively destructive: a repair (by
-        # the orchestrator OR by hand) rewrites every tracked file in a directory
-        # an agent is live inside. None is "docker could not be asked", which is
-        # not the same claim as "nothing is running" — so it gets the same
-        # treatment (code review on #163).
+        # The drift shape where the move-HEAD advice below would be actively
+        # destructive: a repair (by the orchestrator OR by hand) rewrites every
+        # tracked file in a directory an agent is live inside. None is "docker
+        # could not be asked", which is not the same claim as "nothing is
+        # running" — so it gets the same treatment (code review on #163).
+        #
+        # Liveness does not decide whether it needs an operator, though: only the
+        # row that holds nothing of its own is cleared by that container's exit.
+        # Printing "resolves on its own" two lines under "unmerged: 3 commit(s)
+        # not on the epic's branch" is how those three commits get deleted (code
+        # review on #163).
+        if not _holds_work(row):
+            resolution = (
+                "this resolves on its own once that container exits."
+                if row.get('container_live')
+                # None is "docker could not be asked", not "something is running":
+                # there may be nothing to wait for, so promising self-resolution
+                # leaves the board's retained lock waiting forever (code review on
+                # #163).
+                else "confirm with `docker ps` that nothing is in there — if "
+                     "nothing is, this does NOT resolve on its own."
+            )
+        else:
+            resolution = (
+                "this does NOT resolve on its own — what is in this directory "
+                "is still here when that container exits, and nothing commits it "
+                "on the way out. Deal with it once `docker ps` shows nothing "
+                "running against this path."
+            )
         print(
             "    ⏳ LIVE CONTAINER — an agent container "
             + ("is still running" if row.get('container_live')
                else "may still be running (docker could not be asked)")
             + " against this worktree. Do NOT move HEAD or remove the directory; "
-            + ("this resolves on its own once that container exits."
-               if row.get('container_live')
-               # None is "docker could not be asked", not "something is running":
-               # there may be nothing to wait for, so promising self-resolution
-               # leaves the board's retained lock waiting forever (code review on
-               # #163).
-               else "confirm with `docker ps` that nothing is in there — if "
-                    "nothing is, this does NOT resolve on its own.")
+            + resolution
         )
     for line in row['uncommitted_files']:
         print(f"      {line}")
@@ -143,14 +179,33 @@ def _print_row(row: dict) -> None:
             # Read-only commands stay; every mutating suggestion below is gated on
             # the liveness answer, because all of them rewrite a working tree an
             # agent may still be editing.
-            print(
-                "      # a container is live in there — nothing else to "
-                "run; it resolves when that container exits"
-                if row.get('container_live') else
-                "      # docker could not be asked whether anything is live in "
-                "there — check `docker ps`; if nothing is, this needs HEAD moved "
-                "by hand"
-            )
+            if not _holds_work(row):
+                print(
+                    "      # a container is live in there — nothing else to "
+                    "run; it resolves when that container exits"
+                    if row.get('container_live') else
+                    "      # docker could not be asked whether anything is live in "
+                    "there — check `docker ps`; if nothing is, this needs HEAD moved "
+                    "by hand"
+                )
+            else:
+                # The container's exit is the START of this row's recovery, not the
+                # whole of it. The commands that deal with the work are suppressed
+                # only while something may still be writing, so the instruction is
+                # to come back rather than "nothing else to run" (code review on
+                # #163).
+                print(
+                    "      # a container is live in there — nothing safe to run "
+                    "yet, and the work above outlives its exit"
+                    if row.get('container_live') else
+                    "      # docker could not be asked whether anything is live in "
+                    "there — check `docker ps`; the work above needs dealing with "
+                    "either way"
+                )
+                print(
+                    "      # once `docker ps` shows nothing against this path, "
+                    "re-run this script for the recovery that applies"
+                )
         # The stash/discard pair only applies when there IS something uncommitted.
         # Printing it for a clean worktree sends an operator to run a no-op and
         # conclude the directory is now fine, which is the wrong conclusion for

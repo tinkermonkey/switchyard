@@ -2445,8 +2445,14 @@ class AgentExecutor:
                 them: the `git checkout` / `git reset --hard` they need is
                 precisely the tree rewrite under a live agent that
                 reconcile_worktree_branch() refused to perform. It is tri-state --
-                True clears itself when that writer exits, None means docker could
-                not be asked and clears itself never (code review on #163).
+                True means there is a writer that will exit, None means docker
+                could not be asked and there may be nothing to wait for at all
+                (code review on #163). Liveness alone does not decide whether the
+                block lifts by itself, though: only the shape with nothing in it to
+                preserve self-clears on that exit, so the clearing step consults
+                drift_dirty and drift_unmerged_commits in this arm too -- a live
+                container sitting on uncommitted work or on commits of its own
+                leaves both behind when it goes (code review on #163).
 
         Always raises NonRetryableAgentError.
         """
@@ -2478,20 +2484,66 @@ class AgentExecutor:
                 # its own, None means docker could not be ASKED, so there may be
                 # nothing to wait for at all and step 4's lock release is the only
                 # thing that moves the board (code review on #163).
-                what_is_there = (
-                    (
-                        "and it holds uncommitted changes" if drift_dirty is True
-                        else "and its working tree state could not be read"
-                        if drift_dirty is None
-                        else "and nothing in it needs preserving"
+                if drift_dirty is True:
+                    what_is_there = "and it holds uncommitted changes"
+                elif drift_dirty is None:
+                    what_is_there = "and its working tree state could not be read"
+                elif drift_unmerged_commits:
+                    # The clean-tree shape that is not an empty one. Since the
+                    # verdict answers liveness for the unmerged case too, this arm
+                    # reaches it -- and reporting it as "nothing in it needs
+                    # preserving" told an operator to `branch -D` commits that
+                    # exist on no other ref (code review on #163).
+                    what_is_there = (
+                        f"and that branch holds {drift_unmerged_commits} commit(s) "
+                        f"{branch_label} does not"
                     )
-                    + (
-                        " — and an agent container is still running against that "
-                        "directory" if drift_container_live
-                        else " — and it could not be established whether anything "
-                        "is still running in that directory"
+                elif drift_unmerged_commits is None:
+                    what_is_there = (
+                        "and it could not be established whether that branch holds "
+                        f"commits {branch_label} does not"
                     )
+                else:
+                    what_is_there = "and nothing in it needs preserving"
+                what_is_there += (
+                    " — and an agent container is still running against that "
+                    "directory" if drift_container_live
+                    else " — and it could not be established whether anything "
+                    "is still running in that directory"
                 )
+                # What survives the writer's exit, and therefore whether waiting
+                # is the whole recovery (code review on #163). For a dirty tree or
+                # a commit-carrying drifted branch it is not: when the container is
+                # gone the work is still there, still on a branch that belongs to
+                # no epic, and that container will not have committed it either --
+                # #149's _verify_commit_branch() refuses its auto-commit for the
+                # very reason this dispatch was refused. Saying "nothing needs a
+                # human" there sends an operator to wait for a block that never
+                # lifts, and then to delete the branch holding the only copy.
+                #
+                # Deliberately prose, not commands: every recovery named here
+                # rewrites the working tree, and this is the one arm that must not
+                # put such a command in front of an operator while something may
+                # still be writing in there. The read-only ones are safe to print.
+                if drift_dirty is not False:
+                    post_writer_remedy = (
+                        "deal with what is in it — `git -C "
+                        f"{project_dir} status` and `git -C {project_dir} diff` are "
+                        "safe to run at any time — by committing it onto "
+                        f"{branch_label} yourself, or discarding it and letting the "
+                        "pipeline redo it"
+                    )
+                elif drift_unmerged_commits != 0:
+                    post_writer_remedy = (
+                        f"move HEAD back onto {branch_label} and decide where "
+                        f"`{current_branch or '<branch>'}`'s commits belong (`git -C "
+                        f"{project_dir} log "
+                        f"{expected_branch or '<epic branch>'}..{current_branch or '<branch>'}` "
+                        "lists them, and the ref survives the move, so nothing is "
+                        "lost)"
+                    )
+                else:
+                    post_writer_remedy = None
                 drift_step = (
                     "2. **Do not touch that worktree** — no checkout, no reset, no "
                     "clean, whatever the other recovery steps for a drifted "
@@ -2503,22 +2555,43 @@ class AgentExecutor:
                     "http://localhost:5001/agents/kill/<container>`) — otherwise "
                     "just let it finish."
                 )
-                drift_clearing_step = (
-                    (
+                if drift_container_live and post_writer_remedy is None:
+                    drift_clearing_step = (
                         "3. Nothing in that directory needs a human — this one "
                         "clears itself once that container exits, and the next "
                         "dispatch restores the epic's branch on its own. It only "
                         "gets that dispatch once the lock in step 4 is released."
                     )
-                    if drift_container_live else
-                    (
+                elif drift_container_live:
+                    drift_clearing_step = (
+                        "3. Waiting is **not** the whole recovery here: what is in "
+                        "that directory is still there after the container exits, "
+                        "still on a branch that belongs to no epic, and that "
+                        "container will not have committed it either — its own "
+                        "auto-commit is refused for the same reason this dispatch "
+                        "was. Once `docker ps` shows nothing running against that "
+                        f"directory, {post_writer_remedy}, then release the lock in "
+                        "step 4."
+                    )
+                elif post_writer_remedy is None:
+                    drift_clearing_step = (
                         "3. This one does **not** clear itself. It is the liveness "
                         "check that failed (docker could not be asked), not the "
                         "worktree — so there may be nothing running that will exit "
                         "and unblock it. Confirm with `docker ps` that nothing is "
                         "in there, then release the lock in step 4."
                     )
-                )
+                else:
+                    drift_clearing_step = (
+                        "3. This one does **not** clear itself, for two independent "
+                        "reasons: it is the liveness check that failed (docker "
+                        "could not be asked), not the worktree, so there may be "
+                        "nothing running that will exit — and what is in that "
+                        "directory outlives it either way. Confirm with `docker ps` "
+                        "that "
+                        f"nothing is in there, then {post_writer_remedy}, and "
+                        "release the lock in step 4."
+                    )
             elif drift_dirty is True:
                 what_is_there = "and it holds uncommitted changes"
                 drift_step = (

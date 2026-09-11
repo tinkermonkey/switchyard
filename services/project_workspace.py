@@ -276,10 +276,12 @@ class WorktreeBranchVerdict:
     comment prescribing `git reset --hard` on a directory an agent was writing.
 
     It is tri-state, and True must not be collapsed with None: True is "a writer
-    is in there, this clears itself when it exits", None is "docker could not be
-    ASKED", which clears itself never and leaves the board's retained lock needing
-    a hand (code review on #163). Both refuse -- the gate is `is not False` -- but
-    they are different things to tell an operator.
+    is in there and will exit", None is "docker could not be ASKED", so there may
+    be nothing to wait for and the board's retained lock needs a hand (code review
+    on #163). Both refuse -- the gate is `is not False` -- but they are different
+    things to tell an operator. Neither answer on its own says the block clears on
+    that exit: read it together with `dirty`/`unmerged_commits`, since a writer
+    that was mid-edit leaves that work behind when it goes (code review on #163).
     """
 
     status: WorktreeBranchStatus
@@ -325,11 +327,17 @@ class WorktreeBranchDriftError(RuntimeError):
         carries commits of its own (`main`, or a sibling epic's branch), in which
         case the count never reaches zero and nothing but a checkout unblocks it.
       * container_live=True -- an agent container (or another git writer) still
-        has this worktree, so the repair was skipped rather than attempted.
-        Nothing in the directory needs a human at all: it clears itself the moment
-        that writer exits. This one is checked FIRST, because it can carry ANY of
-        the dirty/unmerged shapes above and every one of their recoveries is
-        actively dangerous for it (code review on #163).
+        has this worktree, so the repair was skipped rather than attempted. This
+        one is checked FIRST, because it can carry ANY of the dirty/unmerged
+        shapes above and every one of their recoveries is actively dangerous for
+        it (code review on #163). It clears itself the moment that writer exits
+        ONLY when it carries none of them: a live container over uncommitted work
+        or over commits of its own leaves both behind when it goes, and does not
+        commit them on the way out either -- #149's _verify_commit_branch() refuses
+        its auto-commit for the same reason the dispatch was refused. So the
+        recovery for those is the shape's own recovery above, deferred until
+        `docker ps` is clear, not "wait and it fixes itself" (code review on
+        #163).
       * container_live=None -- the liveness question could not be answered at all
         (docker unreachable or slow). It refuses for the same reason True does,
         but tells the operator the opposite thing about clearing: nothing is
@@ -2086,7 +2094,10 @@ class ProjectWorkspaceManager:
         commit-carrying drifted branch all clear themselves the moment a human
         commits, discards or merges the work; the bind-mounted shape
         (container_live is True) clears itself with no human at all, the moment
-        that container exits, and is the one shape an operator must NOT act on --
+        that container exits, PROVIDED it carries none of those three -- a live
+        container over uncommitted work or over commits of its own still leaves
+        them for a human, it just cannot be acted on until that container is gone.
+        It is the one shape an operator must NOT act on while it lasts --
         the `git checkout` the other clean shapes want is the very tree rewrite
         this gate refused. container_live is None -- docker could not be asked --
         refuses for the same reason but clears itself never, and is reported as
@@ -3116,8 +3127,9 @@ class ProjectWorkspaceManager:
             epic's sole local branch, or None when there are none or several),
             epic_branches (all of them), belongs_to_epic, drifted, container_live
             (True/False/None-for-unanswerable -- a drifted worktree an agent
-            container is still inside needs no operator action and must not be
-            touched), unmerged_commits (commits the drifted branch holds that
+            container is still inside must not be touched, and needs no operator
+            action at all only when uncommitted/unmerged say it holds nothing of
+            its own), unmerged_commits (commits the drifted branch holds that
             expected_branch does not; None when unanswerable or not applicable),
             uncommitted (True/False/None for unreadable), uncommitted_files (the
             porcelain lines, capped), and prune_skipped (whether the startup
@@ -3170,10 +3182,12 @@ class ProjectWorkspaceManager:
                         worktree_path, expected_branch, current_branch or 'HEAD'
                     )
                 # The liveness answer reconcile's own gate makes, reported for the
-                # same reason the verdict carries it (code review on #163): a
-                # drifted worktree a container is still inside needs no operator
-                # action at all, and the "move HEAD back" advice this script prints
-                # for every other clean-drift shape is actively dangerous for it.
+                # same reason the verdict carries it (code review on #163): the
+                # "move HEAD back" advice printed for every other clean-drift shape
+                # is actively dangerous for a worktree a container is still inside.
+                # Whether it needs an operator at all is a separate question the
+                # row's uncommitted/unmerged fields answer -- only a live container
+                # over an empty directory is cleared by its own exit.
                 container_live = self._worktree_is_bind_mounted(
                     worktree_path, running_mount_sources
                 )

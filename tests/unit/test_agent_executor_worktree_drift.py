@@ -265,7 +265,77 @@ class TestADriftedWorktreeBlocksBeforeDispatch:
         # Still honest about what is in there -- the live shape is no longer
         # assumed to be the empty one.
         assert 'holds uncommitted changes' in body
-        assert 'clears itself' in body
+        # ...and not told, two paragraphs later, that it therefore needs nobody:
+        # when that container exits the tree is still dirty and HEAD is still
+        # drifted, and the container's own auto-commit is refused by #149's
+        # _verify_commit_branch() for the very reason this dispatch was (code
+        # review on #163).
+        assert 'clears itself' not in body
+        assert 'Waiting is **not** the whole recovery' in body
+        assert 'docker ps' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_over_its_own_commits_says_what_is_there(
+        self, agent_executor
+    ):
+        """The shape that made the live arm's "nothing in it needs preserving"
+        false: an agent that committed onto the drifted branch leaves an EMPTY
+        porcelain, so the verdict is the unmerged one -- which now carries the
+        liveness answer and lands here (code review on #163). Those commits are
+        reachable from a local ref nothing pushes, and telling an operator the
+        directory holds nothing worth keeping is how `branch -D` deletes them."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=3, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'nothing in it needs preserving' not in body
+        assert '3 commit(s)' in body
+        assert 'clears itself' not in body
+        assert 'Waiting is **not** the whole recovery' in body
+        # The do-not-touch invariant still holds: no mutating command at all while
+        # something may be writing in there.
+        assert 'reset --hard' not in body
+        assert 'checkout feature/issue-42-epic' not in body
+        assert 'Do not touch that worktree' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_over_an_uncomparable_branch_does_not_self_clear(
+        self, agent_executor
+    ):
+        """unmerged_commits=None on a clean tree is "the count could not be taken",
+        which reconcile treats as "there is something here" -- so it must not be
+        reported as the empty shape either (code review on #163)."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=None, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'nothing in it needs preserving' not in body
+        assert 'could not be established whether that branch holds commits' in body
+        assert 'clears itself' not in body
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_liveness_check_over_work_names_the_work(
+        self, agent_executor
+    ):
+        """Both halves are unresolved here: nothing may exit to unblock it, AND the
+        work outlives whatever is (or is not) in there. The None arm used to send
+        the operator straight from `docker ps` to release_lock.py, leaving the
+        dirty tree that refuses the very next dispatch untouched (code review on
+        #163)."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=True, container_live=None),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'does **not** clear itself' in body
+        assert 'docker ps' in body
+        assert 'committing it onto' in body
+        assert 'release_lock.py' in body
 
     @pytest.mark.asyncio
     async def test_an_unanswerable_liveness_check_does_not_promise_self_clearing(
