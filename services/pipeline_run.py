@@ -694,6 +694,7 @@ class PipelineRunManager:
                 found_branch=verdict.found_branch,
                 dirty=verdict.dirty,
                 unmerged_commits=verdict.unmerged_commits,
+                container_live=verdict.container_live,
             )
         if verdict.repaired:
             self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)

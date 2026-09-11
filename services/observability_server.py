@@ -4913,6 +4913,13 @@ def get_epic_worktrees():
             'total': len(worktrees),
             'drifted': sum(1 for w in worktrees if w['drifted']),
             'prune_skipped': sum(1 for w in worktrees if w['prune_skipped']),
+            # A drifted worktree a container is (or may be) still inside needs no
+            # operator action at all and must not be touched — the opposite
+            # recovery to every other clean-drift shape (code review on #163).
+            'container_live': sum(
+                1 for w in worktrees
+                if w['drifted'] and w.get('container_live') is not False
+            ),
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }), 200
 

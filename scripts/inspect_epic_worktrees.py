@@ -17,24 +17,30 @@ here:
     is refused, because committing that work to the drifted branch is the
     wrong-branch commit #149 exists to prevent, and committing it to the epic's
     branch, or discarding it, are calls only a human can make.
-  * PRUNE-SKIPPED — the worktree is drifted AND holds uncommitted changes, so
-    prune_epic_worktrees() leaves it alone at startup rather than force-removing
-    work it has no way to preserve (`_push_local_commits_if_any()` saves commits,
-    not a dirty tree). That skip is what keeps a refusal's evidence alive across
-    a restart; the cost is that such a directory stays until someone deals with
-    it, and this is where to see which ones those are. A dirty worktree still on
-    its own epic's branch is NOT skipped — that is an ordinary interrupted run,
-    and leaving it would contaminate the next sibling issue's commit.
+  * PRUNE-SKIPPED — the worktree is drifted AND holds something the startup
+    sweep cannot preserve: uncommitted changes, an unreadable working tree, or
+    commits on the drifted branch that no branch of this epic already has. So
+    prune_epic_worktrees() leaves it alone rather than force-removing work it
+    has no way to save (`_push_local_commits_if_any()` publishes the drifted
+    branch to the shared repo and nothing else). That skip is what keeps a
+    refusal's evidence alive across a restart; the cost is that such a directory
+    stays until someone deals with it, and this is where to see which ones those
+    are. A dirty worktree still on its own epic's branch is NOT skipped — that is
+    an ordinary interrupted run, and leaving it would contaminate the next
+    sibling issue's commit.
 
 Deliberately READ-ONLY. There is no `--clear`, and nothing to clear: neither
 condition is recorded anywhere and both are re-derived from the worktree's live
 HEAD and working tree on every dispatch. Most of them stop applying the moment
-the work in that directory is committed, discarded or merged; the one that does
-not is a clean, empty worktree whose HEAD simply could not be moved back, which
-needs a `git checkout` by hand. The recovery is therefore ordinary git, run
-against the path this script prints, followed by scripts/release_lock.py for the
-board's retained pipeline lock — the commands are printed alongside each
-finding.
+the work in that directory is committed, discarded or merged; a clean, empty
+worktree whose HEAD simply could not be moved back needs a `git checkout` by
+hand. The one shape that needs NO action at all is a drifted worktree an agent
+container is still running inside — it is reported as LIVE CONTAINER, it resolves
+by itself when that container exits, and the `git checkout` the other clean
+shapes want would rewrite the tree underneath the running agent. The recovery is
+therefore ordinary git, run against the path this script prints, followed by
+scripts/release_lock.py for the board's retained pipeline lock — the commands are
+printed alongside each finding.
 
 Usage:
     python scripts/inspect_epic_worktrees.py
@@ -79,9 +85,15 @@ def _describe_unmerged(row: dict) -> str:
     return str(row['unmerged_commits'])
 
 
+def _describe_branch(row: dict) -> str:
+    if row['current_branch']:
+        return row['current_branch']
+    return '<detached HEAD>' if row.get('head_detached') else '<unreadable>'
+
+
 def _print_row(row: dict) -> None:
     print(f"  epic #{row['epic_id']}  {row['path']}")
-    print(f"    branch:       {row['current_branch'] or '<unreadable/detached>'}")
+    print(f"    branch:       {_describe_branch(row)}")
     print(f"    epic branch:  {row['expected_branch'] or '<none found>'}")
     if len(row['epic_branches']) > 1:
         print(f"    epic has:     {', '.join(row['epic_branches'])}")
@@ -91,13 +103,27 @@ def _print_row(row: dict) -> None:
         # committed its own work onto the drifted branch leaves an empty
         # porcelain and commits that exist nowhere else.
         print(f"    unmerged:     {_describe_unmerged(row)} commit(s) not on the epic's branch")
-    print(f"    prune:        {'SKIPPED (drifted + uncommitted work)' if row['prune_skipped'] else 'eligible'}")
+    print(f"    prune:        {'SKIPPED (drifted + work this sweep cannot preserve)' if row['prune_skipped'] else 'eligible'}")
 
     if row['drifted']:
         print(
-            f"    ⚠️  DRIFTED — {row['current_branch']!r} belongs to no epic. "
+            f"    ⚠️  DRIFTED — {_describe_branch(row)} belongs to no epic. "
             "Dispatches for this epic are refused unless this directory holds "
             "nothing the epic's branch does not (clean tree, no commits of its own)."
+        )
+    if row['drifted'] and row.get('container_live') is not False:
+        # The one drift shape with no operator action at all, and the one where
+        # the move-HEAD advice below would be actively destructive: a repair (by
+        # the orchestrator OR by hand) rewrites every tracked file in a directory
+        # an agent is live inside. None is "docker could not be asked", which is
+        # not the same claim as "nothing is running" — so it gets the same
+        # treatment (code review on #163).
+        print(
+            "    ⏳ LIVE CONTAINER — an agent container "
+            + ("is still running" if row.get('container_live')
+               else "may still be running (docker could not be asked)")
+            + " against this worktree. Do NOT move HEAD or remove the directory; "
+            "this resolves on its own once that container exits."
         )
     for line in row['uncommitted_files']:
         print(f"      {line}")
@@ -106,11 +132,19 @@ def _print_row(row: dict) -> None:
         print("    to recover:")
         print(f"      git -C {row['path']} status")
         print(f"      git -C {row['path']} diff")
+        if row.get('container_live') is not False:
+            # Read-only commands stay; every mutating suggestion below is gated on
+            # the liveness answer, because all of them rewrite a working tree an
+            # agent may still be editing.
+            print(
+                "      # a container is (or may be) live in there — nothing else to "
+                "run; it resolves when that container exits"
+            )
         # The stash/discard pair only applies when there IS something uncommitted.
         # Printing it for a clean worktree sends an operator to run a no-op and
         # conclude the directory is now fine, which is the wrong conclusion for
         # every clean shape of this block.
-        if row['uncommitted'] is not False:
+        if row['uncommitted'] is not False and row.get('container_live') is False:
             if row['expected_branch']:
                 print(
                     f"      # keep it:    git -C {row['path']} stash && "
@@ -127,9 +161,17 @@ def _print_row(row: dict) -> None:
                 f"{row['expected_branch']}..{row['current_branch']}  "
                 "# cherry-pick/merge them, or `branch -D` if unwanted"
             )
-        if row['drifted'] and not row['uncommitted'] and row['unmerged_commits'] == 0:
+        if (
+            row['drifted']
+            and not row['uncommitted']
+            and row['unmerged_commits'] == 0
+            and row.get('container_live') is False
+        ):
             # Nothing to commit or discard, so this one does not clear itself:
-            # the block persists until HEAD is moved by hand.
+            # the block persists until HEAD is moved by hand. Suppressed when a
+            # container is (or may be) live in there — telling an operator to
+            # check out over a running agent's working tree is the one thing the
+            # orchestrator's own liveness gate exists to prevent.
             print(
                 f"      # nothing to preserve — move HEAD back: git -C {row['path']} "
                 f"checkout {row['expected_branch'] or '<epic branch>'}"
@@ -182,9 +224,12 @@ def main():
 
     drifted = sum(1 for row in rows if row['drifted'])
     skipped = sum(1 for row in rows if row['prune_skipped'])
+    live = sum(1 for row in rows if row['drifted'] and row.get('container_live') is not False)
     print(
         f"{len(rows)} worktree(s): {drifted} drifted, "
-        f"{skipped} drifted and holding uncommitted work (prune skips these)."
+        f"{skipped} holding work the startup sweep cannot preserve (prune skips "
+        f"these), {live} with a container still (or possibly) live inside — those "
+        "need no action."
     )
     return 0
 

@@ -1059,6 +1059,115 @@ class TestPruneUncommittedWorkSkip:
 
         assert drifted.exists()
 
+    def _drifted_with_commits_git(self, porcelain: str, head: str, epic_branch: str,
+                                  ahead: str = "3"):
+        """A drifted worktree whose branch carries commits of its own: clean
+        porcelain, an epic branch in the local ref store, and a non-zero
+        `rev-list --count <epic>..<drifted>`."""
+        def _run(cmd, **kwargs):
+            if 'status' in cmd:
+                return _ok(porcelain)
+            if 'rev-parse' in cmd and '--abbrev-ref' in cmd:
+                return _ok(f"{head}\n")
+            if 'for-each-ref' in cmd:
+                return _ok(f"{epic_branch}\n")
+            if 'rev-list' in cmd and '--count' in cmd:
+                return _ok(f"{ahead}\n")
+            return _ok()
+        return _run
+
+    def test_skips_a_clean_drifted_worktree_whose_branch_carries_its_own_commits(
+        self, manager, tmp_path
+    ):
+        """The shape the rule used to miss entirely (code review on #163).
+
+        reconcile_worktree_branch() refuses over a drifted branch with a CLEAN
+        tree and commits of its own, on the stated grounds that "only a human can
+        decide whether they belong on the epic's branch", and the issue comment
+        prints a `git log` against this path. The skip covered only the dirty
+        shape, so the next restart ran _push_local_commits_if_any() -- publishing
+        the junk branch to the shared GitHub repo -- and then force-removed the
+        directory the comment told the operator to look in, bypassing the
+        adjudication the refusal demanded."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '978'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/978\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._drifted_with_commits_git(
+                       "", head='scratch', epic_branch='feature/issue-978-epic')
+                   ) as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert drifted.exists()
+        assert [c for c in mock_run.call_args_list if 'remove' in c.args[0]] == []
+        # And no stray branch published to the shared repo on the way out.
+        assert [c for c in mock_run.call_args_list if 'push' in c.args[0]] == []
+
+    def test_still_removes_a_clean_drifted_worktree_the_epics_branch_already_has(
+        self, manager, tmp_path
+    ):
+        """The control: containment, not "is it drifted". A drifted branch whose
+        commits the epic's own branch already holds has nothing to adjudicate, so
+        widening the skip must not pin every drifted directory on disk."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '979'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/979\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._drifted_with_commits_git(
+                       "", head='scratch', epic_branch='feature/issue-979-epic',
+                       ahead="0")):
+            manager.prune_epic_worktrees()
+
+        assert not drifted.exists()
+
+    def test_an_uncountable_comparison_skips_rather_than_removes(self, manager, tmp_path):
+        """Unanswerable resolves to the non-destructive answer here too -- the
+        same rule _worktree_has_uncommitted_work() applies to an unreadable
+        status."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '980'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/980\n")
+
+        def _run(cmd, **kwargs):
+            if 'status' in cmd:
+                return _ok("")
+            if 'rev-parse' in cmd and '--abbrev-ref' in cmd:
+                return _ok("scratch\n")
+            if 'for-each-ref' in cmd:
+                return _ok("feature/issue-980-epic\n")
+            if 'rev-list' in cmd and '--count' in cmd:
+                return _fail("fatal: bad revision")
+            return _ok()
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_run):
+            manager.prune_epic_worktrees()
+
+        assert drifted.exists()
+
+    def test_a_clean_worktree_with_no_epic_branch_at_all_is_still_removed(
+        self, manager, tmp_path
+    ):
+        """Nothing to compare against and nothing to preserve onto -- the same
+        answer reconcile's matching verdict gives ("there is no local branch of
+        this epic to restore HEAD to ... nothing here needs preserving"). Calling
+        that "holds work" would pin every clean worktree whose HEAD is merely
+        unreadable on disk forever."""
+        _make_base_clone(tmp_path, "my-project")
+        drifted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '981'
+        drifted.mkdir(parents=True)
+        (drifted / '.git').write_text("gitdir: /fake/base/.git/worktrees/981\n")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=self._dirty_git("", head='scratch')):
+            manager.prune_epic_worktrees()
+
+        assert not drifted.exists()
+
     def test_the_skip_self_clears_once_the_work_is_committed(self, manager, tmp_path):
         """Nothing durable records the skip -- it is re-derived from the live
         working tree every startup, so committing or discarding the work is the
@@ -1513,20 +1622,30 @@ class TestGetRunningContainerMountSources:
         assert result == set()
         mock_run.assert_called_once()  # docker inspect never called -- nothing to inspect
 
-    def test_docker_ps_failure_returns_empty_set(self):
+    def test_docker_ps_failure_is_unanswerable_not_empty(self, caplog):
+        """None, not set() (code review on #163). An empty set is the claim
+        "docker answered: nothing is running", and reconcile_worktree_branch()
+        now acts destructively on that claim -- it is the only gate before a
+        `git checkout` that rewrites every tracked file in a directory a live
+        agent container may be mid-run inside. This exit used to log nothing
+        at all."""
         with patch('services.project_workspace.subprocess.run') as mock_run:
             mock_run.return_value = _fail("docker daemon not running")
-            result = ProjectWorkspaceManager._get_running_container_mount_sources()
-        assert result == set()
+            with caplog.at_level('WARNING', logger='services.project_workspace'):
+                result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result is None
+        assert any('docker ps' in r.message for r in caplog.records)
 
-    def test_docker_inspect_failure_returns_empty_set(self):
+    def test_docker_inspect_failure_is_unanswerable_not_empty(self, caplog):
         with patch('services.project_workspace.subprocess.run') as mock_run:
             mock_run.side_effect = [
                 _ok(stdout="repair-cycle-my-project-100-abc12345\n"),  # docker ps
                 _fail("no such container"),  # docker inspect
             ]
-            result = ProjectWorkspaceManager._get_running_container_mount_sources()
-        assert result == set()
+            with caplog.at_level('WARNING', logger='services.project_workspace'):
+                result = ProjectWorkspaceManager._get_running_container_mount_sources()
+        assert result is None
+        assert any('docker inspect' in r.message for r in caplog.records)
 
     def test_collects_mount_sources_across_multiple_containers(self):
         import json as _json
@@ -1570,17 +1689,32 @@ class TestGetRunningContainerMountSources:
             result = ProjectWorkspaceManager._get_running_container_mount_sources()
         assert result == set()
 
-    def test_subprocess_exception_returns_empty_set_not_a_crash(self):
+    def test_subprocess_exception_is_unanswerable_not_a_crash(self):
         with patch('services.project_workspace.subprocess.run', side_effect=OSError("docker not found")):
             result = ProjectWorkspaceManager._get_running_container_mount_sources()
-        assert result == set()
+        assert result is None
 
-    def test_timeout_returns_empty_set_not_a_crash(self):
+    def test_timeout_is_unanswerable_not_a_crash(self):
+        """The realistic shape of this under load: `docker inspect` exceeds its
+        10s budget. Reported as "could not be asked", never as "nothing is
+        running"."""
         import subprocess as _subprocess
         with patch('services.project_workspace.subprocess.run',
                     side_effect=_subprocess.TimeoutExpired(cmd="docker", timeout=10)):
             result = ProjectWorkspaceManager._get_running_container_mount_sources()
-        assert result == set()
+        assert result is None
+
+    def test_an_unanswerable_liveness_check_is_not_bind_mounted_nor_not(self):
+        """The consumer half of the same distinction: _worktree_is_bind_mounted()
+        passes None through rather than collapsing it to False, so each caller
+        resolves it for itself -- reconcile refuses (non-destructive), prune
+        keeps its pre-existing fail-open sweep."""
+        assert ProjectWorkspaceManager._worktree_is_bind_mounted(
+            '/workspace/.orchestrator/worktrees/my-project/42', None
+        ) is None
+        assert ProjectWorkspaceManager._worktree_is_bind_mounted(
+            '/workspace/.orchestrator/worktrees/my-project/42', set()
+        ) is False
 
 
 class TestPruneEpicWorktreesLivenessCheck:

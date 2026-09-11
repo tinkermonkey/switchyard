@@ -410,6 +410,7 @@ class AgentExecutor:
                                 pre_dispatch=True,
                                 drift_dirty=resolve_err.dirty,
                                 drift_unmerged_commits=resolve_err.unmerged_commits,
+                                drift_container_live=resolve_err.container_live,
                             )
                         raise
                     epic_id = pipeline_run_for_workspace.epic_id
@@ -2397,6 +2398,7 @@ class AgentExecutor:
         pre_dispatch: bool = False,
         drift_dirty: Optional[bool] = None,
         drift_unmerged_commits: Optional[int] = None,
+        drift_container_live: bool = False,
     ):
         """
         Escalate a refusal to work against a workspace that could not be confirmed
@@ -2429,14 +2431,20 @@ class AgentExecutor:
                 changes only how the comment describes what is on disk (nobody's
                 work was produced by this run; what is sitting there is an earlier
                 one's).
-            drift_dirty / drift_unmerged_commits: the pre-dispatch verdict's own
-                answers about what that worktree actually holds, straight off
-                WorktreeBranchDriftError. The summary and the recovery steps are
-                derived from them rather than hardcoded (code review on #163): the
-                verdict has four distinct shapes, only one of which is "it holds
-                uncommitted changes", and telling an operator to `git reset --hard`
-                a clean worktree sends them to run a no-op and then hit the exact
-                same refusal on the next poll.
+            drift_dirty / drift_unmerged_commits / drift_container_live: the
+                pre-dispatch verdict's own answers about what that worktree
+                actually holds and whether anything is still running inside it,
+                straight off WorktreeBranchDriftError. The summary and the recovery
+                steps are derived from them rather than hardcoded (code review on
+                #163): the verdict has several distinct shapes, only one of which
+                is "it holds uncommitted changes", and telling an operator to `git
+                reset --hard` a clean worktree sends them to run a no-op and then
+                hit the exact same refusal on the next poll. drift_container_live
+                is checked FIRST because three shapes share dirty=False /
+                unmerged_commits==0 and its recovery is the opposite of theirs: the
+                `git checkout` the others need is precisely the tree rewrite under
+                a live agent that reconcile_worktree_branch() refused to perform,
+                and this shape clears itself with no human action at all.
 
         Always raises NonRetryableAgentError.
         """
@@ -2449,11 +2457,33 @@ class AgentExecutor:
         drift_step = None
         drift_clearing_step = None
         if pre_dispatch:
-            # One of reconcile_worktree_branch()'s four drift shapes, each with its
-            # own honest description and its own recovery. Only the first of them
-            # is the "commit it or discard it" case this comment used to assume for
-            # all four (code review on #163).
-            if drift_dirty is True:
+            # One of reconcile_worktree_branch()'s drift shapes, each with its own
+            # honest description and its own recovery. Only the dirty one is the
+            # "commit it or discard it" case this comment used to assume for all of
+            # them (code review on #163).
+            if drift_container_live:
+                # First, because it also carries dirty=False / unmerged==0 and
+                # every other clean shape's recovery is a `git checkout` in that
+                # directory -- which here means a human rewriting the working tree
+                # underneath a running agent, the exact thing the verdict's
+                # liveness gate refused to do (code review on #163).
+                what_is_there = (
+                    "and nothing in it needs preserving — but an agent container "
+                    "may still be running against that directory"
+                )
+                drift_step = (
+                    "2. **Do not touch that worktree.** HEAD was deliberately left "
+                    "where it is because restoring it would rewrite the working "
+                    "tree underneath a live agent. If you need the epic moving "
+                    "again sooner, find the container with `docker ps` and stop it "
+                    "(`curl -X POST http://localhost:5001/agents/kill/<container>`) "
+                    "— otherwise just let it finish."
+                )
+                drift_clearing_step = (
+                    "3. This one clears itself with no git at all: the next dispatch "
+                    "after that container exits restores the epic's branch on its own."
+                )
+            elif drift_dirty is True:
                 what_is_there = "and it holds uncommitted changes"
                 drift_step = (
                     f"2. Inspect the worktree at `{project_dir}` and preserve anything "
@@ -2535,6 +2565,30 @@ class AgentExecutor:
                 "could not be read, so nothing was staged, committed, pushed, or turned "
                 "into a PR. The changes are still sitting uncommitted on disk."
             )
+            # A branch that could not be READ is a detached or unreadable HEAD, and
+            # the `git checkout` step is not optional for it (code review on #163).
+            # A commit made in a detached HEAD is reachable from no branch at all,
+            # and while reconcile_worktree_branch() does repair a CONFIRMED
+            # detached HEAD once the tree is clean, it deliberately does not touch
+            # a HEAD git could not read at all -- so promising unconditional
+            # self-repair here is the one thing that leaves an operator looping
+            # through the identical refusal.
+            drift_step = (
+                f"2. Inspect the worktree at `{project_dir}` and preserve anything "
+                "worth keeping (`git status`, `git diff`). HEAD is detached or "
+                "unreadable, so do NOT commit in place — a commit made here belongs "
+                f"to no branch. Put HEAD back first: `git -C {project_dir} checkout "
+                f"{expected_branch or '<epic branch>'}` (stash and pop around it to "
+                "carry the changes over), or discard them with `git reset --hard` / "
+                "`git clean -fd` and let the pipeline redo the work."
+            )
+            drift_clearing_step = (
+                "3. Move HEAD back **before** releasing the lock. A detached HEAD is "
+                "restored by the next dispatch once that worktree is clean, but a "
+                "HEAD git cannot read at all is not repaired automatically at any "
+                "point — every subsequent dispatch keeps its own resolved branch and "
+                "refuses here again."
+            )
         else:
             summary = (
                 "The agent completed its work, but the workspace was **not on this "
@@ -2542,22 +2596,30 @@ class AgentExecutor:
                 "pushed, or turned into a PR. The changes are still sitting uncommitted "
                 "on disk."
             )
+            drift_step = (
+                f"2. Inspect the worktree at `{project_dir}` and preserve anything "
+                "worth keeping (`git status`, `git diff`) — commit it onto "
+                f"{branch_label} yourself, or discard it with `git reset --hard` / "
+                "`git clean -fd` and let the pipeline redo it. Then put HEAD back: "
+                f"`git -C {project_dir} checkout {expected_branch or '<epic branch>'}`."
+            )
+            drift_clearing_step = (
+                "3. Nothing else needs clearing: once that worktree is clean, the "
+                "next dispatch restores the epic's branch on its own even if you "
+                "skip the checkout above."
+            )
 
         def _wrong_branch_comment(lock_status_line: str, board_name: str) -> str:
             steps = "\n".join([
                 f"1. See what is there: `python scripts/inspect_epic_worktrees.py "
                 f"--project {project_name}` (reports every epic worktree's branch, "
                 "whether it has drifted, and what is uncommitted in it).",
-                drift_step or (
-                    f"2. Inspect the worktree at `{project_dir}` and preserve anything "
-                    "worth keeping (`git status`, `git diff`) — commit it onto "
-                    f"`{expected_branch or '<branch>'}` yourself, or discard it with "
-                    "`git reset --hard` / `git clean -fd` and let the pipeline redo it."
-                ),
-                drift_clearing_step or (
-                    "3. Nothing else needs clearing: once that worktree is clean, the "
-                    "next dispatch restores the epic's branch on its own."
-                ),
+                # Always set by one of the branches above -- each shape of this
+                # refusal has its own recovery, and a shared fallback is how the
+                # post-dispatch path silently lost its `git checkout` step (code
+                # review on #163).
+                drift_step,
+                drift_clearing_step,
                 f"4. Run `python scripts/release_lock.py --project {project_name} "
                 f"--board \"{board_name}\" --issue "
                 f"{task_context.get('issue_number')}` to release the pipeline lock "

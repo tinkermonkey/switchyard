@@ -568,8 +568,8 @@ class TestResolveWorkspaceBranchDivergence:
                            return_value="feature/issue-42-requested"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="feature/issue-42-actually-on-disk"):
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("feature/issue-42-actually-on-disk", False)):
 
             result = await pipeline_run_manager.resolve_workspace(
                 pipeline_run, mock_github_integration, workspace_type='issues'
@@ -610,8 +610,8 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
                            return_value="feature/issue-42-epic"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="scratch"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("scratch", False)), \
              patch.object(workspace_manager, '_worktree_has_uncommitted_work',
                            return_value=True), \
              patch.object(workspace_manager, '_restore_worktree_branch') as mock_restore:
@@ -648,8 +648,8 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
                            return_value="feature/issue-42-epic"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="scratch"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("scratch", False)), \
              patch.object(workspace_manager, '_worktree_has_uncommitted_work',
                            return_value=False), \
              patch.object(workspace_manager, '_local_branch_exists',
@@ -687,8 +687,8 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
                            return_value="feature/issue-42-epic"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="scratch"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("scratch", False)), \
              patch.object(workspace_manager, '_worktree_has_uncommitted_work',
                            return_value=False), \
              patch.object(workspace_manager, '_local_branch_exists', return_value=True), \
@@ -722,8 +722,8 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
                            return_value="feature/issue-42-epic"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="scratch"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("scratch", False)), \
              patch.object(workspace_manager, '_worktree_has_uncommitted_work',
                            return_value=False), \
              patch.object(workspace_manager, '_local_branch_exists', return_value=True), \
@@ -755,8 +755,8 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
                            return_value="feature/issue-42-epic"), \
              patch.object(workspace_manager, 'get_or_create_epic_worktree',
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
-             patch.object(workspace_manager, '_current_worktree_branch',
-                           return_value="scratch"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=("scratch", False)), \
              patch.object(workspace_manager, '_worktree_has_uncommitted_work',
                            return_value=True), \
              patch('monitoring.observability.get_observability_manager', return_value=obs):

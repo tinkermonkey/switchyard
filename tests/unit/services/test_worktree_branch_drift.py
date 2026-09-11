@@ -61,8 +61,16 @@ class FakeGit:
     """
 
     def __init__(self, head, status="", status_rc=0, local_branches=(), checkout_ok=True,
-                 checkout_moves_head=True, ahead=0, ahead_rc=0, mounted_sources=()):
+                 checkout_moves_head=True, ahead=0, ahead_rc=0, mounted_sources=(),
+                 head_rc=0, docker_rc=0):
         self.head = head
+        # `rev-parse --abbrev-ref HEAD` failing outright, as opposed to answering
+        # the literal string `HEAD` for a detached one -- the two states this
+        # method must tell apart.
+        self.head_rc = head_rc
+        # `docker ps` failing, i.e. the liveness question is unanswerable rather
+        # than answered "nothing is running".
+        self.docker_rc = docker_rc
         self.status = status
         self.status_rc = status_rc
         self.local_branches = set(local_branches)
@@ -79,12 +87,16 @@ class FakeGit:
     def __call__(self, cmd, **kwargs):
         self.calls.append(list(cmd))
         if cmd[0] == 'docker':
+            if self.docker_rc != 0:
+                return _result(self.docker_rc, "", "Cannot connect to the Docker daemon")
             if 'ps' in cmd:
                 return _result(0, "live-container\n" if self.mounted_sources else "")
             return _result(0, json.dumps(
                 [{'Source': src} for src in self.mounted_sources]
             ) + "\n")
         if 'rev-parse' in cmd and '--abbrev-ref' in cmd:
+            if self.head_rc != 0:
+                return _result(self.head_rc, "", "fatal: not a git repository")
             return _result(0, f"{self.head}\n" if self.head else "HEAD\n")
         if 'rev-parse' in cmd and '--verify' in cmd:
             branch = cmd[-1].split('refs/heads/')[-1]
@@ -154,17 +166,80 @@ class TestTheOrdinaryCases:
             'feature/issue-42-actually-on-disk'
         )
 
-    def test_a_detached_head_is_unknown_not_drift(self, manager):
-        """_current_worktree_branch() is documented best-effort and answers None
-        for a transient git failure as readily as for a detached HEAD. Turning
-        that into a blocked dispatch would be a new failure mode in exchange for
-        a check #149 already does at the point it matters."""
-        git = FakeGit(head=None)
+    def test_an_unreadable_head_is_unknown_not_drift(self, manager):
+        """`rev-parse` failing outright is best-effort's transient case: turning
+        it into a blocked dispatch would be a new failure mode in exchange for a
+        check #149 already does at the point it matters. Deliberately NOT the
+        same as a detached HEAD, which git answers definitively -- see
+        TestADetachedHeadIsDrift."""
+        git = FakeGit(head=None, head_rc=128)
         verdict = _reconcile(manager, git)
 
         assert verdict.status is WorktreeBranchStatus.UNKNOWN
         assert verdict.branch == EPIC_BRANCH
         assert not git.ran('checkout')
+
+
+class TestADetachedHeadIsDrift:
+    """A detached HEAD used to reach the same UNKNOWN verdict an unreadable one
+    does, because _current_worktree_branch() collapsed both into None (code
+    review on #163) -- so the dispatch PROCEEDED with its own resolved branch.
+
+    `git checkout <sha>` / an aborted rebase inside an epic worktree is a shape
+    auto_commit.py already documents as observed. The commit path refuses over it
+    and leaves the work uncommitted on disk; the next sibling sub-issue then
+    reconciled to UNKNOWN, ran an agent on top of that unclaimed work, and only
+    the commit-time check caught it -- now with two issues' work mixed in one
+    directory, which is exactly what the pre-dispatch refusal exists to prevent.
+    """
+
+    def test_a_detached_head_with_dirty_work_is_refused(self, manager):
+        git = FakeGit(head=None, status=" M someone_elses_work.py\n",
+                      local_branches=[EPIC_BRANCH])
+        verdict = _reconcile(manager, git)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.branch is None, (
+            "offering a branch here is how the dispatch proceeded onto work "
+            "nobody had claimed"
+        )
+        assert verdict.found_branch is None
+        assert verdict.dirty is True
+        assert 'detached HEAD' in verdict.detail
+        assert not git.ran('checkout')
+
+    def test_a_clean_detached_head_is_repaired_rather_than_wedged(self, manager):
+        """Drift is not a synonym for refusal: the same repair every other clean
+        drift gets applies here, so an aborted rebase does not wedge the epic."""
+        git = FakeGit(head=None, status="", local_branches=[EPIC_BRANCH], ahead=0)
+        verdict = _reconcile(manager, git)
+
+        assert verdict.status is WorktreeBranchStatus.REPAIRED
+        assert verdict.branch == EPIC_BRANCH
+        assert git.ran('checkout')
+
+    def test_commits_made_while_detached_are_counted_against_head(self, manager):
+        """There is no branch name to compare against, and the commits an agent
+        made while detached are reachable from HEAD and from nothing else --
+        walking away from them is exactly what the ahead-count exists to stop."""
+        git = FakeGit(head=None, status="", local_branches=[EPIC_BRANCH], ahead=2)
+        verdict = _reconcile(manager, git)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.unmerged_commits == 2
+        rev_list = [call for call in git.calls if 'rev-list' in call]
+        assert rev_list and f'{EPIC_BRANCH}..HEAD' in rev_list[0]
+        assert not git.ran('checkout')
+
+    def test_a_detached_head_is_not_adopted_when_no_branch_was_resolved(self, manager):
+        """The `not expected_branch` arm adopts whatever HEAD is on. With no
+        branch to adopt it must fall through to the drift path, not report an
+        EPIC_BRANCH verdict carrying branch=None."""
+        git = FakeGit(head=None, status=" M work.py\n", local_branches=[EPIC_BRANCH])
+        verdict = _reconcile(manager, git, expected_branch=None)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.branch is None
 
 
 class TestCleanDriftIsRepaired:
@@ -336,6 +411,75 @@ class TestALiveContainerIsNeverRepairedUnderneath:
         assert 'live, running container' in verdict.detail
         assert not git.ran('checkout')
 
+    def test_the_liveness_refusal_is_distinguishable_from_a_failed_repair(self, manager):
+        """It carries dirty=False/unmerged_commits==0, byte-identical to the
+        "clean tree, nothing to preserve, but the checkout failed" verdict --
+        which is the one whose operator recovery is `git checkout` in that very
+        directory (code review on #163). Without its own discriminator the issue
+        comment told a human to rewrite a live agent's working tree by hand, and
+        claimed a shape that clears itself in minutes never clears at all."""
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
+                      mounted_sources=['/host/workspace/.orchestrator/worktrees/my-project/42'])
+
+        with patch('claude.docker_runner.DockerAgentRunner._detect_host_workspace_path',
+                   return_value='/host/workspace'):
+            live = _reconcile(manager, git)
+
+        failed_repair = _reconcile(
+            manager,
+            FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
+                    checkout_ok=False),
+        )
+
+        assert live.dirty == failed_repair.dirty
+        assert live.unmerged_commits == failed_repair.unmerged_commits
+        assert live.container_live is True
+        assert failed_repair.container_live is False
+        assert 'clears itself' in live.detail
+
+    def test_an_unanswerable_liveness_check_refuses_rather_than_repairs(self, manager):
+        """The only guard on the only destructive thing this method does used to
+        fail OPEN: `docker inspect` timing out under load produced an empty set,
+        which read as "nothing is running", and the repair proceeded to rewrite
+        every tracked file under a mid-run agent container. Unanswerable resolves
+        to the non-destructive answer here, same as an unreadable `git status`
+        and an uncountable rev-list."""
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
+                      docker_rc=1)
+        verdict = _reconcile(manager, git)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.container_live is True
+        assert 'could not be established' in verdict.detail
+        assert not git.ran('checkout')
+
+    def test_a_worktree_marked_in_use_by_a_git_writer_is_refused_too(self, manager):
+        """A container is not the only writer that can be mid-run in there
+        (code review on #163): startup recovery's auto-commit thread takes
+        mark_worktree_path_in_use() for its own lifetime, prune already consults
+        that map, and the mutation this gate protects is no less destructive
+        than prune's."""
+        manager.mark_worktree_path_in_use(WORKTREE)
+        try:
+            git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH])
+            verdict = _reconcile(manager, git)
+        finally:
+            manager.clear_worktree_path_in_use(WORKTREE)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.container_live is True
+        assert 'marked in use' in verdict.detail
+        assert not git.ran('checkout')
+
+    def test_clearing_the_in_use_mark_lets_the_repair_proceed(self, manager):
+        """The control: like every other shape of this refusal, it is re-derived
+        live and clears itself the moment the condition is gone."""
+        manager.mark_worktree_path_in_use(WORKTREE)
+        manager.clear_worktree_path_in_use(WORKTREE)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH])
+
+        assert _reconcile(manager, git).status is WorktreeBranchStatus.REPAIRED
+
     def test_an_unrelated_running_container_does_not_block_the_repair(self, manager):
         git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
                       mounted_sources=['/host/workspace/.orchestrator/worktrees/my-project/99'])
@@ -501,6 +645,100 @@ class TestSurveyEpicWorktrees:
         assert rows[0]['drifted'] is False
         assert rows[0]['uncommitted'] is True
         assert rows[0]['prune_skipped'] is False
+
+    def test_a_clean_drifted_worktree_carrying_its_own_commits_is_prune_skipped(
+        self, manager, tmp_path
+    ):
+        """The shape the sweep's drift rule used to miss entirely (code review on
+        #163): reconcile refuses over it because "only a human can decide whether
+        those commits belong on the epic's branch", the issue comment prints a
+        `git log` against the path -- and then the next restart pushed the drifted
+        branch to the shared repo as a stray and deleted the directory the comment
+        pointed at, bypassing the adjudication the refusal demanded."""
+        self._stage(tmp_path, 'my-project', 42)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH], ahead=3)
+
+        with patch('services.project_workspace.subprocess.run', side_effect=git):
+            rows = manager.survey_epic_worktrees()
+
+        assert rows[0]['drifted'] is True
+        assert rows[0]['uncommitted'] is False
+        assert rows[0]['unmerged_commits'] == 3
+        assert rows[0]['prune_skipped'] is True
+
+    def test_a_clean_drifted_worktree_with_nothing_of_its_own_stays_prunable(
+        self, manager, tmp_path
+    ):
+        """The control for the rule above: there is genuinely nothing here the
+        epic's branch does not already have, so widening the skip must not pin
+        every drifted directory on disk forever."""
+        self._stage(tmp_path, 'my-project', 42)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH], ahead=0)
+
+        with patch('services.project_workspace.subprocess.run', side_effect=git):
+            rows = manager.survey_epic_worktrees()
+
+        assert rows[0]['drifted'] is True
+        assert rows[0]['prune_skipped'] is False
+
+    def test_a_detached_head_is_reported_as_drift_not_as_unreadable(
+        self, manager, tmp_path
+    ):
+        self._stage(tmp_path, 'my-project', 42)
+        git = FakeGit(head=None, status=" M work.py\n", local_branches=[EPIC_BRANCH])
+
+        with patch('services.project_workspace.subprocess.run', side_effect=git):
+            rows = manager.survey_epic_worktrees()
+
+        assert rows[0]['current_branch'] is None
+        assert rows[0]['head_detached'] is True
+        assert rows[0]['drifted'] is True
+
+    def test_a_live_container_is_reported_so_the_script_can_suppress_its_advice(
+        self, manager, tmp_path
+    ):
+        """survey_epic_worktrees() consulted no container liveness at all, so
+        scripts/inspect_epic_worktrees.py printed "nothing to preserve — move HEAD
+        back" for a worktree an agent was mid-run inside (code review on #163).
+
+        The container-side -> host-side translation only fires for paths actually
+        rooted at /workspace/, which these tmp_path-rooted worktrees are not, so
+        the check itself is stubbed here and exercised directly in
+        TestALiveContainerIsNeverRepairedUnderneath."""
+        path = self._stage(tmp_path, 'my-project', 42)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH])
+
+        with patch.object(ProjectWorkspaceManager, '_worktree_is_bind_mounted',
+                          return_value=True) as mounted, \
+             patch('services.project_workspace.subprocess.run', side_effect=git):
+            rows = manager.survey_epic_worktrees(project_name='my-project')
+
+        assert rows[0]['container_live'] is True
+        assert str(mounted.call_args[0][0]) == str(path)
+
+    def test_an_unanswerable_liveness_check_is_reported_as_unknown_not_as_idle(
+        self, manager, tmp_path
+    ):
+        self._stage(tmp_path, 'my-project', 42)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
+                      docker_rc=1)
+
+        with patch('services.project_workspace.subprocess.run', side_effect=git):
+            rows = manager.survey_epic_worktrees()
+
+        assert rows[0]['container_live'] is None
+
+    def test_liveness_is_asked_once_for_the_whole_survey(self, manager, tmp_path):
+        """It backs an HTTP handler; two docker round-trips per staged worktree
+        is not a diagnostic cost anyone signed up for."""
+        self._stage(tmp_path, 'my-project', 42)
+        self._stage(tmp_path, 'my-project', 43)
+        git = FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH])
+
+        with patch('services.project_workspace.subprocess.run', side_effect=git):
+            manager.survey_epic_worktrees()
+
+        assert len([call for call in git.calls if call[0] == 'docker']) <= 1
 
     def test_scoped_to_one_project(self, manager, tmp_path):
         self._stage(tmp_path, 'my-project', 42)

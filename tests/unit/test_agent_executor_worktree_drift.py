@@ -38,7 +38,7 @@ def agent_executor():
         return AgentExecutor()
 
 
-def _drift_error(dirty=True, unmerged_commits=None):
+def _drift_error(dirty=True, unmerged_commits=None, container_live=False):
     return WorktreeBranchDriftError(
         "Epic worktree for test-project epic #42 at /workspace/.orchestrator/"
         "worktrees/test-project/42 has drifted onto a branch that belongs to no "
@@ -50,6 +50,7 @@ def _drift_error(dirty=True, unmerged_commits=None):
         found_branch='scratch',
         dirty=dirty,
         unmerged_commits=unmerged_commits,
+        container_live=container_live,
     )
 
 
@@ -211,6 +212,34 @@ class TestADriftedWorktreeBlocksBeforeDispatch:
         assert 'holds uncommitted changes' in body
         assert 'reset --hard' in body
         assert 'restores the epic' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_is_never_described_as_a_failed_checkout(
+        self, agent_executor
+    ):
+        """Three drift shapes carry byte-identical dirty=False/unmerged==0, and
+        this one's recovery is the OPPOSITE of the other two (code review on
+        #163). The comment told an operator that HEAD "could not be moved back",
+        printed `git -C <worktree> checkout <epic branch>` as step 2 -- a human
+        rewriting the working tree underneath a mid-run agent container, the exact
+        thing reconcile_worktree_branch()'s liveness gate refused to do -- and
+        then claimed the block never clears, when it clears by itself the moment
+        that container exits."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=0, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'HEAD could not be moved back' not in body
+        assert 'checkout feature/issue-42-epic' not in body
+        assert 'reset --hard' not in body
+        assert 'does **not** clear itself' not in body
+        assert 'Do not touch that worktree' in body
+        assert 'clears itself' in body
+        # The supported way to stop it, for an operator who needs the epic moving
+        # sooner than the container will finish.
+        assert 'agents/kill' in body
 
     @pytest.mark.asyncio
     async def test_an_ordinary_resolution_failure_is_not_escalated_this_way(

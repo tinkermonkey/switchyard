@@ -376,6 +376,28 @@ class TestARefusalStopsTheRunInsteadOfAdvancingIt:
         assert 'scratch' in body
 
     @pytest.mark.asyncio
+    async def test_the_post_dispatch_comment_still_tells_the_operator_to_move_head(self):
+        """The `git checkout <expected branch>` step was the whole of the old
+        step 2 and it silently disappeared when the pre-dispatch shapes were added
+        (code review on #163) -- no test pinned this body beyond the "Wrong
+        Branch" heading. Committing or discarding the work makes the tree clean;
+        it does not put HEAD back, and an operator following a comment that never
+        mentions the branch has no reason to think it needs putting back."""
+        harness = await _run_finalization({
+            'success': False,
+            'branch_mismatch': True,
+            'expected_branch': 'feature/issue-5-epic',
+            'current_branch': 'scratch',
+            'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
+        })
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'checkout feature/issue-5-epic' in body
+        # The self-repair promise is fine for THIS shape -- a readable wrong
+        # branch really is restored by the next dispatch once the tree is clean.
+        assert 'restores the epic' in body
+
+    @pytest.mark.asyncio
     async def test_an_ordinary_finalization_failure_still_runs_the_failsafe(self):
         """The pre-existing behavior for every other failure must be
         untouched -- the skip and the escalation are scoped to the branch
@@ -433,6 +455,30 @@ class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
 
         body = harness['github'].post_comment.await_args[0][1]
         assert 'Branch Unverifiable' in body
+
+    @pytest.mark.asyncio
+    async def test_the_unverifiable_comment_does_not_promise_automatic_repair(self):
+        """`unverifiable` is reached when HEAD could not be read at all -- in
+        practice a detached HEAD, or git failing outright. The rewritten recovery
+        steps asserted unconditionally that "once that worktree is clean, the next
+        dispatch restores the epic's branch on its own", which is simply false for
+        a HEAD reconcile_worktree_branch() cannot read: it returns UNKNOWN, keeps
+        the run's own resolved branch, and the identical refusal fires again on
+        the next poll (code review on #163). A commit made in a detached HEAD is
+        reachable from no branch either, so "commit it onto the epic's branch
+        yourself" is wrong advice on its own terms here."""
+        from services.agent_executor import FailsafeBranchCheck
+
+        harness = await _run_finalization(
+            dict(self._UNVERIFIABLE),
+            failsafe_refusal=FailsafeBranchCheck(None, True, None),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'checkout feature/issue-5-epic' in body
+        assert 'detached' in body
+        assert 'not repaired automatically' in body
+        assert 'restores the epic' not in body
 
     @pytest.mark.asyncio
     async def test_the_branch_the_failsafe_DID_read_is_named_in_the_comment(self):
