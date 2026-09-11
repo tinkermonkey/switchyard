@@ -61,9 +61,22 @@ _VALID_ENVIRONMENT_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
 _cache: Dict[str, Tuple[float, str]] = {}
 
 
+class _TransientResolutionError(Exception):
+    """Resolution failed for a reason that is not "this is not a project".
+
+    Carries the fallback so environment_for() can return it WITHOUT caching --
+    see _lookup_environment's second handler for why caching a degraded answer
+    is worse than recomputing it.
+    """
+
+    def __init__(self, fallback: str):
+        super().__init__(fallback)
+        self.fallback = fallback
+
+
 def clear_cache() -> None:
-    """Drop memoized lookups. For tests, and for any caller that has just
-    rewritten a project config and needs the change to take effect now."""
+    """Drop memoized lookups. Test-only today -- no production caller needs it,
+    because CACHE_TTL_SECONDS bounds staleness on its own."""
     _cache.clear()
 
 
@@ -75,14 +88,40 @@ def _lookup_environment(project_name: str) -> str:
     pre-#198 behaviour.
     """
     try:
-        from config.manager import config_manager
+        from config.manager import config_manager, ConfigurationError
+    except Exception:  # pragma: no cover - config package unavailable
+        return project_name
+
+    # ConfigurationError is what ConfigManager raises for "no such project"
+    # (its _load_yaml wraps a missing file), so it belongs in the QUIET branch
+    # alongside the builtins -- system-level callers pass names that are not
+    # projects all the time (state-file stems, "switchyard"), and warning on
+    # those would bury the real faults the second handler is for.
+    try:
         project_config = config_manager.get_project_config(project_name)
-    except Exception as e:
+    except (ConfigurationError, FileNotFoundError, KeyError) as e:
+        # Genuinely not a project. System-level callers pass names that are not
+        # projects (state-file stems, "switchyard"), so this is routine and
+        # stays quiet.
         logger.debug(
             f"No project config for {project_name!r} while resolving its dev-container "
             f"environment ({e}); using the project name"
         )
         return project_name
+    except Exception as e:
+        # Anything else is a FAULT, not an absence -- a YAML file caught
+        # mid-write, an IO error, a permission blip. Degrading to the project
+        # name is still the safe answer for this call, but it must be VISIBLE
+        # and must NOT be cached: a cached wrong answer points a member at its
+        # own image for the whole TTL, which silently bypasses the very build
+        # lock that serialises the shared environment.
+        logger.warning(
+            f"Could not resolve the dev-container environment for {project_name!r} "
+            f"({type(e).__name__}: {e}); using the project name for this call only. "
+            f"If this project shares an environment, this call is NOT serialised "
+            f"against the other members."
+        )
+        raise _TransientResolutionError(project_name) from e
 
     dev_container = getattr(project_config, 'dev_container', None) or {}
     environment = dev_container.get('environment')
@@ -113,7 +152,13 @@ def environment_for(project_name: str) -> str:
     if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
 
-    environment = _lookup_environment(project_name)
+    try:
+        environment = _lookup_environment(project_name)
+    except _TransientResolutionError as e:
+        # Deliberately not cached: the next call re-reads and, once the
+        # transient fault clears, resolves correctly again.
+        return e.fallback
+
     _cache[project_name] = (now, environment)
     return environment
 
@@ -203,6 +248,15 @@ def validate_environments(
         for member in members:
             github = getattr(project_configs[member], 'github', None) or {}
             repos[member] = github.get('repo_url')
+        missing = [m for m, r in repos.items() if not r]
+        if missing:
+            errors.append(
+                f"Projects {', '.join(sorted(missing))} share dev_container.environment "
+                f"'{environment}' but declare no github.repo_url, so the "
+                f"same-repository requirement cannot be checked for them. An image "
+                f"bakes one repository's dependencies; declare repo_url on every "
+                f"member."
+            )
         distinct = {r for r in repos.values() if r}
         if len(distinct) > 1:
             detail = ', '.join(f"{m}={repos[m]!r}" for m in members)

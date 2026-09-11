@@ -268,12 +268,30 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
                     "member of the environment)",
                     agent, project, environment, completed.value,
                 )
+                from services.dev_container_state import DevContainerStatus
+
+                if completed == DevContainerStatus.BLOCKED:
+                    # NOT a success. Saying "completed the build" here told the
+                    # operator a broken environment was ready, and the stage
+                    # reported success and advanced the card -- so a failed
+                    # environment build presented as clean setup on every other
+                    # member's board.
+                    raise RuntimeError(
+                        f"Dev container environment '{environment}' is BLOCKED: another "
+                        f"run reached a terminal failure for this environment while "
+                        f"'{agent}' was waiting for the build lock. Not rebuilding, and "
+                        f"not reporting success. Inspect "
+                        f"state/dev_containers/{environment}.yaml for the recorded "
+                        f"error, fix it, and re-run dev_environment_setup."
+                    )
+
                 return (
                     f"## Dev container environment `{environment}` already "
                     f"{completed.value}\n\n"
-                    f"Another project sharing this dev-container environment "
-                    f"completed the build while this run was waiting for the build "
-                    f"lock, so `{agent}` had nothing to do. No image was rebuilt.\n"
+                    f"This environment reached `{completed.value}` while `{agent}` was "
+                    f"waiting for the build lock, so there was nothing to do and no "
+                    f"image was rebuilt. Under a shared environment that means another "
+                    f"member built it; otherwise an operator or recovery path did.\n"
                 )
 
             return await _run_locally_under_checkout_lock(

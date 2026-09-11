@@ -209,46 +209,186 @@ class TestBuildDeduplication:
 
 # ------------------------------------------------- Cost 1: the prompt contract
 
-class TestSetupAgentPrompt:
-    """The image tag is emitted by a model following a prompt, not by code.
+class TestPromptRendering:
+    """The tag must reach the RENDERED prompt.
 
-    Before environments existed the tag and the checkout path were the same
-    identifier, so composing `{PROJECT_NAME}-agent:latest` was self-consistent.
-    Now they diverge, and a build tagged from the project name would be a
-    correct image under a name nothing reads. Prompt content is not otherwise
-    test-covered, and this is the one place a prompt edit can silently break a
-    keying invariant.
+    The tests these replace asserted only on markdown file contents and on
+    inspect.getsource() -- they passed with every line of Python in this change
+    deleted, while the value never reached the agent at all. Prompt content is
+    not otherwise covered, and this is where a wiring mistake is invisible.
     """
 
-    GUIDELINES = Path('prompts/content/agents/dev_environment_setup/guidelines.md')
+    TASK = {
+        'project': 'features',
+        'issue': {'title': 'T', 'body': 'B', 'labels': []},
+        'dev_container_image_tag': 'mono-agent:latest',
+        'dev_container_environment': 'mono',
+    }
 
-    def test_prompt_never_composes_the_tag_from_the_project_name(self):
-        text = self.GUIDELINES.read_text()
-        assert '{PROJECT_NAME}-agent' not in text, (
-            "dev_environment_setup must not derive the image tag from the project "
-            "name -- it is the dev-container ENVIRONMENT's tag and the two differ "
-            "whenever projects share an environment. Use "
-            "{DEV_CONTAINER_IMAGE_TAG}, supplied verbatim in the agent's context."
+    def _ctx(self, agent, **over):
+        from prompts.context import PromptContext
+        task = {**self.TASK, **over}
+        return PromptContext.from_task_context(
+            task,
+            agent_name=agent,
+            agent_display_name='X',
+            agent_role_description='Y',
+            output_sections=['Summary'],
         )
 
-    def test_prompt_uses_the_supplied_tag_placeholder(self):
-        text = self.GUIDELINES.read_text()
-        assert '{DEV_CONTAINER_IMAGE_TAG}' in text
-        assert 'dev_container_image_tag' in text
+    def _builder(self):
+        from prompts.builder import PromptBuilder
+        return PromptBuilder()
 
-    def test_prompt_still_uses_the_project_name_for_paths(self):
-        """The path deliberately stays project-scoped: each project keeps its
-        own checkout, only the image is shared."""
-        text = self.GUIDELINES.read_text()
-        assert '/workspace/{PROJECT_NAME}' in text
+    def test_setup_prompt_carries_the_resolved_tag(self):
+        prompt = self._builder().build(self._ctx('dev_environment_setup'))
+        assert 'mono-agent:latest' in prompt
+        assert '{DEV_CONTAINER_IMAGE_TAG}' not in prompt
+
+    def test_verifier_prompt_carries_the_same_tag(self):
+        """Maker and checker must agree. The verifier's prompt composed the tag
+        from the project name -- and unlike the setup guidelines, that
+        placeholder IS substituted -- so the checker inspected an image the
+        maker never built whenever an environment was shared."""
+        prompt = self._builder().build_verifier_prompt(self._ctx('dev_environment_verifier'))
+        assert 'mono-agent:latest' in prompt
+        assert 'features-agent:latest' not in prompt
+        assert '{DEV_CONTAINER_IMAGE_TAG}' not in prompt
+
+    def test_unconfigured_deployment_is_unchanged(self):
+        """The prompt change is unconditional, so it must be correct for a
+        deployment that has opted into nothing."""
+        prompt = self._builder().build(self._ctx(
+            'dev_environment_setup',
+            dev_container_image_tag='features-agent:latest',
+            dev_container_environment='features',
+        ))
+        assert 'features-agent:latest' in prompt
+
+    def test_tag_is_derived_when_not_threaded(self):
+        """A context built directly must still render a usable prompt."""
+        from unittest.mock import patch
+        ctx = self._ctx('dev_environment_setup', dev_container_image_tag='')
+        with patch('services.dev_container_environment.image_tag_for',
+                   return_value='derived-agent:latest'):
+            prompt = self._builder().build(ctx)
+        assert 'derived-agent:latest' in prompt
+
+    def test_refuses_to_render_an_untagged_build(self):
+        """Substituting an empty string yields `docker build -t  /workspace/x`,
+        which builds SOMETHING and fails only much later as 'never built'."""
+        ctx = self._ctx('dev_environment_setup', dev_container_image_tag='', project='')
+        with pytest.raises(ValueError, match='DEV_CONTAINER_IMAGE_TAG'):
+            self._builder().build(ctx)
+
+    def test_setup_prompt_resolves_the_project_path_concretely(self):
+        """The path stays project-scoped -- each project keeps its own checkout
+        -- and under the unified expansion pass it is now substituted for real
+        rather than left as a placeholder for the model to fill in."""
+        prompt = self._builder().build(self._ctx('dev_environment_setup'))
+        assert '/workspace/features' in prompt
+        assert '{PROJECT_NAME}' not in prompt
+
+    def test_path_and_tag_resolve_to_different_identifiers(self):
+        """The whole hazard in one assertion: under a shared environment the
+        checkout path and the image tag are no longer the same string."""
+        prompt = self._builder().build(self._ctx('dev_environment_setup'))
+        assert '/workspace/features' in prompt      # project
+        assert 'mono-agent:latest' in prompt        # environment
 
 
-class TestExecutionContext:
-    def test_context_carries_both_identifiers(self):
-        """Whatever the prompt references must actually be supplied."""
+class TestWatchdogActivityKey:
+    """The build lock registers watchdog activity under the REAL project name.
+
+    The registry is keyed (project, issue_number) and looked up by project by
+    pipeline_watchdog and project_monitor. Registering under the environment
+    made every lookup miss for a shared-environment member, so a run
+    legitimately blocked on the lock lost its zombie-cleanup exemption and was
+    reaped and re-dispatched -- two concurrent executions of one issue.
+    """
+
+    def test_activity_registers_under_the_project_not_the_environment(self):
         import inspect
-        import services.agent_executor as ae
+        import services.dev_container_build_lock as lock
 
-        src = inspect.getsource(ae)
-        assert "context['dev_container_environment']" in src
-        assert "context['dev_container_image_tag']" in src
+        src = inspect.getsource(lock)
+        # The rebind must capture the original before overwriting it...
+        assert 'watchdog_project = project' in src
+        # ...and the registry must use that, never the resolved key.
+        assert 'RESOURCE_NAME, watchdog_project, issue_number' in src
+        assert 'RESOURCE_NAME, project, issue_number' not in src
+
+
+class TestStartupValidation:
+    """A validator nothing calls is worse than none: it reads as enforced."""
+
+    def test_startup_validates_dev_container_environments(self):
+        import inspect
+        import main
+
+        src = inspect.getsource(main)
+        assert 'validate_dev_container_environments()' in src
+
+    def test_config_manager_surfaces_errors_from_real_configs(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+        from config.manager import ConfigManager
+
+        mgr = ConfigManager.__new__(ConfigManager)
+        bad = FakeConfig({'environment': 'mono'},
+                         repo_url='git@github.com:acme/other.git')
+        good = FakeConfig({'environment': 'mono'})
+        with patch.object(ConfigManager, 'list_projects', return_value=['a', 'b']), \
+             patch.object(ConfigManager, 'get_project_config',
+                          side_effect=lambda n: {'a': good, 'b': bad}[n]):
+            errors = mgr.validate_dev_container_environments()
+        assert any('different github.repo_url' in e for e in errors)
+
+
+class TestTransientResolutionIsNotCached:
+    """A cached wrong answer points a member at its own image for the whole
+    TTL, silently bypassing the build lock that serialises the environment."""
+
+    def test_fault_is_not_cached_and_recovers_on_the_next_call(self):
+        from unittest.mock import MagicMock, patch
+        import services.dev_container_environment as dce
+
+        mgr = MagicMock()
+        calls = {'n': 0}
+
+        def flaky(name):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OSError("transient IO error")
+            return FakeConfig({'environment': 'mono'})
+
+        mgr.get_project_config.side_effect = flaky
+        with patch('config.manager.config_manager', mgr):
+            first = dce.environment_for('features')
+            second = dce.environment_for('features')
+
+        assert first == 'features', "must degrade safely on the faulting call"
+        assert second == 'mono', "must NOT have cached the degraded answer"
+
+    def test_missing_project_stays_quiet_and_is_cached(self):
+        """A name that simply is not a project is routine -- system callers pass
+        state-file stems and 'switchyard' constantly."""
+        from unittest.mock import MagicMock, patch
+        from config.manager import ConfigurationError
+        import services.dev_container_environment as dce
+
+        mgr = MagicMock()
+        mgr.get_project_config.side_effect = ConfigurationError("no such project")
+        with patch('config.manager.config_manager', mgr):
+            assert dce.environment_for('not-a-project') == 'not-a-project'
+
+
+class TestValidationRepoUrlHole:
+    def test_member_without_repo_url_is_not_silently_exempt(self):
+        """`{r for r in repos.values() if r}` skipped members with no repo_url,
+        so the one structural check for a cross-repo share ignored exactly the
+        configs that declared nothing."""
+        errors = validate_environments({
+            'features': FakeConfig({'environment': 'mono'}),
+            'bugs': FakeConfig({'environment': 'mono'}, repo_url=None),
+        })
+        assert any('no github.repo_url' in e for e in errors)

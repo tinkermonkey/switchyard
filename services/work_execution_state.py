@@ -3906,7 +3906,16 @@ class WorkExecutionStateTracker:
                                                 "Dev environment verifier succeeded (recovered from Redis) "
                                                 "but state was not VERIFIED"
                                             ),
-                                            skip_when=(DevContainerStatus.VERIFIED,),
+                                            # BLOCKED included (#198 review): without
+                                            # it, a verifier that wrote BLOCKED because
+                                            # the expected image was missing has that
+                                            # verdict silently overwritten with VERIFIED
+                                            # by this recovery sweep, naming a tag that
+                                            # does not exist.
+                                            skip_when=(
+                                                DevContainerStatus.VERIFIED,
+                                                DevContainerStatus.BLOCKED,
+                                            ),
                                             image_name=image_tag_for(project_name),
                                         )
 

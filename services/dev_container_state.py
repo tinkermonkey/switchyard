@@ -85,6 +85,17 @@ class StateWriteResult(Enum):
         return self is StateWriteResult.WRITTEN
 
 
+class DockerUnavailableError(RuntimeError):
+    """Docker could not answer whether an image exists (#198 review).
+
+    Distinct from "the image is absent". Callers that would mark an environment
+    BLOCKED on absence must NOT do so on this: BLOCKED is respected by every
+    member of a shared environment and, unlike IN_PROGRESS and CHANGES_NEEDED,
+    has no staleness escape, so a transient daemon outage would strand every
+    member until a human intervened.
+    """
+
+
 class DevContainerStatus(Enum):
     """Status of a project's development container"""
     UNVERIFIED = "unverified"  # Default for new projects
@@ -355,11 +366,17 @@ class DevContainerStateManager:
         """
         cleared = 0
         for state_file in sorted(self.state_dir.glob('*.yaml')):
-            # An ENVIRONMENT name (#198) -- the project's own name unless it
-            # opted into a shared one. Resolution is identity for a name that
-            # is not itself a project, so this reads back the same file.
+            # These stems are ENVIRONMENT names, and must NOT be run back
+            # through project->environment resolution (#198). Resolution is
+            # identity only for a stem that is not itself a project name --
+            # which is false for exactly the case this feature creates: a
+            # leftover `features.yaml` from before `features` joined
+            # environment `monorepo` resolves to monorepo.yaml, so this loop
+            # would read and clear a DIFFERENT file than the one it is
+            # iterating, and the stale marker on the leftover file would never
+            # be cleared at all. Read the file directly instead.
+            state = self._read_state_file(state_file)
             project_name = state_file.stem
-            state = self._read_state(project_name)
             if not state.get('pending_operation'):
                 continue
             if not self._is_stale_pending_operation(state.get('pending_operation_at')):
@@ -486,6 +503,31 @@ class DevContainerStateManager:
         accessor -- and without re-deriving the locked read below.
         """
         return self._read_state(project_name)
+
+    def _read_state_file(self, state_file: Path) -> Dict:
+        """Read one state file BY PATH, with no project->environment resolution.
+
+        For callers that already hold an environment-keyed path (the state_dir
+        globs). _read_state() resolves its argument, which is correct for a
+        project name and wrong for a stem that is already an environment.
+        """
+        from utils.file_lock import file_lock
+
+        if not state_file.exists():
+            return {}
+        try:
+            with file_lock(
+                self._state_lock_file(state_file),
+                timeout=STATE_LOCK_TIMEOUT_SECONDS,
+                enforce_timeout=True,
+            ):
+                if not state_file.exists():
+                    return {}
+                with open(state_file, 'r') as f:
+                    return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Failed to read dev container state file {state_file}: {e}")
+            return {}
 
     def _read_state(self, project_name: str) -> Dict:
         """
@@ -731,6 +773,17 @@ class DevContainerStateManager:
             )
 
             if result.returncode != 0:
+                stderr = (result.stderr or '').lower()
+                if 'cannot connect to the docker daemon' in stderr or 'permission denied' in stderr:
+                    # NOT "the image is missing" (#198 review). Reporting this
+                    # as absence lets a 10-second daemon blip mark a shared
+                    # environment BLOCKED -- which every member respects, and
+                    # which has no staleness escape, so it waits for a human
+                    # forever. Raise so the caller can tell the two apart.
+                    raise DockerUnavailableError(
+                        f"Docker is unreachable, so the existence of {image_name} "
+                        f"could not be determined: {(result.stderr or '').strip()[:200]}"
+                    )
                 logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
                 return False
 
@@ -749,6 +802,11 @@ class DevContainerStateManager:
 
         except subprocess.TimeoutExpired:
             logger.error(f"Timeout checking if Docker image {image_name} exists")
+            # A slow/overloaded daemon is not evidence of absence -- same
+            # reasoning as the unreachable case above.
+            raise DockerUnavailableError(
+                f"Timed out asking Docker whether {image_name} exists"
+            )
             return False
         except Exception as e:
             logger.error(f"Error checking if Docker image {image_name} exists: {e}")
@@ -884,11 +942,17 @@ class DevContainerStateManager:
         statuses = {}
 
         for state_file in self.state_dir.glob("*.yaml"):
-            # Already an environment name; get_status() resolves its argument,
-            # and resolution is identity for a name that is not a project, so
-            # this lands on the file it was read from either way.
+            # Read the file directly rather than resolving its stem (#198) --
+            # see clear_stale_pending_operations for why passing an environment
+            # name back through project->environment resolution is unsound.
             environment = state_file.stem
-            statuses[environment] = self.get_status(environment)
+            state = self._read_state_file(state_file)
+            try:
+                statuses[environment] = DevContainerStatus(
+                    state.get('status', 'unverified')
+                )
+            except Exception:
+                statuses[environment] = DevContainerStatus.UNVERIFIED
 
         return statuses
 

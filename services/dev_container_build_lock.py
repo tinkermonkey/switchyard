@@ -545,6 +545,17 @@ async def dev_container_build_lock_async(
     """
     # Key on the environment, not the project (#198) -- identity unless
     # this project opted into a shared dev-container environment.
+    #
+    # The ORIGINAL project name is kept for the watchdog activity registry
+    # below. That registry is keyed (project, issue_number) and looked up by
+    # the real project name -- services/pipeline_watchdog.py and
+    # services/project_monitor.py both pass the project of the run they are
+    # deciding about. Registering under the environment made every lookup miss
+    # for a shared-environment member, so a run legitimately blocked here lost
+    # its zombie-cleanup exemption and got reaped and re-dispatched: two
+    # concurrent executions of one issue, which is the precise failure the
+    # exemption exists to prevent.
+    watchdog_project = project
     project = _resource_key(project)
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
@@ -561,7 +572,8 @@ async def dev_container_build_lock_async(
     # stalls with no output would otherwise keep this issue's pipeline run
     # exempt from zombie cleanup until the orchestrator process restarts.
     with _tracked_resource_activity(
-        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+        RESOURCE_NAME, watchdog_project, issue_number,
+        wait_budget_seconds=timeout_seconds,
     ) as activity:
         heartbeat = await _poll_until_acquired_async(
             facade, RESOURCE_NAME, project, holder_id, issue_number,
@@ -607,11 +619,23 @@ def dev_container_build_lock_sync(
     """
     # Key on the environment, not the project (#198) -- identity unless
     # this project opted into a shared dev-container environment.
+    #
+    # The ORIGINAL project name is kept for the watchdog activity registry
+    # below. That registry is keyed (project, issue_number) and looked up by
+    # the real project name -- services/pipeline_watchdog.py and
+    # services/project_monitor.py both pass the project of the run they are
+    # deciding about. Registering under the environment made every lookup miss
+    # for a shared-environment member, so a run legitimately blocked here lost
+    # its zombie-cleanup exemption and got reaped and re-dispatched: two
+    # concurrent executions of one issue, which is the precise failure the
+    # exemption exists to prevent.
+    watchdog_project = project
     project = _resource_key(project)
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     with _tracked_resource_activity(
-        RESOURCE_NAME, project, issue_number, wait_budget_seconds=timeout_seconds
+        RESOURCE_NAME, watchdog_project, issue_number,
+        wait_budget_seconds=timeout_seconds,
     ) as activity:
         _poll_until_acquired_sync(
             facade, RESOURCE_NAME, project, holder_id, issue_number,

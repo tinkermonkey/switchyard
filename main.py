@@ -662,6 +662,27 @@ async def main():
         task_queue.enqueue(task)
         logger.info(f"Queued dev_environment_setup task: {task.id}")
 
+    # Dev-container environment validation (#198). Runs BEFORE anything reads a
+    # dev-container tag, state file or lock, because every one of those keys is
+    # derived from the environment name being validated here.
+    #
+    # Fails startup rather than warning. These are static config errors an
+    # operator must fix, not runtime conditions that might clear on their own,
+    # and the failure they prevent is silent: two projects on different
+    # repositories sharing one image means agents building and testing against
+    # another codebase's baked dependencies, with nothing anywhere reporting it.
+    # (Contrast the Projects-v2 permission guard, which SKIPS rather than exits
+    # precisely because that condition is runtime and can be transient.)
+    dev_container_config_errors = config_manager.validate_dev_container_environments()
+    if dev_container_config_errors:
+        for err in dev_container_config_errors:
+            logger.log_error(f"Invalid dev_container configuration: {err}")
+        logger.log_error(
+            f"Refusing to start: {len(dev_container_config_errors)} dev-container "
+            f"environment configuration error(s). Fix config/projects/*.yaml and restart."
+        )
+        exit(1)
+
     # Reconcile all visible (non-hidden) projects on startup
     # Hidden projects (like test-project) are excluded from normal operations
     projects = config_manager.list_visible_projects()

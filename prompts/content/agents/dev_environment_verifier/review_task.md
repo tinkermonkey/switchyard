@@ -51,7 +51,7 @@ you can validate a fix that doesn't actually work:
   `WORKDIR` baked into the image at build time.
 - Reproduce this exactly rather than improvising your own layout: run the freshly built
   image with the project mounted the same way production does —
-  `docker run --rm -v <host_project_checkout>:/workspace -w /workspace {project_name}-agent:latest <exact failing command>`.
+  `docker run --rm -v <host_project_checkout>:/workspace -w /workspace {DEV_CONTAINER_IMAGE_TAG} <exact failing command>`.
   If your sandbox's Docker daemon can't reach the real host checkout path via `-v` (bind
   mounts silently no-op), the next-best approximation is `docker cp`-ing the real source
   tree into a running container of that image — but if you do, you MUST place it at
@@ -78,10 +78,10 @@ Verify the Docker image exists and is functional:
 
 ```bash
 # Check if image exists (use project name from context above)
-docker images {project_name}-agent:latest
+docker images {DEV_CONTAINER_IMAGE_TAG}
 
 # Inspect image details
-docker inspect {project_name}-agent:latest
+docker inspect {DEV_CONTAINER_IMAGE_TAG}
 ```
 
 ### Step 3: Verify Critical CLI Tools
@@ -90,20 +90,20 @@ docker inspect {project_name}-agent:latest
 
 ```bash
 # 1. Claude CLI - CRITICAL for agent execution
-docker run --rm {project_name}-agent:latest which claude
-docker run --rm {project_name}-agent:latest claude --version
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} which claude
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} claude --version
 
 # 2. Git CLI - CRITICAL for version control operations
-docker run --rm {project_name}-agent:latest which git
-docker run --rm {project_name}-agent:latest git --version
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} which git
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} git --version
 
 # 3. GitHub CLI - CRITICAL for GitHub API operations
-docker run --rm {project_name}-agent:latest which gh
-docker run --rm {project_name}-agent:latest gh --version
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} which gh
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} gh --version
 
 # 4. Basic runtime (Python, Node, etc. — depends on project)
-docker run --rm {project_name}-agent:latest python3 --version 2>/dev/null || echo "Python not required"
-docker run --rm {project_name}-agent:latest node --version 2>/dev/null || echo "Node not required"
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} python3 --version 2>/dev/null || echo "Python not required"
+docker run --rm {DEV_CONTAINER_IMAGE_TAG} node --version 2>/dev/null || echo "Node not required"
 ```
 
 **All three CLI tools (claude, git, gh) MUST be present and working.** If any are missing, mark as BLOCKED.
@@ -129,7 +129,7 @@ Confirm:
 from services.dev_container_state import dev_container_state, DevContainerStatus
 
 project_name = "{project_name}"
-image_name = f"{{project_name}}-agent:latest"
+image_name = "{DEV_CONTAINER_IMAGE_TAG}"
 
 dev_container_state.set_status(
     project_name=project_name,
@@ -220,7 +220,7 @@ IMPORTANT: Output your verification review as text directly in your response. DO
 
 #### Docker Image Status
 - Image exists: [Yes/No]
-- Image name: {project_name}-agent:latest
+- Image name: {DEV_CONTAINER_IMAGE_TAG}
 - Created: [timestamp if available]
 - Size: [size if available]
 

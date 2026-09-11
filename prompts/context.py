@@ -115,6 +115,20 @@ class PromptContext:
     # ── Dev environment verifier ──────────────────────────────────────────────
     project_name: str = ""   # explicit project name (verifier needs it expanded)
 
+    # ── Dev container environment (#198) ──────────────────────────────────────
+    # The COMPLETE image tag the dev-environment agents must build and probe,
+    # e.g. "monorepo-agent:latest". Expanded into their content files as
+    # {DEV_CONTAINER_IMAGE_TAG} -- see PromptBuilder._expand_content_placeholders.
+    #
+    # Carried here rather than left to the agent to compose, because once
+    # projects can share a dev-container environment the tag and the project
+    # name stop being the same string, and the environment name appears nowhere
+    # else in the rendered prompt. `{PROJECT_NAME}` survives as an unexpanded
+    # prose convention only because the model CAN recover the project from the
+    # prompt; it cannot recover an environment it has never been told about.
+    dev_container_image_tag: str = ""
+    dev_container_environment: str = ""
+
     # ── Reference repositories ────────────────────────────────────────────────
     # Pre-rendered section injected into every prompt when the project has reference_repos configured.
     # Empty string when no reference repos are configured (section is omitted).
@@ -229,6 +243,8 @@ class PromptContext:
             include_sub_issue_format=include_sub_issue_format,
             sub_issue_parent_issue_number=sub_issue_parent,
             project_name=task_context.get("project") or "",
+            dev_container_image_tag=task_context.get("dev_container_image_tag", ""),
+            dev_container_environment=task_context.get("dev_container_environment", ""),
             pr_url=task_context.get("pr_url", ""),
             check_name=task_context.get("check_name", ""),
             check_content=task_context.get("check_content", ""),

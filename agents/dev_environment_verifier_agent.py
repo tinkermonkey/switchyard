@@ -137,9 +137,24 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 # nothing ever reads -- surfacing forever after as "not built"
                 # with no indication why. Checking here converts that into one
                 # legible failure naming both tags.
-                if not dev_container_state.verify_image_exists(
-                    project_name, image_name=expected_tag
-                ):
+                from services.dev_container_state import DockerUnavailableError
+
+                try:
+                    tag_exists = dev_container_state.verify_image_exists(
+                        project_name, image_name=expected_tag
+                    )
+                except DockerUnavailableError as e:
+                    # Cannot answer -> do not decide. Marking BLOCKED here would
+                    # strand every member of the environment on a transient
+                    # daemon outage, with no staleness escape.
+                    logger.error(
+                        "Could not verify %s for %s (%s); leaving the environment "
+                        "status untouched for the next run to resolve",
+                        expected_tag, project_name, e,
+                    )
+                    return {"status": "success", "output": review_text}
+
+                if not tag_exists:
                     error_message = (
                         f"Verifier approved the environment but the expected image "
                         f"tag {expected_tag!r} does not exist (or is not a genuine "
@@ -148,11 +163,25 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         f"environment {environment!r}. Re-run dev_environment_setup; "
                         f"it must use context['dev_container_image_tag'] verbatim."
                     )
-                    dev_container_state.set_status(
+                    # NOT truncated to 200: this message is the operator's
+                    # only persistent record, and the remedy lives in its second
+                    # half -- a [:200] cut it mid-word and discarded the
+                    # environment name and the "re-run dev_environment_setup"
+                    # instruction entirely.
+                    wrote = dev_container_state.set_status(
                         project_name=project_name,
                         status=DevContainerStatus.BLOCKED,
-                        error_message=error_message[:200],
+                        error_message=error_message,
                     )
+                    if not wrote:
+                        # Unchecked, this leaves the environment at IN_PROGRESS
+                        # forever -- the dangling state this module's own
+                        # CRITICAL comment exists to prevent.
+                        logger.error(
+                            "Failed to record BLOCKED for %s; the environment may "
+                            "remain IN_PROGRESS and stall every member",
+                            project_name,
+                        )
                     logger.error(
                         "Refusing to mark %s VERIFIED: expected image %s is missing",
                         project_name, expected_tag,
