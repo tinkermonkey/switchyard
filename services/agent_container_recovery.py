@@ -874,7 +874,11 @@ class AgentContainerRecovery:
         try:
             # Try state directory (where RepairCycleCheckpoint actually writes checkpoints)
             if issue_number is not None:
-                state_dir = Path("/workspace/switchyard/state/projects")
+                # Resolved from ORCHESTRATOR_ROOT, not hardcoded (#181).
+                # "/workspace/switchyard" is the SAME INODE as /app on the
+                # deployment, so this literal ignored every redirect there is.
+                from config.state_manager import orchestrator_state_root
+                state_dir = orchestrator_state_root() / "projects"
                 checkpoint_file = state_dir / project / "repair_cycles" / str(issue_number) / "checkpoint.json"
 
                 if checkpoint_file.exists():

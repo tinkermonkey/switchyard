@@ -1326,7 +1326,11 @@ def kill_pipeline_run(pipeline_run_id):
 def _load_github_state(project_name: str) -> dict:
     """Load the github_state.yaml for a project, returning the inner github_state dict."""
     try:
-        state_file = Path(f'state/projects/{project_name}/github_state.yaml')
+        # Resolved, not CWD-relative (#181). A read rather than a write, so it
+        # never corrupted anything -- but from any CWD other than the
+        # orchestrator's own it silently found nothing and returned {}.
+        from config.state_manager import orchestrator_state_root
+        state_file = orchestrator_state_root() / 'projects' / project_name / 'github_state.yaml'
         if not state_file.exists():
             return {}
         with open(state_file) as f:

@@ -41,19 +41,24 @@ alone does NOT cover both:
     singleton-construction / import time. This script sets that env var before
     importing anything from `services/`, which is why there are no orchestrator
     imports at module scope.
-  * `config/state_manager.py` derives its root from
-    `Path(__file__).parent.parent` with NO environment override (#181), so it
-    follows the checkout the code is running from, not ORCHESTRATOR_ROOT. It is
-    repointed explicitly, in place.
+  * `config/state_manager.py` and `state_management/pr_review_state_manager.py`
+    now resolve through `orchestrator_state_root()`, which DOES honour
+    ORCHESTRATOR_ROOT (#181 -- they used to derive from
+    `Path(__file__).parent.parent` instead). The explicit in-place repoint
+    below is therefore belt-and-braces rather than load-bearing, and it is kept
+    because the module-level singleton binds at import time: anything that
+    already imported it holds that object, not the module attribute.
   * `config/manager.py` resolves `projects_dir` from `Path(__file__).parent`
     too, so running from a worktree examines the worktree's project set. A
     worktree usually has NO `config/projects/` at all (it is gitignored), which
     silently reduces a 17-project sweep to zero configured projects and makes
     every lock/queue protection degrade to "could not load project config".
     --config-root repoints it at the deployment's config by default.
-  * Some writers build a path relative to the process CWD rather than any root
-    at all (`services/review_cycle.py` does `os.path.join('state', ...)`), so
-    the sweep runs with the CWD set to the scratch root.
+  * Historically some writers built a path relative to the process CWD rather
+    than to any root at all, and others hardcoded the deployment's own
+    directory. Those are fixed (#181), but the sweep still runs with its CWD
+    set to the scratch root: it costs nothing, and it is the only thing that
+    would contain a writer nobody has found yet.
 
 External effects — the harness checksums `state/` and nothing else, so anything
 a sweep writes elsewhere is, by construction, something it cannot prove it left
@@ -685,9 +690,11 @@ def repoint_runtime(scratch_root: Path, config_root: Path) -> Dict[str, str]:
     resolved['ConfigManager.projects_dir'] = str(config_manager.projects_dir)
     resolved['ConfigManager.foundations_dir'] = str(config_manager.foundations_dir)
 
-    # config/state_manager.py derives its root from Path(__file__).parent.parent
-    # with NO environment override (#181), so ORCHESTRATOR_ROOT above does not
-    # move it. Mutated IN PLACE rather than replaced: modules that already did
+    # config/state_manager.py resolves through orchestrator_state_root() now,
+    # so ORCHESTRATOR_ROOT above already moves it (#181). This stays because
+    # the singleton is constructed at IMPORT time, and this function may run
+    # after something has already imported it. Mutated IN PLACE rather than
+    # replaced: modules that already did
     # `from config.state_manager import state_manager` hold a reference to this
     # very object, and rebinding the module attribute would leave them pointed
     # at the live tree.

@@ -8,6 +8,7 @@ import pytest
 import asyncio
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Any
@@ -269,6 +270,17 @@ def _redirect_orchestrator_root_to_scratch():
 
     override = os.environ.get('SWITCHYARD_TEST_STATE_ROOT')
     if override:
+        # Validated here, because the mkdtemp branch below guarantees an
+        # existing writable directory and this one guaranteed nothing. An
+        # unusable value surfaced as a FileNotFoundError from some unrelated
+        # singleton's import-time mkdir, naming neither environment variable.
+        try:
+            Path(override).mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"SWITCHYARD_TEST_STATE_ROOT={override!r} is not usable as a "
+                f"state root: {e}"
+            ) from e
         os.environ['ORCHESTRATOR_ROOT'] = override
         return
 
@@ -427,17 +439,20 @@ def _stop_the_background_call_trace_summarizer():
     of them outlives its test and goes on mutating shared state inside every
     later test.
 
-    Patched here rather than per file because three separate files had already
-    forgotten it -- test_github_api_rate_limit_redis_mirror.py (29 threads),
-    test_git_workflow_manager.py and test_github_api_rate_limit_buckets.py --
-    while test_github_app_rate_limit_accounting.py patches it at all six of its
-    construction sites. That ratio is the argument: this is a property of the
-    constructor, not of any one test's setup.
+    Patched here rather than per file because FOUR of the five test files that
+    construct a client had already forgotten it -- test_github_api_rate_limit_
+    redis_mirror.py (11 threads, one per test using its `client` fixture),
+    test_git_workflow_manager.py, test_github_api_rate_limit_buckets.py and
+    test_feature_branch_pr_ready.py -- while only test_github_app_rate_limit_
+    accounting.py patches it, at all five of its construction sites. That ratio
+    is the argument: this is a property of the constructor, not of any one
+    test's setup.
 
-    Nothing under test depends on it. It does nothing at all within a 5-minute
-    window and no test runs that long, and the method it would call,
-    _summarize_and_cleanup_call_traces(), is exercised directly where it
-    matters.
+    Nothing under test depends on it: it does nothing at all within a 5-minute
+    window and no test runs that long. Note that the method it would call,
+    _summarize_and_cleanup_call_traces(), has NO test coverage either way -- a
+    repo-wide grep finds no caller outside the production module. Neutralising
+    the thread does not reduce coverage, because there is none to reduce.
     """
     try:
         from services.github_api_client import GitHubAPIClient
@@ -1231,13 +1246,22 @@ LEAKED_THREAD_GRACE_SECONDS = float(
     os.environ.get('SWITCHYARD_TEST_THREAD_GRACE', '2.0')
 )
 
-# Worker threads of process-global ThreadPoolExecutors, which are created
-# lazily on first use and then live for the rest of the session BY DESIGN.
-# Whichever test happens to touch the pool first appears to "start" them, but
-# they are a singleton's workers, not that test's leak -- and the pools exist
-# precisely so that lock waits do not run on the caller's thread
-# (services/project_workspace.py's _get_epic_worktree_executor, and #151/WI-6
-# for why they are separate pools).
+# Worker threads of executor pools that are not any one test's leak. The two
+# entries are exempt for DIFFERENT reasons, which the first version of this
+# comment got wrong by lumping them together:
+#
+#   * 'epic-worktree' -- a genuine module-global, lazily built and guarded
+#     (services/project_workspace.py:99-108), living for the rest of the
+#     session by design. Whichever test touches it first appears to start its
+#     workers. It exists so that a lock wait does not run on the caller's
+#     thread (#151/WI-6).
+#   * 'project-init' -- NOT global and NOT lazy. It is a `with
+#     ThreadPoolExecutor(...)` block local to initialize_all_projects()
+#     (services/project_workspace.py:492-495), so `with` joins its workers
+#     before the call returns and they cannot outlive the grace window anyway.
+#     It exists to stop startup taking len(projects) x 120s (#140 item 3), not
+#     for lock waits. Listed defensively; if it ever trips this guard,
+#     something is wrong with the pool rather than with the test.
 PERSISTENT_POOL_THREAD_PREFIXES = ('epic-worktree', 'project-init')
 
 
@@ -1259,7 +1283,7 @@ def _fail_on_leaked_threads(request):
     nothing joins them and the process exits regardless, so without this the
     only symptom is somebody else's inexplicable failure weeks later. Adding
     this guard immediately surfaced a second, unrelated leak nobody had filed
-    -- GitHubAPIClient's call-trace summarizer, 29 threads from one file.
+    -- GitHubAPIClient's call-trace summarizer, 11 threads from one file.
 
     Opt out with `@pytest.mark.allow_thread_leak` for a test that deliberately
     leaves something running. There are none today, and a new one should have
@@ -1270,7 +1294,12 @@ def _fail_on_leaked_threads(request):
         return
 
     import threading
-    before = {t.ident for t in threading.enumerate()}
+    # Thread OBJECTS, not idents. CPython recycles Thread.ident aggressively --
+    # 50 sequential short-lived threads measured as ONE distinct ident -- so an
+    # ident-based snapshot lets a new leak inherit a dead thread's number and
+    # go unseen. enumerate() only ever returns live threads, and Thread hashes
+    # by identity, so this is exact.
+    before = set(threading.enumerate())
 
     yield
 
@@ -1278,7 +1307,7 @@ def _fail_on_leaked_threads(request):
     while True:
         leaked = [
             t for t in threading.enumerate()
-            if t.ident not in before
+            if t not in before
             and t.is_alive()
             and not t.name.startswith(PERSISTENT_POOL_THREAD_PREFIXES)
         ]
@@ -1296,3 +1325,59 @@ def _fail_on_leaked_threads(request):
             f"tests.utils.builders.RecordedThread), or mark the test "
             f"@pytest.mark.allow_thread_leak if the leak is deliberate."
         )
+
+
+# ============================================================================
+# Process-global restoration (#181, #186, #133)
+# ============================================================================
+
+# Package prefixes whose modules hold singletons built at import time. A test
+# that pops one from sys.modules to force a re-import replaces those singletons
+# -- and the class objects -- for the rest of the session.
+FIRST_PARTY_PREFIXES = (
+    'services.', 'config.', 'pipeline.', 'claude.', 'monitoring.',
+    'state_management.', 'task_queue.', 'agents.',
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_process_globals():
+    """Undo the two process-wide mutations tests reach for to isolate themselves.
+
+    Both are the same instinct -- "point the state modules at my tmp_path" --
+    and both outlive the test that did it:
+
+      * `os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)`. Assigned directly
+        rather than through monkeypatch, so it survives. Every later test that
+        resolves a state path gets a directory pytest has since deleted. Two
+        files do this (test_work_execution_redis_recovery.py,
+        test_stale_execution_history.py, the latter at six separate sites).
+      * `sys.modules.pop('services.work_execution_state', None)` to force a
+        re-import. The re-import builds a NEW module-level singleton and a NEW
+        class object, so anything holding the old one keeps a stale root and
+        `isinstance` against the old class starts returning False.
+
+    Caught by test_state_root_isolation.py's singleton check, which failed in
+    full-suite order while passing alone -- the signature of exactly the
+    contamination this suite keeps paying for.
+
+    Restores rather than forbids: these tests are doing something reasonable,
+    they just need it undone. Only entries that were REPLACED or REMOVED are
+    put back, so modules a test legitimately imports for the first time stay.
+    """
+    previous_root = os.environ.get('ORCHESTRATOR_ROOT')
+    previous_modules = {
+        name: module for name, module in sys.modules.items()
+        if name.startswith(FIRST_PARTY_PREFIXES)
+    }
+
+    yield
+
+    if previous_root is None:
+        os.environ.pop('ORCHESTRATOR_ROOT', None)
+    elif os.environ.get('ORCHESTRATOR_ROOT') != previous_root:
+        os.environ['ORCHESTRATOR_ROOT'] = previous_root
+
+    for name, module in previous_modules.items():
+        if sys.modules.get(name) is not module:
+            sys.modules[name] = module

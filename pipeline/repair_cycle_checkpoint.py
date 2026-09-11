@@ -62,7 +62,11 @@ class RepairCycleCheckpoint:
         
         # Store checkpoint in state directory (keeps project workspace clean)
         if issue_number is not None:
-            state_dir = Path("/workspace/switchyard/state/projects")
+            # Resolved from ORCHESTRATOR_ROOT, not hardcoded (#181).
+            # "/workspace/switchyard" is the SAME INODE as /app on the
+            # deployment, so this literal ignored every redirect there is.
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "projects"
             repair_cycle_dir = state_dir / project_name / "repair_cycles" / str(issue_number)
             repair_cycle_dir.mkdir(parents=True, exist_ok=True)
 

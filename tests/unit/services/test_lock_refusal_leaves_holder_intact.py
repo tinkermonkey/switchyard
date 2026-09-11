@@ -40,8 +40,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
-from tests.utils.builders import RecordedThread
-
 import pytest
 
 from config.manager import ConfigManager
@@ -122,13 +120,16 @@ def _drive_review_cycle_gate(project_monitor, acquire_result, holder_read=None):
          patch.object(project_monitor.pipeline_run_manager, 'get_or_create_pipeline_run',
                       return_value=(Mock(id='run-1'), False)), \
          patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
-               return_value=mock_lock_manager), \
-         patch('threading.Thread', RecordedThread):
-        # RecordedThread, not the real one (#186): the grant path ends by
-        # spawning a daemon thread that runs an ACTUAL review cycle, and
-        # nothing here joins it. It outlived these tests and did real work --
-        # Redis, Elasticsearch, file locks under a relative state/ path --
-        # inside whatever test ran next.
+               return_value=mock_lock_manager):
+        # No thread patch here, deliberately. Every call site in this file
+        # passes an acquire_result of (False, ...), so the gate refuses and
+        # returns before reaching the spawn -- instrumented across all 13
+        # tests: zero threads started. An earlier version patched
+        # RecordedThread in anyway and claimed this file leaked a cycle; it
+        # does not, and removing the patch changed nothing. The sibling file
+        # test_review_cycle_missing_context_cleanup.py is the one that drives
+        # the grant path, and it asserts started() == 1 so its patch cannot
+        # rot into decoration the way this one had.
         result = project_monitor._start_review_cycle_for_issue(
             project_name='rounds',
             board_name='SDLC Execution',

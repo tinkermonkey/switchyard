@@ -14,7 +14,7 @@ if not os.path.isdir('/app'):
 import asyncio
 import threading
 
-from tests.utils.builders import JoinableThread
+from tests.utils.builders import JoinableThread, JoinResult
 import time
 from unittest.mock import Mock, patch, AsyncMock, MagicMock, call
 from tests.unit.orchestrator.mocks import MockGitHubAPI
@@ -176,14 +176,8 @@ class TestReviewCycleThreading:
              patch('services.github_integration.GitHubIntegration', return_value=mock_gh_integration), \
              patch('services.git_workflow_manager.git_workflow_manager', mock_gwm), \
              patch('services.project_workspace.workspace_manager') as mock_wsm, \
-             patch('threading.Thread', JoinableThread):
+             patch('services.project_workspace.workspace_manager') as mock_wsm:
 
-            # JoinableThread, not the real one (#186). This test WANTS the
-            # thread body to run -- it is asserting on what the closure can
-            # see -- but _start_review_cycle_for_issue does not return its
-            # thread, so there was nothing to join and the cycle carried on
-            # into whatever test ran next.
-            JoinableThread.reset()
             mock_wsm.get_project_dir.return_value = '/workspace/test-project'
 
             from services.project_monitor import ProjectMonitor
@@ -232,28 +226,44 @@ class TestReviewCycleThreading:
             workflow_template = Mock()
             workflow_template.columns = [column]
             
-            # Call the method
-            result = monitor._start_review_cycle_for_issue(
-                project_name='test-project',
-                board_name='planning',
-                issue_number=2001,
-                status='Design Review',
-                repository='test-repo',
-                project_config=project_config,
-                pipeline_config=pipeline_config,
-                workflow_template=workflow_template,
-                column=column
-            )
-            
-            # Wait for thread to potentially access pipeline_run
-            # Give it 2 seconds to start
-            pipeline_run_accessed.wait(timeout=2.0)
+            # JoinableThread, not the real one (#186). This test WANTS the
+            # thread body to run -- it asserts on what the closure can see --
+            # but _start_review_cycle_for_issue does not return its thread, so
+            # there was nothing to join and the cycle ran on into whatever test
+            # came next.
+            #
+            # Patched around THIS CALL ONLY. project_monitor does its `import
+            # threading` inside functions, so there is no module attribute to
+            # patch and the global name is the only handle -- and the global
+            # also catches ThreadPoolExecutor's internal `threading.Thread(...)`,
+            # whose workers would become no-ops and whose .result() would then
+            # block forever. Narrowing the window to one call that spawns
+            # exactly one known thread is what keeps that unreachable.
+            JoinableThread.reset()
+            with patch('threading.Thread', JoinableThread):
+                result = monitor._start_review_cycle_for_issue(
+                    project_name='test-project',
+                    board_name='planning',
+                    issue_number=2001,
+                    status='Design Review',
+                    repository='test-repo',
+                    project_config=project_config,
+                    pipeline_config=pipeline_config,
+                    workflow_template=workflow_template,
+                    column=column
+                )
+
+                # The thread sets the event and then unwinds; see
+                # mock_start_review_cycle above.
+                pipeline_run_accessed.wait(timeout=2.0)
             
             # Assert: Thread was able to access pipeline_run.id
             assert pipeline_run_accessed.is_set(), "pipeline_run.id was not accessible in the thread"
 
-            # ...and it does not outlive this test.
-            JoinableThread.join_all(timeout=5)
+            # ...and it does not outlive this test. ALL_JOINED specifically,
+            # not merely "did not raise": NONE_REGISTERED would mean the patch
+            # stopped taking and this test silently stopped testing anything.
+            assert JoinableThread.join_all() is JoinResult.ALL_JOINED
     
     def test_review_cycle_thread_handles_missing_previous_output(
         self,

@@ -59,7 +59,19 @@ class PRReviewCheckpoint:
         self.project_name = project_name
         self.issue_number = issue_number
 
-        state_dir = base_dir if base_dir is not None else Path("/workspace/switchyard/state/projects")
+        # Resolved from ORCHESTRATOR_ROOT, not hardcoded (#181). This used to
+        # be the literal "/workspace/switchyard/state/projects", which is the
+        # SAME INODE as /app on the deployment (docker-compose mounts the
+        # checkout twice). An absolute literal ignores ORCHESTRATOR_ROOT, the
+        # CWD and any test redirect, and this constructor mkdirs -- so merely
+        # constructing one created directories in production state. Observed
+        # doing exactly that during a test run whose ORCHESTRATOR_ROOT was
+        # pointed at a scratch directory.
+        if base_dir is not None:
+            state_dir = base_dir
+        else:
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "projects"
         pr_review_dir = state_dir / project_name / "pr_review_checkpoints"
         pr_review_dir.mkdir(parents=True, exist_ok=True)
 
