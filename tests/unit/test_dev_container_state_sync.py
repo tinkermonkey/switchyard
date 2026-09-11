@@ -18,7 +18,19 @@ from unittest.mock import Mock, patch, MagicMock
 # Set ORCHESTRATOR_ROOT to temp dir before importing modules
 # This prevents permission errors when modules create state directories at import time
 _temp_root = tempfile.mkdtemp()
-os.environ['ORCHESTRATOR_ROOT'] = _temp_root
+# setdefault, NOT assignment. This runs at COLLECTION time, so an unconditional
+# assignment here re-pointed ORCHESTRATOR_ROOT for the whole process regardless
+# of test order -- including over the scratch root tests/conftest.py chooses and
+# over one the operator passed on the command line. Every later test that
+# derived a state path from it then read and wrote a directory nobody else knew
+# about, which is what broke
+# test_dry_run_state_sweep.py::test_step_two_the_restore_fixture_puts_the_real_tracker_back
+# in full-suite order while it passed in isolation.
+# The protection this line exists for -- modules creating state directories at
+# import time under an unwritable /app -- is preserved: setdefault still fires
+# when nothing has chosen a root. Matches test_dev_container_image_label_
+# verification.py, which already did it this way.
+os.environ.setdefault('ORCHESTRATOR_ROOT', _temp_root)
 
 # Skip if not in Docker environment
 try:

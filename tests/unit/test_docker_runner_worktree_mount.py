@@ -141,8 +141,15 @@ class TestPrepareWorktreeGitMount:
         # test happens to be running from on disk.
         worktree_dir = tmp_path / 'worktree-content'
         worktree_dir.mkdir(parents=True)
+        # A project name that cannot exist, NOT a real one. The origin clone's
+        # hooks/config/packed-refs are probed through this process's own
+        # /workspace view, and inside the orchestrator container
+        # /workspace/phone-home is a live checkout -- so naming a real project
+        # here made protected_relative_paths come back populated and this
+        # assertion fail, in the container only. The positive case has its own
+        # test below, against a real tmp_path-based origin clone.
         (worktree_dir / '.git').write_text(
-            'gitdir: /workspace/phone-home/.git/worktrees/204\n'
+            'gitdir: /workspace/__no_such_project__/.git/worktrees/204\n'
         )
         override_file = tmp_path / 'worktree_gitdir_override_c1.git'
         with patch.object(
@@ -151,15 +158,14 @@ class TestPrepareWorktreeGitMount:
             result = runner._prepare_worktree_git_mount(worktree_dir, '/host/workspace', 'c1')
 
         assert result is not None
-        assert result.host_git_base_path == '/host/workspace/phone-home/.git'
+        assert result.host_git_base_path == '/host/workspace/__no_such_project__/.git'
         assert result.worktree_admin_id == '204'
         assert result.host_override_path == str(override_file)
-        # /workspace/phone-home isn't a real path in THIS test process, so
-        # the origin clone's hooks/config/packed-refs can't be found here --
-        # covered instead by test_protected_relative_paths_reflect_what_
-        # actually_exists below, which points the pointer file at a real
-        # tmp_path-based origin clone so the existence checks have something
-        # real to check against.
+        # /workspace/__no_such_project__ exists nowhere, so the origin
+        # clone's hooks/config/packed-refs cannot be found -- covered instead
+        # by test_protected_relative_paths_reflect_what_actually_exists below,
+        # which points the pointer file at a real tmp_path-based origin clone
+        # so the existence checks have something real to check against.
         assert result.protected_relative_paths == ()
         # worktree_dir isn't a real git repository in this test process either
         # (just a bare .git pointer file with no working structure behind
@@ -176,7 +182,7 @@ class TestPrepareWorktreeGitMount:
         # The worktree's own real .git file on disk is untouched -- other
         # consumers (the orchestrator's own process, repair-cycle containers)
         # use a different mount layout and depend on the original content.
-        assert (worktree_dir / '.git').read_text() == 'gitdir: /workspace/phone-home/.git/worktrees/204\n' 
+        assert (worktree_dir / '.git').read_text() == 'gitdir: /workspace/__no_such_project__/.git/worktrees/204\n'
 
     def test_protected_relative_paths_reflect_what_actually_exists(self, runner, tmp_path):
         """Review pass 3: hooks/config/packed-refs must each be reported only

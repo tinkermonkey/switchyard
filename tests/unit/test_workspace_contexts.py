@@ -205,6 +205,16 @@ class TestIssuesWorkspaceContext:
             mock_config.get_project_agent_config.return_value = {}
 
             mock_fbm.get_current_branch = AsyncMock(return_value='feature/test-branch')
+            # IssuesWorkspaceContext.finalize_execution() awaits this. Left as a
+            # plain MagicMock attribute it returns a MagicMock, `await` raises
+            # TypeError, and execute_agent()'s handler falls through to the
+            # FAILSAFE commit path -- which tries to read a branch from a
+            # directory that does not exist and then posts a real comment to
+            # GitHub. The test still passed its own assertion while doing that,
+            # because the assertion is about get_working_directory().
+            mock_fbm.finalize_feature_branch_work = AsyncMock(
+                return_value={'success': True, 'pr_url': 'https://github.com/org/repo/pull/1'}
+            )
 
             mock_agent = MagicMock()
             mock_agent.execute = AsyncMock(return_value={'status': 'success'})
@@ -410,6 +420,11 @@ class TestWorkspaceContextBehaviorEquivalence:
                  patch('services.pipeline_run.get_pipeline_run_manager', return_value=mock_prm):
 
                 mock_fbm.get_current_branch = AsyncMock(return_value='feature/test')
+                # Awaited by IssuesWorkspaceContext.finalize_execution() -- see
+                # the equivalent note in test_issues_workspace_uses_git_directory.
+                mock_fbm.finalize_feature_branch_work = AsyncMock(
+                    return_value={'success': True, 'pr_url': 'https://github.com/org/repo/pull/1'}
+                )
                 mock_config.get_project_config.return_value = MagicMock(
                     github={'org': 'test-org', 'repo': 'test-repo'}
                 )

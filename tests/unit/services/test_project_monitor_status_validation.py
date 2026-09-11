@@ -145,7 +145,7 @@ def test_status_validation_retry_success(project_monitor, mock_config_manager):
                                         'nodes': [
                                             {
                                                 'field': {'name': 'Status'},
-                                                'name': 'No Status'
+                                                'name': 'Bogus Status'
                                             }
                                         ]
                                     }
@@ -235,7 +235,7 @@ def test_status_validation_permanent_failure(project_monitor, mock_config_manage
                                     'nodes': [
                                         {
                                             'field': {'name': 'Status'},
-                                            'name': 'No Status'
+                                            'name': 'Bogus Status'
                                         }
                                     ]
                                 }
@@ -316,7 +316,7 @@ def test_status_validation_partial_invalid(project_monitor, mock_config_manager)
                                     'nodes': [
                                         {
                                             'field': {'name': 'Status'},
-                                            'name': 'No Status'
+                                            'name': 'Bogus Status'
                                         }
                                     ]
                                 }
@@ -416,3 +416,68 @@ def test_workflow_lookup_failure(project_monitor, mock_config_manager):
 
         # Assert: execute_board_query_cached called once (no retry since validation skipped)
         assert mock_query.call_count == 1
+
+
+def test_unstatused_items_are_dropped_without_retrying(project_monitor, mock_config_manager):
+    """"No Status" must NOT drive the retry loop -- it is permanent, not transient.
+
+    _split_valid_invalid_items() distinguishes two failure modes on purpose: an
+    out-of-column status may be transient GraphQL staleness and is worth
+    re-fetching, while "No Status" means the field is genuinely unset on GitHub
+    (issues cross-added to a board and never given a column). Retrying that
+    achieves nothing and costs three board queries plus 6s of sleep on every
+    poll cycle, forever, for every untriaged card.
+
+    Pinned here because the two tests above USED "No Status" as their invalid
+    status and asserted three attempts. They were written before the split and
+    kept passing only while the old semantics held; once the code stopped
+    retrying them they failed with call_count 1 != 3, and the obvious repair --
+    "make the retry loop handle No Status again" -- would have reinstated
+    exactly the log spam the split removed. Now the deliberate behaviour has
+    its own test, so the next person sees an assertion rather than an absence.
+    """
+    with patch.object(project_monitor, '_get_valid_columns_for_board',
+                      return_value={'Backlog', 'In Progress', 'Done'}), \
+         patch('services.github_owner_utils.execute_board_query_cached') as mock_query, \
+         patch('services.github_owner_utils.invalidate_board_query_cache') as mock_invalidate, \
+         patch('services.github_owner_utils.get_owner_type') as mock_owner_type, \
+         patch('services.github_api_client.get_github_client') as mock_github, \
+         patch('time.sleep') as mock_sleep:
+
+        mock_github.return_value.breaker.is_open.return_value = False
+        mock_owner_type.return_value = 'organization'
+        mock_query.return_value = {
+            'organization': {
+                'projectV2': {
+                    'items': {
+                        'nodes': [
+                            {
+                                'id': 'item1',
+                                'content': {
+                                    'id': 'issue1',
+                                    'number': 1,
+                                    'title': 'Untriaged Issue',
+                                    'updatedAt': '2025-01-01T00:00:00Z',
+                                    'repository': {'name': 'test-repo'}
+                                },
+                                'fieldValues': {
+                                    'nodes': [
+                                        {'field': {'name': 'Status'}, 'name': 'No Status'}
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        items = project_monitor.get_project_items('test-org', 123)
+
+        # Dropped from the returned items -- an unstatused card is not dispatchable.
+        assert items == []
+        # ...and dropped on the FIRST pass: no re-fetch, no cache invalidation,
+        # no backoff sleep.
+        assert mock_query.call_count == 1
+        mock_invalidate.assert_not_called()
+        mock_sleep.assert_not_called()

@@ -375,16 +375,26 @@ class TestObservabilityElasticsearchIndexing:
         """Test that Elasticsearch errors don't break event emission"""
         # Make Elasticsearch raise an error
         mock_elasticsearch.index.side_effect = Exception("ES connection error")
-        
-        # Should not raise exception
-        obs_manager.emit(
-            EventType.AGENT_ROUTING_DECISION,
-            agent="orchestrator",
-            task_id="test_task",
-            project="test-project",
-            data={'decision_category': 'routing'}
-        )
-        
+
+        # es_index_with_retry() really sleeps 2+4+8+16s between its five
+        # attempts, so without this the test spends 30 REAL seconds proving
+        # something that has nothing to do with the wait -- it was the single
+        # slowest test in the unit suite. The retry count is still exercised;
+        # only the waiting is skipped.
+        with patch('monitoring.observability.time.sleep') as mock_sleep:
+            # Should not raise exception
+            obs_manager.emit(
+                EventType.AGENT_ROUTING_DECISION,
+                agent="orchestrator",
+                task_id="test_task",
+                project="test-project",
+                data={'decision_category': 'routing'}
+            )
+
+        # All five attempts were made, with a backoff between each.
+        assert mock_elasticsearch.index.call_count == 5
+        assert [c.args[0] for c in mock_sleep.call_args_list] == [2, 4, 8, 16]
+
         # Redis should still work
         assert mock_redis.publish.called
         assert mock_redis.xadd.called
@@ -826,68 +836,105 @@ class TestEventTypeCompleteness:
     """Test that EventType enum is complete and all events are handled"""
     
     def test_all_event_types_have_tests(self):
-        """Verify that we have awareness of all EventType values"""
+        """Every EventType must be consciously categorized, and the
+        categorization here must match what the code actually does.
+
+        The three sets below are a mirror of monitoring/observability.py's
+        _is_decision_event() and _is_agent_lifecycle_event(). That is the
+        point: adding an EventType fails this test until someone states which
+        bucket it belongs in, which is the speed bump this file exists to
+        provide. What it did NOT do before was check the mirror against the
+        original, and the mirror had drifted badly -- it was missing
+        pipeline_run_active_no_container_detected entirely (the failure that
+        prompted this rewrite), had performance_metric and token_usage filed
+        as non-indexed when the code indexes both (decision-events-* on the
+        live cluster carries rows of each), and listed all eleven of
+        task_received/prompt_constructed/claude_api_call_*/container_* as
+        non-indexed when the code treats them as agent-lifecycle events --
+        contradicting test_task_received_and_claude_api_are_lifecycle_events
+        in this same file.
+        """
         all_event_types = list(EventType)
-        
-        # Expected categorization
+
         expected_decision_events = {
-            'feedback_detected', 'feedback_listening_started', 'feedback_listening_stopped', 'feedback_ignored',
-            'agent_routing_decision', 'agent_selected', 'workspace_routing_decision',
-            'status_validation_failure',
-            'status_progression_started', 'status_progression_completed', 'status_progression_failed',
-            'pipeline_stage_transition',
-            'review_cycle_started', 'review_cycle_iteration', 'review_cycle_maker_selected',
-            'review_cycle_reviewer_selected', 'review_cycle_escalated', 'review_cycle_completed',
-            'conversational_loop_started', 'conversational_question_routed',
-            'conversational_loop_paused', 'conversational_loop_resumed',
-            'error_encountered', 'error_recovered', 'circuit_breaker_opened',
-            'circuit_breaker_closed', 'retry_attempted',
-            'task_queued', 'task_dequeued', 'task_priority_changed', 'task_cancelled',
-            'branch_selected', 'branch_created', 'branch_reused', 'branch_conflict_detected',
-            'branch_stale_detected', 'branch_selection_escalated',
-            'worktree_branch_drift_detected', 'worktree_branch_drift_repaired',
-            'worktree_branch_drift_unchecked',
-            'result_persistence_failed', 'fallback_storage_used',
-            'output_validation_failed', 'empty_output_detected', 'container_result_recovered',
-            'repair_cycle_started', 'repair_cycle_iteration',
-            'repair_cycle_test_cycle_started', 'repair_cycle_test_cycle_completed',
-            'repair_cycle_test_execution_started', 'repair_cycle_test_execution_completed',
-            'repair_cycle_fix_cycle_started', 'repair_cycle_fix_cycle_completed',
-            'repair_cycle_file_fix_started', 'repair_cycle_file_fix_completed', 'repair_cycle_file_fix_failed',
-            'repair_cycle_warning_review_started', 'repair_cycle_warning_review_completed',
-            'repair_cycle_warning_review_failed', 'repair_cycle_completed', 'repair_cycle_failed',
-            'repair_cycle_systemic_analysis_started', 'repair_cycle_systemic_analysis_completed',
-            'repair_cycle_env_rebuild_started', 'repair_cycle_env_rebuild_completed',
-            'repair_cycle_systemic_fix_started', 'repair_cycle_systemic_fix_completed',
-            'pr_review_stage_started', 'pr_review_phase_started',
-            'pr_review_phase_completed', 'pr_review_phase_failed', 'pr_review_stage_completed',
-            'pr_review_outcome_tracking',
-            'execution_state_reconciled',
+            'agent_output_format_unexpected', 'agent_routing_decision',
+            'agent_selected', 'branch_conflict_detected',
+            'branch_created', 'branch_reused', 'branch_selected',
+            'branch_selection_escalated', 'branch_stale_detected',
+            'circuit_breaker_closed', 'circuit_breaker_opened',
+            'container_result_recovered', 'conversational_loop_paused',
+            'conversational_loop_resumed',
+            'conversational_loop_started',
+            'conversational_question_routed', 'empty_output_detected',
+            'error_encountered', 'error_recovered',
+            'execution_state_reconciled', 'fallback_storage_used',
+            'feedback_detected', 'feedback_ignored',
+            'feedback_listening_started', 'feedback_listening_stopped',
+            'github_comment_posted', 'output_validation_failed',
+            'performance_metric',
+            'pipeline_run_active_no_container_detected',
+            'pipeline_run_completed', 'pipeline_run_failed',
+            'pipeline_run_started', 'pipeline_stage_transition',
+            'pr_review_outcome_tracking', 'pr_review_phase_completed',
+            'pr_review_phase_failed', 'pr_review_phase_started',
+            'pr_review_stage_completed', 'pr_review_stage_started',
+            'prompt_size_warning', 'repair_cycle_completed',
+            'repair_cycle_container_checkpoint_updated',
+            'repair_cycle_container_completed',
+            'repair_cycle_container_killed',
+            'repair_cycle_container_recovered',
+            'repair_cycle_container_started',
+            'repair_cycle_env_rebuild_completed',
+            'repair_cycle_env_rebuild_started', 'repair_cycle_failed',
+            'repair_cycle_file_fix_completed',
+            'repair_cycle_file_fix_failed',
+            'repair_cycle_file_fix_started',
+            'repair_cycle_fix_cycle_completed',
+            'repair_cycle_fix_cycle_started', 'repair_cycle_iteration',
+            'repair_cycle_started',
+            'repair_cycle_systemic_analysis_completed',
+            'repair_cycle_systemic_analysis_started',
+            'repair_cycle_systemic_fix_completed',
+            'repair_cycle_systemic_fix_started',
+            'repair_cycle_test_cycle_completed',
+            'repair_cycle_test_cycle_started',
+            'repair_cycle_test_execution_completed',
+            'repair_cycle_test_execution_started',
+            'repair_cycle_warning_review_completed',
+            'repair_cycle_warning_review_failed',
+            'repair_cycle_warning_review_started',
+            'result_persistence_failed', 'retry_attempted',
+            'review_cycle_completed', 'review_cycle_escalated',
+            'review_cycle_iteration', 'review_cycle_maker_selected',
+            'review_cycle_reviewer_selected', 'review_cycle_started',
+            'status_progression_completed', 'status_progression_failed',
+            'status_progression_started', 'status_validation_failure',
             'sub_issue_created', 'sub_issue_creation_failed',
-            'prompt_size_warning', 'agent_output_format_unexpected',
-            'github_comment_posted',
+            'task_cancelled', 'task_dequeued', 'task_priority_changed',
+            'task_queued', 'token_usage', 'workspace_routing_decision',
+            'worktree_branch_drift_detected',
+            'worktree_branch_drift_repaired',
+            'worktree_branch_drift_unchecked'
         }
 
         expected_lifecycle_events = {
-            'agent_initialized', 'agent_started', 'agent_completed', 'agent_failed'
+            'agent_completed', 'agent_failed', 'agent_initialized',
+            'agent_started', 'claude_api_call_completed',
+            'claude_api_call_failed', 'claude_api_call_started',
+            'container_execution_completed',
+            'container_execution_failed', 'container_execution_started',
+            'container_launch_failed', 'container_launch_started',
+            'container_launch_succeeded', 'prompt_constructed',
+            'task_received'
         }
-        
+
         expected_non_indexed_events = {
-            'task_received', 'prompt_constructed', 'claude_api_call_started',
-            'claude_api_call_completed', 'claude_api_call_failed',
-            'container_launch_started', 'container_launch_succeeded', 'container_launch_failed',
-            'container_execution_started', 'container_execution_completed', 'container_execution_failed',
-            'response_chunk_received',
-            'response_processing_started', 'response_processing_completed',
-            'tool_execution_started', 'tool_execution_completed',
-            'performance_metric', 'token_usage',
-            'pipeline_run_started', 'pipeline_run_completed', 'pipeline_run_failed',
-            'repair_cycle_container_started', 'repair_cycle_container_checkpoint_updated',
-            'repair_cycle_container_recovered', 'repair_cycle_container_killed',
-            'repair_cycle_container_completed',
+            'response_chunk_received', 'response_processing_completed',
+            'response_processing_started', 'tool_execution_completed',
+            'tool_execution_started'
         }
-        
-        # Check that all events are accounted for
+
+        # 1. Nothing falls through the three buckets.
         for event_type in all_event_types:
             event_name = event_type.value
             assert (
@@ -895,13 +942,30 @@ class TestEventTypeCompleteness:
                 event_name in expected_lifecycle_events or
                 event_name in expected_non_indexed_events
             ), f"EventType.{event_type.name} ({event_name}) is not categorized in tests"
-        
-        # Verify counts match
+
+        # 2. Nothing is listed twice, and nothing is listed that no longer exists.
         total_expected = (
             len(expected_decision_events) +
             len(expected_lifecycle_events) +
             len(expected_non_indexed_events)
         )
-        
         assert total_expected == len(all_event_types), \
             f"Event count mismatch: {total_expected} expected, {len(all_event_types)} actual"
+
+        # 3. The mirror agrees with the original. Without this the sets above
+        #    are unfalsifiable: an event can sit in the wrong one forever and
+        #    the two assertions above still pass.
+        #
+        #    Both predicates ignore self, so they are called unbound rather
+        #    than standing up an ObservabilityManager (which connects to Redis
+        #    and Elasticsearch).
+        for event_type in all_event_types:
+            name = event_type.value
+            assert ObservabilityManager._is_decision_event(None, event_type) == (
+                name in expected_decision_events
+            ), (f"EventType.{event_type.name} ({name}): _is_decision_event() and this "
+                f"test's categorization disagree. Decide which is right, don't just move it.")
+            assert ObservabilityManager._is_agent_lifecycle_event(None, event_type) == (
+                name in expected_lifecycle_events
+            ), (f"EventType.{event_type.name} ({name}): _is_agent_lifecycle_event() and "
+                f"this test's categorization disagree.")

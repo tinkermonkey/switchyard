@@ -301,8 +301,25 @@ class ObservabilityEvent:
     execution_type: str = ""
 
     def to_json(self) -> str:
-        """Serialize to JSON for Redis pub/sub"""
-        return json.dumps(asdict(self))
+        """Serialize to JSON for Redis pub/sub.
+
+        `default=str` because `data` is an open dict assembled by ~90 emit
+        sites out of task context, agent config and pipeline state. Anything
+        that is not JSON-native there -- a Path, a datetime, an Enum, a
+        dataclass, a config object -- used to raise TypeError out of
+        ObservabilityManager.emit(), which is called INLINE on the dispatch
+        path and does not guard this call. So one unexpected value in a
+        telemetry payload aborted the agent run it was describing.
+
+        Reached by four tests in tests/unit/test_workspace_contexts.py, which
+        pass a MagicMock agent_config into emit_agent_initialized() and got a
+        TypeError out of execute_agent() -- a mock standing in for exactly the
+        "some object nobody expected" case. Stringifying is the right trade
+        for an observability envelope: the event is still emitted, still
+        indexed, and still searchable, and from_json() already tolerates
+        fields it does not recognise.
+        """
+        return json.dumps(asdict(self), default=str)
 
     @classmethod
     def from_json(cls, json_str: str) -> 'ObservabilityEvent':
@@ -624,7 +641,23 @@ class ObservabilityManager:
             execution_type=execution_type
         )
 
-        event_json = event.to_json()
+        try:
+            event_json = event.to_json()
+        except (TypeError, ValueError) as e:
+            # default=str above makes this nearly total, but not total --
+            # a circular reference or an object whose __str__ raises still
+            # gets here. Losing one telemetry event is strictly better than
+            # aborting the dispatch it was describing, which is what this
+            # unguarded call used to do. Logged at ERROR with the event type
+            # so it is not silent: a recurring line here means some emit site
+            # is putting a genuinely unserialisable object in `data`.
+            logger.error(
+                f"Could not serialise {event_type.value} event for "
+                f"{agent}/{project} (task {task_id}); dropping this event "
+                f"rather than failing the caller: {e}",
+                exc_info=True,
+            )
+            return
 
         # Redis pub/sub + stream (independent of ES)
         try:

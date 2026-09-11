@@ -264,9 +264,79 @@ def _default_orchestrator_root_outside_the_container():
 # logging "Failed to connect to Redis for observability: Error -3 connecting
 # to redis:6379" before any guard existed. What they have to beat is this
 # module's own first-party imports, not the first test module.
+DEPLOYMENT_TUNING_ENV_VARS = (
+    'USE_BATCHED_BOARD_QUERIES',
+    'WATCHDOG_MAX_RETRIES',
+    'WATCHDOG_MAX_RECORD_AGE_HOURS',
+    'RECONCILIATION_FRESHNESS_HOURS',
+    'TOKEN_METRICS_INTERVAL_HOURS',
+    'PROGRAMMATIC_CHANGE_WINDOW_SECONDS',
+    'DOCKER_SOCKET_ACCESS_MAX_CONCURRENT',
+    'DOCKER_SOCKET_ACCESS_MAX_WAIT_SECONDS',
+)
+
+
+def _clear_deployment_tuning_env_vars():
+    """
+    Remove the deployment's rollout/tuning knobs so unit tests see the code's
+    own defaults.
+
+    These are set on the orchestrator container by docker-compose, and the
+    documented way to run this suite is inside that container -- so a test
+    asserting "this feature is off unless someone turns it on" was really
+    asserting "this feature is off on whatever machine happens to run me".
+    USE_BATCHED_BOARD_QUERIES=true is set there today, and it failed
+    test_project_monitor_batched_polling.py::test_defaults_off and
+    test_project_monitor_failsafe_batching.py::TestFailsafeBatchedGathering
+    Unflagged in the container while both passed on a host.
+
+    An explicit list, not a pattern or a blanket scrub. Credentials, service
+    hostnames and ORCHESTRATOR_ROOT are deliberately NOT in it: tests that
+    need them need the real ones, and the guards above already handle the
+    hostnames. Only knobs whose *default value* is itself under test belong
+    here -- a test that wants one set uses patch.dict, as
+    test_enabled_via_env_var already does.
+    """
+    for name in DEPLOYMENT_TUNING_ENV_VARS:
+        os.environ.pop(name, None)
+
+
+def _install_a_disabled_observability_singleton():
+    """
+    Stop the suite writing telemetry into the deployment's Elasticsearch.
+
+    get_observability_manager() lazily builds ObservabilityManager(enabled=True),
+    which connects to REDIS_HOST/ELASTICSEARCH_HOST -- inside the orchestrator
+    container those are the LIVE services. Any test that reaches an emit() then
+    publishes to the real event stream and indexes a document into the real
+    agent-events-*/decision-events-* indices. Those documents are built from
+    whatever the test passed in, so they are not merely extra: they are wrong.
+
+    It is also slow in a way that reads as a hang. es_index_with_retry() retries
+    5 times with 2/4/8/16s backoff, so one rejected document costs 30 seconds of
+    time.sleep() inside a test. Four tests in test_workspace_contexts.py were
+    paying exactly that -- 150s for a 10-test file.
+
+    enabled=False short-circuits emit() on its first line and skips client
+    construction entirely, so this is also strictly faster than connecting.
+
+    Tests that actually exercise indexing are unaffected: they construct their
+    own ObservabilityManager with mock redis/es clients (see
+    tests/unit/test_observability_elasticsearch.py) rather than going through
+    this singleton. Anything that wants to assert on emits through the
+    singleton should patch it, which the fixtures that care already do.
+    """
+    import monitoring.observability as observability
+    observability._observability_manager = observability.ObservabilityManager(
+        enabled=False
+    )
+
+
 _refuse_to_resolve_compose_service_hostnames()
 _bound_service_client_timeouts()
 _default_orchestrator_root_outside_the_container()
+_clear_deployment_tuning_env_vars()
+_install_a_disabled_observability_singleton()
 
 
 # Import test utilities
