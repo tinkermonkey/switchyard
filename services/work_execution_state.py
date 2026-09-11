@@ -56,14 +56,38 @@ _WATCHDOG_MAX_RECORD_AGE_HOURS = 24
 _WATCHDOG_MAX_RETRIES = 2
 
 
+def _dispatch_failure_budget() -> int:
+    """project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES.
+
+    Read rather than restated so the two cannot drift apart again; the import is
+    local because project_monitor imports this module back (lazily, from inside its
+    own functions) and pulls in most of the orchestrator with it. An unreadable
+    constant falls back to one above the watchdog's own default budget, i.e. to the
+    relationship the pair is supposed to hold.
+    """
+    try:
+        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
+        return MAX_CONSECUTIVE_DISPATCH_FAILURES
+    except Exception as e:
+        logger.debug(
+            f"Could not read MAX_CONSECUTIVE_DISPATCH_FAILURES ({e}) -- "
+            f"assuming {_WATCHDOG_MAX_RETRIES + 1}"
+        )
+        return _WATCHDOG_MAX_RETRIES + 1
+
+
 def _watchdog_max_retries() -> int:
     """WATCHDOG_MAX_RETRIES, clamped strictly below the dispatch-failure budget.
 
-    Reads project_monitor's constant rather than restating it so the two cannot
-    drift apart again; the import is local because project_monitor imports this
-    module back (lazily, from inside its own functions) and pulls in most of the
-    orchestrator with it. An unreadable constant falls back to the module default,
-    which already satisfies the relationship.
+    Only the ceiling is enforced. A value BELOW the default is an operator turning
+    the retry down, including all the way off: WATCHDOG_MAX_RETRIES=0 leaves a fresh
+    record's watchdog_retry_count of 0 already at the limit, so Check 1 refuses
+    every rewrite and the watchdog is a pure detector again. That is the kill switch
+    an operator reaches for when the gate starts rewriting records it shouldn't, and
+    clamping it up to 1 -- which this did (#166 review) -- silently re-enabled one
+    rewrite and one redispatch per eligible record. Zero satisfies the relationship
+    with MAX_CONSECUTIVE_DISPATCH_FAILURES a fortiori; it is only the other
+    direction that is not a configuration choice.
     """
     import os
 
@@ -77,17 +101,7 @@ def _watchdog_max_retries() -> int:
         )
         configured = _WATCHDOG_MAX_RETRIES
 
-    try:
-        from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
-        ceiling = MAX_CONSECUTIVE_DISPATCH_FAILURES - 1
-    except Exception as e:
-        logger.debug(
-            f"Could not read MAX_CONSECUTIVE_DISPATCH_FAILURES ({e}) -- "
-            f"capping the watchdog budget at {_WATCHDOG_MAX_RETRIES}"
-        )
-        ceiling = _WATCHDOG_MAX_RETRIES
-
-    return max(1, min(configured, ceiling))
+    return max(0, min(configured, _dispatch_failure_budget() - 1))
 
 
 # How much of a workspace the empty-output gate reads before it gives up and
@@ -669,10 +683,20 @@ class WorkExecutionStateTracker:
         # the board lock -- exactly the blast radius the budget exists to bound, and
         # the reason _watchdog_max_retries() is clamped strictly below it.
         #
-        # Scoped to the last record for this same (column, agent), and only when the
-        # watchdog is what ended it: a redispatch that then genuinely posts leaves an
-        # ordinary 'success' as that record, so the next unrelated start begins at
-        # zero again rather than inheriting a budget spent months ago.
+        # Scoped to the last record for this same (column, agent), and cleared by a
+        # 'success': a redispatch that then genuinely posts ends the run, so the next
+        # unrelated start begins at zero again rather than inheriting a budget spent
+        # months ago.
+        #
+        # What does NOT clear it is any other outcome, watchdog-written or not (#166
+        # review). Conditioning the carry on the previous record's
+        # watchdog_retry_triggered -- which only ever lands on the record the sweep
+        # itself rewrote -- meant one genuine dispatch failure landing between two
+        # rewrites reset the budget to zero while count_consecutive_failures() kept
+        # climbing, so the pair the budget is supposed to stay below could still be
+        # reached. The run terminator is the same one count_consecutive_failures()
+        # uses, for the same reason: these two counters have to agree about where a
+        # run of failures begins or the budget bounds nothing.
         #
         # The lookback searches BACKWARD for this (column, agent) rather than testing
         # history[-1] (#166 review). A state file is per (project, issue) and holds
@@ -689,7 +713,7 @@ class WorkExecutionStateTracker:
             ),
             None
         )
-        if previous and previous.get('watchdog_retry_triggered'):
+        if previous and previous.get('outcome') != 'success':
             carried = previous.get('watchdog_retry_count', 0)
             if carried:
                 execution['watchdog_retry_count'] = carried
@@ -737,7 +761,8 @@ class WorkExecutionStateTracker:
         outcome: str,
         project_name: str,
         error: Optional[str] = None,
-        claude_session_id: Optional[str] = None
+        claude_session_id: Optional[str] = None,
+        github_post_attempted: bool = True
     ):
         """Record the outcome of work execution.
 
@@ -746,6 +771,16 @@ class WorkExecutionStateTracker:
         already established a Claude Code session — see docker_runner.py's
         _rate_limit_signal capture. Used by the active-resume step to decide
         whether a captured session is worth --resume-ing.
+
+        github_post_attempted=False says this caller finalized the record on a path
+        that never posts the agent's comment at all (#166 review). It is stamped onto
+        the record as outcome_recovered_without_post and the empty-output gate
+        declines it, for the same reason it declines _apply_redis_result()'s records:
+        "no signed agent comment" is only evidence of "produced nothing" when
+        something tried to write one. The default is True because every other caller
+        reaches here through a completion path that posts first — see
+        docker_runner._complete_agent_execution and
+        agent_executor._post_agent_output_to_github.
 
         board_name (#144) is deliberately NOT a parameter here: the normal path
         mutates the in_progress entry record_execution_start() already wrote, so
@@ -767,6 +802,11 @@ class WorkExecutionStateTracker:
             if (execution['column'] == column and
                 execution['agent'] == agent and
                 execution['outcome'] == 'in_progress'):
+
+                # Stamped before the outcome, the same way _apply_redis_result()
+                # stamps its own, so the two can never be written apart.
+                if not github_post_attempted:
+                    execution['outcome_recovered_without_post'] = True
 
                 execution['outcome'] = outcome
                 if not found_primary:
@@ -849,6 +889,12 @@ class WorkExecutionStateTracker:
             'trigger_source': 'unknown',
             'start_time_unknown': True
         }
+
+        # Already declined by start_time_unknown and trigger_source 'unknown', but
+        # stamped anyway so the record says why in the caller's own terms rather than
+        # relying on two other flags to happen to cover it.
+        if not github_post_attempted:
+            execution['outcome_recovered_without_post'] = True
 
         if error:
             execution['error'] = error
@@ -1112,9 +1158,28 @@ class WorkExecutionStateTracker:
         preceding failures are no longer consecutive.
         """
         state = self.load_state(project_name, issue_number)
+        return self._count_consecutive_failures_in(
+            state['execution_history'], column, agent
+        )
+
+    @staticmethod
+    def _count_consecutive_failures_in(
+        executions: List[dict],
+        column: str,
+        agent: str
+    ) -> int:
+        """count_consecutive_failures() over an already-loaded history.
+
+        Split out for the empty-output sweep (#166 review), which has to ask this
+        question with the state file's flock in hand: load_state() takes that same
+        lock on a fresh fd, and flock locks are per open-file-description, so the
+        public method would block forever there -- the same re-entrancy that wedged
+        PROTECTION 1 until #150. It also lets the sweep ask about history MINUS the
+        record it is about to rewrite; see _rewrite_verified_empty_execution().
+        """
         column_executions = [
-            e for e in state['execution_history']
-            if e['column'] == column and e['agent'] == agent
+            e for e in executions
+            if e.get('column') == column and e.get('agent') == agent
         ]
         count = 0
         for execution in reversed(column_executions):
@@ -2253,8 +2318,13 @@ class WorkExecutionStateTracker:
         1. has_active_execution() - Checks ALL 4 types of active work
         2. Pipeline lock verification
         3. Queue status check
-        4. Execution eligibility via _should_retry_failed_execution
         5. 5-minute recency check
+        4. Execution eligibility via _should_retry_failed_execution
+        6. GitHub-output verification via _has_github_output
+
+        4 and 6 are listed last because they run last: they are the two protections
+        that talk to GitHub, and they run in a second pass with no state-file lock
+        held. See the comment at the collection site.
 
         CRITICAL: This method only marks executions as 'failure' - it does NOT
         directly trigger work. The project_monitor picks up failed executions and
@@ -2466,26 +2536,20 @@ class WorkExecutionStateTracker:
                     ):
                         continue
 
-                    # PROTECTION 4: Check execution eligibility
+                    # PROTECTION 4 is NOT run here either -- it joins the gate in the
+                    # unlocked pass below. Its Checks 2/3/5 are one `gh api graphql`
+                    # query for the issue's state and column, and Check 3's
+                    # get_active_pipeline_run() falls through to an Elasticsearch
+                    # search on a Redis mapping miss, which is the normal case; both
+                    # are exactly the blocking remote work the paragraph below refuses
+                    # to hold this issue's flock across (#166 review). All this pass
+                    # keeps is the local sanity check that there is an agent and a
+                    # column to ask about at all.
                     agent = last_exec.get('agent')
                     column = last_exec.get('column')
 
                     if not agent or not column:
                         logger.warning(f"Watchdog: Missing agent or column for {project_name}/#{issue_number}")
-                        continue
-
-                    # project_config is the sweep's per-project cached copy (may be
-                    # None if the lookup above failed, in which case the callee
-                    # fetches it itself) -- see the cache comment above PROTECTION 2.
-                    should_retry, reason = self._should_retry_failed_execution(
-                        project_name, issue_number, agent, column, last_exec,
-                        project_config=project_config
-                    )
-
-                    if not should_retry:
-                        logger.debug(
-                            f"Watchdog: Not eligible for retry {project_name}/#{issue_number}: {reason}"
-                        )
                         continue
 
                     # PROTECTION 5: Verify no recent execution started
@@ -2511,32 +2575,37 @@ class WorkExecutionStateTracker:
                         except Exception as e:
                             logger.debug(f"Could not parse completed_at timestamp: {e}")
 
-                    # PROTECTION 6, the GitHub-output gate, is deliberately NOT run
-                    # here -- it is the second pass below, with no lock held.
+                    # PROTECTION 4 and PROTECTION 6, the two remote protections, are
+                    # deliberately NOT run here -- they are the second pass below,
+                    # with no lock held.
                     #
-                    # Everything above this point is local file/lock/queue work. The
-                    # gate makes blocking `gh` subprocess calls: a REST call for the
-                    # issue's comments and, in a discussion workspace, a GraphQL call
-                    # as well, each of which sleeps up to 30s for rate-limit
-                    # throttling, uses a 30s subprocess timeout and retries a
-                    # transient failure three times on a 2/4/8s ladder -- so a single
-                    # record can spend minutes inside it. This loop holds the issue's
-                    # flock for its whole body, taken with file_lock()'s default
-                    # enforce_timeout=False, i.e. blocking with no timeout; every
-                    # record_execution_start()/record_execution_outcome() for the same
-                    # issue goes through that lock, several of them from async callers
-                    # on the event loop (review_cycle, human_feedback_loop,
+                    # Everything above this point is local file/lock/queue work, and
+                    # that is the invariant this loop is built on rather than a
+                    # description of where the code happens to sit. Both remote
+                    # protections make blocking `gh` subprocess calls -- PROTECTION 4
+                    # a GraphQL query for the issue's state and column, the gate a
+                    # REST call for the issue's comments and, in a discussion
+                    # workspace, a GraphQL call as well -- each of which sleeps up to
+                    # 30s for rate-limit throttling, uses a 30s subprocess timeout and
+                    # retries a transient failure three times on a 2/4/8s ladder, so a
+                    # single record can spend minutes inside them. This loop holds the
+                    # issue's flock for its whole body, taken with file_lock()'s
+                    # default enforce_timeout=False, i.e. blocking with no timeout;
+                    # every record_execution_start()/record_execution_outcome() for the
+                    # same issue goes through that lock, several of them from async
+                    # callers on the event loop (review_cycle, human_feedback_loop,
                     # pr_review_stage). Verifying under the lock therefore parks the
                     # monitoring thread -- and the event loop -- behind a GitHub call,
                     # and surfaces as an unexplained polling stall rather than as an
                     # error. It cost nothing before #166 only because the gate returned
-                    # before its first network call on every production record.
+                    # before its first network call on every production record;
+                    # PROTECTION 4's query was made under the lock on every single one
+                    # of them (#166 review).
                     #
-                    # project_config/agent/column ride along so the rewrite pass can
-                    # re-run PROTECTIONS 2/3/4 without re-reading the project's YAML
-                    # or re-deriving them from a record it re-reads anyway (#166
-                    # review): every protection except PROTECTION 1 was answered once
-                    # here and then acted on minutes later.
+                    # project_config/agent/column ride along so the second pass can run
+                    # PROTECTION 4 -- and the rewrite re-run it, plus 2/3 -- without
+                    # re-reading the project's YAML or re-deriving them from a record
+                    # it re-reads anyway.
                     candidates.append({
                         'state_file': state_file,
                         'project_name': project_name,
@@ -2550,15 +2619,32 @@ class WorkExecutionStateTracker:
             except Exception as e:
                 logger.error(f"Watchdog: Error processing {state_file}: {e}", exc_info=True)
 
-        # PROTECTION 6: ask GitHub whether each surviving candidate actually produced
-        # output, with no lock held, then re-take the lock to rewrite -- see
-        # _rewrite_verified_empty_execution() for what the re-read has to re-establish.
+        # PROTECTIONS 4 and 6: ask GitHub whether each surviving candidate is still
+        # eligible and whether it actually produced output, with no lock held, then
+        # re-take the lock to rewrite -- see _rewrite_verified_empty_execution() for
+        # what the re-read has to re-establish.
         for candidate in candidates:
             state_file = candidate['state_file']
             project_name = candidate['project_name']
             issue_number = candidate['issue_number']
 
             try:
+                # PROTECTION 4, ahead of the gate because it is the cheaper of the
+                # two: its Check 1 (the retry budget) answers with no network at all,
+                # and a record it refuses never pays for the comment scan. Given the
+                # sweep's per-project cached config (may be None if that lookup
+                # failed, in which case the callee fetches it itself) -- see the cache
+                # comment above PROTECTION 2.
+                should_retry, reason = self._should_retry_failed_execution(
+                    project_name, issue_number, candidate['agent'], candidate['column'],
+                    candidate['execution'], project_config=candidate['project_config']
+                )
+                if not should_retry:
+                    logger.debug(
+                        f"Watchdog: Not eligible for retry {project_name}/#{issue_number}: {reason}"
+                    )
+                    continue
+
                 # Fails closed - see the method's docstring: True also means "could
                 # not verify", which defers rather than redispatching.
                 if self._has_github_output(
@@ -2617,6 +2703,17 @@ class WorkExecutionStateTracker:
         call and holding this issue's flock across a GitHub call is what the two-phase
         split exists to avoid. PROTECTIONS 1/2/3 are local/Redis reads and run inside
         it, as tight to the write as they can be.
+
+        The last check before the write is not a protection at all but the budget
+        itself, read off the counter that actually drives the escalation (#166
+        review). _should_retry_failed_execution()'s Check 1 counts only the watchdog's
+        OWN rewrites, while count_consecutive_failures() counts every trailing
+        'failure' for the (column, agent) whoever wrote it -- so a genuine dispatch
+        failure already sitting in the trailing run is added to the watchdog's, and
+        the private budget bounds a different number from the one project_monitor
+        escalates on. Asked here, with the history in hand and the record still
+        unwritten, the question is exact: the count over everything BEFORE this record
+        plus the one this rewrite is about to add.
 
         Returns True only when the record was actually rewritten.
         """
@@ -2689,6 +2786,29 @@ class WorkExecutionStateTracker:
             if self._watchdog_queue_blocks_retry(
                 project_name, issue_number, project_config, queue_manager_cache
             ):
+                return False
+
+            # The dispatch-failure budget, read off project_monitor's own counter --
+            # see the docstring. history[:-1] is everything before the record being
+            # rewritten (the trailing 'success' this method exists to turn over, which
+            # would otherwise end the run at zero every time), and +1 is the failure
+            # about to be appended to that run. Refusing at the budget rather than one
+            # short of it is deliberate: >= is the same comparison project_monitor
+            # makes, so this declines exactly the rewrite that would trip mark_failed()
+            # -- NOT a plain release, the board's pipeline lock stays held and durably
+            # marked retained-due-to-failure until a human runs scripts/release_lock.py.
+            consecutive_failures = self._count_consecutive_failures_in(
+                state['execution_history'][:-1], column, agent
+            )
+            dispatch_budget = _dispatch_failure_budget()
+            if consecutive_failures + 1 >= dispatch_budget:
+                logger.warning(
+                    f"Watchdog: {project_name}/#{issue_number} produced no output for "
+                    f"'{agent}' in '{column}', but rewriting it would be dispatch "
+                    f"failure {consecutive_failures + 1} of {dispatch_budget} for that "
+                    f"pair -- declining, so the retry loop stops here instead of "
+                    f"retaining the board's pipeline lock"
+                )
                 return False
 
             # ALL PROTECTIONS PASSED - Safe to mark for retry
@@ -2781,10 +2901,17 @@ class WorkExecutionStateTracker:
                 and does its own, unsigned; its 50 live 'success' records arrive
                 under allowlisted trigger sources, and a redispatch of it re-creates
                 the sub-issues. See _WATCHDOG_UNATTRIBUTABLE_AGENTS.
-              - the WRITER of the outcome. _apply_redis_result() marks a record
-                'success' from an exit_code recovered out of Redis, on a path that
-                never posts to GitHub at all; those records are stamped
-                outcome_recovered_from_redis and declined here.
+              - the WRITER of the outcome. Two writers mark a record 'success' from
+                an exit code alone, on paths that never post to GitHub at all:
+                _apply_redis_result(), from a payload recovered out of Redis, and
+                docker_runner._process_recovered_pr_review_phase_completion(), which
+                checkpoints a recovered PR-review phase and re-triggers the stage.
+                Those are stamped outcome_recovered_from_redis and
+                outcome_recovered_without_post respectively, and both are declined
+                here. Any future writer that finalizes a record without posting
+                belongs on this axis too: pass github_post_attempted=False to
+                record_execution_outcome() rather than relying on one of the other
+                two axes to happen to cover it.
 
         Args:
             project_name: Project name
@@ -2838,7 +2965,8 @@ class WorkExecutionStateTracker:
                 )
                 return True
 
-            if execution.get('outcome_recovered_from_redis'):
+            if (execution.get('outcome_recovered_from_redis')
+                    or execution.get('outcome_recovered_without_post')):
                 # cleanup_stuck_in_progress_states() -> _apply_redis_result() turned
                 # this in_progress entry into a 'success' from an exit_code it found
                 # in Redis, on a record that keeps its real start timestamp and its
@@ -2848,9 +2976,18 @@ class WorkExecutionStateTracker:
                 # gate would answer "no output" correctly and redispatch a
                 # code-writing agent onto a branch it has already pushed commits to.
                 # Declined for the same reason every other "can't tell" is (#166).
+                #
+                # outcome_recovered_without_post is the same shape reached by a
+                # different writer: record_execution_outcome(github_post_attempted=
+                # False), used by docker_runner._process_recovered_pr_review_phase_
+                # completion, which finalizes a recovered phase container's record as
+                # 'success' under an allowlisted trigger_source ('pr_review_phase2' /
+                # 'pr_review_phase4'), with a real start timestamp and an agent that
+                # is not on the denylist -- and posts nothing, because it checkpoints
+                # the phase output and re-triggers the stage instead (#166 review).
                 logger.debug(
-                    f"Watchdog: {project_name}/#{issue_number}'s outcome was recovered from "
-                    f"Redis, so no GitHub post was ever attempted on this path "
+                    f"Watchdog: {project_name}/#{issue_number}'s outcome was recorded on a "
+                    f"path that never attempts a GitHub post "
                     f"-- leaving the record alone"
                 )
                 return True

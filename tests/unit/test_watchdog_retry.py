@@ -1023,6 +1023,35 @@ class TestGitHubOutputVerification:
 
         gh_client.rest.assert_not_called()
 
+    def test_an_outcome_recorded_without_a_github_post_is_never_verified(self, tracker):
+        """The fourth shape on the writer axis (#166 review), and the one none of
+        the other three guards caught.
+
+        docker_runner._process_recovered_pr_review_phase_completion() finalizes a
+        recovered PR-review phase container's record as 'success' from its exit code
+        alone: it checkpoints the phase output and re-triggers the stage, and never
+        calls _complete_agent_execution, so nothing is posted. The record it closes
+        was written by pr_review_stage with trigger_source 'pr_review_phase4' -- ON
+        the allowlist -- a real start timestamp, no start_time_unknown, and
+        pr_review_agent, which is not on the agent denylist. Its re-trigger can
+        legitimately dispatch nothing (a closed issue, a retained lock, another issue
+        ahead of it in the queue), and in exactly that state no comment lands after
+        the anchor: the gate would rewrite the record and project_monitor would burn
+        a fresh PR review cycle on it."""
+        gh_client = MagicMock()
+        with self._gate_environment(gh_client):
+            assert tracker._has_github_output(
+                'test-project', 123,
+                self._execution(
+                    agent='pr_review_agent',
+                    column='In Review',
+                    trigger_source='pr_review_phase4',
+                    outcome_recovered_without_post=True,
+                )
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
     # -- where the gate looks ---------------------------------------------
 
     def test_an_unresolvable_workspace_is_never_verified(self, tracker):
@@ -3643,15 +3672,23 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
         assert self._run(tracker, should_retry=lambda *a, **k: next(answers)) == 0
         assert self._outcome(state_file) == 'success'
 
-    def test_the_eligibility_recheck_runs_with_no_state_file_lock_held(
+    def test_every_eligibility_check_runs_with_no_state_file_lock_held(
         self, tracker, temp_state_dir
     ):
-        """_should_retry_failed_execution() makes its own GraphQL call, and holding
-        this issue's flock across a GitHub call is the whole thing the two-phase
-        split exists to avoid -- every record_execution_start()/outcome() for the
-        issue queues behind it, several from async callers on the event loop. flock
-        is per open-file-description, so a second fd in this same process proves it:
-        it would fail to take the lock if the rewrite pass were holding it."""
+        """REGRESSION (#166 review): the collection pass called PROTECTION 4 from
+        INSIDE `with file_lock(lock_file):`, so on every single production record
+        the sweep held that issue's flock across a `gh api graphql` issue-state
+        query (30s rate-limit sleeps, a 30s subprocess timeout, a 2/4/8s retry
+        ladder) plus get_active_pipeline_run(), which falls through to an
+        Elasticsearch search on the normal Redis mapping miss. Every
+        record_execution_start()/record_execution_outcome() for that issue queues
+        behind that lock, several of them from async callers on the event loop --
+        an unexplained polling stall, not an error. Only the rewrite pass's re-check
+        was lock-free, and the comments asserted the invariant held for both.
+
+        flock is per open-file-description, so a second fd in this same process
+        proves it: it would fail to take the lock if either caller were holding
+        it."""
         import fcntl
 
         state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
@@ -3669,16 +3706,14 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
             finally:
                 os.close(fd)
 
-        calls = []
-
         def _answer(*args, **kwargs):
-            calls.append(1)
-            if len(calls) == 2:  # the rewrite pass's re-check
-                held_during.append(_lock_is_taken())
+            held_during.append(_lock_is_taken())
             return (True, 'eligible')
 
         assert self._run(tracker, should_retry=_answer) == 1
-        assert held_during == [False]
+        # Two calls -- the verification pass's check and the rewrite's re-check --
+        # and neither of them under the lock.
+        assert held_during == [False, False]
 
 
 class TestTheWatchdogBudgetStaysBelowTheDispatchBudget:
@@ -3712,11 +3747,47 @@ class TestTheWatchdogBudgetStaysBelowTheDispatchBudget:
         with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': '1'}):
             assert _watchdog_max_retries() == 1
 
+    @pytest.mark.parametrize('configured', ['0', '-1'])
+    def test_zero_still_turns_the_retry_off(self, configured):
+        """REGRESSION (#166 review): the clamp was max(1, min(configured, ceiling)),
+        so its floor rewrote values BELOW the default as well as above it.
+        WATCHDOG_MAX_RETRIES=0 is the kill switch -- a fresh record's
+        watchdog_retry_count of 0 is already at the limit, so Check 1 refuses every
+        rewrite -- and it is the obvious thing an operator reaches for when the
+        activated gate starts rewriting records it shouldn't. Clamping it to 1
+        silently re-enabled one rewrite and one redispatch per eligible record. Only
+        the ceiling is a hard invariant; a smaller number satisfies it a fortiori."""
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': configured}):
+            assert _watchdog_max_retries() == 0
+
     def test_an_unparseable_override_falls_back_rather_than_raising(self):
         from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES
 
         with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': 'three'}):
             assert 1 <= _watchdog_max_retries() < MAX_CONSECUTIVE_DISPATCH_FAILURES
+
+    def test_zero_actually_refuses_a_fresh_records_first_rewrite(self, tmp_path):
+        """The end of the kill switch that matters: not the clamp's return value but
+        PROTECTION 4 refusing a record that has never been retried. A fresh record's
+        watchdog_retry_count is 0, so 0 >= 0 has to bind -- that is the whole
+        mechanism by which WATCHDOG_MAX_RETRIES=0 disables the retry, and it is what
+        clamping the value up to 1 quietly undid."""
+        tracker = WorkExecutionStateTracker(state_dir=tmp_path)
+        execution = {
+            'agent': 'test-agent', 'column': 'In Progress', 'outcome': 'success',
+            'timestamp': _ANCHOR, 'trigger_source': 'board_dispatch',
+        }
+
+        with patch.dict(os.environ, {'WATCHDOG_MAX_RETRIES': '0'}), \
+             patch('services.github_api_client.get_github_client') as get_client:
+            should_retry, reason = tracker._should_retry_failed_execution(
+                'test-project', 123, 'test-agent', 'In Progress', execution
+            )
+
+        assert should_retry is False
+        assert 'max_retries_exceeded' in reason
+        # And it costs nothing: Check 1 short-circuits before the issue-state query.
+        get_client.assert_not_called()
 
 
 class TestWatchdogRetryBudgetSurvivesTheRedispatch:
@@ -3836,6 +3907,42 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
 
         assert self._last(tracker)['watchdog_retry_count'] == 2
 
+    def test_the_count_survives_an_intervening_genuine_dispatch_failure(self, tracker):
+        """REGRESSION (#166 review): the carry was conditioned on the previous
+        record's watchdog_retry_triggered, which _rewrite_verified_empty_execution()
+        stamps only on the record IT rewrote. So one genuine dispatch failure landing
+        between two watchdog rewrites reset the carried budget to zero while
+        count_consecutive_failures() -- which counts every trailing 'failure' for the
+        pair, whoever wrote it -- kept climbing. The budget was bounding a different
+        number from the one project_monitor escalates on.
+
+        A 'success' is still the run terminator, the same one
+        count_consecutive_failures() uses; nothing else clears it."""
+        def _start():
+            tracker.record_execution_start(
+                issue_number=123, column='In Progress', agent='test-agent',
+                trigger_source='board_dispatch', project_name='test-project',
+            )
+
+        def _end(**fields):
+            state = tracker.load_state('test-project', 123)
+            state['execution_history'][-1].update(fields)
+            tracker.save_state('test-project', 123, state)
+
+        # A watchdog rewrite...
+        _start()
+        _end(outcome='failure', watchdog_retry_triggered=True, watchdog_retry_count=1)
+
+        # ...then the redispatch it invited fails for an ordinary reason. The record
+        # carries the budget but not the watchdog's own flag.
+        _start()
+        assert self._last(tracker)['watchdog_retry_count'] == 1
+        _end(outcome='failure', error='container exited 1')
+
+        # The next dispatch still inherits it.
+        _start()
+        assert self._last(tracker)['watchdog_retry_count'] == 1
+
     def test_the_budget_is_exhausted_before_the_dispatch_failure_budget(self, tracker):
         """The end-to-end guarantee the budget is supposed to give: sweep,
         redispatch, sweep, redispatch -- and the third sweep refuses, one rewrite
@@ -3935,6 +4042,164 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
         assert len(failures) < MAX_CONSECUTIVE_DISPATCH_FAILURES
 
 
+class TestTheRewriteStopsShortOfTheDispatchFailureBudget:
+    """#166 review: the watchdog's private budget does not bound mark_failed().
+
+    _should_retry_failed_execution()'s Check 1 counts only the watchdog's OWN
+    rewrites, while count_consecutive_failures() counts every trailing 'failure' for
+    the (column, agent) whoever wrote it. Genuine dispatch failures already sitting
+    in the trailing run are therefore added to the watchdog's, and two rewrites can
+    still take the pair to MAX_CONSECUTIVE_DISPATCH_FAILURES -- whose terminal state
+    is mark_failed(): NOT a plain release, the board's pipeline lock stays held and
+    durably marked retained-due-to-failure, blocking every sibling issue on that
+    board until a human runs scripts/release_lock.py.
+
+    So the last check before the write reads the counter that actually drives the
+    escalation, off the history already in hand.
+    """
+
+    @pytest.fixture
+    def temp_state_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture
+    def tracker(self, temp_state_dir):
+        return WorkExecutionStateTracker(state_dir=temp_state_dir)
+
+    @staticmethod
+    def _write(tracker, preceding_outcomes):
+        """A state file whose last record is the verified-empty 'success', preceded
+        by `preceding_outcomes` for the same (column, agent).
+
+        Named through get_state_file(), not hand-spelled, so count_consecutive_
+        failures() reads back the same file the sweep rewrote."""
+        history = [
+            {
+                'agent': 'test-agent',
+                'column': 'In Progress',
+                'outcome': outcome,
+                'timestamp': _iso(minutes_ago=120 - i),
+                'board_name': 'SDLC Execution',
+            }
+            for i, outcome in enumerate(preceding_outcomes)
+        ]
+        history.append({
+            'agent': 'test-agent',
+            'column': 'In Progress',
+            'outcome': 'success',
+            'completed_at': _EXAMINABLE_COMPLETED_AT,
+            'timestamp': _EXAMINABLE_TIMESTAMP,
+            'board_name': 'SDLC Execution',
+        })
+        state_file = tracker.get_state_file('test-project', 123)
+        with open(state_file, 'w') as f:
+            yaml.dump({
+                'project_name': 'test-project',
+                'issue_number': 123,
+                'execution_history': history,
+            }, f)
+        return state_file
+
+    @staticmethod
+    def _run(tracker):
+        lock_manager = MagicMock()
+        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        queue_manager = MagicMock()
+        queue_manager.get_issue_status.return_value = None
+        pipeline_cfg = MagicMock()
+        pipeline_cfg.board_name = 'SDLC Execution'
+        project_config = MagicMock()
+        project_config.pipelines = [pipeline_cfg]
+
+        with patch.object(tracker, '_should_retry_failed_execution',
+                          return_value=(True, 'eligible')), \
+             patch.object(tracker, '_has_github_output', return_value=False), \
+             patch('config.manager.config_manager') as mock_config_manager, \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+                   return_value=lock_manager), \
+             patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
+                   return_value=queue_manager):
+            mock_config_manager.get_project_config.return_value = project_config
+            return tracker.detect_and_retry_empty_successful_executions()
+
+    @staticmethod
+    def _outcome(state_file):
+        with open(state_file) as f:
+            return yaml.safe_load(f)['execution_history'][-1]['outcome']
+
+    def test_a_clean_run_is_still_rewritten(self, tracker):
+        """Control: nothing trailing, so this rewrite is dispatch failure 1 of 3."""
+        state_file = self._write(tracker, [])
+
+        assert self._run(tracker) == 1
+        assert self._outcome(state_file) == 'failure'
+
+    def test_one_preceding_failure_still_leaves_room(self, tracker):
+        state_file = self._write(tracker, ['failure'])
+
+        assert self._run(tracker) == 1
+        assert self._outcome(state_file) == 'failure'
+        assert tracker.count_consecutive_failures(
+            'test-project', 123, 'In Progress', 'test-agent'
+        ) == MAX_CONSECUTIVE_DISPATCH_FAILURES - 1
+
+    def test_the_rewrite_that_would_trip_mark_failed_is_declined(
+        self, tracker, caplog
+    ):
+        """Two genuine dispatch failures already trailing: rewriting would make three
+        consecutive, which is exactly what project_monitor escalates on. The private
+        budget cannot see them -- neither carries watchdog_retry_count."""
+        state_file = self._write(tracker, ['failure', 'failure'])
+
+        with caplog.at_level(logging.WARNING):
+            assert self._run(tracker) == 0
+
+        assert self._outcome(state_file) == 'success'
+        assert tracker.count_consecutive_failures(
+            'test-project', 123, 'In Progress', 'test-agent'
+        ) < MAX_CONSECUTIVE_DISPATCH_FAILURES
+        assert any('declining' in r.message for r in caplog.records), (
+            "the refusal has to say so -- a silent decline is the failure mode this "
+            "whole gate was split out of #150 to stop repeating"
+        )
+
+    def test_a_lock_contention_in_the_run_is_transparent(self, tracker):
+        """count_consecutive_failures() skips 'lock_contention' rather than ending
+        the run on it, and this check reads the same counter -- so contention neither
+        buys the watchdog another rewrite nor costs it one."""
+        state_file = self._write(tracker, ['failure', 'lock_contention', 'failure'])
+
+        assert self._run(tracker) == 0
+        assert self._outcome(state_file) == 'success'
+
+    def test_a_success_in_the_run_resets_it(self, tracker):
+        """...and every other outcome still ends the run, so older failures beyond a
+        completed execution do not count against this rewrite."""
+        state_file = self._write(tracker, ['failure', 'failure', 'success'])
+
+        assert self._run(tracker) == 1
+        assert self._outcome(state_file) == 'failure'
+
+    def test_another_agents_failures_do_not_count(self, tracker):
+        """The counter is per (column, agent), so an unrelated agent's failures on
+        the same issue are not this pair's run."""
+        state_file = self._write(tracker, [])
+        with open(state_file) as f:
+            state = yaml.safe_load(f)
+        state['execution_history'][:0] = [
+            {'agent': 'other-agent', 'column': 'In Progress', 'outcome': 'failure',
+             'timestamp': _iso(minutes_ago=200)},
+            {'agent': 'other-agent', 'column': 'In Progress', 'outcome': 'failure',
+             'timestamp': _iso(minutes_ago=199)},
+        ]
+        with open(state_file, 'w') as f:
+            yaml.dump(state, f)
+
+        assert self._run(tracker) == 1
+        assert self._outcome(state_file) == 'failure'
+
+
 class TestRedisRecoveredOutcomesAreMarked:
     """_apply_redis_result()'s records, the third writer of outcome='success'."""
 
@@ -3987,3 +4252,118 @@ class TestRedisRecoveredOutcomesAreMarked:
         assert applied is False
         assert execution['outcome'] == 'in_progress'
         assert 'outcome_recovered_from_redis' not in execution
+
+
+class TestOutcomesRecordedWithoutAGitHubPostAreMarked:
+    """record_execution_outcome(github_post_attempted=False), the fourth writer of
+    outcome='success' on a path that posts nothing (#166 review)."""
+
+    @pytest.fixture
+    def tracker(self, tmp_path):
+        return WorkExecutionStateTracker(state_dir=tmp_path)
+
+    @staticmethod
+    def _last(tracker):
+        return tracker.load_state('test-project', 123)['execution_history'][-1]
+
+    def test_the_default_leaves_an_ordinary_record_verifiable(self, tracker):
+        """Every other caller reaches record_execution_outcome() through a completion
+        path that posts first, so the flag must not appear unasked -- stamping it by
+        default would silently switch the whole gate off."""
+        tracker.record_execution_start(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            trigger_source='pr_review_phase4', project_name='test-project',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            outcome='success', project_name='test-project',
+        )
+
+        assert 'outcome_recovered_without_post' not in self._last(tracker)
+
+    def test_the_flag_is_stamped_on_the_finalized_record(self, tracker):
+        tracker.record_execution_start(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            trigger_source='pr_review_phase4', project_name='test-project',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            outcome='success', project_name='test-project',
+            github_post_attempted=False,
+        )
+
+        last = self._last(tracker)
+        assert last['outcome'] == 'success'
+        assert last['outcome_recovered_without_post'] is True
+
+    def test_the_stamped_record_is_declined_by_the_gate(self, tracker):
+        """End to end: the record this path writes carries an allowlisted
+        trigger_source, a real start anchor and an agent that is not on the denylist,
+        so the flag is the only thing standing between it and a rewrite."""
+        tracker.record_execution_start(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            trigger_source='pr_review_phase4', project_name='test-project',
+        )
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            outcome='success', project_name='test-project',
+            github_post_attempted=False,
+        )
+
+        gh_client = MagicMock()
+        state_manager = MagicMock()
+        state_manager.get_discussion_for_issue_checked.return_value = (None, True)
+        with patch('services.github_api_client.get_github_client', return_value=gh_client), \
+             patch('config.manager.config_manager.get_project_config') as mock_config, \
+             patch('claude.docker_runner.resolve_workspace_type_for_column_strict',
+                   return_value='issues'), \
+             patch('config.state_manager.state_manager', state_manager):
+            mock_config.return_value = ProjectConfig(
+                name='test-project', description='test',
+                github={'org': 'test-org', 'repo': 'test-repo'},
+                tech_stacks={}, pipelines=[], pipeline_routing={},
+            )
+            assert tracker._has_github_output(
+                'test-project', 123, self._last(tracker)
+            ) is True
+
+        gh_client.rest.assert_not_called()
+
+    def test_the_crash_recovery_record_carries_it_too(self, tracker):
+        """No in_progress entry to finalize, so the synthesised record is the one
+        that has to say it."""
+        tracker.record_execution_outcome(
+            issue_number=123, column='In Review', agent='pr_review_agent',
+            outcome='success', project_name='test-project',
+            github_post_attempted=False,
+        )
+
+        assert self._last(tracker)['outcome_recovered_without_post'] is True
+
+    def test_the_recovered_pr_review_phase_path_passes_it(self):
+        """The one production caller. Pinned by name because the docstring's
+        enumeration in _has_github_output() is what a future reader will trust, and
+        this is the shape it now claims is covered."""
+        from claude.docker_runner import DockerAgentRunner
+
+        tracker = MagicMock()
+        with patch('pipeline.pr_review_checkpoint.PRReviewCheckpoint') as checkpoint, \
+             patch('services.work_execution_state.work_execution_tracker', tracker), \
+             patch('config.manager.config_manager') as mock_config_manager:
+            checkpoint.return_value.save_phase_output.return_value = True
+            mock_config_manager.get_project_config.return_value = None
+            DockerAgentRunner._process_recovered_pr_review_phase_completion(
+                MagicMock(),
+                project='test-project',
+                issue_number=123,
+                agent='pr_review_agent',
+                column='In Review',
+                exit_code=0,
+                output='phase output',
+                pr_review_phase='phase4',
+                pr_review_cycle='1',
+            )
+
+        assert tracker.record_execution_outcome.call_args.kwargs[
+            'github_post_attempted'
+        ] is False

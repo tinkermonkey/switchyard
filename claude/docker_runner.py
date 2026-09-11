@@ -3653,6 +3653,16 @@ class DockerAgentRunner:
         try:
             from services.work_execution_state import work_execution_tracker
             if column != 'unknown':
+                # github_post_attempted=False: this path checkpoints the phase output
+                # and re-triggers the stage, it never calls _complete_agent_execution
+                # and posts nothing (#166 review). The record it finalizes otherwise
+                # looks exactly like an ordinary verifiable one to the empty-output
+                # watchdog -- an allowlisted trigger_source ('pr_review_phase2' /
+                # 'pr_review_phase4'), a real start timestamp, an agent that does not
+                # own its own posting -- so without the flag a re-trigger that
+                # legitimately does not dispatch (see the returned-None case below)
+                # leaves a 'success' with no agent comment after it, which the gate
+                # reads as "verified empty" and rewrites into a fresh PR review cycle.
                 work_execution_tracker.record_execution_outcome(
                     issue_number=issue_number,
                     column=column,
@@ -3660,6 +3670,7 @@ class DockerAgentRunner:
                     outcome='success' if exit_code == 0 else 'failed',
                     project_name=project,
                     error=None if exit_code == 0 else f"Container exited with code {exit_code}",
+                    github_post_attempted=False,
                 )
             else:
                 # Not a no-op: this phase's own in_progress execution_history entry
