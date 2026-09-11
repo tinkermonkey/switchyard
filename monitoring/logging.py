@@ -26,8 +26,11 @@ class OrchestratorLogger:
         self.logger.addHandler(console_handler)
 
         # File handler for audit trail - now in orchestrator_data/logs
-        file_handler = logging.FileHandler(log_dir / f'{name}_orchestrator.log')
-        file_handler.setFormatter(formatter)
+        from monitoring.log_rotation import rotating_file_handler
+        file_handler = rotating_file_handler(
+            log_dir / f'{name}_orchestrator.log',
+            formatter=formatter,
+        )
         self.logger.addHandler(file_handler)
     
     def log_agent_start(self, agent: str, task_id: str, context: dict):

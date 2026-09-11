@@ -47,6 +47,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 
     environment:
+      # Data retention: ONE window for every Elasticsearch ILM policy and every
+      # filesystem sweep (config/retention.py). Every service that PUTs an ILM
+      # policy must see the same value -- log-collector owns agent-logs and
+      # claude-otel, the orchestrator owns the rest, and two different values
+      # would recreate exactly the split-brain this change replaced.
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - LOG_MAX_BYTES=${LOG_MAX_BYTES:-268435456}
+      - LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-3}
+      - CHECKOUT_LOG_MAX_BYTES=${CHECKOUT_LOG_MAX_BYTES:-16777216}
+      - CHECKOUT_LOG_BACKUP_COUNT=${CHECKOUT_LOG_BACKUP_COUNT:-1}
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITHUB_APP_ID=${GITHUB_APP_ID}
       - GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID}
@@ -105,6 +115,16 @@ services:
       - ..:/workspace  # Mount workspace read-write for Advisor agent execution
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      # Data retention: ONE window for every Elasticsearch ILM policy and every
+      # filesystem sweep (config/retention.py). Every service that PUTs an ILM
+      # policy must see the same value -- log-collector owns agent-logs and
+      # claude-otel, the orchestrator owns the rest, and two different values
+      # would recreate exactly the split-brain this change replaced.
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - LOG_MAX_BYTES=${LOG_MAX_BYTES:-268435456}
+      - LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-3}
+      - CHECKOUT_LOG_MAX_BYTES=${CHECKOUT_LOG_MAX_BYTES:-16777216}
+      - CHECKOUT_LOG_BACKUP_COUNT=${CHECKOUT_LOG_BACKUP_COUNT:-1}
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITHUB_APP_ID=${GITHUB_APP_ID}
@@ -141,6 +161,16 @@ services:
     volumes:
       - ./:/app
     environment:
+      # Data retention: ONE window for every Elasticsearch ILM policy and every
+      # filesystem sweep (config/retention.py). Every service that PUTs an ILM
+      # policy must see the same value -- log-collector owns agent-logs and
+      # claude-otel, the orchestrator owns the rest, and two different values
+      # would recreate exactly the split-brain this change replaced.
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - LOG_MAX_BYTES=${LOG_MAX_BYTES:-268435456}
+      - LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-3}
+      - CHECKOUT_LOG_MAX_BYTES=${CHECKOUT_LOG_MAX_BYTES:-16777216}
+      - CHECKOUT_LOG_BACKUP_COUNT=${CHECKOUT_LOG_BACKUP_COUNT:-1}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
@@ -206,6 +236,16 @@ services:
     volumes:
       - ./:/app
     environment:
+      # Data retention: ONE window for every Elasticsearch ILM policy and every
+      # filesystem sweep (config/retention.py). Every service that PUTs an ILM
+      # policy must see the same value -- log-collector owns agent-logs and
+      # claude-otel, the orchestrator owns the rest, and two different values
+      # would recreate exactly the split-brain this change replaced.
+      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+      - LOG_MAX_BYTES=${LOG_MAX_BYTES:-268435456}
+      - LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-3}
+      - CHECKOUT_LOG_MAX_BYTES=${CHECKOUT_LOG_MAX_BYTES:-16777216}
+      - CHECKOUT_LOG_BACKUP_COUNT=${CHECKOUT_LOG_BACKUP_COUNT:-1}
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITHUB_APP_ID=${GITHUB_APP_ID}

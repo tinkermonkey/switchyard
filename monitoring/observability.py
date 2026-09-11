@@ -14,6 +14,7 @@ from enum import Enum
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.timestamp_utils import utc_now, utc_isoformat
+from config.retention import RETENTION_DAYS, build_ilm_policy
 
 logger = logging.getLogger(__name__)
 
@@ -49,37 +50,13 @@ def es_index_with_retry(es, index: str, document: dict, doc_id=None, max_retries
     raise last_exc
 
 
-# ILM Policy for decision events (7-day retention)
-DECISION_EVENTS_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {
-                    "set_priority": {
-                        "priority": 100
-                    }
-                }
-            },
-            "warm": {
-                "min_age": "3d",
-                "actions": {
-                    "set_priority": {
-                        "priority": 50
-                    }
-                }
-            },
-            "delete": {
-                "min_age": "7d",
-                "actions": {
-                    "delete": {
-                        "delete_searchable_snapshot": True
-                    }
-                }
-            }
-        }
-    }
-}
+# ILM Policy for decision-events-%Y-%m-%d (daily indices).
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+DECISION_EVENTS_ILM_POLICY = build_ilm_policy()
 
 # Index template for decision events
 DECISION_EVENTS_TEMPLATE = {
@@ -422,12 +399,15 @@ class ObservabilityManager:
             return False
 
         try:
-            # Create ILM policy for decision events (7-day retention)
+            # Create/update the ILM policy for decision events
             self.es.ilm.put_lifecycle(
                 name="decision-events-ilm-policy",
                 body=DECISION_EVENTS_ILM_POLICY
             )
-            logger.info("Created/updated ILM policy: decision-events-ilm-policy (7-day retention)")
+            logger.info(
+                f"Created/updated ILM policy: decision-events-ilm-policy "
+                f"({RETENTION_DAYS}-day retention)"
+            )
 
             # Create index template for decision events
             self.es.indices.put_index_template(

@@ -36,11 +36,20 @@ from elasticsearch import Elasticsearch
 # Ensure the project root is on the path when run directly
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from config.retention import RETENTION_DAYS  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 RECORDS_INDEX = "orchestrator-test-cycle-records-*"
 STATS_INDEX = "orchestrator-test-cycle-stats"
-DEFAULT_LOOKBACK_DAYS = 180
+# Bounded by what orchestrator-test-cycle-records-* actually still holds. It
+# used to be a hand-written 180 matching a hand-written 180-day ILM window;
+# both now come from config/retention.py, so the rollup cannot quietly compute
+# its statistics over a window most of which was deleted. _upsert_stats()
+# REPLACES each {project}_{test_type} document rather than accumulating, so a
+# lookback longer than retention does not preserve an older sample -- it just
+# overwrites a good one with a thinner one.
+DEFAULT_LOOKBACK_DAYS = RETENTION_DAYS
 # ─── Statistics helpers ───────────────────────────────────────────────────────
 
 def _percentile(sorted_values: list[float], pct: float) -> float:

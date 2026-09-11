@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 from monitoring.observability import es_index_with_retry
+from config.retention import build_ilm_policy
 
 logger = logging.getLogger(__name__)
 
@@ -24,37 +25,13 @@ logger = logging.getLogger(__name__)
 # free outcome away and pushed the container onto the in-flight path instead.
 _COMMIT_JOIN_FLOOR_SECONDS = 60.0
 
-# ILM Policy for repair cycle recovery metrics (7-day retention)
-REPAIR_CYCLE_RECOVERY_ILM_POLICY = {
-    "policy": {
-        "phases": {
-            "hot": {
-                "min_age": "0ms",
-                "actions": {
-                    "set_priority": {
-                        "priority": 100
-                    }
-                }
-            },
-            "warm": {
-                "min_age": "3d",
-                "actions": {
-                    "set_priority": {
-                        "priority": 50
-                    }
-                }
-            },
-            "delete": {
-                "min_age": "7d",
-                "actions": {
-                    "delete": {
-                        "delete_searchable_snapshot": True
-                    }
-                }
-            }
-        }
-    }
-}
+# ILM Policy for repair-cycle-recovery-%Y.%m.%d (daily indices).
+# Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
+# by default), so Elasticsearch and the filesystem sweep in
+# services/data_retention.py cannot disagree -- and a change takes effect on data
+# that already exists, because ILM re-reads a policy rather than stamping it onto
+# an index at creation. See config/retention.py for what this replaced.
+REPAIR_CYCLE_RECOVERY_ILM_POLICY = build_ilm_policy()
 
 # Index template for repair cycle recovery metrics
 REPAIR_CYCLE_RECOVERY_TEMPLATE = {

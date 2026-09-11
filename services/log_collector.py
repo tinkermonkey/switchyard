@@ -26,6 +26,7 @@ from services.pattern_detection_schema import (
     get_index_name,
     enrich_claude_log,
 )
+from config.retention import RETENTION_DAYS
 from services.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
@@ -111,12 +112,15 @@ class LogCollector:
         logger.info("Setting up Elasticsearch indices...")
 
         try:
-            # Create ILM policy for agent logs (7-day retention)
+            # Create/update the ILM policy for agent logs
             self.es.ilm.put_lifecycle(
                 name="agent-logs-ilm-policy",
                 body=AGENT_LOGS_ILM_POLICY
             )
-            logger.info("Created ILM policy: agent-logs-ilm-policy (14-day retention)")
+            logger.info(
+                f"Created/updated ILM policy: agent-logs-ilm-policy "
+                f"({RETENTION_DAYS}-day retention)"
+            )
             
             # Create index templates for both new indices
             self.es.indices.put_index_template(
@@ -143,7 +147,10 @@ class LogCollector:
                 name="claude-otel-ilm-policy",
                 body=CLAUDE_OTEL_ILM_POLICY
             )
-            logger.info("Created ILM policy: claude-otel-ilm-policy (14-day retention)")
+            logger.info(
+                f"Created/updated ILM policy: claude-otel-ilm-policy "
+                f"({RETENTION_DAYS}-day retention)"
+            )
 
             self.es.indices.put_index_template(
                 name="claude-otel-logs-ilm",
