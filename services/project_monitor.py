@@ -462,6 +462,21 @@ def _launch_repair_cycle_container(
             '-e', f'CLAUDE_CODE_OAUTH_TOKEN={env.claude_code_oauth_token.get_secret_value() if env.claude_code_oauth_token else ""}',
             '-e', f'GITHUB_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',
             '-e', f'GH_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',  # For gh CLI
+            # GITHUB_ORG (#188). This container runs real GitHub writes -- every
+            # inner agent run's output comment is posted from inside it -- and
+            # GitHubIntegration resolved its owner from this variable alone.
+            # Omitting it made every one of those calls address
+            # `/repos/None/<repo>/...`, so a repair cycle's agent output went
+            # nowhere and left no trace, since this container is --rm and its
+            # logs are discarded. GitHubIntegration now prefers the owner passed
+            # from project config, which is the actual fix; this is passed
+            # through as well because it is the documented way to configure the
+            # org and other code in this container (services/project_manager.py's
+            # project discovery) still reads it directly. Forwarded from the
+            # orchestrator's own environment rather than derived from any one
+            # project's config: the variable is global by definition, and this
+            # container is scoped to a single project whose org may not be it.
+            '-e', f'GITHUB_ORG={os.environ.get("GITHUB_ORG", "")}',
             '-e', f'HOST_WORKSPACE_PATH={host_workspace_path}',  # Pass host workspace path for Docker-in-Docker
             '-e', f'HOST_HOME={host_home_path}',  # Pass host home for SSH/git mounts
             '-e', 'PYTHONUNBUFFERED=1',  # Ensure logs are flushed

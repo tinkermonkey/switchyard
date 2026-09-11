@@ -676,6 +676,32 @@ async def main():
             logger.log_error(f"Failed to reconcile project '{project_name}' - GitHub project management is not working")
             failure_count += 1
 
+    # Report project state directories no config claims (#175's siblings).
+    #
+    # Reported, never removed: see GitHubStateManager.list_orphaned_project_state
+    # for why removal is an operator decision. This exists because the two found
+    # on the live deployment had been there for six months and nine months
+    # respectively with nothing anywhere that would have mentioned them --
+    # they surfaced only because someone happened to list the directory.
+    #
+    # Not fatal, and deliberately outside the reconcile loop's failure
+    # accounting: an orphaned directory is inert. Nothing reads a project's
+    # state except calls made for that project by name, and no such call is
+    # made for a project that has no config.
+    try:
+        orphaned_state = github_state_manager.list_orphaned_project_state()
+        if orphaned_state:
+            logger.log_warning(
+                f"{len(orphaned_state)} project state director"
+                f"{'y has' if len(orphaned_state) == 1 else 'ies have'} no "
+                f"matching config in config/projects/: "
+                f"{', '.join(orphaned_state)}. Nothing reads them and nothing "
+                f"will remove them. Inspect with "
+                f"`python scripts/inspect_project_state.py`."
+            )
+    except Exception as e:
+        logger.log_warning(f"Could not check for orphaned project state: {e}")
+
     # If all of the projects failed to reconcile, exit
     if failure_count == len(projects) and failure_count > 0:
         logger.log_error("All projects failed to reconcile - GitHub project management is not working")

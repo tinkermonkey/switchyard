@@ -21,6 +21,22 @@ from .manager import ConfigManager, ProjectConfig, WorkflowTemplate
 
 logger = logging.getLogger(__name__)
 
+# Backup retention is NOT declared here, and as of this branch is not applied
+# anywhere: state backups accumulate. The rule that will age them out is
+# age-based, comes from config/retention.py's single RETENTION_DAYS value, and
+# is applied by the nightly sweep in services/data_retention.py -- the same
+# window every Elasticsearch ILM policy uses. None of those three files exist
+# in this branch; they arrive with that change. Until then this is a known,
+# bounded cost (31MB at the time of writing) that scripts/inspect_project_state.py
+# reports so it stays visible.
+#
+# An earlier version of this bounded backups by COUNT ("keep the 10 newest"),
+# which is not aging: ten backups is four days on a busy project and nine
+# months on a quiet one, and it would have deleted backups from inside the
+# retention window that the sweep intends to keep. Two mechanisms with two
+# different answers for the same files is exactly the situation the single
+# value exists to remove.
+
 
 @dataclass
 class GitHubColumn:
@@ -472,7 +488,12 @@ class GitHubStateManager:
             logger.info(f"Cleaned up state for project {project_name}")
 
     def backup_state(self, project_name: str) -> str:
-        """Create a backup of project state and return backup path"""
+        """Create a backup of project state and return backup path.
+
+        Unbounded here on purpose: these are to be aged out by the shared
+        retention sweep (services/data_retention.py, a separate change not yet
+        in this branch), not pruned on write. See the note beside the imports.
+        """
         state_file = self._get_project_state_file(project_name)
         if not state_file.exists():
             return ""
@@ -484,6 +505,121 @@ class GitHubStateManager:
         shutil.copy2(state_file, backup_file)
         logger.info(f"Created state backup: {backup_file}")
         return str(backup_file)
+
+    def list_state_backups(self, project_name: str) -> List[Path]:
+        """This project's backups, newest first.
+
+        Ordered by the timestamp in the FILENAME, not by mtime: the files are
+        written with copy2, which preserves the source's mtime rather than
+        recording when the backup was taken, so every backup of an unchanged
+        state file carries the same mtime and mtime order says nothing about
+        backup order. The name is the only record of when each was made.
+        """
+        project_dir = self.projects_state_dir / project_name
+        if not project_dir.is_dir():
+            return []
+        return sorted(
+            project_dir.glob("github_state_backup_*.yaml"),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+
+    def list_orphaned_project_state(self) -> List[str]:
+        """Project state directories that no project config claims.
+
+        The answer to "what happens to a project's state when its config is
+        removed" is: nothing happens, and that is deliberate. A config can go
+        missing for reasons that are not a decommission -- an unmounted volume,
+        a half-finished rename, a file removed to pause a project for an
+        afternoon -- and github_state.yaml is the only local record of that
+        project's board and column node IDs. Deleting it costs a full
+        reconciliation against GitHub to rebuild, and reconciliation that
+        cannot see an existing board CREATES a duplicate of it.
+
+        So this reports and never removes. scripts/inspect_project_state.py is
+        the operator entry point that can remove, one project at a time, with
+        the name typed out.
+        """
+        if not self.projects_state_dir.exists():
+            return []
+
+        try:
+            stems = self.config_manager.list_projects()
+        except Exception as e:
+            # Without a trustworthy config list every directory looks orphaned,
+            # and reporting all of them is worse than reporting none.
+            logger.warning(
+                f"Could not list configured projects, skipping orphaned-state "
+                f"detection: {e}"
+            )
+            return []
+
+        if not stems:
+            # An empty config list is not "every project was decommissioned",
+            # it is "I cannot see the configs" -- and the two are
+            # indistinguishable from here. `config/projects/` is gitignored as
+            # a DIRECTORY, so every git worktree and every fresh checkout sees
+            # zero of them; so does a deployment whose config volume failed to
+            # mount. Reporting on that reading told an operator that all 20
+            # live projects were orphaned and printed a removal command for
+            # each, which is the single worst output this function can produce.
+            logger.warning(
+                "No project configs found at all, skipping orphaned-state "
+                "detection: an empty config/projects/ means the configs are "
+                "not visible from here (it is gitignored as a directory), not "
+                "that every project has been decommissioned."
+            )
+            return []
+
+        # A config's FILENAME and its declared project.name are two different
+        # strings that are merely usually equal, and the state directory is
+        # named after the declared name. Claiming a directory under both spellings
+        # is the safe direction: the cost of missing an orphan is a line of
+        # output nobody reads, and the cost of a false positive is an operator
+        # deleting the live board state of a project that is perfectly fine.
+        configured = set(stems)
+        for stem in stems:
+            try:
+                project_config = self.config_manager.get_project_config(stem)
+            except Exception as e:
+                # A config that will not parse is the STRONGEST evidence that
+                # this function does not know what is orphaned, so it suppresses
+                # the whole run rather than skipping the one config.
+                #
+                # Skipping it and carrying on looks harmless and is not. The
+                # loop exists because a config's filename stem and its declared
+                # project.name are two different strings, and the state
+                # directory is named after the DECLARED one. Drop the declared
+                # name for a config that failed to load and its live state
+                # directory is reported as orphaned, with a removal command
+                # printed under it -- and scripts/inspect_project_state.py's
+                # re-derivation at the point of deletion is no protection,
+                # because it calls this same function and inherits the same
+                # wrong answer. The result is `github_state.yaml`, the only
+                # local record of a project's board and column node IDs, deleted
+                # for a project that is perfectly fine.
+                #
+                # The failures that land here -- a truncated write, a YAML error
+                # mid-edit, a partially-mounted config volume, a permissions gap
+                # -- tend to hit several configs at once, so the blast radius is
+                # plural. This is the same reading as the empty-stems guard
+                # above: cannot see the configs, therefore cannot say.
+                logger.warning(
+                    f"Could not read project config '{stem}', skipping "
+                    f"orphaned-state detection: {e}. A config that cannot be "
+                    f"parsed cannot be shown to have been decommissioned, and "
+                    f"its state directory may be named after a declared "
+                    f"project.name this run is unable to read."
+                )
+                return []
+            declared = getattr(project_config, 'name', None)
+            if declared:
+                configured.add(declared)
+
+        return sorted(
+            d.name for d in self.projects_state_dir.iterdir()
+            if d.is_dir() and d.name not in configured
+        )
 
     def link_issue_to_discussion(self, project_name: str, issue_number: int, discussion_id: str):
         """Create bidirectional link between issue and discussion"""
