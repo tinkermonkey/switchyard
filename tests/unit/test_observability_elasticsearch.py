@@ -5,6 +5,9 @@ Tests that all event types are properly categorized and indexed to Elasticsearch
 This ensures that decision events and agent lifecycle events appear in the pipeline view.
 """
 
+import json
+import logging
+
 import pytest
 from unittest.mock import Mock, MagicMock, patch, call
 from datetime import datetime
@@ -24,6 +27,13 @@ class TestObservabilityElasticsearchIndexing:
         mock.xadd = Mock()
         mock.expire = Mock()
         mock.ping = Mock(return_value=True)
+        # llen must return a real int: _es_write()'s backup-buffer path does
+        # `if self.redis.llen(...) >= self._ES_BACKUP_MAX`, and on a bare Mock
+        # that comparison is a TypeError which the enclosing `except Exception`
+        # swallows -- so the buffer silently never receives anything and any
+        # test asserting on it is testing the fixture, not the code.
+        mock.llen = Mock(return_value=0)
+        mock.lpush = Mock()
         return mock
     
     @pytest.fixture
@@ -163,59 +173,25 @@ class TestObservabilityElasticsearchIndexing:
             assert obs_manager._is_agent_lifecycle_event(event_type), \
                 f"{event_type.value} should be an agent lifecycle event"
 
-    def test_all_event_types_are_categorized(self, obs_manager):
-        """Test that every EventType is either indexed or explicitly not indexed"""
-        all_event_types = list(EventType)
+    # test_all_event_types_are_categorized used to live here: a SECOND
+    # hand-maintained mirror of the same categorization, 750 lines above
+    # TestEventTypeCompleteness.test_all_event_types_have_tests. Deleted rather
+    # than repaired, because it was strictly subsumed by that one and was
+    # actively teaching the wrong answer.
+    #
+    # Its non_indexed_events list still contained every error that test's
+    # docstring describes as drift -- TASK_RECEIVED, PROMPT_CONSTRUCTED, the
+    # CLAUDE_API_CALL_*/CONTAINER_* eleven, PERFORMANCE_METRIC, TOKEN_USAGE,
+    # PIPELINE_RUN_* and REPAIR_CYCLE_CONTAINER_* -- all of which the code
+    # actually indexes. It never failed because its only assertion was
+    # `is_decision or is_lifecycle or is_non_indexed`, and everything on that
+    # wrong list satisfies one of the first two disjuncts. So the list was
+    # unfalsifiable, and it directly contradicted
+    # test_task_received_and_claude_api_are_lifecycle_events twelve lines above.
+    # It was also the copy a contributor adding an EventType was most likely to
+    # find first. (Its other assertion, `len(indexed_events) > 35`, was slack by
+    # a factor of three against the real 105.)
 
-        # Events that should be indexed
-        indexed_events = []
-
-        # Events that should not be indexed (transient/streaming events)
-        non_indexed_events = [
-            EventType.TASK_RECEIVED,
-            EventType.PROMPT_CONSTRUCTED,
-            EventType.CLAUDE_API_CALL_STARTED,
-            EventType.CLAUDE_API_CALL_COMPLETED,
-            EventType.CLAUDE_API_CALL_FAILED,
-            EventType.CONTAINER_LAUNCH_STARTED,
-            EventType.CONTAINER_LAUNCH_SUCCEEDED,
-            EventType.CONTAINER_LAUNCH_FAILED,
-            EventType.CONTAINER_EXECUTION_STARTED,
-            EventType.CONTAINER_EXECUTION_COMPLETED,
-            EventType.CONTAINER_EXECUTION_FAILED,
-            EventType.RESPONSE_CHUNK_RECEIVED,
-            EventType.RESPONSE_PROCESSING_STARTED,
-            EventType.RESPONSE_PROCESSING_COMPLETED,
-            EventType.TOOL_EXECUTION_STARTED,
-            EventType.TOOL_EXECUTION_COMPLETED,
-            EventType.PERFORMANCE_METRIC,
-            EventType.TOKEN_USAGE,
-            EventType.PIPELINE_RUN_STARTED,
-            EventType.PIPELINE_RUN_COMPLETED,
-            EventType.PIPELINE_RUN_FAILED,
-            EventType.REPAIR_CYCLE_CONTAINER_STARTED,
-            EventType.REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED,
-            EventType.REPAIR_CYCLE_CONTAINER_RECOVERED,
-            EventType.REPAIR_CYCLE_CONTAINER_KILLED,
-            EventType.REPAIR_CYCLE_CONTAINER_COMPLETED,
-        ]
-        
-        for event_type in all_event_types:
-            is_decision = obs_manager._is_decision_event(event_type)
-            is_lifecycle = obs_manager._is_agent_lifecycle_event(event_type)
-            is_non_indexed = event_type in non_indexed_events
-            
-            if is_decision or is_lifecycle:
-                indexed_events.append(event_type)
-            
-            # Every event should be either indexed OR explicitly non-indexed
-            assert (is_decision or is_lifecycle or is_non_indexed), \
-                f"{event_type.value} is not categorized - add to decision, lifecycle, or non_indexed list"
-        
-        # Ensure we have a good coverage of indexed events
-        assert len(indexed_events) > 35, \
-            f"Expected 35+ indexed events, found {len(indexed_events)}"
-    
     # ========== ELASTICSEARCH INDEXING TESTS ==========
     
     def test_decision_event_indexes_to_elasticsearch(self, obs_manager, mock_elasticsearch):
@@ -398,6 +374,20 @@ class TestObservabilityElasticsearchIndexing:
         # Redis should still work
         assert mock_redis.publish.called
         assert mock_redis.xadd.called
+
+        # ...and the document is not lost. _es_write() falls through to the
+        # Redis backup buffer that drain_es_backup() replays once ES is healthy
+        # again -- the whole durability story for an ES outage, and until this
+        # line nothing in the suite touched it (no test referenced
+        # _ES_BACKUP_KEY, es:failed_events or drain_es_backup anywhere). This
+        # test was already driving the retry to exhaustion, so asserting it is
+        # free.
+        mock_redis.lpush.assert_called_once()
+        backup_key, backup_payload = mock_redis.lpush.call_args.args
+        assert backup_key == ObservabilityManager._ES_BACKUP_KEY
+        buffered = json.loads(backup_payload)
+        assert buffered['index'].startswith('decision-events-')
+        assert buffered['document']['event_type'] == EventType.AGENT_ROUTING_DECISION.value
     
     def test_observability_disabled_skips_everything(self, mock_redis, mock_elasticsearch):
         """Test that disabled observability skips all operations"""
@@ -418,7 +408,135 @@ class TestObservabilityElasticsearchIndexing:
         # Nothing should be called
         assert not mock_redis.publish.called
         assert not mock_elasticsearch.index.called
-    
+
+    # ========== SERIALISATION OF THE OPEN `data` DICT ==========
+
+    def test_a_non_json_native_value_in_data_is_stringified_not_raised(
+        self, obs_manager, mock_redis, mock_elasticsearch
+    ):
+        """`data` is an open dict filled by ~90 emit sites out of task context,
+        agent config and pipeline state, and emit() serialises it INLINE on the
+        dispatch path. Before `default=str`, a Path/datetime/Enum/dataclass in
+        there raised TypeError straight out of execute_agent() -- a telemetry
+        payload killing the agent run it was describing.
+
+        Pinned per type rather than as one blob, because `default=str` is only
+        consulted for values json does not already handle: a regression that
+        narrowed it (say, to a `str` subclass check) would still pass a
+        single-case test.
+        """
+        from pathlib import Path
+        from dataclasses import dataclass
+
+        @dataclass
+        class _SomeConfig:
+            name: str
+
+        obs_manager.emit(
+            EventType.AGENT_ROUTING_DECISION,
+            agent="orchestrator",
+            task_id="test_task",
+            project="test-project",
+            data={
+                'workspace': Path('/workspace/proj'),
+                'when': datetime(2026, 1, 2, 3, 4, 5),
+                'which': EventType.AGENT_SELECTED,
+                'config': _SomeConfig(name='x'),
+                'mock': MagicMock(),
+            },
+        )
+
+        # Emitted rather than dropped, and the values survive as strings.
+        assert mock_redis.publish.called
+        published = json.loads(mock_redis.publish.call_args.args[1])
+        assert published['data']['workspace'] == '/workspace/proj'
+        assert published['data']['when'] == '2026-01-02 03:04:05'
+        assert published['data']['which'] == str(EventType.AGENT_SELECTED)
+        assert isinstance(published['data']['mock'], str)
+        # A nested dataclass is handled by asdict() before json.dumps ever sees
+        # it, so it survives as structure rather than being stringified.
+        assert published['data']['config'] == {'name': 'x'}
+
+        # ...and the event still reaches Elasticsearch, carrying the SAME
+        # normalized values, on the FIRST attempt.
+        #
+        # The second half of that is the assertion that matters. The ES
+        # document used to be re-assembled from the raw `data` dict rather than
+        # from the normalized envelope, so a Path here reached es.index()
+        # untouched, the client raised SerializationError, and
+        # es_index_with_retry -- which cannot tell permanent from transient --
+        # burned five attempts and 30 real seconds of time.sleep() on the
+        # dispatch path before dropping it. call_count == 1 is what pins that
+        # shut; a plain `.called` would pass with all five.
+        assert mock_elasticsearch.index.call_count == 1
+        indexed = mock_elasticsearch.index.call_args.kwargs['document']
+        assert indexed['workspace'] == '/workspace/proj'
+        assert indexed['when'] == '2026-01-02 03:04:05'
+        assert indexed['config'] == {'name': 'x'}
+        assert isinstance(indexed['mock'], str)
+        # Redis and Elasticsearch cannot disagree about what the event was.
+        for key, value in published['data'].items():
+            assert indexed[key] == value
+
+    @pytest.mark.parametrize('label', [
+        'circular_dict',      # RecursionError
+        'unpicklable_object', # TypeError  ("cannot pickle '_thread.lock' object")
+        'str_raises',         # that object's own exception (RuntimeError here)
+    ])
+    def test_an_unserialisable_event_is_dropped_and_logged_not_raised(
+        self, obs_manager, mock_redis, mock_elasticsearch, caplog, label
+    ):
+        """`default=str` does NOT make to_json() total, and the exceptions that
+        get past it are not one family.
+
+        to_json() is json.dumps(asdict(self), default=str), and it is asdict()
+        -- which runs first and deep-copies every value in `data` -- that
+        raises, so `default=str` never gets a say. Measured against this
+        dataclass: a cycle is a RecursionError, a lock/socket/generator is a
+        TypeError from the pickle machinery, and an object whose __str__ or
+        __deepcopy__ raises propagates its own exception type. Only the middle
+        one is a TypeError, which is why the guard catches Exception rather than
+        a tuple -- the set of types reachable from ~90 emit sites' open `data`
+        dicts is not enumerable in advance.
+
+        The deliberate trade being pinned here is that the event is DROPPED --
+        losing one telemetry row beats aborting the dispatch it describes -- and
+        that the drop is loud (ERROR, naming the event type) rather than silent.
+        """
+        import threading
+
+        if label == 'circular_dict':
+            value = {}
+            value['self'] = value
+        elif label == 'unpicklable_object':
+            value = threading.Lock()
+        else:
+            class _StrRaises:
+                def __str__(self): raise RuntimeError('boom')
+                def __repr__(self): raise RuntimeError('boom')
+            value = _StrRaises()
+
+        with caplog.at_level(logging.ERROR, logger='monitoring.observability'):
+            obs_manager.emit(
+                EventType.AGENT_ROUTING_DECISION,
+                agent="orchestrator",
+                task_id="test_task",
+                project="test-project",
+                data={'bad': value},
+            )
+
+        # Dropped: neither transport saw it.
+        assert not mock_redis.publish.called
+        assert not mock_redis.xadd.called
+        assert not mock_elasticsearch.index.called
+
+        # ...but loudly, and identifiably.
+        assert any(
+            record.levelno == logging.ERROR
+            and EventType.AGENT_ROUTING_DECISION.value in record.getMessage()
+            for record in caplog.records
+        ), f"expected an ERROR naming the event type, got {caplog.records}"
+
     # ========== INTEGRATION TESTS ==========
     
     def test_multiple_decision_events_index_correctly(self, obs_manager, mock_elasticsearch):
