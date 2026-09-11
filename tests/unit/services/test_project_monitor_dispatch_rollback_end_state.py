@@ -196,7 +196,7 @@ class TestDispatchRollbackEndState:
 
     def test_in_progress_execution_record_is_cleared(self, temp_state_dir):
         """REGRESSION (#147): record_execution_start() runs immediately before the
-        enqueue. When the enqueue blows up, an orphan 'manual' in_progress probe
+        enqueue. When the enqueue blows up, an orphan 'board_dispatch' in_progress probe
         used to survive for the life of the process (the stale-probe self-heal is
         scoped to pipeline_progression probes), making has_active_execution()
         permanently True - which disarms BOTH this rollback's own liveness guard

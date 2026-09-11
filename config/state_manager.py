@@ -12,7 +12,7 @@ import os
 import yaml
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 import logging
@@ -511,6 +511,39 @@ class GitHubStateManager:
 
         # Convert to string - YAML keys are strings even for numeric values
         return state.issue_discussion_links.get(str(issue_number))
+
+    def get_discussion_for_issue_checked(
+        self, project_name: str, issue_number: int
+    ) -> Tuple[Optional[str], bool]:
+        """get_discussion_for_issue(), plus whether the link store was readable.
+
+        Returns (discussion_id, link_store_readable). load_project_state() answers
+        None for "no state file yet" and for "the file is there and failed to
+        load" alike -- it logs the second and returns the first's value -- so
+        get_discussion_for_issue() cannot tell "this issue has no discussion" from
+        "the link table could not be read".
+
+        The empty-output watchdog needs them apart (#166): it decides whether to
+        scan a Discussion for an agent's output on the strength of that id, and
+        save_project_state() is a non-atomic truncate-and-rewrite called from the
+        project-monitor thread, so a concurrent read genuinely does land on an
+        unparseable file. Treating that as "no discussion" would let the watchdog
+        rewrite a record whose output is in a Discussion it never looked at.
+        """
+        state_file = self._get_project_state_file(project_name)
+        if not state_file.exists():
+            # Nothing has ever been linked for this project. An honest absence,
+            # not a failed read.
+            return None, True
+
+        state = self.load_project_state(project_name)
+        if state is None:
+            return None, False
+
+        if state.issue_discussion_links is None:
+            return None, True
+
+        return state.issue_discussion_links.get(str(issue_number)), True
 
     def get_issue_for_discussion(self, project_name: str, discussion_id: str) -> Optional[int]:
         """Get issue number for a discussion"""

@@ -102,6 +102,78 @@ except ImportError:
         pass
 
 
+def resolve_workspace_type_for_column_strict(project: str, column: str) -> Optional[str]:
+    """
+    Where an agent executing in `column` posts, or None when that cannot be told.
+
+    The same resolution resolve_workspace_type_for_column() performs, except that
+    every way it can fail to resolve -- an 'unknown' or absent column, a column no
+    configured pipeline's workflow names any more (a board rename, or a pipeline
+    disabled since the record was written), an unloadable project config, any
+    exception at all -- is reported as None rather than collapsing into the
+    legitimate value 'issues'.
+
+    The empty-output watchdog needs that distinction (#166). 'issues' is the one
+    answer that lets its gate skip the Discussion scan entirely, so a resolution
+    failure returned as 'issues' silently turns "I could not work out where this
+    agent posts" into "demonstrably produced no output" for an agent whose report
+    is sitting in a Discussion. The gate declines a None the same way it declines
+    a discussions column with no recorded discussion.
+    """
+    if not column or column == 'unknown':
+        return None
+    try:
+        from config.manager import config_manager
+        project_config = config_manager.get_project_config(project)
+        if not project_config:
+            logger.warning(
+                f"Could not resolve the workspace for {project} column '{column}': "
+                f"no project config"
+            )
+            return None
+        for pipeline in project_config.pipelines:
+            workflow_template = config_manager.get_workflow_template(pipeline.workflow)
+            if not workflow_template:
+                continue
+            if any(c.name == column for c in workflow_template.columns):
+                return getattr(pipeline, 'workspace', 'issues')
+    except Exception as e:
+        # Was `except Exception: pass` falling through to the 'issues' default,
+        # which is how a ConfigurationError from a momentarily unreadable project
+        # YAML became a positive assertion about where the agent posted -- with no
+        # log line anywhere (#166).
+        logger.warning(
+            f"Could not resolve the workspace for {project} column '{column}': {e}"
+        )
+        return None
+
+    logger.debug(
+        f"Column '{column}' matches no configured workflow column of {project} "
+        f"-- workspace unresolved"
+    )
+    return None
+
+
+def resolve_workspace_type_for_column(project: str, column: str) -> str:
+    """
+    Derive workspace_type from pipeline config using project and column name.
+
+    workspace_type is a property of the pipeline template (e.g. 'issues' for
+    sdlc_execution, 'discussions' for planning_design). Given the column the
+    agent was executing in, we can find the owning pipeline and return its
+    workspace. Falls back to 'issues' if the column is unknown or unmatched --
+    the poster has to write somewhere, so a default is the right answer here.
+
+    Module-level rather than a DockerAgentRunner method because the empty-output
+    watchdog needs the same answer (#166): services/work_execution_state.py has to
+    look for an agent's comment in the workspace the completion path posted it to,
+    and instantiating a container runner is not what a state sweep should do to
+    find out. That caller uses the _strict variant above instead, because a reader
+    deciding whether to redispatch cannot afford this function's default.
+    """
+    return resolve_workspace_type_for_column_strict(project, column) or 'issues'
+
+
 class DockerAgentRunner:
     """Runs Claude Code agents in isolated Docker containers"""
 
@@ -3398,30 +3470,15 @@ class DockerAgentRunner:
         }
 
     def _get_workspace_type_from_column(self, project: str, column: str) -> str:
-        """
-        Derive workspace_type from pipeline config using project and column name.
+        """Derive workspace_type from pipeline config using project and column name.
 
-        workspace_type is a property of the pipeline template (e.g. 'issues' for
-        sdlc_execution, 'discussions' for planning_design). Given the column the
-        agent was executing in, we can find the owning pipeline and return its
-        workspace. Falls back to 'issues' if the column is unknown or unmatched.
+        Delegates to the module-level resolve_workspace_type_for_column(), which is
+        shared with the empty-output watchdog's GitHub-output gate (#166) -- that
+        gate has to look for the agent's comment in the same workspace this method
+        told the poster to write it to, and a second copy of this resolution is how
+        the two would come to disagree.
         """
-        if column == 'unknown':
-            return 'issues'
-        try:
-            from config.manager import config_manager
-            project_config = config_manager.get_project_config(project)
-            if not project_config:
-                return 'issues'
-            for pipeline in project_config.pipelines:
-                workflow_template = config_manager.get_workflow_template(pipeline.workflow)
-                if not workflow_template:
-                    continue
-                if any(c.name == column for c in workflow_template.columns):
-                    return getattr(pipeline, 'workspace', 'issues')
-        except Exception:
-            pass
-        return 'issues'
+        return resolve_workspace_type_for_column(project, column)
 
     async def _complete_agent_execution(
         self,
@@ -3596,6 +3653,16 @@ class DockerAgentRunner:
         try:
             from services.work_execution_state import work_execution_tracker
             if column != 'unknown':
+                # github_post_attempted=False: this path checkpoints the phase output
+                # and re-triggers the stage, it never calls _complete_agent_execution
+                # and posts nothing (#166 review). The record it finalizes otherwise
+                # looks exactly like an ordinary verifiable one to the empty-output
+                # watchdog -- an allowlisted trigger_source ('pr_review_phase2' /
+                # 'pr_review_phase4'), a real start timestamp, an agent that does not
+                # own its own posting -- so without the flag a re-trigger that
+                # legitimately does not dispatch (see the returned-None case below)
+                # leaves a 'success' with no agent comment after it, which the gate
+                # reads as "verified empty" and rewrites into a fresh PR review cycle.
                 work_execution_tracker.record_execution_outcome(
                     issue_number=issue_number,
                     column=column,
@@ -3603,6 +3670,7 @@ class DockerAgentRunner:
                     outcome='success' if exit_code == 0 else 'failed',
                     project_name=project,
                     error=None if exit_code == 0 else f"Container exited with code {exit_code}",
+                    github_post_attempted=False,
                 )
             else:
                 # Not a no-op: this phase's own in_progress execution_history entry

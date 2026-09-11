@@ -1004,9 +1004,12 @@ async def process_task_integrated(task, state_manager, logger):
 
     # Record execution start in work execution state.
     # Guard: only write a new probe entry if no in_progress entry already exists for
-    # this agent/column. project_monitor writes a 'manual' probe before enqueueing;
-    # creating a second 'task_queue' probe here would leave a redundant in_progress
-    # entry if the orchestrator restarts before stamp_execution_task_id() runs.
+    # this agent/column. project_monitor writes a 'board_dispatch' probe before
+    # enqueueing; creating a second 'task_queue' probe here would leave a redundant
+    # in_progress entry if the orchestrator restarts before stamp_execution_task_id()
+    # runs. So on the ordinary board-dispatch path this branch does NOT fire and the
+    # record the empty-output watchdog eventually sees is the 'board_dispatch' one --
+    # both names are on that gate's allowlist for exactly that reason (#166).
     if 'issue_number' in task_context and 'column' in task_context:
         from services.work_execution_state import work_execution_tracker
         issue_number_ctx = task_context['issue_number']

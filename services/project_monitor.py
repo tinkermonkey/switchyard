@@ -4070,7 +4070,24 @@ class ProjectMonitor:
                     issue_number=issue_number,
                     column=status,
                     agent=agent,
-                    trigger_source='manual',  # Triggered from project monitor
+                    # 'board_dispatch', not 'manual' (#166). This is the ordinary
+                    # board dispatch: the agent named here runs in its own container
+                    # and finishes through _complete_agent_execution /
+                    # _post_agent_output_to_github, so its output IS a comment signed
+                    # by this agent. The two wrapper stages below (pr_review_stage,
+                    # repair cycle) keep 'manual' because they record an outcome under
+                    # a name their sub-run does not post under -- and while all three
+                    # shared one name, the empty-output watchdog had to decline the
+                    # lot, which is 6,104 attributable records and the largest single
+                    # population it could otherwise verify.
+                    #
+                    # This is the record the gate actually sees: the task-queue
+                    # worker's own record_execution_start() is guarded on there being
+                    # no in_progress entry for this agent/column (see
+                    # agents/orchestrator_integration.py), so it does NOT write a
+                    # second 'task_queue' start behind this probe --
+                    # record_execution_outcome() finalizes THIS entry in place.
+                    trigger_source='board_dispatch',  # Triggered from project monitor
                     project_name=project_name,
                     board_name=board_name
                 )
@@ -4110,8 +4127,8 @@ class ProjectMonitor:
                     # The in_progress probe above is written BEFORE the enqueue on
                     # purpose, so a worker can never beat it. That makes the enqueue
                     # blowing up the one case where it has to be undone here: nothing
-                    # else ever will. It carries trigger_source='manual', which the
-                    # stale-probe self-heal in work_execution_state deliberately does
+                    # else ever will. It carries trigger_source='board_dispatch',
+                    # which the stale-probe self-heal in work_execution_state does
                     # NOT age out (that guard is scoped to pipeline_progression
                     # probes), so it would otherwise survive for the life of the
                     # process and make has_active_execution() permanently True for
