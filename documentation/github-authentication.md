@@ -6,7 +6,11 @@ Switchyard uses two distinct GitHub authentication methods: a Personal Access To
 
 A PAT is the simplest way to authenticate and covers most GitHub API operations — issues, pull requests, code, and comments. It requires no setup beyond creating a token and setting an environment variable.
 
-However, a PAT cannot access the GitHub Discussions write API. GitHub's Discussions mutations (`createDiscussion`, `addDiscussionComment`) are GraphQL-only and require an installation token from a GitHub App. There is no PAT scope that grants write access to Discussions. This is an API fragmentation issue on GitHub's side: Discussions were added after the PAT scope model was established, and write access was never exposed through that mechanism.
+Historically this codebase treated Discussions writes as App-only. That is **not** correct against the current API: a classic PAT carrying `repo` passes the scope gate for `createDiscussion`, `addDiscussionComment` and `updateDiscussion`.
+
+This was established by a scope-ordering probe rather than by reading the docs. GitHub evaluates token scopes *before* resolving node IDs — a mutation the token lacks scope for returns `INSUFFICIENT_SCOPES` even when handed a bogus node ID, whereas all three Discussions mutations returned only `NOT_FOUND` on the bogus node. That proves the scope gate passed. The repository-permission gate is evaluated later, against a real node, so it is not covered by that probe.
+
+The GitHub App remains preferred for Discussions (bot identity, separate rate-limit budget), but it is no longer believed to be strictly required.
 
 `services/github_discussions.py` uses `self.app.graphql_request` when the App is configured. If the App is not configured, `_execute_graphql` falls back to a PAT-authenticated GraphQL call, which will succeed for read queries but fail for write mutations with a permission error. Any orchestrator workflow that creates or comments on Discussions requires a GitHub App.
 
@@ -41,7 +45,7 @@ With a PAT configured and no GitHub App, all API operations proceed through the 
 - All comments and actions appear as the token owner's user account
 - Rate limit is shared across all applications using the same token
 - PAT tokens do not expire by default but can be revoked at any time; revocation immediately breaks all orchestrator operations
-- Cannot perform GitHub Discussions write operations (`createDiscussion`, `addDiscussionComment`); these mutations require a GitHub App installation token regardless of PAT scopes
+- Discussions writes are believed to work with the `repo` scope (see "Why multiple authentication methods" above); the App is still preferred for bot identity and a separate quota
 
 ## GitHub App
 
@@ -116,11 +120,24 @@ This means a PAT in `GITHUB_TOKEN` functions as a fallback for any call made thr
 
 `GitHubAPIClient` does not use `GitHubApp` directly. Its three execution paths — `graphql`, `rest`, and `gh_cli` — invoke the GitHub CLI (`gh api graphql`, `gh api`, arbitrary `gh` commands). The CLI inherits authentication from the environment: it reads `GH_TOKEN` then `GITHUB_TOKEN`, and if `gh auth login` has been run, it uses the stored credential. The `http_request` method makes direct HTTP calls and applies the same env-var lookup (`GH_TOKEN` or `GITHUB_TOKEN`) when building the `Authorization` header.
 
-`GitHubAPIClient` does not natively handle GitHub App installation tokens. It relies on the environment having a valid token, either by setting `GITHUB_TOKEN` to an installation token before the process starts, or by the GitHub CLI's own stored credentials.
+`GitHubAPIClient` resolves its credential per call rather than reading a static environment variable. The `GITHUB_CREDENTIAL_PREFERENCE` environment variable selects which:
+
+- `pat` (default) — read `GH_TOKEN`/`GITHUB_TOKEN` from the environment, the historical behaviour
+- `app` — mint a GitHub App installation token per call via `services/github_app.py`
+
+An `app` preference still falls back to the PAT when the App is not configured or its token exchange fails, so a partially configured deployment degrades rather than going dark. The fallback is reported, not silent, because the credential a call actually used selects which rate-limit bucket its response headers update (see below).
+
+Setting `GITHUB_TOKEN` to an installation token manually does not work: installation tokens expire after one hour, and a static environment variable cannot rotate.
 
 ## The `GitHubAPIClient`: rate limit tracking and circuit breaker
 
 `GitHubAPIClient` (`services/github_api_client.py`) is the centralized gateway for all API interactions that need rate limit awareness. It wraps the GitHub CLI and direct HTTP calls with two cross-cutting behaviors.
+
+### Credential-scoped rate limit buckets
+
+A rate-limit reading belongs to the *(credential, resource)* pair whose budget was actually spent, never to the transport that produced it. `GitHubAPIClient` therefore keeps four buckets — PAT/GraphQL, PAT/REST, App/GraphQL, App/REST — and selects among them using the credential a call ended up on, including when an App-preference call fell back to the PAT.
+
+App readings mirror to their own Redis keys (`github:rate_limit:{rest,graphql}:app`). The two original keys keep meaning exactly "the PAT budget", so cross-process readers are unaffected; on an App-only deployment they correctly go stale rather than reporting a budget nothing is spending.
 
 ### Rate limit tracking
 

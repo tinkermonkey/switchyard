@@ -84,6 +84,28 @@ class GitHubProjectManager:
             else:
                 logger.info(f"Starting reconciliation for project: {project_name} (state is stale or incomplete)")
 
+            # WI-5 GUARD. Board reconciliation is the one operation whose
+            # failure mode on a permission-less credential is SILENT and
+            # DESTRUCTIVE: a Projects v2 read without Projects permission
+            # returns an empty, successful result, so _reconcile_pipeline_board
+            # concludes no board exists and creates a duplicate of every board
+            # on every startup. Refusing to reconcile is strictly better than
+            # reconciling blind - and it is a skip rather than a raise so the
+            # rest of the orchestrator (issues, PRs, discussions, agent
+            # dispatch) keeps running on a deployment whose Projects
+            # permission simply has not been granted yet.
+            from services.github_capabilities import github_capabilities, GitHubCapability
+            if not github_capabilities.has_capability(GitHubCapability.PROJECTS_V2_WRITE):
+                status = github_capabilities.get_status()
+                logger.critical(
+                    f"SKIPPING board reconciliation for '{project_name}': the active "
+                    f"GitHub credential cannot write Projects v2 boards "
+                    f"({status.get('projects_v2_detail')}). Reconciling without that "
+                    f"permission would silently create duplicate boards, because a "
+                    f"Projects query made without it returns empty rather than failing."
+                )
+                return False
+
             # Load project configuration
             project_config = self.config_manager.get_project_config(project_name)
 

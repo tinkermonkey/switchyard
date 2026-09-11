@@ -10,7 +10,7 @@ import time
 import jwt
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -78,8 +78,10 @@ class GitHubAppAuth:
         # JWT claims
         now = int(time.time())
         payload = {
-            'iat': now,  # Issued at
-            'exp': now + (10 * 60),  # Expires in 10 minutes
+            # Backdated 60s to absorb clock drift against GitHub -- see the
+            # matching comment in services/github_app.py's _generate_jwt().
+            'iat': now - 60,  # Issued at
+            'exp': now + (9 * 60),  # 10 minutes from iat, GitHub's maximum
             'iss': self.app_id  # Issuer (App ID)
         }
 
@@ -106,7 +108,6 @@ class GitHubAppAuth:
 
         # Check if we have a valid cached token
         if not force_refresh and self.installation_token and self.token_expires_at:
-            from datetime import timezone
             if datetime.now(timezone.utc) < self.token_expires_at:
                 return self.installation_token
 
@@ -138,8 +139,14 @@ class GitHubAppAuth:
                     expires_at_str.replace('Z', '+00:00')
                 ) - timedelta(minutes=5)
             else:
-                # Default to 55 minutes from now if not provided
-                self.token_expires_at = datetime.now() + timedelta(minutes=55)
+                # Default to 55 minutes from now if not provided -- 5 minutes
+                # of margin off GitHub's documented 1-hour lifetime, matching
+                # the branch above. Must be timezone-AWARE: the cache check
+                # compares against datetime.now(timezone.utc), and a naive value
+                # there raises TypeError ("can't compare offset-naive and
+                # offset-aware datetimes") on the NEXT call rather than simply
+                # reading as expired.
+                self.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=55)
 
             logger.info(f"Generated new installation token, expires at {self.token_expires_at}")
 

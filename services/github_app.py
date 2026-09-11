@@ -56,6 +56,13 @@ class GitHubApp:
         self.private_key_path = os.environ.get('GITHUB_APP_PRIVATE_KEY_PATH')
         self._installation_token = None
         self._token_expires_at = None
+        # Permissions GitHub reports on the token-exchange response. This is
+        # the ONLY authoritative answer to "can this credential touch X" -
+        # probing by listing resources cannot distinguish "none exist" from
+        # "not permitted" (a Projects v2 list with no Projects permission
+        # comes back empty and successful). See
+        # services/github_capabilities.py (WI-5).
+        self._installation_permissions = None
 
         # Rate-limit hold state, one entry per credential (#168). Once GitHub
         # reports a GraphQL budget exhausted, every further query on that
@@ -90,8 +97,14 @@ class GitHubApp:
         """Generate JWT for GitHub App authentication"""
         now = int(time.time())
         payload = {
-            'iat': now,
-            'exp': now + (10 * 60),  # Expires in 10 minutes
+            # iat is backdated 60s so clock drift between this host and GitHub
+            # can't fail the 'iat' claim check -- that surfaces as a 401 on the
+            # token exchange ("'iat' claim timestamp check failed"), which the
+            # caller can only report as "Failed to get installation token".
+            # GitHub caps a JWT's lifetime at 10 minutes measured from iat, so
+            # exp is +540 to keep exp-iat at exactly 600s.
+            'iat': now - 60,
+            'exp': now + (9 * 60),
             'iss': self.app_id
         }
 
@@ -123,6 +136,10 @@ class GitHubApp:
 
             data = response.json()
             self._installation_token = data['token']
+            # Captured on every mint so it can never drift from the token in
+            # hand (an admin changing the App's permissions takes effect on
+            # the next exchange, not retroactively).
+            self._installation_permissions = data.get('permissions') or {}
             self._token_expires_at = datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00'))
 
             logger.info(f"Generated new GitHub App installation token (expires: {self._token_expires_at})")
@@ -131,6 +148,21 @@ class GitHubApp:
         except Exception as e:
             logger.error(f"Failed to get installation token: {e}")
             return None
+
+    def get_installation_permissions(self) -> Optional[dict]:
+        """Permissions this installation granted, e.g. {'issues': 'write', ...}.
+
+        Returns None when the App isn't configured or a token has never been
+        minted - callers must treat that as "unknown", not as "denied", since
+        an unconfigured App simply means this deployment authenticates some
+        other way.
+        """
+        if not self.enabled:
+            return None
+        if self._installation_permissions is None:
+            # Minting refreshes the cached permissions as a side effect.
+            self.get_installation_token()
+        return self._installation_permissions
 
     def _invalidate_token(self):
         """Invalidate cached installation token so the next call generates a fresh one."""
