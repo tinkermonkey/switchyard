@@ -38,8 +38,11 @@ RATE_LIMIT_HOLD_MAX_SECONDS = 3600
 # every discussions / human_feedback_loop / review_cycle / pr_review_stage
 # query through it, and without a hold each one logs its own ERROR: the same
 # 484-lines-in-three-hours burst #168 reports, just on the other credential.
-CREDENTIAL_APP = 'app'
-CREDENTIAL_PAT = 'pat'
+# Imported rather than redefined (#191 review): this module and
+# github_api_client both name the credential a call was made on, and duplicate
+# literals had already drifted -- the two label maps disagreed on what to call
+# the PAT. services/github_app_credentials.py is the single definition.
+from services.github_app_credentials import CREDENTIAL_APP, CREDENTIAL_PAT
 _CREDENTIAL_LABELS = {
     CREDENTIAL_APP: 'GitHub App',
     CREDENTIAL_PAT: 'PAT fallback',
@@ -56,6 +59,13 @@ class GitHubApp:
         self.private_key_path = os.environ.get('GITHUB_APP_PRIVATE_KEY_PATH')
         self._installation_token = None
         self._token_expires_at = None
+        # Permissions GitHub reports on the token-exchange response. This is
+        # the ONLY authoritative answer to "can this credential touch X" -
+        # probing by listing resources cannot distinguish "none exist" from
+        # "not permitted" (a Projects v2 list with no Projects permission
+        # comes back empty and successful). See
+        # services/github_capabilities.py (WI-5).
+        self._installation_permissions = None
 
         # Rate-limit hold state, one entry per credential (#168). Once GitHub
         # reports a GraphQL budget exhausted, every further query on that
@@ -90,8 +100,14 @@ class GitHubApp:
         """Generate JWT for GitHub App authentication"""
         now = int(time.time())
         payload = {
-            'iat': now,
-            'exp': now + (10 * 60),  # Expires in 10 minutes
+            # iat is backdated 60s so clock drift between this host and GitHub
+            # can't fail the 'iat' claim check -- that surfaces as a 401 on the
+            # token exchange ("'iat' claim timestamp check failed"), which the
+            # caller can only report as "Failed to get installation token".
+            # GitHub caps a JWT's lifetime at 10 minutes measured from iat, so
+            # exp is +540 to keep exp-iat at exactly 600s.
+            'iat': now - 60,
+            'exp': now + (9 * 60),
             'iss': self.app_id
         }
 
@@ -118,11 +134,20 @@ class GitHubApp:
             }
 
             url = f'https://api.github.com/app/installations/{self.installation_id}/access_tokens'
-            response = requests.post(url, headers=headers)
+            # Timeout is not optional now that credential routing puts this on
+            # the path of every App-routed API call (#191 review): a hang here
+            # blocks the calling operation indefinitely, past the 30s subprocess
+            # timeouts the routing design leans on, and a hang produces no log
+            # line and runs no error path.
+            response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
 
             data = response.json()
             self._installation_token = data['token']
+            # Captured on every mint so it can never drift from the token in
+            # hand (an admin changing the App's permissions takes effect on
+            # the next exchange, not retroactively).
+            self._installation_permissions = data.get('permissions') or {}
             self._token_expires_at = datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00'))
 
             logger.info(f"Generated new GitHub App installation token (expires: {self._token_expires_at})")
@@ -131,6 +156,25 @@ class GitHubApp:
         except Exception as e:
             logger.error(f"Failed to get installation token: {e}")
             return None
+
+    def get_installation_permissions(self) -> Optional[dict]:
+        """Permissions this installation granted, e.g. {'issues': 'write', ...}.
+
+        Returns None when the App isn't configured, or when minting a token to
+        read the permissions from FAILS. It does not return None merely because
+        no token has been minted yet -- that case mints on demand below.
+
+        The failure case matters: a transient token-exchange error (network
+        blip, GitHub 5xx, clock skew) is indistinguishable here from a
+        deliberately unconfigured App, and the caller treats None as a hard
+        denial. The underlying error is logged by get_installation_token().
+        """
+        if not self.enabled:
+            return None
+        if self._installation_permissions is None:
+            # Minting refreshes the cached permissions as a side effect.
+            self.get_installation_token()
+        return self._installation_permissions
 
     def _invalidate_token(self):
         """Invalidate cached installation token so the next call generates a fresh one."""

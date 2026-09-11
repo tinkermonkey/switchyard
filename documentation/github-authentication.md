@@ -1,18 +1,31 @@
 # GitHub authentication
 
-Switchyard uses two distinct GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Both are supported simultaneously, and the system selects between them at runtime based on availability. Understanding why both exist, what each provides, and how the system manages them is necessary for operating and troubleshooting the orchestrator.
+Switchyard supports two GitHub authentication methods: a Personal Access Token (PAT) and a GitHub App. Either can be used alone, or both together. `GITHUB_CREDENTIAL_PREFERENCE` selects which one `GitHubAPIClient` routes its own calls through (`pat` by default). The fallback is one-directional: an `app` preference falls back to the PAT when the App is unavailable, but a `pat` preference never falls back to the App.
+
+Running **App-only** is supported, and is the right configuration for an organization that restricts personal access tokens. If it manages Projects v2 boards it requires an organization-owned app — see "Account type determines Projects v2 access". A deployment that does not manage boards can use a personal-account app.
 
 ## Why multiple authentication methods
 
 A PAT is the simplest way to authenticate and covers most GitHub API operations — issues, pull requests, code, and comments. It requires no setup beyond creating a token and setting an environment variable.
 
-However, a PAT cannot access the GitHub Discussions write API. GitHub's Discussions mutations (`createDiscussion`, `addDiscussionComment`) are GraphQL-only and require an installation token from a GitHub App. There is no PAT scope that grants write access to Discussions. This is an API fragmentation issue on GitHub's side: Discussions were added after the PAT scope model was established, and write access was never exposed through that mechanism.
+Historically this codebase treated Discussions writes as App-only, on the grounds that no PAT scope grants them. **That is not correct against the current API.** Both credentials were verified with real writes against a throwaway repository:
 
-`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured. If the App is not configured, `_execute_graphql` falls back to a PAT-authenticated GraphQL call, which will succeed for read queries but fail for write mutations with a permission error. Any orchestrator workflow that creates or comments on Discussions requires a GitHub App.
+| Mutation | PAT | GitHub App |
+|---|---|---|
+| `createDiscussion` | pass | pass |
+| `addDiscussionComment` | pass | pass |
+
+The PAT's discussion was authored by the token owner; the App's by the app's bot identity. Both were then deleted.
+
+The PAT used carries `repo` **and** `write:discussion`, so this establishes that such a token works — not which of the two scopes is load-bearing. `write:discussion` is documented as covering *team* discussions rather than repository Discussions, which points at `repo`, but that has not been isolated. A deployment provisioning a minimal token should grant both until it has tested otherwise.
+
+The GitHub App is still preferred for Discussions — bot identity and a separate rate-limit budget — but it is not required.
+
+`services/github_discussions.py` uses `self.app.graphql_request` when the App is configured, and `_execute_graphql` falls back to a PAT-authenticated GraphQL call when it is not. That fallback works for writes as well as reads.
 
 Beyond Discussions, the GitHub App provides two additional benefits: actions appear as `orchestrator-bot[bot]` rather than as the PAT owner's personal account, and the rate limit is per-installation (5,000 requests per hour for this installation) rather than shared across all applications using the same user token.
 
-The system supports both simultaneously so that operators can start with a PAT for initial setup, then add the GitHub App when Discussions functionality is needed. The GitHub App is always preferred when configured; the PAT serves as fallback for everything except Discussions write mutations.
+Supporting both lets operators start with a PAT for initial setup and add the GitHub App later, or run App-only from the start. Note that the App's advantages are real but bounded: bot identity, a separate rate-limit budget, and short-lived credentials rather than a long-lived one.
 
 ## Personal Access Token
 
@@ -24,7 +37,7 @@ The `.env.example` specifies the following scopes for `GITHUB_TOKEN`:
 - `project` — read/write access to GitHub Projects v2 boards
 - `admin:repo_hook` — create and manage webhooks
 
-The `project` scope is essential. Without it, the reconciliation loop that creates and manages Kanban board columns will fail silently or with permission errors.
+The `project` scope is essential, and its absence fails **silently**: a Projects v2 query made without it returns an empty, successful result rather than an error, which board reconciliation would read as "no board exists" before creating a duplicate of every board. `services/github_capabilities.py` therefore checks the credential's grant (`x-oauth-scopes` for a PAT, installation permissions for an app) at startup, and `services/github_project_manager.py` skips reconciliation entirely rather than run it blind.
 
 ### Environment variable
 
@@ -41,7 +54,7 @@ With a PAT configured and no GitHub App, all API operations proceed through the 
 - All comments and actions appear as the token owner's user account
 - Rate limit is shared across all applications using the same token
 - PAT tokens do not expire by default but can be revoked at any time; revocation immediately breaks all orchestrator operations
-- Cannot perform GitHub Discussions write operations (`createDiscussion`, `addDiscussionComment`); these mutations require a GitHub App installation token regardless of PAT scopes
+- Discussions writes DO work from a PAT (verified — see "Why multiple authentication methods" above); the App is still preferred for bot identity and a separate quota
 
 ## GitHub App
 
@@ -73,9 +86,11 @@ GitHub App authentication is a two-step process.
 
 **Step 1: Generate a JWT.** The orchestrator signs a JWT using the app's RSA private key. The JWT payload contains:
 
-- `iat`: current Unix timestamp (issued at)
-- `exp`: current timestamp plus 600 seconds (10-minute expiry)
+- `iat`: current Unix timestamp **minus 60 seconds**
+- `exp`: current timestamp plus 540 seconds
 - `iss`: the numeric app ID
+
+`iat` is backdated so clock drift between the host and GitHub cannot fail the `iat` claim check, which surfaces as a 401 on the token exchange reported only as "Failed to get installation token". GitHub caps a JWT's lifetime at 10 minutes measured from `iat`, so `exp` is set to +540 to keep `exp - iat` at exactly 600 seconds.
 
 The JWT is signed with the `RS256` algorithm. This JWT authenticates the app itself, not the installation.
 
@@ -114,13 +129,36 @@ This means a PAT in `GITHUB_TOKEN` functions as a fallback for any call made thr
 
 ### In `github_api_client.py`
 
-`GitHubAPIClient` does not use `GitHubApp` directly. Its three execution paths — `graphql`, `rest`, and `gh_cli` — invoke the GitHub CLI (`gh api graphql`, `gh api`, arbitrary `gh` commands). The CLI inherits authentication from the environment: it reads `GH_TOKEN` then `GITHUB_TOKEN`, and if `gh auth login` has been run, it uses the stored credential. The `http_request` method makes direct HTTP calls and applies the same env-var lookup (`GH_TOKEN` or `GITHUB_TOKEN`) when building the `Authorization` header.
+`GitHubAPIClient` has four execution paths: `graphql`, `rest` and `gh_cli` invoke the GitHub CLI, and `http_request` makes direct HTTP calls. All four are credential-routed — the CLI no longer inherits ambient authentication, because each call is given an explicitly constructed environment.
 
-`GitHubAPIClient` does not natively handle GitHub App installation tokens. It relies on the environment having a valid token, either by setting `GITHUB_TOKEN` to an installation token before the process starts, or by the GitHub CLI's own stored credentials.
+`GitHubAPIClient` resolves its credential per call rather than reading a static environment variable. The `GITHUB_CREDENTIAL_PREFERENCE` environment variable selects which:
+
+- `pat` (default) — read `GH_TOKEN`/`GITHUB_TOKEN` from the environment, the historical behaviour
+- `app` — mint a GitHub App installation token per call via `services/github_app.py`
+
+An `app` preference still falls back to the PAT when the App is not configured or its token exchange fails, so a partially configured deployment degrades rather than going dark. The fallback is reported, not silent, because the credential a call actually used selects which rate-limit bucket its response headers update (see below).
+
+Setting `GITHUB_TOKEN` to an installation token manually does not work: installation tokens expire after one hour, and a static environment variable cannot rotate.
 
 ## The `GitHubAPIClient`: rate limit tracking and circuit breaker
 
 `GitHubAPIClient` (`services/github_api_client.py`) is the centralized gateway for all API interactions that need rate limit awareness. It wraps the GitHub CLI and direct HTTP calls with two cross-cutting behaviors.
+
+### Board reconciliation is refused, not attempted, without Projects write access
+
+A Projects v2 query made with a credential lacking the permission returns an empty, successful result rather than an error. Board reconciliation would read that as "no board exists" and create a duplicate of every configured board, on every startup.
+
+`services/github_capabilities.py` therefore checks the credential's **grant** — installation permissions for an app, `x-oauth-scopes` for a PAT — rather than trying to list boards, because listing cannot distinguish "none" from "not permitted". If the check fails, or cannot be performed at all, `reconcile_project()` raises `ProjectsPermissionUnavailable` and the startup loop skips board management for that project while leaving every other pipeline stage running. It is a skip, not a fatal error: the orchestrator keeps going and logs why.
+
+One case passes without being verified: a fine-grained PAT reports no scopes header, so the check cannot prove anything either way and allows reconciliation with a `NOT VERIFIED` warning. A *failed* check — a revoked token, a 403, no network — fails closed instead.
+
+Every `gh` call whose result feeds a decision about boards runs as the routed credential, including the discovery reads in `services/github_owner_utils.py` that are not made through `GitHubAPIClient`. Discovering boards with one credential and creating them with another reintroduces the duplicate-board failure this guard exists to prevent.
+
+### Credential-scoped rate limit buckets
+
+A rate-limit reading belongs to the *(credential, resource)* pair whose budget was actually spent, never to the transport that produced it. `GitHubAPIClient` therefore keeps four buckets — PAT/GraphQL, PAT/REST, App/GraphQL, App/REST — and selects among them using the credential a call ended up on, including when an App-preference call fell back to the PAT.
+
+App readings mirror to their own Redis keys (`github:rate_limit:{rest,graphql}:app`). The two original keys keep meaning exactly "the PAT budget", so cross-process readers are unaffected; on an App-only deployment they correctly go stale rather than reporting a budget nothing is spending.
 
 ### Rate limit tracking
 
@@ -129,18 +167,19 @@ This means a PAT in `GITHUB_TOKEN` functions as a fallback for any call made thr
 - HTTP response headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset`, `x-ratelimit-resource`) after each `http_request` call
 - The `extensions.cost.rateLimit` or `data.rateLimit` fields in GraphQL responses
 
-On startup, a background daemon thread waits 5 seconds and then queries the GraphQL `rateLimit` field to populate accurate values rather than starting with defaults. A second background thread repeats this query every 300 seconds.
+Buckets are populated only from `x-ratelimit-*` headers on real API responses. There is no periodic poll — one existed and was removed (issue #103 follow-up) because `/rate_limit` returned bogus always-full data. A consequence worth knowing when debugging: a credential this deployment never uses keeps its bucket at the 5000/5000 constructor defaults with `ever_updated == False`, and alarms deliberately skip such buckets. `gh_cli` also contributes no readings at all (it parses no headers), so on an App-routed deployment the board traffic is invisible to this accounting.
 
 When usage exceeds thresholds, the client inserts blocking sleeps before executing requests:
 
 | Usage threshold | Action |
 |---|---|
 | Above 80% | Log warning, no delay |
+| Above 95% (GraphQL/REST buckets) | Log warning |
 | Above 90% | Sleep 10 seconds before request |
 | Above 95% | Sleep 30 seconds before request |
 | Limit hit | Trip circuit breaker |
 
-An alarm is logged at critical level when fewer than 100 points remain, error level below 250, warning above 90%, and info above 80%.
+An alarm is logged at critical level when fewer than 100 points remain, error level below 250, and warning above 95% and above 90% and above 80%. Buckets that have never been populated by a real response are skipped, so an unused credential does not report a spuriously healthy budget.
 
 ### Circuit breaker
 
@@ -170,7 +209,15 @@ The following steps create and configure the GitHub App that the orchestrator us
 
 ### 1. Create the app
 
-Navigate to `https://github.com/settings/apps/new` (personal account) or `https://github.com/organizations/<org>/settings/apps/new` (organization).
+**Who should own the app.** If the app needs to manage Projects v2 boards, it must be owned by and installed on an **organization**:
+
+```
+https://github.com/organizations/<org>/settings/apps/new
+```
+
+An app owned by a personal account cannot reach Projects v2 at all — see "Account type determines Projects v2 access" below. App creation lives under the org's **Settings → Developer settings → GitHub Apps → New GitHub App**, which is a different page from the org's "GitHub Apps" installed-apps list (the one showing Marketplace / My apps). An app created on a personal account by mistake can be moved with **Transfer ownership** at the bottom of its settings page, which preserves the app ID and existing private keys.
+
+For a deployment that does not manage boards, a personal-account app (`https://github.com/settings/apps/new`) is sufficient.
 
 Set:
 - **App name**: a unique name, e.g., `orchestrator-bot`
@@ -178,26 +225,60 @@ Set:
 - **Webhook**: disable (uncheck "Active") unless you intend to use webhook delivery
 - **Where can this GitHub App be installed?**: "Only on this account"
 
+Note that "Only on this account" means the owning account. On a personal-account app it therefore excludes every organization, and the org will not appear as an option at install time.
+
 ### 2. Configure permissions
 
 Under "Repository permissions", set:
 
-| Permission | Level |
-|---|---|
-| Contents | Read and write |
-| Issues | Read and write |
-| Pull requests | Read and write |
-| Projects | Read and write (requires organization-level permission) |
-| Discussions | Read and write |
-| Metadata | Read-only (mandatory) |
+| Permission | Level | Needed for |
+|---|---|---|
+| Contents | Read and write | repository access; also required to *link* a new board to a repository |
+| Issues | Read and write | issue comments, labels, board cards |
+| Pull requests | Read and write | PR creation and the review cycle |
+| Discussions | Read and write | the `planning_design` pipeline (`workspace: discussions`) |
+| Metadata | Read-only | mandatory for every app |
 
-Under "Organization permissions" (if using an org):
+Under "Organization permissions":
 
-| Permission | Level |
-|---|---|
-| Projects | Read and write |
+| Permission | Level | Needed for |
+|---|---|---|
+| Projects | Read and write | **Projects v2 boards** |
+
+**Do not confuse the two "Projects" permissions.** Both appear in the UI under that single word, in separate sections of the same page:
+
+- **Repository permissions → Projects** is labelled "Manage classic projects within a repository". It governs *classic* project boards and grants no Projects v2 access whatsoever. Granting it in place of the organization permission is a silent no-op for this orchestrator.
+- **Organization permissions → Projects** is the one that governs Projects v2, and the one board reconciliation requires.
 
 No event subscriptions are required unless the app will receive webhooks.
+
+Changing an app's permissions after installation does not apply them retroactively: the installation keeps its previously accepted set until the owning account approves the new one (a banner appears at `https://github.com/settings/installations`). The two can be compared directly — `GET /app` reports what the registration *requests*, `GET /app/installations/{id}` what the installation has *accepted*. If those disagree, an approval is pending; if the registration itself lacks the permission, the change was never saved.
+
+### Account type determines Projects v2 access
+
+A GitHub App can only reach Projects v2 owned by an **organization**. There is no equivalent permission for boards owned by a personal account, and an app installed on a personal account does not receive that account's `projectsV2` even for boards linked to repositories the app can otherwise access.
+
+This is the practical constraint on running without a PAT: board management requires an org-owned app installed on the org that owns the boards. Everything else the orchestrator does — issues, pull requests, discussions, repository contents — works from a personal-account app.
+
+### Verified configuration
+
+The six permissions above were verified end to end against an organization-owned app installed on an organization, reading a **private** Projects v2 board:
+
+| Check | Result |
+|---|---|
+| Token carries `organization_projects: write` | pass |
+| App sees the private board exists | pass |
+| App reads the board's **items** | pass |
+| App resolves item content inside a private repository | pass |
+| App creates a board (what reconciliation does) | pass |
+| App reads the Status field's options (column configuration) | pass |
+| App creates a discussion and comments on it | pass |
+
+`gh project list --owner <org>` through `GitHubAPIClient.gh_cli()` returns the org's boards on this configuration. The same command returns an empty, successful result — no error — when the Projects permission is absent, which is the failure the reconciliation guard in `services/github_project_manager.py` exists to catch.
+
+Note that `Workflows` is not in the list. It is not required by anything the orchestrator does, and omitting it keeps the permission request smaller.
+
+With these six permissions an organization-owned app covers every GitHub operation the orchestrator performs, including Discussions — so **App-only needs no PAT at all**. The organization's default discussion categories include `Ideas`, which is what `config/foundations/pipelines.yaml` sets as the `planning_design` pipeline's `discussion_category`; no extra setup is needed for that pipeline.
 
 ### 3. Generate a private key
 
@@ -210,6 +291,8 @@ The app ID is shown at the top of the app settings page as a numeric value, e.g.
 ### 5. Install the app
 
 Navigate to the app's settings page and click "Install App". Select the organization or account and choose which repositories the app can access. After installation, the URL will contain the installation ID: `https://github.com/settings/installations/<installation_id>`.
+
+The installation ID can also be recovered from the app's own credentials without visiting the UI — `GET /app/installations`, authenticated with the app JWT, lists every installation with its ID, account and accepted permissions.
 
 ### 6. Configure environment variables
 

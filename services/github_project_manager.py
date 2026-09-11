@@ -18,6 +18,7 @@ import logging
 from config.manager import ConfigManager, ProjectConfig, WorkflowTemplate
 from config.state_manager import GitHubStateManager
 from services.github_api_client import get_github_client
+from services.github_api_client import routed_gh_env
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,23 @@ WORKFLOW_STATE_LABELS = [
     },
     # Future labels can be added here (e.g., 'needs-rebase', 'merge-ready', etc.)
 ]
+
+
+class ProjectsPermissionUnavailable(Exception):
+    """Board reconciliation was refused because the active GitHub credential
+    cannot write Projects v2.
+
+    A distinct exception rather than `return False` because the two outcomes
+    demand opposite responses from the caller and are otherwise
+    indistinguishable. `False` means "this project failed, something is wrong";
+    main.py counts those and exits(1) when every project fails. But this
+    condition is CREDENTIAL-global, not per-project -- it is true for every
+    project simultaneously the moment it is true for one -- so returning False
+    made `failure_count == len(projects)` hold by construction and turned a
+    missing permission into a boot crash-loop. That is the exact opposite of
+    this guard's purpose, which is to keep issues, PRs, discussions and agent
+    dispatch running while boards alone stand down.
+    """
 
 
 class GitHubProjectManager:
@@ -84,6 +102,26 @@ class GitHubProjectManager:
             else:
                 logger.info(f"Starting reconciliation for project: {project_name} (state is stale or incomplete)")
 
+            # WI-5 GUARD. Board reconciliation is the one operation whose
+            # failure mode on a permission-less credential is SILENT and
+            # DESTRUCTIVE: a Projects v2 read without Projects permission
+            # returns an empty, successful result, so _reconcile_pipeline_board
+            # concludes no board exists and creates a duplicate of every board
+            # on every startup. Refusing to reconcile is strictly better than
+            # reconciling blind - and it is a skip rather than a raise so the
+            # rest of the orchestrator (issues, PRs, discussions, agent
+            # dispatch) keeps running on a deployment whose Projects
+            # permission simply has not been granted yet.
+            from services.github_capabilities import github_capabilities, GitHubCapability
+            if not github_capabilities.has_capability(GitHubCapability.PROJECTS_V2_WRITE):
+                status = github_capabilities.get_status()
+                raise ProjectsPermissionUnavailable(
+                    f"the active GitHub credential cannot write Projects v2 boards "
+                    f"({status.get('projects_v2_detail')}). Reconciling without that "
+                    f"permission would silently create duplicate boards, because a "
+                    f"Projects query made without it returns empty rather than failing."
+                )
+
             # Load project configuration
             project_config = self.config_manager.get_project_config(project_name)
 
@@ -111,6 +149,12 @@ class GitHubProjectManager:
             logger.info(f"Successfully reconciled project: {project_name}")
             return True
 
+        except ProjectsPermissionUnavailable:
+            # Deliberately not caught here: this is a refusal, not a failure,
+            # and only the caller can tell the difference (see the exception's
+            # docstring). Swallowing it into the `return False` below would
+            # reinstate the crash-loop it exists to prevent.
+            raise
         except Exception as e:
             logger.error(f"Failed to reconcile project '{project_name}': {e}")
             return False
@@ -558,7 +602,10 @@ class GitHubProjectManager:
                         '--force'  # Update if exists
                     ]
 
-                    subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    subprocess.run(
+                        cmd, capture_output=True, text=True, check=True,
+                        env=routed_gh_env(),
+                    )
                     created_labels.append(label_config['name'])
                     logger.info(f"Created label: {label_config['name']}")
 
@@ -594,7 +641,10 @@ class GitHubProjectManager:
                 '--owner', org,
                 '--repo', repo
             ]
-            result = subprocess.run(link_cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                link_cmd, capture_output=True, text=True, check=False,
+                env=routed_gh_env(),
+            )
             
             if result.returncode == 0:
                 logger.info(f"Linked project '{board_name}' (#{project_number}) to repository {org}/{repo}")
@@ -662,7 +712,10 @@ class GitHubProjectManager:
 
         # 2. Check if user can access the organization
         try:
-            org_result = subprocess.run(['gh', 'api', f'orgs/{org}'], capture_output=True, text=True)
+            org_result = subprocess.run(
+                ['gh', 'api', f'orgs/{org}'], capture_output=True, text=True,
+                env=routed_gh_env(),
+            )
             _track('gh_api_orgs', f'gh api orgs/{org} (diagnostics)')
             if org_result.returncode == 0:
                 logger.info(f"Organization access ({org}): SUCCESS")
@@ -677,6 +730,7 @@ class GitHubProjectManager:
         # 3. Check GitHub Projects v2 permissions specifically
         try:
             projects_result = subprocess.run(['gh', 'project', 'list', '--owner', org, '--format', 'json'],
+                                             env=routed_gh_env(),
                                            capture_output=True, text=True)
             _track('gh_project_list', f'gh project list --owner {org} (diagnostics)')
             if projects_result.returncode == 0:
@@ -707,7 +761,12 @@ class GitHubProjectManager:
                 '--owner', org,
                 '--title', f'orchestrator-test-{int(time.time())}',
                 '--format', 'json'
-            ], capture_output=True, text=True, timeout=30)
+            ], capture_output=True, text=True, timeout=30,
+                # Routed credential (WI-2): diagnostics must probe the SAME
+                # credential the failure occurred on. Probing the ambient one
+                # produced advice about PAT scopes for failures on an App
+                # installation token, where that advice is meaningless.
+                env=routed_gh_env())
 
             if test_result.returncode == 0:
                 logger.info("Test project creation: SUCCESS")
@@ -717,7 +776,8 @@ class GitHubProjectManager:
                     test_project_id = test_data.get('id')
                     if test_project_id:
                         subprocess.run(['gh', 'project', 'delete', test_project_id, '--confirm'],
-                                     capture_output=True, timeout=10)
+                                     capture_output=True, timeout=10,
+                                     env=routed_gh_env())
                         logger.info("Cleaned up test project")
                 except:
                     logger.error("Test project created but cleanup failed - may need manual deletion")
@@ -772,7 +832,11 @@ class GitHubProjectManager:
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
                 capture_output=True,
                 text=True,
-                check=False
+                check=False,
+                # Routed credential (WI-2): a board this credential cannot SEE
+                # is indistinguishable from a board that does not exist, and
+                # this method's answer decides whether one gets created.
+                env=routed_gh_env(),
             )
             
             if result.returncode == 0:
