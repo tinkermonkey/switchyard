@@ -21,10 +21,14 @@ from .manager import ConfigManager, ProjectConfig, WorkflowTemplate
 
 logger = logging.getLogger(__name__)
 
-# Backup retention is NOT declared here. It is age-based, comes from
-# config/retention.py's single RETENTION_DAYS value, and is applied by the
-# nightly sweep in services/data_retention.py -- the same window every
-# Elasticsearch ILM policy uses.
+# Backup retention is NOT declared here, and as of this branch is not applied
+# anywhere: state backups accumulate. The rule that will age them out is
+# age-based, comes from config/retention.py's single RETENTION_DAYS value, and
+# is applied by the nightly sweep in services/data_retention.py -- the same
+# window every Elasticsearch ILM policy uses. None of those three files exist
+# in this branch; they arrive with that change. Until then this is a known,
+# bounded cost (31MB at the time of writing) that scripts/inspect_project_state.py
+# reports so it stays visible.
 #
 # An earlier version of this bounded backups by COUNT ("keep the 10 newest"),
 # which is not aging: ten backups is four days on a busy project and nine
@@ -486,9 +490,9 @@ class GitHubStateManager:
     def backup_state(self, project_name: str) -> str:
         """Create a backup of project state and return backup path.
 
-        Unbounded here on purpose: these are aged out by the shared retention
-        sweep (services/data_retention.py), not pruned on write. See the note
-        beside the imports.
+        Unbounded here on purpose: these are to be aged out by the shared
+        retention sweep (services/data_retention.py, a separate change not yet
+        in this branch), not pruned on write. See the note beside the imports.
         """
         state_file = self._get_project_state_file(project_name)
         if not state_file.exists():
@@ -577,8 +581,37 @@ class GitHubStateManager:
         for stem in stems:
             try:
                 project_config = self.config_manager.get_project_config(stem)
-            except Exception:
-                continue
+            except Exception as e:
+                # A config that will not parse is the STRONGEST evidence that
+                # this function does not know what is orphaned, so it suppresses
+                # the whole run rather than skipping the one config.
+                #
+                # Skipping it and carrying on looks harmless and is not. The
+                # loop exists because a config's filename stem and its declared
+                # project.name are two different strings, and the state
+                # directory is named after the DECLARED one. Drop the declared
+                # name for a config that failed to load and its live state
+                # directory is reported as orphaned, with a removal command
+                # printed under it -- and scripts/inspect_project_state.py's
+                # re-derivation at the point of deletion is no protection,
+                # because it calls this same function and inherits the same
+                # wrong answer. The result is `github_state.yaml`, the only
+                # local record of a project's board and column node IDs, deleted
+                # for a project that is perfectly fine.
+                #
+                # The failures that land here -- a truncated write, a YAML error
+                # mid-edit, a partially-mounted config volume, a permissions gap
+                # -- tend to hit several configs at once, so the blast radius is
+                # plural. This is the same reading as the empty-stems guard
+                # above: cannot see the configs, therefore cannot say.
+                logger.warning(
+                    f"Could not read project config '{stem}', skipping "
+                    f"orphaned-state detection: {e}. A config that cannot be "
+                    f"parsed cannot be shown to have been decommissioned, and "
+                    f"its state directory may be named after a declared "
+                    f"project.name this run is unable to read."
+                )
+                return []
             declared = getattr(project_config, 'name', None)
             if declared:
                 configured.add(declared)

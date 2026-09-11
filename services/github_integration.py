@@ -410,9 +410,20 @@ class GitHubIntegration:
 
     async def has_agent_processed_issue(self, issue_number: int, agent_name: str, repo: Optional[str] = None) -> bool:
         """Check if an agent has already processed this issue by looking for its signature in comments"""
+        # Resolved outside the block below, and caught narrowly: the enclosing
+        # handler catches only CalledProcessError, so _repo_path()'s refusal
+        # would otherwise escape an `-> bool` method that no caller expects to
+        # raise. A broad `except ValueError` around the whole body would not do
+        # -- json.JSONDecodeError IS a ValueError, and swallowing a malformed
+        # `gh` response as "not processed" is the kind of quiet wrong answer
+        # this PR exists to remove.
         try:
             repo_arg = self._repo_path(repo) if repo else ""
+        except ValueError as e:
+            logger.error(f"Failed to check issue comments: {e}")
+            return False
 
+        try:
             cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'comments']
 
             if repo:
@@ -531,13 +542,25 @@ class GitHubIntegration:
         """Get comments that mention @orchestrator-bot for feedback using REST API with rate limiting"""
         try:
             repo_name = repo or self.repo_name
-            endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{issue_number}/comments"
-            
+            try:
+                endpoint = f"/repos/{self._repo_path(repo_name)}/issues/{issue_number}/comments"
+            except ValueError as e:
+                # The handler at the bottom of this method logs at WARNING and
+                # parks the traceback at INFO, which is a reasonable level for
+                # "a comment body was shaped oddly" and the wrong one for "this
+                # instance cannot address any repository at all". In the
+                # repair-cycle container -- the environment #188 was about --
+                # WARNING and INFO are exactly the levels that go to discarded
+                # stdout. Report the misconfiguration at ERROR before the
+                # generic handler can soften it.
+                logger.error(f"Cannot fetch feedback comments: {e}")
+                return []
+
             success, response = get_github_client().rest(
                 method='GET',
                 endpoint=endpoint
             )
-            
+
             if not success:
                 logger.error(f"Failed to fetch feedback comments: {response}")
                 return []
@@ -695,6 +718,11 @@ class GitHubIntegration:
 
                 subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
 
+        except ValueError as e:
+            # See has_agent_processed_issue: the enclosing handler catches only
+            # CalledProcessError, so _repo_path()'s refusal would otherwise
+            # escape a method whose callers do not expect it to raise.
+            logger.error(f"Failed to add labels: {e}")
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to add labels: {e.stderr}")
 
@@ -707,9 +735,18 @@ class GitHubIntegration:
         repo: Optional[str] = None
     ) -> Dict[str, Any]:
         """Create a new issue from agent work"""
+        # Resolved and caught outside the block below for the same reason as in
+        # has_agent_processed_issue: the enclosing handler catches only
+        # CalledProcessError, and a blanket `except ValueError` around the whole
+        # body would also swallow the `int(issue_number)` below -- i.e. report
+        # "not created" for an issue GitHub did create.
         try:
             repo_arg = self._repo_path(repo) if repo else ""
+        except ValueError as e:
+            logger.error(f"Failed to create issue: {e}")
+            return {'success': False, 'error': str(e)}
 
+        try:
             cmd = ['gh', 'issue', 'create', '--title', title, '--body', body]
 
             if repo:
@@ -1018,7 +1055,18 @@ class GitHubIntegration:
         Returns:
             True if successfully marked ready, False otherwise
         """
-        repo_arg = self._repo_path()
+        # Unlike every other _repo_path() call in this class, this one is not
+        # inside the method's try block -- there isn't one at this level, only
+        # a per-attempt try inside the retry loop. Resolving the owner here
+        # without catching would turn a misconfiguration into a ValueError
+        # escaping an `-> bool` method, which is a different contract from the
+        # one every sibling method keeps (log loudly, return the documented
+        # failure value). Resolve once, up front, and report it the same way.
+        try:
+            repo_arg = self._repo_path()
+        except ValueError as e:
+            logger.error(f"Cannot mark PR #{pr_number} ready for review: {e}")
+            return False
 
         for attempt in range(1, max_retries + 1):
             try:

@@ -26,9 +26,15 @@ Two conditions are worth an operator's attention:
   * BACKUP CHURN -- `github_state_backup_*.yaml` files. Reconciliation writes
     one per project per run and nothing has ever read one; 3,196 of them / 31MB
     had accumulated, 612 for a single project. Counted here for visibility, but
-    aged out by the shared retention sweep -- see
-    scripts/inspect_data_retention.py, which owns every age-based rule so that
-    no two places can hold different opinions about the same files.
+    NOT pruned by anything yet. The age-based sweep that will own them
+    (config/retention.py's single RETENTION_DAYS window, applied by
+    services/data_retention.py, inspected with
+    scripts/inspect_data_retention.py) lands in a separate change and is not
+    in this branch -- the count is reported here so the growth is at least
+    visible until it does. Deliberately not bounded by count in the meantime:
+    ten backups is four days on a busy project and nine months on a quiet one,
+    and two mechanisms with two different answers for the same files is what
+    the single retention value exists to prevent.
 
 Removal is opt-in, one project at a time, with the name typed out
 (`--remove-orphan NAME`), and it refuses any name that still has a config.
@@ -81,15 +87,27 @@ def _human(num_bytes: int) -> str:
 
 
 def _configured_projects() -> list:
+    """The configured project stems, or [] if they could not be listed.
+
+    The failure is printed rather than discarded. An empty return feeds two
+    messages that name a specific cause -- "config/projects/ is gitignored as a
+    directory, so a checkout sees zero" -- and one of them guards the only
+    destructive operation in this script. If the listing failed for some other
+    reason (a permissions gap, a missing mount, an API change), telling the
+    operator to "run this inside the orchestrator container" when that is
+    exactly where they are is worse than saying nothing.
+    """
     try:
         return state_manager.config_manager.list_projects()
-    except Exception:
+    except Exception as e:
+        print(f"Could not list project configs: {e!r}", file=sys.stderr)
         return []
 
 
 def collect() -> dict:
     """Everything the report and the JSON output are both derived from."""
     projects_dir = state_manager.projects_state_dir
+    configured = _configured_projects()
     orphaned = set(state_manager.list_orphaned_project_state())
 
     entries = []
@@ -114,7 +132,11 @@ def collect() -> dict:
     return {
         'state_root': str(state_manager.state_root),
         'config_dir': str(getattr(state_manager.config_manager, 'projects_dir', '?')),
-        'configured_count': len(_configured_projects()),
+        'configured_count': len(configured),
+        # Explicit because `orphaned: []` is ambiguous on its own, and the two
+        # readings are opposite: "nothing is orphaned" or "orphan detection did
+        # not run". Anything parsing this output would read the first.
+        'detection_enabled': bool(configured),
         'projects': entries,
         'orphaned': sorted(orphaned),
         'total_backups': sum(e['backup_count'] for e in entries),
@@ -133,9 +155,11 @@ def report(data: dict, orphans_only: bool) -> None:
         # the normal state of any checkout that is not the deployment.
         print()
         print("No project configs are visible from here, so orphaned-state")
-        print("detection is disabled for this run. Run this inside the")
-        print("orchestrator container (or from the deployment checkout), where")
-        print("config/projects/ is populated.")
+        print("detection is disabled for this run. Either config/projects/ is")
+        print("empty -- it is gitignored as a directory, so every checkout that")
+        print("is not the deployment sees zero -- or listing it failed, in")
+        print("which case the reason was printed to stderr above. Run this")
+        print("inside the orchestrator container, where it is populated.")
     print()
 
     entries = [e for e in data['projects'] if e['orphaned']] if orphans_only \
@@ -158,7 +182,9 @@ def report(data: dict, orphans_only: bool) -> None:
     print(f"{len(data['orphaned'])} orphaned, "
           f"{data['total_backups']} backups, "
           f"{_human(data['total_size_bytes'])} total")
-    print("Backups are aged out by scripts/inspect_data_retention.py.")
+    print("Backups are not pruned by anything yet -- the shared age-based")
+    print("retention sweep that will own them is a separate change. Nothing")
+    print("has ever read one; the count above is growth, not state.")
 
     if data['orphaned']:
         print()
@@ -187,10 +213,11 @@ def remove_orphan(name: str) -> int:
         # configured, which is the opposite of true.
         print(f"Refusing to remove '{name}': no project configs are visible "
               f"from here, so nothing can be established to be orphaned.")
-        print(f"config/projects/ ("
+        print(f"Either config/projects/ ("
               f"{getattr(state_manager.config_manager, 'projects_dir', '?')}) "
               f"is empty -- it is gitignored as a directory, so any checkout "
-              f"that is not the deployment sees zero configs.")
+              f"that is not the deployment sees zero configs -- or listing it "
+              f"failed, in which case the reason was printed to stderr above.")
         print("Run this inside the orchestrator container.")
         return 1
 
@@ -199,10 +226,19 @@ def remove_orphan(name: str) -> int:
         if not project_dir.exists():
             print(f"No state directory for '{name}' at {project_dir}")
         else:
-            print(f"Refusing to remove '{name}': it is NOT orphaned -- a config "
-                  f"in config/projects/ still claims it.")
-            print("Remove the config first if this project is being "
-                  "decommissioned.")
+            # Deliberately not phrased as "a config still claims it". Orphan
+            # detection also declines wholesale when a config cannot be parsed
+            # (see GitHubStateManager.list_orphaned_project_state), and from
+            # here the two are one empty list. Asserting the wrong one of them
+            # sends an operator off to look for a config file that is not
+            # there. The refusal is the same either way; the next step is not.
+            print(f"Refusing to remove '{name}': it is not reported as "
+                  f"orphaned.")
+            print("Either a config in config/projects/ still claims it -- by "
+                  "filename or by its declared project.name -- or orphan "
+                  "detection declined this run because a config could not be "
+                  "read (that is logged as a warning). Run this script with no "
+                  "arguments to see which.")
         return 1
 
     size = _dir_size_bytes(project_dir)
