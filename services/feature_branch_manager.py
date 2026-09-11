@@ -335,6 +335,26 @@ class FeatureBranchManager:
             return int(match.group(1))
         return None
 
+    def branch_belongs_to_epic(self, branch_name: Optional[str], epic_id) -> bool:
+        """True if branch_name is one of epic_id's own feature branches.
+
+        The public form of _parse_issue_from_branch_name()'s question, for callers
+        outside this class that need to tell "a different branch of the same epic"
+        apart from "a branch belonging to no epic at all" -- ProjectWorkspaceManager.
+        reconcile_worktree_branch() (#163), which treats the first as adoptable and
+        the second as drift. Kept here rather than reimplemented there so it stays
+        tied to the same parse create_feature_branch_name()/_find_branch_for_parent()
+        use; an epic_id that is not a plain number belongs to no branch under this
+        scheme, which is False, not an error.
+        """
+        if not branch_name:
+            return False
+        try:
+            epic_number = int(str(epic_id).strip())
+        except (TypeError, ValueError):
+            return False
+        return self._parse_issue_from_branch_name(branch_name) == epic_number
+
     def _find_branch_for_parent(self, project_dir: str, parent_issue: int) -> Optional[str]:
         """
         Find the feature branch for a parent issue by querying git.

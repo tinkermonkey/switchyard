@@ -4880,6 +4880,64 @@ def get_all_pipeline_locks():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/epic-worktrees', methods=['GET'])
+def get_epic_worktrees():
+    """
+    Survey every epic worktree staged on disk: its branch, whether that branch
+    has drifted off the epic, and whether it holds uncommitted work.
+
+    The web-UI half of #163's operator entry point (scripts/inspect_epic_worktrees.py
+    is the CLI half). A dispatch refused over a drifted, dirty worktree blocks
+    that epic until a human deals with the directory, and a worktree holding
+    uncommitted work is deliberately skipped by the startup prune sweep — neither
+    is written down anywhere, so without this the only way to see either is to
+    shell into the container and run git by hand.
+
+    Read-only and lock-free by design (see survey_epic_worktrees()): every field
+    is a snapshot that may already have moved. Runs three or four short, purely
+    local git subprocesses per staged worktree — no fetch, nothing that writes the
+    shared base clone — so it is a diagnostic endpoint, not something to poll
+    tightly.
+
+    Query params:
+        project: limit the survey to one project.
+    """
+    try:
+        from services.project_workspace import workspace_manager
+
+        project = request.args.get('project')
+        worktrees = workspace_manager.survey_epic_worktrees(project_name=project)
+
+        return jsonify({
+            'worktrees': worktrees,
+            'total': len(worktrees),
+            'drifted': sum(1 for w in worktrees if w['drifted']),
+            'prune_skipped': sum(1 for w in worktrees if w['prune_skipped']),
+            # A drifted worktree a container is still inside must not be touched —
+            # the opposite recovery to every other clean-drift shape (code review
+            # on #163). It needs no operator action at all only when the row's
+            # uncommitted/unmerged fields say it holds nothing of its own; a
+            # container that was mid-edit leaves that work behind when it exits.
+            'container_live': sum(
+                1 for w in worktrees
+                if w['drifted'] and w.get('container_live') is True
+            ),
+            # Counted separately, NOT folded into the above: None is "docker could
+            # not be asked", so there may be nothing in there that will ever exit
+            # and clear it. Both are refused and neither may be touched, but only
+            # the confirmed-live one resolves on its own (code review on #163).
+            'container_liveness_unknown': sum(
+                1 for w in worktrees
+                if w['drifted'] and w.get('container_live') is None
+            ),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Failed to survey epic worktrees: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/pipeline-queue/<project>/<board>/refresh', methods=['POST'])
 def refresh_pipeline_queue_order(project, board):
     """

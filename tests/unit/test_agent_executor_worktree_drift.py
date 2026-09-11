@@ -1,0 +1,395 @@
+"""
+Tests for how execute_agent() handles resolve_workspace()'s drifted-worktree
+refusal (#163).
+
+The condition is the same one #149's commit-time verification refuses over -- an
+epic worktree on a branch belonging to no epic, holding uncommitted work nobody
+has claimed -- caught BEFORE an agent runs against it rather than after. Two
+things have to follow from that:
+
+  * it must not be treated as an ordinary dispatch failure. Three of those reach
+    project_monitor's MAX_CONSECUTIVE_DISPATCH_FAILURES before anything durable
+    happens, and the two dispatches in between would each run a container against
+    the same drifted directory, piling their work on top of the work already
+    sitting there uncommitted;
+  * the operator has to be told where the work is and what to do with it. #163's
+    first requirement on any mechanism that stops production work is a supported
+    way to un-wedge it -- named in the comment, the way the push-failure comment
+    names release_lock.py.
+"""
+
+import os
+import pytest
+
+if not os.path.isdir('/app'):
+    pytest.skip("Requires Docker container environment", allow_module_level=True)
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from services.agent_executor import AgentExecutor
+from services.project_workspace import WorktreeBranchDriftError
+
+
+@pytest.fixture
+def agent_executor():
+    with patch('services.agent_executor.get_observability_manager'), \
+         patch('services.agent_executor.PipelineFactory'), \
+         patch('services.agent_executor.GitHubIntegration'):
+        return AgentExecutor()
+
+
+def _drift_error(dirty=True, unmerged_commits=None, container_live=False):
+    return WorktreeBranchDriftError(
+        "Epic worktree for test-project epic #42 at /workspace/.orchestrator/"
+        "worktrees/test-project/42 has drifted onto a branch that belongs to no "
+        "epic.",
+        project_name='test-project',
+        epic_id='42',
+        worktree_path='/workspace/.orchestrator/worktrees/test-project/42',
+        expected_branch='feature/issue-42-epic',
+        found_branch='scratch',
+        dirty=dirty,
+        unmerged_commits=unmerged_commits,
+        container_live=container_live,
+    )
+
+
+async def _run(agent_executor, resolve_error):
+    """Drive execute_agent() far enough to hit the workspace-resolution block."""
+    task_context = {
+        'issue_number': 903,
+        'column': 'Development',
+        'board': 'Dev Board',
+        'workspace_type': 'issues',
+        'pipeline_run_id': 'run-903',
+    }
+    tracker = MagicMock()
+    tracker.load_state.return_value = {'execution_history': []}
+
+    project_config = MagicMock()
+    project_config.github = {'org': 'test-org', 'repo': 'test-repo'}
+
+    fake_run = MagicMock()
+    fake_run.issue_number = 903
+
+    prm = MagicMock()
+    prm.get_pipeline_run.return_value = fake_run
+    prm.resolve_workspace = AsyncMock(side_effect=resolve_error)
+    prm.mark_failed.return_value = True
+
+    github = MagicMock()
+    github.post_comment = AsyncMock()
+
+    with patch('services.agent_executor.config_manager') as mock_config, \
+         patch('services.work_execution_state.work_execution_tracker', tracker), \
+         patch('services.pipeline_run.get_pipeline_run_manager', return_value=prm), \
+         patch('services.github_integration.GitHubIntegration', return_value=github), \
+         patch.object(agent_executor.obs, 'emit_task_received'), \
+         patch.object(agent_executor.obs, 'emit_agent_initialized'):
+        mock_config.get_project_config.return_value = project_config
+
+        raised = None
+        try:
+            await agent_executor.execute_agent(
+                agent_name='developer',
+                project_name='test-project',
+                task_context=task_context,
+            )
+        except Exception as e:
+            raised = e
+
+    return {
+        'exception': raised,
+        'tracker': tracker,
+        'prm': prm,
+        'github': github,
+    }
+
+
+class TestADriftedWorktreeBlocksBeforeDispatch:
+
+    @pytest.mark.asyncio
+    async def test_it_retains_the_board_lock_on_the_first_occurrence(self, agent_executor):
+        from agents.non_retryable import NonRetryableAgentError
+
+        harness = await _run(agent_executor, _drift_error())
+
+        assert isinstance(harness['exception'], NonRetryableAgentError)
+        harness['prm'].mark_failed.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_comment_names_the_worktree_the_branches_and_the_recovery(
+        self, agent_executor
+    ):
+        harness = await _run(agent_executor, _drift_error())
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Wrong Branch' in body
+        assert 'scratch' in body
+        assert 'feature/issue-42-epic' in body
+        assert '/workspace/.orchestrator/worktrees/test-project/42' in body
+        # #163's first requirement: the operator entry point is named, not left
+        # as "go rm a file inside the container".
+        assert 'scripts/inspect_epic_worktrees.py' in body
+        assert 'scripts/release_lock.py' in body
+        # It happened before any agent ran, so the comment must not claim the
+        # agent completed work.
+        assert 'no agent was dispatched' in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_in_progress_entry_is_still_closed_out(self, agent_executor):
+        """The refusal runs before execute_agent()'s own big try/except, so
+        without the explicit record the 'in_progress' entry never gets a terminal
+        outcome and should_execute_work() answers "work_already_in_progress" on
+        every subsequent poll."""
+        harness = await _run(agent_executor, _drift_error())
+
+        outcomes = [
+            call.kwargs.get('outcome')
+            for call in harness['tracker'].record_execution_outcome.call_args_list
+        ]
+        assert outcomes == ['failure']
+
+    @pytest.mark.asyncio
+    async def test_the_comment_does_not_claim_uncommitted_work_that_is_not_there(
+        self, agent_executor
+    ):
+        """reconcile_worktree_branch() returns DRIFTED in four distinct shapes and
+        only one of them is "it holds uncommitted changes" (code review on #163).
+
+        Telling an operator to `git reset --hard` / `git clean -fd` a worktree
+        `git status` reports as clean sends them to run a no-op, conclude the
+        worktree is now fine, release the lock, and hit the identical refusal on
+        the next poll -- while step 3's promise that the block self-clears is
+        false for the shape that has nothing in it to clear."""
+        harness = await _run(
+            agent_executor, _drift_error(dirty=False, unmerged_commits=0)
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'holds uncommitted changes' not in body
+        assert 'nothing uncommitted in it' in body
+        assert 'HEAD could not be moved back' in body
+        # The actionable remedy, not "commit or discard work that is not there".
+        assert 'checkout feature/issue-42-epic' in body
+        assert 'does **not** clear itself' in body
+        assert 'reset --hard' not in body
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_working_tree_is_described_as_unreadable(
+        self, agent_executor
+    ):
+        """dirty is None means `git status --porcelain` itself failed -- most
+        plausibly a stale index.lock left by a killed agent-side git. Asserting
+        uncommitted changes exist is a claim the verdict never made."""
+        harness = await _run(agent_executor, _drift_error(dirty=None))
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'working tree state could not be read' in body
+        assert 'index.lock' in body
+
+    @pytest.mark.asyncio
+    async def test_commits_on_the_drifted_branch_are_named_as_commits(
+        self, agent_executor
+    ):
+        """A clean tree on a branch carrying its own commits is a different thing
+        to go looking for -- and a different recovery -- than a dirty tree."""
+        harness = await _run(
+            agent_executor, _drift_error(dirty=False, unmerged_commits=3)
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert '3 commit(s)' in body
+        assert 'not lost' in body
+        assert 'feature/issue-42-epic..scratch' in body
+
+    @pytest.mark.asyncio
+    async def test_the_dirty_case_keeps_its_wording(self, agent_executor):
+        """The control: the shape the comment was written for is unchanged."""
+        harness = await _run(agent_executor, _drift_error(dirty=True))
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'holds uncommitted changes' in body
+        assert 'reset --hard' in body
+        assert 'restores the epic' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_is_never_described_as_a_failed_checkout(
+        self, agent_executor
+    ):
+        """Three drift shapes carry byte-identical dirty=False/unmerged==0, and
+        this one's recovery is the OPPOSITE of the other two (code review on
+        #163). The comment told an operator that HEAD "could not be moved back",
+        printed `git -C <worktree> checkout <epic branch>` as step 2 -- a human
+        rewriting the working tree underneath a mid-run agent container, the exact
+        thing reconcile_worktree_branch()'s liveness gate refused to do -- and
+        then claimed the block never clears, when it clears by itself the moment
+        that container exits."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=0, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'HEAD could not be moved back' not in body
+        assert 'checkout feature/issue-42-epic' not in body
+        assert 'reset --hard' not in body
+        assert 'does **not** clear itself' not in body
+        assert 'Do not touch that worktree' in body
+        assert 'clears itself' in body
+        # The supported way to stop it, for an operator who needs the epic moving
+        # sooner than the container will finish.
+        assert 'agents/kill' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_suppresses_the_destructive_dirty_recovery(
+        self, agent_executor
+    ):
+        """The shape a live agent container ACTUALLY produces: it is mid-edit, so
+        `git status --porcelain` is non-empty and the verdict is the dirty one.
+        reconcile_worktree_branch() used to answer the liveness question only on
+        the clean path, so this arrived with container_live=False, took the dirty
+        branch, and posted "discard it with `git reset --hard` / `git clean -fd`"
+        about a directory a running agent was writing into (code review on #163)
+        -- by hand, the exact tree rewrite the verdict's own liveness gate
+        refused to perform."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=True, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'reset --hard' not in body
+        assert 'clean -fd' not in body
+        assert 'Do not touch that worktree' in body
+        # Still honest about what is in there -- the live shape is no longer
+        # assumed to be the empty one.
+        assert 'holds uncommitted changes' in body
+        # ...and not told, two paragraphs later, that it therefore needs nobody:
+        # when that container exits the tree is still dirty and HEAD is still
+        # drifted, and the container's own auto-commit is refused by #149's
+        # _verify_commit_branch() for the very reason this dispatch was (code
+        # review on #163).
+        assert 'clears itself' not in body
+        assert 'Waiting is **not** the whole recovery' in body
+        assert 'docker ps' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_over_its_own_commits_says_what_is_there(
+        self, agent_executor
+    ):
+        """The shape that made the live arm's "nothing in it needs preserving"
+        false: an agent that committed onto the drifted branch leaves an EMPTY
+        porcelain, so the verdict is the unmerged one -- which now carries the
+        liveness answer and lands here (code review on #163). Those commits are
+        reachable from a local ref nothing pushes, and telling an operator the
+        directory holds nothing worth keeping is how `branch -D` deletes them."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=3, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'nothing in it needs preserving' not in body
+        assert '3 commit(s)' in body
+        assert 'clears itself' not in body
+        assert 'Waiting is **not** the whole recovery' in body
+        # The do-not-touch invariant still holds: no mutating command at all while
+        # something may be writing in there.
+        assert 'reset --hard' not in body
+        assert 'checkout feature/issue-42-epic' not in body
+        assert 'Do not touch that worktree' in body
+
+    @pytest.mark.asyncio
+    async def test_a_live_container_over_an_uncomparable_branch_does_not_self_clear(
+        self, agent_executor
+    ):
+        """unmerged_commits=None on a clean tree is "the count could not be taken",
+        which reconcile treats as "there is something here" -- so it must not be
+        reported as the empty shape either (code review on #163)."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=None, container_live=True),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'nothing in it needs preserving' not in body
+        assert 'could not be established whether that branch holds commits' in body
+        assert 'clears itself' not in body
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_liveness_check_over_work_names_the_work(
+        self, agent_executor
+    ):
+        """Both halves are unresolved here: nothing may exit to unblock it, AND the
+        work outlives whatever is (or is not) in there. The None arm used to send
+        the operator straight from `docker ps` to release_lock.py, leaving the
+        dirty tree that refuses the very next dispatch untouched (code review on
+        #163)."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=True, container_live=None),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'does **not** clear itself' in body
+        assert 'docker ps' in body
+        assert 'committing it onto' in body
+        assert 'release_lock.py' in body
+
+    @pytest.mark.asyncio
+    async def test_an_unanswerable_liveness_check_does_not_promise_self_clearing(
+        self, agent_executor
+    ):
+        """container_live=None is "docker could not be asked", and it used to be
+        reported as True -- whose whole story is "do nothing, it clears itself
+        when the container exits". mark_failed() retains the board's pipeline lock,
+        so there is no next dispatch to clear it, and with docker merely slow there
+        may be no container either: the board sat wedged behind a comment saying no
+        action was needed (code review on #163)."""
+        harness = await _run(
+            agent_executor,
+            _drift_error(dirty=False, unmerged_commits=0, container_live=None),
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        assert 'Do not touch that worktree' in body
+        assert 'reset --hard' not in body
+        assert 'does **not** clear itself' in body
+        assert 'docker ps' in body
+        assert 'release_lock.py' in body
+
+    @pytest.mark.asyncio
+    async def test_the_commits_recovery_leads_with_moving_head(self, agent_executor):
+        """`branch -D <found_branch>` is a command git always refuses here: that
+        branch is by construction the one checked out in this very worktree. And
+        the count is "commits the drifted branch has that the epic's does not",
+        which for `main` or a sibling epic's branch never reaches zero -- so the
+        cherry-pick/merge advice never terminated and the one instruction that
+        does clear it, `git checkout <epic branch>`, was printed only for the
+        OTHER clean shape (code review on #163)."""
+        harness = await _run(
+            agent_executor, _drift_error(dirty=False, unmerged_commits=3)
+        )
+
+        body = harness['github'].post_comment.await_args[0][1]
+        checkout_at = body.index('checkout feature/issue-42-epic')
+        assert checkout_at < body.index('branch -D'), (
+            "moving HEAD is what unblocks the epic and what makes `branch -D` "
+            "possible at all, so it has to come first"
+        )
+        assert 'does **not** clear itself' in body
+        assert '`main`' in body
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_resolution_failure_is_not_escalated_this_way(
+        self, agent_executor
+    ):
+        """The control: only the drift verdict gets the block-and-comment
+        treatment. Everything else keeps the generic record-and-propagate path,
+        this codebase's uniform retry/escalation pattern."""
+        harness = await _run(agent_executor, RuntimeError("worktree add failed"))
+
+        assert isinstance(harness['exception'], RuntimeError)
+        harness['prm'].mark_failed.assert_not_called()
+        harness['github'].post_comment.assert_not_awaited()

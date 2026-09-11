@@ -260,6 +260,20 @@ class EventType(Enum):
     BRANCH_CONFLICT_DETECTED = "branch_conflict_detected"
     BRANCH_STALE_DETECTED = "branch_stale_detected"
     BRANCH_SELECTION_ESCALATED = "branch_selection_escalated"
+    # An epic worktree found on a branch belonging to no epic -- an agent
+    # container's own git having moved HEAD in the bind-mounted directory (#163).
+    # DETECTED means the dispatch was refused over it (uncommitted work was left
+    # exactly where it is); REPAIRED means the tree was clean, so HEAD was simply
+    # put back and the dispatch continued.
+    WORKTREE_BRANCH_DRIFT_DETECTED = "worktree_branch_drift_detected"
+    WORKTREE_BRANCH_DRIFT_REPAIRED = "worktree_branch_drift_repaired"
+    # UNCHECKED is the gate abstaining, not a third drift outcome: git could not
+    # read HEAD at all, so the dispatch proceeded on the branch it had already
+    # resolved. Its own type rather than DETECTED with a status field, so a count
+    # of drifts stays a count of drifts -- but findable, because an abstention by
+    # the check that exists to stop wrong-branch dispatches is worth finding
+    # (code review on #163).
+    WORKTREE_BRANCH_DRIFT_UNCHECKED = "worktree_branch_drift_unchecked"
 
     # Issue Management
     SUB_ISSUE_CREATED = "sub_issue_created"
@@ -536,6 +550,9 @@ class ObservabilityManager:
             EventType.BRANCH_CONFLICT_DETECTED,
             EventType.BRANCH_STALE_DETECTED,
             EventType.BRANCH_SELECTION_ESCALATED,
+            EventType.WORKTREE_BRANCH_DRIFT_DETECTED,
+            EventType.WORKTREE_BRANCH_DRIFT_REPAIRED,
+            EventType.WORKTREE_BRANCH_DRIFT_UNCHECKED,
             # Issue Management
             EventType.SUB_ISSUE_CREATED,
             EventType.SUB_ISSUE_CREATION_FAILED,
