@@ -524,10 +524,14 @@ async def queue_dev_environment_setup(
         # rebuild. Returning instead leaves the state file and the queue
         # agreeing -- nothing marked, nothing queued -- and that same next poll
         # retries the whole check-then-mark.
+        # (#198) The tag belongs to the dev-container environment, which
+        # several projects may share -- never compose it from the project name.
+        from services.dev_container_environment import image_tag_for
+
         marked = dev_container_state.set_status(
             project,
             DevContainerStatus.IN_PROGRESS,
-            image_name=f"{project}-agent:latest"
+            image_name=image_tag_for(project)
         )
         if not marked:
             logger.error(

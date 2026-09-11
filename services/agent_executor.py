@@ -1908,6 +1908,27 @@ class AgentExecutor:
         if hasattr(agent_config, 'timeout') and agent_config.timeout:
             context['agent_hard_timeout'] = agent_config.timeout
 
+        # Dev-container environment identifiers (#198).
+        #
+        # dev_container_image_tag is the COMPLETE, FINAL tag string, handed to
+        # the agent to copy verbatim rather than compose. Before environments
+        # existed, the image tag and the checkout path were always the same
+        # identifier, so `-t {PROJECT_NAME}-agent:latest ... /workspace/
+        # {PROJECT_NAME}` was self-consistent. With a shared environment they
+        # diverge -- the tag is the environment's, the path stays the
+        # project's -- and asking a model to keep two nearly-identical
+        # identifiers apart on every run is the kind of instruction that works
+        # in testing and then quietly builds a correct image under the wrong
+        # name, which reads forever after as "not built".
+        #
+        # Set for every agent, not just the dev-environment ones: it costs
+        # nothing, and a template that references it must not silently render
+        # empty for some other agent.
+        from services.dev_container_environment import environment_for, image_tag_for
+
+        context['dev_container_environment'] = environment_for(project_name)
+        context['dev_container_image_tag'] = image_tag_for(project_name)
+
         return context
 
     async def _post_agent_output_to_github(

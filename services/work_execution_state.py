@@ -3897,6 +3897,8 @@ class WorkExecutionStateTracker:
                                     # rather than contended) and left for the operator.
                                     if agent == 'dev_environment_verifier':
                                         from services.dev_container_state import DevContainerStatus
+                                        # (#198) environment-scoped tag
+                                        from services.dev_container_environment import image_tag_for
                                         _transition_dev_container_state(
                                             project_name,
                                             DevContainerStatus.VERIFIED,
@@ -3905,7 +3907,7 @@ class WorkExecutionStateTracker:
                                                 "but state was not VERIFIED"
                                             ),
                                             skip_when=(DevContainerStatus.VERIFIED,),
-                                            image_name=f"{project_name}-agent:latest",
+                                            image_name=image_tag_for(project_name),
                                         )
 
                                     try:

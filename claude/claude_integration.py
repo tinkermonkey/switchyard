@@ -244,7 +244,38 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     )
 
     if agent_holds_build_window(agent):
+        # (#198) Capture the status BEFORE queueing for the lock, so the
+        # re-read after acquiring can tell "another member of this shared
+        # dev-container environment built it while I waited" (skip) from "it
+        # was already built and an operator is deliberately rebuilding"
+        # (proceed). See build_already_done_by_another_member().
+        from services.dev_container_build_lock import (
+            build_already_done_by_another_member,
+        )
+        from services.dev_container_state import dev_container_state
+
+        status_before_wait = dev_container_state.get_status(project)
+
         async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
+            completed = build_already_done_by_another_member(project, status_before_wait)
+            if completed is not None:
+                from services.dev_container_environment import environment_for
+
+                environment = environment_for(project)
+                logger.info(
+                    "Skipping %s for %s: dev-container environment %s reached %s "
+                    "while this run waited for the build lock (built by another "
+                    "member of the environment)",
+                    agent, project, environment, completed.value,
+                )
+                return (
+                    f"## Dev container environment `{environment}` already "
+                    f"{completed.value}\n\n"
+                    f"Another project sharing this dev-container environment "
+                    f"completed the build while this run was waiting for the build "
+                    f"lock, so `{agent}` had nothing to do. No image was rebuilt.\n"
+                )
+
             return await _run_locally_under_checkout_lock(
                 prompt, context, agent, project, work_dir_for_lock, issue_number_for_dev_lock
             )

@@ -113,8 +113,23 @@ class DevContainerStateManager:
         logger.info(f"DevContainerStateManager initialized with state_dir: {state_dir}")
 
     def get_state_file(self, project_name: str) -> Path:
-        """Get the state file path for a project"""
-        return self.state_dir / f"{project_name}.yaml"
+        """State file for the dev-container ENVIRONMENT `project_name` uses (#198).
+
+        Resolution happens here, at the one place that turns a project into a
+        path, so every accessor on this class -- reads and writes alike -- keys
+        on the environment without each having to remember to resolve.
+
+        Unlike the rejected owner/sharer design, writes resolve too: under
+        environments every member is equally entitled to build, and the first
+        one to get the lock does. There is no "borrowing" member whose writes
+        would need refusing.
+
+        Identity for any project that has not opted in, so an unconfigured
+        deployment reads and writes exactly the paths it always did.
+        """
+        from services.dev_container_environment import environment_for
+
+        return self.state_dir / f"{environment_for(project_name)}.yaml"
 
     def get_status(self, project_name: str) -> DevContainerStatus:
         """
@@ -340,6 +355,9 @@ class DevContainerStateManager:
         """
         cleared = 0
         for state_file in sorted(self.state_dir.glob('*.yaml')):
+            # An ENVIRONMENT name (#198) -- the project's own name unless it
+            # opted into a shared one. Resolution is identity for a name that
+            # is not itself a project, so this reads back the same file.
             project_name = state_file.stem
             state = self._read_state(project_name)
             if not state.get('pending_operation'):
@@ -852,16 +870,25 @@ class DevContainerStateManager:
 
     def get_all_statuses(self) -> Dict[str, DevContainerStatus]:
         """
-        Get status for all projects
+        Status of every dev-container ENVIRONMENT on disk.
+
+        Keys are environment names, which for a project that has not opted
+        into a shared environment is its own name (#198) -- so this reads as
+        "per project" for any deployment that configures no environments.
+        Where projects DO share one, the shared environment appears once, not
+        once per member.
 
         Returns:
-            Dict mapping project names to their dev container status
+            Dict mapping environment names to their dev container status
         """
         statuses = {}
 
         for state_file in self.state_dir.glob("*.yaml"):
-            project_name = state_file.stem
-            statuses[project_name] = self.get_status(project_name)
+            # Already an environment name; get_status() resolves its argument,
+            # and resolution is identity for a name that is not a project, so
+            # this lands on the file it was read from either way.
+            environment = state_file.stem
+            statuses[environment] = self.get_status(environment)
 
         return statuses
 

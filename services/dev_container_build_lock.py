@@ -374,6 +374,23 @@ BUILD_WINDOW_AGENTS = frozenset({"dev_environment_setup", "dev_environment_verif
 # retry is the intended behavior, not a bug -- see project_checkout_lock.py's
 # own "Blocking vs failing" section for the full reasoning, which applies
 # unchanged here.
+# One dev_environment_setup agent timeout (3600s, config/foundations/agents.yaml)
+# plus headroom -- see CLAUDE.md on keeping these two calibrated together.
+#
+# (#198) Several projects can now share one dev-container environment and
+# therefore contend for this one lock. The budget still covers ONE build, not
+# N, and that holds only because of two things that must stay true:
+#
+#   * a member whose environment is already VERIFIED never acquires at all
+#     (the caller checks first, and dev_container_build_lock_if_free_* exists
+#     for exactly this), so the steady state produces no contention; and
+#   * a member that DID wait re-reads state on acquiring and stands down if
+#     another member finished meanwhile -- see
+#     build_already_done_by_another_member(). That is what makes the queue
+#     drain at `1 x build + N x epsilon` instead of `N x build`.
+#
+# Remove either and N members sharing an environment can serialize N full
+# builds behind this timeout, and the last one in the queue will raise.
 DEFAULT_TIMEOUT_SECONDS = 3700.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 
@@ -416,6 +433,76 @@ def agent_holds_build_window(agent: Optional[str]) -> bool:
 # shared loops, so this module no longer imports them directly.
 
 
+def build_already_done_by_another_member(
+    project: str, status_before_wait: object
+) -> object:
+    """The status another member reached while this caller waited for the lock,
+    or None if this caller should go ahead and build (#198).
+
+    Double-checked locking. Several projects can share one dev-container
+    environment and any of them may build it, so a member that queued behind
+    the lock must re-read state after acquiring: if someone else finished the
+    build during the wait, rebuilding it is pure waste, and the whole
+    timeout budget below assumes the queue drains at `1 x build + N x epsilon`
+    rather than `N x build`.
+
+    Why this compares against the status BEFORE the wait rather than just
+    testing for VERIFIED: an operator re-running dev_environment_setup on an
+    already-VERIFIED project is a legitimate, deliberate rebuild (that is how
+    a Dockerfile change gets applied), and must not be silently skipped. Only
+    a transition that happened *while we were blocked* means someone else did
+    our work for us.
+
+    BLOCKED counts as well as VERIFIED. A failed build must not fan out into
+    one failed build per member: DevContainerStatus.BLOCKED already means
+    "failed to build a working image; stop retrying", so a member arriving
+    after that failure should respect it rather than immediately re-attempting
+    the same broken build N-1 more times.
+
+    Returns the new status (truthy) when the caller should stand down, else
+    None.
+    """
+    from services.dev_container_state import DevContainerStatus, dev_container_state
+
+    terminal = (DevContainerStatus.VERIFIED, DevContainerStatus.BLOCKED)
+    if status_before_wait in terminal:
+        # Already in a terminal state before we waited -- this is a deliberate
+        # re-run, not a redundant one.
+        return None
+
+    status_now = dev_container_state.get_status(project)
+    if status_now in terminal:
+        return status_now
+    return None
+
+
+def _resource_key(project: str) -> str:
+    """The resource this lock actually protects, for `project` (#198).
+
+    A dev container is a named ENVIRONMENT, and several projects on the same
+    repository can share one. The physical resource being serialized -- the
+    `{environment}-agent:latest` tag, its Docker build, and
+    state/dev_containers/{environment}.yaml -- is therefore per-environment,
+    not per-project. Keying this lock on the project instead would let two
+    members of one environment build the same tag concurrently, which is
+    precisely the race this lock exists to close (#56).
+
+    Identity for any project that has not opted into an environment, so every
+    existing deployment keys on exactly the string it always did and this
+    lock's behaviour is unchanged. Only the key differs; acquisition,
+    heartbeat, timeout and release are untouched.
+    """
+    from services.dev_container_environment import environment_for
+
+    environment = environment_for(project)
+    if environment != project:
+        logger.debug(
+            f"dev_container_build lock for project {project!r} keys on shared "
+            f"environment {environment!r}"
+        )
+    return environment
+
+
 @asynccontextmanager
 async def dev_container_build_lock_async(
     project: str,
@@ -456,6 +543,9 @@ async def dev_container_build_lock_async(
     Raises:
         DevContainerBuildLockTimeoutError: not acquired within timeout_seconds.
     """
+    # Key on the environment, not the project (#198) -- identity unless
+    # this project opted into a shared dev-container environment.
+    project = _resource_key(project)
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
     # Publishes the wait AND the hold to project_checkout_lock's in-process
@@ -515,6 +605,9 @@ def dev_container_build_lock_sync(
     `facade` test-injection parameter and the `issue_number` log-only
     caveat); identical semantics otherwise.
     """
+    # Key on the environment, not the project (#198) -- identity unless
+    # this project opted into a shared dev-container environment.
+    project = _resource_key(project)
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     with _tracked_resource_activity(
@@ -629,6 +722,9 @@ async def dev_container_build_lock_attempt_async(
             dev_container_build_lock_async().
         facade: injected ProjectResourceLockManager -- for tests only.
     """
+    # Key on the environment, not the project (#198) -- identity unless
+    # this project opted into a shared dev-container environment.
+    project = _resource_key(project)
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
     # Off the event loop for the same reason the polling variant is: this is a
@@ -671,6 +767,9 @@ async def dev_container_build_lock_if_free_async(
     See that function for the full contract, and for when the refusal reason
     matters instead.
     """
+    # Key on the environment, not the project (#198) -- identity unless
+    # this project opted into a shared dev-container environment.
+    project = _resource_key(project)
     async with dev_container_build_lock_attempt_async(
         project, issue_number, facade
     ) as (acquired, _reason):
@@ -693,6 +792,9 @@ def dev_container_build_lock_if_free_sync(
     Unlike dev_container_build_lock_sync() this never sleeps, so it is safe on
     startup and inside another file lock.
     """
+    # Key on the environment, not the project (#198) -- identity unless
+    # this project opted into a shared dev-container environment.
+    project = _resource_key(project)
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()
     can_execute, reason = facade.acquire_resource(project, RESOURCE_NAME, holder_id)

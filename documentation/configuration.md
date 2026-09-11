@@ -380,6 +380,53 @@ agent_customizations:
     retries: 5
 ```
 
+### `dev_container` section
+
+Optional. Nested under `project`. Lets several project configs that point at the
+**same repository** share one dev-container image instead of each building an
+identical copy.
+
+| Field | Type | Description |
+|---|---|---|
+| `environment` | string | Name of the dev-container environment this project participates in. Defaults to the project's own name. |
+
+```yaml
+# features.yaml, bugs.yaml, infra.yaml — the same block in each
+dev_container:
+  environment: "monorepo"
+```
+
+Projects naming the same environment share one image tag
+(`monorepo-agent:latest`), one state file
+(`state/dev_containers/monorepo.yaml`) and one build lock. With the field
+absent — the default, and every project that has not opted in — the
+environment is the project's own name, which is exactly the keying that
+applied before environments existed.
+
+**There is no owner.** Membership is symmetric and the build is first-come:
+whichever member reaches its Environment Support board first acquires the
+build lock and builds; members arriving afterwards find the environment
+already verified and do nothing. Any member can build it, so removing every
+other config leaves the survivor able to build unaided. This is deliberate —
+an earlier design had one project own the image, which made the others
+undispatchable until that project's *board pipeline* had run, with no way to
+see or trigger the thing blocking them.
+
+**Only the image is shared.** Each project keeps its own checkout at
+`/workspace/<project>`; the dev-container environment affects the image, its
+state and its build lock, nothing else. Boards, labels, branches and pipeline
+state remain keyed per project.
+
+Validation rejects, at config load:
+
+- members of one environment whose `github.repo_url` differ — the image bakes
+  one repository's dependencies, so sharing across repositories would run
+  agents against the wrong environment
+- an environment name that is not a valid Docker tag component, since it
+  becomes one verbatim
+- an environment named after a *different* project that has not opted into it,
+  which would silently couple two unrelated projects' images
+
 ### `orchestrator` section
 
 Sits at the top level of the file (sibling to `project`, not nested under it).

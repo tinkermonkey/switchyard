@@ -116,12 +116,58 @@ class DevEnvironmentVerifierAgent(PipelineStage):
         if status_match:
             status = status_match.group(1).strip().upper()
             if status == "APPROVED":
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.VERIFIED,
-                    image_name=f"{project_name}-agent:latest",
+                # (#198) The tag belongs to the dev-container ENVIRONMENT, which
+                # several projects may share -- never compose it from the project
+                # name here.
+                from services.dev_container_environment import (
+                    environment_for,
+                    image_tag_for,
                 )
-                logger.info("Marked %s dev container as VERIFIED", project_name)
+
+                expected_tag = image_tag_for(project_name)
+                environment = environment_for(project_name)
+
+                # ASSERT, don't trust (#198). The setup agent issues the
+                # `docker build` itself from inside its own Claude Code session,
+                # so the tag is produced by a model following a prompt. Before
+                # environments existed the tag and the checkout path were the
+                # same identifier and a mistake was near-impossible; now they
+                # differ, and a build tagged from the project name instead of
+                # the environment would be a perfectly good image under a name
+                # nothing ever reads -- surfacing forever after as "not built"
+                # with no indication why. Checking here converts that into one
+                # legible failure naming both tags.
+                if not dev_container_state.verify_image_exists(
+                    project_name, image_name=expected_tag
+                ):
+                    error_message = (
+                        f"Verifier approved the environment but the expected image "
+                        f"tag {expected_tag!r} does not exist (or is not a genuine "
+                        f"agent environment). The build most likely tagged the image "
+                        f"after the project name instead of the dev-container "
+                        f"environment {environment!r}. Re-run dev_environment_setup; "
+                        f"it must use context['dev_container_image_tag'] verbatim."
+                    )
+                    dev_container_state.set_status(
+                        project_name=project_name,
+                        status=DevContainerStatus.BLOCKED,
+                        error_message=error_message[:200],
+                    )
+                    logger.error(
+                        "Refusing to mark %s VERIFIED: expected image %s is missing",
+                        project_name, expected_tag,
+                    )
+                else:
+                    dev_container_state.set_status(
+                        project_name=project_name,
+                        status=DevContainerStatus.VERIFIED,
+                        image_name=expected_tag,
+                    )
+                    logger.info(
+                        "Marked dev container environment %s as VERIFIED (image %s, "
+                        "requested by project %s)",
+                        environment, expected_tag, project_name,
+                    )
             elif status == "BLOCKED":
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
