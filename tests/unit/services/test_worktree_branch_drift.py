@@ -30,6 +30,7 @@ resolution, so it cannot outlive the drift and there is no quarantine to clear.
 """
 
 import json
+import subprocess
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -178,6 +179,44 @@ class TestTheOrdinaryCases:
         assert verdict.status is WorktreeBranchStatus.UNKNOWN
         assert verdict.branch == EPIC_BRANCH
         assert not git.ran('checkout')
+
+    def test_an_unreadable_head_says_so_in_the_log(self, manager, caplog):
+        """_read_worktree_head() ended in a bare `except Exception: return None,
+        False` with no logging at all, and returned a non-zero exit the same way
+        -- alone among the helpers this method uses (code review on #163). It
+        resolves to UNKNOWN, the one verdict that neither blocks nor repairs, so
+        without a line here the whole gate could abstain and leave no trace of
+        why anywhere."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'):
+            _reconcile(manager, FakeGit(head=None, head_rc=128))
+            _reconcile(manager, FakeGit(head=None, head_rc=128))
+
+        messages = [r.message for r in caplog.records]
+        assert any(
+            'Could not read the checked-out branch' in m and 'rev-parse rc=128' in m
+            for m in messages
+        )
+
+    def test_an_unrunnable_head_read_says_so_in_the_log(self, manager, caplog):
+        """The exception half of the same gap -- a `rev-parse` that times out
+        under load is the realistic way this happens."""
+        import logging
+
+        def boom(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        with caplog.at_level(logging.WARNING, logger='services.project_workspace'), \
+             patch('services.project_workspace.subprocess.run', side_effect=boom):
+            verdict = manager.reconcile_worktree_branch(
+                'my-project', '42', WORKTREE, EPIC_BRANCH, issue_number=101
+            )
+
+        assert verdict.status is WorktreeBranchStatus.UNKNOWN
+        assert any(
+            'Could not read the checked-out branch' in r.message for r in caplog.records
+        )
 
 
 class TestADetachedHeadIsDrift:
@@ -449,9 +488,97 @@ class TestALiveContainerIsNeverRepairedUnderneath:
         verdict = _reconcile(manager, git)
 
         assert verdict.status is WorktreeBranchStatus.DRIFTED
-        assert verdict.container_live is True
+        assert verdict.container_live is None
         assert 'could not be established' in verdict.detail
         assert not git.ran('checkout')
+
+    def test_unanswerable_does_not_promise_to_clear_itself(self, manager):
+        """`None` used to be reported as container_live=True, i.e. byte-identical
+        to a CONFIRMED live container -- and that shape's whole operator story is
+        "do nothing, it clears itself when the container exits". With mark_failed()
+        retaining the board's pipeline lock there is no next dispatch to clear it,
+        and with docker merely slow there may be no container either, so the board
+        sat wedged behind advice that said no action was needed (code review on
+        #163). Both still refuse; only one self-clears."""
+        unanswerable = _reconcile(
+            manager,
+            FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH], docker_rc=1),
+        )
+
+        with patch('claude.docker_runner.DockerAgentRunner._detect_host_workspace_path',
+                   return_value='/host/workspace'):
+            confirmed = _reconcile(
+                manager,
+                FakeGit(head='scratch', status="", local_branches=[EPIC_BRANCH],
+                        mounted_sources=[
+                            '/host/workspace/.orchestrator/worktrees/my-project/42'
+                        ]),
+            )
+
+        assert unanswerable.status is confirmed.status is WorktreeBranchStatus.DRIFTED
+        assert unanswerable.container_live is None
+        assert confirmed.container_live is True
+        assert 'clears itself' in confirmed.detail
+        assert 'does NOT clear itself' in unanswerable.detail
+
+    def test_every_drift_verdict_carries_the_liveness_answer(self, manager):
+        """The probe used to run only on the path that reaches the repair, so the
+        dirty, no-restore-target and unmerged-commits verdicts all carried the
+        dataclass default container_live=False (code review on #163). A live agent
+        container's MOST likely shape is the dirty one -- it is mid-edit, so
+        porcelain is non-empty -- and _handle_wrong_branch_refusal() reads
+        container_live as authoritative, so that shape told an operator to `git
+        reset --hard` / `git clean -fd` a directory a running agent was writing:
+        by hand, the exact tree rewrite this gate refuses to perform."""
+        mounted = ['/host/workspace/.orchestrator/worktrees/my-project/42']
+        shapes = {
+            'dirty': FakeGit(head='scratch', status=" M the_agents_work.py\n",
+                             local_branches=[EPIC_BRANCH], mounted_sources=mounted),
+            'unreadable_status': FakeGit(head='scratch', status_rc=128,
+                                         local_branches=[EPIC_BRANCH],
+                                         mounted_sources=mounted),
+            'no_restore_target': FakeGit(head='scratch', status="",
+                                         local_branches=[], mounted_sources=mounted),
+            'unmerged_commits': FakeGit(head='scratch', status="",
+                                        local_branches=[EPIC_BRANCH], ahead=3,
+                                        mounted_sources=mounted),
+        }
+
+        for label, git in shapes.items():
+            with patch('claude.docker_runner.DockerAgentRunner._detect_host_workspace_path',
+                       return_value='/host/workspace'):
+                verdict = _reconcile(manager, git)
+
+            assert verdict.status is WorktreeBranchStatus.DRIFTED, label
+            assert verdict.container_live is True, label
+            assert git.ran('ps'), f"{label} never asked the liveness question"
+            assert not git.ran('checkout'), label
+
+    def test_the_dirty_verdicts_detail_says_a_writer_is_in_there(self, manager):
+        """`detail` is what gets logged, emitted as the decision event's reason,
+        and printed as the issue comment's "Reason" line -- so the verdicts that
+        are not themselves about liveness still have to say when one is in there,
+        because every recovery they otherwise suggest rewrites that tree."""
+        git = FakeGit(head='scratch', status=" M work.py\n", local_branches=[EPIC_BRANCH],
+                      mounted_sources=['/host/workspace/.orchestrator/worktrees/my-project/42'])
+
+        with patch('claude.docker_runner.DockerAgentRunner._detect_host_workspace_path',
+                   return_value='/host/workspace'):
+            verdict = _reconcile(manager, git)
+
+        assert 'holds uncommitted changes' in verdict.detail
+        assert 'writer is still live' in verdict.detail
+
+    def test_the_liveness_answer_on_a_dirty_verdict_is_not_invented(self, manager):
+        """The control for the above: nothing running means the dirty verdict
+        still reports False, so the 'commit it or discard it' recovery -- which is
+        correct and safe for that shape -- is not suppressed."""
+        git = FakeGit(head='scratch', status=" M work.py\n", local_branches=[EPIC_BRANCH])
+        verdict = _reconcile(manager, git)
+
+        assert verdict.status is WorktreeBranchStatus.DRIFTED
+        assert verdict.dirty is True
+        assert verdict.container_live is False
 
     def test_a_worktree_marked_in_use_by_a_git_writer_is_refused_too(self, manager):
         """A container is not the only writer that can be mid-run in there

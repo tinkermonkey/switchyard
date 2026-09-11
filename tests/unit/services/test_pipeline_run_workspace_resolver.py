@@ -772,3 +772,42 @@ class TestResolveWorkspaceRefusesToAdoptDrift:
         assert payload['found_branch'] == "scratch"
         assert payload['expected_branch'] == "feature/issue-42-epic"
         assert payload['worktree_path'] == "/workspace/.orchestrator/worktrees/context-studio/42"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_head_leaves_a_trace_instead_of_passing_silently(
+        self, pipeline_run_manager, pipeline_run, mock_github_integration, caplog
+    ):
+        """UNKNOWN is the gate ABSTAINING, and it used to leave nothing at all
+        (code review on #163): it is not drifted, not repaired, and carries
+        branch == the branch we resolved, so none of resolve_workspace()'s three
+        arms fired, no event was emitted, and the dispatch proceeded against a HEAD
+        nobody had read -- which is exactly the outcome this pre-dispatch check
+        exists to prevent. #149's commit-time check still catches it, but only
+        after an agent has run on top of whatever is in there.
+        """
+        import logging
+        from monitoring.observability import EventType
+        from services.feature_branch_manager import feature_branch_manager
+        from services.project_workspace import workspace_manager
+
+        obs = MagicMock()
+        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+             patch.object(feature_branch_manager, 'resolve_epic_branch_name',
+                           return_value="feature/issue-42-epic"), \
+             patch.object(workspace_manager, 'get_or_create_epic_worktree',
+                           return_value="/workspace/.orchestrator/worktrees/context-studio/42"), \
+             patch.object(workspace_manager, '_read_worktree_head',
+                           return_value=(None, False)), \
+             patch('monitoring.observability.get_observability_manager', return_value=obs), \
+             caplog.at_level(logging.WARNING, logger='services.pipeline_run'):
+
+            result = await pipeline_run_manager.resolve_workspace(
+                pipeline_run, mock_github_integration, workspace_type='issues'
+            )
+
+        # Unchanged behaviour: the run keeps the branch it resolved and proceeds.
+        assert result.branch_name == "feature/issue-42-epic"
+        assert any('Could not verify the epic worktree' in r.message for r in caplog.records)
+        obs.emit.assert_called_once()
+        assert obs.emit.call_args[0][0] is EventType.WORKTREE_BRANCH_DRIFT_UNCHECKED
+        assert obs.emit.call_args[0][4]['status'] == 'unknown'

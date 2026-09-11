@@ -574,7 +574,11 @@ class PipelineRunManager:
             return pipeline_run
 
         from services.feature_branch_manager import feature_branch_manager
-        from services.project_workspace import WorktreeBranchDriftError, workspace_manager
+        from services.project_workspace import (
+            WorktreeBranchDriftError,
+            WorktreeBranchStatus,
+            workspace_manager,
+        )
 
         # Code review correction (issue #122): this used to hard-fail on no
         # resolvable parent for workspace_type == 'issues', reasoning that
@@ -698,6 +702,21 @@ class PipelineRunManager:
             )
         if verdict.repaired:
             self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)
+        if verdict.status is WorktreeBranchStatus.UNKNOWN:
+            # "I could not check the thing this gate exists to check" used to leave
+            # no trace at all (code review on #163): UNKNOWN is not drifted, not
+            # repaired, and carries branch == the branch we resolved, so none of
+            # the three arms here fired, no event was emitted, and the dispatch
+            # proceeded against a HEAD nobody had read. #149's commit-time check
+            # still catches it, but only after an agent has run on top of whatever
+            # is in there -- which is precisely what this pre-dispatch gate exists
+            # to prevent, so an abstention has to be as findable as a refusal.
+            logger.warning(
+                f"Could not verify the epic worktree's branch for pipeline run "
+                f"{pipeline_run.id} ({pipeline_run.project} epic #{epic_id}) -- "
+                f"proceeding with the resolved branch {branch_name!r}: {verdict.detail}"
+            )
+            self._emit_worktree_drift_event(pipeline_run, epic_id, project_dir, verdict)
         if verdict.branch and verdict.branch != branch_name:
             logger.warning(
                 f"Resolved branch_name={branch_name!r} for pipeline run {pipeline_run.id} "
@@ -740,9 +759,14 @@ class PipelineRunManager:
 
         A drift that stops an epic, and a repair that quietly saved one, both need
         to be findable somewhere other than a container log line -- #163 item 5.
-        Emitted for the DRIFTED and REPAIRED verdicts only: MATCH is the normal
-        case, and EPIC_BRANCH/UNKNOWN keep their pre-existing log-only treatment
-        because neither changed anything or blocked anything.
+        Emitted for DRIFTED, REPAIRED and UNKNOWN: MATCH is the normal case and
+        EPIC_BRANCH keeps its pre-existing log-only treatment, since neither
+        changed anything or blocked anything. UNKNOWN is here because it is the
+        gate abstaining rather than passing (code review on #163) -- the dispatch
+        goes ahead against a HEAD nobody could read, which is the outcome this
+        check exists to make impossible, and it used to be emitted nowhere and
+        logged nowhere. It gets its own event type rather than riding DETECTED, so
+        a count of detected drifts stays a count of detected drifts.
 
         Never raises: an observability failure must not be what decides whether a
         dispatch proceeds.
@@ -754,6 +778,8 @@ class PipelineRunManager:
             event_type = (
                 EventType.WORKTREE_BRANCH_DRIFT_REPAIRED
                 if verdict.status is WorktreeBranchStatus.REPAIRED
+                else EventType.WORKTREE_BRANCH_DRIFT_UNCHECKED
+                if verdict.status is WorktreeBranchStatus.UNKNOWN
                 else EventType.WORKTREE_BRANCH_DRIFT_DETECTED
             )
             get_observability_manager().emit(
@@ -774,6 +800,11 @@ class PipelineRunManager:
                     # a branch carrying its own commits is a different thing to go
                     # looking for than a dirty tree (code review on #163).
                     "unmerged_commits": verdict.unmerged_commits,
+                    # The third discriminator, carried for the same reason the
+                    # other two are: True/None mean a refusal an operator must NOT
+                    # act on in that directory, and the two differ on whether it
+                    # clears itself (code review on #163).
+                    "container_live": verdict.container_live,
                     "status": verdict.status.value,
                     "detail": verdict.detail,
                 },

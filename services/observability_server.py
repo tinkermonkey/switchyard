@@ -4913,12 +4913,20 @@ def get_epic_worktrees():
             'total': len(worktrees),
             'drifted': sum(1 for w in worktrees if w['drifted']),
             'prune_skipped': sum(1 for w in worktrees if w['prune_skipped']),
-            # A drifted worktree a container is (or may be) still inside needs no
-            # operator action at all and must not be touched — the opposite
-            # recovery to every other clean-drift shape (code review on #163).
+            # A drifted worktree a container is still inside needs no operator
+            # action at all and must not be touched — the opposite recovery to
+            # every other clean-drift shape (code review on #163).
             'container_live': sum(
                 1 for w in worktrees
-                if w['drifted'] and w.get('container_live') is not False
+                if w['drifted'] and w.get('container_live') is True
+            ),
+            # Counted separately, NOT folded into the above: None is "docker could
+            # not be asked", so there may be nothing in there that will ever exit
+            # and clear it. Both are refused and neither may be touched, but only
+            # the confirmed-live one resolves on its own (code review on #163).
+            'container_liveness_unknown': sum(
+                1 for w in worktrees
+                if w['drifted'] and w.get('container_live') is None
             ),
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }), 200

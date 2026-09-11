@@ -268,6 +268,18 @@ class WorktreeBranchVerdict:
     NOT moved -- has the opposite recovery to the other two. Telling an operator
     to `git checkout` that directory is telling them to do by hand the exact tree
     rewrite this verdict refused to do.
+
+    It is answered for EVERY drift verdict, not only the one whose checkout the
+    gate guards (code review on #163). The dirty verdict used to return before the
+    probe ran and so carried the default False -- and a live agent's most likely
+    shape is precisely a dirty one, since it is mid-edit -- which had the operator
+    comment prescribing `git reset --hard` on a directory an agent was writing.
+
+    It is tri-state, and True must not be collapsed with None: True is "a writer
+    is in there, this clears itself when it exits", None is "docker could not be
+    ASKED", which clears itself never and leaves the board's retained lock needing
+    a hand (code review on #163). Both refuse -- the gate is `is not False` -- but
+    they are different things to tell an operator.
     """
 
     status: WorktreeBranchStatus
@@ -277,7 +289,7 @@ class WorktreeBranchVerdict:
     dirty: Optional[bool]
     detail: str
     unmerged_commits: Optional[int] = None
-    container_live: bool = False
+    container_live: Optional[bool] = False
 
     @property
     def drifted(self) -> bool:
@@ -308,14 +320,21 @@ class WorktreeBranchDriftError(RuntimeError):
         stale index.lock from a killed agent-side git); clear that first.
       * dirty=False with unmerged_commits -- the tree is clean but the drifted
         branch holds commits the epic's branch does not. Nothing is lost (the ref
-        survives), but only a human can decide whether they belong on the epic's
-        branch.
-      * container_live=True -- an agent container still has this worktree
-        bind-mounted, so the repair was skipped rather than attempted. Nothing in
-        the directory needs a human at all: it clears itself the moment that
-        container exits. This one is checked FIRST, because it also carries
-        dirty=False/unmerged_commits==0 and the recovery below is actively
-        dangerous for it (code review on #163).
+        survives), and the block is cleared by moving HEAD back, not by
+        adjudicating the commits: the drifted branch may be one that legitimately
+        carries commits of its own (`main`, or a sibling epic's branch), in which
+        case the count never reaches zero and nothing but a checkout unblocks it.
+      * container_live=True -- an agent container (or another git writer) still
+        has this worktree, so the repair was skipped rather than attempted.
+        Nothing in the directory needs a human at all: it clears itself the moment
+        that writer exits. This one is checked FIRST, because it can carry ANY of
+        the dirty/unmerged shapes above and every one of their recoveries is
+        actively dangerous for it (code review on #163).
+      * container_live=None -- the liveness question could not be answered at all
+        (docker unreachable or slow). It refuses for the same reason True does,
+        but tells the operator the opposite thing about clearing: nothing is
+        running that will exit, so the retained board lock has to be released by
+        hand (code review on #163).
       * dirty=False with unmerged_commits == 0 -- nothing to preserve at all; the
         repair itself failed (no local branch of this epic to restore to, or git
         refused the checkout). This one does NOT self-clear: there is no work for
@@ -333,7 +352,7 @@ class WorktreeBranchDriftError(RuntimeError):
         found_branch: Optional[str],
         dirty: Optional[bool],
         unmerged_commits: Optional[int] = None,
-        container_live: bool = False,
+        container_live: Optional[bool] = False,
     ):
         super().__init__(message)
         self.project_name = project_name
@@ -1585,6 +1604,13 @@ class ProjectWorkspaceManager:
         The two are distinguishable at the source -- exit 0 printing literally
         `HEAD` is definitive, and is never a branch this epic owns -- so they are
         kept apart here and decided separately by the caller. Never raises.
+
+        The unreadable answer is LOGGED, matching every other best-effort helper on
+        this path (code review on #163). It resolves to UNKNOWN in
+        reconcile_worktree_branch(), which is the one verdict that neither blocks
+        nor repairs -- so without a line here the whole drift gate could abstain,
+        the dispatch proceed against a HEAD nobody read, and the only trace of why
+        be nothing at all.
         """
         try:
             result = subprocess.run(
@@ -1592,12 +1618,19 @@ class ProjectWorkspaceManager:
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
+                logger.warning(
+                    f"Could not read the checked-out branch in {worktree_path} "
+                    f"(rev-parse rc={result.returncode}): {result.stderr.strip()}"
+                )
                 return None, False
             branch = result.stdout.strip()
             if branch == 'HEAD':
                 return None, True
             return (branch or None), False
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"Could not read the checked-out branch in {worktree_path}: {e}"
+            )
             return None, False
 
     @staticmethod
@@ -2052,10 +2085,13 @@ class ProjectWorkspaceManager:
         are (code review on #163). Dirty drift, unreadable status and a
         commit-carrying drifted branch all clear themselves the moment a human
         commits, discards or merges the work; the bind-mounted shape
-        (container_live) clears itself with no human at all, the moment that
-        container exits, and is the one shape an operator must NOT act on -- the
-        `git checkout` the other clean shapes want is the very tree rewrite this
-        gate refused. The last shape -- clean tree, nothing
+        (container_live is True) clears itself with no human at all, the moment
+        that container exits, and is the one shape an operator must NOT act on --
+        the `git checkout` the other clean shapes want is the very tree rewrite
+        this gate refused. container_live is None -- docker could not be asked --
+        refuses for the same reason but clears itself never, and is reported as
+        its own thing precisely so nobody is told to wait for a container that may
+        not exist. The last shape -- clean tree, nothing
         to preserve, but the checkout itself failed -- does NOT: there is nothing
         for a human to commit or discard, so every subsequent dispatch re-runs the
         identical sequence and refuses identically until someone moves HEAD or frees
@@ -2182,6 +2218,51 @@ class ProjectWorkspaceManager:
                     ),
                 )
 
+            # The liveness question, asked ONCE and asked here -- before the first
+            # drift verdict can return, not just before the checkout it gates
+            # (code review on #163). It used to be computed only on the path that
+            # reaches the repair, so the dirty verdict, the no-restore-target
+            # verdict and the unmerged-commits verdict all carried the dataclass
+            # default container_live=False. A live agent container's MOST likely
+            # shape is the dirty one -- it is mid-edit, so `git status --porcelain`
+            # is non-empty -- and _handle_wrong_branch_refusal() reads
+            # container_live as authoritative, so that shape posted an issue
+            # comment telling an operator to `git reset --hard` / `git clean -fd` a
+            # directory a running agent was writing into: by hand, the exact tree
+            # rewrite the gate below refuses to do. survey_epic_worktrees() has
+            # always asked it unconditionally; the dispatch path now matches.
+            #
+            # Tri-state and deliberately not collapsed: True is "there is a writer
+            # in there", None is "docker could not be ASKED". Both refuse (the gate
+            # is `is not False`, the non-destructive answer), but only True clears
+            # itself when that writer exits -- None promises nothing, and saying
+            # otherwise leaves a board's retained lock waiting on a container that
+            # does not exist.
+            #
+            # _worktree_paths_in_use is checked alongside it (code review on
+            # #163): a container is not the only writer that can be mid-run in
+            # here. Startup recovery's auto-commit thread marks the path in use
+            # for its own lifetime, and prune already consults that map -- the
+            # mutation this gate protects is no less destructive than prune's.
+            with self._epic_worktree_lock:
+                marked_in_use = str(worktree_path) in self._worktree_paths_in_use
+            live = self._worktree_is_bind_mounted(
+                worktree_path, self._get_running_container_mount_sources()
+            )
+            container_live = True if marked_in_use else live
+            # The detail is what gets logged, emitted and printed as the issue
+            # comment's "Reason", so the drift verdicts that are not themselves
+            # about liveness still say when one is (or may be) in there -- every
+            # recovery those verdicts otherwise suggest rewrites that tree.
+            live_note = (
+                " A writer is still live in that directory, so nothing in it may "
+                "be touched by hand either."
+                if container_live is True else
+                " It could not be established whether a writer is still live in "
+                "that directory, so nothing in it may be touched by hand either."
+                if container_live is None else ""
+            )
+
             dirty = self._worktree_has_uncommitted_work(worktree_path)
             if dirty is not False:
                 return WorktreeBranchVerdict(
@@ -2190,6 +2271,7 @@ class ProjectWorkspaceManager:
                     expected_branch=expected_branch,
                     found_branch=found_branch,
                     dirty=dirty,
+                    container_live=container_live,
                     detail=(
                         f"{worktree_path} is on {found_label}, which belongs to no "
                         f"epic (expected {expected_branch!r} for epic #{epic_id}), and "
@@ -2199,6 +2281,7 @@ class ProjectWorkspaceManager:
                             else "its working tree state could not be read"
                         )
                         + " -- HEAD was left untouched and nothing was committed."
+                        + live_note
                     ),
                 )
 
@@ -2223,12 +2306,14 @@ class ProjectWorkspaceManager:
                     found_branch=found_branch,
                     dirty=False,
                     unmerged_commits=0,
+                    container_live=container_live,
                     detail=(
                         f"{worktree_path} is on {found_label}, which belongs to no "
                         f"epic (expected {expected_branch!r} for epic #{epic_id}); the "
                         "working tree is clean, but there is no local branch of this "
                         "epic to restore HEAD to. Nothing here needs preserving -- "
                         "this does not clear itself and needs HEAD moved by hand."
+                        + live_note
                     ),
                 )
 
@@ -2250,6 +2335,7 @@ class ProjectWorkspaceManager:
                     found_branch=found_branch,
                     dirty=False,
                     unmerged_commits=unmerged,
+                    container_live=container_live,
                     detail=(
                         f"{worktree_path} is on {found_label}, which belongs to no "
                         f"epic (expected {expected_branch!r} for epic #{epic_id}); its "
@@ -2261,6 +2347,7 @@ class ProjectWorkspaceManager:
                         )
                         + " -- HEAD was left untouched so those commits are not "
                         "stranded on a branch nothing pushes."
+                        + live_note
                     ),
                 )
 
@@ -2283,16 +2370,9 @@ class ProjectWorkspaceManager:
             # used to fail open into a bare empty set, which read here as "go
             # ahead" whenever the daemon was slow or unreachable.
             #
-            # _worktree_paths_in_use is checked alongside it (code review on
-            # #163): a container is not the only writer that can be mid-run in
-            # here. Startup recovery's auto-commit thread marks the path in use
-            # for its own lifetime, and prune already consults that map -- the
-            # mutation this gate protects is no less destructive than prune's.
-            with self._epic_worktree_lock:
-                marked_in_use = str(worktree_path) in self._worktree_paths_in_use
-            live = self._worktree_is_bind_mounted(
-                worktree_path, self._get_running_container_mount_sources()
-            )
+            # The answers themselves were taken above, before the first drift
+            # verdict could return -- see there for why every verdict carries them
+            # and not just this one.
             if marked_in_use or live is not False:
                 live_reason = (
                     "is marked in use by a git writer running against it"
@@ -2302,6 +2382,20 @@ class ProjectWorkspaceManager:
                     "it could not be established whether a running container still "
                     "has it bind-mounted"
                 )
+                # True and None refuse identically but clear differently, and
+                # promising self-clearing for the unanswerable one is how a board
+                # ends up waiting on a container that was never there (code review
+                # on #163): mark_failed() retains the pipeline lock, so "the next
+                # dispatch fixes it" is only true once something releases it.
+                clearing = (
+                    "This one needs no human action and clears itself once that "
+                    "writer is done."
+                    if container_live is True else
+                    "This one does NOT clear itself: it is the liveness check that "
+                    "failed, not the worktree, so nothing is going to exit and "
+                    "unblock it -- confirm nothing is running in there, then "
+                    "release the board's retained lock by hand."
+                )
                 return WorktreeBranchVerdict(
                     status=WorktreeBranchStatus.DRIFTED,
                     branch=None,
@@ -2309,14 +2403,12 @@ class ProjectWorkspaceManager:
                     found_branch=found_branch,
                     dirty=False,
                     unmerged_commits=0,
-                    container_live=True,
+                    container_live=container_live,
                     detail=(
                         f"{worktree_path} is on {found_label}, which belongs to no "
                         f"epic (expected {expected_branch!r} for epic #{epic_id}), and "
                         f"{live_reason} -- restoring HEAD would rewrite the tree "
-                        "underneath a live writer, so nothing was touched. This one "
-                        "needs no human action and clears itself once that writer is "
-                        "done."
+                        f"underneath a live writer, so nothing was touched. {clearing}"
                     ),
                 )
 
@@ -2351,6 +2443,10 @@ class ProjectWorkspaceManager:
                 found_branch=found_branch,
                 dirty=False,
                 unmerged_commits=0,
+                # Reached only through the gate above, i.e. with a confirmed
+                # "nothing is running in there" -- stated rather than defaulted, so
+                # the discriminator means the same thing on every drift verdict.
+                container_live=False,
                 detail=(
                     f"{worktree_path} is on {found_label}, which belongs to no epic "
                     f"(expected {expected_branch!r} for epic #{epic_id}); the working "

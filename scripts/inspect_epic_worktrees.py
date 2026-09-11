@@ -123,7 +123,14 @@ def _print_row(row: dict) -> None:
             + ("is still running" if row.get('container_live')
                else "may still be running (docker could not be asked)")
             + " against this worktree. Do NOT move HEAD or remove the directory; "
-            "this resolves on its own once that container exits."
+            + ("this resolves on its own once that container exits."
+               if row.get('container_live')
+               # None is "docker could not be asked", not "something is running":
+               # there may be nothing to wait for, so promising self-resolution
+               # leaves the board's retained lock waiting forever (code review on
+               # #163).
+               else "confirm with `docker ps` that nothing is in there — if "
+                    "nothing is, this does NOT resolve on its own.")
         )
     for line in row['uncommitted_files']:
         print(f"      {line}")
@@ -137,8 +144,12 @@ def _print_row(row: dict) -> None:
             # the liveness answer, because all of them rewrite a working tree an
             # agent may still be editing.
             print(
-                "      # a container is (or may be) live in there — nothing else to "
+                "      # a container is live in there — nothing else to "
                 "run; it resolves when that container exits"
+                if row.get('container_live') else
+                "      # docker could not be asked whether anything is live in "
+                "there — check `docker ps`; if nothing is, this needs HEAD moved "
+                "by hand"
             )
         # The stash/discard pair only applies when there IS something uncommitted.
         # Printing it for a clean worktree sends an operator to run a no-op and
@@ -158,9 +169,20 @@ def _print_row(row: dict) -> None:
         if row['drifted'] and row['unmerged_commits'] != 0 and row['expected_branch']:
             print(
                 f"      # commits on {row['current_branch']}: git -C {row['path']} log "
-                f"{row['expected_branch']}..{row['current_branch']}  "
-                "# cherry-pick/merge them, or `branch -D` if unwanted"
+                f"{row['expected_branch']}..{row['current_branch']}"
             )
+            if row['uncommitted'] is False and row.get('container_live') is False:
+                # Moving HEAD is what unblocks this, and `branch -D` is named only
+                # after it: git refuses to delete the branch checked out in this
+                # very worktree, and the count never reaches zero on its own when
+                # the drifted branch legitimately carries commits of its own
+                # (`main`, a sibling epic's branch) -- so "merge them and it
+                # clears" is advice that never terminates (code review on #163).
+                print(
+                    f"      # unblock it:  git -C {row['path']} checkout "
+                    f"{row['expected_branch']}  "
+                    "# the ref survives; cherry-pick/merge or `branch -D` after"
+                )
         if (
             row['drifted']
             and not row['uncommitted']

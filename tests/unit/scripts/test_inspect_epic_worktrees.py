@@ -96,3 +96,55 @@ class TestDetachedHeadIsNamedAsSuch:
 
         out = capsys.readouterr().out
         assert '<unreadable>' in out
+
+
+class TestTheCommitCarryingDriftIsGivenAWorkingRecovery:
+    """`branch -D <current_branch>` is a command git always refuses here: that
+    branch is by construction the one checked out in this very worktree
+    ("Cannot delete branch 'X' checked out at ..."). And the count is "commits
+    the drifted branch has that the epic's does not", which for `main` or a
+    sibling epic's branch never reaches zero -- so the cherry-pick/merge advice
+    never terminates either, and the one instruction that does clear the block
+    was printed only for the OTHER clean shape (code review on #163)."""
+
+    def test_moving_head_is_offered_before_deleting_the_branch(self, capsys):
+        _print_row(_row(unmerged_commits=3, prune_skipped=True))
+
+        out = capsys.readouterr().out
+        assert out.index('checkout feature/issue-42-epic') < out.index('branch -D')
+
+    def test_it_is_suppressed_while_a_writer_may_be_live_in_there(self, capsys):
+        _print_row(_row(unmerged_commits=3, container_live=None, prune_skipped=True))
+
+        out = capsys.readouterr().out
+        assert 'unblock it' not in out
+        # The read-only `git log` of what is on that branch still prints.
+        assert 'feature/issue-42-epic..scratch' in out
+
+    def test_it_is_suppressed_while_the_tree_is_dirty(self, capsys):
+        """A checkout over uncommitted work is refused by git anyway; that shape
+        gets the stash/discard pair instead."""
+        _print_row(_row(unmerged_commits=3, uncommitted=True,
+                        uncommitted_files=[' M work.py'], prune_skipped=True))
+
+        out = capsys.readouterr().out
+        assert 'unblock it' not in out
+
+
+class TestAnUnanswerableLivenessCheckIsNotPromisedToSelfResolve:
+    """None used to be printed with the same "this resolves on its own once that
+    container exits" as a CONFIRMED live container. mark_failed() retains the
+    board's pipeline lock, so there is no next dispatch to resolve it, and with
+    docker merely slow there may be no container either (code review on #163)."""
+
+    def test_a_confirmed_live_container_keeps_its_self_resolving_promise(self, capsys):
+        _print_row(_row(container_live=True))
+
+        assert 'resolves on its own' in capsys.readouterr().out
+
+    def test_an_unanswerable_one_does_not(self, capsys):
+        _print_row(_row(container_live=None))
+
+        out = capsys.readouterr().out
+        assert 'does NOT resolve on its own' in out
+        assert 'docker ps' in out
