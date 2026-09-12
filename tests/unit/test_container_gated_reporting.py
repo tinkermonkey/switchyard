@@ -59,20 +59,59 @@ def inside_container():
         yield
 
 
+def _config(timeout_plugin=True):
+    """A stand-in for the Config pytest hands the hook.
+
+    `hasplugin` is pinned rather than left as a bare MagicMock attribute: a
+    MagicMock is truthy by accident, and whether these tests see the #204
+    timeout line should be a stated choice, not a side effect of that.
+    """
+    config = MagicMock()
+    config.pluginmanager.hasplugin.return_value = timeout_plugin
+    return config
+
+
+def _header(timeout_plugin=True):
+    """The hook returns one line per concern (#204 added a second); the terminal
+    prints them on consecutive lines, which is what joining reproduces."""
+    return '\n'.join(pytest_report_header(_config(timeout_plugin)))
+
+
 class TestHeader:
 
     def test_names_the_container_when_inside_it(self, inside_container):
-        assert 'yes' in pytest_report_header(MagicMock())
+        assert 'yes' in _header()
 
     def test_warns_loudly_when_outside_it(self, outside_container):
-        header = pytest_report_header(MagicMock())
+        header = _header()
         assert 'NO' in header
         assert 'SKIPPED' in header
         # The header is where someone learns how to get the missing coverage.
         assert 'docker exec' in header
 
     def test_names_the_marker_it_actually_checks(self, outside_container):
-        assert ORCHESTRATOR_CONTAINER_MARKER in pytest_report_header(MagicMock())
+        assert ORCHESTRATOR_CONTAINER_MARKER in _header()
+
+    def test_says_nothing_about_pytest_timeout_while_it_is_registered(
+        self, inside_container
+    ):
+        """The #204 line is a fault report, so on a healthy run the header has
+        to stay exactly as short as it was before #204 added it."""
+        assert 'pytest-timeout' not in _header(timeout_plugin=True)
+
+    def test_carries_both_concerns_at_once(self, outside_container):
+        """The two conditions are independent and can hold together -- a host
+        run of a checkout whose venv predates #204 is both. Reporting only the
+        first would hide the one that stops the run outright.
+
+        Substance of the #204 line is asserted in
+        tests/unit/test_per_test_timeout.py; what is checked here is that the
+        hook composes rather than replaces.
+        """
+        header = _header(timeout_plugin=False)
+
+        assert ORCHESTRATOR_CONTAINER_MARKER in header
+        assert 'pytest-timeout: NOT REGISTERED' in header
 
 
 class TestTerminalSummary:

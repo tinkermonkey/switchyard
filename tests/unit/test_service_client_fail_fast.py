@@ -4,9 +4,16 @@ A test run cannot block on a service that is not there (#174).
 On a bare python:3.11-slim runner with only `pip install -r requirements.txt`,
 `pytest tests/unit` did not finish: it reached services/cancellation.py's
 `redis.Redis(host='redis', port=6379, decode_responses=True).ping()` and sat
-there, ~6s of CPU over 3+ minutes at ~0.2%. pytest.ini's `timeout = 300` does
-not bound it, because pytest-timeout cannot interrupt a blocking socket call in
-the main thread.
+there, ~6s of CPU over 3+ minutes at ~0.2%. Nothing bounded it: pytest.ini's
+`timeout = 300` was dead config at the time -- wrong section, and pytest-timeout
+not installed (#204).
+
+An earlier version of this docstring gave the reason as "pytest-timeout cannot
+interrupt a blocking socket call in the main thread". That is not true and was
+never measured; see tests/conftest.py's
+_refuse_to_resolve_compose_service_hostnames for the measurement that replaced
+it. The live 180s timeout does bound this, but as a 180s abort-with-stacks; the
+guards below keep it to a fast, specific failure instead.
 
 The obvious reading is a missing socket_connect_timeout, and ~20 call sites
 across services/, monitoring/, claude/ and task_queue/ do omit one. Timing it in
@@ -44,6 +51,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests import conftest as tests_conftest
 from tests.conftest import (
     COMPOSE_SERVICE_HOSTS,
     TEST_SERVICE_CONNECT_TIMEOUT,
@@ -142,6 +150,68 @@ class TestTheTestDataPurgeCannotRunAgainstSomebodyElsesStore:
         with patch('tests.conftest.running_in_orchestrator_container', return_value=False), \
                 patch('tests.conftest.ALLOW_REAL_SERVICE_HOSTS', True):
             assert _may_purge_service_data() is True
+
+    # --- the purge runs at BOTH ends, and the entry end is load-bearing (#204)
+    #
+    # Found in the same review as the paragraph in pytest.ini's
+    # `timeout_method` block. `thread` ends a wedged run with os._exit(1),
+    # which skips every fixture teardown -- measured at timeout = 3 with a
+    # session-autouse fixture appending a marker on setup and on teardown:
+    # `signal` wrote `pre` and `post`, `thread` wrote only `pre`. So after a
+    # timed-out run the exit-side purge never happens and the global
+    # github:rate_limit:* keys keep whatever the tests left in them. The purge
+    # on the way IN is what clears that, on the next run, and nothing else
+    # does. It therefore reads as redundant and is not; these two tests are
+    # what stops it being tidied away.
+
+    @staticmethod
+    def _drive_the_fixture():
+        """The fixture's own generator, steppable a yield at a time.
+
+        pytest >= 8.4 hands back a FixtureFunctionDefinition wrapping the
+        function and exposes the original as `__wrapped__`; older pytest
+        returns the function itself. If it is ever neither, calling the result
+        raises rather than quietly testing something else.
+        """
+        fixture = tests_conftest.cleanup_test_data
+        return getattr(fixture, '__wrapped__', fixture)()
+
+    def test_the_purge_runs_on_the_way_in_as_well_as_on_the_way_out(self):
+        calls = []
+        with patch('tests.conftest._may_purge_service_data', return_value=True), \
+                patch('tests.conftest._purge_test_data',
+                      side_effect=lambda: calls.append('purge')):
+            generator = self._drive_the_fixture()
+
+            next(generator)
+            assert calls == ['purge'], (
+                'cleanup_test_data did not purge before yielding to the '
+                'session. A run killed by pytest-timeout under '
+                '`timeout_method = thread` never reaches the teardown half, so '
+                'without this one nothing ever clears what the previous run '
+                f'left in Redis/Elasticsearch. Calls so far: {calls}'
+            )
+
+            with pytest.raises(StopIteration):
+                next(generator)
+            assert calls == ['purge', 'purge'], (
+                'cleanup_test_data did not purge on teardown; the run that '
+                f'just finished leaves its own data behind. Calls: {calls}'
+            )
+
+    def test_a_run_that_owns_no_store_purges_at_neither_end(self):
+        with patch('tests.conftest._may_purge_service_data', return_value=False), \
+                patch('tests.conftest._purge_test_data') as purge:
+            generator = self._drive_the_fixture()
+            next(generator)
+            with pytest.raises(StopIteration):
+                next(generator)
+
+        assert purge.call_count == 0, (
+            'cleanup_test_data purged during a run that does not own the '
+            'Redis/Elasticsearch it can reach -- on a developer machine that '
+            'is the live deployment.'
+        )
 
 
 class TestRedisConnectIsBounded:

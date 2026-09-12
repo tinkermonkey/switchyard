@@ -422,8 +422,12 @@ class RecordedThread:
     So the mitigation is the WINDOW, not the target: wrap only the call that
     spawns. A wide window also replaces `ThreadPoolExecutor`'s internal
     `threading.Thread(...)`, whose workers become no-ops -- the first
-    `future.result()` then blocks forever, and there is no per-test timeout in
-    this project to interrupt it (see pytest.ini).
+    `future.result()` then blocks forever. There IS now a per-test timeout to
+    stop that (pytest.ini, #204), measured against this exact wedge: it reports
+    a timeout with a stack naming `waiter.acquire()`, and the timer survives
+    this patch because `threading.Timer` subclasses the real `Thread` captured
+    when `threading` was imported. But it is a 180s abort of the whole run, not
+    a reason to widen the window.
 
     Note the parentheses on `started()`: it is a classmethod, so `assert
     RecordedThread.started` asserts a bound method object and can never fail.
