@@ -40,6 +40,10 @@ apscheduler>=3.10.4
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=1.0.0
+# Supplies the per-test timeout configured in pytest.ini (#204). Without it
+# pytest does not even recognise the `timeout` ini key, so the suite has no
+# bound on a wedged test. Verified against pytest 9.1.1 with 2.4.0.
+pytest-timeout>=2.4.0
 
 # GitHub Integration
 PyGithub>=1.59.1

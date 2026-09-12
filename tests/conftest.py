@@ -67,8 +67,19 @@ def _refuse_to_resolve_compose_service_hostnames():
     with only `pip install -r requirements.txt`, `pytest tests/unit` did not
     finish -- it reached services/cancellation.py's `redis.Redis(host='redis',
     port=6379, decode_responses=True).ping()` and sat there, ~6s of CPU over 3+
-    minutes at ~0.2%. pytest.ini's `timeout = 300` does not bound it, because
-    pytest-timeout cannot interrupt a blocking socket call in the main thread.
+    minutes at ~0.2%. Nothing bounded it: pytest.ini's `timeout = 300` was dead
+    config at the time (wrong section, and pytest-timeout not installed -- #204).
+
+    An earlier version of this comment gave the reason as "pytest-timeout
+    cannot interrupt a blocking socket call in the main thread". That is not
+    true, and it was never measured. With the plugin installed and
+    `timeout_method = thread` -- what #204 configured -- a `connect()` to an
+    unroutable address IS bounded, measured at the limit plus interpreter
+    startup, because that method never has to interrupt the main thread: a
+    separate timer thread dumps every stack and exits. The 180s timeout is
+    still a backstop rather than the fix, though. It turns this into a 180s
+    abort-with-stacks, and the two functions here keep it to a fast, specific
+    failure instead.
 
     The obvious reading is a missing socket_connect_timeout, and ~20 call sites
     across services/, monitoring/, claude/ and task_queue/ do omit it. Timed in

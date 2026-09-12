@@ -1,0 +1,270 @@
+"""The suite has a per-test timeout, and it is live rather than merely written
+down (#204).
+
+It was written down and dead for two independent reasons, either sufficient on
+its own: `timeout` / `timeout_method` sat under `[pytest:log]`, a section pytest
+does not read, and `pytest-timeout` was not installed at all. Fixing one without
+the other would have produced a pytest.ini that looks protected and is not --
+which is precisely the state #204 was filed about.
+
+So neither test here reads pytest.ini as text. A grep would have passed happily
+against the dead config. Instead:
+
+  * TestTheTimeoutIsLiveForThisVeryTest asks the enforcement path itself what it
+    would apply to the test that is asking. If the plugin goes away, or the keys
+    move back under a section pytest ignores, the resolved value is gone and
+    these fail.
+  * TestThePluginActuallyKillsAHungTest runs a real pytest on a real sleeping
+    test and watches it die. That is the part no amount of config inspection can
+    stand in for.
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+import pytest
+
+# Imported at module scope on purpose: with pytest-timeout missing this file
+# fails at collection with a ModuleNotFoundError naming the package, rather
+# than passing vacuously. It is the second line of defence, not the first --
+# pytest.ini's `--strict-config` turns the same condition into
+# `ERROR: Unknown config option: timeout` and exit 4 before anything is
+# collected (measured). This one still matters if someone ever drops
+# --strict-config.
+import pytest_timeout
+
+# The private resolver pytest-timeout's own `pytest_runtest_protocol` calls to
+# decide whether to arm a timer for an item. Asserting on it means asserting on
+# the value that is actually enforced, not on a parallel re-derivation of it.
+# If a future release renames this, the import fails loudly here rather than
+# letting the guard quietly start checking nothing.
+from pytest_timeout import _get_item_settings
+
+# The full unit suite measures 162s and its slowest single test 45.1s, so
+# anything at or below the slowest test would flake and anything above the whole
+# suite would be pointless as a bound. The configured value is 180; these are the
+# walls it has to stay inside, not a restatement of it.
+SLOWEST_MEASURED_TEST_SECONDS = 45.2
+FULL_UNIT_SUITE_SECONDS = 162.0
+
+
+def _resolved_timeout(node):
+    """The timeout pytest-timeout would arm for `node`, or a failure saying so.
+
+    Going through this rather than comparing `settings.timeout` directly:
+    when the key is dead the resolver returns None, and a bare `None > 45.2`
+    fails with `TypeError: '>' not supported between instances of 'NoneType'
+    and 'float'` -- a guard that fires for the right cause while reporting the
+    wrong one.
+    """
+    timeout = _get_item_settings(node).timeout
+    if timeout is None:
+        pytest.fail(
+            'pytest-timeout resolved no timeout for this test, so there is '
+            'nothing to range-check. The `timeout` key is missing, empty, or '
+            'in a section pytest does not read.'
+        )
+    return timeout
+
+
+class TestTheTimeoutIsLiveForThisVeryTest:
+
+    def test_the_plugin_is_installed_and_registered(self, pytestconfig):
+        """Reason two of the two. `pytest-timeout` absent means pytest does not
+        even recognise the ini key."""
+        assert pytestconfig.pluginmanager.hasplugin('timeout'), (
+            'pytest-timeout is not registered with this pytest run, so the '
+            '`timeout` key in pytest.ini is enforcing nothing.'
+        )
+
+    def test_a_timeout_is_resolved_for_the_running_item(self, request):
+        """Reason one of the two. Keys under `[pytest:log]` resolve to None here
+        even with the plugin installed and happy."""
+        settings = _get_item_settings(request.node)
+
+        assert settings.timeout is not None, (
+            'pytest-timeout resolved no timeout for this test. The `timeout` '
+            'key is either missing or in a section pytest does not read.'
+        )
+        assert settings.timeout > 0, (
+            f'timeout resolved to {settings.timeout!r}; 0 or negative disables '
+            'the timeout entirely.'
+        )
+
+    def test_the_value_is_above_the_slowest_real_test(self, request):
+        """Below the slowest legitimate test, the timeout is a flake generator
+        rather than a backstop."""
+        timeout = _resolved_timeout(request.node)
+
+        assert timeout > SLOWEST_MEASURED_TEST_SECONDS, (
+            f'timeout={timeout}s is not above the slowest measured test '
+            f'({SLOWEST_MEASURED_TEST_SECONDS}s), so that test would be killed '
+            'while behaving correctly.'
+        )
+
+    def test_the_value_is_not_so_large_it_stops_bounding_anything(self, request):
+        """Above the whole suite's own runtime the number stops being a bound on
+        anything a human would wait for. The previous dead value was 300s --
+        1.85x the entire suite for one wedged test."""
+        timeout = _resolved_timeout(request.node)
+
+        assert timeout <= 2 * FULL_UNIT_SUITE_SECONDS, (
+            f'timeout={timeout}s lets a single wedged test cost more than two '
+            f'clean runs of the whole {FULL_UNIT_SUITE_SECONDS}s suite.'
+        )
+
+    # There is deliberately no "the method is one pytest-timeout implements"
+    # test. An earlier draft had one on the assumption that a typo would be
+    # another silently-dead setting; measured, it is not. `-o
+    # timeout_method=threed` never reaches collection -- pytest-timeout's
+    # pytest_configure raises `ValueError: Invalid method threed from config
+    # file` and the run ends in INTERNALERROR. A guard that cannot run when the
+    # thing it guards is broken guards nothing.
+
+    def test_the_method_is_thread(self, request):
+        """Measured, not preference. Against the hazard #204 is about -- a test
+        patching `threading.Thread` globally starves a ThreadPoolExecutor and
+        the first `future.result()` blocks forever -- `thread` reported a
+        timeout with a stack naming `waiter.acquire()`, while `signal` stopped
+        the hang but surfaced it as `RuntimeError: cannot join thread before it
+        is started` from the executor's `__exit__`, with no mention of a
+        timeout. `thread` is also immune to that same patch, because
+        `threading.Timer` subclasses the real `Thread` captured when
+        `threading` was imported.
+
+        Change this if the tradeoff is reconsidered -- `thread` hard-exits the
+        run, which is a real cost -- but change it knowing that is the trade.
+        """
+        assert _get_item_settings(request.node).method == 'thread'
+
+
+class TestThePluginActuallyKillsAHungTest:
+    """An out-of-process proof. Everything above is still, ultimately, reading
+    configuration; this watches a test that will never finish get killed."""
+
+    SLEEP_SECONDS = 60
+    CHILD_TIMEOUT = 2
+    # Generous: the child should die at ~2s plus interpreter start. Anything
+    # near this number means it was not killed by the plugin.
+    WALL_CLOCK_BUDGET = 30
+
+    def _run_child(self, tmp_path, method):
+        (tmp_path / 'test_wedged.py').write_text(
+            'import time\n'
+            '\n'
+            '\n'
+            'def test_never_finishes():\n'
+            f'    time.sleep({self.SLEEP_SECONDS})\n'
+        )
+        # A standalone ini, not this repo's: the point is to prove the installed
+        # plugin enforces using the method this repo configures, without waiting
+        # out the repo's own (correctly large) 180s.
+        (tmp_path / 'child.ini').write_text(
+            '[pytest]\n'
+            f'timeout = {self.CHILD_TIMEOUT}\n'
+            f'timeout_method = {method}\n'
+        )
+
+        env = dict(os.environ)
+        # Would silently alter the child's config and, for PYTEST_TIMEOUT,
+        # override the very thing under test.
+        env.pop('PYTEST_ADDOPTS', None)
+        env.pop('PYTEST_TIMEOUT', None)
+
+        started = time.monotonic()
+        completed = subprocess.run(
+            [
+                sys.executable, '-m', 'pytest',
+                '-c', 'child.ini',
+                '--rootdir', str(tmp_path),
+                '-p', 'no:randomly',
+                '-p', 'no:cacheprovider',
+                '-q',
+                'test_wedged.py',
+            ],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            # Backstop on the guard itself. If the plugin does not work, this
+            # raises TimeoutExpired and the test fails loudly instead of
+            # inheriting the very hang it exists to rule out.
+            timeout=self.WALL_CLOCK_BUDGET,
+        )
+        return completed, time.monotonic() - started
+
+    def test_a_sleeping_test_is_killed_well_before_it_finishes(
+        self, tmp_path, request
+    ):
+        method = _get_item_settings(request.node).method
+        completed, elapsed = self._run_child(tmp_path, method)
+        output = completed.stdout + completed.stderr
+
+        assert completed.returncode != 0, (
+            f'a test sleeping {self.SLEEP_SECONDS}s under a '
+            f'{self.CHILD_TIMEOUT}s timeout exited 0:\n{output}'
+        )
+        assert elapsed < self.SLEEP_SECONDS, (
+            f'the child ran {elapsed:.1f}s, i.e. it was allowed to finish its '
+            f'{self.SLEEP_SECONDS}s sleep rather than being killed.'
+        )
+        assert 'Timeout' in output, (
+            'the child died without pytest-timeout saying so, so something '
+            f'other than the timeout killed it:\n{output}'
+        )
+
+    def test_the_kill_names_the_line_that_hung(self, tmp_path, request):
+        """The whole value of a timeout over a wedged CI job is the diagnosis it
+        leaves behind. A kill with no pointer to the hung line is barely better
+        than the hang."""
+        method = _get_item_settings(request.node).method
+        completed, _ = self._run_child(tmp_path, method)
+        output = completed.stdout + completed.stderr
+
+        assert 'test_wedged.py' in output, (
+            f'the timeout report does not name the offending file:\n{output}'
+        )
+        assert 'test_never_finishes' in output or 'time.sleep' in output, (
+            f'the timeout report does not name the offending test or the call '
+            f'it hung in:\n{output}'
+        )
+
+
+class TestTheSuiteStillWritesNoLogFileIntoTheCheckout:
+    """`log_file = tests/test_run.log` lived in the same dead `[pytest:log]`
+    section and was dropped rather than moved (#204, and #181 before it: the
+    suite must not write into the tree it is running from). Measured by running
+    tests/unit once with it restored: 3.8MB over 33,440 lines, per run, inside
+    the checkout, and invisible to `git status` because `.gitignore` covers
+    `*.log`.
+
+    This reads the live config, not the text of pytest.ini -- restoring the key
+    under `[pytest]` flips it, which is how it was checked."""
+
+    def test_no_log_file_sink_is_configured(self, pytestconfig):
+        assert not pytestconfig.getini('log_file'), (
+            f'log_file is set to {pytestconfig.getini("log_file")!r}; the suite '
+            'would write a DEBUG log into the checkout on every run.'
+        )
+
+
+def test_the_timeout_marker_survives_strict_markers():
+    """`addopts` carries `--strict-markers`, so an unregistered marker is a
+    collection error. pytest-timeout registers `timeout` in its own
+    `pytest_configure`; if that ever stopped, every documented per-test override
+    (`@pytest.mark.timeout(600)`) would become an error instead of an escape
+    hatch."""
+    assert hasattr(pytest.mark, 'timeout')
+    assert pytest_timeout.__name__ == 'pytest_timeout'
+
+
+@pytest.mark.timeout(SLOWEST_MEASURED_TEST_SECONDS + 5)
+def test_a_per_test_override_is_honoured(request):
+    """The escape hatch pytest.ini points tests/integration and tests/e2e at.
+    Exercising it here also proves `--strict-markers` accepts the marker, which
+    is the part that would break first."""
+    assert _get_item_settings(request.node).timeout == pytest.approx(
+        SLOWEST_MEASURED_TEST_SECONDS + 5
+    )
