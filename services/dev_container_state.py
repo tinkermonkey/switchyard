@@ -112,6 +112,20 @@ class DevContainerStateManager:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"DevContainerStateManager initialized with state_dir: {state_dir}")
 
+    @staticmethod
+    def _status_from_state(state: Dict, label: str) -> 'DevContainerStatus':
+        """Parse a state dict's status, defaulting to UNVERIFIED and saying so.
+
+        Written out three times before this (get_status, get_status_and_updated_at,
+        get_all_statuses), and the third copy swallowed the exception silently
+        where the other two logged.
+        """
+        try:
+            return DevContainerStatus(state.get('status', 'unverified'))
+        except Exception as e:
+            logger.error(f"Failed to read dev container status for {label}: {e}")
+            return DevContainerStatus.UNVERIFIED
+
     def get_state_file(self, project_name: str) -> Path:
         """State file for the dev-container ENVIRONMENT `project_name` uses (#198).
 
@@ -141,12 +155,7 @@ class DevContainerStateManager:
         Returns:
             Current DevContainerStatus
         """
-        try:
-            status_str = self._read_state(project_name).get('status', 'unverified')
-            return DevContainerStatus(status_str)
-        except Exception as e:
-            logger.error(f"Failed to read dev container status for {project_name}: {e}")
-            return DevContainerStatus.UNVERIFIED
+        return self._status_from_state(self._read_state(project_name), project_name)
 
     def get_status_and_updated_at(
         self, project_name: str
@@ -525,34 +534,12 @@ class DevContainerStateManager:
             return {}
 
     def _read_state(self, project_name: str) -> Dict:
+        """The project's state file as a dict, {} if absent or unreadable.
+
+        Delegates, so the locked read-modify-read dance lives in exactly one
+        place -- the same shape as _merge_state/_merge_state_file.
         """
-        The project's state file as a dict, {} if absent or unreadable.
-
-        Taken under the state file's own lock so a reader never sees the
-        half-written file a concurrent _merge_state() is producing -- the same
-        reason PipelineLockManager._read_yaml_lock_only holds its lock across
-        the read.
-        """
-        from utils.file_lock import file_lock
-
-        state_file = self.get_state_file(project_name)
-
-        if not state_file.exists():
-            return {}
-
-        try:
-            with file_lock(
-                self._state_lock_file(state_file),
-                timeout=STATE_LOCK_TIMEOUT_SECONDS,
-                enforce_timeout=True,
-            ):
-                if not state_file.exists():  # Check again inside lock
-                    return {}
-                with open(state_file, 'r') as f:
-                    return yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.error(f"Failed to read dev container state for {project_name}: {e}")
-            return {}
+        return self._read_state_file(self.get_state_file(project_name))
 
     @staticmethod
     def _state_lock_file(state_file: Path) -> Path:
@@ -1004,13 +991,9 @@ class DevContainerStateManager:
             # see clear_stale_pending_operations for why passing an environment
             # name back through project->environment resolution is unsound.
             environment = state_file.stem
-            state = self._read_state_file(state_file)
-            try:
-                statuses[environment] = DevContainerStatus(
-                    state.get('status', 'unverified')
-                )
-            except Exception:
-                statuses[environment] = DevContainerStatus.UNVERIFIED
+            statuses[environment] = self._status_from_state(
+                self._read_state_file(state_file), environment
+            )
 
         return statuses
 

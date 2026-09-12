@@ -20,6 +20,38 @@ class DevEnvironmentVerifierAgent(PipelineStage):
       prompts/content/review_cycle/verifier_rereviewing.md
     """
 
+    @staticmethod
+    def _record_status(project_name, status, success_log=None, **kwargs) -> bool:
+        """Write `status`, and announce it only if the write actually landed.
+
+        Two rules, both learned the hard way, in one place instead of six:
+
+        1. The return value is checked. set_status() is a compare-and-set that
+           can be refused, and it can fail outright; an unchecked write leaves
+           the environment at IN_PROGRESS, which every member of a shared
+           environment then waits on -- the dangling state this module's
+           CRITICAL comment exists to prevent.
+        2. `success_log` fires only on success. Announcing regardless produced
+           adjacent lines reading "Failed to record VERIFIED for features" and
+           "Marked ... as VERIFIED"; whichever an operator read second is the
+           one they believed. services/dev_container_state.py makes the same
+           point about its own reset announcement (#171 review).
+
+        Returns whether the write landed.
+        """
+        wrote = bool(dev_container_state.set_status(
+            project_name=project_name, status=status, **kwargs
+        ))
+        if not wrote:
+            logger.error(
+                "Failed to record %s for %s; the environment may remain "
+                "IN_PROGRESS and stall every member of it",
+                status.value, project_name,
+            )
+        elif success_log:
+            logger.info(*success_log)
+        return wrote
+
     def __init__(self, agent_config: Dict[str, Any] = None):
         super().__init__("dev_environment_verifier", agent_config=agent_config)
         self._prompt_builder = PromptBuilder()
@@ -176,65 +208,36 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     )
                     # Not truncated -- the remedy is in the second half, and
                     # this is the operator's only persistent record.
-                    _wrote = dev_container_state.set_status(
-                        project_name=project_name,
-                        status=DevContainerStatus.BLOCKED,
+                    if self._record_status(
+                        project_name,
+                        DevContainerStatus.BLOCKED,
                         error_message=error_message,
-                    )
-                    if not _wrote:
-                        logger.error(
-                            "Failed to record BLOCKED for %s; the environment may "
-                            "remain IN_PROGRESS and stall every member",
-                            project_name,
-                        )
-                    else:
+                    ):
                         logger.error(
                             "Refusing to mark %s VERIFIED: expected image %s is "
                             "missing or unverifiable", project_name, expected_tag,
                         )
                 else:
-                    _wrote = dev_container_state.set_status(
-                        project_name=project_name,
-                        status=DevContainerStatus.VERIFIED,
+                    self._record_status(
+                        project_name,
+                        DevContainerStatus.VERIFIED,
+                        success_log=(
+                            "Marked dev container environment %s as VERIFIED (image %s, "
+                            "requested by project %s)",
+                            environment, expected_tag, project_name,
+                        ),
                         image_name=expected_tag,
-                    )
-                    if not _wrote:
-                        # Unchecked, a refused or failed write leaves the
-                        # environment at IN_PROGRESS forever -- the dangling
-                        # state this module's CRITICAL comment exists to
-                        # prevent, and it strands every member of a shared
-                        # environment, not just this project.
-                        logger.error(
-                            'Failed to record %s for %s; the environment may '
-                            'remain IN_PROGRESS and stall every member',
-                            'VERIFIED', project_name,
-                        )
-                    logger.info(
-                        "Marked dev container environment %s as VERIFIED (image %s, "
-                        "requested by project %s)",
-                        environment, expected_tag, project_name,
                     )
             elif status == "BLOCKED":
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Verification failed"
-                _wrote = dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
                     error_message=error_message[:200],
                 )
-                if not _wrote:
-                    # Unchecked, a refused or failed write leaves the
-                    # environment at IN_PROGRESS forever -- the dangling
-                    # state this module's CRITICAL comment exists to
-                    # prevent, and it strands every member of a shared
-                    # environment, not just this project.
-                    logger.error(
-                        'Failed to record %s for %s; the environment may '
-                        'remain IN_PROGRESS and stall every member',
-                        'BLOCKED', project_name,
-                    )
                 logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
             elif status == "CHANGES NEEDED":
                 # Distinct from BLOCKED: used when the verifier could not independently
@@ -244,45 +247,23 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
-                _wrote = dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.CHANGES_NEEDED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.CHANGES_NEEDED,
                     error_message=error_message[:200],
                 )
-                if not _wrote:
-                    # Unchecked, a refused or failed write leaves the
-                    # environment at IN_PROGRESS forever -- the dangling
-                    # state this module's CRITICAL comment exists to
-                    # prevent, and it strands every member of a shared
-                    # environment, not just this project.
-                    logger.error(
-                        'Failed to record %s for %s; the environment may '
-                        'remain IN_PROGRESS and stall every member',
-                        'CHANGES_NEEDED', project_name,
-                    )
                 logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message[:100])
             else:
                 # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
                 error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED, BLOCKED, or CHANGES NEEDED)"
-                _wrote = dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
+                    success_log=(
+                        "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
+                        error_message, project_name
+                    ),
                     error_message=error_message[:200],
-                )
-                if not _wrote:
-                    # Unchecked, a refused or failed write leaves the
-                    # environment at IN_PROGRESS forever -- the dangling
-                    # state this module's CRITICAL comment exists to
-                    # prevent, and it strands every member of a shared
-                    # environment, not just this project.
-                    logger.error(
-                        'Failed to record %s for %s; the environment may '
-                        'remain IN_PROGRESS and stall every member',
-                        'BLOCKED', project_name,
-                    )
-                logger.error(
-                    "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
-                    error_message, project_name
                 )
         else:
             # No "### Status **X**" marker in the final response text. Before
@@ -341,27 +322,16 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             else:
                 snippet = review_text.strip()[:300]
                 error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
-                _wrote = dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
+                    success_log=(
+                        "Could not parse verification status for %s -- marking dev container BLOCKED "
+                        "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
+                        "output excerpt)",
+                        project_name, project_name
+                    ),
                     error_message=error_message[:200],
-                )
-                if not _wrote:
-                    # Unchecked, a refused or failed write leaves the
-                    # environment at IN_PROGRESS forever -- the dangling
-                    # state this module's CRITICAL comment exists to
-                    # prevent, and it strands every member of a shared
-                    # environment, not just this project.
-                    logger.error(
-                        'Failed to record %s for %s; the environment may '
-                        'remain IN_PROGRESS and stall every member',
-                        'BLOCKED', project_name,
-                    )
-                logger.error(
-                    "Could not parse verification status for %s -- marking dev container BLOCKED "
-                    "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
-                    "output excerpt)",
-                    project_name, project_name
                 )
 
         return {"status": "success", "agent_output": review_text}

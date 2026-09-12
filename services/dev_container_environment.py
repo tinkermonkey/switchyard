@@ -168,16 +168,6 @@ def image_tag_for(project_name: str) -> str:
     return f"{environment_for(project_name)}{IMAGE_TAG_SUFFIX}"
 
 
-def members_of(environment: str, project_names: List[str]) -> List[str]:
-    """Which of `project_names` participate in `environment`.
-
-    No production caller today -- kept because "who else is in this
-    environment" is the question every operator-facing message about a shared
-    environment raises, and the answer belongs here when one is added.
-    """
-    return sorted(p for p in project_names if environment_for(p) == environment)
-
-
 def validate_environments(
     project_configs: Dict[str, 'object'],
 ) -> List[str]:
@@ -202,7 +192,7 @@ def validate_environments(
     """
     errors: List[str] = []
 
-    def _env_of(cfg) -> Optional[str]:
+    def _env_of(cfg) -> object:   # str | None | _MALFORMED
         """The declared environment, or None. Never raises.
 
         Every malformed shape has to come back as None-plus-an-error rather

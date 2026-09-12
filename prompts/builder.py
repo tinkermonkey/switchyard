@@ -147,19 +147,6 @@ class PromptBuilder:
     #
     # .replace(), not .format(), so an unrelated brace anywhere in a content
     # file cannot raise.
-    def _content_placeholders(self, ctx: "PromptContext") -> dict:
-        """The substitution map applied to every content file."""
-        project = ctx.project_name or ctx.project
-        # No {DEV_CONTAINER_ENVIRONMENT} entry: no content file references it,
-        # and a placeholder in this map that nothing uses reads as wired when it
-        # is scaffolding. Add it here when a content file needs it -- and give
-        # it the same hard refusal the tag gets, rather than the silent
-        # leave-it-literal the two project placeholders fall back to.
-        return {
-            "{PROJECT_NAME}": project,
-            "{project_name}": project,
-        }
-
     def _resolve_dev_container_image_tag(self, ctx: "PromptContext") -> str:
         """The complete image tag, derived from the project when not threaded.
 
@@ -209,9 +196,10 @@ class PromptBuilder:
                 )
             text = text.replace("{DEV_CONTAINER_IMAGE_TAG}", tag)
 
-        for placeholder, value in self._content_placeholders(ctx).items():
-            if value and placeholder in text:
-                text = text.replace(placeholder, value)
+        project = ctx.project_name or ctx.project
+        if project:
+            for placeholder in ("{PROJECT_NAME}", "{project_name}"):
+                text = text.replace(placeholder, project)
         return text
 
     def build_verifier_prompt(self, ctx: "PromptContext") -> str:

@@ -17,7 +17,6 @@ from services.dev_container_environment import (
     clear_cache,
     environment_for,
     image_tag_for,
-    members_of,
     validate_environments,
 )
 
@@ -76,16 +75,6 @@ class TestResolution:
         would be worse than ignoring the setting."""
         with _with_configs({'p': FakeConfig({'environment': 'Not A Tag!'})}):
             assert environment_for('p') == 'p'
-
-    def test_members_of(self):
-        configs = {
-            'features': FakeConfig({'environment': 'mono'}),
-            'bugs': FakeConfig({'environment': 'mono'}),
-            'solo': FakeConfig(),
-        }
-        with _with_configs(configs):
-            assert members_of('mono', list(configs)) == ['bugs', 'features']
-            assert members_of('solo', list(configs)) == ['solo']
 
 
 # ----------------------------------------------------------------- validation
@@ -262,7 +251,6 @@ class TestPromptRendering:
 
     def test_tag_is_derived_when_not_threaded(self):
         """A context built directly must still render a usable prompt."""
-        from unittest.mock import patch
         ctx = self._ctx('dev_environment_setup', dev_container_image_tag='')
         with patch('services.dev_container_environment.image_tag_for',
                    return_value='derived-agent:latest'):
@@ -476,7 +464,6 @@ class TestTransientResolutionIsNotCached:
     TTL, silently bypassing the build lock that serialises the environment."""
 
     def test_fault_is_not_cached_and_recovers_on_the_next_call(self):
-        from unittest.mock import MagicMock, patch
         import services.dev_container_environment as dce
 
         mgr = MagicMock()
@@ -499,7 +486,6 @@ class TestTransientResolutionIsNotCached:
     def test_missing_project_stays_quiet_and_is_cached(self):
         """A name that simply is not a project is routine -- system callers pass
         state-file stems and 'switchyard' constantly."""
-        from unittest.mock import MagicMock, patch
         from config.manager import ConfigurationError
         import services.dev_container_environment as dce
 
