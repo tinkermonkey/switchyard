@@ -55,6 +55,21 @@ def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
 from agents.non_retryable import NonRetryableAgentError
 
 
+def _dev_container_state_path(environment: str) -> str:
+    """Where an operator will actually find `environment`'s state file.
+
+    Resolved through orchestrator_state_root() rather than spelled as a literal
+    (#181): a hardcoded relative path ignores ORCHESTRATOR_ROOT and so names a
+    location that does not exist in any deployment that sets it -- and this
+    string is the breadcrumb from a stalled board to the cause, which two
+    earlier review rounds already found pointing at the wrong file for a
+    different reason (the project name instead of the environment).
+    """
+    from config.state_manager import orchestrator_state_root
+
+    return str(orchestrator_state_root() / "dev_containers" / f"{environment}.yaml")
+
+
 class DevContainerEnvironmentBlocked(NonRetryableAgentError):
     """Another run drove this dev-container environment to BLOCKED while this
     one waited for the build lock.
@@ -308,7 +323,7 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
                         f"run reached a terminal failure for this environment while "
                         f"'{agent}' was waiting for the build lock. Not rebuilding, and "
                         f"not reporting success. Inspect "
-                        f"state/dev_containers/{environment}.yaml for the recorded "
+                        f"{_dev_container_state_path(environment)} for the recorded "
                         f"error, fix it, and re-run dev_environment_setup."
                     )
 
