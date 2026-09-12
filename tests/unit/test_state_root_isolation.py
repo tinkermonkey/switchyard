@@ -547,7 +547,7 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         """The #181 invariant, checked as an invariant rather than as a grep.
 
         Replaces a line-at-a-time regex scan that reported zero offenders while
-        fourteen sites in six files walked past it. See the module comment
+        thirteen sites in five files walked past it. See the module comment
         above for what it does and what it still does not.
         """
         root = Path(__file__).parent.parent.parent

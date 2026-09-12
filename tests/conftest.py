@@ -1498,7 +1498,7 @@ FIRST_PARTY_PREFIXES = (
 # module-level ints and five functions. So a reload mints nothing that
 # `isinstance` or `patch(...)` can start disagreeing about. What it DOES leave
 # stale is the copy each `from config.retention import RETENTION_DAYS` took --
-# thirteen non-test modules do that, observability.py and pipeline_run.py among
+# ten non-test modules do that, observability.py and pipeline_run.py among
 # them -- which is why those four tests restore the module in a `finally`
 # rather than leaving the last reload standing.
 RELOADABLE_FIRST_PARTY_MODULES = frozenset({
