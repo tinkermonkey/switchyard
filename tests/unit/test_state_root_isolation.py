@@ -179,8 +179,29 @@ class TestBothHoldoutsUseIt:
 #   * A loop variable is bound to the ELEMENTS of a literal sequence and
 #     otherwise to the iterable expression itself. `for seg in segments_from(x)`
 #     is therefore opaque in the same way a function parameter is.
+#   * A bare string LITERAL is an entry point in only two places: assigned to a
+#     name, and passed to a call while being a root in its own right -- absolute
+#     or `..`-escaping, and whitespace-free (see _is_rooted_state_literal). A
+#     RELATIVE `relative_path='state/projects'` argument is not reported, which
+#     is the point: it is a segment, not a root. Neither is a literal carrying
+#     whitespace, so `open('/app/state/notes for x')` is a measured miss. Until
+#     the third review round of #203 the call-argument half did not exist at
+#     all, and the file it mattered in was the one that DELETES aged trees.
+#   * It checks how a path is spelled, never what ORCHESTRATOR_ROOT held when
+#     the resolver read it. A module that sets the variable from its own
+#     location is invisible here, and is checked separately by
+#     root_override_findings() further down.
 
 _STATE_SEGMENT = re.compile(r'(?:^|/)state(?:/|$)')
+
+# A string literal that is a path ROOT in its own right: absolute, or climbing
+# out of wherever it is joined with `..`. Such a literal ignores the resolver no
+# matter what it is joined to -- measured, `Path('/tmp/scratch/state') /
+# '/app/state/execution_history'` is `/app/state/execution_history`, because
+# pathlib DISCARDS the left operand when the right side is absolute. A literal
+# WITHOUT this shape (`'state/execution_history'`) is a relative segment, lands
+# under whatever root it is joined to, and is not reported by the argument scan.
+_ROOT_LITERAL = re.compile(r'^/|(?:^|/)\.\.(?:/|$)')
 
 _PATH_TYPES = {'Path', 'PurePath', 'PosixPath', 'PurePosixPath'}
 # os.path helpers whose FIRST argument is the path being operated on
@@ -276,6 +297,33 @@ def _environ_key(node):
 
 def _has_state_segment(segments):
     return any(_STATE_SEGMENT.search(s) for s in segments if isinstance(s, str))
+
+
+def _is_rooted_state_literal(node):
+    """A string literal that is both a state path AND its own root.
+
+    The walk's other entry points are all EXPRESSIONS -- a `/`, a `Path(...)`, a
+    write call, an assignment. A literal handed straight to some other
+    constructor (`RetentionRule(relative_path='/app/state/execution_history')`)
+    is none of those, and was invisible. Two gates keep this from reporting
+    prose:
+
+      * it must be a root (`_ROOT_LITERAL`), so the relative segments a rule
+        table is actually made of stay quiet;
+      * it must contain no whitespace, so a message that merely NAMES a state
+        path is not a finding. Measured on the shape that matters,
+        `logger.info('/app/state/projects was swept', extra=meta)`: with the
+        gate, nothing; with the gate removed, one finding rooted at
+        `literal:'/app/state/projects was swept'`, which is the message and not
+        a path anyone built. (Nothing in this tree trips it either way -- the
+        tree-wide check reports zero with the gate removed as well as with it
+        in place -- so, like the separator gate above, it protects future code.)
+    """
+    return (isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and not any(c.isspace() for c in node.value)
+            and _ROOT_LITERAL.search(node.value)
+            and _STATE_SEGMENT.search(node.value))
 
 
 class _Bindings:
@@ -582,6 +630,14 @@ def state_path_findings(source, relpath, allowed_roots=frozenset()):
                 consider(node.args[0], node.lineno)
             elif base in _WRITE_METHODS and isinstance(node.func, ast.Attribute):
                 consider(node.func.value, node.lineno)
+            # ...and, whatever the callee is, any argument that is a state path
+            # rooted at itself. `RetentionRule(relative_path='/app/state/...')`
+            # is not a path EXPRESSION and reaches none of the branches above,
+            # so before this the module that deletes aged trees could name the
+            # live tree outright and the scan matched nothing (#203, round 3).
+            for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                if _is_rooted_state_literal(argument):
+                    consider(argument, node.lineno)
         elif isinstance(node, ast.Assign):
             # `STATE_REL = "state/projects"` -- a path literal parked in a
             # constant. Requires a '/' so that `self.state = "running"` and
@@ -601,9 +657,25 @@ def state_path_findings(source, relpath, allowed_roots=frozenset()):
 # not listed here still fails, in these files as in any other. The old table
 # exempted services/data_retention.py -- the module that DELETES aged trees --
 # whole-file; it needs no entry at all now, because its `relative_path=` values
-# are relative SEGMENTS in a rule table, not path roots, and the AST walk can
-# tell the difference. An absolute or __file__-derived path added to that file
-# tomorrow is reported.
+# are relative SEGMENTS in a rule table (joined at line 362 as `root /
+# rule.relative_path`, under a root the resolver produced), not path roots.
+#
+# Measured on that file rather than asserted, because the FIRST version of this
+# comment asserted more than the walk did. Unmodified: 0 findings. Change one
+# rule to `relative_path='/app/state/execution_history'`: reported, rooted at
+# that literal. To `'../../app/state/projects'`: reported. Append
+# `LEGACY = Path(__file__).parent.parent / 'state' / 'old'`: reported, rooted at
+# __file__. The first two of those three were NOT reported until the argument
+# scan in state_path_findings() was added -- a path-shaped literal handed to
+# some other constructor reached none of the walk's entry points, and pathlib
+# discards the left operand when the right side is absolute
+# (`Path('/tmp/scratch/state') / '/app/state/execution_history'` ->
+# `/app/state/execution_history`, measured), so an absolute value there would
+# have swept the live tree even under a scratch ORCHESTRATOR_ROOT.
+#
+# Still NOT reported, and deliberately: a RELATIVE `relative_path='state/...'`.
+# That is the shape the file is made of and it lands under whatever root it is
+# joined to, which is the property being relied on.
 EXEMPT_ROOTS = {
     'config/state_manager.py': (
         frozenset({'__file__', 'env:ORCHESTRATOR_ROOT', "literal:''"}),
@@ -654,6 +726,144 @@ EXEMPT_ROOTS = {
             'services/work_execution_state.py',
         )
     },
+}
+
+# ---------------------------------------------------------------------------
+# The other half of the invariant: where the resolver's INPUT came from (#203)
+# ---------------------------------------------------------------------------
+#
+# Everything above checks how a path is SPELLED. None of it says anything about
+# what ORCHESTRATOR_ROOT held when the resolver read it, so a module that sets
+# the variable from its own location is back at #181 with the whole tree
+# scanning clean. Measured: a module containing
+#
+#     os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
+#     (orchestrator_state_root() / 'projects' / p).mkdir(parents=True)
+#
+# produces ZERO findings from state_path_findings() -- the word `state` never
+# appears in it -- and the same is true of the os.environ.setdefault spelling.
+#
+# This check is deliberately provenance-BLIND, so that respelling the value
+# cannot beat it the way respelling a path beat the line scan: no first-party
+# module may write ORCHESTRATOR_ROOT unconditionally, whatever it writes. A
+# write guarded by a test that the variable is absent defers to whatever the
+# operator already chose -- and to tests/conftest.py, which treats any pre-set
+# value as an explicit override (see _redirect_orchestrator_root_to_scratch);
+# an unguarded one silently beats both, which would put the suite back to
+# writing the deployment checkout.
+#
+# scripts/maintain_agent_team.py:53 and scripts/rebuild_project_images.py:52
+# are both the guarded shape today. They are one deleted `if` away from being
+# the unguarded one, and this is the check that notices.
+#
+# LIMITS, same house rules as the walk above. It knows subscript assignment,
+# `os.environ.update()` (dict-literal or keyword form) and `os.putenv()`. It
+# does NOT know `os.execve`, a write through an alias (`env = os.environ;
+# env['ORCHESTRATOR_ROOT'] = ...`), or a key assembled at runtime. Guardedness
+# is judged only on the absence tests spelled out in _is_absence_test(): any
+# other wrapper, `if FORCE:` included, counts as unguarded, which is the safe
+# direction.
+
+_ROOT_VAR = 'ORCHESTRATOR_ROOT'
+
+
+def _is_environ(node):
+    return (_dotted(node) or '').endswith('environ')
+
+
+def _reads_root_var(node):
+    return isinstance(node, ast.Call) and _environ_key(node) == _ROOT_VAR
+
+
+def _is_absence_test(test):
+    """True for the ways a module asks 'is ORCHESTRATOR_ROOT still unset?'."""
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        inner = test.operand
+        if _reads_root_var(inner):  # `if not os.environ.get('...'):`
+            return True
+        return (isinstance(inner, ast.Compare) and len(inner.ops) == 1
+                and isinstance(inner.ops[0], ast.In)
+                and isinstance(inner.left, ast.Constant)
+                and inner.left.value == _ROOT_VAR
+                and _is_environ(inner.comparators[0]))
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        operator = test.ops[0]
+        if (isinstance(operator, ast.NotIn)          # `if '...' not in os.environ:`
+                and isinstance(test.left, ast.Constant)
+                and test.left.value == _ROOT_VAR
+                and _is_environ(test.comparators[0])):
+            return True
+        if (isinstance(operator, ast.Is)             # `if os.environ.get(...) is None:`
+                and _reads_root_var(test.left)
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value is None):
+            return True
+    return False
+
+
+def _root_override(node):
+    """The source of a write to ORCHESTRATOR_ROOT, or None.
+
+    `os.environ.setdefault('ORCHESTRATOR_ROOT', ...)` is absent on purpose: it
+    is the guarded shape by construction.
+    """
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if (isinstance(target, ast.Subscript)
+                    and _is_environ(target.value)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == _ROOT_VAR):
+                return ast.unparse(node)
+        return None
+    if isinstance(node, ast.Call):
+        base = _callee(node).split('.')[-1]
+        if (base == 'putenv' and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == _ROOT_VAR):
+            return ast.unparse(node)
+        if (base == 'update' and isinstance(node.func, ast.Attribute)
+                and _is_environ(node.func.value)):
+            keys = [keyword.arg for keyword in node.keywords]
+            for argument in node.args:
+                if isinstance(argument, ast.Dict):
+                    keys += [key.value for key in argument.keys
+                             if isinstance(key, ast.Constant)]
+            if _ROOT_VAR in keys:
+                return ast.unparse(node)
+    return None
+
+
+def root_override_findings(source, relpath):
+    """Every UNGUARDED write to ORCHESTRATOR_ROOT in `source`."""
+    tree = ast.parse(source)
+
+    guarded = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _is_absence_test(node.test):
+            for statement in node.body:
+                for inner in ast.walk(statement):
+                    guarded.add(id(inner))
+
+    findings = []
+    for node in ast.walk(tree):
+        if id(node) in guarded:
+            continue
+        code = _root_override(node)
+        if code:
+            findings.append(f'{relpath}:{node.lineno}: {code[:120]}')
+    return sorted(set(findings))
+
+
+# path -> why an UNGUARDED write is right in that file.
+EXEMPT_ROOT_OVERRIDES = {
+    'scripts/dry_run_state_sweep.py':
+        "repointing the running process at a scratch copy IS this harness's "
+        "contract -- _repoint_runtime() sets ORCHESTRATOR_ROOT precisely so "
+        "that everything imported afterwards resolves under scratch, and "
+        "tests/unit/scripts/test_dry_run_state_sweep.py restores the previous "
+        "value around it. Deferring to an operator's value here would defeat "
+        "the tool",
 }
 
 _SKIP_TREES = ('tests', '.claude', 'node_modules', 'venv', '.venv', '.git',
@@ -734,12 +944,188 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         )
 
 
+class TestNoModuleQuietlyRepointsTheResolver:
+    """#181 one hop up: the resolver is only as good as its input."""
+
+    def test_no_first_party_module_writes_orchestrator_root_unconditionally(self):
+        root = Path(__file__).parent.parent.parent
+
+        offenders = []
+        for relative, source in _first_party_sources(root):
+            if str(relative) in EXEMPT_ROOT_OVERRIDES:
+                continue
+            offenders += root_override_findings(
+                source.read_text(errors='ignore'), relative
+            )
+
+        assert offenders == [], (
+            "these lines set ORCHESTRATOR_ROOT without first checking that it "
+            "is unset, so they silently beat an operator's choice -- and "
+            "tests/conftest.py's scratch redirect is exactly such a choice "
+            "(#181):\n  " + "\n  ".join(offenders) +
+            "\nGuard the write with `if 'ORCHESTRATOR_ROOT' not in os.environ:` "
+            "or use os.environ.setdefault(), or add the file to "
+            "EXEMPT_ROOT_OVERRIDES with the reason it must win."
+        )
+
+    def test_every_override_exemption_is_live(self):
+        """Same rule as EXEMPT_ROOTS: no exemption without something to exempt."""
+        root = Path(__file__).parent.parent.parent
+
+        for relative, reason in sorted(EXEMPT_ROOT_OVERRIDES.items()):
+            assert reason, f"{relative} is exempt without a stated reason"
+            source = root / relative
+            assert source.is_file(), f"{relative} is exempt but does not exist"
+            assert root_override_findings(source.read_text(errors='ignore'), relative), (
+                f"{relative} is exempt from the ORCHESTRATOR_ROOT override check "
+                f"but the check finds nothing in it -- the exemption is dead"
+            )
+
+    def test_the_path_walk_alone_does_not_see_this(self):
+        """Why this check exists at all, restated as a measurement.
+
+        The walk reports on the SPELLING of a path expression. This module
+        spells every path through the resolver and still writes wherever it
+        happens to live, so the walk is silent on it -- both here and for the
+        setdefault spelling, which is silent for the same reason and safe for a
+        different one.
+        """
+        repointed = """
+import os
+from pathlib import Path
+os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
+from config.state_manager import orchestrator_state_root
+def ensure(project):
+    directory = orchestrator_state_root() / 'projects' / project
+    directory.mkdir(parents=True, exist_ok=True)
+"""
+        assert state_path_findings(repointed, 'mutant.py') == []
+        assert root_override_findings(repointed, 'mutant.py')
+
+    @pytest.mark.parametrize('description, source', [
+        ('subscript assignment from __file__', """
+import os
+from pathlib import Path
+os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
+"""),
+        ('subscript assignment of anything at all', """
+import os
+os.environ['ORCHESTRATOR_ROOT'] = args.root
+"""),
+        ('os.environ.update with a dict literal', """
+import os
+os.environ.update({'ORCHESTRATOR_ROOT': '/app'})
+"""),
+        ('os.environ.update with a keyword', """
+import os
+os.environ.update(ORCHESTRATOR_ROOT='/app')
+"""),
+        ('os.putenv', """
+import os
+os.putenv('ORCHESTRATOR_ROOT', '/app')
+"""),
+        ('guarded by the wrong condition', """
+import os
+from pathlib import Path
+if FORCE_LOCAL:
+    os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent)
+"""),
+    ])
+    def test_it_flags_an_unguarded_write(self, description, source):
+        assert root_override_findings(source, 'mutant.py'), f"not flagged: {description}"
+
+    @pytest.mark.parametrize('description, source', [
+        ('not-in test, the spelling both scripts use', """
+import os
+from pathlib import Path
+if 'ORCHESTRATOR_ROOT' not in os.environ:
+    os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
+"""),
+        ('setdefault, guarded by construction', """
+import os
+import tempfile
+os.environ.setdefault('ORCHESTRATOR_ROOT', tempfile.mkdtemp())
+"""),
+        ('falsy test, which also covers the empty string', """
+import os
+from pathlib import Path
+if not os.environ.get('ORCHESTRATOR_ROOT'):
+    os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent)
+"""),
+        ('an is-None test', """
+import os
+if os.environ.get('ORCHESTRATOR_ROOT') is None:
+    os.environ['ORCHESTRATOR_ROOT'] = '/app'
+"""),
+        ('reading it is not writing it', """
+import os
+root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
+"""),
+        ('a different variable entirely', """
+import os
+os.environ['WORKSPACE_ROOT'] = '/workspace'
+"""),
+    ])
+    def test_it_stays_quiet_on_a_guarded_write(self, description, source):
+        findings = root_override_findings(source, 'clean.py')
+        assert findings == [], f"false positive: {description}\n  " + "\n  ".join(findings)
+
+    @pytest.mark.parametrize('relative', [
+        'scripts/maintain_agent_team.py',
+        'scripts/rebuild_project_images.py',
+    ])
+    def test_dropping_the_real_guard_in_a_real_file_is_caught(self, relative):
+        """The mutation test, run against the two files that actually do this.
+
+        Asserting the tree is clean proves nothing on its own -- the predecessor
+        of this whole module was clean while #181 was live. So take the real
+        source, lift the write out of its `if`, and require the check to report
+        THAT line. The `guard_block in source` assert is the other half: if
+        either script ever stops spelling the guard this way, this test fails
+        loudly rather than silently mutating nothing and passing on a file it
+        never changed.
+        """
+        root = Path(__file__).parent.parent.parent
+        source = (root / relative).read_text()
+
+        assert root_override_findings(source, relative) == []
+
+        guard_block = (
+            "if 'ORCHESTRATOR_ROOT' not in os.environ:\n"
+            "    os.environ['ORCHESTRATOR_ROOT'] = "
+            "str(Path(__file__).parent.parent.resolve())\n"
+        )
+        assert guard_block in source, (
+            f"{relative} no longer spells the guard the way this test mutates; "
+            f"update the test rather than deleting it"
+        )
+        mutated = source.replace(
+            guard_block,
+            "os.environ['ORCHESTRATOR_ROOT'] = "
+            "str(Path(__file__).parent.parent.resolve())\n",
+        )
+
+        findings = root_override_findings(mutated, relative)
+        assert len(findings) == 1 and 'ORCHESTRATOR_ROOT' in findings[0], findings
+
+
 # Shapes that reintroduce #181. Split by what the PREDECESSOR did with them,
-# measured, not assumed: the first five walk straight past the line scan, the
-# last three it already caught. Keeping the caught ones here too is the
+# measured, not assumed: the first six walk straight past the line scan, the
+# last four it already caught. Keeping the caught ones here too is the
 # regression half -- an AST walk that quietly stopped seeing `os.path.join(...,
-# "state")` would be a downgrade even while looking like an upgrade.
+# "state")` would be a downgrade even while looking like an upgrade. 'an
+# absolute state root handed to some other constructor', below, is that
+# downgrade caught in the act: the grep DID see an absolute `'/app/state/...'`
+# literal wherever it appeared, and until the third review round of #203 the
+# walk had stopped seeing one outside an assignment.
 _DEFEATED_THE_LINE_SCAN = {
+    'an escaping state root handed to some other constructor': """
+RULES = [
+    RetentionRule(relative_path='../../app/state/projects', root_kind='orchestrator'),
+]
+for rule in RULES:
+    shutil.rmtree(resolve_roots()[rule.root_kind] / rule.relative_path)
+""",
     'split __file__ derivation from the literal': """
 from pathlib import Path
 _ROOT = Path(__file__).parent.parent
@@ -785,6 +1171,13 @@ os.makedirs(p, exist_ok=True)
 from pathlib import Path
 STATE_REL = "state/projects"
 Path(STATE_REL).mkdir(parents=True, exist_ok=True)
+""",
+    'an absolute state root handed to some other constructor': """
+RULES = [
+    RetentionRule(relative_path='/app/state/execution_history', root_kind='orchestrator'),
+]
+for rule in RULES:
+    shutil.rmtree(resolve_roots()[rule.root_kind] / rule.relative_path)
 """,
 }
 
@@ -880,6 +1273,10 @@ RULES = [
 for rule in RULES:
     for entry in (resolve_roots()[rule.root_kind] / rule.relative_path).iterdir():
         pass
+""",
+    'a message that names a state path without building one': """
+logger.info('/app/state/projects was swept', extra=meta)
+raise RuntimeError('refusing to sweep /app/state with RETENTION_DAYS unset')
 """,
 }
 
