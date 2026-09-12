@@ -134,11 +134,27 @@ class TestBothHoldoutsUseIt:
 # covered. It was not, and the deadness of that entry was the measure of the
 # hole.
 #
-# Measured against origin/main rather than quoted: on that tree the line scan
-# reports ZERO offenders, while this walk reports thirteen sites in five
-# first-party files (mcp/server.py and four scripts/) that build a state path
-# from a root the resolver never saw. Those thirteen feed eight mkdir calls and
-# six file writes. #203 fixes all thirteen.
+# Measured rather than quoted, and re-measured after the rebase, because #202
+# (PR #208) landed first and rewrote most of the files this walk inspects. Both
+# numbers below are this walk with THIS FILE'S exemption table, run over the
+# named tree:
+#
+#   * d7d8e3a, the main this branch was written against: line scan ZERO
+#     offenders, walk TWENTY-TWO sites in THIRTEEN files -- thirteen of them in
+#     the five files #203 set out to fix (mcp/server.py and four scripts/), the
+#     other nine in the eight modules the table exempted at the time. Those
+#     thirteen fed eight mkdir calls and six file writes.
+#   * b722401, main today: line scan ZERO offenders, walk ONE site --
+#     `mcp/server.py:72: APP_ROOT / 'state' / 'projects'`. #202 fixed the four
+#     scripts (differently, through config.paths.orchestrator_root()) and
+#     migrated the seven services to orchestrator_state_root(), so twenty-one
+#     of the twenty-two are gone and every one of those eight exemptions with
+#     them. The site it did not touch is the one whose DEAD EXEMPTION is the
+#     reason this guard was written, which is the point restated rather than
+#     weakened: the shape the predecessor could not see is exactly the shape
+#     that survived a whole PR aimed at this bug class.
+#
+# On the rebased branch the walk reports ZERO.
 #
 # So: parse each module, find every expression that builds a path with a
 # `state` segment in it, trace that expression's ROOT back through local name
@@ -228,7 +244,48 @@ _LEADS_WITH_PLACEHOLDER = re.compile(
     r'^%(?:\([^)]*\))?[-+ #0]*[0-9*]*(?:\.[0-9*]+)?[hlL]?[a-zA-Z%]'
 )
 
+# A path segment that IS the start of the state tree: `state`, or `/state/...`
+# written as one literal. Used only for the SAFE_CHECKOUT_ROOT rule below.
+_LEADS_WITH_STATE = re.compile(r'^/?state(?:/|$)')
+
+# THE TWO RESOLVERS, AND WHY THEY ARE NOT INTERCHANGEABLE HERE.
+#
+# config/paths.py exposes both (#202). `orchestrator_state_root()` returns the
+# `state/` tree itself, so ANY path hung off it is inside the state tree by
+# construction and the walk can stop looking. `orchestrator_root()` returns the
+# CHECKOUT -- one level up -- because two kinds of caller need the root rather
+# than the state dir: services/data_retention.resolve_roots(), which hangs its
+# rule table off the root, and the scripts/ entry points, which derive both
+# `root/state/projects/...` and `root.parent` (the workspace) from the same
+# value. Both honour ORCHESTRATOR_ROOT through the same root_from_env(), which
+# strips, resolves, and REFUSES a relative value, so both are legitimate
+# origins for a state path.
+#
+# They are not the same claim, though, and the walk must not pretend they are.
+# `orchestrator_root() / 'state' / 'projects'` is the state tree.
+# `orchestrator_root() / 'projects' / 'state'` is a directory called `state`
+# somewhere else in the checkout, and a guard that blessed it on the strength
+# of the root alone would be handing out the resolver's guarantee to a path the
+# resolver never promised anything about. So SAFE_CHECKOUT_ROOT is approved
+# ONLY when the first segment appended to it is `state` -- checked on the
+# ORIGIN expression, walking names, so that a two-step
+# `base = orchestrator_root() / 'projects'` then `base / 'state'` reads as
+# `projects/state` and is reported.
+#
+# LIMIT, stated rather than implied: approval is granted on the NAME of the
+# call. A module that defined its own `orchestrator_root()` returning something
+# unresolved would be believed. That is the same trust the predecessor placed
+# in `orchestrator_state_root()` and this change does not widen it -- the two
+# names live in config/paths.py, which this walk also inspects (it has no
+# exemption: its one state path is `orchestrator_root() / "state"`, approved by
+# the rule above, and rewriting that line to a `__file__` derivation is
+# reported like any other file's).
 SAFE_ROOT = 'orchestrator_state_root()'
+SAFE_CHECKOUT_ROOT = 'orchestrator_root()'
+_SAFE_RESOLVERS = {
+    'orchestrator_state_root': SAFE_ROOT,
+    'orchestrator_root': SAFE_CHECKOUT_ROOT,
+}
 
 
 def _dotted(node):
@@ -383,46 +440,65 @@ class _Bindings:
             return self.by_name.get(_dotted(node) or '', [])
         return []
 
-    def segments(self, node, depth=0):
-        """Literal path pieces this expression contributes ITSELF.
+    def segments(self, node, depth=0, follow=False):
+        """Literal path pieces this expression contributes, in order.
 
-        Does not follow names -- state_origin() does that, so that the finding
-        is reported at the line that built the path rather than at every later
-        use of it.
+        By default it does NOT follow names -- state_origin() does that, so
+        that the finding is reported at the line that built the path rather
+        than at every later use of it.
+
+        `follow=True` does follow them, and exists for one caller:
+        _descends_straight_into_state(), which has to know what the WHOLE path
+        looks like from its root down rather than what one expression added to
+        it. Only the first binding of a name that contributes anything is
+        taken; unioning is meaningless for an ordered sequence, and the caller
+        fails closed when the answer is empty. Termination is the depth cap,
+        which also bounds the self-referential `root = root / seg` shape.
         """
         if depth > 12:
             return []
         if isinstance(node, ast.Constant):
             return [node.value] if isinstance(node.value, str) else []
+        if follow and isinstance(node, (ast.Name, ast.Attribute)) and not (
+                isinstance(node, ast.Attribute) and node.attr in _PATH_ATTRS):
+            for value in self.of(node):
+                pieces = self.segments(value, depth + 1, follow)
+                if pieces:
+                    return pieces
+            return []
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add, ast.Mod)):
             # Mod is `'%s/state' % base`. The f-string and `.format()` spellings
             # of the same path were already covered; %-formatting was not, and
             # nothing in the limits list said so.
-            return (self.segments(node.left, depth + 1)
-                    + self.segments(node.right, depth + 1))
+            return (self.segments(node.left, depth + 1, follow)
+                    + self.segments(node.right, depth + 1, follow))
         if isinstance(node, ast.JoinedStr):
             out = []
             for value in node.values:
-                out += self.segments(value, depth + 1)
+                out += self.segments(value, depth + 1, follow)
             return out
+        if isinstance(node, ast.FormattedValue):
+            # Only reachable with follow=True: without it a `{BASE}` hole
+            # contributes nothing, which is what the un-followed answer means.
+            return self.segments(node.value, depth + 1, follow) if follow else []
         if isinstance(node, ast.Attribute) and node.attr in _PATH_ATTRS:
-            return self.segments(node.value, depth + 1)
+            return self.segments(node.value, depth + 1, follow)
         if isinstance(node, ast.Subscript):  # Path(...).parents[1]
-            return self.segments(node.value, depth + 1)
+            return self.segments(node.value, depth + 1, follow)
         elements = _path_join_elements(node)
         if elements is not None:  # os.sep.join([base, 'state', 'projects'])
             out = []
             for element in elements:
-                out += self.segments(element, depth + 1)
+                out += self.segments(element, depth + 1, follow)
             return out
         if isinstance(node, ast.Call):
             base = _callee(node).split('.')[-1]
             if base in _PATH_TYPES or base in _OS_PATH_ROOTED or base in _PATH_DERIVING:
                 out = []
                 if isinstance(node.func, ast.Attribute) and base in _PATH_DERIVING:
-                    out += self.segments(node.func.value, depth + 1)
+                    out += self.segments(node.func.value, depth + 1, follow)
                 for arg in node.args:
-                    out += self.segments(arg, depth + 1)
+                    out += self.segments(arg, depth + 1, follow)
                 return out
         return []
 
@@ -568,10 +644,29 @@ class _Bindings:
                 })
                 return f'env:{key}->' + '|'.join(inner)
             name = _callee(node) or '?'
-            if name.split('.')[-1] == 'orchestrator_state_root':
-                return SAFE_ROOT
+            resolved = _SAFE_RESOLVERS.get(name.split('.')[-1])
+            if resolved is not None:
+                return resolved
             return f'call:{name}()'
         return type(node).__name__
+
+
+def _descends_straight_into_state(binds, origin):
+    """Does this path enter the state tree at its FIRST segment?
+
+    The question only `orchestrator_root()` raises. It hands back the checkout,
+    so it is an approved origin for `<root>/state/...` and for nothing else:
+    `<root>/projects/state` is a different directory that happens to end in the
+    same word. Answered on the ordered segments of the origin expression with
+    names followed, so that the two-step spelling reads the same as the
+    one-line one, and answered NO when there is nothing to read -- an origin
+    whose leading segments the walk cannot see is not one it can bless.
+    """
+    for piece in binds.segments(origin, follow=True):
+        if not isinstance(piece, str) or not piece.strip('/'):
+            continue
+        return bool(_LEADS_WITH_STATE.match(piece))
+    return False
 
 
 def state_path_findings(source, relpath, allowed_roots=frozenset()):
@@ -589,7 +684,17 @@ def state_path_findings(source, relpath, allowed_roots=frozenset()):
         if origin is None:
             return
         labels = sorted({binds.label(root) for root in (binds.roots(expr) or [expr])})
-        if all(label == SAFE_ROOT or label in allowed_roots for label in labels):
+
+        def approved(label):
+            if label == SAFE_ROOT or label in allowed_roots:
+                return True
+            if label == SAFE_CHECKOUT_ROOT:
+                # The root, not the state dir -- approved only for a path that
+                # descends into `state/` immediately. See _SAFE_RESOLVERS.
+                return _descends_straight_into_state(binds, origin)
+            return False
+
+        if all(approved(label) for label in labels):
             return
         line = getattr(origin, 'lineno', fallback_line)
         previous = found.get(line)
@@ -676,13 +781,24 @@ def state_path_findings(source, relpath, allowed_roots=frozenset()):
 # Still NOT reported, and deliberately: a RELATIVE `relative_path='state/...'`.
 # That is the shape the file is made of and it lands under whatever root it is
 # joined to, which is the property being relied on.
+#
+# WHAT #202 (PR #208) TOOK OFF THIS TABLE, and why nothing replaced it. This
+# branch was written against a tree where `config/state_manager.py` defined
+# orchestrator_state_root() with a `__file__` fallback, and where seven
+# services modules open-coded `Path(os.environ.get('ORCHESTRATOR_ROOT', '/app'))
+# / "state" / ...`. All eight had entries here. #202 landed first and moved the
+# resolver to config/paths.py and migrated all seven services to call it, so
+# every one of those eight entries stopped matching anything. They are deleted
+# rather than kept "in case": test_every_exemption_is_live() fails a dead
+# entry, which is the rule that removed them, and a dead exemption is a
+# standing blind spot over the file it names. Re-measured on the rebased tree:
+# config/state_manager.py and all seven services now produce ZERO findings
+# without any exemption at all.
+#
+# config/paths.py, which is where the resolver went, likewise needs no entry:
+# its only state path is `orchestrator_root() / "state"`, and that is approved
+# by the SAFE_CHECKOUT_ROOT rule rather than waved through by a file name.
 EXEMPT_ROOTS = {
-    'config/state_manager.py': (
-        frozenset({'__file__', 'env:ORCHESTRATOR_ROOT', "literal:''"}),
-        "defines orchestrator_state_root(): the __file__ fallback IS the "
-        "deployment's own behaviour when ORCHESTRATOR_ROOT is unset, and the "
-        "env read plus its `or ''` are the resolver itself",
-    ),
     'scripts/dry_run_state_sweep.py': (
         frozenset({
             'call:_resolve_deployment_root()',
@@ -696,36 +812,24 @@ EXEMPT_ROOTS = {
         "deliberately does NOT use ORCHESTRATOR_ROOT for the live one because "
         "it overwrites that variable itself",
     ),
-    # The seven modules that read ORCHESTRATOR_ROOT directly with an ABSOLUTE
-    # default. #181 blessed this shape and did not change it; #203 does not
-    # either. What the exemption is pinned to is the point: the label carries
-    # the fallback, so `os.environ.get('ORCHESTRATOR_ROOT', '.')` or a
-    # `__file__` fallback in one of these files is a DIFFERENT label and still
-    # fails -- which is exactly how the five scripts #203 fixed were found.
-    #
-    # Stated plainly, because the docstring should not imply otherwise: this
-    # shape is weaker than the resolver. It does not refuse a relative
-    # ORCHESTRATOR_ROOT, so `ORCHESTRATOR_ROOT=tmp/scratch` still resolves
-    # against the CWD in these seven. Migrating them to
-    # orchestrator_state_root() is the obvious follow-up and is deliberately
-    # not bundled into this change: they are the lock, queue, semaphore and
-    # execution-history roots of a running deployment.
-    **{
-        path: (
-            frozenset({"env:ORCHESTRATOR_ROOT->literal:'/app'"}),
-            "reads ORCHESTRATOR_ROOT directly with an absolute /app fallback "
-            "(pre-existing, see #181); pinned to that exact fallback",
-        )
-        for path in (
-            'services/conversational_session_state.py',
-            'services/dev_container_state.py',
-            'services/pipeline_lock_manager.py',
-            'services/pipeline_queue_manager.py',
-            'services/pipeline_semaphore_manager.py',
-            'services/scheduled_tasks.py',
-            'services/work_execution_state.py',
-        )
-    },
+    # An `--analysis`/`--strategy` path typed on the command line is not
+    # derived from any root at all, and the branch that uses it never touches
+    # the state tree. It appears here only because the walk UNIONS the two
+    # branches of `file = Path(args.x) if args.x else <root>/state/...` and
+    # requires every root in the union to be approved -- which is the direction
+    # that makes the guard hard to defeat and is not being relaxed. Pinned to
+    # the exact argparse attribute: any other root in these files still fails.
+    'scripts/generate_artifacts.py': (
+        frozenset({'attr:args.strategy', 'attr:args.analysis'}),
+        "the --strategy/--analysis overrides: an explicit file path from the "
+        "command line, unioned with the resolver-derived default by the branch "
+        "walk",
+    ),
+    'scripts/generate_strategy.py': (
+        frozenset({'attr:args.analysis'}),
+        "the --analysis override: an explicit file path from the command line, "
+        "unioned with the resolver-derived default by the branch walk",
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -884,8 +988,9 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         """The #181 invariant, checked as an invariant rather than as a grep.
 
         Replaces a line-at-a-time regex scan that reported zero offenders while
-        thirteen sites in five files walked past it. See the module comment
-        above for what it does and what it still does not.
+        twenty-two sites walked past it, one of which was still there on main
+        after a whole PR (#202) aimed at this bug class. See the module comment
+        above for the two measurements and for what this does not do.
         """
         root = Path(__file__).parent.parent.parent
 
@@ -1278,6 +1383,18 @@ for rule in RULES:
 logger.info('/app/state/projects was swept', extra=meta)
 raise RuntimeError('refusing to sweep /app/state with RETENTION_DAYS unset')
 """,
+    'the checkout resolver, descending into state at once (#202 spelling)': """
+from config.paths import orchestrator_root
+ORCHESTRATOR_ROOT = orchestrator_root()
+STATE_DIR = ORCHESTRATOR_ROOT / 'state' / 'projects'
+state_file = STATE_DIR / project / 'agent_generation_state.yaml'
+state_file.parent.mkdir(parents=True, exist_ok=True)
+""",
+    'the checkout resolver used for the workspace, which is not state': """
+from config.paths import orchestrator_root
+def get_workspace_root():
+    return orchestrator_root().parent
+""",
 }
 
 
@@ -1382,16 +1499,128 @@ sneaked = Path(__file__).parent.parent / 'state' / 'projects'
         findings = state_path_findings(source, 'mutant.py', allowed)
         assert len(findings) == 1 and '__file__' in findings[0], findings
 
-        # An exemption whose file has stopped matching is a permanent blind
-        # spot with no remaining justification, and the file it covers is
-        # usually the one most worth watching -- config/state_manager.py sat
-        # here, exempted, for exactly that reason after #202 moved the resolver
-        # out from under it.
-        assert set(EXEMPT) == exemptions_used, (
-            "these EXEMPT entries no longer match anything, so they only "
-            "hide whatever is added to those files next -- delete them: "
-            f"{sorted(set(EXEMPT) - exemptions_used)}"
+
+class TestTheTwoResolversAreModelledApart:
+    """`orchestrator_root()` is the CHECKOUT; `orchestrator_state_root()` is
+    the `state/` tree under it (#202). Both are approved origins and they are
+    not approved for the same paths.
+
+    Without this the five scripts #202 rewrote would ALL fail the walk -- each
+    of them now derives from orchestrator_root() -- and the cheap fix (one more
+    name on the safe list) would have blessed every path in the checkout that
+    happens to contain a directory called `state`.
+    """
+
+    def test_the_state_resolver_blesses_whatever_hangs_off_it(self):
+        source = """
+from config.state_manager import orchestrator_state_root
+p = orchestrator_state_root() / 'projects' / project / 'review_cycles'
+p.mkdir(parents=True, exist_ok=True)
+"""
+        assert state_path_findings(source, 'clean.py') == []
+
+    def test_the_checkout_resolver_is_blessed_when_state_is_the_first_segment(self):
+        source = """
+from config.paths import orchestrator_root
+p = orchestrator_root() / 'state' / 'projects' / project
+p.mkdir(parents=True, exist_ok=True)
+"""
+        assert state_path_findings(source, 'clean.py') == []
+
+    def test_the_checkout_resolver_is_not_blessed_for_some_other_state_dir(self):
+        """`<checkout>/projects/state` is not the state tree. The resolver made
+        no promise about it, and the guard must not make one on its behalf."""
+        source = """
+from config.paths import orchestrator_root
+p = orchestrator_root() / 'projects' / 'state'
+p.mkdir(parents=True, exist_ok=True)
+"""
+        findings = state_path_findings(source, 'mutant.py')
+        assert findings and SAFE_CHECKOUT_ROOT in findings[0], findings
+
+    def test_a_detour_taken_in_two_steps_is_still_not_blessed(self):
+        """The reason the descent check follows names. Judged on the ORIGIN
+        expression alone, `base / 'state'` reads as a first segment of `state`
+        and would pass; read from the root down it is `projects/state`."""
+        source = """
+from config.paths import orchestrator_root
+base = orchestrator_root() / 'projects'
+p = base / 'state'
+p.mkdir(parents=True, exist_ok=True)
+"""
+        findings = state_path_findings(source, 'mutant.py')
+        assert findings and SAFE_CHECKOUT_ROOT in findings[0], findings
+
+    def test_the_f_string_spelling_descends_the_same_way(self):
+        clean = """
+from config.paths import orchestrator_root
+p = f"{orchestrator_root()}/state/projects"
+"""
+        dirty = """
+from config.paths import orchestrator_root
+p = f"{orchestrator_root()}/projects/state"
+"""
+        assert state_path_findings(clean, 'clean.py') == []
+        assert state_path_findings(dirty, 'mutant.py'), 'the detour was blessed'
+
+    def test_an_opaque_root_named_orchestrator_root_is_not_the_resolver(self):
+        """A local variable of that name resolves through its BINDING, not
+        through the name -- only a call is ever labelled as a resolver."""
+        source = """
+import os
+from pathlib import Path
+orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+p = orchestrator_root / 'state' / 'projects'
+p.mkdir(parents=True, exist_ok=True)
+"""
+        findings = state_path_findings(source, 'mutant.py')
+        assert findings and "env:ORCHESTRATOR_ROOT->literal:'.'" in findings[0], findings
+
+
+class TestTheResolverModulesAreThemselvesInspected:
+    """config/paths.py is where #202 put the resolution, and config/
+    state_manager.py is where it used to live and still re-exports from. Both
+    are inside the walk's scope and neither has an exemption any more; these
+    tests are what makes that statement checkable rather than assumed."""
+
+    @staticmethod
+    def _source(relative):
+        return (Path(__file__).parent.parent.parent / relative).read_text()
+
+    @pytest.mark.parametrize(
+        'relative', ['config/paths.py', 'config/state_manager.py']
+    )
+    def test_it_is_in_scope_and_needs_no_exemption(self, relative):
+        assert relative not in EXEMPT_ROOTS
+        assert any(str(rel) == relative for rel, _ in
+                   _first_party_sources(Path(__file__).parent.parent.parent))
+        assert state_path_findings(self._source(relative), relative) == []
+
+    def test_rewriting_the_resolver_to_a_file_derivation_is_reported(self):
+        """The mutation that matters for config/paths.py: put #181 back inside
+        the function every other module trusts. Nothing here is exempt, so it
+        is reported like anyone else's."""
+        source = self._source('config/paths.py')
+        real = 'return orchestrator_root() / "state"'
+        assert real in source, (
+            'config/paths.py no longer spells orchestrator_state_root() the '
+            'way this test mutates; update the test rather than deleting it'
         )
+
+        mutated = source.replace(
+            real, 'return Path(__file__).parent.parent / "state"'
+        )
+        findings = state_path_findings(mutated, 'config/paths.py')
+        assert len(findings) == 1 and '__file__' in findings[0], findings
+
+    def test_the_re_export_in_state_manager_still_resolves_to_the_safe_label(self):
+        """config/state_manager.py imports the resolver rather than defining
+        it now. The label is computed from the CALL, so the re-export does not
+        change it -- which is why its old exemption is dead rather than moved."""
+        source = self._source('config/state_manager.py')
+        assert 'from .paths import orchestrator_state_root' in source
+        assert 'orchestrator_state_root()' in source
+        assert state_path_findings(source, 'config/state_manager.py') == []
 
 
 class TestTheSuiteCannotReachTheDeploymentsState:
