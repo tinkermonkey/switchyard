@@ -163,6 +163,22 @@ class TestBothHoldoutsUseIt:
 #     one line and an unsafe one on another, the unsafe one is reported. That
 #     is the intended direction -- a guard that resolves branches would start
 #     missing things.
+#   * Of the ways to assemble a path out of strings, it knows `/`, `+`,
+#     f-strings, `.format()`, `%`-formatting, `os.path.join()`, and
+#     `<sep>.join([...])` where <sep> is `os.sep`, `os.path.sep` or a literal
+#     separator. It does NOT know the rest -- measured misses:
+#     `''.join([base, '/state'])`, `SEP.join([base, 'state'])` with the
+#     separator in a variable, and any `bytes` path such as
+#     `os.makedirs(b'/app/state')`. This list is the second draft -- the
+#     first named neither `%`-formatting nor separator joins nor
+#     loop-accumulated segments, all
+#     three of which walked past it, and all three of which are now both fixed
+#     and pinned as samples in _DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK below.
+#     Treat the list as the measured edge of the walk, not as a boundary that
+#     was reasoned about once and then trusted.
+#   * A loop variable is bound to the ELEMENTS of a literal sequence and
+#     otherwise to the iterable expression itself. `for seg in segments_from(x)`
+#     is therefore opaque in the same way a function parameter is.
 
 _STATE_SEGMENT = re.compile(r'(?:^|/)state(?:/|$)')
 
@@ -182,6 +198,15 @@ _WRITE_METHODS = {'mkdir', 'write_text', 'write_bytes', 'touch', 'unlink',
 _WRITE_FUNCS = {'open', 'makedirs', 'mkdir', 'rmtree', 'remove', 'unlink',
                 'copy', 'copy2', 'copytree', 'move'}
 
+# separators that make `<sep>.join([...])` a PATH join rather than prose
+_PATH_SEPARATORS = {'/', '\\'}
+_PATH_SEP_NAMES = {'os.sep', 'os.path.sep', 'sep'}
+# a %-format string that STARTS with its first placeholder: '%s/state' puts the
+# substituted value at the front of the path, '/app/state/%s' does not
+_LEADS_WITH_PLACEHOLDER = re.compile(
+    r'^%(?:\([^)]*\))?[-+ #0]*[0-9*]*(?:\.[0-9*]+)?[hlL]?[a-zA-Z%]'
+)
+
 SAFE_ROOT = 'orchestrator_state_root()'
 
 
@@ -195,6 +220,37 @@ def _dotted(node):
         parts.append(node.id)
         return '.'.join(reversed(parts))
     return None
+
+
+def _path_join_elements(node):
+    """The pieces of `<sep>.join([...])`, or None if this is not a path join.
+
+    `os.path.join(...)` is already handled as an _OS_PATH_ROOTED call. This is
+    the OTHER spelling -- `os.sep.join([base, 'state'])`, `'/'.join([...])` --
+    which the first draft of this walk missed entirely, because `.join` takes a
+    SEQUENCE and segments() had no case for a list display.
+
+    Gated on the separator rather than on the bare method name, and the gate is
+    load-bearing: measured, with it removed `', '.join(['state', 'status'])`
+    is reported as a state path rooted at `literal:'state'`. (Nothing in this
+    tree joins a literal list containing 'state' today -- the tree-wide check
+    reports zero findings with the gate removed as well as with it in place --
+    so the gate is protecting future code, not current code.)
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    if node.func.attr != 'join' or len(node.args) != 1:
+        return None
+    receiver = node.func.value
+    separator_named = _dotted(receiver) in _PATH_SEP_NAMES
+    separator_literal = (isinstance(receiver, ast.Constant)
+                         and receiver.value in _PATH_SEPARATORS)
+    if not (separator_named or separator_literal):
+        return None
+    sequence = node.args[0]
+    if isinstance(sequence, (ast.List, ast.Tuple, ast.Set)):
+        return list(sequence.elts)
+    return [sequence]
 
 
 def _callee(node):
@@ -239,6 +295,28 @@ class _Bindings:
                     self._bind(target, node.value)
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
                 self._bind(node.target, node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                self._bind_iteration(node.target, node.iter)
+
+    def _bind_iteration(self, target, iterable):
+        """A loop variable is bound to whatever the sequence yields.
+
+        `for seg in ['state', 'projects']: root = root / seg` is a real #181
+        spelling, and the only reason the first draft of this walk missed it is
+        that a for-target is not an Assign, so the loop variable had no binding
+        and the `state` literal was never reachable from `root`.
+
+        A literal sequence binds element by element. Anything else binds to the
+        iterable expression itself, which over-approximates in the safe
+        direction: segments() does not follow names, so a Name iterable
+        contributes no segments of its own and only state_origin()'s binding
+        walk can reach through it.
+        """
+        if isinstance(iterable, (ast.List, ast.Tuple, ast.Set)):
+            for element in iterable.elts:
+                self._bind(target, element)
+        else:
+            self._bind(target, iterable)
 
     def _bind(self, target, value):
         if isinstance(target, ast.Name):
@@ -268,7 +346,10 @@ class _Bindings:
             return []
         if isinstance(node, ast.Constant):
             return [node.value] if isinstance(node.value, str) else []
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add, ast.Mod)):
+            # Mod is `'%s/state' % base`. The f-string and `.format()` spellings
+            # of the same path were already covered; %-formatting was not, and
+            # nothing in the limits list said so.
             return (self.segments(node.left, depth + 1)
                     + self.segments(node.right, depth + 1))
         if isinstance(node, ast.JoinedStr):
@@ -280,6 +361,12 @@ class _Bindings:
             return self.segments(node.value, depth + 1)
         if isinstance(node, ast.Subscript):  # Path(...).parents[1]
             return self.segments(node.value, depth + 1)
+        elements = _path_join_elements(node)
+        if elements is not None:  # os.sep.join([base, 'state', 'projects'])
+            out = []
+            for element in elements:
+                out += self.segments(element, depth + 1)
+            return out
         if isinstance(node, ast.Call):
             base = _callee(node).split('.')[-1]
             if base in _PATH_TYPES or base in _OS_PATH_ROOTED or base in _PATH_DERIVING:
@@ -311,7 +398,7 @@ class _Bindings:
         if _has_state_segment(self.segments(node)):
             return node
         children = []
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add, ast.Mod)):
             children = [node.left, node.right]
         elif isinstance(node, ast.Subscript):
             children = [node.value]
@@ -319,6 +406,8 @@ class _Bindings:
             children = list(node.values)
         elif isinstance(node, ast.FormattedValue):
             children = [node.value]
+        elif _path_join_elements(node) is not None:
+            children = _path_join_elements(node)
         elif isinstance(node, ast.Call):
             base = _callee(node).split('.')[-1]
             if base in _PATH_TYPES or base in _OS_PATH_ROOTED or base in _PATH_DERIVING:
@@ -343,6 +432,24 @@ class _Bindings:
         seen = seen | {id(node)}
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
             return self.roots(node.left, seen, depth + 1) or [node.left]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            # `fmt % values`. Which side is the ROOT depends on the format
+            # string: '%s/state' % base is anchored at base, '/app/state/%s' %
+            # name is anchored at the literal. Getting this right is what makes
+            # the finding say `__file__` instead of `literal:'%s/state'`; both
+            # fail closed, only one is readable.
+            left, right = node.left, node.right
+            if (isinstance(left, ast.Constant) and isinstance(left.value, str)
+                    and _LEADS_WITH_PLACEHOLDER.match(left.value)):
+                if isinstance(right, ast.Dict):  # '%(base)s/state' % {...}
+                    out = []
+                    for value in right.values:
+                        out += self.roots(value, seen, depth + 1)
+                    return out or [right]
+                if isinstance(right, (ast.Tuple, ast.List)) and right.elts:
+                    right = right.elts[0]  # substituted left to right
+                return self.roots(right, seen, depth + 1) or [right]
+            return self.roots(left, seen, depth + 1) or [left]
         if isinstance(node, ast.BoolOp):  # `os.environ.get(...) or ''`
             out = []
             for value in node.values:
@@ -372,6 +479,9 @@ class _Bindings:
                 # Stop here: label() renders the variable AND its fallback, and
                 # the fallback is the half that decides whether this is #181.
                 return [node]
+            elements = _path_join_elements(node)
+            if elements:  # os.sep.join([base, ...]) is anchored at base
+                return self.roots(elements[0], seen, depth + 1) or [elements[0]]
             base = _callee(node).split('.')[-1]
             if base in _PATH_DERIVING and isinstance(node.func, ast.Attribute):
                 return self.roots(node.func.value, seen, depth + 1) or [node.func.value]
@@ -441,6 +551,23 @@ def state_path_findings(source, relpath, allowed_roots=frozenset()):
     for node in ast.walk(tree):
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
             consider(node, node.lineno)
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            # Gated exactly like the f-string below, and for the same reason:
+            # `logger.info('wrote %s' % STATE_DIR)` interpolates a state path
+            # without building one, and its root is the format string. Measured
+            # on the shape that matters, an exempt file's own log line:
+            # ungated, `os.environ.get('ORCHESTRATOR_ROOT', '/app') + '/state'`
+            # followed by `logger.info('wrote %s' % STATE_DIR)` is reported with
+            # the root `literal:'wrote %s'`, which the file's exemption cannot
+            # name and which is not what built the path. The gate asks that the
+            # FORMAT STRING itself carry the `state` segment.
+            #
+            # What that leaves flagged, deliberately and symmetrically with the
+            # f-string: a log line whose format string spells out a state path,
+            # `'%s/state/projects was rebuilt' % base_dir`. Measured -- the
+            # f-string spelling of that same line is flagged today.
+            if _has_state_segment(binds.segments(node)):
+                consider(node, node.lineno)
         elif isinstance(node, ast.JoinedStr):
             # Only a path-shaped f-string. Without this gate every log line
             # that interpolates a state path gets reported at its own root,
@@ -661,6 +788,56 @@ Path(STATE_REL).mkdir(parents=True, exist_ok=True)
 """,
 }
 
+# Shapes that defeated the FIRST DRAFT of this AST walk -- found in review of
+# #203, each one run through state_path_findings() and confirmed MISSED before
+# the fix. They are the same defect the line scan had, one layer up: the walk
+# knew `/`, `+`, f-strings and `.format()`, so its limits list read as though
+# string-assembled paths were covered, and three spellings were not.
+#
+# Scored against the predecessor line scan too (see the scoring test below): it
+# misses all of these as well, so the "strictly stronger than what it replaced"
+# claim still holds.
+_DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK = {
+    '%-formatting, the one formatting spelling that was missed': """
+import os
+base = os.path.dirname(os.path.dirname(__file__))
+STATE_DIR = "%s/state" % base
+os.makedirs(STATE_DIR, exist_ok=True)
+""",
+    '%-formatting with a mapping': """
+import os
+base = os.path.dirname(__file__)
+STATE_DIR = "%(b)s/state" % {"b": base}
+os.makedirs(STATE_DIR, exist_ok=True)
+""",
+    'os.sep.join over a literal sequence': """
+import os
+base = os.path.dirname(os.path.dirname(__file__))
+STATE_DIR = os.sep.join([base, "state", "projects"])
+os.makedirs(STATE_DIR, exist_ok=True)
+""",
+    'a literal slash join over a literal sequence': """
+import os
+base = os.path.dirname(__file__)
+STATE_DIR = "/".join([base, "state", "projects"])
+open(STATE_DIR + "/x.yaml", "w")
+""",
+    'segments accumulated by a loop rather than written out': """
+from pathlib import Path
+root = Path(__file__).parent.parent
+for seg in ["state", "projects"]:
+    root = root / seg
+root.mkdir(parents=True, exist_ok=True)
+""",
+    'segments accumulated by a comprehension': """
+from pathlib import Path
+root = Path(__file__).parent
+paths = [root / seg for seg in ["state", "projects"]]
+for q in paths:
+    q.mkdir(parents=True, exist_ok=True)
+""",
+}
+
 _ALREADY_CORRECT = {
     'the resolver, joined and mkdir-ed': """
 from config.state_manager import orchestrator_state_root
@@ -684,6 +861,16 @@ columns = ["state", "status"]
 from pathlib import Path
 p = Path("/workspace") / project / "Dockerfile.agent"
 p.write_text(dockerfile)
+""",
+    'a comma join that happens to contain the word state': """
+header = ", ".join(["state", "status"])
+for phase in ["state", "status"]:
+    results[phase] = compute(phase)
+""",
+    'a %-formatted FILENAME under the resolver': """
+from config.state_manager import orchestrator_state_root
+p = orchestrator_state_root() / ("%s.yaml" % project)
+p.write_text(payload)
 """,
     'relative segments in a rule table (services/data_retention.py)': """
 RULES = [
@@ -710,6 +897,18 @@ class TestTheGuardItselfCatchesWhatDefeatedTheLastOne:
     def test_it_still_flags_what_the_line_scan_did_catch(self, description):
         findings = state_path_findings(_THE_LINE_SCAN_ALREADY_CAUGHT[description], 'mutant.py')
         assert findings, f"regression, the predecessor caught this: {description}"
+
+    @pytest.mark.parametrize(
+        'description', sorted(_DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK)
+    )
+    def test_it_flags_every_shape_that_walked_past_the_first_draft(self, description):
+        """The second round of the same lesson. Each of these was MISSED by the
+        walk as first written, and by its limits list, which named neither
+        %-formatting nor a separator join nor a loop-accumulated segment."""
+        findings = state_path_findings(
+            _DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK[description], 'mutant.py'
+        )
+        assert findings, f"not flagged: {description}"
 
     @pytest.mark.parametrize('description', sorted(_ALREADY_CORRECT))
     def test_it_stays_quiet_on_code_that_is_already_right(self, description):
@@ -749,6 +948,12 @@ class TestTheGuardItselfCatchesWhatDefeatedTheLastOne:
                 if not old_scan_flags(_THE_LINE_SCAN_ALREADY_CAUGHT[d])] == [], (
             "the old scan misses one of the samples filed under "
             "_THE_LINE_SCAN_ALREADY_CAUGHT"
+        )
+        assert [d for d in sorted(_DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK)
+                if old_scan_flags(_DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK[d])] == [], (
+            "a sample filed under _DEFEATED_THE_FIRST_DRAFT_OF_THIS_WALK is "
+            "caught by the old scan, so it is not evidence that this walk is "
+            "strictly stronger than what it replaced"
         )
 
     def test_a_name_bound_once_safely_and_once_not_is_still_flagged(self):
