@@ -25,7 +25,6 @@ from scripts.maintain_agent_team import (
     load_project_state,
     save_project_state,
     ensure_directories,
-    STATE_DIR
 )
 
 
@@ -50,13 +49,22 @@ def temp_workspace(tmp_path):
 
 @pytest.fixture
 def temp_config(tmp_path, monkeypatch):
-    """Configure temporary directories for tests"""
-    state_dir = tmp_path / "state" / "projects"
-    state_dir.mkdir(parents=True)
+    """Point the script's state directory at tmp_path.
 
-    # Monkeypatch the module-level constants
-    import scripts.maintain_agent_team as module
-    monkeypatch.setattr(module, 'STATE_DIR', state_dir)
+    Was `monkeypatch.setattr(module, 'STATE_DIR', state_dir)` against a module
+    constant built from `Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) /
+    'state' / 'projects'`. That constant is gone: the script resolves through
+    orchestrator_state_root() per call now (#203), so the redirect goes where
+    the production one does -- the environment. Which also means these tests
+    now exercise the real resolution path rather than an attribute swap that
+    could not have failed if the resolution were wrong.
+
+    `.resolve()` on the expectation because orchestrator_state_root() resolves,
+    and pytest's tmp_path can sit under a symlinked TMPDIR.
+    """
+    monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+    state_dir = Path(tmp_path).resolve() / "state" / "projects"
+    state_dir.mkdir(parents=True)
 
     return {
         'state_dir': state_dir
