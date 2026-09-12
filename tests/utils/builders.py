@@ -399,23 +399,33 @@ class RecordedThread:
     drive that method past its pipeline-lock gate to assert on the gate, and
     both used to let the thread actually start: it kept running into whatever
     test came next, connecting to Redis, writing to Elasticsearch and taking
-    file locks under a relative `state/projects/<project>/...` path while
-    unrelated tests were asserting (#186). Nondeterministic timing, which makes
+    file locks under `state/projects/<project>/...` while unrelated tests were
+    asserting (#186). That path was CWD-relative at the time, which is what
+    made it land in the deployment; services/review_cycle.py resolves it
+    properly now (#181), but the thread leak is the same either way. Nondeterministic timing, which makes
     it exactly the kind of thing that produces chunk-dependent results.
 
     Patch it in where the gate is exercised:
 
-        with patch('services.project_monitor.threading.Thread', RecordedThread):
-            ...
+        RecordedThread.reset()
+        with patch('threading.Thread', RecordedThread):
+            monitor._start_review_cycle_for_issue(...)   # the ONE spawning call
         assert RecordedThread.started() == 1
 
-    Patch the MODULE's attribute, not the global `threading.Thread`. The global
-    form also catches ThreadPoolExecutor's internal `threading.Thread(...)`, so
-    any executor constructed inside the block gets no-op workers and the first
-    `future.result()` blocks until the suite times out. project_monitor uses
-    attribute access at all ten of its spawn sites, so the narrow patch works.
+    The patch is GLOBAL and there is no narrower option. `services/project_
+    monitor.py` does its `import threading` inside functions, so there is no
+    `services.project_monitor.threading` attribute to patch -- and adding a
+    module-level import would not help either, because that attribute IS the
+    `threading` module, so patching through it sets `threading.Thread` exactly
+    as the global form does. Measured, not assumed.
 
-    And note the parentheses: `started` is a classmethod, so `assert
+    So the mitigation is the WINDOW, not the target: wrap only the call that
+    spawns. A wide window also replaces `ThreadPoolExecutor`'s internal
+    `threading.Thread(...)`, whose workers become no-ops -- the first
+    `future.result()` then blocks forever, and there is no per-test timeout in
+    this project to interrupt it (see pytest.ini).
+
+    Note the parentheses on `started()`: it is a classmethod, so `assert
     RecordedThread.started` asserts a bound method object and can never fail.
 
     The gate's own behaviour is unchanged -- it still constructs a thread and
@@ -467,12 +477,19 @@ class JoinableThread(threading.Thread):
     `_start_review_cycle_for_issue` does not return its thread, so there is
     nothing to join without this.
 
-        with patch('services.project_monitor.threading.Thread', JoinableThread):
-            ...
+        JoinableThread.reset()
+        with patch('threading.Thread', JoinableThread):
+            monitor._start_review_cycle_for_issue(...)   # the ONE spawning call
         assert JoinableThread.join_all() is JoinResult.ALL_JOINED
 
-    Patch the MODULE's attribute rather than the global `threading.Thread` --
-    see RecordedThread for why.
+    Global patch, narrow window -- see RecordedThread for why there is no
+    narrower target. The hazard here differs from RecordedThread's: this class
+    subclasses Thread and does NOT override run(), so an executor's workers
+    still run. What goes wrong instead is that they REGISTER, under names like
+    `ThreadPoolExecutor-0_0` that match no entry in
+    PERSISTENT_POOL_THREAD_PREFIXES, and join_all() then waits out its whole
+    budget on a session-lifetime worker and reports STUCK against the wrong
+    test.
     """
 
     instances: ClassVar[List["JoinableThread"]] = []

@@ -11,7 +11,12 @@ from pipeline.pr_review_checkpoint import PRReviewCheckpoint
 
 @pytest.fixture
 def checkpoint(tmp_path):
-    """Checkpoint manager rooted under a temp dir instead of /workspace/switchyard."""
+    """Checkpoint manager rooted under a temp dir.
+
+    The default is resolved from ORCHESTRATOR_ROOT now; it used to be the
+    hardcoded literal /workspace/switchyard, which is the same directory as
+    /app on the deployment and ignored every redirect (#181).
+    """
     return PRReviewCheckpoint("test-project", 123, base_dir=tmp_path)
 
 

@@ -1364,7 +1364,18 @@ def _restore_process_globals():
     Restores rather than forbids: these tests are doing something reasonable,
     they just need it undone. Only entries that were REPLACED or REMOVED are
     put back, so modules a test legitimately imports for the first time stay.
+
+    LIMIT, stated because the docstring above would otherwise imply more:
+    `importlib.reload` is invisible to this. Reload re-executes the module body
+    in place and keeps the same object, so `sys.modules.get(name) is module`
+    stays True and nothing here fires -- even though a reload rebuilds every
+    module-level singleton and mints a new class object, which is the same
+    damage by a different route. tests/unit/services/test_data_retention.py
+    reloads at eight sites; it restores itself in a finally, so nothing is
+    broken today. Covering reload needs a per-module sentinel, not this.
     """
+    from unittest.mock import NonCallableMock
+
     previous_root = os.environ.get('ORCHESTRATOR_ROOT')
     previous_modules = {
         name: module for name, module in sys.modules.items()
@@ -1379,5 +1390,20 @@ def _restore_process_globals():
         os.environ['ORCHESTRATOR_ROOT'] = previous_root
 
     for name, module in previous_modules.items():
-        if sys.modules.get(name) is not module:
-            sys.modules[name] = module
+        current = sys.modules.get(name)
+        if current is module:
+            continue
+        if isinstance(current, NonCallableMock):
+            # Leave it. pytest_sessionfinish above exists to FAIL the run when a
+            # first-party module is left replaced by a mock (#133), and it reads
+            # sys.modules to find out. Restoring here would put the module back
+            # before that check runs, so the detector would see a clean session
+            # and the leak it was written for would become undetectable --
+            # verified: a test that assigns a MagicMock and never restores it
+            # goes from "first-party modules left mocked in sys.modules" to
+            # total silence with this fixture in place.
+            #
+            # So: repair an honest re-import, never a mock. Those are different
+            # mistakes and only one of them is the caller's own business.
+            continue
+        sys.modules[name] = module

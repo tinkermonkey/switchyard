@@ -57,10 +57,11 @@ class TestBothHoldoutsUseIt:
         root under tmp_path -- which pytest then deletes -- and mints a second
         class object, so `isinstance` and
         `patch('config.state_manager.GitHubStateManager')` in any later test
-        stop referring to what their consumers actually use. Roughly 20 call
+        stop referring to what their consumers actually use. 26 non-test call
         sites do a function-level `from config.state_manager import
-        state_manager` and would pick up the new one while module-level
-        importers kept the old.
+        state_manager` -- 20 of them in services/project_monitor.py alone --
+        and would pick up the new one while module-level importers kept the
+        old.
 
         It was never needed: orchestrator_state_root() reads the environment on
         every call, so constructing under the patched env proves the same thing
@@ -127,11 +128,21 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         saw. It also could not see the other half of #181, which turned out to
         be the more common shape here: a relative or hardcoded literal that
         ignores ORCHESTRATOR_ROOT entirely. Five such sites existed while that
-        scan was passing. Three were writers, and one mkdir'd in a constructor.
+        scan was passing. Three were writers, and TWO of them mkdir'd in a
+        constructor (pr_review_checkpoint.py, repair_cycle_checkpoint.py).
 
         So this matches on CO-OCCURRENCE rather than on syntax. It will
         overmatch eventually; that is the intended direction. Add to EXEMPT
         with a reason rather than narrowing the pattern.
+
+        WHAT IT STILL MISSES, measured rather than guessed: it scans ONE LINE
+        AT A TIME, so splitting the derivation from the `"state"` literal
+        defeats it -- `_root = Path(__file__).parent.parent` on one line and
+        `_root / "state"` on the next passes clean, as does any `<var> /
+        "state"`. Five such sites already exist in scripts/ and mcp/ and are
+        not flagged. This is a tripwire for the shapes that caused #181, not a
+        proof that they cannot recur; closing it properly wants an AST walk
+        from each mkdir/open back to its root, which is tracked separately.
         """
         import re
 
@@ -142,11 +153,23 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
             # Its fallback IS production behaviour: reached only when
             # ORCHESTRATOR_ROOT is unset, which is the deployment's own case.
             'config/state_manager.py': 'defines the resolver',
-            # Names swept directories as data, not as paths it opens.
-            'services/data_retention.py': 'retention rule table',
-            # A separate service (switchyard-mcp) in its own container, with
-            # its own APP_ROOT override and a /app default. Not in this
-            # suite's import graph, and configurable rather than hardcoded.
+            # Its three matches are `relative_path=` values in the rule table
+            # -- relative SEGMENTS hung off a root that is itself resolved from
+            # ORCHESTRATOR_ROOT/WORKSPACE_ROOT (see resolve_roots there). It
+            # does open them; the resolution is what makes that safe. Exempting
+            # the whole file is broader than that reason justifies -- an
+            # absolute or __file__-derived path added to this module later
+            # would be invisible.
+            'services/data_retention.py': 'rule-table relative segments',
+            # NOTE: this entry is currently DEAD -- the patterns below do not
+            # match mcp/server.py at all, because `APP_ROOT / "state" /
+            # "projects"` has no quoted path literal and no __file__ on the
+            # line. Kept because the reason is real (a separate service in its
+            # own container, with its own APP_ROOT override and a /app
+            # default), and because the day the patterns get strong enough to
+            # see `<var> / "state"` is the day this entry starts earning its
+            # place. Its deadness is itself the measure of how much the
+            # patterns still miss.
             'mcp/server.py': 'separate service, APP_ROOT-configurable',
         }
 

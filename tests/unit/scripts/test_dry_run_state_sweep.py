@@ -355,10 +355,14 @@ class TestIsolation:
         )
 
     def test_the_cwd_is_the_scratch_root_while_the_sweep_runs(self, deployment, tmp_path):
-        """Not every writer resolves a root: services/review_cycle.py builds
-        os.path.join('state', 'projects', ...) against the process CWD and
-        os.makedirs() it. Repointing ORCHESTRATOR_ROOT does nothing for that, so
-        the CWD has to be inside the scratch root too — and has to be put back."""
+        """Belt and braces, now that the known CWD-relative writers are fixed.
+
+        services/review_cycle.py used to build os.path.join('state', ...)
+        against the process CWD, which ORCHESTRATOR_ROOT could not move; it
+        resolves properly now (#181). The sweep still runs with its CWD inside
+        the scratch root, because that costs nothing and it is the only thing
+        that would contain a writer nobody has found yet -- and the scan that
+        looks for them still cannot see a `<var> / "state"` expression."""
         before = os.getcwd()
         seen = {}
 
@@ -378,9 +382,10 @@ class TestIsolation:
         assert os.getcwd() == before
 
     def test_config_state_manager_is_repointed_too(self, deployment, tmp_path):
-        """#181: config/state_manager.py derives its root from
-        Path(__file__).parent.parent with no environment override, so
-        ORCHESTRATOR_ROOT alone does not move it."""
+        """#181: config/state_manager.py honours ORCHESTRATOR_ROOT now, so this
+        repoint is no longer the only thing moving it -- but it is still
+        required, because the module-level singleton is built at IMPORT time and
+        26 call sites hold that object directly."""
         report = _run(_spec(lambda m: None), deployment, tmp_path)
 
         assert report['isolation']['config.state_manager.state_manager.state_root'] == str(

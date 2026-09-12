@@ -175,7 +175,6 @@ class TestReviewCycleThreading:
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_mgr), \
              patch('services.github_integration.GitHubIntegration', return_value=mock_gh_integration), \
              patch('services.git_workflow_manager.git_workflow_manager', mock_gwm), \
-             patch('services.project_workspace.workspace_manager') as mock_wsm, \
              patch('services.project_workspace.workspace_manager') as mock_wsm:
 
             mock_wsm.get_project_dir.return_value = '/workspace/test-project'
@@ -234,13 +233,20 @@ class TestReviewCycleThreading:
             #
             # Patched around THIS CALL ONLY. project_monitor does its `import
             # threading` inside functions, so there is no module attribute to
-            # patch and the global name is the only handle -- and the global
-            # also catches ThreadPoolExecutor's internal `threading.Thread(...)`,
-            # whose workers would become no-ops and whose .result() would then
-            # block forever. Narrowing the window to one call that spawns
-            # exactly one known thread is what keeps that unreachable.
+            # patch, and patching through one would set `threading.Thread`
+            # anyway -- that attribute IS the threading module. The global name
+            # is the only handle there is.
+            #
+            # The hazard it opens is specific to JoinableThread: it subclasses
+            # Thread and does not override run(), so an executor's workers still
+            # RUN -- but they register here, under names like
+            # `ThreadPoolExecutor-0_0` that match no persistent-pool prefix, and
+            # join_all() would then burn its budget waiting on a session-
+            # lifetime worker and blame this test. Narrowing the window to one
+            # call that spawns exactly one known thread is what keeps that
+            # unreachable.
             JoinableThread.reset()
-            with patch('threading.Thread', JoinableThread):
+            with patch('threading.Thread', JoinableThread):  # global; see builders.py
                 result = monitor._start_review_cycle_for_issue(
                     project_name='test-project',
                     board_name='planning',
