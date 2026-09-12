@@ -23,7 +23,11 @@ class PRReviewStateManager:
 
     def __init__(self, state_root: Optional[str] = None):
         if state_root is None:
-            state_root = Path(__file__).parent.parent / "state" / "projects"
+            # ORCHESTRATOR_ROOT-aware, like every other state path (#181).
+            # See config/state_manager.orchestrator_state_root() for what
+            # deriving this from __file__ cost.
+            from config.state_manager import orchestrator_state_root
+            state_root = orchestrator_state_root() / "projects"
         self.state_root = Path(state_root)
 
     def _get_state_file(self, project_name: str) -> Path:

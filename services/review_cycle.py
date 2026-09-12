@@ -391,10 +391,20 @@ class ReviewCycleExecutor:
 
     def _get_state_file_path(self, project_name: str) -> str:
         """Get path to active cycles state file for a project"""
-        import os
-        state_dir = os.path.join('state', 'projects', project_name, 'review_cycles')
-        os.makedirs(state_dir, exist_ok=True)
-        return os.path.join(state_dir, 'active_cycles.yaml')
+        # Resolved, not CWD-relative (#181). This used to be
+        # os.path.join('state', 'projects', ...), which means "under whatever
+        # directory the process was started in" -- and the documented way to
+        # run the unit suite is `pytest tests/unit` from the repository root,
+        # which on the deployment IS the directory bind-mounted at /app. So the
+        # suite created review_cycles/ directories, and wrote active_cycles.yaml
+        # and its .lock, inside real production project state. Reproduced on
+        # the branch that added orchestrator_state_root(): a clean full run
+        # still produced state/projects/{documentation_robotics,code-wrapper,
+        # test-project,proj}/review_cycles/ under the repo root.
+        from config.state_manager import orchestrator_state_root
+        state_dir = orchestrator_state_root() / 'projects' / project_name / 'review_cycles'
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return str(state_dir / 'active_cycles.yaml')
 
     def _save_cycle_state(self, cycle_state: ReviewCycleState):
         """Persist cycle state to disk"""

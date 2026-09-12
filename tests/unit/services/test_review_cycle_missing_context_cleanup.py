@@ -13,6 +13,8 @@ mirrors the cleanup pattern already used by the sibling "skip work" branch in
 """
 from unittest.mock import Mock, patch
 
+from tests.utils.builders import RecordedThread
+
 import pytest
 
 from config.manager import ConfigManager
@@ -64,16 +66,16 @@ class TestMissingContextCleansUpImmediately:
         with patch.object(project_monitor, 'get_issue_details', return_value={'title': 'T', 'url': 'u'}), \
              patch.object(project_monitor, 'get_previous_stage_context', return_value=''):
             result = project_monitor._start_review_cycle_for_issue(
-                project_name='rounds',
-                board_name='SDLC Execution',
-                issue_number=159,
-                status='Code Review',
-                repository='rounds',
-                project_config=_project_config(),
-                pipeline_config=_pipeline_config(),
-                workflow_template=Mock(),
-                column=_review_column(),
-            )
+                    project_name='rounds',
+                    board_name='SDLC Execution',
+                    issue_number=159,
+                    status='Code Review',
+                    repository='rounds',
+                    project_config=_project_config(),
+                    pipeline_config=_pipeline_config(),
+                    workflow_template=Mock(),
+                    column=_review_column(),
+                )
 
         assert result is None
         project_monitor.pipeline_run_manager.end_pipeline_run.assert_called_once()
@@ -96,7 +98,17 @@ class TestMissingContextCleansUpImmediately:
             mock_lock_manager.try_acquire_lock.return_value = (True, 'acquired')
             mock_get_lock_mgr.return_value = mock_lock_manager
 
-            project_monitor._start_review_cycle_for_issue(
+            # RecordedThread, not the real one (#186). This is the ONE test in
+            # this file that reaches the grant path, so it is the one that used
+            # to leave a real review cycle running into everything after it.
+            #
+            # Scoped to the call, not the whole block: the global name is the
+            # only handle (project_monitor imports threading inside functions),
+            # and a wide window would also replace ThreadPoolExecutor's own
+            # worker threads with no-ops.
+            RecordedThread.reset()
+            with patch('threading.Thread', RecordedThread):
+                project_monitor._start_review_cycle_for_issue(
                 project_name='rounds',
                 board_name='SDLC Execution',
                 issue_number=159,
@@ -109,3 +121,6 @@ class TestMissingContextCleansUpImmediately:
             )
 
         project_monitor.pipeline_run_manager.end_pipeline_run.assert_not_called()
+        # ...and the happy path really did get as far as launching the cycle,
+        # which is what makes "end_pipeline_run was not called" meaningful.
+        assert RecordedThread.started() == 1

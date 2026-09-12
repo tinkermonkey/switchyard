@@ -5,8 +5,11 @@ Provides fluent interfaces for building complex test objects
 without verbose setup code in every test.
 """
 
+import threading
+import time
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from enum import Enum
+from typing import ClassVar, List, Dict, Any, Optional
 from services.review_cycle import ReviewCycleState
 
 
@@ -372,3 +375,181 @@ class TaskContextBuilder:
     def build(self) -> Dict[str, Any]:
         """Build the task context dictionary"""
         return self._context
+
+
+class JoinResult(Enum):
+    """What join_all() found. Falsy for everything but a clean join.
+
+    NONE_REGISTERED is the member that earns this type: it means the patch did
+    not take, which an exception-or-nothing signature reports as success.
+    """
+    ALL_JOINED = "all_joined"
+    NONE_REGISTERED = "none_registered"
+    STUCK = "stuck"
+
+    def __bool__(self) -> bool:
+        return self is JoinResult.ALL_JOINED
+
+
+class RecordedThread:
+    """A `threading.Thread` stand-in that records instead of running.
+
+    `services/project_monitor.py::_start_review_cycle_for_issue` ends by
+    spawning a daemon thread that runs a REAL review cycle. Two test files
+    drive that method past its pipeline-lock gate to assert on the gate, and
+    both used to let the thread actually start: it kept running into whatever
+    test came next, connecting to Redis, writing to Elasticsearch and taking
+    file locks under `state/projects/<project>/...` while unrelated tests were
+    asserting (#186). That path was CWD-relative at the time, which is what
+    made it land in the deployment; services/review_cycle.py resolves it
+    properly now (#181), but the thread leak is the same either way. Nondeterministic timing, which makes
+    it exactly the kind of thing that produces chunk-dependent results.
+
+    Patch it in where the gate is exercised:
+
+        RecordedThread.reset()
+        with patch('threading.Thread', RecordedThread):
+            monitor._start_review_cycle_for_issue(...)   # the ONE spawning call
+        assert RecordedThread.started() == 1
+
+    The patch is GLOBAL and there is no narrower option. `services/project_
+    monitor.py` does its `import threading` inside functions, so there is no
+    `services.project_monitor.threading` attribute to patch -- and adding a
+    module-level import would not help either, because that attribute IS the
+    `threading` module, so patching through it sets `threading.Thread` exactly
+    as the global form does. Measured, not assumed.
+
+    So the mitigation is the WINDOW, not the target: wrap only the call that
+    spawns. A wide window also replaces `ThreadPoolExecutor`'s internal
+    `threading.Thread(...)`, whose workers become no-ops -- the first
+    `future.result()` then blocks forever, and there is no per-test timeout in
+    this project to interrupt it (see pytest.ini).
+
+    Note the parentheses on `started()`: it is a classmethod, so `assert
+    RecordedThread.started` asserts a bound method object and can never fail.
+
+    The gate's own behaviour is unchanged -- it still constructs a thread and
+    calls start() -- so what the test is actually checking is not weakened.
+    """
+
+    instances: ClassVar[List["RecordedThread"]] = []
+
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None,
+                 *, daemon=None):
+        # Signature mirrors threading.Thread's exactly, including the unused
+        # leading `group`. An earlier version reordered it, so a positional
+        # `Thread(None, fn)` bound fn to `daemon` and recorded a thread with no
+        # target -- silently, because it also swallowed unknown kwargs in
+        # **extra where the real Thread raises TypeError.
+        self.group = group
+        self.target = target
+        self.daemon = daemon
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.name = name if name is not None else f'recorded-{len(RecordedThread.instances)}'
+        self.did_start = False
+        RecordedThread.instances.append(self)
+
+    def start(self):
+        self.did_start = True
+
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return False
+
+    @classmethod
+    def reset(cls):
+        cls.instances.clear()
+
+    @classmethod
+    def started(cls) -> int:
+        return sum(1 for t in cls.instances if t.did_start)
+
+
+class JoinableThread(threading.Thread):
+    """A real `threading.Thread` that a test can find again and join.
+
+    `RecordedThread` is for tests asserting on a gate -- they do not want the
+    body to run. A few tests do: they are testing what the thread's closure can
+    see. Those still must not let it outlive them, and
+    `_start_review_cycle_for_issue` does not return its thread, so there is
+    nothing to join without this.
+
+        JoinableThread.reset()
+        with patch('threading.Thread', JoinableThread):
+            monitor._start_review_cycle_for_issue(...)   # the ONE spawning call
+        assert JoinableThread.join_all() is JoinResult.ALL_JOINED
+
+    Global patch, narrow window -- see RecordedThread for why there is no
+    narrower target. The hazard here differs from RecordedThread's: this class
+    subclasses Thread and does NOT override run(), so an executor's workers
+    still run. What goes wrong instead is that they REGISTER, under names like
+    `ThreadPoolExecutor-0_0` that match no entry in
+    PERSISTENT_POOL_THREAD_PREFIXES, and join_all() then waits out its whole
+    budget on a session-lifetime worker and reports STUCK against the wrong
+    test.
+    """
+
+    instances: ClassVar[List["JoinableThread"]] = []
+
+    def start(self):
+        # Registered on START, not in __init__. Thread.join() raises
+        # RuntimeError on a thread that was constructed but never started, and
+        # that raise used to happen inside join_all()'s loop -- before its own
+        # reset -- leaving stale entries for the NEXT test's join_all() to fail
+        # on, for an unrelated reason.
+        JoinableThread.instances.append(self)
+        super().start()
+
+    @classmethod
+    def reset(cls):
+        cls.instances.clear()
+
+    @classmethod
+    def join_all(cls, timeout: float = 5.0) -> "JoinResult":
+        """Join every thread this class started, within ONE shared budget.
+
+        Returns rather than raises, because "nothing was registered" and
+        "everything joined cleanly" are different answers and the first one is
+        the dangerous one: if the patch silently stops taking -- a module
+        switches to `from threading import Thread`, the spawn moves behind a
+        helper -- an empty registry read as success means the test that most
+        needs to fail is the one that passes. This is the same collapse
+        CommitResult and TouchResult were introduced to remove in production,
+        so it gets the same treatment, `__bool__` included.
+
+        One budget for the whole call, not `timeout` per thread: N stuck
+        threads would otherwise cost N x timeout serially. See
+        tests/unit/services/test_agent_container_recovery_commit_join_budget.py
+        for the production bug of exactly that shape.
+
+        Threads belonging to the process-global pools are skipped rather than
+        joined -- they are session-lifetime workers by design, and waiting on
+        one to exit is waiting forever.
+        """
+        from tests.conftest import PERSISTENT_POOL_THREAD_PREFIXES
+
+        deadline = time.monotonic() + timeout
+        stuck = []
+        joined = 0
+        for thread in list(cls.instances):
+            if thread.name.startswith(PERSISTENT_POOL_THREAD_PREFIXES):
+                continue
+            remaining = max(0.05, deadline - time.monotonic())
+            thread.join(timeout=remaining)
+            if thread.is_alive():
+                stuck.append(thread.name)
+            else:
+                joined += 1
+
+        if stuck:
+            # Registry deliberately NOT cleared: these references are the only
+            # handle on threads that are still running, and this class exists
+            # because the production code does not return its thread. The
+            # conftest leak guard reports the survivors independently.
+            return JoinResult.STUCK
+
+        cls.reset()
+        return JoinResult.ALL_JOINED if joined else JoinResult.NONE_REGISTERED

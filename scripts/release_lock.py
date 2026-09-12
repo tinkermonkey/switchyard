@@ -67,8 +67,9 @@ def main():
             f"Could not determine lock state for {args.project}/{args.board} — "
             f"both Redis and the YAML state file failed to read. This does NOT "
             f"mean the board is unlocked; it means lock state is currently "
-            f"unknown. Check Redis connectivity and the state file at "
-            f"state/pipeline_locks/ before assuming anything, then retry."
+            f"unknown. Check Redis connectivity and the pipeline_locks "
+            f"directory under the orchestrator state root before assuming "
+            f"anything, then retry."
         )
         sys.exit(1)
 
