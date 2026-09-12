@@ -703,24 +703,58 @@ class TestTheDataRetentionDoor:
 # resolves inside the two functions that need it, so there is nothing to see at
 # import. The repository-wide tripwire above is what covers that file.
 SCRIPTS_THAT_RESOLVE_A_ROOT_AT_IMPORT = [
-    'analyze_codebase',
-    'generate_artifacts',
     'validate_artifacts',
     'maintain_agent_team',
     'rebuild_project_images',
 ]
 
-# Of those, the four that also BIND the resolved root to a module-scope
+# Of those, the two that also BIND the resolved root to a module-scope
 # constant, so the value itself can be read back. rebuild_project_images is
 # absent: it presets ORCHESTRATOR_ROOT into the environment for config_manager
 # and resolves inside get_workspace_root(), so it has no such constant. Its
 # refusal comes from services.dev_container_state, which it imports -- which is
 # why it is in the list above and not this one.
 SCRIPTS_THAT_BIND_A_ROOT_AT_IMPORT = [
-    'analyze_codebase',
-    'generate_artifacts',
     'validate_artifacts',
     'maintain_agent_team',
+]
+
+# analyze_codebase and generate_artifacts BELONG in both lists above and were in
+# them until #199 landed. They are held out here because they cannot currently
+# be imported AT ALL, for a reason that has nothing to do with #202:
+#
+#   claude/claude_integration.py:55  from agents.non_retryable import ...
+#     -> agents/__init__.py:9        from .base_maker_agent import MakerAgent
+#     -> agents/base_maker_agent.py:17  from claude.claude_integration import
+#                                        run_claude_code   # line 55 not reached
+#   ImportError: cannot import name 'run_claude_code' from partially
+#   initialized module 'claude.claude_integration'
+#
+# The back-edge at claude_integration.py:55 is new in #199; the six forward
+# edges (base_maker_agent and five agent modules) predate it. Any module that
+# reaches claude.claude_integration BEFORE it reaches agents/ now dies, which is
+# these two scripts and scripts/generate_strategy.py. Reproduced on the
+# deployment's own checkout, not just here:
+#   docker exec -w /workspace/switchyard switchyard-orchestrator-1 \
+#     python -c 'import claude.claude_integration'   -> the ImportError above
+# main.py is unaffected because it reaches agents/ first, which is why the
+# running orchestrator is healthy and this went unnoticed.
+#
+# Deliberately NOT fixed here: the fix is either six lazy imports across the
+# agent base class and five agents, or relocating NonRetryableAgentError out of
+# the agents package, and neither belongs in a state-root PR without its own
+# review. Filed rather than folded in.
+#
+# This exclusion CANNOT quietly outlive its reason. The test below asserts that
+# each held-out script still fails for exactly that cycle -- so on the day the
+# cycle is fixed, that test goes red and whoever fixed it is told to move these
+# two names back into the lists above. The doors in these two files are still
+# covered meanwhile by the repository-wide grep tripwire in
+# tests/unit/test_state_root_isolation.py, which reads source and needs no
+# import; what is suspended is only the dynamic proof.
+SCRIPTS_BLOCKED_BY_THE_AGENTS_IMPORT_CYCLE = [
+    'analyze_codebase',
+    'generate_artifacts',
 ]
 
 
@@ -806,6 +840,47 @@ class TestTheScriptsDoors:
         assert done.returncode == 0, done.stderr[-2000:]
         if module in SCRIPTS_THAT_BIND_A_ROOT_AT_IMPORT:
             assert done.stdout.strip() == f'BOUND {scratch}', done.stdout
+
+    @pytest.mark.parametrize('module', SCRIPTS_BLOCKED_BY_THE_AGENTS_IMPORT_CYCLE)
+    def test_the_held_out_scripts_are_still_held_out_for_the_stated_reason(
+        self, module, tmp_path
+    ):
+        """The expiry date on SCRIPTS_BLOCKED_BY_THE_AGENTS_IMPORT_CYCLE.
+
+        An exclusion list with a prose reason rots the moment the reason stops
+        being true, and nothing tells you: the two tests above simply stop
+        covering two files and still go green. So assert the reason itself.
+
+        Given a PERFECTLY GOOD absolute root -- the input the test above feeds
+        the scripts that work, and the one case where nothing about #202 should
+        make a script fail -- these two must still die on the agents/ import
+        cycle. When that is fixed they will import cleanly, this test will fail
+        on its own first assertion, and the fix is to delete this test and put
+        the two names back in the two lists above.
+
+        Asserting the cycle by its exact ImportError, not by returncode: a
+        script that started failing for some THIRD reason would otherwise keep
+        this test green while its door went unguarded.
+        """
+        scratch = tmp_path / 'scratch'
+        scratch.mkdir()
+
+        done = _import_script_in_a_subprocess(
+            module, cwd=tmp_path, root=str(scratch)
+        )
+
+        assert done.returncode != 0, (
+            f"scripts/{module}.py now imports cleanly, so the agents/ import "
+            f"cycle that held it out of SCRIPTS_THAT_RESOLVE_A_ROOT_AT_IMPORT "
+            f"and SCRIPTS_THAT_BIND_A_ROOT_AT_IMPORT is fixed. Move "
+            f"'{module}' back into both lists and delete this test."
+        )
+        assert "cannot import name 'run_claude_code'" in done.stderr, (
+            f"scripts/{module}.py is failing for something OTHER than the "
+            f"documented agents/ import cycle, so the stated reason for "
+            f"holding it out is no longer the real one. Re-triage it rather "
+            f"than leaving it excluded:\n{done.stderr[-2000:]}"
+        )
 
 
 def _import_the_observability_server_in_a_subprocess(cwd: Path, root: str):
