@@ -6,7 +6,6 @@ Multi-stage validation for generated agents and skills.
 """
 
 import logging
-import os
 import re
 import sys
 import yaml
@@ -16,11 +15,21 @@ from typing import Dict, Any, List, Optional
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from config.paths import orchestrator_root
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Constants
-ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+# Resolved through config.paths rather than open-coded (#202).
+# `os.environ.get('ORCHESTRATOR_ROOT', <default>)` returns `''` for
+# `-e ORCHESTRATOR_ROOT=` on a docker run, so the default never applied to that
+# case: measured here before the change, this module bound PosixPath('.'), and
+# every `root / 'state' / 'projects' / ...` below was then a mkdir under
+# whatever the CWD happened to be. config.paths, not config.state_manager,
+# because importing the latter builds its GitHubStateManager singleton and
+# mkdirs a state tree as a side effect of asking for a directory name.
+ORCHESTRATOR_ROOT = orchestrator_root()
 
 # Valid tool names
 VALID_TOOLS = [

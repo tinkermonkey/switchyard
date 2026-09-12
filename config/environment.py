@@ -52,6 +52,16 @@ class Environment(BaseSettings):
 
     # Project Paths
     workspace_root: Path = Path.home() / "development"
+    # DECLARED, NOT USED, and deliberately left that way (#202). Nothing reads
+    # `environment.orchestrator_root` -- `grep -rn '\.orchestrator_root'` over
+    # the non-test tree returns no call sites. It exists so pydantic-settings'
+    # strict `extra='forbid'` does not reject ORCHESTRATOR_ROOT when it appears
+    # in .env (it is offered in .env.example:74), which is the same reason
+    # use_batched_board_queries below is declared here.
+    #
+    # Do not start reading it as the orchestrator root: it does not strip,
+    # refuse a relative value or resolve, and its default is Path.cwd() rather
+    # than the checkout. config.paths.orchestrator_root() is the resolver.
     orchestrator_root: Path = Path.cwd()
 
     # Monitoring

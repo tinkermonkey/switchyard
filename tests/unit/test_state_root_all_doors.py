@@ -24,10 +24,16 @@ duration of the construction -- the point of that case is the path that was
 chosen, not that it was created.
 """
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# tests/unit/<this file> -> the checkout root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 # (label, subdir under state/, factory taking an optional state_dir)
@@ -253,36 +259,273 @@ class TestTheSeventhDoorIsNotAConstructor:
         )
 
 
-class TestNoneOfThemReadTheEnvironmentDirectly:
+class TestNothingButTheResolverReadsARootFromTheEnvironment:
+    """Repository-wide, because the first pass of #202 was not.
 
-    @pytest.mark.parametrize('module_name', [row[0] for row in THE_SEVEN] + ['scheduled_tasks'])
-    def test_the_module_does_not_open_code_the_default(self, module_name):
-        """A tripwire, and honest about being one.
+    The tripwire this replaces importlib-imported `services.<the seven>` and
+    looked at those seven files, while config/state_manager.py's docstring
+    claimed to be "the ONLY place that reads it to build a state path". Two
+    counterexamples were live at the time and invisible to that guard:
+    services/data_retention.py open-coded both roots (and a sweep DELETES from
+    what it returns), and six scripts/ entry points open-coded
+    `Path(os.environ.get('ORCHESTRATOR_ROOT', <default>)) / 'state' / ...`
+    followed by a mkdir -- #202's headline bug verbatim, in the tree the
+    issue's own "why it has not bitten" section names as unprotected.
 
-        The behavioural tests above are the real guard -- this only catches the
-        shape coming BACK, which in this repo it has, five times. It is
-        deliberately narrow: the exact co-occurrence of ORCHESTRATOR_ROOT and a
-        default on one line. It does not see a two-line rewrite, and it is not
-        meant to; that is what the constructor tests are for.
-        """
-        import importlib
+    Walking the repository is the only scope that matches the claim being made.
+    A per-module list is a guard that can only see the doors someone already
+    remembered.
 
-        module = importlib.import_module(f'services.{module_name}')
-        source = Path(module.__file__).read_text()
+    It is still a text match, and still narrow on purpose: the exact
+    co-occurrence of `environ.get(` and a quoted root name on one line. It does
+    not see `os.environ['ORCHESTRATOR_ROOT']` -- scripts/dry_run_state_sweep.py
+    legitimately WRITES the variable that way, and no text pattern separates
+    that from a read. The behavioural tests in this file are the real guard;
+    this only catches the shape coming back, which in this repo it has.
+    """
 
-        offenders = [
-            f"{number}: {line.strip()}"
-            for number, line in enumerate(source.splitlines(), 1)
-            if not line.strip().startswith('#')
-            and "environ.get('ORCHESTRATOR_ROOT'" in line.replace('"', "'")
-        ]
+    # path -> why it legitimately reads one
+    EXEMPT = {
+        # It is the resolver. Its actual read is `os.environ.get(name)` with
+        # the root name as a PARAMETER, which the pattern below cannot see
+        # anyway; the one line that does match is in the module docstring,
+        # quoting the bug. Exempted explicitly rather than relying on that,
+        # because the day someone inlines a literal here is not the day this
+        # guard should start failing.
+        'config/paths.py': 'defines the resolver',
+    }
+
+    SKIP_TREES = ('tests', '.claude', '.git', 'node_modules', 'venv', '.venv')
+
+    def test_no_module_outside_config_paths_resolves_a_root_itself(self):
+        import re
+
+        pattern = re.compile(
+            r"""environ\.get\(['"](?:ORCHESTRATOR_ROOT|WORKSPACE_ROOT)['"]"""
+        )
+
+        offenders = []
+        for source in sorted(_REPO_ROOT.rglob('*.py')):
+            relative = source.relative_to(_REPO_ROOT)
+            if relative.parts[0] in self.SKIP_TREES:
+                continue
+            if str(relative) in self.EXEMPT:
+                continue
+            for number, line in enumerate(
+                source.read_text(errors='ignore').splitlines(), 1
+            ):
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+                if pattern.search(line):
+                    offenders.append(f"{relative}:{number}: {stripped[:100]}")
 
         assert offenders == [], (
-            f"services/{module_name}.py resolves ORCHESTRATOR_ROOT itself "
-            f"again -- use config.state_manager.orchestrator_state_root(), "
-            f"which strips, resolves and refuses a relative value (#202):\n  "
+            "these lines resolve a root from the environment by hand. "
+            "`os.environ.get(name, <default>)` returns '' when the key exists "
+            "and is empty (`-e ORCHESTRATOR_ROOT=` on a docker run), so the "
+            "default never applies to the case that actually happens, and "
+            "Path('') is the CWD (#202). Use config.paths.orchestrator_root(), "
+            "orchestrator_state_root() or workspace_root():\n  "
             + "\n  ".join(offenders)
         )
+
+
+class TestTheDataRetentionDoor:
+    """resolve_roots() read both roots raw -- and sweep() DELETES from them.
+
+    This was the second place config/state_manager.py's "ONLY place" docstring
+    was wrong about, and the more serious of the two: _PROTECTED_ROOTS lists
+    only /app, /workspace and /, so a root that is merely RELATIVE sails past
+    it. Measured on this branch before the fix:
+    `ORCHESTRATOR_ROOT='   '` gave
+    `{'orchestrator': PosixPath('   '), 'workspace': PosixPath('   ')}`.
+    """
+
+    def test_a_whitespace_root_is_no_longer_a_relative_sweep_root(
+        self, monkeypatch
+    ):
+        from services.data_retention import resolve_roots
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', '   ')
+        monkeypatch.delenv('WORKSPACE_ROOT', raising=False)
+
+        roots = resolve_roots()
+
+        assert [p for p in roots.values() if not p.is_absolute()] == [], (
+            f"a sweep would recurse from a relative root: {roots}"
+        )
+        assert roots == {
+            'orchestrator': Path('/app'),
+            'workspace': Path('/workspace'),
+        }
+
+    @pytest.mark.parametrize('name', ['ORCHESTRATOR_ROOT', 'WORKSPACE_ROOT'])
+    def test_a_relative_root_is_refused_rather_than_swept(
+        self, monkeypatch, name
+    ):
+        """A dropped leading slash is the likeliest typo in the documented
+        command, and here it decides what gets deleted."""
+        from services.data_retention import resolve_roots
+
+        monkeypatch.setenv(name, 'relative-oops')
+
+        with pytest.raises(ValueError, match='absolute'):
+            resolve_roots()
+
+    def test_an_absolute_override_still_carries_the_workspace_rules_with_it(
+        self, monkeypatch, tmp_path
+    ):
+        """The behaviour resolve_roots() exists for, unchanged by the
+        validation: a scratch orchestrator root moves the workspace-rooted
+        rules under it too, rather than reaching out to the real /workspace."""
+        from services.data_retention import resolve_roots
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        monkeypatch.delenv('WORKSPACE_ROOT', raising=False)
+
+        assert resolve_roots() == {
+            'orchestrator': tmp_path.resolve(),
+            'workspace': tmp_path.resolve(),
+        }
+
+    def test_the_unset_default_stays_the_literal_app(self, monkeypatch):
+        """Deliberately NOT config.paths.orchestrator_root().
+
+        The two are the same directory on the deployment and different ones in
+        a worktree or a developer checkout -- and _PROTECTED_ROOTS is keyed on
+        the literal '/app'. Resolving the unset case to "whatever checkout this
+        code was imported from" would have handed the pytest guard an absolute,
+        plausible, unlisted path, so the check that exists to shout when a test
+        sweeps production would have gone quiet instead. A fix that turns a
+        loud failure into a silent one is not a fix.
+        """
+        from services.data_retention import (
+            _refuse_unisolated_apply,
+            resolve_roots,
+        )
+
+        monkeypatch.delenv('ORCHESTRATOR_ROOT', raising=False)
+        monkeypatch.delenv('WORKSPACE_ROOT', raising=False)
+
+        roots = resolve_roots()
+        assert roots == {
+            'orchestrator': Path('/app'),
+            'workspace': Path('/workspace'),
+        }
+
+        with pytest.raises(RuntimeError, match='Refusing to apply retention'):
+            _refuse_unisolated_apply(roots)
+
+
+# The scripts/ entry points that resolve a root at import time, and so can be
+# observed by importing them. generate_strategy is deliberately absent: it
+# resolves inside the two functions that need it, so there is nothing to see at
+# import. The repository-wide tripwire above is what covers that file.
+SCRIPTS_THAT_RESOLVE_A_ROOT_AT_IMPORT = [
+    'analyze_codebase',
+    'generate_artifacts',
+    'validate_artifacts',
+    'maintain_agent_team',
+    'rebuild_project_images',
+]
+
+# Of those, the four that also BIND the resolved root to a module-scope
+# constant, so the value itself can be read back. rebuild_project_images is
+# absent: it presets ORCHESTRATOR_ROOT into the environment for config_manager
+# and resolves inside get_workspace_root(), so it has no such constant. Its
+# refusal comes from services.dev_container_state, which it imports -- which is
+# why it is in the list above and not this one.
+SCRIPTS_THAT_BIND_A_ROOT_AT_IMPORT = [
+    'analyze_codebase',
+    'generate_artifacts',
+    'validate_artifacts',
+    'maintain_agent_team',
+]
+
+
+def _import_script_in_a_subprocess(module: str, cwd: Path, root: str):
+    environment = dict(os.environ)
+    environment['ORCHESTRATOR_ROOT'] = root
+    environment['PYTHONPATH'] = str(_REPO_ROOT)
+    return subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            f'import scripts.{module} as m; '
+            f'print("BOUND", getattr(m, "ORCHESTRATOR_ROOT", "<none>"))',
+        ],
+        cwd=str(cwd),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+class TestTheScriptsDoors:
+    """#202's headline bug, verbatim, in files the first pass did not touch.
+
+    `ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))` then
+    `output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project /
+    'analysis'; output_dir.mkdir(parents=True, exist_ok=True)`. Measured before
+    the fix with `-e ORCHESTRATOR_ROOT=`: analyze_codebase, validate_artifacts,
+    generate_artifacts and maintain_agent_team all bound PosixPath('.'), so
+    that mkdir landed under whatever the CWD was -- which for the documented
+    invocation is the checkout, i.e. the deployment.
+
+    A SUBPROCESS, not importlib.reload: the value under test only exists at
+    module scope, and reloading these inside the session would rebind
+    services.dev_container_state's process-wide singleton (which
+    rebuild_project_images imports) for every test that runs afterwards.
+
+    The probe root is RELATIVE rather than empty on purpose. Both are the bug,
+    but only the relative one can be observed without creating anything: an
+    empty root resolves to the checkout's own `state/`, and importing
+    rebuild_project_images mkdirs it.
+    """
+
+    @pytest.mark.parametrize('module', SCRIPTS_THAT_RESOLVE_A_ROOT_AT_IMPORT)
+    def test_a_relative_root_is_refused_at_import_rather_than_bound(
+        self, module, tmp_path
+    ):
+        done = _import_script_in_a_subprocess(
+            module, cwd=tmp_path, root='relative-oops'
+        )
+
+        assert done.returncode != 0, (
+            f"scripts/{module}.py imported cleanly with "
+            f"ORCHESTRATOR_ROOT='relative-oops' and bound "
+            f"{done.stdout.strip()!r}. Every `root / 'state' / ...` in it is "
+            f"then a mkdir under whatever the CWD happens to be (#202)"
+        )
+        assert 'must be an absolute path' in done.stderr, (
+            f"scripts/{module}.py failed for some reason other than the root "
+            f"resolver, so this test is no longer measuring what it "
+            f"claims:\n{done.stderr[-2000:]}"
+        )
+        assert list(tmp_path.iterdir()) == [], (
+            f"scripts/{module}.py created something under the CWD on its way "
+            f"to refusing the root: {list(tmp_path.iterdir())}"
+        )
+
+    @pytest.mark.parametrize('module', SCRIPTS_THAT_RESOLVE_A_ROOT_AT_IMPORT)
+    def test_an_absolute_root_is_honoured(self, module, tmp_path):
+        """The other half: refusing everything would also pass the test above.
+
+        Anything these modules create on import lands under tmp_path, which is
+        the point of pointing them there.
+        """
+        scratch = tmp_path / 'scratch'
+        scratch.mkdir()
+
+        done = _import_script_in_a_subprocess(
+            module, cwd=tmp_path, root=str(scratch)
+        )
+
+        assert done.returncode == 0, done.stderr[-2000:]
+        if module in SCRIPTS_THAT_BIND_A_ROOT_AT_IMPORT:
+            assert done.stdout.strip() == f'BOUND {scratch}', done.stdout
 
 
 class TestTheObservabilityServersDoor:

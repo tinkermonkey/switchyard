@@ -52,13 +52,28 @@ logger = logging.getLogger(__name__)
 
 
 from config.retention import RETENTION_DAYS  # noqa: E402
+# At module scope, unlike every other config import in services/: config.paths
+# has no side effects at all (see its docstring), so nothing is acquired by
+# naming it here. This module must not import config.state_manager, whose
+# import mkdirs a state tree -- a sweep is the last thing that should CREATE
+# directories on its way to deciding what to delete.
+# Aliased: resolve_roots() below takes a parameter named `workspace_root`, and
+# a module-level function of the same name would be shadowed inside exactly the
+# function that cares most about getting the root right.
+from config.paths import root_from_env  # noqa: E402
+from config.paths import workspace_root as _default_workspace_root  # noqa: E402
 
 
 # Where the workspace root is, for the locations that live beside the
 # orchestrator checkout rather than inside it (`/workspace/.orchestrator`,
 # `/workspace/<project>/`). In the container /app IS /workspace/switchyard, so
 # this cannot be derived from ORCHESTRATOR_ROOT alone.
-WORKSPACE_ROOT = os.environ.get('WORKSPACE_ROOT', '/workspace')
+#
+# Resolved rather than read raw: `os.environ.get('WORKSPACE_ROOT', '/workspace')`
+# returns `''` for `-e WORKSPACE_ROOT=`, and `Path('')` is `.`. That is the
+# same empty-key fault #202 fixed for ORCHESTRATOR_ROOT, in the one module
+# whose use of the value is recursive deletion.
+WORKSPACE_ROOT = str(_default_workspace_root())
 
 
 @dataclass(frozen=True)
@@ -432,9 +447,26 @@ def resolve_roots(
     own scratch tree for the orchestrator rules and the REAL /workspace -- which
     holds every managed project checkout -- for the other two. Only a
     deployment that has set neither gets the production defaults.
+
+    Both env values go through config.paths.root_from_env(), which strips,
+    refuses a relative value and resolves -- the same treatment every state
+    path gets (#202). Reading them raw was the last place in config/ or
+    services/ that did not, and it was the worst place for it: what comes back
+    is what sweep() DELETES from. Measured on the branch before this change,
+    `ORCHESTRATOR_ROOT='   '` resolved to `{'orchestrator': PosixPath('   '),
+    'workspace': PosixPath('   ')}` -- relative, so the sweep would have
+    recursed under the current working directory, and _PROTECTED_ROOTS below
+    (which lists only /app, /workspace and /) would not have caught it.
+
+    The UNSET default stays the literal `/app` rather than becoming
+    config.paths.orchestrator_root(). They are the same directory on the
+    deployment, but not in a worktree or a developer checkout -- and
+    _PROTECTED_ROOTS is keyed on `/app`, so resolving the unset case to a
+    checkout path would quietly disarm the "you are sweeping production from
+    inside a test" guard instead of tripping it.
     """
-    env_root = os.environ.get('ORCHESTRATOR_ROOT')
-    env_workspace = os.environ.get('WORKSPACE_ROOT')
+    env_root = root_from_env('ORCHESTRATOR_ROOT')
+    env_workspace = root_from_env('WORKSPACE_ROOT')
 
     if root is not None:
         orchestrator = Path(root)
@@ -483,7 +515,19 @@ def sweep(
     now: Optional[float] = None,
     workspace_root: Optional[Path] = None,
 ) -> List[RuleOutcome]:
-    """Run every retention rule. Never raises; failures land in the outcomes."""
+    """Run every retention rule. Per-rule and per-entry failures land in the
+    outcomes rather than raising -- one undeletable file must not abandon the
+    sweep.
+
+    The two things that DO raise are both about where the sweep is pointed,
+    and both raise before a single rule runs: resolve_roots() on a relative
+    ORCHESTRATOR_ROOT/WORKSPACE_ROOT (#202) and _refuse_unisolated_apply() on a
+    production root under pytest. Neither is a failure of a rule, and turning
+    either into an outcome would mean reporting "0 files removed" for a sweep
+    that was aimed at the wrong tree. On the deployment the first is
+    unreachable anyway: main.py:16 imports config.state_manager, so a bad root
+    kills the process at boot, long before the nightly job.
+    """
     roots = resolve_roots(root, workspace_root)
     if apply:
         _refuse_unisolated_apply(roots)

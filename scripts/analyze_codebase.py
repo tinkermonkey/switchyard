@@ -8,7 +8,6 @@ Orchestrates three discovery prompts to deeply understand the codebase.
 
 import json
 import logging
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,11 +20,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from claude.claude_integration import run_claude_code
 from monitoring.timestamp_utils import utc_isoformat
 from scripts._prompt_loader import load_prompt
+from config.paths import orchestrator_root
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+# Resolved through config.paths rather than open-coded (#202).
+# `os.environ.get('ORCHESTRATOR_ROOT', <default>)` returns `''` for
+# `-e ORCHESTRATOR_ROOT=` on a docker run, so the default never applied to that
+# case: measured here before the change, this module bound PosixPath('.'), and
+# every `root / 'state' / 'projects' / ...` below was then a mkdir under
+# whatever the CWD happened to be. config.paths, not config.state_manager,
+# because importing the latter builds its GitHubStateManager singleton and
+# mkdirs a state tree as a side effect of asking for a directory name.
+ORCHESTRATOR_ROOT = orchestrator_root()
 
 
 def get_workspace_root() -> Path:
@@ -38,8 +46,7 @@ def get_workspace_root() -> Path:
     if Path('/workspace').exists() and Path('/workspace').is_dir():
         return Path('/workspace')
     else:
-        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
-        return orchestrator_root.parent
+        return orchestrator_root().parent
 
 
 def validate_project_name(project: str):
@@ -264,8 +271,7 @@ async def run_codebase_analysis(project: str, workspace_root: Path) -> Dict[str,
     }
 
     # Save analysis metadata
-    orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
-    state_output_dir = orchestrator_root / 'state' / 'projects' / project
+    state_output_dir = ORCHESTRATOR_ROOT / 'state' / 'projects' / project
     state_output_dir.mkdir(parents=True, exist_ok=True)
     output_file = state_output_dir / 'codebase_analysis.json'
 
