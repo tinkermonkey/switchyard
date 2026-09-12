@@ -69,7 +69,6 @@ SERVER_VERSION = "0.2.1"
 APP_ROOT = root_from_env("APP_ROOT") or Path("/app")
 WORKFLOWS_YAML = APP_ROOT / "config" / "foundations" / "workflows.yaml"
 PROJECTS_CONFIG_DIR = APP_ROOT / "config" / "projects"
-STATE_DIR = APP_ROOT / "state" / "projects"
 OBSERVABILITY_URL = os.environ.get("OBSERVABILITY_URL", "http://observability-server:5001")
 
 # ── Lazy Redis / Elasticsearch clients ────────────────────────────────────────
@@ -165,9 +164,39 @@ def _load_project_config(project: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _projects_state_dir() -> Path:
+    """`state/projects` in the orchestrator's own state tree.
+
+    Was `APP_ROOT / "state" / "projects"`, a module constant, and it was listed
+    in the #181 source scan's EXEMPT table -- an entry that matched nothing,
+    because that scan could not see `<var> / "state"` at all. So the exemption
+    was never exercised and this line was never checked (#203).
+
+    Fixed rather than exempted. Nothing sets APP_ROOT: docker-compose.yml's
+    switchyard-mcp service does not, and it mounts ./ at /app with working_dir
+    /app, so both spellings resolve to /app/state/projects on the deployment
+    today -- this is not a behaviour change there. What it buys is that the MCP
+    server reads the same state tree as every other first-party reader,
+    including under an ORCHESTRATOR_ROOT override, instead of a second root
+    that only looks the same by coincidence.
+
+    APP_ROOT still owns config/ above: the code and config this server was
+    shipped with is a genuinely different question from where runtime state
+    lives.
+
+    Deferred import: config/state_manager.py builds a GitHubStateManager at
+    module scope and that constructor mkdirs. Importing it at module scope here
+    would make starting the MCP server create state directories as a side
+    effect of an import.
+    """
+    from config.state_manager import orchestrator_state_root
+
+    return orchestrator_state_root() / "projects"
+
+
 def _load_project_state(project: str) -> dict | None:
     project = _resolve_project_name(project)
-    state_file = STATE_DIR / project / "github_state.yaml"
+    state_file = _projects_state_dir() / project / "github_state.yaml"
     if not state_file.exists():
         return None
     with open(state_file) as f:

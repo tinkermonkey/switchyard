@@ -1484,6 +1484,32 @@ FIRST_PARTY_PREFIXES = (
     'state_management.', 'task_queue.', 'agents.',
 )
 
+# Modules a test is allowed to importlib.reload(). Reload is not restorable --
+# see _restore_process_globals below -- so what this list buys is that a NEW
+# one cannot be added silently.
+#
+# One entry, and the detector is what identified it: #203 predicted
+# `services.data_retention`, because that is the name on the test file. The
+# module actually reloaded is `config.retention`, at eight sites in
+# tests/unit/services/test_data_retention.py (four tests, each reloading once
+# under a patched RETENTION_DAYS and once more in a `finally`).
+#
+# Allowed because config/retention.py mints no new object on reload. It
+# defines no class at all: four module-level ints (RETENTION_DAYS,
+# RETENTION_SECONDS, _DEFAULT_RETENTION_DAYS, MONTHLY_INDEX_PERIOD_DAYS), five
+# functions, and one object -- `logger`. That one is safe for its own reason,
+# measured on this container rather than assumed: logging.getLogger returns the
+# manager-cached Logger, so `r.logger is before_logger` is True across an
+# importlib.reload. So a reload mints nothing that `isinstance` or `patch(...)`
+# can start disagreeing about. What it DOES leave stale is the copy each
+# `from config.retention import RETENTION_DAYS` took -- ten non-test modules do
+# that, observability.py and pipeline_run.py among them -- which is why those
+# four tests restore the module in a `finally` rather than leaving the last
+# reload standing.
+RELOADABLE_FIRST_PARTY_MODULES = frozenset({
+    'config.retention',
+})
+
 
 @pytest.fixture(autouse=True)
 def _restore_process_globals():
@@ -1494,9 +1520,11 @@ def _restore_process_globals():
 
       * `os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)`. Assigned directly
         rather than through monkeypatch, so it survives. Every later test that
-        resolves a state path gets a directory pytest has since deleted. Two
-        files do this (test_work_execution_redis_recovery.py,
-        test_stale_execution_history.py, the latter at six separate sites).
+        resolves a state path gets a directory pytest has since deleted.
+        Three files do this, at eight sites: test_stale_execution_history.py
+        (six), test_work_execution_redis_recovery.py and
+        test_container_redis_tracking.py (one each). The last also does the
+        second bullet, in the same helper.
       * `sys.modules.pop('services.work_execution_state', None)` to force a
         re-import. The re-import builds a NEW module-level singleton and a NEW
         class object, so anything holding the old one keeps a stale root and
@@ -1510,14 +1538,32 @@ def _restore_process_globals():
     they just need it undone. Only entries that were REPLACED or REMOVED are
     put back, so modules a test legitimately imports for the first time stay.
 
-    LIMIT, stated because the docstring above would otherwise imply more:
-    `importlib.reload` is invisible to this. Reload re-executes the module body
-    in place and keeps the same object, so `sys.modules.get(name) is module`
-    stays True and nothing here fires -- even though a reload rebuilds every
-    module-level singleton and mints a new class object, which is the same
-    damage by a different route. tests/unit/services/test_data_retention.py
-    reloads at eight sites; it restores itself in a finally, so nothing is
-    broken today. Covering reload needs a per-module sentinel, not this.
+    THIRD, `importlib.reload` -- DETECTED here, not restored, and the
+    difference is deliberate (#203).
+
+    Reload re-executes the module body in place and keeps the same object, so
+    `sys.modules.get(name) is module` stays True and the loop below never
+    fires, even though the reload has rebuilt every module-level singleton and
+    minted a new class object. The per-module sentinel that does see it is
+    `module.__spec__`: importlib._bootstrap._exec assigns a freshly-found spec
+    on every reload, so spec IDENTITY changes while module identity does not.
+    Measured on this container's Python 3.11.16: after `importlib.reload(m)`,
+    `m.__spec__` is a different object, `m.__dict__` is the SAME object, and an
+    attribute stamped into `m.__dict__` beforehand survives -- which is why a
+    stamped counter cannot be the sentinel and the spec can.
+
+    Restoring is not on the table. There is nothing to put back: the damaged
+    object IS the live one, and the only way to rebuild it is another reload,
+    which mints yet another class object and does the same damage again. So it
+    raises instead. Being a teardown, pytest reports that as an ERROR against
+    the offending test rather than a FAILURE -- the test body itself still
+    passes -- which is loud, non-zero, and lands next to its cause. Modules on
+    RELOADABLE_FIRST_PARTY_MODULES above are allowed.
+
+    LIMIT, stated so the docstring does not outrun the code: a module that a
+    test imports for the FIRST time and then reloads within the same test is
+    not in `previous_modules`, so its reload is not seen. Nothing in the suite
+    does that today.
     """
     from unittest.mock import NonCallableMock
 
@@ -1525,6 +1571,12 @@ def _restore_process_globals():
     previous_modules = {
         name: module for name, module in sys.modules.items()
         if name.startswith(FIRST_PARTY_PREFIXES)
+    }
+    # Strong references, not ids: the old spec is dropped on reload and a new
+    # object can land at the same address.
+    previous_specs = {
+        name: getattr(module, '__spec__', None)
+        for name, module in previous_modules.items()
     }
 
     yield
@@ -1552,3 +1604,23 @@ def _restore_process_globals():
             # mistakes and only one of them is the caller's own business.
             continue
         sys.modules[name] = module
+
+    reloaded = sorted(
+        name for name, module in previous_modules.items()
+        if name not in RELOADABLE_FIRST_PARTY_MODULES
+        and sys.modules.get(name) is module
+        and previous_specs[name] is not None
+        and getattr(module, '__spec__', None) is not previous_specs[name]
+    )
+    assert not reloaded, (
+        "this test called importlib.reload() on a first-party module: "
+        + ', '.join(reloaded) +
+        ". Reload re-executes the module body in place, so every module-level "
+        "singleton is rebuilt and every class object is replaced while the "
+        "module object -- and therefore every `import x` anyone already did -- "
+        "stays the same. Nothing can put that back (#181, #203). Construct the "
+        "object under a patched environment instead; see "
+        "tests/unit/test_state_root_isolation.py::TestBothHoldoutsUseIt for the "
+        "pattern. If the module genuinely has nothing process-wide to damage, "
+        "add it to RELOADABLE_FIRST_PARTY_MODULES in this file with the reason."
+    )

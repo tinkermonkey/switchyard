@@ -489,7 +489,9 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
         )
 
 
-def _import_the_mcp_server_in_a_subprocess(cwd: Path, app_root: str):
+def _import_the_mcp_server_in_a_subprocess(
+    cwd: Path, app_root: str, orchestrator_root: str = None
+):
     """Import mcp/server.py the way it is actually run and report its paths.
 
     A SUBPROCESS, and `sys.path.insert(0, <repo>/mcp)` rather than an import of
@@ -500,9 +502,18 @@ def _import_the_mcp_server_in_a_subprocess(cwd: Path, app_root: str):
 
     Measured in switchyard-orchestrator-1: 0.9s per import, ES and FastMCP
     clients included, because every client in that module is lazy.
+
+    PROJECTS_STATE_DIR is a CALL, not a module constant, and that is the whole
+    of what #203 changed here: `STATE_DIR = APP_ROOT / "state" / "projects"`
+    became `_projects_state_dir()`, resolving through orchestrator_state_root()
+    like every other first-party reader of that tree. It is probed here rather
+    than dropped because the property worth holding moved rather than
+    disappeared -- see TestTheMcpServersDoor.
     """
     environment = dict(os.environ)
     environment['APP_ROOT'] = app_root
+    if orchestrator_root is not None:
+        environment['ORCHESTRATOR_ROOT'] = orchestrator_root
     environment['PYTHONPATH'] = str(_REPO_ROOT)
     return subprocess.run(
         [
@@ -511,7 +522,7 @@ def _import_the_mcp_server_in_a_subprocess(cwd: Path, app_root: str):
             f'sys.path.insert(0, {str(_REPO_ROOT / "mcp")!r})\n'
             'import server\n'
             'print("APP_ROOT", server.APP_ROOT)\n'
-            'print("STATE_DIR", server.STATE_DIR)\n'
+            'print("PROJECTS_STATE_DIR", server._projects_state_dir())\n'
             'print("WORKFLOWS_YAML", server.WORKFLOWS_YAML)\n'
             'print("PROJECTS_CONFIG_DIR", server.PROJECTS_CONFIG_DIR)\n',
         ],
@@ -540,6 +551,29 @@ class TestTheMcpServersDoor:
     into that alternation, which is why this behavioural pair exists alongside
     it -- a grep that passes while the thing it guards is broken is the failure
     mode this file was written against.
+
+    WHAT #203 CHANGED UNDER THESE TESTS, and why they assert the opposite of
+    what they first did about one of the four paths. #202 kept the state
+    directory hung off APP_ROOT and pinned it here (`STATE_DIR ==
+    '/app/state/projects'` for a blank APP_ROOT, `scratch/state/projects` for
+    an absolute one). #203 re-rooted it at orchestrator_state_root(), because
+    this server READS `github_state.yaml` out of a tree the orchestrator WROTE
+    through that resolver, and a reader resolving its root differently from the
+    writer reads a different tree -- which is #181 with the two halves in
+    separate containers. Nothing sets APP_ROOT (no compose service, no
+    Dockerfile, no .env), so on the deployment both spellings are
+    /app/state/projects and this is not a behaviour change there; what it buys
+    is that an ORCHESTRATOR_ROOT override now moves the MCP server's reads with
+    everyone else's, and an APP_ROOT override no longer silently moves them
+    away on its own.
+
+    So the assertion below is inverted deliberately, not weakened: APP_ROOT
+    still owns the CODE AND CONFIG this server shipped with (WORKFLOWS_YAML,
+    PROJECTS_CONFIG_DIR, checked unchanged), and ORCHESTRATOR_ROOT owns the
+    runtime state. #202's actual fix to this file -- root_from_env() instead of
+    `os.environ.get("APP_ROOT", "/app")`, so a blank value reads as unset and a
+    relative one is refused -- is untouched and still checked by all three
+    tests.
     """
 
     @staticmethod
@@ -549,14 +583,20 @@ class TestTheMcpServersDoor:
             for line in stdout.splitlines()
             if line.split(maxsplit=1)[:1]
             and line.split(maxsplit=1)[0] in {
-                'APP_ROOT', 'STATE_DIR', 'WORKFLOWS_YAML', 'PROJECTS_CONFIG_DIR',
+                'APP_ROOT', 'PROJECTS_STATE_DIR', 'WORKFLOWS_YAML',
+                'PROJECTS_CONFIG_DIR',
             }
         )
 
     def test_a_blank_app_root_does_not_become_the_working_directory(self, tmp_path):
         """The accident this issue is named for, in the one file that still had
         it. Run from tmp_path so a regression is visible as a path under it."""
-        done = _import_the_mcp_server_in_a_subprocess(tmp_path, app_root='')
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
+
+        done = _import_the_mcp_server_in_a_subprocess(
+            tmp_path, app_root='', orchestrator_root=str(elsewhere)
+        )
 
         assert done.returncode == 0, done.stderr[-3000:]
         paths = self._paths_from(done.stdout)
@@ -568,13 +608,18 @@ class TestTheMcpServersDoor:
                 f"mcp/server.py's {name} is {chosen} -- relative, so it "
                 f"resolves against the CWD (#202)"
             )
-            assert tmp_path not in chosen.parents
 
         assert paths['APP_ROOT'] == '/app', (
             "a blank APP_ROOT must read as unset and land on the documented "
             f"default, not on {paths['APP_ROOT']}"
         )
-        assert paths['STATE_DIR'] == '/app/state/projects'
+        assert Path(paths['WORKFLOWS_YAML']).is_relative_to('/app')
+        assert Path(paths['PROJECTS_CONFIG_DIR']).is_relative_to('/app')
+
+        # ...and the state tree follows ORCHESTRATOR_ROOT, not APP_ROOT (#203).
+        assert paths['PROJECTS_STATE_DIR'] == str(
+            elsewhere / 'state' / 'projects'
+        )
 
     def test_a_relative_app_root_is_refused_at_import(self, tmp_path):
         """A dropped leading slash means "under the CWD", and this service's
@@ -593,22 +638,36 @@ class TestTheMcpServersDoor:
         )
         assert list(tmp_path.iterdir()) == []
 
-    def test_an_absolute_app_root_is_still_honoured(self, tmp_path):
+    def test_an_absolute_app_root_is_still_honoured_for_code_and_config(
+        self, tmp_path
+    ):
         """The other half: refusing everything would also pass the test above,
-        and APP_ROOT is a real override this service documents."""
+        and APP_ROOT is a real override this service reads.
+
+        It moves the code and config paths and, since #203, NOT the state tree
+        -- the assertion that used to read `scratch/state/projects`. Both roots
+        are pointed somewhere of this test's choosing so that "it followed the
+        other one" is a visible failure rather than two identical strings.
+        """
         scratch = tmp_path / 'scratch'
         scratch.mkdir()
+        elsewhere = tmp_path / 'elsewhere'
+        elsewhere.mkdir()
 
-        done = _import_the_mcp_server_in_a_subprocess(tmp_path, app_root=str(scratch))
+        done = _import_the_mcp_server_in_a_subprocess(
+            tmp_path, app_root=str(scratch), orchestrator_root=str(elsewhere)
+        )
 
         assert done.returncode == 0, done.stderr[-3000:]
         paths = self._paths_from(done.stdout)
         assert paths['APP_ROOT'] == str(scratch)
-        assert paths['STATE_DIR'] == str(scratch / 'state' / 'projects')
         assert paths['WORKFLOWS_YAML'] == str(
             scratch / 'config' / 'foundations' / 'workflows.yaml'
         )
         assert paths['PROJECTS_CONFIG_DIR'] == str(scratch / 'config' / 'projects')
+        assert paths['PROJECTS_STATE_DIR'] == str(
+            elsewhere / 'state' / 'projects'
+        ), "APP_ROOT moved the state tree; since #203 only ORCHESTRATOR_ROOT does"
 
 
 class TestTheDataRetentionDoor:
