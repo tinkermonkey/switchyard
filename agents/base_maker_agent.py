@@ -202,13 +202,6 @@ class MakerAgent(PipelineStage, ABC):
             # single ~3h contention wait would be retried into ~9h AND counted
             # toward this agent+project's own breaker.
             from services.resource_lock_errors import is_lock_timeout_error
-            from claude.claude_integration import DevContainerEnvironmentBlocked
-            # Re-raised unwrapped for the same reason a lock timeout is: both
-            # are terminal conditions about a SHARED resource, not failures of
-            # this agent, and wrapping them as generic agent failures feeds
-            # them to a retry loop that makes the situation worse (#198 review
-            # -- a retried stand-down performs the very rebuild it stood down
-            # from).
-            if is_lock_timeout_error(exc) or isinstance(exc, DevContainerEnvironmentBlocked):
+            if is_lock_timeout_error(exc):
                 raise
             raise Exception(f"{self.agent_display_name} execution failed: {exc}") from exc

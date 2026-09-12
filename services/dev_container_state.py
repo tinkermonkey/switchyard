@@ -771,6 +771,37 @@ class DevContainerStateManager:
             return False
 
         try:
+            exists, _inconclusive = self._probe_image(image_name)
+            return exists
+
+        except Exception as e:
+            logger.error(f"Error checking if Docker image {image_name} exists: {e}")
+            return False
+
+    def _probe_image(self, image_name: str) -> Tuple[bool, bool]:
+        """(exists, inconclusive) for `image_name`.
+
+        Private because only ONE caller needs the second element:
+        verify_and_update_status(), which turns a negative into a durable state
+        mutation and must not do that on an unanswered probe. Every other
+        caller wants the plain bool that verify_image_exists() still returns,
+        and three of them degrade gracefully on it.
+
+        Deliberately not an exception (#199 review). Raising from the probe was
+        tried: the raise for the unreachable-daemon case sat inside a `try`
+        whose own `except Exception` caught it, so it never fired, while the
+        timeout raise came from inside an except handler and DID escape --
+        breaking docker_runner's image selection, main.py's startup sweep and
+        project_workspace's dependency extraction, none of which had any reason
+        to change. A second return value cannot be swallowed by a handler and
+        cannot escape to a caller that did not ask for it.
+
+        `inconclusive` is True only when Docker did not answer -- an
+        unreachable daemon, a permission failure, or the 10s timeout. A
+        successful "no such image", and an image present but missing the
+        agent-environment label, are both conclusive negatives.
+        """
+        try:
             result = subprocess.run(
                 ['docker', 'image', 'inspect',
                  '--format', '{{ index .Config.Labels "%s" }}' % SWITCHYARD_AGENT_ENV_LABEL,
@@ -779,30 +810,46 @@ class DevContainerStateManager:
                 text=True,
                 timeout=10
             )
-
-            if result.returncode != 0:
-                logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
-                return False
-
-            if result.stdout.strip() != "true":
-                logger.warning(
-                    f"Docker image {image_name} exists but is missing the "
-                    f"{SWITCHYARD_AGENT_ENV_LABEL} label — it was not built from this "
-                    f"project's Dockerfile.agent and has likely overwritten the tag "
-                    f"(e.g. an unrelated docker-compose service sharing the same name). "
-                    f"Treating as not verified; rebuild required."
-                )
-                return False
-
-            logger.debug(f"Docker image {image_name} exists locally and is a genuine agent environment")
-            return True
-
         except subprocess.TimeoutExpired:
-            logger.error(f"Timeout checking if Docker image {image_name} exists")
-            return False
+            logger.error(
+                f"Timed out asking Docker whether {image_name} exists; treating "
+                f"as unknown, not as absent"
+            )
+            return False, True
         except Exception as e:
             logger.error(f"Error checking if Docker image {image_name} exists: {e}")
-            return False
+            return False, True
+
+        if result.returncode != 0:
+            # Docker's own stderr, which used to be captured and discarded
+            # (#199 review): "Cannot connect to the Docker daemon" and "No such
+            # image" produced byte-identical output, so an operator reading a
+            # BLOCKED verdict could not tell them apart.
+            stderr = (result.stderr or '').strip()
+            lowered = stderr.lower()
+            unanswered = (
+                'cannot connect to the docker daemon' in lowered
+                or 'permission denied' in lowered
+                or 'is the docker daemon running' in lowered
+            )
+            logger.warning(
+                f"`docker image inspect {image_name}` failed "
+                f"(rc={result.returncode}): {stderr[:200] or 'no stderr'}"
+            )
+            return False, unanswered
+
+        if result.stdout.strip() != "true":
+            logger.warning(
+                f"Docker image {image_name} exists but is missing the "
+                f"{SWITCHYARD_AGENT_ENV_LABEL} label - it was not built from this "
+                f"project's Dockerfile.agent and has likely overwritten the tag "
+                f"(e.g. an unrelated docker-compose service sharing the same name). "
+                f"Treating as not verified; rebuild required."
+            )
+            return False, False
+
+        logger.debug(f"Docker image {image_name} exists locally and is a genuine agent environment")
+        return True, False
 
     def verify_and_update_status(self, project_name: str) -> bool:
         """
@@ -835,9 +882,28 @@ class DevContainerStateManager:
         if status != DevContainerStatus.VERIFIED:
             return True  # No verification needed for other states
 
-        # Check if image actually exists
-        if self.verify_image_exists(project_name, image_name=image_name):
+        # Check if image actually exists.
+        #
+        # The INCONCLUSIVE case is handled separately here and nowhere else
+        # (#199 review). verify_image_exists() returns False both for "no such
+        # image" and for "Docker did not answer" -- and its four callers mostly
+        # degrade harmlessly on that, so the bool contract is right for them.
+        # This caller is the exception: it turns a False into a DURABLE state
+        # mutation (VERIFIED -> UNVERIFIED), which under a shared environment
+        # un-verifies every member and queues a full rebuild for all of them.
+        # One slow `docker image inspect` during a busy startup should not do
+        # that. Probed through the private helper so the public contract --
+        # which three other callers depend on -- is untouched.
+        exists, inconclusive = self._probe_image(image_name)
+        if exists:
             return True  # Image exists, all good
+        if inconclusive:
+            logger.warning(
+                f"Could not determine whether {image_name} exists; leaving "
+                f"{project_name}'s dev-container status unchanged rather than "
+                f"forcing a rebuild on an unanswered probe"
+            )
+            return False
 
         # Image is missing, or the tag now points at something that isn't a
         # genuine switchyard agent environment (see verify_image_exists) - reset

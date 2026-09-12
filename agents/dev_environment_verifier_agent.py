@@ -4,19 +4,10 @@ from claude.claude_integration import run_claude_code
 from services.dev_container_state import dev_container_state, DevContainerStatus
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
 import logging
-import time
 import json
 import re
 
 logger = logging.getLogger(__name__)
-
-
-# How many times to ask Docker whether the expected image exists before
-# concluding it does not. verify_image_exists() returns False for a genuinely
-# missing image AND for a daemon that did not answer, so a single False is not
-# evidence of absence -- see the call site.
-_IMAGE_CHECK_ATTEMPTS = 3
-_IMAGE_CHECK_RETRY_SECONDS = 2.0
 
 
 class DevEnvironmentVerifierAgent(PipelineStage):
@@ -137,81 +128,70 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 environment = environment_for(project_name)
 
                 # ASSERT, don't trust (#198). The setup agent issues the
-                # `docker build` itself from inside its own Claude Code session,
-                # so the tag is produced by a model following a prompt. Before
-                # environments existed the tag and the checkout path were the
-                # same identifier and a mistake was near-impossible; now they
-                # differ, and a build tagged from the project name instead of
-                # the environment would be a perfectly good image under a name
-                # nothing ever reads -- surfacing forever after as "not built"
-                # with no indication why. Checking here converts that into one
-                # legible failure naming both tags.
-                # ASSERT, don't trust (#198). The setup agent issues the
                 # `docker build` itself from inside its own Claude Code
                 # session, so the tag is produced by a model following a
                 # prompt. A build tagged from the project name instead of the
                 # environment would be a perfectly good image under a name
                 # nothing ever reads -- surfacing forever after as "not built"
-                # with no indication why.
+                # with no indication why. Checking here converts that into one
+                # legible failure naming both tags.
                 #
-                # Retried rather than trusted on the first answer, and the
-                # inconclusive case is CHANGES_NEEDED rather than BLOCKED.
-                # verify_image_exists() cannot distinguish "no such image" from
-                # "Docker did not answer" -- it returns False for a missing
-                # image, an unreachable daemon and a 10s timeout alike -- and
-                # BLOCKED is respected by every member of a shared environment
-                # and has no staleness escape, so one daemon blip would strand
-                # all of them until a human intervened. CHANGES_NEEDED is the
-                # retryable sibling (see DevContainerStatus) and ages out.
+                # BLOCKED, deliberately, and NOT retried here. Two earlier
+                # attempts to soften this were both worse:
                 #
-                # Deliberately NOT solved by making verify_image_exists() raise:
-                # it is called by docker_runner's image selection, main.py's
-                # startup sweep and project_workspace's baked-dependency
-                # extraction, all of which degrade gracefully on False. Changing
-                # that contract to fix this one caller broke all three.
-                tag_exists = False
-                for attempt in range(_IMAGE_CHECK_ATTEMPTS):
-                    if dev_container_state.verify_image_exists(
-                        project_name, image_name=expected_tag
-                    ):
-                        tag_exists = True
-                        break
-                    if attempt + 1 < _IMAGE_CHECK_ATTEMPTS:
-                        time.sleep(_IMAGE_CHECK_RETRY_SECONDS)
-
-                if not tag_exists:
+                #   * raising a DockerUnavailableError from verify_image_exists
+                #     to separate "missing" from "Docker did not answer" -- the
+                #     raise sat inside a try whose own `except Exception`
+                #     caught it, so it never fired, while a sibling raise from
+                #     an except handler DID escape and broke three unrelated
+                #     callers that degrade gracefully on False.
+                #   * recording CHANGES_NEEDED instead, so a transient Docker
+                #     failure would age out -- but the fault this check exists
+                #     for (a model tagging the image after the project) is
+                #     DETERMINISTIC, and CHANGES_NEEDED's 30-minute staleness
+                #     escape has no attempt counter outside repair_cycle. That
+                #     turned one terminal failure into an unbounded loop of
+                #     hour-scale rebuilds, per member, with the stage still
+                #     reporting success so nothing ever counted it.
+                #
+                # BLOCKED is terminal, bounded, respected by every member of
+                # the environment, and clearable by an operator
+                # (scripts/set_dev_container_verified.py). The transient case
+                # is made diagnosable instead of special-cased: verify_image_
+                # exists now logs Docker's own stderr, so "Cannot connect to
+                # the Docker daemon" is distinguishable from "No such image"
+                # in the log line right above this verdict.
+                if not dev_container_state.verify_image_exists(
+                    project_name, image_name=expected_tag
+                ):
                     error_message = (
                         f"Verifier approved the environment but the expected image "
-                        f"tag {expected_tag!r} could not be confirmed after "
-                        f"{_IMAGE_CHECK_ATTEMPTS} attempts. Either the build tagged "
-                        f"the image after the project name instead of the "
-                        f"dev-container environment {environment!r}, or Docker did "
-                        f"not answer. Re-run dev_environment_setup; it must use the "
-                        f"image tag supplied in its prompt verbatim."
+                        f"tag {expected_tag!r} does not exist (or is not a genuine "
+                        f"agent environment). Most likely the build tagged the image "
+                        f"after the project name instead of the dev-container "
+                        f"environment {environment!r}; if the log line above reports "
+                        f"a Docker error instead, the image could not be checked at "
+                        f"all. Re-run dev_environment_setup; it must use the image "
+                        f"tag supplied in its prompt verbatim."
                     )
-                    # CHANGES_NEEDED, not BLOCKED: retryable, ages out, and does
-                    # not strand every other member of a shared environment on
-                    # what may have been a transient Docker failure. Not
-                    # truncated -- the remedy lives in the second half of the
-                    # message, and this is the operator's only persistent record.
-                    wrote = dev_container_state.set_status(
+                    # Not truncated -- the remedy is in the second half, and
+                    # this is the operator's only persistent record.
+                    _wrote = dev_container_state.set_status(
                         project_name=project_name,
-                        status=DevContainerStatus.CHANGES_NEEDED,
+                        status=DevContainerStatus.BLOCKED,
                         error_message=error_message,
                     )
-                    if not wrote:
-                        # Unchecked, this leaves the environment at IN_PROGRESS
-                        # forever -- the dangling state this module's own
-                        # CRITICAL comment exists to prevent.
+                    if not _wrote:
                         logger.error(
-                            "Failed to record CHANGES_NEEDED for %s; the environment "
-                            "may remain IN_PROGRESS and stall every member",
+                            "Failed to record BLOCKED for %s; the environment may "
+                            "remain IN_PROGRESS and stall every member",
                             project_name,
                         )
-                    logger.error(
-                        "Refusing to mark %s VERIFIED: expected image %s could not "
-                        "be confirmed", project_name, expected_tag,
-                    )
+                    else:
+                        logger.error(
+                            "Refusing to mark %s VERIFIED: expected image %s is "
+                            "missing or unverifiable", project_name, expected_tag,
+                        )
                 else:
                     _wrote = dev_container_state.set_status(
                         project_name=project_name,

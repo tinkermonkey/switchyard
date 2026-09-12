@@ -52,17 +52,30 @@ def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
         )
     return Path(str(raw_work_dir))
 
-class DevContainerEnvironmentBlocked(RuntimeError):
+from agents.non_retryable import NonRetryableAgentError
+
+
+class DevContainerEnvironmentBlocked(NonRetryableAgentError):
     """Another run drove this dev-container environment to BLOCKED while this
     one waited for the build lock.
 
-    A distinct type because it must NOT be retried. The generic agent-failure
-    retry in services/agent_executor.py re-runs the agent, and on the second
-    attempt `status_before_wait` is already BLOCKED -- which
+    Subclasses NonRetryableAgentError rather than defining its own
+    non-retryability, because "non-retryable" is not a property a type has by
+    existing -- it is a property the retry loops implement. An earlier version
+    of this was a bare RuntimeError whose docstring asserted it "must NOT be
+    retried"; nothing keyed on it, so services/agent_executor.py retried it,
+    and on attempt two `status_before_wait` was already BLOCKED, which
     build_already_done_by_another_member() correctly reads as a DELIBERATE
-    re-run and allows through, so the member performs the full rebuild the
-    stand-down existed to prevent. That defeats the fan-out guard the build
-    lock's timeout budget is documented as resting on.
+    re-run and lets through -- performing the exact rebuild the stand-down
+    prevented. Worse, the retry-exhausted handler then reset the SHARED
+    environment to UNVERIFIED, destroying the other member's BLOCKED verdict
+    and the error_message this exception's own text tells the operator to go
+    and read.
+
+    NonRetryableAgentError is already honoured by both retry loops
+    (services/agent_executor.py, services/worker_pool.py) and re-raised
+    unwrapped by agents/base_maker_agent.py, so inheriting it gets all three
+    for free and cannot drift out of sync with them.
     """
 
 

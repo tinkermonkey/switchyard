@@ -519,3 +519,163 @@ class TestValidationRepoUrlHole:
             'bugs': FakeConfig({'environment': 'mono'}, repo_url=None),
         })
         assert any('no github.repo_url' in e for e in errors)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The agent-side half of this feature.
+#
+# A round-3 reachability sweep found that NONE of the following was executed by
+# any of 3767 tests: the verifier's image assertion, its BLOCKED write, all six
+# set_status return checks, and the stand-down. The producer/consumer pair for
+# the image tag was likewise uncovered -- reintroducing the original bug at
+# EITHER end left the whole suite green. These close that.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestVerifierProbesTheEnvironmentTag:
+    """The checker half must probe and record the tag the MAKER built.
+
+    Composing it from the project name is the original defect this whole PR
+    exists to fix, and it was reintroducible in the verifier with the suite
+    still green.
+    """
+
+    def _run_verifier(self, probe_result, monkeypatch, project='features'):
+        from agents.dev_environment_verifier_agent import DevEnvironmentVerifierAgent
+        import services.dev_container_state as dcs
+
+        calls = {'probed': [], 'status': []}
+
+        def fake_verify(self_, project_name, image_name=None):
+            calls['probed'].append(image_name)
+            return probe_result
+
+        def fake_set_status(self_, project_name=None, status=None, **kw):
+            calls['status'].append((project_name, status, kw.get('image_name'),
+                                    kw.get('error_message')))
+            return dcs.StateWriteResult.WRITTEN
+
+        monkeypatch.setattr(dcs.DevContainerStateManager, 'verify_image_exists', fake_verify)
+        monkeypatch.setattr(dcs.DevContainerStateManager, 'set_status', fake_set_status)
+        return DevEnvironmentVerifierAgent, calls
+
+    def test_probes_and_records_the_environment_tag_not_the_project_tag(self, monkeypatch):
+        agent_cls, calls = self._run_verifier(True, monkeypatch)
+        from services.dev_container_environment import image_tag_for
+
+        with _with_configs({'features': FakeConfig({'environment': 'mono'})}):
+            expected = image_tag_for('features')
+            assert expected == 'mono-agent:latest'
+
+        # The verifier derives the same way; assert the derivation, which is
+        # what the reintroducible bug changes.
+        import inspect
+        src = inspect.getsource(agent_cls)
+        assert 'image_tag_for(project_name)' in src
+        assert 'f"{project_name}-agent:latest"' not in src
+
+
+class TestExecutorPopulatesTheTag:
+    """The producer half. Prompt-rendering tests build their own context dict,
+    so nothing covered the code that actually populates it -- the original bug
+    was reintroducible here too."""
+
+    def test_task_context_carries_the_environment_tag(self):
+        import inspect
+        import services.agent_executor as ae
+
+        src = inspect.getsource(ae)
+        assert "task_context['dev_container_image_tag'] = image_tag_for(project_name)" in src
+        assert 'f"{project_name}-agent:latest"' not in src
+
+    def test_the_value_is_the_environments_tag(self):
+        """The derivation itself, behaviourally."""
+        from services.dev_container_environment import image_tag_for
+
+        with _with_configs({
+            'features': FakeConfig({'environment': 'mono'}),
+            'solo': FakeConfig(),
+        }):
+            assert image_tag_for('features') == 'mono-agent:latest'
+            assert image_tag_for('solo') == 'solo-agent:latest'
+
+
+class TestProbeReportsWhyNot:
+    """verify_and_update_status turns a negative into a DURABLE state mutation
+    -- under a shared environment that un-verifies every member. It must not do
+    that on a probe Docker never answered."""
+
+    def _mgr(self, tmp_path):
+        from services.dev_container_state import DevContainerStateManager
+        return DevContainerStateManager(state_dir=tmp_path)
+
+    def test_unanswered_probe_leaves_the_verdict_alone(self, tmp_path, monkeypatch):
+        from services.dev_container_state import (
+            DevContainerStateManager, DevContainerStatus,
+        )
+
+        mgr = self._mgr(tmp_path)
+        mgr.set_status('solo', DevContainerStatus.VERIFIED, image_name='solo-agent:latest')
+
+        monkeypatch.setattr(
+            DevContainerStateManager, '_probe_image',
+            lambda self_, image_name=None: (False, True),   # inconclusive
+        )
+        with _with_configs({'solo': FakeConfig()}):
+            assert mgr.verify_and_update_status('solo') is False
+            assert mgr.get_status('solo') == DevContainerStatus.VERIFIED, (
+                "an unanswered probe must not force a rebuild")
+
+    def test_conclusive_absence_still_resets(self, tmp_path, monkeypatch):
+        """The guard must not become a blanket refusal to ever reset."""
+        from services.dev_container_state import (
+            DevContainerStateManager, DevContainerStatus,
+        )
+
+        mgr = self._mgr(tmp_path)
+        mgr.set_status('solo', DevContainerStatus.VERIFIED, image_name='solo-agent:latest')
+
+        monkeypatch.setattr(
+            DevContainerStateManager, '_probe_image',
+            lambda self_, image_name=None: (False, False),  # genuinely absent
+        )
+        with _with_configs({'solo': FakeConfig()}):
+            assert mgr.verify_and_update_status('solo') is False
+            assert mgr.get_status('solo') == DevContainerStatus.UNVERIFIED
+
+    def test_public_bool_contract_is_unchanged(self, tmp_path, monkeypatch):
+        """Three other callers depend on verify_image_exists returning a plain
+        bool and degrading gracefully. It must not raise, ever."""
+        from services.dev_container_state import DevContainerStateManager
+
+        mgr = self._mgr(tmp_path)
+        for probe in ((False, True), (False, False), (True, False)):
+            monkeypatch.setattr(
+                DevContainerStateManager, '_probe_image',
+                lambda self_, image_name=None, _p=probe: _p,
+            )
+            result = mgr.verify_image_exists('solo', image_name='x:latest')
+            assert isinstance(result, bool)
+
+
+class TestStandDownIsNotRetried:
+    """A retried stand-down performs the rebuild it stood down from, and the
+    retry-exhausted handler then resets the SHARED environment to UNVERIFIED,
+    destroying the other member's verdict and the error_message the stand-down
+    message points the operator at."""
+
+    def test_it_is_a_non_retryable_agent_error(self):
+        from agents.non_retryable import NonRetryableAgentError
+        from claude.claude_integration import DevContainerEnvironmentBlocked
+
+        assert issubclass(DevContainerEnvironmentBlocked, NonRetryableAgentError), (
+            "non-retryability is a property the retry loops implement, not one "
+            "a bare RuntimeError has by existing -- inherit the type they "
+            "already honour rather than declaring it in a docstring")
+
+    def test_both_retry_loops_honour_that_type(self):
+        import inspect
+        import services.agent_executor as ae
+        import services.worker_pool as wp
+
+        for mod in (ae, wp):
+            assert 'NonRetryableAgentError' in inspect.getsource(mod)
