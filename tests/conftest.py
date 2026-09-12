@@ -439,14 +439,18 @@ def _stop_the_background_call_trace_summarizer():
     of them outlives its test and goes on mutating shared state inside every
     later test.
 
-    Patched here rather than per file because FOUR of the five test files that
-    construct a client had already forgotten it -- test_github_api_rate_limit_
-    redis_mirror.py (11 threads, one per test using its `client` fixture),
-    test_git_workflow_manager.py, test_github_api_rate_limit_buckets.py and
-    test_feature_branch_pr_ready.py -- while only test_github_app_rate_limit_
-    accounting.py patches it, at all five of its construction sites. That ratio
-    is the argument: this is a property of the constructor, not of any one
-    test's setup.
+    Patched here rather than per file because nearly every test file that
+    constructs a client forgets it. When this was written, five of the six such
+    files did -- test_github_api_rate_limit_redis_mirror.py alone leaked 11
+    threads, one per test using its `client` fixture -- and exactly one,
+    test_github_app_rate_limit_accounting.py, remembered, at every one of its
+    construction sites.
+
+    Deliberately not restating that ratio as a number to maintain: it went
+    stale within a day, when an unrelated PR added a sixth file. The argument
+    does not depend on the count anyway -- this is a property of the
+    constructor, so the constructor's own test harness is the only place that
+    cannot be forgotten.
 
     Nothing under test depends on it: it does nothing at all within a 5-minute
     window and no test runs that long. Note that the method it would call,
