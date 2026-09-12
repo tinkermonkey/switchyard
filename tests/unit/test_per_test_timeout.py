@@ -168,9 +168,15 @@ class TestTheTimeoutIsLiveForThisVeryTest:
         killed that case at the limit.
 
         Change this if the tradeoff is reconsidered -- `thread` calls
-        os._exit(1), so the rest of the run is abandoned and the report-only CI
-        job loses its results, which is a real cost -- but change it knowing
-        that is the trade, and re-measure rather than reasoning about it.
+        os._exit(1), so the rest of the run is abandoned, the report-only CI job
+        loses its results, and every fixture teardown is skipped, which costs
+        tests/conftest.py's session-autouse cleanup_test_data its exit-side
+        purge of the global rate-limit keys (measured: a marker fixture wrote
+        `pre` and `post` under signal, only `pre` under thread) -- but change it
+        knowing those are the trades, and re-measure rather than reasoning about
+        it. pytest.ini carries the numbers and
+        test_service_client_fail_fast.py guards the entry-side purge that is the
+        recovery.
         """
         assert _get_item_settings(request.node).method == 'thread'
 

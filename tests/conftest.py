@@ -1372,6 +1372,16 @@ def cleanup_test_data():
     from a previous crashed run is also removed. Unit tests that mock ES/Redis
     are unaffected, and a run that does not own a Redis/ES does not purge at
     all — see _may_purge_service_data().
+
+    The purge on the way IN is not belt-and-braces, and must not be dropped as
+    redundant (found in review, #204). pytest.ini sets `timeout_method =
+    thread`, and that method ends a wedged run with os._exit(1), which skips
+    every fixture teardown including this one — measured: a session-autouse
+    fixture writing a marker on setup and teardown wrote only the setup half
+    under `thread`. So after a timed-out run the rate-limit keys below are left
+    holding whatever the tests put there, and this entry-side purge is the only
+    thing that ever clears them. pytest.ini's `timeout_method` block carries the
+    full measurement.
     """
     if not _may_purge_service_data():
         yield
