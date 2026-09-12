@@ -211,35 +211,126 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
 
 class TestTheSuiteCannotReachTheDeploymentsState:
 
-    def test_the_active_root_is_not_the_deployments_directory_under_any_alias(self):
-        """Compare identity, not spelling.
+    def test_the_active_root_would_still_pass_the_import_time_guard(self):
+        """The st_dev/st_ino identity check itself now lives in
+        tests/conftest.py::_refuse_a_root_that_can_reach_the_deployment, where
+        it runs at conftest import and RAISES (#202). Here it only ran partway
+        through the session, so everything alphabetically before it had already
+        written wherever the bad root pointed -- detection, not prevention, and
+        22 tests including all 11 of this file's were observed green with
+        ORCHESTRATOR_ROOT pointed at the checkout.
 
-        The first version asserted `Path(active) != Path('/app')`. That is not
-        the property it claimed. On the deployment `/app` and
-        `/workspace/switchyard` are the SAME INODE -- docker-compose mounts the
-        checkout twice -- so it passed for `/workspace/switchyard`, for `.`,
-        and for `/app/../app`, every one of which writes production.
-
-        `orchestrator_state_root()` now refuses relative values outright, so
-        what is left to check is the absolute aliases, and st_dev/st_ino is the
-        only thing that answers that. Skips where /app does not exist, because
-        off-container there is no deployment to collide with.
+        What is left here is the end-state assertion: whatever the session is
+        actually running with still satisfies the guard. That is not a
+        tautology -- a test that reassigns os.environ['ORCHESTRATOR_ROOT']
+        session-wide would break it, and conftest's guard would never see it.
         """
+        from tests.conftest import _refuse_a_root_that_can_reach_the_deployment
+
         active = os.environ.get('ORCHESTRATOR_ROOT')
         assert active, "conftest must have redirected ORCHESTRATOR_ROOT"
 
-        deployment = Path('/app')
-        if not deployment.is_dir():
+        _refuse_a_root_that_can_reach_the_deployment(active, 'ORCHESTRATOR_ROOT')
+
+
+class TestTheImportTimeGuardOnTheRoot:
+    """tests/conftest.py::_refuse_a_root_that_can_reach_the_deployment.
+
+    It used to be that `if os.environ.get('ORCHESTRATOR_ROOT'): return` --
+    any preset value accepted as given, which is how the whole suite could be
+    pointed at the live checkout and stay green (#202).
+    """
+
+    @staticmethod
+    def _guard():
+        from tests.conftest import _refuse_a_root_that_can_reach_the_deployment
+        return _refuse_a_root_that_can_reach_the_deployment
+
+    @staticmethod
+    def _skip_without_a_deployment():
+        if not Path('/app').is_dir():
             pytest.skip("no /app on this host; nothing to collide with")
 
-        def identity(path: Path):
-            info = path.stat()
-            return (info.st_dev, info.st_ino)
+    def test_an_absolute_scratch_root_is_accepted(self, tmp_path):
+        assert self._guard()(str(tmp_path), 'ORCHESTRATOR_ROOT') == str(tmp_path)
 
-        assert identity(Path(active)) != identity(deployment), (
-            f"ORCHESTRATOR_ROOT={active!r} is the deployment directory under "
-            f"another name -- writing there is exactly #181"
-        )
+    def test_a_relative_root_is_refused(self):
+        with pytest.raises(RuntimeError, match='relative'):
+            self._guard()('tmp/rv202', 'ORCHESTRATOR_ROOT')
+
+    def test_the_deployment_directory_itself_is_refused(self):
+        self._skip_without_a_deployment()
+
+        with pytest.raises(RuntimeError, match='deployment'):
+            self._guard()('/app', 'ORCHESTRATOR_ROOT')
+
+    def test_an_alias_of_the_deployment_directory_is_refused(self):
+        """Spelling is not identity. `/app/../app` normalises to the same inode
+        and is exactly the shape `!= '/app'` used to wave through."""
+        self._skip_without_a_deployment()
+
+        with pytest.raises(RuntimeError, match='deployment'):
+            self._guard()('/app/../app', 'ORCHESTRATOR_ROOT')
+
+    def test_a_path_under_the_deployment_is_refused(self):
+        """Stricter than the identity check this replaces, deliberately: the
+        caller mkdir(parents=True)s an accepted root, so `/app/scratch` does
+        not merely read production, it creates a directory inside it."""
+        self._skip_without_a_deployment()
+
+        with pytest.raises(RuntimeError, match='deployment'):
+            self._guard()('/app/scratch-that-does-not-exist', 'ORCHESTRATOR_ROOT')
+
+    def test_the_live_state_tree_is_refused(self):
+        """The worst case, and the one #181 actually hit."""
+        self._skip_without_a_deployment()
+
+        with pytest.raises(RuntimeError, match='deployment'):
+            self._guard()('/app/state', 'ORCHESTRATOR_ROOT')
+
+    def test_the_message_names_the_variable_it_was_given(self):
+        """Both callers share this function; an error naming the wrong
+        environment variable sends the operator to the wrong place."""
+        with pytest.raises(RuntimeError, match='SWITCHYARD_TEST_STATE_ROOT'):
+            self._guard()('still-relative', 'SWITCHYARD_TEST_STATE_ROOT')
+
+    def test_a_preset_root_goes_through_the_guard(self, monkeypatch):
+        """The redirect honours a preset ORCHESTRATOR_ROOT -- the documented
+        `docker exec -e ORCHESTRATOR_ROOT=/tmp/...` invocation depends on it --
+        but no longer unvalidated."""
+        self._skip_without_a_deployment()
+        from tests.conftest import _redirect_orchestrator_root_to_scratch
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', '/app')
+
+        with pytest.raises(RuntimeError, match='deployment'):
+            _redirect_orchestrator_root_to_scratch()
+
+    @pytest.mark.parametrize('preset', ['', '   '], ids=['empty', 'whitespace'])
+    def test_a_blank_preset_is_redirected_to_scratch_not_read_as_unset(
+        self, monkeypatch, preset
+    ):
+        """orchestrator_state_root() reads blank as unset and falls back to the
+        checkout -- which is the deployment. conftest must NOT agree with it
+        here: a blank preset has to become a scratch directory.
+
+        The whitespace case is the one that was broken: `if
+        os.environ.get('ORCHESTRATOR_ROOT'): return` saw `'   '` as truthy and
+        returned, leaving it set, and every module then resolved the checkout.
+        `''` was already falsy and fell through; it is parametrized alongside
+        so the two cannot diverge again.
+        """
+        from tests.conftest import _redirect_orchestrator_root_to_scratch
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', preset)
+        monkeypatch.delenv('SWITCHYARD_TEST_STATE_ROOT', raising=False)
+
+        _redirect_orchestrator_root_to_scratch()
+
+        chosen = os.environ['ORCHESTRATOR_ROOT']
+        assert chosen.strip(), f"a blank preset ({preset!r}) was left in place"
+        assert Path(chosen).is_dir()
+        self._guard()(chosen, 'ORCHESTRATOR_ROOT')
 
     def test_a_relative_root_is_refused_rather_than_resolved_against_the_cwd(
         self, monkeypatch

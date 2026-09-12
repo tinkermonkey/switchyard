@@ -36,6 +36,23 @@ from pathlib import Path
 from datetime import datetime, timezone
 import time
 
+# Module scope, deliberately, and the one place in this file that imports
+# config.state_manager (#202). It used to be a lazy import inside
+# _load_github_state(), i.e. on a request path -- and importing that module
+# runs `state_manager = GitHubStateManager()`, two mkdirs and a full
+# ConfigManager(), in THIS container, which never built that singleton at
+# start. So a misconfigured ORCHESTRATOR_ROOT raised its ValueError on the
+# first board-URL lookup rather than at boot, inside the `except Exception:
+# return {}` below, and the Web UI silently showed every project with no board
+# and no repo URL instead of the server refusing to start.
+#
+# main.py:16 gets this fail-at-start property by importing config.state_manager
+# too; this line is that same property for the observability server. The cost
+# is the singleton's construction at import, which for a process entrypoint is
+# the point; library modules (the seven in services/) import the resolver
+# lazily instead, see orchestrator_state_root()'s docstring.
+from config.state_manager import orchestrator_state_root
+
 # Setup logging with reduced verbosity
 logger = setup_service_logging('observability_server')
 
@@ -1324,19 +1341,41 @@ def kill_pipeline_run(pipeline_run_id):
         }), 500
 
 def _load_github_state(project_name: str) -> dict:
-    """Load the github_state.yaml for a project, returning the inner github_state dict."""
+    """Load the github_state.yaml for a project, returning the inner github_state dict.
+
+    Returns {} for a project with no state file yet -- that is a normal state,
+    not an error, and both callers degrade to "no URL" for it.
+
+    Anything else is logged (#202). This body used to be `except Exception:
+    return {}` with no log at all, which made three different situations look
+    identical to the Web UI: no state file, an unreadable/corrupt one, and a
+    ValueError out of the state-root resolver. The last of those is a
+    configuration error that now cannot reach here -- the module-scope import
+    at the top of this file makes it fatal at boot instead -- but a
+    PermissionError or a YAML parse error still can, and silently showing every
+    board and repo link as missing is the wrong way to report them.
+
+    Still returns {} rather than raising: these two callers decorate a project
+    list that is otherwise fully populated, and a bad state file for one
+    project should not 500 the whole endpoint. The log line is the loud part.
+    """
+    # Resolved, not CWD-relative (#181). A read rather than a write, so it
+    # never corrupted anything -- but from any CWD other than the
+    # orchestrator's own it silently found nothing and returned {}.
+    state_file = orchestrator_state_root() / 'projects' / project_name / 'github_state.yaml'
     try:
-        # Resolved, not CWD-relative (#181). A read rather than a write, so it
-        # never corrupted anything -- but from any CWD other than the
-        # orchestrator's own it silently found nothing and returned {}.
-        from config.state_manager import orchestrator_state_root
-        state_file = orchestrator_state_root() / 'projects' / project_name / 'github_state.yaml'
         if not state_file.exists():
             return {}
         with open(state_file) as f:
             data = yaml.safe_load(f)
-        return data.get('github_state', {})
-    except Exception:
+        return (data or {}).get('github_state', {})
+    except Exception as e:
+        logger.warning(
+            f"Could not read GitHub state for {project_name} from {state_file}: "
+            f"{type(e).__name__}: {e} -- the Web UI will show this project with "
+            f"no board or repo links",
+            exc_info=True,
+        )
         return {}
 
 

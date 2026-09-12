@@ -650,8 +650,13 @@ class ScheduledTasksService:
         try:
             from config.manager import config_manager
             from services.pipeline_queue_manager import PipelineQueueManager
-            from pathlib import Path
-            import os
+            # `from pathlib import Path` and `import os` used to sit here for
+            # the open-coded state_dir below; both are dead now that
+            # PipelineQueueManager resolves its own default (#202). The `import
+            # os` in particular was the shadowing shape pipeline_lock_manager's
+            # constructor docstring documents -- a function-local `import os`
+            # makes `os` local to the WHOLE function, so any other use of the
+            # module-level one in here would have raised UnboundLocalError.
 
             # Get all projects
             project_names = config_manager.list_visible_projects()
@@ -676,10 +681,13 @@ class ScheduledTasksService:
                                 f"Force syncing queue for {project_name}/{board_name}"
                             )
 
-                            # Get queue manager
-                            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
-                            state_dir = Path(orchestrator_root) / "state" / "pipeline_queues"
-                            queue_manager = PipelineQueueManager(project_name, board_name, state_dir)
+                            # Get queue manager. No state_dir: this used to
+                            # open-code the same pipeline_queues path that
+                            # PipelineQueueManager's own default resolves -- a
+                            # second, unvalidated copy of a resolution that now
+                            # lives in exactly one place (#202). Omitting it
+                            # keeps the two from drifting.
+                            queue_manager = PipelineQueueManager(project_name, board_name)
 
                             # Force sync with GitHub
                             queue_manager.force_sync_with_github()

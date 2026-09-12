@@ -41,13 +41,19 @@ logger = logging.getLogger(__name__)
 def orchestrator_state_root() -> Path:
     """The `state/` tree this process owns, as a resolved absolute path.
 
-    ORCHESTRATOR_ROOT first, matching the eight other modules that derive a
-    state path (dev_container_state, work_execution_state, pipeline_queue_
-    manager, pipeline_lock_manager, pipeline_semaphore_manager,
-    conversational_session_state, scheduled_tasks, data_retention). This module
-    and state_management/pr_review_state_manager.py derived from
+    ORCHESTRATOR_ROOT first. This is now the ONLY place that reads it to build
+    a state path: dev_container_state, work_execution_state,
+    pipeline_queue_manager, pipeline_lock_manager, pipeline_semaphore_manager,
+    conversational_session_state and scheduled_tasks each used to open-code
+    `Path(os.environ.get('ORCHESTRATOR_ROOT', '/app')) / "state" / <subdir>`
+    and mkdir it a line or two later, with no strip, no resolve and none of the
+    validation below (#202). `os.environ.get(key, '/app')` returns `''` when
+    the key EXISTS BUT IS EMPTY -- which `-e ORCHESTRATOR_ROOT=` on a docker
+    run is -- so the `/app` default never applied to that case and
+    `Path('') / "state"` is the CWD-relative `state`. This module and
+    state_management/pr_review_state_manager.py derived from
     `Path(__file__).parent.parent` instead -- i.e. from whatever checkout the
-    code was imported from.
+    code was imported from (#181).
 
     That is #181: the documented way to run the unit suite is `pytest
     tests/unit` from the repository root, and on the deployment the repository
@@ -68,6 +74,15 @@ def orchestrator_state_root() -> Path:
     state root, the value is set once at container start, and failing at the
     first call is how an operator finds out in a second rather than after a
     sweep has run somewhere unintended.
+
+    HOW CALLERS IMPORT THIS. The seven above do it INSIDE the branch that needs
+    it, not at module scope, because importing this module runs
+    `state_manager = GitHubStateManager()` at the bottom of the file: two
+    mkdirs and a full ConfigManager(). A library module should not acquire that
+    at import time just to learn a directory name.
+    services/observability_server.py deliberately does the opposite, and says
+    why on the import itself: for a process entrypoint that side effect IS the
+    fail-at-start, which is what main.py:16 already gets.
     """
     raw = (os.environ.get('ORCHESTRATOR_ROOT') or '').strip()
     if not raw:

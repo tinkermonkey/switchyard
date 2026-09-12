@@ -231,6 +231,85 @@ def _patch_init_defaults(cls, **defaults):
     cls.__init__ = bounded_init
 
 
+# The deployment's own directory, reused from the container marker above rather
+# than re-spelled: if /app ever stops being what identifies this container, the
+# guard below must move with it.
+DEPLOYMENT_DIR = Path(ORCHESTRATOR_CONTAINER_MARKER)
+
+
+def _refuse_a_root_that_can_reach_the_deployment(value: str, source: str) -> str:
+    """Reject a caller-supplied state root that would write into production.
+
+    This check used to live in
+    tests/unit/test_state_root_isolation.py::test_the_active_root_is_not_the_
+    deployments_directory_under_any_alias, where it DETECTED rather than
+    prevented: a test runs partway through the session, so everything
+    alphabetically before it has already written wherever the bad root pointed
+    (#202). Here it runs at conftest import, before a single module is
+    imported, and raises.
+
+    Three refusals, in the order they can bite:
+
+    1. Not absolute. `orchestrator_state_root()` refuses these too, but only
+       when something calls it -- a relative root would otherwise be accepted
+       here and then blow up module by module. `-e ORCHESTRATOR_ROOT=tmp/x`, a
+       dropped leading slash, is the documented command's likeliest typo, and
+       the CWD it would resolve against is the checkout.
+
+    2. The deployment directory under any alias. Compare identity, not
+       spelling: on the deployment `/app` and `/workspace/switchyard` are the
+       SAME INODE (docker-compose mounts the checkout twice), so `!= '/app'`
+       passes for `/workspace/switchyard`, for `/app/../app`, and for a
+       bind-mounted worktree path that lands on the same inode.
+
+    3. ANYTHING UNDER the deployment directory. Stricter than the test this
+       replaces, deliberately: the next thing the caller does with an accepted
+       root is `mkdir(parents=True)`, so `/app/scratch` does not merely read
+       production, it CREATES a directory in it -- and `/app/state` would hand
+       the suite the live tree outright. Walking the resolved path's ancestors
+       catches those through every alias too, because the ancestors are
+       compared by identity as well.
+
+    Skips 2 and 3 where /app is not a directory: off-container there is no
+    deployment to collide with, and every path would otherwise be compared
+    against a stat() that fails.
+    """
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise RuntimeError(
+            f"{source}={value!r} is relative. A relative state root resolves "
+            f"against the current working directory, which for the documented "
+            f"invocation is the checkout itself -- so the suite would write "
+            f"into the deployment (#181). Use an absolute path."
+        )
+
+    if not DEPLOYMENT_DIR.is_dir():
+        return str(candidate)
+
+    deployment = DEPLOYMENT_DIR.stat()
+    deployment_identity = (deployment.st_dev, deployment.st_ino)
+
+    resolved = candidate.resolve()
+    for ancestor in (resolved, *resolved.parents):
+        try:
+            info = ancestor.stat()
+        except OSError:
+            # Does not exist yet (the caller may be about to mkdir it) or is
+            # unreadable. Either way it is not the deployment directory.
+            continue
+        if (info.st_dev, info.st_ino) == deployment_identity:
+            where = "is" if ancestor == resolved else f"is under {ancestor}, which is"
+            raise RuntimeError(
+                f"{source}={value!r} {where} the deployment directory "
+                f"({DEPLOYMENT_DIR}) under another name. The suite would write "
+                f"into live orchestrator state -- that is exactly #181. Point "
+                f"it somewhere outside the checkout, e.g. a directory under "
+                f"/tmp."
+            )
+
+    return str(candidate)
+
+
 def _redirect_orchestrator_root_to_scratch():
     """
     Point ORCHESTRATOR_ROOT at a scratch directory for EVERY test run, so the
@@ -263,13 +342,29 @@ def _redirect_orchestrator_root_to_scratch():
     An explicitly-set ORCHESTRATOR_ROOT still wins, so the invocation in
     CLAUDE.md (`docker exec -e ORCHESTRATOR_ROOT=/tmp/... ... pytest`) is
     unchanged -- it is simply no longer the only thing standing between the
-    suite and production.
+    suite and production. It no longer wins UNVALIDATED, though: it used to be
+    accepted exactly as given, so `ORCHESTRATOR_ROOT=<the checkout>` ran the
+    whole suite against live state with all of it green (#202). Both preset
+    paths now go through _refuse_a_root_that_can_reach_the_deployment().
+
+    A preset that is empty or whitespace-only is NOT honoured as "unset" here
+    and falls through to the scratch branch. orchestrator_state_root() reads
+    those as unset and falls back to the checkout -- which is the deployment --
+    so honouring them the same way would point the suite straight at
+    production.
     """
-    if os.environ.get('ORCHESTRATOR_ROOT'):
+    preset = os.environ.get('ORCHESTRATOR_ROOT')
+    if preset and preset.strip():
+        os.environ['ORCHESTRATOR_ROOT'] = _refuse_a_root_that_can_reach_the_deployment(
+            preset.strip(), 'ORCHESTRATOR_ROOT'
+        )
         return
 
     override = os.environ.get('SWITCHYARD_TEST_STATE_ROOT')
-    if override:
+    if override and override.strip():
+        override = _refuse_a_root_that_can_reach_the_deployment(
+            override.strip(), 'SWITCHYARD_TEST_STATE_ROOT'
+        )
         # Validated here, because the mkdtemp branch below guarantees an
         # existing writable directory and this one guaranteed nothing. An
         # unusable value surfaced as a FileNotFoundError from some unrelated
