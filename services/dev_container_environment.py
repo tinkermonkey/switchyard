@@ -60,18 +60,12 @@ _VALID_ENVIRONMENT_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$')
 
 _cache: Dict[str, Tuple[float, str]] = {}
 
-
-class _TransientResolutionError(Exception):
-    """Resolution failed for a reason that is not "this is not a project".
-
-    Carries the fallback so environment_for() can return it WITHOUT caching --
-    see _lookup_environment's second handler for why caching a degraded answer
-    is worse than recomputing it.
-    """
-
-    def __init__(self, fallback: str):
-        super().__init__(fallback)
-        self.fallback = fallback
+# Returned by validate_environments' _env_of() for a dev_container block that is
+# not a mapping, or an `environment` that is not a string. A sentinel rather
+# than an exception so the validator stays TOTAL -- it is the startup guard, and
+# raising from inside it crashes the process with a traceback naming no project,
+# which is exactly the failure it exists to report legibly.
+_MALFORMED = object()
 
 
 def clear_cache() -> None:
@@ -80,65 +74,68 @@ def clear_cache() -> None:
     _cache.clear()
 
 
-def _lookup_environment(project_name: str) -> str:
-    """Uncached read of `project_name`'s configured environment, or its own name.
+def _lookup_environment(project_name: str) -> Tuple[str, bool]:
+    """(environment, cacheable) for `project_name`.
 
-    Never raises: a project with no config at all (system-level callers pass
-    names that aren't real projects) resolves to itself, which is exactly the
-    pre-#198 behaviour.
+    `cacheable` is False whenever the answer is a FALLBACK produced by a
+    failure rather than a real reading. Caching a fallback is what makes a
+    momentary fault dangerous: for the whole TTL the project resolves to its
+    own name, which means a member of a shared environment takes a DIFFERENT
+    build-lock key from its siblings and builds concurrently against the same
+    image -- the exact race the shared key exists to close.
+
+    A flag rather than an exception (#199 review): the previous version tried
+    to classify faults by exception type and got it backwards, because
+    ConfigManager._load_yaml collapses "no such file" and "unparseable YAML"
+    into one ConfigurationError. Classification cannot be made reliable here,
+    so this does not attempt it -- ANY failure yields an uncached fallback,
+    which is correct for both cases and needs no taxonomy.
+
+    Never raises.
     """
     try:
-        from config.manager import config_manager, ConfigurationError
-    except Exception:  # pragma: no cover - config package unavailable
-        return project_name
-
-    # ConfigurationError is what ConfigManager raises for "no such project"
-    # (its _load_yaml wraps a missing file), so it belongs in the QUIET branch
-    # alongside the builtins -- system-level callers pass names that are not
-    # projects all the time (state-file stems, "switchyard"), and warning on
-    # those would bury the real faults the second handler is for.
-    try:
+        from config.manager import config_manager
         project_config = config_manager.get_project_config(project_name)
-    except (ConfigurationError, FileNotFoundError, KeyError) as e:
-        # Genuinely not a project. System-level callers pass names that are not
-        # projects (state-file stems, "switchyard"), so this is routine and
-        # stays quiet.
-        logger.debug(
-            f"No project config for {project_name!r} while resolving its dev-container "
-            f"environment ({e}); using the project name"
-        )
-        return project_name
     except Exception as e:
-        # Anything else is a FAULT, not an absence -- a YAML file caught
-        # mid-write, an IO error, a permission blip. Degrading to the project
-        # name is still the safe answer for this call, but it must be VISIBLE
-        # and must NOT be cached: a cached wrong answer points a member at its
-        # own image for the whole TTL, which silently bypasses the very build
-        # lock that serialises the shared environment.
-        logger.warning(
+        # Covers "not a project" (routine -- system callers pass state-file
+        # stems and non-project names constantly) and every genuine fault
+        # alike. DEBUG because the routine case dominates; the uncached
+        # fallback is what makes the fault case safe, not the log level.
+        logger.debug(
             f"Could not resolve the dev-container environment for {project_name!r} "
-            f"({type(e).__name__}: {e}); using the project name for this call only. "
-            f"If this project shares an environment, this call is NOT serialised "
-            f"against the other members."
+            f"({type(e).__name__}: {e}); using the project name, not cached"
         )
-        raise _TransientResolutionError(project_name) from e
+        return project_name, False
 
-    dev_container = getattr(project_config, 'dev_container', None) or {}
+    dev_container = getattr(project_config, 'dev_container', None)
+    if not dev_container:
+        return project_name, True
+
+    if not isinstance(dev_container, dict):
+        # `dev_container: monorepo` instead of the nested block. Guarded here
+        # because .get() on a str/list raises AttributeError, and this function
+        # sits under EVERY dev-container state read, build-lock acquisition and
+        # tag resolution -- including in the observability-server and mcp
+        # processes, which never run the startup validator.
+        logger.error(
+            f"Project {project_name!r} has a non-mapping dev_container "
+            f"({type(dev_container).__name__}); expected a block like "
+            f"'dev_container:\n  environment: <name>'. Using the project name."
+        )
+        return project_name, False
+
     environment = dev_container.get('environment')
     if not environment:
-        return project_name
+        return project_name, True
 
     if not isinstance(environment, str) or not _VALID_ENVIRONMENT_NAME.match(environment):
-        # Config validation rejects this at load, so reaching here means a
-        # config was edited underneath a running orchestrator. Degrade to the
-        # project's own name rather than emitting an unusable docker tag.
         logger.error(
             f"Project {project_name!r} declares an invalid dev-container environment "
             f"{environment!r}; falling back to the project name"
         )
-        return project_name
+        return project_name, False
 
-    return environment
+    return environment, True
 
 
 def environment_for(project_name: str) -> str:
@@ -152,14 +149,9 @@ def environment_for(project_name: str) -> str:
     if cached is not None and now - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
 
-    try:
-        environment = _lookup_environment(project_name)
-    except _TransientResolutionError as e:
-        # Deliberately not cached: the next call re-reads and, once the
-        # transient fault clears, resolves correctly again.
-        return e.fallback
-
-    _cache[project_name] = (now, environment)
+    environment, cacheable = _lookup_environment(project_name)
+    if cacheable:
+        _cache[project_name] = (now, environment)
     return environment
 
 
@@ -177,7 +169,12 @@ def image_tag_for(project_name: str) -> str:
 
 
 def members_of(environment: str, project_names: List[str]) -> List[str]:
-    """Which of `project_names` participate in `environment`."""
+    """Which of `project_names` participate in `environment`.
+
+    No production caller today -- kept because "who else is in this
+    environment" is the question every operator-facing message about a shared
+    environment raises, and the answer belongs here when one is added.
+    """
     return sorted(p for p in project_names if environment_for(p) == environment)
 
 
@@ -206,15 +203,47 @@ def validate_environments(
     errors: List[str] = []
 
     def _env_of(cfg) -> Optional[str]:
-        dev_container = getattr(cfg, 'dev_container', None) or {}
-        return dev_container.get('environment')
+        """The declared environment, or None. Never raises.
+
+        Every malformed shape has to come back as None-plus-an-error rather
+        than an exception: this validator IS the startup guard, so raising
+        from here crashes the process with a traceback naming no project --
+        the precise failure the guard exists to report legibly.
+        """
+        dev_container = getattr(cfg, 'dev_container', None)
+        if not dev_container:
+            return None
+        if not isinstance(dev_container, dict):
+            return _MALFORMED
+        environment = dev_container.get('environment')
+        if environment is None:
+            return None
+        if not isinstance(environment, str):
+            return _MALFORMED
+        return environment
+
+    # Rule 0 -- the block is the right SHAPE at all. Reported first and
+    # separately because every later rule compares and sorts these values, and
+    # a non-string among them raises rather than failing the config.
+    malformed = set()
+    for name, cfg in sorted(project_configs.items()):
+        if _env_of(cfg) is _MALFORMED:
+            malformed.add(name)
+            dev_container = getattr(cfg, 'dev_container', None)
+            errors.append(
+                f"Project '{name}' has a malformed dev_container block "
+                f"({dev_container!r}). Expected:\n"
+                f"  dev_container:\n    environment: <name>"
+            )
 
     # Rule 2 -- name legality
     for name, cfg in sorted(project_configs.items()):
+        if name in malformed:
+            continue
         environment = _env_of(cfg)
         if environment is None:
             continue
-        if not isinstance(environment, str) or not _VALID_ENVIRONMENT_NAME.match(environment):
+        if not _VALID_ENVIRONMENT_NAME.match(environment):
             errors.append(
                 f"Project '{name}' declares dev_container.environment "
                 f"{environment!r}, which is not a valid Docker tag component "
@@ -223,10 +252,13 @@ def validate_environments(
 
     # Rule 3 -- collision with a different project's implicit environment
     for name, cfg in sorted(project_configs.items()):
+        if name in malformed:
+            continue
         environment = _env_of(cfg)
         if environment is None or environment == name:
             continue
-        if environment in project_configs and _env_of(project_configs[environment]) != environment:
+        other = _env_of(project_configs[environment]) if environment in project_configs else None
+        if environment in project_configs and other is not _MALFORMED and other != environment:
             errors.append(
                 f"Project '{name}' declares dev_container.environment "
                 f"'{environment}', which is also the name of a different project "
@@ -238,6 +270,8 @@ def validate_environments(
     # Rule 1 -- members must share a repository
     by_environment: Dict[str, List[str]] = {}
     for name, cfg in sorted(project_configs.items()):
+        if name in malformed:
+            continue
         environment = _env_of(cfg) or name
         by_environment.setdefault(environment, []).append(name)
 

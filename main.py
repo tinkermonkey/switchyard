@@ -137,6 +137,36 @@ def setup_telemetry_shutdown_handler():
     signal.signal(signal.SIGTERM, sigterm_handler)
 
 
+def _enforce_dev_container_config(config_manager, logger) -> None:
+    """Fail startup on an invalid dev_container configuration (#198).
+
+    Extracted from main() so the fail-closed DECISION is testable: the
+    validator itself has unit tests, but "and then we exit" sat 500 lines into
+    an async entrypoint where nothing could reach it, so a change turning it
+    into a warning would have gone unnoticed.
+
+    Fails rather than warns because these are static config errors an operator
+    must fix, not runtime conditions that clear on their own, and the failure
+    they prevent is silent: two projects on different repositories sharing one
+    image means agents building and testing against another codebase's baked
+    dependencies, with nothing anywhere reporting it. (Deliberately unlike the
+    Projects-v2 permission guard, which SKIPS, because that condition IS
+    runtime and can be transient.)
+
+    Raises SystemExit on invalid configuration; returns None otherwise.
+    """
+    errors = config_manager.validate_dev_container_environments()
+    if not errors:
+        return
+    for err in errors:
+        logger.log_error(f"Invalid dev_container configuration: {err}")
+    logger.log_error(
+        f"Refusing to start: {len(errors)} dev-container environment "
+        f"configuration error(s). Fix config/projects/*.yaml and restart."
+    )
+    raise SystemExit(1)
+
+
 async def main():
     # Setup zombie process reaper FIRST before any other initialization
     # This prevents accumulation of defunct child processes from subprocess calls
@@ -287,6 +317,18 @@ async def main():
     # is unaffected), but every other asyncio task this same event loop will
     # go on to run later in startup (the monitor loop, scheduler, etc.) would
     # be unable to even begin until this returns.
+    # Dev-container environment validation (#198), placed here because
+    # initialize_all_projects() below is the first thing in startup that
+    # resolves an environment -- it reaches verify_image_exists() via
+    # baked-dependency extraction, and everything after it (the state sweep at
+    # "Verifying Docker images", the setup-task enqueue, board reconciliation)
+    # reads or writes environment-keyed state. An earlier placement of this
+    # block sat after all of that, so an invalid config had already been used
+    # to resolve state keys and had already pushed setup tasks into a
+    # persistent Redis queue before the process refused to start -- which, in a
+    # restart loop, accumulated a fresh set of them on every attempt.
+    _enforce_dev_container_config(config_manager, logger)
+
     logger.info("Initializing project workspaces")
     projects_needing_setup = await asyncio.to_thread(workspace_manager.initialize_all_projects)
     logger.info("Project workspaces initialized")
@@ -661,27 +703,6 @@ async def main():
 
         task_queue.enqueue(task)
         logger.info(f"Queued dev_environment_setup task: {task.id}")
-
-    # Dev-container environment validation (#198). Runs BEFORE anything reads a
-    # dev-container tag, state file or lock, because every one of those keys is
-    # derived from the environment name being validated here.
-    #
-    # Fails startup rather than warning. These are static config errors an
-    # operator must fix, not runtime conditions that might clear on their own,
-    # and the failure they prevent is silent: two projects on different
-    # repositories sharing one image means agents building and testing against
-    # another codebase's baked dependencies, with nothing anywhere reporting it.
-    # (Contrast the Projects-v2 permission guard, which SKIPS rather than exits
-    # precisely because that condition is runtime and can be transient.)
-    dev_container_config_errors = config_manager.validate_dev_container_environments()
-    if dev_container_config_errors:
-        for err in dev_container_config_errors:
-            logger.log_error(f"Invalid dev_container configuration: {err}")
-        logger.log_error(
-            f"Refusing to start: {len(dev_container_config_errors)} dev-container "
-            f"environment configuration error(s). Fix config/projects/*.yaml and restart."
-        )
-        exit(1)
 
     # Reconcile all visible (non-hidden) projects on startup
     # Hidden projects (like test-project) are excluded from normal operations

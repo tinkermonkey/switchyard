@@ -746,8 +746,7 @@ async def dev_container_build_lock_attempt_async(
             dev_container_build_lock_async().
         facade: injected ProjectResourceLockManager -- for tests only.
     """
-    # Key on the environment, not the project (#198) -- identity unless
-    # this project opted into a shared dev-container environment.
+    # Key on the environment, not the project (#198) -- see _resource_key.
     project = _resource_key(project)
     facade = facade if facade is not None else await _default_facade_off_loop()
     holder_id = _mint_unique_holder_id()
@@ -791,9 +790,13 @@ async def dev_container_build_lock_if_free_async(
     See that function for the full contract, and for when the refusal reason
     matters instead.
     """
-    # Key on the environment, not the project (#198) -- identity unless
-    # this project opted into a shared dev-container environment.
-    project = _resource_key(project)
+    # NOT resolved here: the delegate below resolves. Doing it at both levels
+    # is not idempotent -- environment_for('monorepo') can differ from
+    # environment_for('features') when a project named 'monorepo' also exists
+    # -- so the two entry points would hold DIFFERENT keys for one build, which
+    # is the #56 race this lock closes. (Rule 3 forbids that config, but the
+    # validator does not run in the observability-server or mcp processes, nor
+    # in the admin CLIs, nor for a config edited under a running orchestrator.)
     async with dev_container_build_lock_attempt_async(
         project, issue_number, facade
     ) as (acquired, _reason):
@@ -816,8 +819,7 @@ def dev_container_build_lock_if_free_sync(
     Unlike dev_container_build_lock_sync() this never sleeps, so it is safe on
     startup and inside another file lock.
     """
-    # Key on the environment, not the project (#198) -- identity unless
-    # this project opted into a shared dev-container environment.
+    # Key on the environment, not the project (#198) -- see _resource_key.
     project = _resource_key(project)
     facade = facade if facade is not None else ProjectResourceLockManager()
     holder_id = _mint_unique_holder_id()

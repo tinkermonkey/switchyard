@@ -8,16 +8,11 @@ exactly the strings it always did, and that opting *in* never lets two members
 build the same tag concurrently or redundantly.
 """
 
-import copy
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
 
-pytest.importorskip("yaml")
-
-from services.dev_container_environment import (  # noqa: E402
+from services.dev_container_environment import (
     IMAGE_TAG_SUFFIX,
     clear_cache,
     environment_for,
@@ -298,49 +293,181 @@ class TestPromptRendering:
 
 
 class TestWatchdogActivityKey:
-    """The build lock registers watchdog activity under the REAL project name.
+    """The build lock must register watchdog activity under the REAL project.
 
-    The registry is keyed (project, issue_number) and looked up by project by
-    pipeline_watchdog and project_monitor. Registering under the environment
+    The registry is keyed (project, issue_number) and looked up by project name
+    by pipeline_watchdog and project_monitor. Registering under the environment
     made every lookup miss for a shared-environment member, so a run
     legitimately blocked on the lock lost its zombie-cleanup exemption and was
     reaped and re-dispatched -- two concurrent executions of one issue.
+
+    Asserts through describe_active_resource_lock_activity(), the same seam the
+    watchdog uses. An earlier version of this test grepped the module source;
+    it was proven vacuous by mutation -- reintroducing the bug while preserving
+    the grepped strings left the whole suite green.
     """
 
-    def test_activity_registers_under_the_project_not_the_environment(self):
-        import inspect
-        import services.dev_container_build_lock as lock
+    def test_activity_is_findable_by_project_not_environment(self):
+        from services.dev_container_build_lock import dev_container_build_lock_sync
+        from services.project_checkout_lock import (
+            describe_active_resource_lock_activity,
+        )
 
-        src = inspect.getsource(lock)
-        # The rebind must capture the original before overwriting it...
-        assert 'watchdog_project = project' in src
-        # ...and the registry must use that, never the resolved key.
-        assert 'RESOURCE_NAME, watchdog_project, issue_number' in src
-        assert 'RESOURCE_NAME, project, issue_number' not in src
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, 'acquired')
+        facade.release_resource.return_value = True
+
+        configs = {'features': FakeConfig({'environment': 'mono'})}
+        with _with_configs(configs):
+            with dev_container_build_lock_sync(
+                'features', issue_number=42, facade=facade
+            ):
+                by_project = describe_active_resource_lock_activity('features', 42)
+                by_environment = describe_active_resource_lock_activity('mono', 42)
+
+        assert by_project is not None, (
+            "the watchdog looks this up by project name; registering under the "
+            "environment silently removes the zombie-cleanup exemption")
+        assert by_environment is None, (
+            "must not be registered under the environment")
+
+    @pytest.mark.asyncio
+    async def test_async_variant_registers_under_the_project_too(self):
+        """Both variants rebind, so both need covering.
+
+        Mutation testing caught this: reintroducing the bug in the ASYNC entry
+        point left the sync-only version of this test green.
+        """
+        from services.dev_container_build_lock import dev_container_build_lock_async
+        from services.project_checkout_lock import (
+            describe_active_resource_lock_activity,
+        )
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, 'acquired')
+        facade.release_resource.return_value = True
+
+        with _with_configs({'features': FakeConfig({'environment': 'mono'})}):
+            async with dev_container_build_lock_async(
+                'features', issue_number=43, facade=facade
+            ):
+                by_project = describe_active_resource_lock_activity('features', 43)
+                by_environment = describe_active_resource_lock_activity('mono', 43)
+
+        assert by_project is not None
+        assert by_environment is None
+        assert facade.acquire_resource.call_args[0][0] == 'mono'
+
+    def test_the_lock_itself_still_keys_on_the_environment(self):
+        """The other half: the RESOURCE is shared even though the activity
+        record is not."""
+        from services.dev_container_build_lock import (
+            RESOURCE_NAME,
+            dev_container_build_lock_sync,
+        )
+
+        facade = MagicMock()
+        facade.acquire_resource.return_value = (True, 'acquired')
+        facade.release_resource.return_value = True
+
+        with _with_configs({'features': FakeConfig({'environment': 'mono'})}):
+            with dev_container_build_lock_sync('features', issue_number=42, facade=facade):
+                pass
+
+        acquired_key = facade.acquire_resource.call_args[0][0]
+        assert acquired_key == 'mono', (
+            "two members must contend for one key, or they build the same tag "
+            "concurrently")
 
 
-class TestStartupValidation:
-    """A validator nothing calls is worse than none: it reads as enforced."""
+class TestStartupEnforcement:
+    """The fail-closed decision, not just the validator.
 
-    def test_startup_validates_dev_container_environments(self):
+    An earlier version grepped main.py's source for the call; replacing
+    exit(1) with `pass` left it green, so it could not tell "enforced" from
+    "called and ignored" -- the exact distinction it existed to make.
+    """
+
+    def test_invalid_config_stops_startup(self):
+        from main import _enforce_dev_container_config
+
+        mgr = MagicMock()
+        mgr.validate_dev_container_environments.return_value = [
+            "Project 'a' and 'b' have different github.repo_url values"
+        ]
+        logger = MagicMock()
+        with pytest.raises(SystemExit) as excinfo:
+            _enforce_dev_container_config(mgr, logger)
+        assert excinfo.value.code == 1
+        # every error must be reported BEFORE the exit, or the operator has
+        # nothing to act on
+        assert logger.log_error.called
+        logged = ' '.join(str(c) for c in logger.log_error.call_args_list)
+        assert 'repo_url' in logged
+        assert 'Refusing to start' in logged
+
+    def test_valid_config_proceeds_silently(self):
+        from main import _enforce_dev_container_config
+
+        mgr = MagicMock()
+        mgr.validate_dev_container_environments.return_value = []
+        logger = MagicMock()
+        _enforce_dev_container_config(mgr, logger)   # must not raise
+        assert not logger.log_error.called
+
+    def test_enforcement_precedes_the_first_environment_read(self):
+        """Ordering matters: an earlier placement ran after the startup state
+        sweep and after setup tasks were pushed into a persistent Redis queue,
+        so a restart loop accumulated a fresh set on every attempt."""
         import inspect
         import main
 
-        src = inspect.getsource(main)
-        assert 'validate_dev_container_environments()' in src
+        src = inspect.getsource(main.main)
+        enforce = src.index('_enforce_dev_container_config(')
+        # the CALL, not the comment several lines above it that names it
+        first_read = src.index('workspace_manager.initialize_all_projects')
+        assert enforce < first_read
 
-    def test_config_manager_surfaces_errors_from_real_configs(self, tmp_path):
-        from unittest.mock import MagicMock, patch
-        from config.manager import ConfigManager
 
-        mgr = ConfigManager.__new__(ConfigManager)
-        bad = FakeConfig({'environment': 'mono'},
-                         repo_url='git@github.com:acme/other.git')
-        good = FakeConfig({'environment': 'mono'})
-        with patch.object(ConfigManager, 'list_projects', return_value=['a', 'b']), \
-             patch.object(ConfigManager, 'get_project_config',
-                          side_effect=lambda n: {'a': good, 'b': bad}[n]):
-            errors = mgr.validate_dev_container_environments()
+class TestValidatorIsTotal:
+    """The validator IS the startup guard, so raising from it crashes the
+    process with a traceback naming no project -- the failure it exists to
+    report legibly. Every malformed shape must come back as an error string."""
+
+    MALFORMED = [
+        ('scalar', 'monorepo'),
+        ('list', ['monorepo']),
+        ('env-list', {'environment': ['a', 'b']}),
+        ('env-int', {'environment': 123}),
+        ('env-bool', {'environment': True}),      # unquoted `environment: yes`
+    ]
+
+    @pytest.mark.parametrize('label,shape', MALFORMED)
+    def test_malformed_shapes_are_reported_not_raised(self, label, shape):
+        errors = validate_environments({'features': FakeConfig(shape)})
+        assert errors, f"{label} produced no error"
+        assert any('features' in e for e in errors), "must name the project"
+
+    @pytest.mark.parametrize('label,shape', MALFORMED)
+    def test_resolution_degrades_instead_of_raising(self, label, shape):
+        """environment_for sits under every state read, build-lock acquisition
+        and tag resolution -- including in processes that never run the
+        validator."""
+        mgr = MagicMock()
+        mgr.get_project_config.return_value = FakeConfig(shape)
+        with patch('config.manager.config_manager', mgr):
+            assert environment_for('features') == 'features'
+
+    def test_one_malformed_member_does_not_hide_the_others(self):
+        """A crash used to abort the whole validation, so the remaining rules
+        never ran -- including the cross-repo check."""
+        errors = validate_environments({
+            'features': FakeConfig({'environment': 'mono'}),
+            'bugs': FakeConfig({'environment': 'mono'},
+                               repo_url='git@github.com:acme/other.git'),
+            'infra': FakeConfig('malformed-scalar'),
+        })
+        assert any('malformed' in e for e in errors)
         assert any('different github.repo_url' in e for e in errors)
 
 

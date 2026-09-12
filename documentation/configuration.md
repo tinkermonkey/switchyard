@@ -22,7 +22,7 @@ state/                    # Runtime state — do not edit manually
 │   ├── github_state.yaml
 │   ├── pr_review_state.yaml
 │   └── github_state_backup_<timestamp>.yaml
-├── dev_containers/<project>.yaml
+├── dev_containers/<environment>.yaml
 ├── execution_history/<project>_issue_<number>.yaml
 ├── pipeline_locks/<project>_<board>.yaml
 ├── pipeline_queues/<project>_<board>.yaml
@@ -417,7 +417,7 @@ see or trigger the thing blocking them.
 state and its build lock, nothing else. Boards, labels, branches and pipeline
 state remain keyed per project.
 
-Validation rejects, at config load:
+Validation rejects, at orchestrator startup (`main.py` refuses to start):
 
 - members of one environment whose `github.repo_url` differ — the image bakes
   one repository's dependencies, so sharing across repositories would run
@@ -585,7 +585,7 @@ pr_reviews:
           - 251
 ```
 
-### `state/dev_containers/<project>.yaml`
+### `state/dev_containers/<environment>.yaml`
 
 Written by `DevContainerStateManager`. Records whether the project's Docker agent image has been verified.
 

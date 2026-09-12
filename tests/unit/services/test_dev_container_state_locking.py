@@ -612,22 +612,25 @@ class TestTheStaleMarkerSweepAnnouncesOnlyWhatItCleared:
         standing. Saying it was cleared sends an operator looking for a marker
         that is still there and still correct."""
         self._stale_marker(manager, 'proj')
-        original_merge = DevContainerStateManager._merge_state
+        # Patches _merge_state_FILE: the sweep addresses state by path, not by
+        # project name, because its stems are already environment names and
+        # re-resolving one writes a different file than it just read (#198).
+        original_merge = DevContainerStateManager._merge_state_file
 
-        def _merge_after_a_fresh_request(self, project_name, updates, expect=None):
+        def _merge_after_a_fresh_request(self, state_file, updates, expect=None):
             if expect is not None:
                 original_merge(
                     self,
-                    project_name,
+                    state_file,
                     {
                         'pending_operation': 'rebuild',
                         'pending_operation_at': datetime.now().isoformat(),
                     },
                 )
-            return original_merge(self, project_name, updates, expect=expect)
+            return original_merge(self, state_file, updates, expect=expect)
 
         monkeypatch.setattr(
-            DevContainerStateManager, '_merge_state', _merge_after_a_fresh_request
+            DevContainerStateManager, '_merge_state_file', _merge_after_a_fresh_request
         )
         captured = MagicMock()
         monkeypatch.setattr(dev_container_state_module, 'logger', captured)

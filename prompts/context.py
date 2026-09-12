@@ -127,6 +127,8 @@ class PromptContext:
     # prose convention only because the model CAN recover the project from the
     # prompt; it cannot recover an environment it has never been told about.
     dev_container_image_tag: str = ""
+    # Carried for callers and diagnostics; no content file references
+    # {DEV_CONTAINER_ENVIRONMENT} today, so PromptBuilder does not substitute it.
     dev_container_environment: str = ""
 
     # ── Reference repositories ────────────────────────────────────────────────

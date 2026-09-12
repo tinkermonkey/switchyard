@@ -85,17 +85,6 @@ class StateWriteResult(Enum):
         return self is StateWriteResult.WRITTEN
 
 
-class DockerUnavailableError(RuntimeError):
-    """Docker could not answer whether an image exists (#198 review).
-
-    Distinct from "the image is absent". Callers that would mark an environment
-    BLOCKED on absence must NOT do so on this: BLOCKED is respected by every
-    member of a shared environment and, unlike IN_PROGRESS and CHANGES_NEEDED,
-    has no staleness escape, so a transient daemon outage would strand every
-    member until a human intervened.
-    """
-
-
 class DevContainerStatus(Enum):
     """Status of a project's development container"""
     UNVERIFIED = "unverified"  # Default for new projects
@@ -402,8 +391,14 @@ class DevContainerStateManager:
             # compare-and-set claims a clear the CAS may refuse, and here the
             # refusal is the interesting case -- it means a rebuild was requested
             # in the gap and its 'queued' display is (correctly) still standing.
-            written = self._merge_state(
-                project_name,
+            # Path-keyed, matching the read above. Passing the stem to
+            # _merge_state() resolved it through environment_for() and wrote a
+            # DIFFERENT file than the one just read -- so for the leftover
+            # per-project file this loop exists to clean, the compare-and-set
+            # checked one file's marker against another's contents and the
+            # stale marker was never cleared at all.
+            written = self._merge_state_file(
+                state_file,
                 {'pending_operation': None, 'pending_operation_at': None},
                 expect={
                     'pending_operation': state['pending_operation'],
@@ -631,9 +626,22 @@ class DevContainerStateManager:
         refusal means somebody else's fresher record is standing while a failure
         means this call's own verdict never reached disk.
         """
-        from utils.file_lock import file_lock
+        return self._merge_state_file(
+            self.get_state_file(project_name), updates, expect=expect
+        )
 
-        state_file = self.get_state_file(project_name)
+    def _merge_state_file(
+        self, state_file: 'Path', updates: Dict, expect: Optional[Dict] = None
+    ) -> StateWriteResult:
+        """_merge_state() addressed BY PATH, with no project->environment
+        resolution.
+
+        For callers that already hold an environment-keyed path -- the state_dir
+        globs, whose stems ARE environment names. Resolving such a stem again
+        writes a different file than the caller read; see
+        clear_stale_pending_operations().
+        """
+        from utils.file_lock import file_lock
 
         try:
             with file_lock(
@@ -659,7 +667,7 @@ class DevContainerStateManager:
                     }
                     if stale:
                         logger.info(
-                            f"Skipping dev container state write for {project_name}: "
+                            f"Skipping dev container state write for {state_file.stem}: "
                             f"expected {expect}, found {stale} on disk -- something "
                             f"else wrote a fresher value while this caller was "
                             f"deciding, so its decision no longer applies"
@@ -682,7 +690,7 @@ class DevContainerStateManager:
                     yaml.dump(state, f, default_flow_style=False)
                 return StateWriteResult.WRITTEN
         except Exception as e:
-            logger.error(f"Failed to save dev container state for {project_name}: {e}")
+            logger.error(f"Failed to save dev container state for {state_file.stem}: {e}")
             return StateWriteResult.FAILED
 
     def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
@@ -773,17 +781,6 @@ class DevContainerStateManager:
             )
 
             if result.returncode != 0:
-                stderr = (result.stderr or '').lower()
-                if 'cannot connect to the docker daemon' in stderr or 'permission denied' in stderr:
-                    # NOT "the image is missing" (#198 review). Reporting this
-                    # as absence lets a 10-second daemon blip mark a shared
-                    # environment BLOCKED -- which every member respects, and
-                    # which has no staleness escape, so it waits for a human
-                    # forever. Raise so the caller can tell the two apart.
-                    raise DockerUnavailableError(
-                        f"Docker is unreachable, so the existence of {image_name} "
-                        f"could not be determined: {(result.stderr or '').strip()[:200]}"
-                    )
                 logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
                 return False
 
@@ -802,11 +799,6 @@ class DevContainerStateManager:
 
         except subprocess.TimeoutExpired:
             logger.error(f"Timeout checking if Docker image {image_name} exists")
-            # A slow/overloaded daemon is not evidence of absence -- same
-            # reasoning as the unreachable case above.
-            raise DockerUnavailableError(
-                f"Timed out asking Docker whether {image_name} exists"
-            )
             return False
         except Exception as e:
             logger.error(f"Error checking if Docker image {image_name} exists: {e}")

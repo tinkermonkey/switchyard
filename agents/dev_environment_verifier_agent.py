@@ -4,10 +4,19 @@ from claude.claude_integration import run_claude_code
 from services.dev_container_state import dev_container_state, DevContainerStatus
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
 import logging
+import time
 import json
 import re
 
 logger = logging.getLogger(__name__)
+
+
+# How many times to ask Docker whether the expected image exists before
+# concluding it does not. verify_image_exists() returns False for a genuinely
+# missing image AND for a daemon that did not answer, so a single False is not
+# evidence of absence -- see the call site.
+_IMAGE_CHECK_ATTEMPTS = 3
+_IMAGE_CHECK_RETRY_SECONDS = 2.0
 
 
 class DevEnvironmentVerifierAgent(PipelineStage):
@@ -137,40 +146,57 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 # nothing ever reads -- surfacing forever after as "not built"
                 # with no indication why. Checking here converts that into one
                 # legible failure naming both tags.
-                from services.dev_container_state import DockerUnavailableError
-
-                try:
-                    tag_exists = dev_container_state.verify_image_exists(
+                # ASSERT, don't trust (#198). The setup agent issues the
+                # `docker build` itself from inside its own Claude Code
+                # session, so the tag is produced by a model following a
+                # prompt. A build tagged from the project name instead of the
+                # environment would be a perfectly good image under a name
+                # nothing ever reads -- surfacing forever after as "not built"
+                # with no indication why.
+                #
+                # Retried rather than trusted on the first answer, and the
+                # inconclusive case is CHANGES_NEEDED rather than BLOCKED.
+                # verify_image_exists() cannot distinguish "no such image" from
+                # "Docker did not answer" -- it returns False for a missing
+                # image, an unreachable daemon and a 10s timeout alike -- and
+                # BLOCKED is respected by every member of a shared environment
+                # and has no staleness escape, so one daemon blip would strand
+                # all of them until a human intervened. CHANGES_NEEDED is the
+                # retryable sibling (see DevContainerStatus) and ages out.
+                #
+                # Deliberately NOT solved by making verify_image_exists() raise:
+                # it is called by docker_runner's image selection, main.py's
+                # startup sweep and project_workspace's baked-dependency
+                # extraction, all of which degrade gracefully on False. Changing
+                # that contract to fix this one caller broke all three.
+                tag_exists = False
+                for attempt in range(_IMAGE_CHECK_ATTEMPTS):
+                    if dev_container_state.verify_image_exists(
                         project_name, image_name=expected_tag
-                    )
-                except DockerUnavailableError as e:
-                    # Cannot answer -> do not decide. Marking BLOCKED here would
-                    # strand every member of the environment on a transient
-                    # daemon outage, with no staleness escape.
-                    logger.error(
-                        "Could not verify %s for %s (%s); leaving the environment "
-                        "status untouched for the next run to resolve",
-                        expected_tag, project_name, e,
-                    )
-                    return {"status": "success", "output": review_text}
+                    ):
+                        tag_exists = True
+                        break
+                    if attempt + 1 < _IMAGE_CHECK_ATTEMPTS:
+                        time.sleep(_IMAGE_CHECK_RETRY_SECONDS)
 
                 if not tag_exists:
                     error_message = (
                         f"Verifier approved the environment but the expected image "
-                        f"tag {expected_tag!r} does not exist (or is not a genuine "
-                        f"agent environment). The build most likely tagged the image "
-                        f"after the project name instead of the dev-container "
-                        f"environment {environment!r}. Re-run dev_environment_setup; "
-                        f"it must use context['dev_container_image_tag'] verbatim."
+                        f"tag {expected_tag!r} could not be confirmed after "
+                        f"{_IMAGE_CHECK_ATTEMPTS} attempts. Either the build tagged "
+                        f"the image after the project name instead of the "
+                        f"dev-container environment {environment!r}, or Docker did "
+                        f"not answer. Re-run dev_environment_setup; it must use the "
+                        f"image tag supplied in its prompt verbatim."
                     )
-                    # NOT truncated to 200: this message is the operator's
-                    # only persistent record, and the remedy lives in its second
-                    # half -- a [:200] cut it mid-word and discarded the
-                    # environment name and the "re-run dev_environment_setup"
-                    # instruction entirely.
+                    # CHANGES_NEEDED, not BLOCKED: retryable, ages out, and does
+                    # not strand every other member of a shared environment on
+                    # what may have been a transient Docker failure. Not
+                    # truncated -- the remedy lives in the second half of the
+                    # message, and this is the operator's only persistent record.
                     wrote = dev_container_state.set_status(
                         project_name=project_name,
-                        status=DevContainerStatus.BLOCKED,
+                        status=DevContainerStatus.CHANGES_NEEDED,
                         error_message=error_message,
                     )
                     if not wrote:
@@ -178,20 +204,31 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         # forever -- the dangling state this module's own
                         # CRITICAL comment exists to prevent.
                         logger.error(
-                            "Failed to record BLOCKED for %s; the environment may "
-                            "remain IN_PROGRESS and stall every member",
+                            "Failed to record CHANGES_NEEDED for %s; the environment "
+                            "may remain IN_PROGRESS and stall every member",
                             project_name,
                         )
                     logger.error(
-                        "Refusing to mark %s VERIFIED: expected image %s is missing",
-                        project_name, expected_tag,
+                        "Refusing to mark %s VERIFIED: expected image %s could not "
+                        "be confirmed", project_name, expected_tag,
                     )
                 else:
-                    dev_container_state.set_status(
+                    _wrote = dev_container_state.set_status(
                         project_name=project_name,
                         status=DevContainerStatus.VERIFIED,
                         image_name=expected_tag,
                     )
+                    if not _wrote:
+                        # Unchecked, a refused or failed write leaves the
+                        # environment at IN_PROGRESS forever -- the dangling
+                        # state this module's CRITICAL comment exists to
+                        # prevent, and it strands every member of a shared
+                        # environment, not just this project.
+                        logger.error(
+                            'Failed to record %s for %s; the environment may '
+                            'remain IN_PROGRESS and stall every member',
+                            'VERIFIED', project_name,
+                        )
                     logger.info(
                         "Marked dev container environment %s as VERIFIED (image %s, "
                         "requested by project %s)",
@@ -202,11 +239,22 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Verification failed"
-                dev_container_state.set_status(
+                _wrote = dev_container_state.set_status(
                     project_name=project_name,
                     status=DevContainerStatus.BLOCKED,
                     error_message=error_message[:200],
                 )
+                if not _wrote:
+                    # Unchecked, a refused or failed write leaves the
+                    # environment at IN_PROGRESS forever -- the dangling
+                    # state this module's CRITICAL comment exists to
+                    # prevent, and it strands every member of a shared
+                    # environment, not just this project.
+                    logger.error(
+                        'Failed to record %s for %s; the environment may '
+                        'remain IN_PROGRESS and stall every member',
+                        'BLOCKED', project_name,
+                    )
                 logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
             elif status == "CHANGES NEEDED":
                 # Distinct from BLOCKED: used when the verifier could not independently
@@ -216,20 +264,42 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
-                dev_container_state.set_status(
+                _wrote = dev_container_state.set_status(
                     project_name=project_name,
                     status=DevContainerStatus.CHANGES_NEEDED,
                     error_message=error_message[:200],
                 )
+                if not _wrote:
+                    # Unchecked, a refused or failed write leaves the
+                    # environment at IN_PROGRESS forever -- the dangling
+                    # state this module's CRITICAL comment exists to
+                    # prevent, and it strands every member of a shared
+                    # environment, not just this project.
+                    logger.error(
+                        'Failed to record %s for %s; the environment may '
+                        'remain IN_PROGRESS and stall every member',
+                        'CHANGES_NEEDED', project_name,
+                    )
                 logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message[:100])
             else:
                 # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
                 error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED, BLOCKED, or CHANGES NEEDED)"
-                dev_container_state.set_status(
+                _wrote = dev_container_state.set_status(
                     project_name=project_name,
                     status=DevContainerStatus.BLOCKED,
                     error_message=error_message[:200],
                 )
+                if not _wrote:
+                    # Unchecked, a refused or failed write leaves the
+                    # environment at IN_PROGRESS forever -- the dangling
+                    # state this module's CRITICAL comment exists to
+                    # prevent, and it strands every member of a shared
+                    # environment, not just this project.
+                    logger.error(
+                        'Failed to record %s for %s; the environment may '
+                        'remain IN_PROGRESS and stall every member',
+                        'BLOCKED', project_name,
+                    )
                 logger.error(
                     "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
                     error_message, project_name
@@ -291,11 +361,22 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             else:
                 snippet = review_text.strip()[:300]
                 error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
-                dev_container_state.set_status(
+                _wrote = dev_container_state.set_status(
                     project_name=project_name,
                     status=DevContainerStatus.BLOCKED,
                     error_message=error_message[:200],
                 )
+                if not _wrote:
+                    # Unchecked, a refused or failed write leaves the
+                    # environment at IN_PROGRESS forever -- the dangling
+                    # state this module's CRITICAL comment exists to
+                    # prevent, and it strands every member of a shared
+                    # environment, not just this project.
+                    logger.error(
+                        'Failed to record %s for %s; the environment may '
+                        'remain IN_PROGRESS and stall every member',
+                        'BLOCKED', project_name,
+                    )
                 logger.error(
                     "Could not parse verification status for %s -- marking dev container BLOCKED "
                     "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "

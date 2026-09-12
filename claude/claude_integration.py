@@ -52,6 +52,20 @@ def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
         )
     return Path(str(raw_work_dir))
 
+class DevContainerEnvironmentBlocked(RuntimeError):
+    """Another run drove this dev-container environment to BLOCKED while this
+    one waited for the build lock.
+
+    A distinct type because it must NOT be retried. The generic agent-failure
+    retry in services/agent_executor.py re-runs the agent, and on the second
+    attempt `status_before_wait` is already BLOCKED -- which
+    build_already_done_by_another_member() correctly reads as a DELIBERATE
+    re-run and allows through, so the member performs the full rebuild the
+    stand-down existed to prevent. That defeats the fan-out guard the build
+    lock's timeout budget is documented as resting on.
+    """
+
+
 async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     """Execute Claude Code with given prompt and context"""
     logger.info("run_claude_code called")
@@ -276,7 +290,7 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
                     # reported success and advanced the card -- so a failed
                     # environment build presented as clean setup on every other
                     # member's board.
-                    raise RuntimeError(
+                    raise DevContainerEnvironmentBlocked(
                         f"Dev container environment '{environment}' is BLOCKED: another "
                         f"run reached a terminal failure for this environment while "
                         f"'{agent}' was waiting for the build lock. Not rebuilding, and "

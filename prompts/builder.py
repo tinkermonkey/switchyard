@@ -138,21 +138,27 @@ class PromptBuilder:
     # from the rendered prompt. It silently fails for anything else -- which is
     # how {DEV_CONTAINER_IMAGE_TAG} came to be referenced by a prompt that
     # could never resolve it. One expansion pass over every content file
-    # removes the distinction: a placeholder listed here is always substituted,
-    # and one that is not listed is left alone.
+    # removes the distinction: a placeholder listed here is substituted
+    # whenever its value resolves, and one that is not listed is left alone.
+    # {DEV_CONTAINER_IMAGE_TAG} additionally REFUSES to render when it cannot
+    # resolve, because an empty tag corrupts a docker build silently; the
+    # project placeholders fall back to being left literal, which is what they
+    # did before this pass existed.
     #
     # .replace(), not .format(), so an unrelated brace anywhere in a content
     # file cannot raise.
     def _content_placeholders(self, ctx: "PromptContext") -> dict:
         """The substitution map applied to every content file."""
         project = ctx.project_name or ctx.project
-        values = {
+        # No {DEV_CONTAINER_ENVIRONMENT} entry: no content file references it,
+        # and a placeholder in this map that nothing uses reads as wired when it
+        # is scaffolding. Add it here when a content file needs it -- and give
+        # it the same hard refusal the tag gets, rather than the silent
+        # leave-it-literal the two project placeholders fall back to.
+        return {
             "{PROJECT_NAME}": project,
             "{project_name}": project,
         }
-        if ctx.dev_container_environment:
-            values["{DEV_CONTAINER_ENVIRONMENT}"] = ctx.dev_container_environment
-        return values
 
     def _resolve_dev_container_image_tag(self, ctx: "PromptContext") -> str:
         """The complete image tag, derived from the project when not threaded.
@@ -165,15 +171,21 @@ class PromptBuilder:
         """
         if ctx.dev_container_image_tag:
             return ctx.dev_container_image_tag
-        if not ctx.project:
+        # Same expression as _content_placeholders, and excluding the "unknown"
+        # sentinel PromptContext defaults `project` to -- deriving from it would
+        # yield "unknown-agent:latest", which is exactly the wrongly-tagged
+        # build the refusal below exists to prevent, but non-empty enough to
+        # slip past it.
+        project = ctx.project_name or ctx.project
+        if not project or project == "unknown":
             return ""
         try:
             from services.dev_container_environment import image_tag_for
-            return image_tag_for(ctx.project)
+            return image_tag_for(project)
         except Exception as e:
             raise ValueError(
                 f"Could not resolve the dev-container image tag for project "
-                f"{ctx.project!r} while rendering {ctx.agent_name}'s prompt: {e}"
+                f"{project!r} while rendering {ctx.agent_name}'s prompt: {e}"
             ) from e
 
     def _expand_content_placeholders(self, text: str, ctx: "PromptContext") -> str:
