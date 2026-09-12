@@ -417,7 +417,7 @@ def _install_a_mock_backed_pipeline_run_manager_singleton():
     )
 
 
-# All six guards install at IMPORT time, not from pytest_configure, and that
+# Every guard below installs at IMPORT time, not from pytest_configure, and that
 # ordering is load-bearing (found in review). pytest_configure is a hook on this
 # module, so by the time it fires this module's body has already run --
 # including the two test-utility imports just below, which reach
@@ -467,6 +467,51 @@ def _stop_the_background_call_trace_summarizer():
     GitHubAPIClient._start_call_trace_summarizer = lambda self: None
 
 
+def _zero_the_agent_retry_backoff():
+    """Stop the suite paying AgentExecutor's real retry backoff (#186 family).
+
+    execute_agent() retries an ordinary agent failure twice, sleeping
+    RETRY_BACKOFF_BASE_SECONDS * attempt between attempts -- 15s then 30s. A
+    unit test whose agent raises a plain Exception matches none of the five
+    retry exemptions (CancellationError, NonRetryableAgentError, a lock
+    timeout, ClaudeCodeRateLimitError, breaker-open), so it takes the full
+    path: 45 seconds of real asyncio.sleep() for a test that asserts on an
+    emitted event. That was 45s of a 163s unit suite, the slowest test in it by
+    two orders of magnitude, and every future test of the failure path would
+    have paid it again without noticing.
+
+    Only the WAIT is removed. attempt counting, the exemptions and the
+    re-raise are untouched, so the tests that assert on retry behaviour --
+    test_agent_executor_lock_timeout_no_retry.py counts
+    run_with_circuit_breaker calls -- see exactly what they saw before. That
+    file already stubbed asyncio.sleep per-test for this reason; this makes
+    the stub unnecessary rather than contradicting it.
+
+    Nothing under test depends on the delay itself. Its stated purpose is to
+    let the Claude Code circuit breaker reach HALF_OPEN between attempts, and
+    no unit test runs a real breaker across a real 30s recovery window.
+
+    Assigning the module global works because the retry loop reads it on every
+    use rather than binding it at import; test_agent_retry_backoff.py pins
+    both halves of that -- the production default, and that this guard applied.
+
+    Installed LAST of the guards, and that position is load-bearing for the
+    same reason the block's ordering comment gives: this is the only guard
+    whose import reaches services.agent_executor, and so transitively
+    pipeline.factory and services.review_cycle, whose module scope builds
+    Redis and Elasticsearch clients. Run before the observability and
+    pipeline-run singletons are installed, it would pay for and pollute the
+    live ones.
+    """
+    try:
+        import services.agent_executor as agent_executor
+    except Exception as e:  # pragma: no cover - import shape, not behaviour
+        logger.debug(f"Could not zero the agent retry backoff: {e}")
+        return
+
+    agent_executor.RETRY_BACKOFF_BASE_SECONDS = 0
+
+
 _refuse_to_resolve_compose_service_hostnames()
 _bound_service_client_timeouts()
 _redirect_orchestrator_root_to_scratch()
@@ -474,6 +519,7 @@ _clear_deployment_tuning_env_vars()
 _install_a_disabled_observability_singleton()
 _stop_the_background_call_trace_summarizer()
 _install_a_mock_backed_pipeline_run_manager_singleton()
+_zero_the_agent_retry_backoff()
 
 
 # Import test utilities

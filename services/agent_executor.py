@@ -32,6 +32,19 @@ except ImportError:
         return None
 
 
+# Base for the retry backoff below: attempt N sleeps N * this, so 15s then 30s.
+# Sized against the Claude Code circuit breaker's 30s recovery timeout -- the
+# first retry lands after the breaker has opened, the second after it has gone
+# HALF_OPEN -- so changing it changes whether a retry can succeed at all.
+#
+# Named rather than inlined so the suite can zero it. Read through the module
+# global on every use, which is what makes that reassignment take effect;
+# tests/conftest.py sets it to 0 at import time, because one unit test that
+# exercises the generic-failure path was paying the full 15+30 = 45 seconds of
+# real asyncio.sleep(), a quarter of the whole unit suite's runtime.
+RETRY_BACKOFF_BASE_SECONDS = 15
+
+
 class FailsafeBranchCheck(NamedTuple):
     """_verify_failsafe_branch()'s verdict on whether the failsafe may commit.
 
@@ -1098,10 +1111,13 @@ class AgentExecutor:
                     # Check if we should retry (for normal agent failures)
                     if attempt < max_attempts:
                         logger.warning(f"Agent execution failed (attempt {attempt}/{max_attempts}): {e}")
-                        # Wait before retry (longer backoff to allow circuit breaker recovery: 15s, 30s, 60s)
-                        # Circuit breaker recovery timeout is 30s, so first retry happens after breaker opens,
-                        # second retry happens after breaker transitions to HALF_OPEN
-                        wait_time = 15 * attempt
+                        # Linear, not exponential: attempt N waits N * the base.
+                        # See RETRY_BACKOFF_BASE_SECONDS for why the base is
+                        # what it is. (The "15s, 30s, 60s" this comment used to
+                        # claim never happened -- the third term of 15*attempt
+                        # is 45, and at the default retries=2 there is no third
+                        # wait at all.)
+                        wait_time = RETRY_BACKOFF_BASE_SECONDS * attempt
                         logger.info(f"Waiting {wait_time}s before retry (allows circuit breaker recovery)...")
                         await asyncio.sleep(wait_time)
                     else:
