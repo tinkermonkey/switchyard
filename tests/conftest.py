@@ -814,8 +814,9 @@ def timeout_plugin_missing_header(config):
     (`PYTHONNOUSERSITE=1`, since the only copy in the running container is a
     user-site install that a `docker compose up` recreate discards): pytest
     prints `ERROR: Unknown config option: timeout` **on stderr**, collects the
-    whole suite anyway (`collected 3781 items / 1 error` -- the full count at
-    this commit), then exits 4 having run nothing.
+    whole suite anyway (`collected 3835 items / 1 error` -- all 3848 items at
+    this commit bar the 13 in the one file that cannot import), then exits 4
+    having run nothing.
 
     Both halves of that are bad to land on cold. The stderr line is gone the
     moment anyone pipes stdout, and neither it nor the `ModuleNotFoundError: No

@@ -33,9 +33,10 @@ import pytest
 # `ERROR: Unknown config option: timeout` and exit 4 with no test run.
 # Measured, with the plugin unimportable: that error goes to stderr (so it lands
 # on the `collecting ...` line in a terminal and disappears if stdout is piped),
-# the suite is still collected in full (`collected 3781 items / 1 error` -- the
-# full count at this commit, the 1 error being this file), and the run phase is
-# what is skipped. So this import raises during that same collection pass and
+# the suite is still collected in full (`collected 3835 items / 1 error` -- all
+# 3848 items at this commit bar this file's own 13, the 1 error being this
+# file), and the run phase is what is skipped. So this import raises during that
+# same collection pass and
 # both defences report together, alongside the third one that survives a pipe:
 # tests/conftest.py's report header. This one still matters if someone ever
 # drops --strict-config.
@@ -48,12 +49,13 @@ import pytest_timeout
 # letting the guard quietly start checking nothing.
 from pytest_timeout import _get_item_settings
 
-# The full unit suite measures 162s and its slowest single test 45.1s, so
+# The full unit suite measures ~170s (four runs: 167.7/168.2/172.3/170.1s) and
+# its slowest single test 45.1s, so
 # anything at or below the slowest test would flake and anything above the whole
 # suite would be pointless as a bound. The configured value is 180; these are the
 # walls it has to stay inside, not a restatement of it.
 SLOWEST_MEASURED_TEST_SECONDS = 45.2
-FULL_UNIT_SUITE_SECONDS = 162.0
+FULL_UNIT_SUITE_SECONDS = 170.0
 
 # The headroom multiple pytest.ini argues for and sizes `timeout` by: 4x the
 # slowest measured test, which is real headroom rather than a guess because
