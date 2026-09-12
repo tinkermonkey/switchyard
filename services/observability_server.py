@@ -1340,20 +1340,56 @@ def kill_pipeline_run(pipeline_run_id):
             'error': str(e)
         }), 500
 
+# (project, exception type, exception message) triples already reported by
+# _load_github_state(). It is a REQUEST path, not a startup path: _get_board_url()
+# and _get_repo_url() each call _load_github_state() once per active pipeline run,
+# and web_ui/src/routes/dashboard.jsx polls /active-pipeline-runs on a 10000 ms
+# interval per open tab. Measured against one corrupt github_state.yaml by
+# tests/unit/test_state_root_all_doors.py::TestTheObservabilityServersDoor::
+# test_the_same_failure_on_a_polled_path_is_logged_once_not_every_call, with this
+# dedup reverted: ten calls produced ten warning records, every one carrying the
+# full yaml.scanner.ScannerError traceback. On the deployment that is 2N stack
+# traces every ten seconds for as long as the file stays broken, into a log that
+# rotates at LOG_MAX_BYTES with 3 backups and into the Elasticsearch log indices.
+#
+# So: the first occurrence of each distinct failure is logged in full, with
+# exc_info, and repeats of the SAME failure are silent. A different exception, or
+# the same one on a different project, is a new signature and logs again. The set
+# is cleared for a project as soon as that project reads cleanly, so a file that is
+# fixed and later breaks again is reported again rather than suppressed forever.
+_state_read_failures_logged: set = set()
+
+# Above this many distinct signatures the set is emptied rather than grown. It is a
+# leak guard, not a policy: the only way to reach it is a message that varies per
+# call (a path with a timestamp in it, say), and a bounded re-log is a better
+# failure mode than unbounded memory in a long-lived server process.
+_STATE_READ_FAILURE_SIGNATURE_CAP = 256
+
+
+def _forget_state_read_failures(project_name: str) -> None:
+    """Re-arm logging for a project that has just read cleanly."""
+    _state_read_failures_logged.difference_update(
+        [seen for seen in _state_read_failures_logged if seen[0] == project_name]
+    )
+
+
 def _load_github_state(project_name: str) -> dict:
     """Load the github_state.yaml for a project, returning the inner github_state dict.
 
     Returns {} for a project with no state file yet -- that is a normal state,
     not an error, and both callers degrade to "no URL" for it.
 
-    Anything else is logged (#202). This body used to be `except Exception:
-    return {}` with no log at all, which made three different situations look
-    identical to the Web UI: no state file, an unreadable/corrupt one, and a
-    ValueError out of the state-root resolver. The last of those is a
-    configuration error that now cannot reach here -- the module-scope import
-    at the top of this file makes it fatal at boot instead -- but a
-    PermissionError or a YAML parse error still can, and silently showing every
-    board and repo link as missing is the wrong way to report them.
+    Anything else is logged ONCE per distinct failure (#202). This body used to
+    be `except Exception: return {}` with no log at all, which made three
+    different situations look identical to the Web UI: no state file, an
+    unreadable/corrupt one, and a ValueError out of the state-root resolver. The
+    last of those is a configuration error that now cannot reach here -- the
+    module-scope import at the top of this file makes it fatal at boot instead --
+    but a PermissionError or a YAML parse error still can, and silently showing
+    every board and repo link as missing is the wrong way to report them.
+
+    The dedup is not cosmetic: see _state_read_failures_logged above for why an
+    unconditional warning here is an unbounded flood rather than a diagnostic.
 
     Still returns {} rather than raising: these two callers decorate a project
     list that is otherwise fully populated, and a bad state file for one
@@ -1368,15 +1404,24 @@ def _load_github_state(project_name: str) -> dict:
             return {}
         with open(state_file) as f:
             data = yaml.safe_load(f)
-        return (data or {}).get('github_state', {})
+        state = (data or {}).get('github_state', {})
     except Exception as e:
-        logger.warning(
-            f"Could not read GitHub state for {project_name} from {state_file}: "
-            f"{type(e).__name__}: {e} -- the Web UI will show this project with "
-            f"no board or repo links",
-            exc_info=True,
-        )
+        signature = (project_name, type(e).__name__, str(e))
+        if signature not in _state_read_failures_logged:
+            if len(_state_read_failures_logged) >= _STATE_READ_FAILURE_SIGNATURE_CAP:
+                _state_read_failures_logged.clear()
+            _state_read_failures_logged.add(signature)
+            logger.warning(
+                f"Could not read GitHub state for {project_name} from {state_file}: "
+                f"{type(e).__name__}: {e} -- the Web UI will show this project with "
+                f"no board or repo links. Further identical failures on this "
+                f"project will not be logged until it reads cleanly again",
+                exc_info=True,
+            )
         return {}
+
+    _forget_state_read_failures(project_name)
+    return state
 
 
 def _get_board_url(project_name: str, board_name: str) -> Optional[str]:

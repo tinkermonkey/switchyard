@@ -27,6 +27,7 @@ chosen, not that it was created.
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -35,6 +36,42 @@ import pytest
 # tests/unit/<this file> -> the checkout root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+# IMPORTED HERE, AT MODULE SCOPE, AND NOT INSIDE THE FACTORIES BELOW.
+#
+# Three of these modules end with a module-scope singleton --
+# `work_execution_tracker = WorkExecutionStateTracker()`,
+# `dev_container_state = DevContainerStateManager()`,
+# `conversational_session_state = ConversationalSessionStateManager()` -- so the
+# FIRST import of one of them anywhere in the pytest session permanently binds
+# that process-wide object's state_dir. The factories used to do those imports
+# lazily, which meant the empty- and whitespace-root tests below (which
+# deliberately poison ORCHESTRATOR_ROOT so the resolver falls back to the
+# checkout) were the things triggering the first import. Measured on this branch
+# before the change, with a pytest_sessionfinish probe:
+# `pytest tests/unit/test_state_root_all_doors.py -k empty_orchestrator_root`
+# ended with all three singletons bound to `<checkout>/state/{execution_history,
+# dev_containers,conversational_sessions}` -- and on the deployment the checkout
+# IS /app, so that is #181 reintroduced by the tests written to prevent it.
+# A full `pytest tests/unit` escaped only because tests/unit/services/ is
+# collected first and imports two of these under conftest's scratch root; the
+# isolation rested on collection order, not on anything enforced.
+#
+# conftest's import-time root guard cannot help: the binding happens at runtime,
+# long after the guard ran. `monkeypatch.setattr(Path, 'mkdir', ...)` cannot
+# either: it stops the directory being CREATED at that instant, not the singleton
+# pointing at it for the rest of the session.
+#
+# Collection imports this module after tests/conftest.py has already redirected
+# ORCHESTRATOR_ROOT to scratch, so binding the singletons here binds them to
+# scratch. test_the_singletons_are_bound_before_any_test_poisons_the_root below
+# holds that true.
+from services.conversational_session_state import ConversationalSessionStateManager
+from services.dev_container_state import DevContainerStateManager
+from services.pipeline_lock_manager import PipelineLockManager
+from services.pipeline_queue_manager import PipelineQueueManager
+from services.pipeline_semaphore_manager import PipelineSemaphoreManager
+from services.work_execution_state import WorkExecutionStateTracker
+
 
 # (label, subdir under state/, factory taking an optional state_dir)
 #
@@ -42,32 +79,26 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # PipelineLockManager(use_redis=False) skips its Redis connect entirely, and
 # PipelineSemaphoreManager takes an injected client for the same reason.
 def _work_execution(state_dir=None):
-    from services.work_execution_state import WorkExecutionStateTracker
     return WorkExecutionStateTracker(state_dir=state_dir)
 
 
 def _dev_container(state_dir=None):
-    from services.dev_container_state import DevContainerStateManager
     return DevContainerStateManager(state_dir=state_dir)
 
 
 def _pipeline_lock(state_dir=None):
-    from services.pipeline_lock_manager import PipelineLockManager
     return PipelineLockManager(state_dir=state_dir, use_redis=False)
 
 
 def _pipeline_queue(state_dir=None):
-    from services.pipeline_queue_manager import PipelineQueueManager
     return PipelineQueueManager('a-project', 'a-board', state_dir)
 
 
 def _pipeline_semaphore(state_dir=None):
-    from services.pipeline_semaphore_manager import PipelineSemaphoreManager
     return PipelineSemaphoreManager(state_dir=state_dir, redis_client=MagicMock())
 
 
 def _conversational_session(state_dir=None):
-    from services.conversational_session_state import ConversationalSessionStateManager
     return ConversationalSessionStateManager(state_dir=state_dir)
 
 
@@ -199,6 +230,116 @@ def test_a_real_orchestrator_root_lands_under_it(
     assert manager.state_dir.is_dir()
 
 
+# module path -> the name of the process-wide singleton it builds at import.
+THE_SINGLETONS = {
+    'services.work_execution_state': 'work_execution_tracker',
+    'services.dev_container_state': 'dev_container_state',
+    'services.conversational_session_state': 'conversational_session_state',
+}
+
+_NESTED = 'SWITCHYARD_ALL_DOORS_NESTED'
+
+
+class TestTheTestsDoNotReopenTheDoorTheyGuard:
+    """The poisoning tests above must not be what first imports the singletons.
+
+    Run in a SUBPROCESS, selecting only the two tests that poison
+    ORCHESTRATOR_ROOT, so the answer does not depend on what else the session
+    happened to collect first. An in-process assertion cannot say this: whether
+    it catches the regression depends on whether it runs before or after the
+    poisoning test, and on whether tests/unit/services/ was collected first --
+    which is exactly the accident this file's isolation used to rest on.
+    """
+
+    _PROBE = textwrap.dedent(
+        '''
+        import sys
+        import pytest
+
+        SINGLETONS = {singletons!r}
+
+        class Probe:
+            def pytest_sessionfinish(self, session, exitstatus):
+                for module, attribute in SINGLETONS.items():
+                    loaded = sys.modules.get(module)
+                    where = (
+                        getattr(loaded, attribute).state_dir
+                        if loaded is not None else "<not imported>"
+                    )
+                    # Leading newline: pytest's own progress line has no
+                    # trailing one under --capture=no (set in pytest.ini), so
+                    # the first PROBE would otherwise share a line with it and
+                    # the parser below would miss exactly one singleton.
+                    print("\\nPROBE", module, where)
+
+        sys.exit(pytest.main({argv!r}, plugins=[Probe()]))
+        '''
+    )
+
+    def test_the_singletons_are_bound_before_any_test_poisons_the_root(self):
+        if os.environ.get(_NESTED):
+            pytest.skip('this is the nested run; it must not recurse')
+
+        scratch_root = os.environ.get('ORCHESTRATOR_ROOT')
+        assert scratch_root, "conftest must have redirected ORCHESTRATOR_ROOT"
+
+        # Neither name appears in this test's own id, so the nested run cannot
+        # select it; the env marker above is the belt to that's braces.
+        argv = [
+            str(Path(__file__).relative_to(_REPO_ROOT)),
+            '-k', 'empty_orchestrator_root or whitespace_orchestrator_root',
+            '-p', 'no:randomly',
+            '-q',
+        ]
+        environment = dict(os.environ)
+        environment[_NESTED] = '1'
+        environment['PYTHONPATH'] = str(_REPO_ROOT)
+
+        done = subprocess.run(
+            [
+                sys.executable, '-c',
+                self._PROBE.format(singletons=THE_SINGLETONS, argv=argv),
+            ],
+            cwd=str(_REPO_ROOT),
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+
+        assert done.returncode == 0, (
+            f"the nested selection did not pass, so its probe says nothing "
+            f"about where the singletons landed:\n{done.stdout[-3000:]}"
+            f"\n{done.stderr[-3000:]}"
+        )
+
+        probed = dict(
+            line.split()[1:3]
+            for line in done.stdout.splitlines()
+            if line.startswith('PROBE ')
+        )
+        assert set(probed) == set(THE_SINGLETONS), (
+            f"probe did not report every singleton: {probed}"
+        )
+
+        for module, where in probed.items():
+            assert where != '<not imported>', (
+                f"{module} was never imported, so this test proved nothing"
+            )
+            chosen = Path(where)
+            assert _REPO_ROOT not in chosen.parents, (
+                f"{module}'s process-wide singleton bound {chosen}, inside the "
+                f"checkout. On the deployment the checkout is /app, so every "
+                f"later write through that object lands in production state "
+                f"(#181). Import the module at test-module scope, before any "
+                f"test manipulates ORCHESTRATOR_ROOT."
+            )
+            assert Path(scratch_root) in chosen.parents, (
+                f"{module}'s singleton bound {chosen}, which is not under the "
+                f"session's scratch root {scratch_root}"
+            )
+
+
 class TestTheSeventhDoorIsNotAConstructor:
     """services/scheduled_tasks.py open-coded the SAME pipeline_queues path
     that PipelineQueueManager's own default resolves, and passed it in.
@@ -282,9 +423,18 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
     legitimately WRITES the variable that way, and no text pattern separates
     that from a read. The behavioural tests in this file are the real guard;
     this only catches the shape coming back, which in this repo it has.
+
+    APP_ROOT is in the alternation because it was the last live instance of the
+    bug class: mcp/server.py had `Path(os.environ.get("APP_ROOT", "/app"))` and
+    hung WORKFLOWS_YAML, PROJECTS_CONFIG_DIR and STATE_DIR off it, which the
+    ORCHESTRATOR_ROOT|WORKSPACE_ROOT pattern could not see at all. It is a
+    read-only path, so a blank APP_ROOT degraded to "the MCP tools report no
+    board state" rather than to a write -- the same bug, a smaller crater.
     """
 
-    # path -> why it legitimately reads one
+    # path -> why it legitimately reads one. Checked for LIVENESS below: an
+    # entry whose file has stopped matching is a blind spot with no remaining
+    # reason, and it is always the file most worth watching that acquires one.
     EXEMPT = {
         # It is the resolver. Its actual read is `os.environ.get(name)` with
         # the root name as a PARAMETER, which the pattern below cannot see
@@ -301,15 +451,14 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
         import re
 
         pattern = re.compile(
-            r"""environ\.get\(['"](?:ORCHESTRATOR_ROOT|WORKSPACE_ROOT)['"]"""
+            r"""environ\.get\(['"](?:ORCHESTRATOR_ROOT|WORKSPACE_ROOT|APP_ROOT)['"]"""
         )
 
         offenders = []
+        exemptions_used = set()
         for source in sorted(_REPO_ROOT.rglob('*.py')):
             relative = source.relative_to(_REPO_ROOT)
             if relative.parts[0] in self.SKIP_TREES:
-                continue
-            if str(relative) in self.EXEMPT:
                 continue
             for number, line in enumerate(
                 source.read_text(errors='ignore').splitlines(), 1
@@ -318,7 +467,10 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
                 if stripped.startswith('#'):
                     continue
                 if pattern.search(line):
-                    offenders.append(f"{relative}:{number}: {stripped[:100]}")
+                    if str(relative) in self.EXEMPT:
+                        exemptions_used.add(str(relative))
+                    else:
+                        offenders.append(f"{relative}:{number}: {stripped[:100]}")
 
         assert offenders == [], (
             "these lines resolve a root from the environment by hand. "
@@ -326,9 +478,137 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
             "and is empty (`-e ORCHESTRATOR_ROOT=` on a docker run), so the "
             "default never applies to the case that actually happens, and "
             "Path('') is the CWD (#202). Use config.paths.orchestrator_root(), "
-            "orchestrator_state_root() or workspace_root():\n  "
+            "orchestrator_state_root(), workspace_root() or root_from_env():\n  "
             + "\n  ".join(offenders)
         )
+
+        assert set(self.EXEMPT) == exemptions_used, (
+            "these EXEMPT entries no longer match anything, so they only hide "
+            "whatever is added to those files next -- delete them: "
+            f"{sorted(set(self.EXEMPT) - exemptions_used)}"
+        )
+
+
+def _import_the_mcp_server_in_a_subprocess(cwd: Path, app_root: str):
+    """Import mcp/server.py the way it is actually run and report its paths.
+
+    A SUBPROCESS, and `sys.path.insert(0, <repo>/mcp)` rather than an import of
+    `mcp.server`: that directory deliberately has no __init__.py (see the
+    module's own docstring) so that it cannot shadow the installed `mcp` SDK,
+    which server.py itself imports. `python mcp/server.py` gets the same
+    sys.path[0] for free; this reproduces it.
+
+    Measured in switchyard-orchestrator-1: 0.9s per import, ES and FastMCP
+    clients included, because every client in that module is lazy.
+    """
+    environment = dict(os.environ)
+    environment['APP_ROOT'] = app_root
+    environment['PYTHONPATH'] = str(_REPO_ROOT)
+    return subprocess.run(
+        [
+            sys.executable, '-c',
+            'import sys\n'
+            f'sys.path.insert(0, {str(_REPO_ROOT / "mcp")!r})\n'
+            'import server\n'
+            'print("APP_ROOT", server.APP_ROOT)\n'
+            'print("STATE_DIR", server.STATE_DIR)\n'
+            'print("WORKFLOWS_YAML", server.WORKFLOWS_YAML)\n'
+            'print("PROJECTS_CONFIG_DIR", server.PROJECTS_CONFIG_DIR)\n',
+        ],
+        cwd=str(cwd),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
+class TestTheMcpServersDoor:
+    """#202's headline shape under a different variable name.
+
+    `APP_ROOT = Path(os.environ.get("APP_ROOT", "/app"))`, with WORKFLOWS_YAML,
+    PROJECTS_CONFIG_DIR and STATE_DIR all hung off it. `-e APP_ROOT=` on the
+    switchyard-mcp container makes that `Path("")`, i.e. the CWD -- verified in
+    the container: `Path(os.environ.get("APP_ROOT", "/app")) / "state" /
+    "projects"` with APP_ROOT set to the empty string is the relative
+    `state/projects`.
+
+    Smaller crater than the orchestrator's seven doors: these three paths are
+    only ever read, never mkdir'd, so a bad APP_ROOT degraded to "every MCP tool
+    reports no board state" rather than to a write into the wrong tree. It was
+    also invisible to the repository-wide tripwire above until APP_ROOT went
+    into that alternation, which is why this behavioural pair exists alongside
+    it -- a grep that passes while the thing it guards is broken is the failure
+    mode this file was written against.
+    """
+
+    @staticmethod
+    def _paths_from(stdout: str) -> dict:
+        return dict(
+            line.split(maxsplit=1)
+            for line in stdout.splitlines()
+            if line.split(maxsplit=1)[:1]
+            and line.split(maxsplit=1)[0] in {
+                'APP_ROOT', 'STATE_DIR', 'WORKFLOWS_YAML', 'PROJECTS_CONFIG_DIR',
+            }
+        )
+
+    def test_a_blank_app_root_does_not_become_the_working_directory(self, tmp_path):
+        """The accident this issue is named for, in the one file that still had
+        it. Run from tmp_path so a regression is visible as a path under it."""
+        done = _import_the_mcp_server_in_a_subprocess(tmp_path, app_root='')
+
+        assert done.returncode == 0, done.stderr[-3000:]
+        paths = self._paths_from(done.stdout)
+        assert len(paths) == 4, f"probe reported {paths}"
+
+        for name, value in paths.items():
+            chosen = Path(value)
+            assert chosen.is_absolute(), (
+                f"mcp/server.py's {name} is {chosen} -- relative, so it "
+                f"resolves against the CWD (#202)"
+            )
+            assert tmp_path not in chosen.parents
+
+        assert paths['APP_ROOT'] == '/app', (
+            "a blank APP_ROOT must read as unset and land on the documented "
+            f"default, not on {paths['APP_ROOT']}"
+        )
+        assert paths['STATE_DIR'] == '/app/state/projects'
+
+    def test_a_relative_app_root_is_refused_at_import(self, tmp_path):
+        """A dropped leading slash means "under the CWD", and this service's
+        CWD is /app. Refusing at import is how the operator finds out."""
+        done = _import_the_mcp_server_in_a_subprocess(
+            tmp_path, app_root='relative-oops'
+        )
+
+        assert done.returncode != 0, (
+            f"mcp/server.py imported cleanly with APP_ROOT='relative-oops' and "
+            f"bound {done.stdout.strip()!r}"
+        )
+        assert 'must be an absolute path' in done.stderr, (
+            f"it failed for some reason other than the root resolver, so this "
+            f"test is no longer measuring what it claims:\n{done.stderr[-2000:]}"
+        )
+        assert list(tmp_path.iterdir()) == []
+
+    def test_an_absolute_app_root_is_still_honoured(self, tmp_path):
+        """The other half: refusing everything would also pass the test above,
+        and APP_ROOT is a real override this service documents."""
+        scratch = tmp_path / 'scratch'
+        scratch.mkdir()
+
+        done = _import_the_mcp_server_in_a_subprocess(tmp_path, app_root=str(scratch))
+
+        assert done.returncode == 0, done.stderr[-3000:]
+        paths = self._paths_from(done.stdout)
+        assert paths['APP_ROOT'] == str(scratch)
+        assert paths['STATE_DIR'] == str(scratch / 'state' / 'projects')
+        assert paths['WORKFLOWS_YAML'] == str(
+            scratch / 'config' / 'foundations' / 'workflows.yaml'
+        )
+        assert paths['PROJECTS_CONFIG_DIR'] == str(scratch / 'config' / 'projects')
 
 
 class TestTheDataRetentionDoor:
@@ -534,6 +814,19 @@ class TestTheObservabilityServersDoor:
     that module's singleton, wrapped in `except Exception: return {}`.
     """
 
+    @pytest.fixture(autouse=True)
+    def _a_clean_failure_log(self):
+        """_state_read_failures_logged is module-scope and survives tests.
+
+        Cleared either side of every test here so that what one asserts about
+        the log does not depend on what another already reported.
+        """
+        from services import observability_server
+
+        observability_server._state_read_failures_logged.clear()
+        yield
+        observability_server._state_read_failures_logged.clear()
+
     def test_the_state_manager_import_is_at_module_scope(self):
         """So a bad root kills the server at boot, as it does the orchestrator.
 
@@ -603,3 +896,119 @@ class TestTheObservabilityServersDoor:
 
         with pytest.raises(ValueError, match='absolute'):
             observability_server._load_github_state('a-project')
+
+    @staticmethod
+    def _corrupt(root: Path, project: str) -> Path:
+        """A github_state.yaml whose parse raises. Returns the file."""
+        project_dir = root / 'state' / 'projects' / project
+        project_dir.mkdir(parents=True, exist_ok=True)
+        state_file = project_dir / 'github_state.yaml'
+        # Unterminated flow sequence: yaml.safe_load raises ScannerError.
+        state_file.write_text('github_state: {boards: [\n')
+        return state_file
+
+    @staticmethod
+    def _warnings_about(caplog, project: str) -> list:
+        return [r for r in caplog.records if project in r.message]
+
+    def test_the_same_failure_on_a_polled_path_is_logged_once_not_every_call(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """This function is polled, so an unconditional warning is a flood.
+
+        _get_board_url() and _get_repo_url() each call it once per active
+        pipeline run, and web_ui/src/routes/dashboard.jsx polls
+        /active-pipeline-runs every 10000 ms per open tab -- so one corrupt file
+        meant 2N warnings, each with a full traceback, every ten seconds for as
+        long as it stayed broken. Measured here: without the dedup these ten
+        calls produce ten records; with it, one.
+        """
+        import logging
+
+        from services import observability_server
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        self._corrupt(tmp_path, 'a-project')
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(10):
+                assert observability_server._load_github_state('a-project') == {}
+
+        assert len(self._warnings_about(caplog, 'a-project')) == 1, (
+            f"one corrupt file, ten polls, "
+            f"{len(self._warnings_about(caplog, 'a-project'))} warnings: "
+            f"{[r.message[:80] for r in caplog.records]}"
+        )
+
+    def test_the_one_warning_still_carries_its_traceback(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Deduping must not quietly become "log less usefully".
+
+        The point of the exc_info was that a YAML error names a line and column;
+        keeping the count at one and dropping the traceback would trade one
+        overshoot for the silent failure #202 was about.
+        """
+        import logging
+
+        from services import observability_server
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        self._corrupt(tmp_path, 'a-project')
+
+        with caplog.at_level(logging.WARNING):
+            observability_server._load_github_state('a-project')
+
+        record, = self._warnings_about(caplog, 'a-project')
+        assert record.exc_info is not None, "the first report lost its traceback"
+
+    def test_the_dedup_is_per_project_not_global(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Suppressing by exception type alone would hide every project after
+        the first, which on a multi-project deployment is the same silence
+        #202 removed."""
+        import logging
+
+        from services import observability_server
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        self._corrupt(tmp_path, 'first-project')
+        self._corrupt(tmp_path, 'second-project')
+
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                observability_server._load_github_state('first-project')
+                observability_server._load_github_state('second-project')
+
+        assert len(self._warnings_about(caplog, 'first-project')) == 1
+        assert len(self._warnings_about(caplog, 'second-project')) == 1
+
+    def test_a_project_that_recovers_and_breaks_again_is_reported_again(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """Otherwise "log once" means "log once per process lifetime", and the
+        second outage of a file that was repaired in between goes unreported
+        until someone restarts the server."""
+        import logging
+
+        from services import observability_server
+
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        state_file = self._corrupt(tmp_path, 'a-project')
+
+        with caplog.at_level(logging.WARNING):
+            observability_server._load_github_state('a-project')
+
+            state_file.write_text('github_state:\n  org: an-org\n')
+            assert observability_server._load_github_state('a-project') == {
+                'org': 'an-org'
+            }
+
+            state_file.write_text('github_state: {boards: [\n')
+            observability_server._load_github_state('a-project')
+
+        assert len(self._warnings_about(caplog, 'a-project')) == 2, (
+            "a repaired-then-rebroken state file was reported "
+            f"{len(self._warnings_about(caplog, 'a-project'))} times, not twice"
+        )

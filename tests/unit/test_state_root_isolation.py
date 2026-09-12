@@ -149,10 +149,27 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         root = Path(__file__).parent.parent.parent
 
         # path -> why it legitimately names one of these
+        #
+        # NO DEAD ENTRIES: the assertion at the end of this test fails if a
+        # listed file has stopped matching. Two were removed under that rule
+        # when it was added.
+        #
+        # `config/state_manager.py`, exempted as "defines the resolver", was
+        # the one that mattered: #202 moved orchestrator_state_root(), and with
+        # it the `Path(__file__).parent.parent / "state"` fallback, out to
+        # config/paths.py, so state_manager.py had stopped matching either
+        # pattern -- leaving the single file that CAUSED #181 blanket-exempted
+        # from the tripwire that exists to catch #181, for a reason that no
+        # longer applied.
+        #
+        # `mcp/server.py` was exempted as "separate service,
+        # APP_ROOT-configurable" and documented as already dead, on the
+        # argument that it would earn its place once the patterns grew strong
+        # enough to see `<var> / "state"`. An exemption that is only justified
+        # by a hypothetical future match is indistinguishable from one whose
+        # reason has expired, which is the failure above; re-add it on the day
+        # the patterns change.
         EXEMPT = {
-            # Its fallback IS production behaviour: reached only when
-            # ORCHESTRATOR_ROOT is unset, which is the deployment's own case.
-            'config/state_manager.py': 'defines the resolver',
             # Its three matches are `relative_path=` values in the rule table
             # -- relative SEGMENTS hung off a root that is itself resolved from
             # ORCHESTRATOR_ROOT/WORKSPACE_ROOT (see resolve_roots there). It
@@ -161,16 +178,6 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
             # absolute or __file__-derived path added to this module later
             # would be invisible.
             'services/data_retention.py': 'rule-table relative segments',
-            # NOTE: this entry is currently DEAD -- the patterns below do not
-            # match mcp/server.py at all, because `APP_ROOT / "state" /
-            # "projects"` has no quoted path literal and no __file__ on the
-            # line. Kept because the reason is real (a separate service in its
-            # own container, with its own APP_ROOT override and a /app
-            # default), and because the day the patterns get strong enough to
-            # see `<var> / "state"` is the day this entry starts earning its
-            # place. Its deadness is itself the measure of how much the
-            # patterns still miss.
-            'mcp/server.py': 'separate service, APP_ROOT-configurable',
         }
 
         derived_from_file = re.compile(r'__file__.*\bstate\b|\bstate\b.*__file__')
@@ -188,24 +195,37 @@ class TestNoModuleStillDerivesStateFromItsOwnLocation:
         )
 
         offenders = []
+        exemptions_used = set()
         for source in sorted(root.rglob('*.py')):
             relative = source.relative_to(root)
             if relative.parts[0] in ('tests', '.claude', 'node_modules', 'venv', '.venv'):
-                continue
-            if str(relative) in EXEMPT:
                 continue
             for number, line in enumerate(source.read_text(errors='ignore').splitlines(), 1):
                 stripped = line.strip()
                 if stripped.startswith('#'):
                     continue
                 if derived_from_file.search(line) or literal_state_root.search(line):
-                    offenders.append(f"{relative}:{number}: {stripped[:90]}")
+                    if str(relative) in EXEMPT:
+                        exemptions_used.add(str(relative))
+                    else:
+                        offenders.append(f"{relative}:{number}: {stripped[:90]}")
 
         assert offenders == [], (
             "these lines build a state path from the code's own location or "
             "from a literal, either of which ignores ORCHESTRATOR_ROOT and "
             "writes into the deployment (#181):\n  " + "\n  ".join(offenders) +
             "\nUse config.state_manager.orchestrator_state_root()."
+        )
+
+        # An exemption whose file has stopped matching is a permanent blind
+        # spot with no remaining justification, and the file it covers is
+        # usually the one most worth watching -- config/state_manager.py sat
+        # here, exempted, for exactly that reason after #202 moved the resolver
+        # out from under it.
+        assert set(EXEMPT) == exemptions_used, (
+            "these EXEMPT entries no longer match anything, so they only "
+            "hide whatever is added to those files next -- delete them: "
+            f"{sorted(set(EXEMPT) - exemptions_used)}"
         )
 
 
