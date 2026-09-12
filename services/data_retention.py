@@ -460,14 +460,67 @@ def resolve_roots(
 # Roots a sweep must never delete from while running under pytest. Any test
 # that resolves to one of these has lost its isolation, and the right outcome
 # is a loud test failure rather than a production directory being emptied.
-_PROTECTED_ROOTS = (Path('/app'), Path('/workspace'), Path('/'))
+#
+# /app and /workspace/switchyard are listed separately even though they are the
+# same directory, so a reader who does not know that still sees the deployment
+# spelling they are looking for. Measured in the live container: both are
+# st_dev=66311 st_ino=12583264, because docker-compose mounts the checkout
+# twice (./:/app and ..:/workspace).
+_PROTECTED_ROOTS = (
+    Path('/app'),
+    Path('/workspace/switchyard'),
+    Path('/workspace'),
+    Path('/'),
+)
+
+
+def _same_directory(a: Path, b: Path) -> bool:
+    """Identity rather than spelling: (st_dev, st_ino) of two paths.
+
+    A path that does not exist is not the same directory as anything, so an
+    OSError here is a False and not an error -- the caller pairs this with a
+    textual comparison for the case where the protected root itself is absent.
+    """
+    try:
+        sa, sb = a.stat(), b.stat()
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _is_protected_root(path: Path) -> bool:
+    """Would deleting under `path` delete under one of _PROTECTED_ROOTS?
+
+    Two comparisons, because neither one alone is enough:
+
+    * Textual, after resolving -- this is what catches the spellings that are
+      the same *name* by a different route ('/app/../app', '.' with cwd /app, a
+      symlink), and it is also the only thing left when the protected root does
+      not exist on this machine (the suite run outside the container, where
+      there is no /app to stat). Dropping it would turn that case from a loud
+      refusal into a silent pass.
+    * Identity -- this is what catches a *different* name for the same
+      directory, which resolve() cannot collapse because it is a bind mount and
+      not a symlink. /workspace/switchyard is exactly that, and it is the
+      spelling the deployment's own docker-compose uses.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for protected in _PROTECTED_ROOTS:
+        if resolved == protected or path == protected:
+            return True
+        if _same_directory(resolved, protected):
+            return True
+    return False
 
 
 def _refuse_unisolated_apply(roots: dict) -> None:
     if not os.environ.get('PYTEST_CURRENT_TEST'):
         return
     for kind, resolved in roots.items():
-        if Path(resolved) in _PROTECTED_ROOTS:
+        if _is_protected_root(Path(resolved)):
             raise RuntimeError(
                 f"Refusing to apply retention to the {kind} root {resolved} "
                 f"from inside a test. Pass root=/workspace_root= explicitly, or "

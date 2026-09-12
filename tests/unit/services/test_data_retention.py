@@ -24,6 +24,7 @@ from services.data_retention import (  # noqa: E402
     _execution_history_records,
     _execution_still_running,
     _repair_cycle_issue_dirs,
+    _same_directory,
     resolve_roots,
     run_scheduled_sweep,
     sweep,
@@ -612,18 +613,273 @@ class TestTestIsolation:
         (issue #181). A sweep that resolves to /app or /workspace anyway has
         lost its isolation, and this is the first code in the tree that deletes
         under WORKSPACE_ROOT -- so it fails loudly rather than quietly emptying
-        a production directory."""
+        a production directory.
+
+        `rules=()` for the same reason as in
+        TestEverySpellingOfTheDeploymentIsRefused: with the env cleared this
+        call resolves to the real /app and /workspace, so with the real rule
+        set a regressed guard would not fail this test, it would run the
+        deletion the test exists to prevent. The guard is checked before
+        `rules` is iterated, so the assertion is unchanged."""
         monkeypatch.delenv('ORCHESTRATOR_ROOT', raising=False)
         monkeypatch.delenv('WORKSPACE_ROOT', raising=False)
 
         with pytest.raises(RuntimeError, match='Refusing to apply'):
-            sweep(apply=True)
+            sweep(apply=True, rules=())
 
         # Reporting is always safe, so it is never blocked. Scoped to one rule
         # pointed at a directory that does not exist, so the assertion does not
         # turn into a full walk of the live /app and /workspace trees.
         outcomes = sweep(apply=False, rules=(_rule(relative_path='nowhere-at-all'),))
         assert [o.missing for o in outcomes] == [True]
+
+
+def _same_inode(a: str, b: str) -> bool:
+    """Deliberately not services.data_retention._same_directory.
+
+    The skip conditions below are built on this. If they were built on the
+    function under test, a _same_directory() broken to always return False
+    would make the tests that prove it works quietly skip instead of fail.
+    """
+    import os as _os
+    try:
+        sa, sb = _os.stat(a), _os.stat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+_APP_EXISTS = Path('/app').is_dir()
+_BOTH_DEPLOYMENT_PATHS_EXIST = (
+    Path('/app').is_dir() and Path('/workspace/switchyard').is_dir()
+)
+_APP_IS_MOUNTED_TWICE = _same_inode('/app', '/workspace/switchyard')
+_NO_DEPLOYMENT = (
+    'not running in the deployment container: /app and /workspace/switchyard '
+    'do not both exist here'
+)
+_NOT_THE_DEPLOYMENT = (
+    'not running in the deployment container: /app and /workspace/switchyard '
+    'are not the same directory here'
+)
+
+
+class TestEverySpellingOfTheDeploymentIsRefused:
+    """The guard in front of shutil.rmtree compares identity, not path text.
+
+    Measured in the live container: /app and /workspace/switchyard are both
+    st_dev=66311 st_ino=12583264 -- one directory under two names, because
+    docker-compose mounts the checkout twice (./:/app and ..:/workspace).
+
+    With the previous `Path(resolved) in _PROTECTED_ROOTS`, the five spellings
+    of that one directory measured as:
+
+        /app                   refused
+        /app/                  refused
+        /workspace/switchyard  NOT refused
+        /app/../app            NOT refused
+        .   (cwd /app)         NOT refused
+
+    so three of five walked past the only thing standing between an
+    unisolated test and a recursive delete of the deployment.
+
+    Every refusal test below passes `rules=()` (the one test that must NOT be
+    refused, test_a_scratch_root_is_still_swept, keeps the real rule set and is
+    pointed at tmp_path), and that is load-bearing rather than tidiness. These
+    refusal tests point a sweep at the LIVE deployment
+    roots on purpose; with the real rule set they are safe only for exactly as
+    long as the guard they exist to test works, and the moment it regresses the
+    test does not fail -- it performs the deletion it was written to prevent,
+    on production. sweep() checks the guard before it iterates `rules`
+    (test_the_guard_is_checked_before_any_rule_is_swept pins that), so an empty
+    tuple leaves the assertion byte-identical and leaves a regression harmless.
+
+    Measured with the guard neutered in-process and sweep_rule replaced by a
+    recorder: `rules=RETENTION_RULES` dispatched 9 rules rooted at
+    /workspace/switchyard; `rules=()` dispatched 0. With the guard intact,
+    `rules=()` still raises the same RuntimeError.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_scratch_root(self, monkeypatch):
+        """Every test here passes an explicit root; clearing the env just
+        keeps which of the two roots trips the guard deterministic."""
+        monkeypatch.delenv('ORCHESTRATOR_ROOT', raising=False)
+        monkeypatch.delenv('WORKSPACE_ROOT', raising=False)
+
+    @pytest.mark.skipif(not _BOTH_DEPLOYMENT_PATHS_EXIST, reason=_NO_DEPLOYMENT)
+    def test_the_checkout_really_is_mounted_at_two_paths(self):
+        """The measured fact the identity comparison exists for.
+
+        Gated on the two paths EXISTING, deliberately not on them being the
+        same inode. Gating it on _APP_IS_MOUNTED_TWICE -- which is what the
+        first version of this did -- makes the skip condition the exact
+        negation of the assertion, so the test can only pass or skip and can
+        never report the thing its docstring promises to report. Confirmed by
+        running that shape against two real non-aliased directories: pytest
+        said `1 skipped`, not `1 failed`.
+
+        So: if the compose mounts ever change and the checkout stops being
+        mounted twice, this FAILS, and the reader is told that
+        test_the_workspace_switchyard_spelling_is_refused and
+        test_a_second_mount_is_caught_even_when_it_is_not_in_the_list -- which
+        do have to skip, because their case no longer exists -- have gone
+        quiet and the (st_dev, st_ino) half of the guard is now uncovered.
+        """
+        app, ws = os.stat('/app'), os.stat('/workspace/switchyard')
+        assert (app.st_dev, app.st_ino) == (ws.st_dev, ws.st_ino), (
+            "/app and /workspace/switchyard are no longer one directory. The "
+            "identity half of _is_protected_root() is now untested: the two "
+            "tests gated on _APP_IS_MOUNTED_TWICE are skipping."
+        )
+
+    @pytest.mark.skipif(not _APP_IS_MOUNTED_TWICE, reason=_NOT_THE_DEPLOYMENT)
+    def test_the_workspace_switchyard_spelling_is_refused(self):
+        """The bind-mount alias, and the reason a textual comparison is not
+        enough: resolve() cannot collapse this one, because it is a second
+        mount rather than a symlink. Only (st_dev, st_ino) catches it."""
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=Path('/workspace/switchyard'), apply=True, rules=())
+
+    def test_a_dot_dot_spelling_is_refused(self):
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=Path('/app/../app'), apply=True, rules=())
+
+    @pytest.mark.skipif(not _APP_EXISTS, reason='no /app to chdir into')
+    def test_a_relative_root_with_the_cwd_at_the_deployment_is_refused(
+        self, monkeypatch
+    ):
+        monkeypatch.chdir('/app')
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=Path('.'), apply=True, rules=())
+
+    @pytest.mark.skipif(not _APP_EXISTS, reason='no /app to link to')
+    def test_a_symlink_to_a_protected_root_is_refused(self, tmp_path):
+        link = tmp_path / 'deployment'
+        link.symlink_to('/app')
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=link, apply=True, rules=())
+
+    def test_the_workspace_root_is_checked_as_well_as_the_orchestrator_one(
+        self, tmp_path
+    ):
+        """Both entries of the roots dict go through the guard. The
+        workspace-rooted rules are the ones that delete under every managed
+        project checkout, so an alias reaching only that one still matters."""
+        with pytest.raises(RuntimeError, match='workspace root'):
+            sweep(
+                root=tmp_path,
+                workspace_root=Path('/workspace/../workspace'),
+                apply=True,
+                rules=(),
+            )
+
+    @pytest.mark.skipif(not _APP_IS_MOUNTED_TWICE, reason=_NOT_THE_DEPLOYMENT)
+    def test_a_second_mount_is_caught_even_when_it_is_not_in_the_list(
+        self, monkeypatch
+    ):
+        """Isolates the identity half of the comparison.
+
+        _PROTECTED_ROOTS names /workspace/switchyard as well as /app, so the
+        test above passes on the name alone -- which would leave
+        (st_dev, st_ino) untested and the next bind mount nobody thought to
+        list unguarded. With only /app in the list, the alias must still be
+        refused, and nothing else in _is_protected_root() can do it: the two
+        paths share no prefix and neither is a symlink, so resolve() cannot
+        turn one into the other.
+        """
+        import services.data_retention as data_retention
+
+        monkeypatch.setattr(data_retention, '_PROTECTED_ROOTS', (Path('/app'),))
+
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=Path('/workspace/switchyard'), apply=True, rules=())
+
+    def test_an_alias_of_a_protected_root_that_does_not_exist_is_refused(
+        self, monkeypatch
+    ):
+        """Isolates the resolve-then-compare-by-name half.
+
+        Resolving is what turns '..', '.' and a symlink back into the
+        protected name; with nothing on disk to stat, it is the only thing
+        that can. So the two comparisons are not redundant -- each one is the
+        only cover for a case the other misses.
+        """
+        import services.data_retention as data_retention
+
+        absent = Path('/no-such-deployment-root')
+        assert not absent.exists()
+        monkeypatch.setattr(data_retention, '_PROTECTED_ROOTS', (absent,))
+
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(
+                root=Path('/no-such-deployment-root/../no-such-deployment-root'),
+                apply=True,
+                rules=(),
+            )
+
+    def test_a_protected_root_that_does_not_exist_is_still_refused(
+        self, monkeypatch
+    ):
+        """Identity cannot stat what is not there. Without the textual
+        comparison beside it, running this suite anywhere without an /app --
+        on the host, in CI -- would turn a loud refusal into a silent pass,
+        which is the worse of the two failures for a guard in front of
+        rmtree."""
+        import services.data_retention as data_retention
+
+        absent = Path('/no-such-deployment-root')
+        assert not absent.exists()
+        monkeypatch.setattr(data_retention, '_PROTECTED_ROOTS', (absent,))
+
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=absent, apply=True, rules=())
+
+    def test_the_guard_is_checked_before_any_rule_is_swept(self, monkeypatch):
+        """The fact that lets every refusal test above pass `rules=()`.
+
+        If the guard ever moved below the loop, `rules=()` would still make
+        those tests pass while production went unguarded -- so the ordering has
+        to be pinned somewhere, and it cannot be pinned by a test that lets a
+        real sweep run. sweep_rule is replaced by a recorder here, so this is
+        the one place the full RETENTION_RULES set is handed a live deployment
+        root and still nothing can be deleted whatever the guard does.
+        """
+        import services.data_retention as data_retention
+
+        swept = []
+        monkeypatch.setattr(
+            data_retention, 'sweep_rule',
+            lambda rule, root, **kw: swept.append((rule.name, str(root))),
+        )
+
+        with pytest.raises(RuntimeError, match='Refusing to apply'):
+            sweep(root=Path('/app/../app'), apply=True, rules=RETENTION_RULES)
+
+        assert swept == [], (
+            "the guard must refuse before sweep_rule is reached -- otherwise "
+            "the rules=() in the tests above is hiding a real sweep of the "
+            f"deployment, not preventing one. Reached: {swept}"
+        )
+
+    def test_same_directory_compares_the_inode_and_not_the_name(self, tmp_path):
+        real = tmp_path / 'real'
+        real.mkdir()
+        link = tmp_path / 'link'
+        link.symlink_to(real)
+        other = tmp_path / 'other'
+        other.mkdir()
+
+        assert _same_directory(link, real), 'two names, one inode'
+        assert not _same_directory(other, real), 'two inodes'
+        assert not _same_directory(tmp_path / 'absent', real), 'nothing to stat'
+
+    def test_a_scratch_root_is_still_swept(self, tmp_path):
+        """The guard has to refuse the deployment and nothing else. An
+        over-broad version of it -- one that treats any ancestor relationship
+        as a match, say -- would refuse tmp_path too and take every other
+        apply=True test in this file down with it."""
+        sweep(root=tmp_path, apply=True)
 
 
 class TestTheSingleConfiguredValue:
