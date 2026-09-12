@@ -104,7 +104,9 @@ class PromptBuilder:
         is_rereviewing = rc.is_rereviewing if rc else False
 
         iteration_context = self._reviewer_iteration_context(ctx, review_domain=review_domain)
-        review_task = self._loader.agent_review_task(agent)
+        review_task = self._expand_content_placeholders(
+            self._loader.agent_review_task(agent), ctx
+        )
         format_instructions = self._reviewer_format_instructions(ctx, is_rereviewing)
         requirements_section = self._reviewer_requirements_section(ctx)
         context_section = self._reviewer_context_section(ctx)
@@ -121,6 +123,85 @@ class PromptBuilder:
         )
         return self._append_reference_repos(prompt, ctx)
 
+    # ── Content-file placeholders ─────────────────────────────────────────
+    #
+    # Content files (agent guidelines, review tasks, quality standards) cannot
+    # use .format() placeholders: they are passed INTO `.format()` as argument
+    # values, so braces inside them are never expanded. Before this existed,
+    # that produced two incompatible conventions for the same idea --
+    # `{PROJECT_NAME}` in the setup guidelines was never substituted and relied
+    # on the model inferring the project from elsewhere in the prompt, while
+    # `{project_name}` in the verifier's review task WAS substituted by a
+    # one-off .replace() in build_verifier_prompt().
+    #
+    # The prose convention only works for values the model can already recover
+    # from the rendered prompt. It silently fails for anything else -- which is
+    # how {DEV_CONTAINER_IMAGE_TAG} came to be referenced by a prompt that
+    # could never resolve it. One expansion pass over every content file
+    # removes the distinction: a placeholder listed here is substituted
+    # whenever its value resolves, and one that is not listed is left alone.
+    # {DEV_CONTAINER_IMAGE_TAG} additionally REFUSES to render when it cannot
+    # resolve, because an empty tag corrupts a docker build silently; the
+    # project placeholders fall back to being left literal, which is what they
+    # did before this pass existed.
+    #
+    # .replace(), not .format(), so an unrelated brace anywhere in a content
+    # file cannot raise.
+    def _resolve_dev_container_image_tag(self, ctx: "PromptContext") -> str:
+        """The complete image tag, derived from the project when not threaded.
+
+        Both paths go through image_tag_for(), so there is one definition of
+        the tag; deriving here just means a context built directly (tests, any
+        non-factory construction) renders what production renders. Resolved
+        lazily and only when the placeholder is present, so contexts that never
+        render a dev-container prompt pay nothing.
+        """
+        if ctx.dev_container_image_tag:
+            return ctx.dev_container_image_tag
+        # Same expression as _content_placeholders, and excluding the "unknown"
+        # sentinel PromptContext defaults `project` to -- deriving from it would
+        # yield "unknown-agent:latest", which is exactly the wrongly-tagged
+        # build the refusal below exists to prevent, but non-empty enough to
+        # slip past it.
+        project = ctx.project_name or ctx.project
+        if not project or project == "unknown":
+            return ""
+        try:
+            from services.dev_container_environment import image_tag_for
+            return image_tag_for(project)
+        except Exception as e:
+            raise ValueError(
+                f"Could not resolve the dev-container image tag for project "
+                f"{project!r} while rendering {ctx.agent_name}'s prompt: {e}"
+            ) from e
+
+    def _expand_content_placeholders(self, text: str, ctx: "PromptContext") -> str:
+        """Expand the known placeholders inside one content file."""
+        if not text:
+            return text
+
+        if "{DEV_CONTAINER_IMAGE_TAG}" in text:
+            tag = self._resolve_dev_container_image_tag(ctx)
+            if not tag:
+                # Refuse rather than substitute an empty string. `docker build
+                # -t  /workspace/x` is a silent corruption: the agent builds
+                # SOMETHING, tagged wrongly or not at all, and the failure
+                # surfaces much later as "the environment was never built".
+                raise ValueError(
+                    f"{ctx.agent_name}'s prompt references "
+                    f"{{DEV_CONTAINER_IMAGE_TAG}} but neither a "
+                    f"dev_container_image_tag nor a project was supplied. "
+                    f"Refusing to render a prompt that would tell the agent to "
+                    f"build an untagged image."
+                )
+            text = text.replace("{DEV_CONTAINER_IMAGE_TAG}", tag)
+
+        project = ctx.project_name or ctx.project
+        if project:
+            for placeholder in ("{PROJECT_NAME}", "{project_name}"):
+                text = text.replace(placeholder, project)
+        return text
+
     def build_verifier_prompt(self, ctx: "PromptContext") -> str:
         """Assemble the DevEnvironmentVerifier prompt."""
         project_name = ctx.project_name or ctx.project
@@ -128,7 +209,11 @@ class PromptBuilder:
         verification_task_raw = self._loader.agent_review_task("dev_environment_verifier")
         # Expand {project_name} placeholders inside the content file so shell
         # commands and Python snippets reference the correct project.
-        verification_task = verification_task_raw.replace("{project_name}", project_name)
+        # One expansion pass, covering {project_name} (previously a one-off
+        # .replace() here) and {DEV_CONTAINER_IMAGE_TAG}. The verifier probes
+        # and records the image the SETUP agent built, so both halves of the
+        # maker-checker pair must be handed the same tag.
+        verification_task = self._expand_content_placeholders(verification_task_raw, ctx)
 
         prompt = self._loader.workflow_template("verification/prompt").format(
             project_name=project_name,
@@ -169,8 +254,12 @@ class PromptBuilder:
 
     def _build_initial(self, ctx: "PromptContext") -> str:
         loader = self._loader
-        guidelines = loader.agent_guidelines(ctx.agent_name)
-        quality_standards = loader.agent_quality_standards(ctx.agent_name)
+        guidelines = self._expand_content_placeholders(
+            loader.agent_guidelines(ctx.agent_name), ctx
+        )
+        quality_standards = self._expand_content_placeholders(
+            loader.agent_quality_standards(ctx.agent_name), ctx
+        )
 
         previous_stage_section = self._previous_stage_section(ctx)
         quality_section = f"\n## Quality Standards\n{quality_standards}\n" if quality_standards else ""
@@ -217,7 +306,9 @@ class PromptBuilder:
 
     def _build_question(self, ctx: "PromptContext") -> str:
         loader = self._loader
-        guidelines = loader.agent_guidelines(ctx.agent_name)
+        guidelines = self._expand_content_placeholders(
+            loader.agent_guidelines(ctx.agent_name), ctx
+        )
         guidelines_section = f"\n{guidelines}" if guidelines else ""
         output_instructions = self._output_instructions(ctx, mode="question")
 

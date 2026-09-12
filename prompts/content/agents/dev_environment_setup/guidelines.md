@@ -42,39 +42,54 @@ and takes priority over the general Dockerfile.agent patterns below when they co
    Follow the Dockerfile.agent Architecture Pattern below (see detailed section).
 
 4. **Build the Docker Image**:
-   Use the project name from your task context to build the image:
+
+   > **The image tag is NOT derived from the project name.** Copy
+   > `context['dev_container_image_tag']` verbatim. Several projects can share
+   > one dev-container environment, in which case the tag belongs to that
+   > environment and differs from the project name — while the build context
+   > path below stays the project's own checkout. These are two different
+   > identifiers that happen to look alike; do not substitute one for the
+   > other, and do not reconstruct the tag from the project name.
+
+   Build context path comes from the project name (`context['project']`);
+   the image tag comes from `context['dev_container_image_tag']`:
    ```bash
-   docker build -f /workspace/{PROJECT_NAME}/Dockerfile.agent -t {PROJECT_NAME}-agent:latest /workspace/{PROJECT_NAME}
+   docker build -f /workspace/{PROJECT_NAME}/Dockerfile.agent -t {DEV_CONTAINER_IMAGE_TAG} /workspace/{PROJECT_NAME}
    ```
    - **CRITICAL**: You MUST actually build the image to verify the changes work
    - Check build output for errors
    - If build fails, fix the Dockerfile and rebuild
-   - The project name will be in your context (e.g., context['project'])
+   - The project name is in `context['project']` — use it for PATHS only
+   - The image tag is in `context['dev_container_image_tag']` — use it for
+     `-t` and for every `docker run` below, verbatim
+   - The orchestrator verifies that this exact tag exists before marking the
+     environment verified; a build tagged anything else will be reported as a
+     failure even though the build itself succeeded
 
 5. **Test the Docker Image**:
    - If there's a validation script provided in the issue, run it in the container
    - **MANDATORY**: Test all three critical CLI tools:
    ```bash
    # Test Claude CLI (REQUIRED)
-   docker run --rm {PROJECT_NAME}-agent:latest which claude
-   docker run --rm {PROJECT_NAME}-agent:latest claude --version
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} which claude
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} claude --version
 
    # Test Git CLI (REQUIRED)
-   docker run --rm {PROJECT_NAME}-agent:latest which git
-   docker run --rm {PROJECT_NAME}-agent:latest git --version
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} which git
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} git --version
 
    # Test GitHub CLI (REQUIRED)
-   docker run --rm {PROJECT_NAME}-agent:latest which gh
-   docker run --rm {PROJECT_NAME}-agent:latest gh --version
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} which gh
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} gh --version
    ```
    - Run project-specific smoke tests:
    ```bash
-   docker run --rm {PROJECT_NAME}-agent:latest python3 --version
-   docker run --rm {PROJECT_NAME}-agent:latest python3 -c "import {MODULE_NAME}"
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} python3 --version
+   docker run --rm {DEV_CONTAINER_IMAGE_TAG} python3 -c "import {MODULE_NAME}"
    ```
    - If validation script exists (check issue description):
    ```bash
-   docker run --rm -v /workspace/{PROJECT_NAME}:/workspace {PROJECT_NAME}-agent:latest python3 /workspace/validation_script.py
+   docker run --rm -v /workspace/{PROJECT_NAME}:/workspace {DEV_CONTAINER_IMAGE_TAG} python3 /workspace/validation_script.py
    ```
    - Document test results (pass/fail with full output)
    - **If claude, git, or gh are missing, the image is NOT valid and must be fixed**

@@ -244,16 +244,23 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
     that FINISHES in the window and writes a fresh VERIFIED."""
 
     @staticmethod
-    def _probe(returns, side_effect=None):
-        """Stand-in for verify_image_exists, recording the tag it was asked
-        about and optionally letting a competing writer land first."""
+    def _probe(returns, side_effect=None, inconclusive=False):
+        """Stand-in for _probe_image, recording the tag it was asked about and
+        optionally letting a competing writer land first.
+
+        Stands in for _probe_image rather than verify_image_exists (#199
+        review): verify_and_update_status is the one caller that turns a
+        negative into a DURABLE state mutation, so it needs to know whether the
+        negative was conclusive. `inconclusive=True` simulates Docker not
+        answering, which must NOT produce a write.
+        """
         seen = []
 
-        def _verify(self, project_name, image_name=None):
+        def _verify(self, image_name=None):
             seen.append(image_name)
             if side_effect is not None:
                 side_effect()
-            return returns
+            return returns, inconclusive
 
         return _verify, seen
 
@@ -266,12 +273,12 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
             )
 
         probe, _seen = self._probe(False, side_effect=_rebuild_lands_during_the_probe)
-        original = DevContainerStateManager.verify_image_exists
+        original = DevContainerStateManager._probe_image
         try:
-            DevContainerStateManager.verify_image_exists = probe
+            DevContainerStateManager._probe_image = probe
             result = manager.verify_and_update_status("proj")
         finally:
-            DevContainerStateManager.verify_image_exists = original
+            DevContainerStateManager._probe_image = original
 
         # The image this call actually looked at really was missing, so the
         # caller is still told not to launch against it...
@@ -297,12 +304,12 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
             )
 
         probe, _seen = self._probe(False, side_effect=_rebuild_finishes_during_the_probe)
-        original = DevContainerStateManager.verify_image_exists
+        original = DevContainerStateManager._probe_image
         try:
-            DevContainerStateManager.verify_image_exists = probe
+            DevContainerStateManager._probe_image = probe
             result = manager.verify_and_update_status("proj")
         finally:
-            DevContainerStateManager.verify_image_exists = original
+            DevContainerStateManager._probe_image = original
 
         # The tag this call inspected was genuinely absent, so its own caller is
         # still told not to launch against it...
@@ -323,12 +330,12 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
             )
 
         probe, seen = self._probe(False, side_effect=_retag_during_the_probe)
-        original = DevContainerStateManager.verify_image_exists
+        original = DevContainerStateManager._probe_image
         try:
-            DevContainerStateManager.verify_image_exists = probe
+            DevContainerStateManager._probe_image = probe
             result = manager.verify_and_update_status("proj")
         finally:
-            DevContainerStateManager.verify_image_exists = original
+            DevContainerStateManager._probe_image = original
 
         assert result is False
         assert seen == ["proj-agent:latest"], "the probe must inspect the tag it read"
@@ -341,12 +348,12 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
         manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
 
         probe, seen = self._probe(True)
-        original = DevContainerStateManager.verify_image_exists
+        original = DevContainerStateManager._probe_image
         try:
-            DevContainerStateManager.verify_image_exists = probe
+            DevContainerStateManager._probe_image = probe
             assert manager.verify_and_update_status("proj") is True
         finally:
-            DevContainerStateManager.verify_image_exists = original
+            DevContainerStateManager._probe_image = original
 
         assert seen == ["proj-agent:latest"]
 
@@ -354,12 +361,12 @@ class TestVerifyAndUpdateStatusDoesNotClobberAFresherVerdict:
         manager.set_status("proj", DevContainerStatus.VERIFIED, image_name="proj-agent:latest")
 
         probe, _seen = self._probe(False)
-        original = DevContainerStateManager.verify_image_exists
+        original = DevContainerStateManager._probe_image
         try:
-            DevContainerStateManager.verify_image_exists = probe
+            DevContainerStateManager._probe_image = probe
             result = manager.verify_and_update_status("proj")
         finally:
-            DevContainerStateManager.verify_image_exists = original
+            DevContainerStateManager._probe_image = original
 
         assert result is False
         assert manager.get_status("proj") == DevContainerStatus.UNVERIFIED
@@ -478,8 +485,11 @@ class TestTheResetIsAnnouncedOnlyIfItHappened:
 
     @staticmethod
     def _missing_image_probe():
-        def _verify(self, project_name, image_name=None):
-            return False
+        # Stands in for _probe_image (#199 review): a CONCLUSIVE negative, i.e.
+        # Docker answered and the image is genuinely absent. An inconclusive
+        # negative must not produce the reset these tests assert on.
+        def _verify(self, image_name=None):
+            return False, False
 
         return _verify
 
@@ -494,11 +504,11 @@ class TestTheResetIsAnnouncedOnlyIfItHappened:
         if side_effect is not None:
             original_probe = probe
 
-            def probe(self, project_name, image_name=None):  # noqa: F811
+            def probe(self, image_name=None):  # noqa: F811
                 side_effect()
-                return original_probe(self, project_name, image_name=image_name)
+                return original_probe(self, image_name=image_name)
 
-        monkeypatch.setattr(DevContainerStateManager, 'verify_image_exists', probe)
+        monkeypatch.setattr(DevContainerStateManager, '_probe_image', probe)
         captured = MagicMock()
         monkeypatch.setattr(dev_container_state_module, 'logger', captured)
         result = manager.verify_and_update_status("proj")
@@ -541,7 +551,7 @@ class TestTheResetIsAnnouncedOnlyIfItHappened:
             manager.get_status("proj")
         )
         monkeypatch.setattr(
-            DevContainerStateManager, 'verify_image_exists', self._missing_image_probe()
+            DevContainerStateManager, '_probe_image', self._missing_image_probe()
         )
         monkeypatch.setattr(dev_container_state_module, 'logger', captured)
 
@@ -612,22 +622,25 @@ class TestTheStaleMarkerSweepAnnouncesOnlyWhatItCleared:
         standing. Saying it was cleared sends an operator looking for a marker
         that is still there and still correct."""
         self._stale_marker(manager, 'proj')
-        original_merge = DevContainerStateManager._merge_state
+        # Patches _merge_state_FILE: the sweep addresses state by path, not by
+        # project name, because its stems are already environment names and
+        # re-resolving one writes a different file than it just read (#198).
+        original_merge = DevContainerStateManager._merge_state_file
 
-        def _merge_after_a_fresh_request(self, project_name, updates, expect=None):
+        def _merge_after_a_fresh_request(self, state_file, updates, expect=None):
             if expect is not None:
                 original_merge(
                     self,
-                    project_name,
+                    state_file,
                     {
                         'pending_operation': 'rebuild',
                         'pending_operation_at': datetime.now().isoformat(),
                     },
                 )
-            return original_merge(self, project_name, updates, expect=expect)
+            return original_merge(self, state_file, updates, expect=expect)
 
         monkeypatch.setattr(
-            DevContainerStateManager, '_merge_state', _merge_after_a_fresh_request
+            DevContainerStateManager, '_merge_state_file', _merge_after_a_fresh_request
         )
         captured = MagicMock()
         monkeypatch.setattr(dev_container_state_module, 'logger', captured)

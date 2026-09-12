@@ -151,6 +151,12 @@ class ProjectConfig:
     # already-safe workspace type down to a specific project, it does not widen
     # which workspace types are eligible.
     worktree_isolation_enabled: bool = False
+    # Dev-container environment participation (#198). {'environment': '<name>'}
+    # lets several project configs on the SAME repository share one image, one
+    # state file and one build lock. Absent (the default) resolves to the
+    # project's own name, which is exactly the pre-#198 keying -- see
+    # services/dev_container_environment.py.
+    dev_container: Optional[Dict[str, Any]] = None
 
 
 class ConfigurationError(Exception):
@@ -413,6 +419,7 @@ class ConfigManager:
             reference_repos=reference_repos,
             code_review_lint=project_data.get('code_review_lint'),
             worktree_isolation_enabled=project_data.get('worktree_isolation_enabled', False),
+            dev_container=project_data.get('dev_container'),
         )
 
     def get_agents(self) -> Dict[str, AgentConfig]:
@@ -540,6 +547,27 @@ class ConfigManager:
                 errors.append(f"Pipeline routing references unknown pipeline: {pipeline_name}")
 
         return errors
+
+    def validate_dev_container_environments(self) -> List[str]:
+        """Cross-project validation of dev_container.environment (#198).
+
+        Cross-project rather than per-project because the rules are about
+        AGREEMENT between the configs that name one environment (same
+        repository, no collision with a third project's name), which no
+        single-config validator can see.
+        """
+        from services.dev_container_environment import validate_environments
+
+        configs = {}
+        for project_name in self.list_projects():
+            try:
+                configs[project_name] = self.get_project_config(project_name)
+            except Exception as e:
+                logger.warning(
+                    f"Skipping {project_name} in dev-container environment "
+                    f"validation: {e}"
+                )
+        return validate_environments(configs)
 
     def list_projects(self) -> List[str]:
         """List all available project configurations"""

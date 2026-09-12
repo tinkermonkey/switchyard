@@ -52,6 +52,48 @@ def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
         )
     return Path(str(raw_work_dir))
 
+from agents.non_retryable import NonRetryableAgentError
+
+
+def _dev_container_state_path(environment: str) -> str:
+    """Where an operator will actually find `environment`'s state file.
+
+    Resolved through orchestrator_state_root() rather than spelled as a literal
+    (#181): a hardcoded relative path ignores ORCHESTRATOR_ROOT and so names a
+    location that does not exist in any deployment that sets it -- and this
+    string is the breadcrumb from a stalled board to the cause, which two
+    earlier review rounds already found pointing at the wrong file for a
+    different reason (the project name instead of the environment).
+    """
+    from config.state_manager import orchestrator_state_root
+
+    return str(orchestrator_state_root() / "dev_containers" / f"{environment}.yaml")
+
+
+class DevContainerEnvironmentBlocked(NonRetryableAgentError):
+    """Another run drove this dev-container environment to BLOCKED while this
+    one waited for the build lock.
+
+    Subclasses NonRetryableAgentError rather than defining its own
+    non-retryability, because "non-retryable" is not a property a type has by
+    existing -- it is a property the retry loops implement. An earlier version
+    of this was a bare RuntimeError whose docstring asserted it "must NOT be
+    retried"; nothing keyed on it, so services/agent_executor.py retried it,
+    and on attempt two `status_before_wait` was already BLOCKED, which
+    build_already_done_by_another_member() correctly reads as a DELIBERATE
+    re-run and lets through -- performing the exact rebuild the stand-down
+    prevented. Worse, the retry-exhausted handler then reset the SHARED
+    environment to UNVERIFIED, destroying the other member's BLOCKED verdict
+    and the error_message this exception's own text tells the operator to go
+    and read.
+
+    NonRetryableAgentError is already honoured by both retry loops
+    (services/agent_executor.py, services/worker_pool.py) and re-raised
+    unwrapped by agents/base_maker_agent.py, so inheriting it gets all three
+    for free and cannot drift out of sync with them.
+    """
+
+
 async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     """Execute Claude Code with given prompt and context"""
     logger.info("run_claude_code called")
@@ -244,7 +286,56 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
     )
 
     if agent_holds_build_window(agent):
+        # (#198) Capture the status BEFORE queueing for the lock, so the
+        # re-read after acquiring can tell "another member of this shared
+        # dev-container environment built it while I waited" (skip) from "it
+        # was already built and an operator is deliberately rebuilding"
+        # (proceed). See build_already_done_by_another_member().
+        from services.dev_container_build_lock import (
+            build_already_done_by_another_member,
+        )
+        from services.dev_container_state import dev_container_state
+
+        status_before_wait = dev_container_state.get_status(project)
+
         async with dev_container_build_lock_async(project, issue_number_for_dev_lock):
+            completed = build_already_done_by_another_member(project, status_before_wait)
+            if completed is not None:
+                from services.dev_container_environment import environment_for
+
+                environment = environment_for(project)
+                logger.info(
+                    "Skipping %s for %s: dev-container environment %s reached %s "
+                    "while this run waited for the build lock (built by another "
+                    "member of the environment)",
+                    agent, project, environment, completed.value,
+                )
+                from services.dev_container_state import DevContainerStatus
+
+                if completed == DevContainerStatus.BLOCKED:
+                    # NOT a success. Saying "completed the build" here told the
+                    # operator a broken environment was ready, and the stage
+                    # reported success and advanced the card -- so a failed
+                    # environment build presented as clean setup on every other
+                    # member's board.
+                    raise DevContainerEnvironmentBlocked(
+                        f"Dev container environment '{environment}' is BLOCKED: another "
+                        f"run reached a terminal failure for this environment while "
+                        f"'{agent}' was waiting for the build lock. Not rebuilding, and "
+                        f"not reporting success. Inspect "
+                        f"{_dev_container_state_path(environment)} for the recorded "
+                        f"error, fix it, and re-run dev_environment_setup."
+                    )
+
+                return (
+                    f"## Dev container environment `{environment}` already "
+                    f"{completed.value}\n\n"
+                    f"This environment reached `{completed.value}` while `{agent}` was "
+                    f"waiting for the build lock, so there was nothing to do and no "
+                    f"image was rebuilt. Under a shared environment that means another "
+                    f"member built it; otherwise an operator or recovery path did.\n"
+                )
+
             return await _run_locally_under_checkout_lock(
                 prompt, context, agent, project, work_dir_for_lock, issue_number_for_dev_lock
             )

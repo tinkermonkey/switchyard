@@ -206,8 +206,20 @@ def rebuild_project_image(
         logger.warning(f"Skipping {project_name}: No Dockerfile.agent found at {dockerfile}")
         return False
 
-    # Build image name
-    image_name = f"{project_name}-agent:latest"
+    # Build image name. image_tag_for() is the single source of truth (#198):
+    # with a shared dev-container environment the tag is the ENVIRONMENT's, not
+    # this project's, and an operator rebuilding through this script must
+    # produce the same tag the pipeline path and the agent produce -- otherwise
+    # it builds a correct image under a name nothing reads.
+    from services.dev_container_environment import environment_for, image_tag_for
+
+    image_name = image_tag_for(project_name)
+    environment = environment_for(project_name)
+    if environment != project_name:
+        logger.info(
+            f"{project_name} shares dev-container environment '{environment}'; "
+            f"rebuilding {image_name} affects every member of that environment"
+        )
 
     # Construct build command
     build_cmd = [

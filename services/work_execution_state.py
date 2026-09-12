@@ -3897,6 +3897,8 @@ class WorkExecutionStateTracker:
                                     # rather than contended) and left for the operator.
                                     if agent == 'dev_environment_verifier':
                                         from services.dev_container_state import DevContainerStatus
+                                        # (#198) environment-scoped tag
+                                        from services.dev_container_environment import image_tag_for
                                         _transition_dev_container_state(
                                             project_name,
                                             DevContainerStatus.VERIFIED,
@@ -3904,8 +3906,17 @@ class WorkExecutionStateTracker:
                                                 "Dev environment verifier succeeded (recovered from Redis) "
                                                 "but state was not VERIFIED"
                                             ),
-                                            skip_when=(DevContainerStatus.VERIFIED,),
-                                            image_name=f"{project_name}-agent:latest",
+                                            # BLOCKED included (#198 review): without
+                                            # it, a verifier that wrote BLOCKED because
+                                            # the expected image was missing has that
+                                            # verdict silently overwritten with VERIFIED
+                                            # by this recovery sweep, naming a tag that
+                                            # does not exist.
+                                            skip_when=(
+                                                DevContainerStatus.VERIFIED,
+                                                DevContainerStatus.BLOCKED,
+                                            ),
+                                            image_name=image_tag_for(project_name),
                                         )
 
                                     try:

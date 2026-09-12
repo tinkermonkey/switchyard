@@ -135,9 +135,15 @@ async def validate_task_can_run(task, logger) -> Dict[str, Any]:
             'defer': True,
         }
     elif status == DevContainerStatus.BLOCKED:
+        from services.dev_container_environment import environment_for
+        blocked_env = environment_for(task.project)
         return {
             'can_run': False,
-            'reason': f"Dev container setup is blocked for '{task.project}'. Check state/dev_containers/{task.project}.yaml for error details",
+            # (#198) the state file is named for the ENVIRONMENT, which may be
+            # shared -- naming the project sends the operator to a path that
+            # does not exist, and this is the primary breadcrumb from a stalled
+            # board to the cause.
+            'reason': f"Dev container setup is blocked for '{task.project}' (environment '{blocked_env}'). Check state/dev_containers/{blocked_env}.yaml for error details",
             'needs_dev_setup': False
         }
     elif status == DevContainerStatus.CHANGES_NEEDED:
@@ -524,10 +530,14 @@ async def queue_dev_environment_setup(
         # rebuild. Returning instead leaves the state file and the queue
         # agreeing -- nothing marked, nothing queued -- and that same next poll
         # retries the whole check-then-mark.
+        # (#198) The tag belongs to the dev-container environment, which
+        # several projects may share -- never compose it from the project name.
+        from services.dev_container_environment import image_tag_for
+
         marked = dev_container_state.set_status(
             project,
             DevContainerStatus.IN_PROGRESS,
-            image_name=f"{project}-agent:latest"
+            image_name=image_tag_for(project)
         )
         if not marked:
             logger.error(

@@ -20,6 +20,38 @@ class DevEnvironmentVerifierAgent(PipelineStage):
       prompts/content/review_cycle/verifier_rereviewing.md
     """
 
+    @staticmethod
+    def _record_status(project_name, status, success_log=None, **kwargs) -> bool:
+        """Write `status`, and announce it only if the write actually landed.
+
+        Two rules, both learned the hard way, in one place instead of six:
+
+        1. The return value is checked. set_status() is a compare-and-set that
+           can be refused, and it can fail outright; an unchecked write leaves
+           the environment at IN_PROGRESS, which every member of a shared
+           environment then waits on -- the dangling state this module's
+           CRITICAL comment exists to prevent.
+        2. `success_log` fires only on success. Announcing regardless produced
+           adjacent lines reading "Failed to record VERIFIED for features" and
+           "Marked ... as VERIFIED"; whichever an operator read second is the
+           one they believed. services/dev_container_state.py makes the same
+           point about its own reset announcement (#171 review).
+
+        Returns whether the write landed.
+        """
+        wrote = bool(dev_container_state.set_status(
+            project_name=project_name, status=status, **kwargs
+        ))
+        if not wrote:
+            logger.error(
+                "Failed to record %s for %s; the environment may remain "
+                "IN_PROGRESS and stall every member of it",
+                status.value, project_name,
+            )
+        elif success_log:
+            logger.info(*success_log)
+        return wrote
+
     def __init__(self, agent_config: Dict[str, Any] = None):
         super().__init__("dev_environment_verifier", agent_config=agent_config)
         self._prompt_builder = PromptBuilder()
@@ -116,20 +148,94 @@ class DevEnvironmentVerifierAgent(PipelineStage):
         if status_match:
             status = status_match.group(1).strip().upper()
             if status == "APPROVED":
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.VERIFIED,
-                    image_name=f"{project_name}-agent:latest",
+                # (#198) The tag belongs to the dev-container ENVIRONMENT, which
+                # several projects may share -- never compose it from the project
+                # name here.
+                from services.dev_container_environment import (
+                    environment_for,
+                    image_tag_for,
                 )
-                logger.info("Marked %s dev container as VERIFIED", project_name)
+
+                expected_tag = image_tag_for(project_name)
+                environment = environment_for(project_name)
+
+                # ASSERT, don't trust (#198). The setup agent issues the
+                # `docker build` itself from inside its own Claude Code
+                # session, so the tag is produced by a model following a
+                # prompt. A build tagged from the project name instead of the
+                # environment would be a perfectly good image under a name
+                # nothing ever reads -- surfacing forever after as "not built"
+                # with no indication why. Checking here converts that into one
+                # legible failure naming both tags.
+                #
+                # BLOCKED, deliberately, and NOT retried here. Two earlier
+                # attempts to soften this were both worse:
+                #
+                #   * raising a DockerUnavailableError from verify_image_exists
+                #     to separate "missing" from "Docker did not answer" -- the
+                #     raise sat inside a try whose own `except Exception`
+                #     caught it, so it never fired, while a sibling raise from
+                #     an except handler DID escape and broke three unrelated
+                #     callers that degrade gracefully on False.
+                #   * recording CHANGES_NEEDED instead, so a transient Docker
+                #     failure would age out -- but the fault this check exists
+                #     for (a model tagging the image after the project) is
+                #     DETERMINISTIC, and CHANGES_NEEDED's 30-minute staleness
+                #     escape has no attempt counter outside repair_cycle. That
+                #     turned one terminal failure into an unbounded loop of
+                #     hour-scale rebuilds, per member, with the stage still
+                #     reporting success so nothing ever counted it.
+                #
+                # BLOCKED is terminal, bounded, respected by every member of
+                # the environment, and clearable by an operator
+                # (scripts/set_dev_container_verified.py). The transient case
+                # is made diagnosable instead of special-cased: verify_image_
+                # exists now logs Docker's own stderr, so "Cannot connect to
+                # the Docker daemon" is distinguishable from "No such image"
+                # in the log line right above this verdict.
+                if not dev_container_state.verify_image_exists(
+                    project_name, image_name=expected_tag
+                ):
+                    error_message = (
+                        f"Verifier approved the environment but the expected image "
+                        f"tag {expected_tag!r} does not exist (or is not a genuine "
+                        f"agent environment). Most likely the build tagged the image "
+                        f"after the project name instead of the dev-container "
+                        f"environment {environment!r}; if the log line above reports "
+                        f"a Docker error instead, the image could not be checked at "
+                        f"all. Re-run dev_environment_setup; it must use the image "
+                        f"tag supplied in its prompt verbatim."
+                    )
+                    # Not truncated -- the remedy is in the second half, and
+                    # this is the operator's only persistent record.
+                    if self._record_status(
+                        project_name,
+                        DevContainerStatus.BLOCKED,
+                        error_message=error_message,
+                    ):
+                        logger.error(
+                            "Refusing to mark %s VERIFIED: expected image %s is "
+                            "missing or unverifiable", project_name, expected_tag,
+                        )
+                else:
+                    self._record_status(
+                        project_name,
+                        DevContainerStatus.VERIFIED,
+                        success_log=(
+                            "Marked dev container environment %s as VERIFIED (image %s, "
+                            "requested by project %s)",
+                            environment, expected_tag, project_name,
+                        ),
+                        image_name=expected_tag,
+                    )
             elif status == "BLOCKED":
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Verification failed"
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
                     error_message=error_message[:200],
                 )
                 logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
@@ -141,23 +247,23 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
                 error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.CHANGES_NEEDED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.CHANGES_NEEDED,
                     error_message=error_message[:200],
                 )
                 logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message[:100])
             else:
                 # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
                 error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED, BLOCKED, or CHANGES NEEDED)"
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
+                    success_log=(
+                        "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
+                        error_message, project_name
+                    ),
                     error_message=error_message[:200],
-                )
-                logger.error(
-                    "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
-                    error_message, project_name
                 )
         else:
             # No "### Status **X**" marker in the final response text. Before
@@ -216,16 +322,16 @@ class DevEnvironmentVerifierAgent(PipelineStage):
             else:
                 snippet = review_text.strip()[:300]
                 error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
-                dev_container_state.set_status(
-                    project_name=project_name,
-                    status=DevContainerStatus.BLOCKED,
+                self._record_status(
+                    project_name,
+                    DevContainerStatus.BLOCKED,
+                    success_log=(
+                        "Could not parse verification status for %s -- marking dev container BLOCKED "
+                        "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
+                        "output excerpt)",
+                        project_name, project_name
+                    ),
                     error_message=error_message[:200],
-                )
-                logger.error(
-                    "Could not parse verification status for %s -- marking dev container BLOCKED "
-                    "instead of leaving it stuck (see state/dev_containers/%s.yaml for the raw "
-                    "output excerpt)",
-                    project_name, project_name
                 )
 
         return {"status": "success", "agent_output": review_text}

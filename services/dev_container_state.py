@@ -112,9 +112,38 @@ class DevContainerStateManager:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"DevContainerStateManager initialized with state_dir: {state_dir}")
 
+    @staticmethod
+    def _status_from_state(state: Dict, label: str) -> 'DevContainerStatus':
+        """Parse a state dict's status, defaulting to UNVERIFIED and saying so.
+
+        Written out three times before this (get_status, get_status_and_updated_at,
+        get_all_statuses), and the third copy swallowed the exception silently
+        where the other two logged.
+        """
+        try:
+            return DevContainerStatus(state.get('status', 'unverified'))
+        except Exception as e:
+            logger.error(f"Failed to read dev container status for {label}: {e}")
+            return DevContainerStatus.UNVERIFIED
+
     def get_state_file(self, project_name: str) -> Path:
-        """Get the state file path for a project"""
-        return self.state_dir / f"{project_name}.yaml"
+        """State file for the dev-container ENVIRONMENT `project_name` uses (#198).
+
+        Resolution happens here, at the one place that turns a project into a
+        path, so every accessor on this class -- reads and writes alike -- keys
+        on the environment without each having to remember to resolve.
+
+        Unlike the rejected owner/sharer design, writes resolve too: under
+        environments every member is equally entitled to build, and the first
+        one to get the lock does. There is no "borrowing" member whose writes
+        would need refusing.
+
+        Identity for any project that has not opted in, so an unconfigured
+        deployment reads and writes exactly the paths it always did.
+        """
+        from services.dev_container_environment import environment_for
+
+        return self.state_dir / f"{environment_for(project_name)}.yaml"
 
     def get_status(self, project_name: str) -> DevContainerStatus:
         """
@@ -126,12 +155,7 @@ class DevContainerStateManager:
         Returns:
             Current DevContainerStatus
         """
-        try:
-            status_str = self._read_state(project_name).get('status', 'unverified')
-            return DevContainerStatus(status_str)
-        except Exception as e:
-            logger.error(f"Failed to read dev container status for {project_name}: {e}")
-            return DevContainerStatus.UNVERIFIED
+        return self._status_from_state(self._read_state(project_name), project_name)
 
     def get_status_and_updated_at(
         self, project_name: str
@@ -340,8 +364,17 @@ class DevContainerStateManager:
         """
         cleared = 0
         for state_file in sorted(self.state_dir.glob('*.yaml')):
+            # These stems are ENVIRONMENT names, and must NOT be run back
+            # through project->environment resolution (#198). Resolution is
+            # identity only for a stem that is not itself a project name --
+            # which is false for exactly the case this feature creates: a
+            # leftover `features.yaml` from before `features` joined
+            # environment `monorepo` resolves to monorepo.yaml, so this loop
+            # would read and clear a DIFFERENT file than the one it is
+            # iterating, and the stale marker on the leftover file would never
+            # be cleared at all. Read the file directly instead.
+            state = self._read_state_file(state_file)
             project_name = state_file.stem
-            state = self._read_state(project_name)
             if not state.get('pending_operation'):
                 continue
             if not self._is_stale_pending_operation(state.get('pending_operation_at')):
@@ -367,8 +400,14 @@ class DevContainerStateManager:
             # compare-and-set claims a clear the CAS may refuse, and here the
             # refusal is the interesting case -- it means a rebuild was requested
             # in the gap and its 'queued' display is (correctly) still standing.
-            written = self._merge_state(
-                project_name,
+            # Path-keyed, matching the read above. Passing the stem to
+            # _merge_state() resolved it through environment_for() and wrote a
+            # DIFFERENT file than the one just read -- so for the leftover
+            # per-project file this loop exists to clean, the compare-and-set
+            # checked one file's marker against another's contents and the
+            # stale marker was never cleared at all.
+            written = self._merge_state_file(
+                state_file,
                 {'pending_operation': None, 'pending_operation_at': None},
                 expect={
                     'pending_operation': state['pending_operation'],
@@ -469,35 +508,38 @@ class DevContainerStateManager:
         """
         return self._read_state(project_name)
 
-    def _read_state(self, project_name: str) -> Dict:
-        """
-        The project's state file as a dict, {} if absent or unreadable.
+    def _read_state_file(self, state_file: Path) -> Dict:
+        """Read one state file BY PATH, with no project->environment resolution.
 
-        Taken under the state file's own lock so a reader never sees the
-        half-written file a concurrent _merge_state() is producing -- the same
-        reason PipelineLockManager._read_yaml_lock_only holds its lock across
-        the read.
+        For callers that already hold an environment-keyed path (the state_dir
+        globs). _read_state() resolves its argument, which is correct for a
+        project name and wrong for a stem that is already an environment.
         """
         from utils.file_lock import file_lock
 
-        state_file = self.get_state_file(project_name)
-
         if not state_file.exists():
             return {}
-
         try:
             with file_lock(
                 self._state_lock_file(state_file),
                 timeout=STATE_LOCK_TIMEOUT_SECONDS,
                 enforce_timeout=True,
             ):
-                if not state_file.exists():  # Check again inside lock
+                if not state_file.exists():
                     return {}
                 with open(state_file, 'r') as f:
                     return yaml.safe_load(f) or {}
         except Exception as e:
-            logger.error(f"Failed to read dev container state for {project_name}: {e}")
+            logger.error(f"Failed to read dev container state file {state_file}: {e}")
             return {}
+
+    def _read_state(self, project_name: str) -> Dict:
+        """The project's state file as a dict, {} if absent or unreadable.
+
+        Delegates, so the locked read-modify-read dance lives in exactly one
+        place -- the same shape as _merge_state/_merge_state_file.
+        """
+        return self._read_state_file(self.get_state_file(project_name))
 
     @staticmethod
     def _state_lock_file(state_file: Path) -> Path:
@@ -571,9 +613,22 @@ class DevContainerStateManager:
         refusal means somebody else's fresher record is standing while a failure
         means this call's own verdict never reached disk.
         """
-        from utils.file_lock import file_lock
+        return self._merge_state_file(
+            self.get_state_file(project_name), updates, expect=expect
+        )
 
-        state_file = self.get_state_file(project_name)
+    def _merge_state_file(
+        self, state_file: 'Path', updates: Dict, expect: Optional[Dict] = None
+    ) -> StateWriteResult:
+        """_merge_state() addressed BY PATH, with no project->environment
+        resolution.
+
+        For callers that already hold an environment-keyed path -- the state_dir
+        globs, whose stems ARE environment names. Resolving such a stem again
+        writes a different file than the caller read; see
+        clear_stale_pending_operations().
+        """
+        from utils.file_lock import file_lock
 
         try:
             with file_lock(
@@ -599,7 +654,7 @@ class DevContainerStateManager:
                     }
                     if stale:
                         logger.info(
-                            f"Skipping dev container state write for {project_name}: "
+                            f"Skipping dev container state write for {state_file.stem}: "
                             f"expected {expect}, found {stale} on disk -- something "
                             f"else wrote a fresher value while this caller was "
                             f"deciding, so its decision no longer applies"
@@ -622,7 +677,7 @@ class DevContainerStateManager:
                     yaml.dump(state, f, default_flow_style=False)
                 return StateWriteResult.WRITTEN
         except Exception as e:
-            logger.error(f"Failed to save dev container state for {project_name}: {e}")
+            logger.error(f"Failed to save dev container state for {state_file.stem}: {e}")
             return StateWriteResult.FAILED
 
     def get_status_updated_at(self, project_name: str) -> Optional[datetime]:
@@ -703,6 +758,37 @@ class DevContainerStateManager:
             return False
 
         try:
+            exists, _inconclusive = self._probe_image(image_name)
+            return exists
+
+        except Exception as e:
+            logger.error(f"Error checking if Docker image {image_name} exists: {e}")
+            return False
+
+    def _probe_image(self, image_name: str) -> Tuple[bool, bool]:
+        """(exists, inconclusive) for `image_name`.
+
+        Private because only ONE caller needs the second element:
+        verify_and_update_status(), which turns a negative into a durable state
+        mutation and must not do that on an unanswered probe. Every other
+        caller wants the plain bool that verify_image_exists() still returns,
+        and three of them degrade gracefully on it.
+
+        Deliberately not an exception (#199 review). Raising from the probe was
+        tried: the raise for the unreachable-daemon case sat inside a `try`
+        whose own `except Exception` caught it, so it never fired, while the
+        timeout raise came from inside an except handler and DID escape --
+        breaking docker_runner's image selection, main.py's startup sweep and
+        project_workspace's dependency extraction, none of which had any reason
+        to change. A second return value cannot be swallowed by a handler and
+        cannot escape to a caller that did not ask for it.
+
+        `inconclusive` is True only when Docker did not answer -- an
+        unreachable daemon, a permission failure, or the 10s timeout. A
+        successful "no such image", and an image present but missing the
+        agent-environment label, are both conclusive negatives.
+        """
+        try:
             result = subprocess.run(
                 ['docker', 'image', 'inspect',
                  '--format', '{{ index .Config.Labels "%s" }}' % SWITCHYARD_AGENT_ENV_LABEL,
@@ -711,30 +797,46 @@ class DevContainerStateManager:
                 text=True,
                 timeout=10
             )
-
-            if result.returncode != 0:
-                logger.warning(f"Docker image {image_name} does not exist locally (state may be stale)")
-                return False
-
-            if result.stdout.strip() != "true":
-                logger.warning(
-                    f"Docker image {image_name} exists but is missing the "
-                    f"{SWITCHYARD_AGENT_ENV_LABEL} label — it was not built from this "
-                    f"project's Dockerfile.agent and has likely overwritten the tag "
-                    f"(e.g. an unrelated docker-compose service sharing the same name). "
-                    f"Treating as not verified; rebuild required."
-                )
-                return False
-
-            logger.debug(f"Docker image {image_name} exists locally and is a genuine agent environment")
-            return True
-
         except subprocess.TimeoutExpired:
-            logger.error(f"Timeout checking if Docker image {image_name} exists")
-            return False
+            logger.error(
+                f"Timed out asking Docker whether {image_name} exists; treating "
+                f"as unknown, not as absent"
+            )
+            return False, True
         except Exception as e:
             logger.error(f"Error checking if Docker image {image_name} exists: {e}")
-            return False
+            return False, True
+
+        if result.returncode != 0:
+            # Docker's own stderr, which used to be captured and discarded
+            # (#199 review): "Cannot connect to the Docker daemon" and "No such
+            # image" produced byte-identical output, so an operator reading a
+            # BLOCKED verdict could not tell them apart.
+            stderr = (result.stderr or '').strip()
+            lowered = stderr.lower()
+            unanswered = (
+                'cannot connect to the docker daemon' in lowered
+                or 'permission denied' in lowered
+                or 'is the docker daemon running' in lowered
+            )
+            logger.warning(
+                f"`docker image inspect {image_name}` failed "
+                f"(rc={result.returncode}): {stderr[:200] or 'no stderr'}"
+            )
+            return False, unanswered
+
+        if result.stdout.strip() != "true":
+            logger.warning(
+                f"Docker image {image_name} exists but is missing the "
+                f"{SWITCHYARD_AGENT_ENV_LABEL} label - it was not built from this "
+                f"project's Dockerfile.agent and has likely overwritten the tag "
+                f"(e.g. an unrelated docker-compose service sharing the same name). "
+                f"Treating as not verified; rebuild required."
+            )
+            return False, False
+
+        logger.debug(f"Docker image {image_name} exists locally and is a genuine agent environment")
+        return True, False
 
     def verify_and_update_status(self, project_name: str) -> bool:
         """
@@ -767,9 +869,28 @@ class DevContainerStateManager:
         if status != DevContainerStatus.VERIFIED:
             return True  # No verification needed for other states
 
-        # Check if image actually exists
-        if self.verify_image_exists(project_name, image_name=image_name):
+        # Check if image actually exists.
+        #
+        # The INCONCLUSIVE case is handled separately here and nowhere else
+        # (#199 review). verify_image_exists() returns False both for "no such
+        # image" and for "Docker did not answer" -- and its four callers mostly
+        # degrade harmlessly on that, so the bool contract is right for them.
+        # This caller is the exception: it turns a False into a DURABLE state
+        # mutation (VERIFIED -> UNVERIFIED), which under a shared environment
+        # un-verifies every member and queues a full rebuild for all of them.
+        # One slow `docker image inspect` during a busy startup should not do
+        # that. Probed through the private helper so the public contract --
+        # which three other callers depend on -- is untouched.
+        exists, inconclusive = self._probe_image(image_name)
+        if exists:
             return True  # Image exists, all good
+        if inconclusive:
+            logger.warning(
+                f"Could not determine whether {image_name} exists; leaving "
+                f"{project_name}'s dev-container status unchanged rather than "
+                f"forcing a rebuild on an unanswered probe"
+            )
+            return False
 
         # Image is missing, or the tag now points at something that isn't a
         # genuine switchyard agent environment (see verify_image_exists) - reset
@@ -852,16 +973,27 @@ class DevContainerStateManager:
 
     def get_all_statuses(self) -> Dict[str, DevContainerStatus]:
         """
-        Get status for all projects
+        Status of every dev-container ENVIRONMENT on disk.
+
+        Keys are environment names, which for a project that has not opted
+        into a shared environment is its own name (#198) -- so this reads as
+        "per project" for any deployment that configures no environments.
+        Where projects DO share one, the shared environment appears once, not
+        once per member.
 
         Returns:
-            Dict mapping project names to their dev container status
+            Dict mapping environment names to their dev container status
         """
         statuses = {}
 
         for state_file in self.state_dir.glob("*.yaml"):
-            project_name = state_file.stem
-            statuses[project_name] = self.get_status(project_name)
+            # Read the file directly rather than resolving its stem (#198) --
+            # see clear_stale_pending_operations for why passing an environment
+            # name back through project->environment resolution is unsound.
+            environment = state_file.stem
+            statuses[environment] = self._status_from_state(
+                self._read_state_file(state_file), environment
+            )
 
         return statuses
 

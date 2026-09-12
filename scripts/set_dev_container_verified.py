@@ -19,7 +19,20 @@ if __name__ == '__main__':
         sys.exit(1)
 
     project_name = sys.argv[1]
-    image_name = f"{project_name}-agent:latest"
+
+    # (#198) The tag belongs to the dev-container ENVIRONMENT, which may be
+    # shared with other projects. Marking it verified marks it verified for
+    # every member, so say so rather than letting an operator believe this
+    # override is scoped to one project.
+    from services.dev_container_environment import environment_for, image_tag_for
+
+    image_name = image_tag_for(project_name)
+    environment = environment_for(project_name)
+    if environment != project_name:
+        print(
+            f"Note: {project_name} shares dev-container environment "
+            f"'{environment}'. This override applies to every project in it."
+        )
 
     # dev_container_build lock (#56): this is one of the two admin scripts
     # that used to bypass PipelineLockManager entirely and could race a live
