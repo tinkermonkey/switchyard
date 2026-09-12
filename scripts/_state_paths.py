@@ -23,8 +23,12 @@ own checkout when unset, resolved, and a relative value refused outright.
 The import is deferred into the call because `config/state_manager.py` builds a
 module-level GitHubStateManager at import time and that constructor mkdirs
 `state/projects` and `state/orchestrator`. Importing it at module scope would
-make merely importing one of these scripts create directories; the eight
-existing first-party call sites defer for the same reason.
+make merely importing one of these scripts create directories. The seven
+first-party call sites that already existed defer for the same reason
+(claude/claude_integration.py, both pipeline/*_checkpoint.py,
+services/agent_container_recovery.py, services/observability_server.py,
+services/review_cycle.py, state_management/pr_review_state_manager.py);
+mcp/server.py becomes the eighth below.
 """
 
 from pathlib import Path

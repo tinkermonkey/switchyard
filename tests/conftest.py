@@ -1494,13 +1494,18 @@ FIRST_PARTY_PREFIXES = (
 # tests/unit/services/test_data_retention.py (four tests, each reloading once
 # under a patched RETENTION_DAYS and once more in a `finally`).
 #
-# Allowed because config/retention.py defines no class and no object: four
-# module-level ints and five functions. So a reload mints nothing that
-# `isinstance` or `patch(...)` can start disagreeing about. What it DOES leave
-# stale is the copy each `from config.retention import RETENTION_DAYS` took --
-# ten non-test modules do that, observability.py and pipeline_run.py among
-# them -- which is why those four tests restore the module in a `finally`
-# rather than leaving the last reload standing.
+# Allowed because config/retention.py mints no new object on reload. It
+# defines no class at all: four module-level ints (RETENTION_DAYS,
+# RETENTION_SECONDS, _DEFAULT_RETENTION_DAYS, MONTHLY_INDEX_PERIOD_DAYS), five
+# functions, and one object -- `logger`. That one is safe for its own reason,
+# measured on this container rather than assumed: logging.getLogger returns the
+# manager-cached Logger, so `r.logger is before_logger` is True across an
+# importlib.reload. So a reload mints nothing that `isinstance` or `patch(...)`
+# can start disagreeing about. What it DOES leave stale is the copy each
+# `from config.retention import RETENTION_DAYS` took -- ten non-test modules do
+# that, observability.py and pipeline_run.py among them -- which is why those
+# four tests restore the module in a `finally` rather than leaving the last
+# reload standing.
 RELOADABLE_FIRST_PARTY_MODULES = frozenset({
     'config.retention',
 })
@@ -1515,9 +1520,11 @@ def _restore_process_globals():
 
       * `os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)`. Assigned directly
         rather than through monkeypatch, so it survives. Every later test that
-        resolves a state path gets a directory pytest has since deleted. Two
-        files do this (test_work_execution_redis_recovery.py,
-        test_stale_execution_history.py, the latter at six separate sites).
+        resolves a state path gets a directory pytest has since deleted.
+        Three files do this, at eight sites: test_stale_execution_history.py
+        (six), test_work_execution_redis_recovery.py and
+        test_container_redis_tracking.py (one each). The last also does the
+        second bullet, in the same helper.
       * `sys.modules.pop('services.work_execution_state', None)` to force a
         re-import. The re-import builds a NEW module-level singleton and a NEW
         class object, so anything holding the old one keeps a stale root and
