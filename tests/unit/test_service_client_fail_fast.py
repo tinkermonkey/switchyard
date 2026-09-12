@@ -4,9 +4,16 @@ A test run cannot block on a service that is not there (#174).
 On a bare python:3.11-slim runner with only `pip install -r requirements.txt`,
 `pytest tests/unit` did not finish: it reached services/cancellation.py's
 `redis.Redis(host='redis', port=6379, decode_responses=True).ping()` and sat
-there, ~6s of CPU over 3+ minutes at ~0.2%. pytest.ini's `timeout = 300` does
-not bound it, because pytest-timeout cannot interrupt a blocking socket call in
-the main thread.
+there, ~6s of CPU over 3+ minutes at ~0.2%. Nothing bounded it: pytest.ini's
+`timeout = 300` was dead config at the time -- wrong section, and pytest-timeout
+not installed (#204).
+
+An earlier version of this docstring gave the reason as "pytest-timeout cannot
+interrupt a blocking socket call in the main thread". That is not true and was
+never measured; see tests/conftest.py's
+_refuse_to_resolve_compose_service_hostnames for the measurement that replaced
+it. The live 180s timeout does bound this, but as a 180s abort-with-stacks; the
+guards below keep it to a fast, specific failure instead.
 
 The obvious reading is a missing socket_connect_timeout, and ~20 call sites
 across services/, monitoring/, claude/ and task_queue/ do omit one. Timing it in

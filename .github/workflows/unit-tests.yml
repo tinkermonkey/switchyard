@@ -11,13 +11,24 @@
 # Why this can exist at all now: until the service fail-fast guards in
 # tests/conftest.py, this job would not have finished. `pytest tests/unit` on a
 # bare python:3.11-slim blocked against the hardcoded `redis` hostname -- ~6s of
-# CPU over 3+ minutes at 0.2% utilisation -- and pytest.ini's `timeout = 300`
-# does not bound a socket call. It now completes in ~90s. Note the guards make
+# CPU over 3+ minutes at 0.2% utilisation -- and nothing bounded it, because
+# pytest.ini's `timeout = 300` was dead config at the time (wrong section, and
+# pytest-timeout not installed -- #204; it is `timeout = 180` and live now).
+# Do not read that as "a timeout cannot bound a socket call": it can, measured,
+# and the earlier version of this comment saying otherwise was wrong. The live
+# timeout is a 180s abort-with-stacks; the conftest guards are what make this
+# fast. It now completes in ~90s. Note the guards make
 # `redis`/`elasticsearch`/`otel-collector` fail to resolve at all here; if this
 # job ever gains real `services:` containers, it must also set
 # SWITCHYARD_TEST_ALLOW_SERVICE_HOSTS=1 or they will be unreachable. That same
 # variable is what re-enables tests/conftest.py's test-data purge, which is
 # otherwise off outside the orchestrator container.
+#
+# One thing to know when reading a red run here: pytest.ini sets
+# `timeout_method = thread`, which calls os._exit(1) on a timeout. A single
+# wedged test therefore ends this job with a stack dump and no summary line and
+# no results for anything after it. That is deliberate (pytest.ini has the
+# measurements), but it means "no summary" here is a timeout, not a crash.
 #
 # What it does NOT cover: the ~65 test files that skip themselves when /app is
 # absent, because they import modules that genuinely only work inside the

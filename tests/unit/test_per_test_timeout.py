@@ -30,9 +30,12 @@ import pytest
 # fails at collection with a ModuleNotFoundError naming the package, rather
 # than passing vacuously. It is the second line of defence, not the first --
 # pytest.ini's `--strict-config` turns the same condition into
-# `ERROR: Unknown config option: timeout` and exit 4 before anything is
-# collected (measured). This one still matters if someone ever drops
-# --strict-config.
+# `ERROR: Unknown config option: timeout` and exit 4 with no test run.
+# Measured, with the plugin unimportable: that error prints on the
+# `collecting ...` line, the suite is still collected in full (`collected 3779
+# items`), and the run phase is what is skipped -- so this import raises during
+# that same collection pass and both defences report together. This one still
+# matters if someone ever drops --strict-config.
 import pytest_timeout
 
 # The private resolver pytest-timeout's own `pytest_runtest_protocol` calls to
@@ -48,6 +51,20 @@ from pytest_timeout import _get_item_settings
 # walls it has to stay inside, not a restatement of it.
 SLOWEST_MEASURED_TEST_SECONDS = 45.2
 FULL_UNIT_SUITE_SECONDS = 162.0
+
+# The headroom multiple pytest.ini argues for and sizes `timeout` by: 4x the
+# slowest measured test, which is real headroom rather than a guess because
+# that test's 45s is a fixed wall-clock budget (four runs: 45.07/45.14/45.15/
+# 45.14s) rather than CPU work that stretches on slower hardware.
+#
+# The upper guard below asserts exactly this multiple rather than something
+# looser, because a looser bound does not defend the decision it documents.
+# The dead value #204 removed was 300s, and an earlier version of that guard
+# read `timeout <= 2 * FULL_UNIT_SUITE_SECONDS` (324s) -- mutation-tested, it
+# passed at `-o timeout=300` and only started failing at 325, i.e. someone
+# could restore the exact value the issue calls useless and this file would
+# still go green. 300s is 6.6x the slowest test; 180s is 3.98x.
+MAX_HEADROOM_OVER_SLOWEST_TEST = 4
 
 
 def _resolved_timeout(node):
@@ -105,14 +122,23 @@ class TestTheTimeoutIsLiveForThisVeryTest:
         )
 
     def test_the_value_is_not_so_large_it_stops_bounding_anything(self, request):
-        """Above the whole suite's own runtime the number stops being a bound on
-        anything a human would wait for. The previous dead value was 300s --
-        1.85x the entire suite for one wedged test."""
+        """Past a few multiples of the slowest real test the number stops being
+        a bound on anything a human would wait for. The previous dead value was
+        300s: 6.6x the slowest test and 1.85x the entire suite, for one wedged
+        test. This asserts the 4x headroom pytest.ini actually argues for, so
+        restoring 300 fails here -- mutation-tested both ways."""
         timeout = _resolved_timeout(request.node)
+        ceiling = MAX_HEADROOM_OVER_SLOWEST_TEST * SLOWEST_MEASURED_TEST_SECONDS
 
-        assert timeout <= 2 * FULL_UNIT_SUITE_SECONDS, (
-            f'timeout={timeout}s lets a single wedged test cost more than two '
-            f'clean runs of the whole {FULL_UNIT_SUITE_SECONDS}s suite.'
+        assert timeout <= ceiling, (
+            f'timeout={timeout}s is more than {MAX_HEADROOM_OVER_SLOWEST_TEST}x '
+            f'the slowest measured test ({SLOWEST_MEASURED_TEST_SECONDS}s), i.e. '
+            f'above the {ceiling}s ceiling pytest.ini sizes the value by, and '
+            f'{timeout / FULL_UNIT_SUITE_SECONDS:.2f}x a clean run of the whole '
+            f'{FULL_UNIT_SUITE_SECONDS}s suite. If a slower test is now '
+            'legitimate, re-measure it and move SLOWEST_MEASURED_TEST_SECONDS; '
+            'if the headroom multiple itself should change, change it here and '
+            'in pytest.ini together.'
         )
 
     # There is deliberately no "the method is one pytest-timeout implements"
@@ -124,18 +150,24 @@ class TestTheTimeoutIsLiveForThisVeryTest:
     # thing it guards is broken guards nothing.
 
     def test_the_method_is_thread(self, request):
-        """Measured, not preference. Against the hazard #204 is about -- a test
-        patching `threading.Thread` globally starves a ThreadPoolExecutor and
-        the first `future.result()` blocks forever -- `thread` reported a
-        timeout with a stack naming `waiter.acquire()`, while `signal` stopped
-        the hang but surfaced it as `RuntimeError: cannot join thread before it
-        is started` from the executor's `__exit__`, with no mention of a
-        timeout. `thread` is also immune to that same patch, because
-        `threading.Timer` subclasses the real `Thread` captured when
-        `threading` was imported.
+        """`thread` is not the plugin default -- pytest_timeout.py picks
+        `signal` wherever SIGALRM exists -- so this pins a deliberate override,
+        and pytest.ini carries the measurements behind it.
 
-        Change this if the tradeoff is reconsidered -- `thread` hard-exits the
-        run, which is a real cost -- but change it knowing that is the trade.
+        The short version, because the long one used to be wrong here: on the
+        RecordedThread/ThreadPoolExecutor wedge #204 is about, the two methods
+        give the *same* diagnosis (`Failed: Timeout (>3.0s)` at
+        threading.py:327 `waiter.acquire()`), both dump every thread's stack,
+        and neither bounds a C-level loop holding the GIL. The one measured
+        difference that favours `thread` is that `signal` raises the timeout
+        *into the test*, so a retry loop swallowing BaseException absorbs it
+        and hangs on regardless; `thread`'s timer needs no cooperation and
+        killed that case at the limit.
+
+        Change this if the tradeoff is reconsidered -- `thread` calls
+        os._exit(1), so the rest of the run is abandoned and the report-only CI
+        job loses its results, which is a real cost -- but change it knowing
+        that is the trade, and re-measure rather than reasoning about it.
         """
         assert _get_item_settings(request.node).method == 'thread'
 
