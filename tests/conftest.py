@@ -797,22 +797,80 @@ def pytest_sessionfinish(session, exitstatus):
 CONTAINER_ONLY_SKIP_REASON = "Requires Docker container environment"
 
 
+# pytest-timeout's entry-point name, which is what it is registered under --
+# `timeout = pytest_timeout` in its own metadata, not the distribution name.
+# Asking the plugin manager is asking the enforcement path itself: it is False
+# both when the package is absent and when someone passes `-p no:timeout`, and
+# those are the same thing as far as pytest.ini's `timeout` key is concerned.
+TIMEOUT_PLUGIN_NAME = "timeout"
+
+
+def timeout_plugin_missing_header(config):
+    """A line naming the remedy when pytest-timeout is not registered, else None.
+
+    `pytest-timeout` is a dependency this repo only acquired in #204, and
+    pytest.ini's `--strict-config` makes its absence fatal rather than degraded.
+    Measured in the orchestrator container with the plugin unimportable
+    (`PYTHONNOUSERSITE=1`, since the only copy in the running container is a
+    user-site install that a `docker compose up` recreate discards): pytest
+    prints `ERROR: Unknown config option: timeout` **on stderr**, collects the
+    whole suite anyway (`collected 3781 items / 1 error` -- the full count at
+    this commit), then exits 4 having run nothing.
+
+    Both halves of that are bad to land on cold. The stderr line is gone the
+    moment anyone pipes stdout, and neither it nor the `ModuleNotFoundError: No
+    module named 'pytest_timeout'` that the guard file raises during the same
+    collection pass says the thing you actually need to do, which is rebuild an
+    image that predates the dependency. This puts that on stdout, in the header
+    block, where the existing container-gating line already lives.
+
+    Reporting rather than failing on purpose: `--strict-config` has already
+    decided the run is over. Adding a second failure here would only change
+    which error you see first.
+    """
+    if config.pluginmanager.hasplugin(TIMEOUT_PLUGIN_NAME):
+        return None
+    return (
+        "pytest-timeout: NOT REGISTERED -- pytest.ini's --strict-config turns "
+        "this into `ERROR: Unknown config option: timeout` on stderr and exit 4. "
+        "Collection still completes and prints a full item count; no test runs. "
+        "The plugin is pinned in requirements.txt (#204), so an image built "
+        "before that landed does not have it: rebuild with "
+        "`docker compose build orchestrator`, and rebuild agent images after "
+        "(Dockerfile.agent is FROM switchyard-orchestrator:latest)."
+    )
+
+
 def pytest_report_header(config):
     """
     Say up front whether the container-gated portion of the suite can run at all
-    (#140 item 37).
+    (#140 item 37), and whether the per-test timeout exists (#204).
 
-    A host run skips those files wholesale, and pytest's summary line reports
-    those skips indistinguishably from any other -- so the run looks green while
-    a large share of it never executed. It is now stated before the first test.
+    A host run skips container-gated files wholesale, and pytest's summary line
+    reports those skips indistinguishably from any other -- so the run looks
+    green while a large share of it never executed. It is now stated before the
+    first test.
+
+    This hook runs even on the exit-4 path `--strict-config` takes when
+    pytest-timeout is missing -- measured, the header block prints in full
+    before the run is abandoned -- which is what makes it a usable place to put
+    that remedy.
     """
     if running_in_orchestrator_container():
-        return f"orchestrator container: yes ({ORCHESTRATOR_CONTAINER_MARKER} present)"
-    return (
-        f"orchestrator container: NO ({ORCHESTRATOR_CONTAINER_MARKER} absent) -- every "
-        "container-gated test file will be SKIPPED, not run. For full coverage: "
-        "docker exec -w /workspace/switchyard switchyard-orchestrator-1 python -m pytest <path>"
-    )
+        lines = [
+            f"orchestrator container: yes ({ORCHESTRATOR_CONTAINER_MARKER} present)"
+        ]
+    else:
+        lines = [
+            f"orchestrator container: NO ({ORCHESTRATOR_CONTAINER_MARKER} absent) -- every "
+            "container-gated test file will be SKIPPED, not run. For full coverage: "
+            "docker exec -w /workspace/switchyard switchyard-orchestrator-1 python -m pytest <path>"
+        ]
+
+    timeout_line = timeout_plugin_missing_header(config)
+    if timeout_line is not None:
+        lines.append(timeout_line)
+    return lines
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

@@ -31,11 +31,14 @@ import pytest
 # than passing vacuously. It is the second line of defence, not the first --
 # pytest.ini's `--strict-config` turns the same condition into
 # `ERROR: Unknown config option: timeout` and exit 4 with no test run.
-# Measured, with the plugin unimportable: that error prints on the
-# `collecting ...` line, the suite is still collected in full (`collected 3779
-# items`), and the run phase is what is skipped -- so this import raises during
-# that same collection pass and both defences report together. This one still
-# matters if someone ever drops --strict-config.
+# Measured, with the plugin unimportable: that error goes to stderr (so it lands
+# on the `collecting ...` line in a terminal and disappears if stdout is piped),
+# the suite is still collected in full (`collected 3781 items / 1 error` -- the
+# full count at this commit, the 1 error being this file), and the run phase is
+# what is skipped. So this import raises during that same collection pass and
+# both defences report together, alongside the third one that survives a pipe:
+# tests/conftest.py's report header. This one still matters if someone ever
+# drops --strict-config.
 import pytest_timeout
 
 # The private resolver pytest-timeout's own `pytest_runtest_protocol` calls to
@@ -262,6 +265,132 @@ class TestThePluginActuallyKillsAHungTest:
             f'the timeout report does not name the offending test or the call '
             f'it hung in:\n{output}'
         )
+
+
+class TestAMissingPluginSaysHowToFixIt:
+    """`pytest-timeout` is new in #204 and `--strict-config` makes its absence
+    fatal, so the first run of this suite inside any image built before #204
+    merged collects the whole suite and then exits 4 with nothing run.
+
+    That is the right shape -- a timeout that quietly evaporates is the bug #204
+    was filed about -- but on its own it says nothing about the cause. Measured
+    in the orchestrator container with the plugin unimportable, the operator
+    gets `ERROR: Unknown config option: timeout` on **stderr** (gone the moment
+    stdout is piped) and a `ModuleNotFoundError` from this file's import during
+    collection. Neither mentions rebuilding an image, which is the only fix.
+
+    tests/conftest.py's report header closes that gap. These three tests guard
+    it: that it stays quiet while the plugin is registered, that it produces the
+    remedy when it is not, and that pytest still reaches the hook on the exit-4
+    path -- a hook pytest never calls would be a guard that reads correct and
+    shows nobody anything. Mutation-tested: dropping the append in
+    pytest_report_header leaves the middle one passing and fails only the third,
+    which is why the third is not redundant.
+    """
+
+    # Same lever `--strict-config` reacts to and the same lever the header
+    # keys off: measured, `-p no:timeout` against this repo's pytest.ini gives
+    # `ERROR: Unknown config option: timeout`, exit 4, `no tests ran`. It is a
+    # faithful stand-in for "not installed" that works without uninstalling
+    # anything, so it runs in CI as well as here.
+    DISABLE_PLUGIN = ('-p', 'no:timeout')
+
+    # Words the remedy has to actually contain. A header that fires on the
+    # right condition and then fails to name the fix is the failure mode this
+    # class exists to prevent, so assert the substance, not just non-emptiness.
+    REQUIRED_PHRASES = ('requirements.txt', 'docker compose build orchestrator')
+
+    def test_the_header_is_silent_while_the_plugin_is_present(self, pytestconfig):
+        """The live config of the run executing this line. Ties the shim below
+        to reality: if `hasplugin('timeout')` ever stops being the question that
+        distinguishes present from absent, this starts failing on every green
+        run rather than letting the shim drift into testing nothing."""
+        from tests.conftest import timeout_plugin_missing_header
+
+        assert pytestconfig.pluginmanager.hasplugin('timeout')
+        assert timeout_plugin_missing_header(pytestconfig) is None, (
+            'the header is warning about a missing pytest-timeout during a run '
+            'in which pytest-timeout is demonstrably registered.'
+        )
+
+    def test_the_header_names_the_remedy_when_the_plugin_is_absent(self):
+        """The condition itself cannot be created in-process -- unregistering a
+        plugin mid-run does not un-parse the ini keys -- so this drives the hook
+        with a plugin manager reporting what the real one reports under
+        `-p no:timeout`. The out-of-process test below is what proves that
+        report and the real failure are the same event."""
+        from tests.conftest import timeout_plugin_missing_header
+
+        class _NoTimeoutPlugin:
+            def hasplugin(self, name):
+                return name != 'timeout'
+
+        class _Config:
+            pluginmanager = _NoTimeoutPlugin()
+
+        line = timeout_plugin_missing_header(_Config())
+
+        assert line is not None, (
+            'pytest-timeout is unregistered and the header said nothing.'
+        )
+        for phrase in self.REQUIRED_PHRASES:
+            assert phrase in line, (
+                f'the header fires but does not mention {phrase!r}, so it '
+                f'reports the symptom without the fix:\n{line}'
+            )
+
+    def test_the_header_reaches_the_screen_on_the_strict_config_exit(self):
+        """The part no in-process call can stand in for. `--strict-config` ends
+        the run at the config layer, and a header hook that pytest skips on that
+        path would leave the guard above passing while the operator sees only
+        the stderr line.
+
+        Measured: pytest prints the whole header block, reports `collected 0
+        items`, and exits 4. `tests/conftest.py` is the collection target on
+        purpose -- it loads this repo's conftest (which is what is under test)
+        without collecting any test file, so nothing here couples to another
+        file's contents.
+        """
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+
+        env = dict(os.environ)
+        env.pop('PYTEST_ADDOPTS', None)
+        env.pop('PYTEST_TIMEOUT', None)
+
+        completed = subprocess.run(
+            [
+                sys.executable, '-m', 'pytest',
+                '-p', 'no:randomly',
+                '-p', 'no:cacheprovider',
+                *self.DISABLE_PLUGIN,
+                '--collect-only', '-q',
+                os.path.join('tests', 'conftest.py'),
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert completed.returncode == 4, (
+            f'expected --strict-config to exit 4 with pytest-timeout '
+            f'unregistered, got {completed.returncode}:\n'
+            f'{completed.stdout}\n{completed.stderr}'
+        )
+        # Deliberately stdout only. The point of the header is that it survives
+        # `... | tee`, which the stderr line does not.
+        assert 'pytest-timeout: NOT REGISTERED' in completed.stdout, (
+            'the child exited 4 for exactly this reason and printed no header '
+            f'saying so on stdout:\n{completed.stdout}'
+        )
+        for phrase in self.REQUIRED_PHRASES:
+            assert phrase in completed.stdout, (
+                f'the header reached stdout without mentioning {phrase!r}:\n'
+                f'{completed.stdout}'
+            )
 
 
 class TestTheSuiteStillWritesNoLogFileIntoTheCheckout:

@@ -43,6 +43,14 @@ pytest-asyncio>=1.0.0
 # Supplies the per-test timeout configured in pytest.ini (#204). Without it
 # pytest does not even recognise the `timeout` ini key, so the suite has no
 # bound on a wedged test. Verified against pytest 9.1.1 with 2.4.0.
+#
+# NEW IN #204, AND `--strict-config` MAKES ITS ABSENCE FATAL: an image built
+# before #204 merged does not have it, and running the suite there collects
+# everything and then exits 4 with nothing run. Both images install from this
+# file (Dockerfile:102, Dockerfile.agent:47), so they must be rebuilt --
+# `docker compose build orchestrator` first, since Dockerfile.agent is
+# `FROM switchyard-orchestrator:latest`. CI is unaffected: unit-tests.yml
+# pip-installs this file on every run.
 pytest-timeout>=2.4.0
 
 # GitHub Integration
