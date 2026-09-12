@@ -8,7 +8,6 @@ This module manages the runtime state of GitHub projects, including:
 - Configuration reconciliation with GitHub
 """
 
-import os
 import yaml
 import hashlib
 from pathlib import Path
@@ -18,6 +17,14 @@ from datetime import datetime
 import logging
 
 from .manager import ConfigManager, ProjectConfig, WorkflowTemplate
+# Re-exported, not defined here. The resolution moved to config/paths.py so
+# that callers which must NOT build this module's GitHubStateManager singleton
+# (scripts/, services/data_retention.py) can reach it without importing this
+# module at all -- see config/paths.py's docstring for the measurement. Every
+# existing `from config.state_manager import orchestrator_state_root` and
+# every `patch('config.state_manager.orchestrator_state_root')` keeps working
+# through this name.
+from .paths import orchestrator_state_root  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -36,54 +43,6 @@ logger = logging.getLogger(__name__)
 # retention window that the sweep intends to keep. Two mechanisms with two
 # different answers for the same files is exactly the situation the single
 # value exists to remove.
-
-
-def orchestrator_state_root() -> Path:
-    """The `state/` tree this process owns, as a resolved absolute path.
-
-    ORCHESTRATOR_ROOT first, matching the eight other modules that derive a
-    state path (dev_container_state, work_execution_state, pipeline_queue_
-    manager, pipeline_lock_manager, pipeline_semaphore_manager,
-    conversational_session_state, scheduled_tasks, data_retention). This module
-    and state_management/pr_review_state_manager.py derived from
-    `Path(__file__).parent.parent` instead -- i.e. from whatever checkout the
-    code was imported from.
-
-    That is #181: the documented way to run the unit suite is `pytest
-    tests/unit` from the repository root, and on the deployment the repository
-    root IS the directory bind-mounted at /app. So the suite wrote its fixtures
-    into the live state tree and the production watchdog did real work on them.
-
-    RESOLVED, and relative values REFUSED, because the obvious guard does not
-    work. `/app` and `/workspace/switchyard` are the same inode on the
-    deployment -- docker-compose mounts the checkout twice -- so a test
-    asserting `root != '/app'` passes for `/workspace/switchyard`, for `.`, and
-    for `/app/../app`, every one of which writes production. A dropped leading
-    slash in `-e ORCHESTRATOR_ROOT=/tmp/...`, the likeliest typo in the
-    documented command, is the same class of accident: a relative root means
-    "somewhere under the current directory", and the current directory is the
-    checkout.
-
-    Refusing is the right severity. There is no sensible reading of a relative
-    state root, the value is set once at container start, and failing at the
-    first call is how an operator finds out in a second rather than after a
-    sweep has run somewhere unintended.
-    """
-    raw = (os.environ.get('ORCHESTRATOR_ROOT') or '').strip()
-    if not raw:
-        # Unset (or empty, or whitespace) is the deployment's own case: it runs
-        # with no override and resolves its own checkout, which is /app.
-        return (Path(__file__).parent.parent / "state").resolve()
-
-    root = Path(raw).expanduser()
-    if not root.is_absolute():
-        raise ValueError(
-            f"ORCHESTRATOR_ROOT must be an absolute path, got {raw!r}. A "
-            f"relative value resolves against the current working directory, "
-            f"which for the documented invocation is the checkout itself -- "
-            f"so it would write state into the deployment (#181)."
-        )
-    return (root / "state").resolve()
 
 
 @dataclass

@@ -54,6 +54,7 @@ if 'ORCHESTRATOR_ROOT' not in os.environ:
     os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
 
 from config.manager import config_manager
+from config.paths import orchestrator_root
 from monitoring.timestamp_utils import utc_isoformat
 
 # Configure logging
@@ -64,7 +65,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants for orchestrator-level directories (per-project state only)
-ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', '.'))
+# Resolved through config.paths rather than open-coded (#202).
+# `os.environ.get('ORCHESTRATOR_ROOT', <default>)` returns `''` for
+# `-e ORCHESTRATOR_ROOT=` on a docker run, so the default never applied to that
+# case: measured here before the change, this module bound PosixPath('.'), and
+# every `root / 'state' / 'projects' / ...` below was then a mkdir under
+# whatever the CWD happened to be. config.paths, not config.state_manager,
+# because importing the latter builds its GitHubStateManager singleton and
+# mkdirs a state tree as a side effect of asking for a directory name.
+# The `if 'ORCHESTRATOR_ROOT' not in os.environ` preset above does not cover
+# this: an env var set to the empty string IS in os.environ, so the preset
+# was skipped and the `'.'` default taken.
+ORCHESTRATOR_ROOT = orchestrator_root()
 STATE_DIR = ORCHESTRATOR_ROOT / 'state' / 'projects'
 
 
@@ -81,8 +93,7 @@ def get_workspace_root() -> Path:
         return Path('/workspace')
     else:
         # Outside container: parent of ORCHESTRATOR_ROOT
-        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
-        return orchestrator_root.parent
+        return ORCHESTRATOR_ROOT.parent
 
 
 def get_project_claude_dir(project: str) -> Path:

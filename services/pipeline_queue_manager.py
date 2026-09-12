@@ -165,9 +165,10 @@ class PipelineQueueManager:
             state_dir: Directory for queue state persistence
         """
         if state_dir is None:
-            import os
-            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
-            state_dir = Path(orchestrator_root) / "state" / "pipeline_queues"
+            # One resolver, validated and absolute (#202) -- see
+            # config.state_manager.orchestrator_state_root().
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "pipeline_queues"
 
         self.project_name = project_name
         self.board_name = board_name

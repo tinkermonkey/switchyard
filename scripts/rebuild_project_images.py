@@ -53,6 +53,7 @@ if 'ORCHESTRATOR_ROOT' not in os.environ:
     os.environ['ORCHESTRATOR_ROOT'] = str(Path(__file__).parent.parent.resolve())
 
 from config.manager import config_manager
+from config.paths import orchestrator_root
 from services.dev_container_state import dev_container_state, DevContainerStatus
 from services.dev_container_build_lock import dev_container_build_lock_sync, DevContainerBuildLockTimeoutError
 
@@ -92,9 +93,10 @@ def get_workspace_root() -> Path:
     if Path('/workspace').exists() and Path('/workspace').is_dir():
         return Path('/workspace')
     else:
-        # Outside container: parent of ORCHESTRATOR_ROOT
-        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
-        return orchestrator_root.parent
+        # Outside container: parent of ORCHESTRATOR_ROOT. Resolved through
+        # config.paths so `-e ORCHESTRATOR_ROOT=` does not make this `.parent`
+        # of the current working directory (#202).
+        return orchestrator_root().parent
 
 
 def discover_projects_with_dockerfiles(project_filter: str = None) -> list:

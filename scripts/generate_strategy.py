@@ -7,7 +7,6 @@ Uses LLM to generate intelligent agent/skill strategy based on codebase analysis
 
 import json
 import logging
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -20,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import Claude Code integration
 from claude.claude_integration import run_claude_code
 from scripts._prompt_loader import load_prompt
+from config.paths import orchestrator_root
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -99,9 +99,9 @@ async def generate_strategy_with_llm(
         patterns_summary=patterns_summary,
     )
 
-    # Determine orchestrator root (script is in scripts/ subdirectory)
-    script_dir = Path(__file__).parent.parent  # Go up from scripts/ to orchestrator root
-    orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', str(script_dir)))
+    # ORCHESTRATOR_ROOT, or this checkout when it is unset -- resolved and
+    # refused if relative by config.paths (#202).
+    root = orchestrator_root()
 
     # Build context for run_claude_code()
     context = {
@@ -109,7 +109,7 @@ async def generate_strategy_with_llm(
         'agent': 'strategy_generator',
         'task_id': f'strategy-{project}',
         'use_docker': False,  # Run locally, no Docker needed
-        'work_dir': str(orchestrator_root),
+        'work_dir': str(root),
         'claude_model': 'claude-sonnet-4-5-20250929',
         'observability': None,  # Optional: emit events if orchestrator running
     }
@@ -142,8 +142,8 @@ async def generate_strategy_with_llm(
 
         logger.info(f"  ✓ Generated strategy: {len(strategy['agents'])} agents, {len(strategy['skills'])} skills")
 
-        # Save strategy (reuse orchestrator_root from context building)
-        output_dir = orchestrator_root / 'state' / 'projects' / project
+        # Save strategy (reuse the root resolved for context building above)
+        output_dir = root / 'state' / 'projects' / project
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / 'generation_strategy.json'
 
@@ -226,7 +226,7 @@ async def main():
     if args.analysis:
         analysis_file = Path(args.analysis)
     else:
-        analysis_file = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects' / args.project / 'codebase_analysis.json'
+        analysis_file = orchestrator_root() / 'state' / 'projects' / args.project / 'codebase_analysis.json'
 
     if not analysis_file.exists():
         logger.error(f"Analysis file not found: {analysis_file}")

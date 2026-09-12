@@ -37,6 +37,10 @@ from fastapi import FastAPI
 from mcp.server.fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
+# config/ has an empty __init__.py and config/paths.py imports nothing beyond os
+# and pathlib, so this costs nothing at import and starts no state tree -- unlike
+# config.state_manager, whose import builds a GitHubStateManager and mkdirs.
+from config.paths import root_from_env
 from services.pipeline_run import format_pipeline_run_issue_key
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
@@ -46,7 +50,23 @@ SERVER_VERSION = "0.2.1"
 
 # ── Paths & external service URLs ─────────────────────────────────────────────
 
-APP_ROOT = Path(os.environ.get("APP_ROOT", "/app"))
+# NOT `Path(os.environ.get("APP_ROOT", "/app"))`. That is #202's headline shape
+# under a different variable name: os.environ.get(key, default) returns "" when
+# the key EXISTS BUT IS EMPTY, so `-e APP_ROOT=` on this container made the
+# default never apply and Path("") is the CWD -- which would have pointed
+# WORKFLOWS_YAML, PROJECTS_CONFIG_DIR and STATE_DIR all at CWD-relative paths.
+# Lower blast radius than the orchestrator's seven doors, because these three are
+# only ever read and never mkdir'd, so the damage was "every MCP tool reports no
+# board state" rather than a write into production -- but it is the same bug.
+#
+# root_from_env() reads empty and whitespace-only as unset, refuses a relative
+# value outright, and resolves what it accepts. The "/app" default is kept as a
+# literal rather than going through config.paths.orchestrator_root(): APP_ROOT is
+# this service's own documented override, and orchestrator_root() would silently
+# start honouring ORCHESTRATOR_ROOT here, which nothing sets on this container.
+# docker-compose.yml's switchyard-mcp service sets no APP_ROOT, so "/app" -- the
+# checkout, bind-mounted -- is what runs today and is unchanged by this.
+APP_ROOT = root_from_env("APP_ROOT") or Path("/app")
 WORKFLOWS_YAML = APP_ROOT / "config" / "foundations" / "workflows.yaml"
 PROJECTS_CONFIG_DIR = APP_ROOT / "config" / "projects"
 STATE_DIR = APP_ROOT / "state" / "projects"

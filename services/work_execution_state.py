@@ -498,10 +498,14 @@ class WorkExecutionStateTracker:
         if state_dir is None:
             # CRITICAL: Use absolute path to orchestrator's state directory
             # This prevents state from being created inside project directories when
-            # agents execute with project working directory
-            import os
-            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
-            state_dir = Path(orchestrator_root) / "state" / "execution_history"
+            # agents execute with project working directory.
+            # One resolver, validated and absolute (#202) -- see
+            # config.state_manager.orchestrator_state_root(). The open-coded
+            # `Path(os.environ.get('ORCHESTRATOR_ROOT', '/app')) / "state" /
+            # ...` this replaces did not get that guarantee, and mkdir's on the
+            # next line.
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "execution_history"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)

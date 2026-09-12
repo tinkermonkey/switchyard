@@ -6,7 +6,6 @@ Generates agent and skill markdown files using Claude Code CLI prompts.
 """
 
 import logging
-import os
 import re
 import sys
 from pathlib import Path
@@ -18,11 +17,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from claude.claude_integration import run_claude_code
 from monitoring.timestamp_utils import utc_isoformat
 from scripts._prompt_loader import load_prompt
+from config.paths import orchestrator_root
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-ORCHESTRATOR_ROOT = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
+# Resolved through config.paths rather than open-coded (#202).
+# `os.environ.get('ORCHESTRATOR_ROOT', <default>)` returns `''` for
+# `-e ORCHESTRATOR_ROOT=` on a docker run, so the default never applied to that
+# case: measured here before the change, this module bound PosixPath('.'), and
+# every `root / 'state' / 'projects' / ...` below was then a mkdir under
+# whatever the CWD happened to be. config.paths, not config.state_manager,
+# because importing the latter builds its GitHubStateManager singleton and
+# mkdirs a state tree as a side effect of asking for a directory name.
+ORCHESTRATOR_ROOT = orchestrator_root()
 
 
 def get_workspace_root() -> Path:
@@ -38,8 +46,7 @@ def get_workspace_root() -> Path:
         return Path('/workspace')
     else:
         # Outside container: parent of ORCHESTRATOR_ROOT
-        orchestrator_root = Path(os.environ.get('ORCHESTRATOR_ROOT', Path(__file__).parent.parent))
-        return orchestrator_root.parent
+        return orchestrator_root().parent
 
 
 def get_project_claude_dir(project: str) -> Path:
@@ -573,7 +580,7 @@ async def _run_generation(args):
     if args.strategy:
         strategy_file = Path(args.strategy)
     else:
-        strategy_file = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects' / args.project / 'generation_strategy.json'
+        strategy_file = ORCHESTRATOR_ROOT / 'state' / 'projects' / args.project / 'generation_strategy.json'
 
     if not strategy_file.exists():
         logger.error(f"Strategy file not found: {strategy_file}")
@@ -586,7 +593,7 @@ async def _run_generation(args):
     if args.analysis:
         analysis_file = Path(args.analysis)
     else:
-        analysis_file = Path(os.environ.get('ORCHESTRATOR_ROOT', '.')) / 'state' / 'projects' / args.project / 'codebase_analysis.json'
+        analysis_file = ORCHESTRATOR_ROOT / 'state' / 'projects' / args.project / 'codebase_analysis.json'
 
     if not analysis_file.exists():
         logger.error(f"Analysis file not found: {analysis_file}")

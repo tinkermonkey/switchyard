@@ -45,9 +45,10 @@ class ConversationalSessionStateManager:
             # CRITICAL: Use absolute path to orchestrator's state directory
             # This prevents state from being created inside project directories when
             # agents execute with project working directory
-            import os
-            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
-            state_dir = Path(orchestrator_root) / "state" / "conversational_sessions"
+            # One resolver, validated and absolute (#202) -- see
+            # config.state_manager.orchestrator_state_root().
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "conversational_sessions"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)

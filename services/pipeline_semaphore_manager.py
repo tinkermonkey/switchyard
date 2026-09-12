@@ -130,8 +130,10 @@ class PipelineSemaphoreManager:
             redis_client: Optional Redis client (will create if not provided)
         """
         if state_dir is None:
-            orchestrator_root = os.environ.get('ORCHESTRATOR_ROOT', '/app')
-            state_dir = Path(orchestrator_root) / "state" / "pipeline_semaphores"
+            # One resolver, validated and absolute (#202) -- see
+            # config.state_manager.orchestrator_state_root().
+            from config.state_manager import orchestrator_state_root
+            state_dir = orchestrator_state_root() / "pipeline_semaphores"
 
         self.state_dir = state_dir
         self.state_dir.mkdir(parents=True, exist_ok=True)
