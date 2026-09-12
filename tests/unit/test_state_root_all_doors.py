@@ -808,6 +808,51 @@ class TestTheScriptsDoors:
             assert done.stdout.strip() == f'BOUND {scratch}', done.stdout
 
 
+def _import_the_observability_server_in_a_subprocess(cwd: Path, root: str):
+    """Import services/observability_server.py the way the container starts it.
+
+    A SUBPROCESS because the property under test is what happens AT IMPORT, and
+    this pytest process has already imported the module (the tests below need
+    `_load_github_state`), so an in-process check can only look at names that
+    are already bound -- which is exactly the weak guard this replaces.
+
+    `python -c 'import services.observability_server'` rather than `python -m`:
+    the module calls `eventlet.monkey_patch()` under `if __name__ ==
+    "__main__"`, and monkey-patching is irreversible and process-wide. The
+    import chain under test (module scope -> config.state_manager ->
+    config.paths) is identical either way, and skipping the patch keeps this
+    helper cheap enough to call twice.
+
+    THE PROBE IMPORTS AND PRINTS, AND DOES NOT CALL THE RESOLVER. An earlier
+    draft of this helper printed `m.orchestrator_state_root()`, and that call
+    raises on a relative root whichever module the name came from -- so the
+    bad-root test below passed under the config.paths mutation on the strength
+    of the probe's own ValueError, exactly the failure mode it exists to catch
+    (measured: mutated, 8 passed / 1 failed; the one that failed was the
+    filesystem assertion). What is being measured is whether the IMPORT
+    survives, so the probe must do nothing but import.
+
+    Measured in switchyard-orchestrator-1 on this branch: 0.6s per import,
+    eventlet/flask/elasticsearch/redis included, because every client in that
+    module is constructed lazily.
+    """
+    environment = dict(os.environ)
+    environment['ORCHESTRATOR_ROOT'] = root
+    environment['PYTHONPATH'] = str(_REPO_ROOT)
+    return subprocess.run(
+        [
+            sys.executable, '-c',
+            'import services.observability_server\n'
+            'print("IMPORTED")\n',
+        ],
+        cwd=str(cwd),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+
+
 class TestTheObservabilityServersDoor:
     """It had the same hole in a different shape: a lazy import of
     config.state_manager on a request path, in a container that never built
@@ -827,20 +872,79 @@ class TestTheObservabilityServersDoor:
         yield
         observability_server._state_read_failures_logged.clear()
 
-    def test_the_state_manager_import_is_at_module_scope(self):
-        """So a bad root kills the server at boot, as it does the orchestrator.
+    def test_a_bad_root_kills_the_server_at_boot(self, tmp_path):
+        """As it does the orchestrator, which dies at main.py:16.
 
-        main.py:16 imports config.state_manager and therefore dies on a bad
+        main.py imports config.state_manager and therefore dies on a bad
         ORCHESTRATOR_ROOT before anything runs. The observability server had no
         such import -- its only one was inside _load_github_state() -- so it
-        started happily and failed per-request, silently.
-        """
-        from services import observability_server
+        started happily and failed per-request, silently, inside `except
+        Exception: return {}`.
 
-        assert hasattr(observability_server, 'orchestrator_state_root'), (
-            "services/observability_server.py no longer imports "
-            "orchestrator_state_root at module scope; a misconfigured "
-            "ORCHESTRATOR_ROOT is back to being a per-request failure (#202)"
+        ASSERTED AS AN EXIT CODE, not as `hasattr(module,
+        'orchestrator_state_root')`, which is what this test used to say. That
+        name-presence check passed under a one-line edit a future reader
+        deduplicating imports would plausibly make -- swapping the import to
+        `from config.paths import orchestrator_state_root`, since config.paths
+        is the side-effect-free module and its own docstring invites importing
+        it at module scope. Measured with that one-line mutation applied on
+        this branch: all eight tests this class then held passed, while
+        `ORCHESTRATOR_ROOT=relative-oops python -c 'import
+        services.observability_server'` exited 0 instead of raising. The side
+        effect IS the property here: it is `import config.state_manager`
+        building the GitHubStateManager singleton that calls the resolver, and
+        only that import fails at boot. Restoring the original bug shape -- the
+        import moved back inside _load_github_state() -- was measured too, and
+        fails this test and the next one for the same reason.
+        """
+        done = _import_the_observability_server_in_a_subprocess(
+            tmp_path, root='relative-oops'
+        )
+
+        assert done.returncode != 0, (
+            "services/observability_server.py imported cleanly with "
+            "ORCHESTRATOR_ROOT='relative-oops'. The server will start on a "
+            "misconfigured root and fail per-request instead, so the Web UI "
+            "shows every project with no board and no repo URL (#202)"
+        )
+        assert 'must be an absolute path' in done.stderr, (
+            "the import failed for some reason other than the root resolver, "
+            "so this test is no longer measuring what it claims:\n"
+            f"{done.stderr[-2000:]}"
+        )
+        assert list(tmp_path.iterdir()) == [], (
+            "something was created under the CWD on the way to refusing the "
+            f"root: {list(tmp_path.iterdir())}"
+        )
+
+    def test_an_absolute_root_is_honoured_and_its_state_tree_built(
+        self, tmp_path
+    ):
+        """The other half: refusing every root would also pass the test above.
+
+        The two mkdirs are the assertion, not a side note. `import
+        config.state_manager` runs `state_manager = GitHubStateManager()`,
+        which mkdirs `<root>/state/projects` and `<root>/state/orchestrator`;
+        importing the resolver from config.paths creates nothing. So this
+        asserts the module-scope `from config.state_manager import
+        orchestrator_state_root` in services/observability_server.py is the
+        side-effectful one -- the same mutation the previous test catches by
+        exit code, caught here by the filesystem.
+        """
+        scratch = tmp_path / 'scratch'
+        scratch.mkdir()
+
+        done = _import_the_observability_server_in_a_subprocess(
+            tmp_path, root=str(scratch)
+        )
+
+        assert done.returncode == 0, done.stderr[-2000:]
+        assert done.stdout.strip() == 'IMPORTED', done.stdout
+        assert (scratch / 'state' / 'projects').is_dir(), (
+            "importing services/observability_server.py did not build the "
+            "GitHubStateManager singleton, so it is no longer importing "
+            "config.state_manager at module scope and a bad root has stopped "
+            f"being fatal at boot (#202). Created: {list(scratch.rglob('*'))}"
         )
 
     def test_an_unreadable_state_file_is_logged_rather_than_swallowed(

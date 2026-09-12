@@ -51,6 +51,13 @@ import time
 # is the singleton's construction at import, which for a process entrypoint is
 # the point; library modules (the seven in services/) import the resolver
 # lazily instead, see orchestrator_state_root()'s docstring.
+#
+# NOT `from config.paths import orchestrator_state_root`, which binds the same
+# function and looks like the tidier import. config.paths has no side effects
+# by design, so that spelling silently gives this file back the per-request
+# failure described above. The side effect is the whole point of this line.
+# TestTheObservabilityServersDoor in tests/unit/test_state_root_all_doors.py
+# fails on that swap -- by subprocess exit code, not by name presence.
 from config.state_manager import orchestrator_state_root
 
 # Setup logging with reduced verbosity
