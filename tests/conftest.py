@@ -794,18 +794,42 @@ leaked_module_mocks = []
 # alone -- so whatever root the module body happened to see is the root every
 # one of those call sites uses for the rest of the process.
 #
+# The enumeration is meant to be EXHAUSTIVE over that category, not a list of
+# the ones that have bitten us. It was derived from
+# scripts/dry_run_state_sweep.py's _RUNTIME_SINGLETONS -- the other place in
+# this repo that has to know every state-owning process global -- plus
+# state_management/pr_review_state_manager.py, which that list does not cover
+# because no sweep touches it.
+#
+# Measured on this container with a pytest_collection hook that prints
+# `name in sys.modules` at collection START (i.e. after conftest import, before
+# the first test module is imported):
+#
+#     services.work_execution_state              False   <- listed
+#     services.conversational_session_state      False   <- listed
+#     state_management.pr_review_state_manager   False   <- listed
+#     services.dev_container_state               True    <- excluded, see below
+#     services.pipeline_lock_manager             False   <- excluded, see below
+#     services.pipeline_semaphore_manager        False   <- excluded, see below
+#
 # services.dev_container_state has the identical shape and is deliberately NOT
-# listed. Measured: it is already in sys.modules before the first test module is
-# imported (this conftest pulls it in transitively), so no test file can be its
-# first importer and an entry for it would be a row that can never fire. Checked
-# by making a test module the first in collection order do exactly what #211's
-# watchdog file did -- import it under a patched, about-to-be-deleted
-# ORCHESTRATOR_ROOT -- and observing `'services.dev_container_state' in
-# sys.modules == True` at that module's top and state_dir still resolving to the
-# session root. Add it back the day that stops being true.
+# listed: it is already in sys.modules before the first test module is imported
+# (this conftest pulls it in transitively, as the probe above shows), so no test
+# file can be its first importer and an entry for it would be a row that can
+# never fire. Add it back the day that stops being true.
+#
+# The two pipeline managers are excluded for the opposite reason: their module
+# globals are None at import and are built by a getter that reads
+# ORCHESTRATOR_ROOT when it is CALLED, so being the first importer binds
+# nothing. They are not import-time singletons and a row for them would be
+# skipped by the `singleton is None` branch below on every run.
 IMPORT_TIME_STATE_SINGLETONS = (
     ('services.work_execution_state', 'work_execution_tracker', 'state_dir',
      'execution_history'),
+    ('services.conversational_session_state', 'conversational_session_state',
+     'state_dir', 'conversational_sessions'),
+    ('state_management.pr_review_state_manager', 'pr_review_state_manager',
+     'state_root', 'projects'),
 )
 
 # Filled in at collection finish, read by
@@ -837,10 +861,13 @@ def _import_time_singletons_bound_outside_the_state_root():
     Sampled at collection finish, for the same reason
     _first_party_modules_replaced_by_mocks() is: pytest imports every selected
     test module before running any test, so an import-time binding is already
-    in place and a later test body cannot be relied on to observe it -- in a
-    full run several tests legitimately repoint these singletons for their own
-    duration, so a sample taken mid-run would be reading their business, not
-    this invariant.
+    in place by then, and the sample answers only the question this guard owns.
+    A mid-run sample would instead be reading whatever the tests that ran before
+    it left behind -- the business of _restore_process_globals below and of the
+    file that repointed the singleton, not of this invariant. Measured, in both
+    directions, in the docstring of
+    tests/unit/test_state_root_isolation.py::TestBothHoldoutsUseIt::
+    test_no_test_file_bound_an_import_time_singleton_outside_the_state_root.
     """
     import sys
 
@@ -1854,6 +1881,41 @@ def _restore_process_globals():
             # mistakes and only one of them is the caller's own business.
             continue
         sys.modules[name] = module
+        # sys.modules is only HALF of what an import binds, and restoring only
+        # that half leaves the two halves disagreeing -- which is worse than
+        # not restoring at all, because it is invisible (#221).
+        #
+        # `import services.work_execution_state as wes` does NOT read
+        # sys.modules for the name it binds: it imports the module, then binds
+        # `getattr(services, 'work_execution_state')`, falling back to
+        # sys.modules only if that attribute is missing. The re-import that a
+        # test forced set that attribute on the `services` package object, and
+        # nothing above puts it back -- so after this fixture,
+        # `importlib.import_module(name)` and `from services.x import y` see
+        # the restored module while `import services.x as y` still sees the
+        # test's replacement.
+        #
+        # Measured on this container against
+        # `pytest tests/unit/services/test_stale_execution_history.py
+        # tests/unit/scripts/test_dry_run_state_sweep.py`, fresh scratch root
+        # each time, while that file still did the sys.modules.pop + re-import
+        # under a tmp_path root:
+        #
+        #     neither half repaired            2 failed, 95 passed
+        #     this line added                  1 failed, 96 passed
+        #     the pop removed at its source   97 passed
+        #
+        # Both of the first two failures are in
+        # tests/unit/scripts/test_dry_run_state_sweep.py's
+        # TestRuntimeSingletonBinding, reading a state_dir under a tmp_path
+        # pytest had already deleted. #221 removed the pop from all three files
+        # that did it; this line is what keeps the next one from being invisible
+        # -- tests/unit/test_no_cross_file_module_leakage.py's
+        # TestConftestRestoresBothHalvesOfAReimport is its regression test.
+        parent_name, _, child_name = name.rpartition('.')
+        parent = sys.modules.get(parent_name) if parent_name else None
+        if parent is not None and getattr(parent, child_name, None) is not module:
+            setattr(parent, child_name, module)
 
     reloaded = sorted(
         name for name, module in previous_modules.items()

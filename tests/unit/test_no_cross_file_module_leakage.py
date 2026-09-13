@@ -30,11 +30,24 @@ sampled both at collection finish (the module-scope shape) and at session finish
 (the run-time shape test_docker_runner_validation.py used).
 """
 
+import os
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tests.conftest import FIRST_PARTY_PACKAGES, leaked_module_mocks
+
+# Module scope on purpose, and a plain import: TestConftestRestoresBothHalves
+# OfAReimport at the bottom of this file needs services.work_execution_state to
+# already be in sys.modules when its FIRST test is set up, because conftest's
+# _restore_process_globals only puts back names it saw at that test's setup.
+# Importing it here is what makes that pair independent of what else the
+# selection happens to contain. Safe under #181: conftest points
+# ORCHESTRATOR_ROOT at a writable scratch root before any test module is
+# imported, which is the whole point of the file this line lives in.
+import services.work_execution_state  # noqa: E402
 
 
 def test_no_first_party_module_was_replaced_by_a_mock_during_collection():
@@ -159,3 +172,73 @@ class TestALeakInsertedWhileTestsRanIsCaughtToo:
             conftest.pytest_sessionfinish(session, session.exitstatus)
 
         assert session.exitstatus == pytest.ExitCode.OK
+
+
+class TestConftestRestoresBothHalvesOfAReimport:
+    """sys.modules is only HALF of what an import binds, and the restore fixture
+    used to put back only that half (#221).
+
+    `import services.work_execution_state as wes` does not read sys.modules for
+    the name it binds: it imports the module, then binds
+    `getattr(services, 'work_execution_state')`, consulting sys.modules only if
+    that attribute is missing. A test that pops the module and re-imports it
+    sets that attribute on the `services` package object, and restoring
+    sys.modules alone leaves the two halves disagreeing -- `import_module()` and
+    `from services.x import y` see the restored module while `import services.x
+    as y` still sees the replacement, along with its singleton bound to a
+    tmp_path pytest has deleted.
+
+    That is not hypothetical: it is why
+    tests/unit/scripts/test_dry_run_state_sweep.py's
+    TestRuntimeSingletonBinding pair failed in any selection that ran a popping
+    file first. Measured on the pre-#221 tree, fresh root:
+    `pytest tests/unit/services/test_stale_execution_history.py
+    tests/unit/scripts/test_dry_run_state_sweep.py` -> 2 failed, 95 passed; with
+    the sys.modules half restored but not the package attribute, still 1 failed.
+
+    The three files that did the pop no longer do (#221 removed the workaround
+    at its source), so this pair is what keeps the fixture's other half honest
+    for the next one.
+    """
+
+    def test_step_one_a_pop_and_reimport_replaces_both_halves(self, tmp_path, monkeypatch):
+        """Half one of a pair -- the test below is the assertion that matters.
+        This one deliberately commits the anti-pattern and pins what it does to
+        BOTH halves, so the next test's subject is established rather than
+        assumed."""
+        import importlib
+
+        import services
+
+        before = sys.modules['services.work_execution_state']
+        monkeypatch.setenv('ORCHESTRATOR_ROOT', str(tmp_path))
+        sys.modules.pop('services.work_execution_state')
+        replacement = importlib.import_module('services.work_execution_state')
+
+        assert replacement is not before
+        assert sys.modules['services.work_execution_state'] is replacement
+        assert getattr(services, 'work_execution_state') is replacement, (
+            "the import system sets the submodule attribute on the parent "
+            "package; if it stopped doing that this pair no longer tests "
+            "anything"
+        )
+        assert Path(replacement.work_execution_tracker.state_dir) == (
+            tmp_path / 'state' / 'execution_history'
+        )
+
+    def test_step_two_both_halves_came_back(self):
+        """Depends on running after the test above, and cannot be folded into
+        it: the restore happens in that test's teardown, which is not observable
+        from inside it. Same shape, and the same reason, as
+        tests/unit/scripts/test_dry_run_state_sweep.py's step_one/step_two."""
+        import services
+        import services.work_execution_state as via_import_statement
+
+        restored = sys.modules['services.work_execution_state']
+
+        assert getattr(services, 'work_execution_state') is restored
+        assert via_import_statement is restored
+        root = Path(os.environ['ORCHESTRATOR_ROOT'])
+        assert Path(via_import_statement.work_execution_tracker.state_dir) == (
+            root / 'state' / 'execution_history'
+        )

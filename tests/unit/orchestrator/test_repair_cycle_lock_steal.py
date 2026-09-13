@@ -1102,17 +1102,19 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
         mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "lock_acquired")
         capture = {}
 
-        # A unique issue_number, not the file's shared default (100). Redundant
-        # for cross-RUN isolation now that the tracker is tmp_path-scoped, but
-        # still load-bearing within a single run: other tests in this class share
-        # this module's process and use the same realistic agent string, and
-        # anything that reached this tracker under issue 100 would land in the
-        # same project+issue-scoped file.
+        # The file's shared default issue_number (100), deliberately. An earlier
+        # version of this fix used a unique 999001 to keep other tests in this
+        # class out of the count; that was left over from the days of the shared
+        # real singleton and is dead now. This tracker exists only inside the
+        # `with` block below and is reachable only through the patched module
+        # attribute, so no other test in the process can write to it, whatever
+        # issue number it uses. Measured: with 999001 replaced by 100, three runs
+        # of this file against ONE shared scratch root -> 41 passed, 41 passed,
+        # 41 passed.
         with patch('services.work_execution_state.work_execution_tracker', tracker):
             result, launch_mock, stage_config = _run_start_repair_cycle(
                 mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
                 mock_state_manager, mock_task_queue,
-                issue_number=999001,
                 pipeline_manager_capture=capture,
                 resolve_workspace_side_effect=RuntimeError(
                     "Failed to add worktree for existing branch feature/issue-42-epic: "
@@ -1122,7 +1124,7 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
             )
 
         assert result is None
-        history = tracker.get_execution_history("test-project", 999001)
+        history = tracker.get_execution_history("test-project", 100)
         failures = [
             e for e in history
             if e.get('column') == 'Testing' and e.get('outcome') == 'failure'

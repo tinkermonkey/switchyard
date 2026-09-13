@@ -115,9 +115,19 @@ class TestBothHoldoutsUseIt:
         through function-level `from services.work_execution_state import
         work_execution_tracker` all over services/. Whatever root the module
         body saw is the root every one of those call sites uses for the rest of
-        the process. (services/dev_container_state.py has the same shape and is
-        deliberately not covered -- see IMPORT_TIME_STATE_SINGLETONS in
-        tests/conftest.py for the measurement that makes a row for it dead.)
+        the process.
+
+        It is not the only one: services/conversational_session_state.py and
+        state_management/pr_review_state_manager.py end the same way, and a test
+        module can be the first importer of either. All three are covered.
+        services/dev_container_state.py has the identical shape and is
+        deliberately NOT covered, and the two pipeline managers are lazy rather
+        than import-time -- see IMPORT_TIME_STATE_SINGLETONS in tests/conftest.py
+        for the probe that decided each of those, and for the mutation test that
+        showed a row is what makes the difference (a test module doing the
+        anti-pattern against only conversational_session_state and
+        pr_review_state_manager: 83 passed with this guard silent before those
+        two rows existed, 1 failed / 82 passed after).
 
         tests/unit/test_watchdog_retry.py imported work_execution_state inside
         `tempfile.TemporaryDirectory()` + `patch.dict(os.environ,
@@ -133,14 +143,23 @@ class TestBothHoldoutsUseIt:
         tests/unit/test_no_cross_file_module_leakage.py, whose shape this
         copies: pytest imports every selected test module before running any
         test, so an import-time binding is already in place by collection
-        finish, whereas by the time THIS body runs several tests have
-        legitimately repointed these singletons for their own duration and put
-        them back (tests/unit/services/test_stale_execution_history.py,
-        test_container_redis_tracking.py and test_work_execution_redis_recovery
-        .py all do, via sys.modules.pop + re-import under a tmp_path root).
-        Measured: an in-body version of this assertion failed the full suite on
-        a leftover from tests/unit/scripts/test_dry_run_state_sweep.py, which is
-        that file's own business and not this invariant.
+        finish. An in-body check would instead be reading whatever the tests
+        that ran BEFORE it left behind -- which is a different question, owned
+        by tests/conftest.py's _restore_process_globals and by the file that
+        repointed the singleton, not by this invariant.
+
+        Measured, both halves, on this container with a fresh scratch root:
+
+          * the shipped collection-finish version passes under `pytest
+            tests/unit/services/test_stale_execution_history.py
+            tests/unit/test_state_root_isolation.py` (102 passed), while an
+            in-body variant -- same assertion, but calling
+            conftest._import_time_singletons_bound_outside_the_state_root()
+            live -- FAILS that same selection on the tracker
+            test_stale_execution_history.py had left repointed (1 failed, 101
+            passed, before the #221 fix to that file);
+          * the in-body variant passes the full `pytest tests/unit` run, so the
+            full suite would never have shown the difference.
         """
         from tests.conftest import singletons_bound_outside_the_state_root
 

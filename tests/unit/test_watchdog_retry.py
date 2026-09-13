@@ -49,14 +49,18 @@ import threading
 #
 # The full suite hid it, which is why it went unnoticed: an earlier-collected
 # module imports work_execution_state first, under the correct root, so the
-# import here is a no-op and the patch binds nothing. Measured by putting this
-# exact workaround back and running the whole of tests/unit -- 4100 passed, 0
-# failed, with the collection-finish guard below silent.
+# import here is a no-op and the patch binds nothing. Re-measured on this
+# container after #221 by putting this exact workaround back and running the
+# whole of tests/unit -- 4102 passed, 2 skipped, 0 failed, with the
+# collection-finish guard below silent.
+#
 # test_state_root_isolation.py's
 # test_no_test_file_bound_an_import_time_singleton_outside_the_state_root now
-# asserts the invariant directly instead of leaving it to that accident; it does
-# fire on this workaround in any selection where this file IS the first
-# importer, in either file order.
+# asserts the invariant directly instead of leaving it to that accident. With
+# the workaround back and this file the first importer it fires:
+# `pytest tests/unit/test_watchdog_retry.py
+# tests/unit/test_state_root_isolation.py` -> 1 failed, 232 passed, the failure
+# being that guard.
 from services.work_execution_state import (
     WorkExecutionStateTracker,
     _watchdog_max_retries,

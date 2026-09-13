@@ -16,8 +16,6 @@ Covers:
    globs state files, parses project/issue, and delegates abandonment correctly.
 """
 
-import os
-import sys
 import re
 import yaml
 import pytest
@@ -27,13 +25,43 @@ from unittest.mock import patch, MagicMock, AsyncMock, call
 
 
 # ---------------------------------------------------------------------------
-# Helpers for importing WorkExecutionStateTracker with a custom state dir
+# Helpers for building a WorkExecutionStateTracker with a custom state dir
 # ---------------------------------------------------------------------------
 
 def _import_tracker_class(tmp_path):
-    """Force-reimport WorkExecutionStateTracker with ORCHESTRATOR_ROOT = tmp_path."""
-    os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
-    sys.modules.pop('services.work_execution_state', None)
+    """The tracker CLASS. Plain import, deliberately -- see #221.
+
+    This used to be
+
+        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
+        sys.modules.pop('services.work_execution_state', None)
+        from services.work_execution_state import WorkExecutionStateTracker
+
+    to stop the module's import-time `work_execution_tracker =
+    WorkExecutionStateTracker()` from mkdir-ing an unwritable /app. #181 made
+    that unnecessary: tests/conftest.py repoints ORCHESTRATOR_ROOT at a writable
+    scratch root at conftest import, before any test module is imported, so a
+    plain import is already safe -- the same reasoning that removed the same
+    workaround from tests/unit/test_watchdog_retry.py in #211.
+
+    It was also actively harmful. The pop + re-import builds a NEW module whose
+    module-level singleton is bound to tmp_path, and neither half of that is
+    reliably undone: conftest's _restore_process_globals only restores names
+    that were in sys.modules at the test's SETUP, so whichever test in this file
+    runs first -- the first importer of services.work_execution_state in the
+    process -- leaves its replacement module standing for the rest of the
+    session. Measured before this change, fresh root each time:
+    `pytest tests/unit/services/test_stale_execution_history.py
+    tests/unit/scripts/test_dry_run_state_sweep.py` -> 2 failed, 95 passed,
+    both failures in test_dry_run_state_sweep.py's TestRuntimeSingletonBinding
+    reading state_dir == <this file's tmp_path>/state/execution_history.
+
+    Nothing here ever needed it: every caller constructs the tracker with an
+    explicit `state_dir=`, and the code under test reads the tracker through a
+    `patch('services.work_execution_state.work_execution_tracker', ...)`.
+
+    tmp_path is unused now and kept only so the call sites read unchanged.
+    """
     from services.work_execution_state import WorkExecutionStateTracker
     return WorkExecutionStateTracker
 
@@ -445,11 +473,9 @@ class TestCleanupOrphanedExecutionHistory:
 
         recovery = self._make_recovery()
 
-        import sys
-        sys.modules.pop('services.work_execution_state', None)
-        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
-
-        # Re-import so the singleton uses our state_dir
+        # Plain import, explicit state_dir -- see _import_tracker_class above
+        # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
+        # was both unnecessary and a session-wide leak (#181, #211, #221).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -484,8 +510,9 @@ class TestCleanupOrphanedExecutionHistory:
 
         recovery = self._make_recovery()
 
-        sys.modules.pop('services.work_execution_state', None)
-        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
+        # Plain import, explicit state_dir -- see _import_tracker_class above
+        # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
+        # was both unnecessary and a session-wide leak (#181, #211, #221).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -529,8 +556,9 @@ class TestCleanupOrphanedExecutionHistory:
 
         recovery = self._make_recovery()
 
-        sys.modules.pop('services.work_execution_state', None)
-        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
+        # Plain import, explicit state_dir -- see _import_tracker_class above
+        # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
+        # was both unnecessary and a session-wide leak (#181, #211, #221).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -562,8 +590,9 @@ class TestCleanupOrphanedExecutionHistory:
 
         recovery = self._make_recovery()
 
-        sys.modules.pop('services.work_execution_state', None)
-        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
+        # Plain import, explicit state_dir -- see _import_tracker_class above
+        # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
+        # was both unnecessary and a session-wide leak (#181, #211, #221).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -580,8 +609,9 @@ class TestCleanupOrphanedExecutionHistory:
 
         recovery = self._make_recovery()
 
-        sys.modules.pop('services.work_execution_state', None)
-        os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
+        # Plain import, explicit state_dir -- see _import_tracker_class above
+        # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
+        # was both unnecessary and a session-wide leak (#181, #211, #221).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
