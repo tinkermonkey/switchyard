@@ -1536,7 +1536,11 @@ git push --force-with-lease
         # NOTE (final whole-PR review pass on #119): unlike auto_commit.py's
         # commit_agent_changes() -- which has no other callers and can safely
         # require project_dir -- this method is also called directly/standalone
-        # (see tests/integration/test_feature_branch_workflow.py and others)
+        # (see tests/unit/test_workspace_behavior.py::
+        # TestFeatureBranchManagerStandalone::
+        # test_finalize_succeeds_without_feature_branch_state, which calls it
+        # with no project_dir_override and asserts result['standalone'] is True;
+        # the integration test this note used to cite was deleted in #213)
         # without an override, where falling back to the shared base clone is
         # the correct, intended behavior, not a bug. The danger this docstring
         # warns about is specific to IssuesWorkspaceContext/HybridWorkspaceContext,

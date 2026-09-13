@@ -179,14 +179,10 @@ The current test suite provides **comprehensive READ operation coverage** with t
 
 ## Test Files
 
-### `test_github_resilience_integration.py`
-- Owner type detection and caching
-- Circuit breaker behavior
-- Retry logic and rate limiting
-- Health monitor integration
-- End-to-end resilience workflows
+### `test_github_resilience_integration.py` — DELETED (#213)
+Removed with the other live-GitHub-write tests; see TESTING_SUMMARY.md.
 
-### `test_github_graphql_queries_integration.py` (NEW)
+### `test_github_graphql_queries_integration.py`
 - Pipeline progression READ queries
 - GitHub project manager READ queries
 - Pipeline run READ queries

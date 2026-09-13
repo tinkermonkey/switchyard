@@ -34,29 +34,13 @@ case "$TEST_TYPE" in
         python -m pytest tests/integration/test_claude_code_mocked.py -v
         ;;
     
-    real|cli)
-        echo -e "${GREEN}Running real Claude CLI tests${NC}"
-        echo ""
-        if ! command -v claude &> /dev/null; then
-            echo -e "${YELLOW}Warning: Claude CLI not found. Tests will be skipped.${NC}"
-            echo "To install: npm install -g @anthropic-ai/claude-code"
-            echo ""
-        fi
-        
-        if [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            echo -e "${YELLOW}Warning: No API key found. Set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN${NC}"
-            echo ""
-        fi
-        
-        python -m pytest tests/integration/test_claude_code_integration.py -v -s
+    real|cli|all)
+        echo -e "${YELLOW}The real-Claude-CLI tests (test_claude_code_integration.py) were${NC}"
+        echo -e "${YELLOW}deleted in #213: they spent real API quota against a live account and${NC}"
+        echo -e "${YELLOW}nobody ran them. Only the mocked suite remains -- use '$0 mocked'.${NC}"
+        exit 1
         ;;
-    
-    all)
-        echo -e "${GREEN}Running all Claude Code tests${NC}"
-        echo ""
-        python -m pytest tests/integration/test_claude_code_mocked.py tests/integration/test_claude_code_integration.py -v
-        ;;
-    
+
     coverage)
         echo -e "${GREEN}Running tests with coverage${NC}"
         echo ""
@@ -74,16 +58,14 @@ case "$TEST_TYPE" in
         echo ""
         echo "Types:"
         echo "  mocked    Run mocked tests only (default, no CLI needed)"
-        echo "  real      Run real CLI tests (requires Claude CLI + API key)"
-        echo "  all       Run all tests"
         echo "  coverage  Run with coverage report"
         echo "  help      Show this help"
+        echo ""
+        echo "('real' and 'all' were removed in #213 with the real-API tests.)"
         echo ""
         echo "Examples:"
         echo "  $0              # Run mocked tests"
         echo "  $0 mocked       # Run mocked tests"
-        echo "  $0 real         # Run with real Claude CLI"
-        echo "  $0 all          # Run all tests"
         echo "  $0 coverage     # Run with coverage"
         exit 0
         ;;

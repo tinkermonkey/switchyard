@@ -6,24 +6,13 @@ Comprehensive integration test suite created to validate GitHub GraphQL query fu
 
 ## Test Files Created
 
-### 1. `test_github_resilience_integration.py`
-**Purpose:** Validate core resilience improvements and most-used GraphQL patterns
+### 1. `test_github_resilience_integration.py` — DELETED (#213)
 
-**Coverage:**
-- ✅ GraphQL flag fix (`-F` → `-f`) validation
-- ✅ Owner type detection (`github_owner_utils.py`)
-- ✅ Project listing
-- ✅ Redis caching behavior
-- ✅ Circuit breaker integration
-- ✅ Retry logic with exponential backoff
-- ✅ Rate limit handling
-- ✅ Health monitor GraphQL operations
-- ✅ Circuit breaker persistence across restarts
-- ✅ End-to-end resilience workflows
+Removed along with the other tests that wrote to the owner's live GitHub
+account. Nobody ran it; the resilience behaviour it described is exercised by
+`tests/unit/` instead.
 
-**Test Count:** 15 tests (all passing)
-
-### 2. `test_github_graphql_queries_integration.py` (NEW)
+### 2. `test_github_graphql_queries_integration.py`
 **Purpose:** Comprehensive READ query coverage for all remaining GraphQL usage
 
 **Coverage:**
@@ -79,11 +68,7 @@ Comprehensive integration test suite created to validate GitHub GraphQL query fu
 ./scripts/test_github_resilience.sh --coverage
 
 # Using pytest directly
-.venv/bin/pytest tests/integration/test_github_resilience_integration.py -v
 .venv/bin/pytest tests/integration/test_github_graphql_queries_integration.py -v
-
-# Run both test files
-.venv/bin/pytest tests/integration/test_github_*_integration.py -v
 ```
 
 ### Test Environment Variables (Optional)
@@ -136,7 +121,6 @@ export GITHUB_TEST_ISSUE="1"
 ### Current Status: ALL PASSING ✅
 
 ```
-test_github_resilience_integration.py: 15 tests - ALL PASSING
 test_github_graphql_queries_integration.py: 3 tests passing, 9 skipped (need env vars)
 ```
 
@@ -178,9 +162,11 @@ test_github_graphql_queries_integration.py: 3 tests passing, 9 skipped (need env
 ## Documentation
 
 ### Created Documentation
-1. `GITHUB_RESILIENCE_TESTS.md` - Test suite overview
-2. `GRAPHQL_COVERAGE_ANALYSIS.md` - Detailed coverage analysis
-3. `TESTING_SUMMARY.md` - This file (execution summary)
+1. `GRAPHQL_COVERAGE_ANALYSIS.md` - Detailed coverage analysis
+2. `TESTING_SUMMARY.md` - This file (execution summary)
+
+(`GITHUB_RESILIENCE_TESTS.md` was deleted in #213 with the test module it
+documented.)
 
 ### Updated Documentation
 - Test files include comprehensive docstrings
