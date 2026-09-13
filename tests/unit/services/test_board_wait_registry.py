@@ -131,6 +131,22 @@ class TestBoardWaitRegistry:
         assert is_new is True
         assert waited == 0.0
 
+    def test_clearing_a_stale_entry_removes_it_but_reports_no_duration(self):
+        """The other half of staleness, on the clear path rather than the read
+        path. An entry that stopped being refreshed has an unknown wait: the
+        gap between last_seen_at and now is time during which nothing was
+        observed, so `now - waiting_since` would be a fabricated figure, and
+        this duration is logged verbatim as "waited Ns". Report None -- the
+        acquire path then stays silent -- but still drop the entry, so the
+        stale wait cannot be woken or cleared a second time."""
+        reg = BoardWaitRegistry()
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+        later = 1000.0 + WAIT_ENTRY_STALE_SECONDS + 1
+        with patch('services.board_wait_registry.time.monotonic', return_value=later):
+            assert reg.clear_wait('proj', 'dev', 100) is None
+        assert reg._entries == {}
+
 
 class TestRefreshIsWhatKeepsAWaitAlive:
     """The review finding this class exists for: nothing on the dispatch path
