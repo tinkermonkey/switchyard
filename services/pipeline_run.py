@@ -10,7 +10,7 @@ import logging
 import redis
 import json
 import uuid
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Set, Tuple
 from datetime import datetime
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
@@ -1042,6 +1042,95 @@ class PipelineRunManager:
 
         return None
     
+    def get_active_run_workspaces(self) -> Dict[str, Set[str]]:
+        """Which epic worktrees currently belong to an ACTIVE pipeline run.
+
+        Returns {project_name: {epic_id, ...}} plus the same runs' resolved
+        project_dir paths under the reserved key '*paths*', so a caller can
+        match either way. Empty on any failure.
+
+        Why this exists (pipeline run 4cf816cf)
+        ------------------------------------------
+        Startup prunes stale epic worktrees and then, a few seconds later,
+        recovers pipeline locks and RE-TRIGGERS their holders. In the observed
+        incident those two steps disagreed: the prune removed
+        `worktrees/codetoreum/1016` at 16:00:47, and lock recovery re-triggered
+        issue #1045 -- whose run's project_dir was exactly that directory -- at
+        16:00:51. The review cycle then failed four seconds later on a
+        directory that no longer existed, and reported it as "no git changes
+        found", because the git helpers swallow a missing cwd into an empty
+        string.
+
+        The prune already knows how to protect a worktree that is tracked
+        in-process or bind-mounted into a live container. Neither covers this
+        case: after a restart nothing is tracked yet, and the agent container
+        for a mid-pipeline run finished long ago. The run record is the only
+        thing that still knows the directory matters, which is why the answer
+        has to come from here.
+
+        Deliberately permissive. A run whose ES doc still reads 'active' but
+        whose work is really dead costs one worktree left on disk until the
+        next sweep -- get_or_create_epic_worktree() adopts it, and
+        cleanup_stale_active_runs_on_startup() ends the run later in the same
+        startup. Deleting a live run's workspace costs the run.
+
+        Never raises: it runs inside a best-effort startup sweep that must not
+        be able to fail the boot.
+        """
+        workspaces: Dict[str, Set[str]] = {}
+        paths: Set[str] = set()
+
+        def _record(run_data: Dict[str, Any]) -> None:
+            project = run_data.get('project')
+            if not project:
+                return
+            epic_id = run_data.get('epic_id')
+            if epic_id:
+                workspaces.setdefault(project, set()).add(str(epic_id))
+            project_dir = run_data.get('project_dir')
+            if project_dir:
+                paths.add(str(project_dir).rstrip('/'))
+
+        # Redis first: it is the source of truth for active runs, and it is a
+        # separate always-on service, so it is readable at the point in startup
+        # the prune calls this -- well before lock recovery runs.
+        try:
+            mapping = self.redis.hgetall(self.redis_issue_mapping) or {}
+            for pipeline_run_id in mapping.values():
+                raw = self.redis.get(self._get_redis_key(pipeline_run_id))
+                if not raw:
+                    continue
+                run_data = json.loads(raw)
+                if PipelineRun.from_dict(run_data).is_active():
+                    _record(run_data)
+        except Exception as e:
+            logger.warning(f"Could not read active pipeline runs from Redis: {e}")
+
+        # Elasticsearch as well, not instead: a run whose Redis blob expired is
+        # exactly the long-running, mid-pipeline case whose worktree most needs
+        # protecting. Deliberately does NOT restore anything to Redis -- see
+        # get_active_pipeline_run(restore_to_redis=False) for why a maintenance
+        # read must not resurrect runs.
+        if self.es:
+            try:
+                result = self.es.search(
+                    index=f"{self.es_index_pattern}-*",
+                    body={
+                        "query": {"terms": {"status": ["active", "feedback_listening"]}},
+                        "size": 1000,
+                    },
+                )
+                for hit in result.get('hits', {}).get('hits', []):
+                    source = hit.get('_source') or {}
+                    if not source.get('ended_at'):
+                        _record(source)
+            except Exception as e:
+                logger.warning(f"Could not read active pipeline runs from Elasticsearch: {e}")
+
+        if paths:
+            workspaces['*paths*'] = paths
+        return workspaces
+
     def get_or_create_pipeline_run(
         self,
         issue_number: int,

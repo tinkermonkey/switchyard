@@ -1197,11 +1197,18 @@ class TestPruneTakesTheCheckoutLockPerProject:
         swept = []
         real_prune = ProjectWorkspaceManager._prune_project_staging
 
-        def _explode_for_broken(self_inner, project_staging, running_mount_sources):
+        def _explode_for_broken(
+            self_inner, project_staging, running_mount_sources, active_run_workspaces=None
+        ):
+            # active_run_workspaces is the active-run skip rule's input
+            # (pipeline run 4cf816cf); forwarded unchanged so this test keeps
+            # exercising the real sweep for the surviving project.
             if project_staging.name == 'broken-project':
                 raise OSError("staging directory vanished")
             swept.append(project_staging.name)
-            return real_prune(self_inner, project_staging, running_mount_sources)
+            return real_prune(
+                self_inner, project_staging, running_mount_sources, active_run_workspaces
+            )
 
         calls = []
         liveness, subproc = self._quiet(manager)

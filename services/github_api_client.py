@@ -1435,6 +1435,31 @@ class GitHubAPIClient:
         # restart; this is what makes it do so.
         return self._budget_fraction_from_mirror(credential, 'graphql')
 
+    def graphql_seconds_until_reset(self) -> Optional[float]:
+        """Seconds until the active credential's GraphQL quota window turns
+        over, or None when that is unknown.
+
+        The companion to graphql_budget_fraction_remaining(), and public for
+        the same reason: a caller deciding "how long should I hold off" needs
+        the window, and which bucket answers is this client's business, not
+        theirs. A caller reaching into _bucket() would have to duplicate
+        _resolve_credential() to pick the right one.
+
+        None means UNKNOWN, not zero -- a bucket that has never seen a real
+        response has no reset time, and treating that as "resets now" would
+        make a budget-aware pause a no-op exactly on a cold start.
+
+        Never raises: every caller is using this to decide how long to sleep.
+        """
+        try:
+            bucket = self._bucket(self._resolve_credential(), 'graphql')
+            if not bucket.ever_updated:
+                return None
+            return bucket.get_time_until_reset()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Could not read the GraphQL reset time: {e}")
+            return None
+
     def _budget_fraction_from_mirror(
         self, credential: str, resource: str
     ) -> Optional[float]:

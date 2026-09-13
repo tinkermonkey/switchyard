@@ -612,6 +612,40 @@ async def main():
                                     f"#{lock.locked_by_issue}: {e} — proceeding with re-trigger"
                                 )
 
+                        # Belt-and-braces against startup's own ordering (issue
+                        # pipeline run 4cf816cf). The epic-worktree prune runs
+                        # earlier in this same startup, and it deleted exactly
+                        # this run's workspace four seconds before the
+                        # re-trigger below in the observed incident.
+                        # prune_epic_worktrees() now refuses to remove an active
+                        # run's workspace, which is the real fix; this checks the
+                        # outcome rather than trusting it, because a re-trigger
+                        # into a missing directory does not fail cleanly -- it
+                        # fails several minutes later, inside the review cycle,
+                        # with an error that names neither the directory nor the
+                        # prune.
+                        if should_retrigger:
+                            try:
+                                from services.pipeline_run import get_pipeline_run_manager
+                                recovered_run = get_pipeline_run_manager().get_active_pipeline_run(
+                                    project_name, lock.locked_by_issue, pipeline.board_name
+                                )
+                                run_dir = recovered_run.project_dir if recovered_run else None
+                                if run_dir and not os.path.isdir(run_dir):
+                                    logger.error(
+                                        f"NOT re-triggering issue #{lock.locked_by_issue}: its "
+                                        f"pipeline run's workspace {run_dir} no longer exists, so "
+                                        f"the agent would run against a missing directory and fail "
+                                        f"mid-cycle. Leaving the lock held and the run as-is for "
+                                        f"deliberate recovery."
+                                    )
+                                    should_retrigger = False
+                            except Exception as e:
+                                logger.warning(
+                                    f"Could not verify the workspace for issue "
+                                    f"#{lock.locked_by_issue}: {e} — proceeding with re-trigger"
+                                )
+
                         # Re-trigger agent only if no active work is running
                         # (May have been interrupted mid-execution during restart)
                         if should_retrigger:

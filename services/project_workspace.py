@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from config.manager import config_manager
 
 logger = logging.getLogger(__name__)
@@ -3244,7 +3244,12 @@ class ProjectWorkspaceManager:
         except Exception:
             return None, []
 
-    def _prune_project_staging(self, project_staging: Path, running_mount_sources: set) -> None:
+    def _prune_project_staging(
+        self,
+        project_staging: Path,
+        running_mount_sources: set,
+        active_run_workspaces: Optional[Dict[str, Set[str]]] = None,
+    ) -> None:
         """One project's half of prune_epic_worktrees()'s sweep, run with that
         project's project_checkout lock HELD.
 
@@ -3257,8 +3262,20 @@ class ProjectWorkspaceManager:
 
         Best-effort like its caller: it swallows its own subprocess/OS failures and
         must never raise (prune_epic_worktrees() runs unguarded at every startup).
+
+        active_run_workspaces is PipelineRunManager.get_active_run_workspaces()'s
+        result, computed once for the whole sweep by the caller. See the
+        active-run skip rule below.
         """
         repo_path = self.workspace_root / project_staging.name
+        active_run_workspaces = active_run_workspaces or {}
+        active_epic_ids = active_run_workspaces.get(project_staging.name, set())
+        # Normalised HERE as well as where the set is built: this rule's whole
+        # job is to not delete a live workspace, and a trailing slash is not a
+        # reason to delete one.
+        active_paths = {
+            str(path).rstrip('/') for path in active_run_workspaces.get('*paths*', set())
+        }
         try:
             worktree_paths = list(project_staging.iterdir())
         except OSError as e:
@@ -3266,6 +3283,35 @@ class ProjectWorkspaceManager:
             return
         for worktree_path in worktree_paths:
             if not worktree_path.is_dir():
+                continue
+
+            # FIFTH skip rule (pipeline run 4cf816cf), and the one that makes
+            # startup's own ordering survivable: this worktree is the resolved
+            # workspace of a pipeline run that is still ACTIVE.
+            #
+            # None of the four rules below sees this case. After a restart
+            # nothing is tracked in-process yet (rule 1), the agent container
+            # for a mid-pipeline run finished long ago (rule 2), and the
+            # worktree is a perfectly healthy, clean checkout (rules 3 and 4) --
+            # it is just the one directory main.py is about to re-trigger an
+            # agent into, seconds from now, during the same startup. Removing it
+            # was observed to turn a recoverable, already-approved run into a
+            # hard failure whose error ("no git changes found") named neither
+            # the directory nor the prune.
+            #
+            # Matched on BOTH the epic id (the directory's own name) and the
+            # run's recorded project_dir: the id is robust to path formatting,
+            # the path is robust to a layout change. Either is enough to skip.
+            if (
+                worktree_path.name in active_epic_ids
+                or str(worktree_path).rstrip('/') in active_paths
+            ):
+                logger.info(
+                    f"Skipping prune of {worktree_path} -- it is the resolved "
+                    f"workspace of a pipeline run that is still active, which "
+                    f"startup's lock recovery may re-trigger an agent into "
+                    f"moments from now"
+                )
                 continue
             # Re-check right before acting on each worktree, not once
             # up front (review pass 2 on #87): container recovery can
@@ -3529,6 +3575,17 @@ class ProjectWorkspaceManager:
         the drifted ones, and it self-clears -- the moment the work is committed
         or discarded, the worktree is an ordinary removal candidate again.
 
+        A FIFTH case (pipeline run 4cf816cf): a worktree that is the resolved
+        workspace of a still-ACTIVE pipeline run is skipped. This one is not
+        about preserving work on disk -- the worktree is typically clean and
+        pushed -- it is about startup's own ordering. main.py prunes here and
+        then recovers pipeline locks and re-triggers their holders a few seconds
+        later, and in the observed incident the prune deleted precisely the
+        directory the re-trigger was about to use. None of the four rules above
+        sees that case: after a restart nothing is tracked in-process, and a
+        mid-pipeline run's agent container finished long ago. See
+        PipelineRunManager.get_active_run_workspaces().
+
         Deliberately NOT "any dirty worktree" (code review on #163). A dirty
         worktree still on the EPIC'S OWN branch is an ordinary interrupted run,
         not a refusal's preserved evidence, and nothing refuses over it: the
@@ -3635,6 +3692,25 @@ class ProjectWorkspaceManager:
             # container regardless of how many worktrees are being considered.
             running_mount_sources = self._get_running_container_mount_sources()
 
+            # Computed once for the whole sweep, alongside running_mount_sources
+            # and for the same reason -- one Redis/ES read covers every worktree
+            # under consideration. See the active-run skip rule in
+            # _prune_project_staging(), and get_active_run_workspaces() for why
+            # the run record is the only thing that still knows a mid-pipeline
+            # worktree matters after a restart.
+            try:
+                from services.pipeline_run import get_pipeline_run_manager
+                active_run_workspaces = get_pipeline_run_manager().get_active_run_workspaces()
+            except Exception as e:
+                # Unknown, not empty -- but this sweep is best-effort and runs
+                # unguarded at startup, so it degrades to the pre-existing four
+                # rules rather than refusing to prune anything.
+                logger.warning(
+                    f"Could not determine which epic worktrees belong to active "
+                    f"pipeline runs; pruning without that protection: {e}"
+                )
+                active_run_workspaces = {}
+
             # WAITING time only, not elapsed time -- see the docstring. Deliberately
             # not a `sweep_deadline = now + BUDGET` computed once: that charges the
             # budget for every second the sweep spends doing its own git work, so a
@@ -3674,7 +3750,9 @@ class ProjectWorkspaceManager:
                         # own work and must not be charged to the shared budget.
                         acquired_at = time.monotonic()
                         lock_wait_spent += acquired_at - wait_started
-                        self._prune_project_staging(project_staging, running_mount_sources)
+                        self._prune_project_staging(
+                            project_staging, running_mount_sources, active_run_workspaces
+                        )
                 except Exception as e:
                     if acquired_at is None:
                         # Never got in, so the whole elapsed span was spent waiting.

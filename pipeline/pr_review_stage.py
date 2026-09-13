@@ -1501,7 +1501,21 @@ class PRReviewStage(PipelineStage):
 
     def _set_issue_status_on_board(self, issue_number: str, repo: str,
                                     github_config: Dict, board, column):
-        """Set an issue's status on a project board."""
+        """Set an issue's status on a project board.
+
+        The sibling of PipelineProgression.move_issue_to_column(), and routed
+        through GitHubAPIClient for the same reason (pipeline run 4cf816cf): a
+        raw `gh api graphql` subprocess bypasses the shared circuit breaker, so
+        it keeps firing into an exhausted GraphQL quota while every other
+        caller is correctly being refused — and reports the failure as
+        "returned non-zero exit status 1", because CalledProcessError's string
+        form drops the stderr `gh` wrote the reason to. Leaving one card-move
+        path un-routed would just move the incident.
+        """
+        from services.github_api_client import get_github_client
+        from services.pipeline_progression import describe_graphql_failure
+
+        github_client = get_github_client()
         try:
             query = f'''{{
                 repository(owner: "{github_config['org']}", name: "{github_config['repo']}") {{
@@ -1516,12 +1530,14 @@ class PRReviewStage(PipelineStage):
                 }}
             }}'''
 
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
-            )
-            data = json.loads(result.stdout)
-            items = data['data']['repository']['issue']['projectItems']['nodes']
+            # graphql() already unwraps the 'data' envelope on success.
+            ok, data = github_client.graphql(query)
+            if not ok:
+                raise RuntimeError(
+                    f"Could not look up the project item for issue #{issue_number}: "
+                    f"{describe_graphql_failure(data)}"
+                )
+            items = data['repository']['issue']['projectItems']['nodes']
 
             item_id = None
             for item in items:
@@ -1550,10 +1566,12 @@ class PRReviewStage(PipelineStage):
                     }}
                 }}
                 '''
-                subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                    capture_output=True, text=True, check=True, timeout=30
-                )
+                mutation_ok, mutation_result = github_client.graphql(mutation)
+                if not mutation_ok:
+                    raise RuntimeError(
+                        f"Could not set the Status field for issue #{issue_number}: "
+                        f"{describe_graphql_failure(mutation_result)}"
+                    )
                 logger.info(f"Set issue #{issue_number} to {column.name} on board")
         except Exception as e:
             logger.error(f"Failed to set status for issue #{issue_number}: {e}", exc_info=True)

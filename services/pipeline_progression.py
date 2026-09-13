@@ -24,6 +24,94 @@ from services.pipeline_run import get_pipeline_run_manager
 logger = logging.getLogger(__name__)
 
 
+# Error shapes GitHubAPIClient.graphql() returns in its second tuple element
+# when the call did not succeed. Named here rather than matched inline because
+# describe_graphql_failure() and is_rate_limit_failure() below are the two
+# things standing between a rate-limited card move and the "returned non-zero
+# exit status 1" this module used to log -- see describe_graphql_failure().
+BREAKER_OPEN_ERROR = "GitHub API rate limit exceeded - circuit breaker open"
+RATE_LIMITED_ERROR = "rate_limited"
+
+
+def describe_graphql_failure(result: Any) -> str:
+    """Render GitHubAPIClient.graphql()'s failure payload as one readable line.
+
+    Exists because of a confirmed production incident (pipeline run
+    4cf816cf): this module used to run its Projects v2 queries as a bare
+    `subprocess.run(..., check=True)` and log the resulting CalledProcessError
+    as `str(e)`. `str()` on that exception is "Command '[...]' returned
+    non-zero exit status 1." and NOTHING else -- `gh` writes the actual reason
+    to stderr, which the string form drops. Three consecutive card-move
+    failures were recorded that way, and the real cause (an exhausted GraphQL
+    budget, with the circuit breaker already open for every other caller) had
+    to be inferred hours later from surrounding log lines rather than read off
+    the error.
+
+    Never raises and never returns an empty string: this renders the text that
+    goes into an operator-facing decision event and a GitHub comment, so an
+    unexpected payload shape must degrade to something printable rather than
+    become a second failure on the failure path.
+    """
+    if isinstance(result, dict):
+        error = result.get('error')
+        detail = result.get('stderr') or result.get('details') or result.get('raw_output')
+        if error and detail:
+            return f"{error}: {str(detail).strip()[:500]}"
+        if error:
+            return str(error)
+        if 'errors' in result:
+            # Body-level GraphQL errors on an otherwise well-formed response --
+            # this is where GitHub reports RATE_LIMIT and INSUFFICIENT_SCOPES.
+            return f"GraphQL errors: {str(result['errors'])[:500]}"
+    return str(result)[:500] if result else "unknown GraphQL failure (no detail returned)"
+
+
+def describe_subprocess_error(exc: BaseException) -> str:
+    """`str(exc)`, plus the stderr/stdout that `str()` alone throws away.
+
+    `str(subprocess.CalledProcessError)` is only "Command '[...]' returned
+    non-zero exit status N." -- the reason the command failed lives in
+    `.stderr`, which the string form omits entirely. Every `gh` failure logged
+    through plain `str()` in this file was therefore unattributable. Applies to
+    TimeoutExpired for the same reason; anything else falls through to `str()`.
+    """
+    text = str(exc)
+    for stream in ('stderr', 'stdout'):
+        raw = getattr(exc, stream, None)
+        if not raw:
+            continue
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', errors='replace')
+        raw = raw.strip()
+        if raw:
+            text = f"{text} ({stream}: {raw[:500]})"
+            break
+    return text
+
+
+def is_rate_limit_failure(result: Any) -> bool:
+    """Whether a GitHubAPIClient.graphql() failure payload means "out of quota".
+
+    Covers both shapes that mean it: the breaker refusing the call before it
+    was made, and GitHub rejecting the call itself. Callers use this to decide
+    whether retrying in a few seconds could possibly help -- it cannot, and
+    _move_card_with_retry()'s 5s/10s backoff spent all three of its attempts
+    inside a single rate-limit window because nothing told it that.
+    """
+    if not isinstance(result, dict):
+        return False
+    error = result.get('error')
+    if error in (RATE_LIMITED_ERROR, BREAKER_OPEN_ERROR):
+        return True
+    if isinstance(error, str) and 'rate limit' in error.lower():
+        return True
+    errors = result.get('errors')
+    if errors:
+        from services.github_api_client import is_graphql_rate_limit_error
+        return is_graphql_rate_limit_error(errors)
+    return False
+
+
 class PipelineProgression:
     """Manage automatic progression through pipeline stages"""
 
@@ -94,8 +182,22 @@ class PipelineProgression:
         
         Returns:
             True if successful, False otherwise
+
+        Every GitHub call below goes through GitHubAPIClient rather than a bare
+        `gh` subprocess. That is not a style preference: while the shared
+        circuit breaker was open on an exhausted GraphQL budget and correctly
+        refusing every other caller in the process, this method's own
+        subprocesses kept firing into the same exhausted quota, failed, and
+        reported only "returned non-zero exit status 1" because
+        CalledProcessError's string form drops stderr. Routing through the
+        client gives this path the breaker, the adaptive throttle, the
+        rate-limit accounting and -- via describe_graphql_failure() -- the
+        actual reason. See the module-level helpers.
         """
+        rate_limited = False
         try:
+            from services.github_api_client import get_github_client
+            github_client = get_github_client()
             project_config = config_manager.get_project_config(project_name)
             project_state = state_manager.load_project_state(project_name)
 
@@ -135,15 +237,14 @@ class PipelineProgression:
                     }}
                 }}'''
                 
-                result = subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                    capture_output=True, text=True, check=True, timeout=30
-                )
-                data = json.loads(result.stdout)
+                # graphql() already unwraps the 'data' envelope on success.
+                status_ok, data = github_client.graphql(query)
+                if not status_ok:
+                    raise RuntimeError(describe_graphql_failure(data))
 
                 # Safely access nested dictionary structure
-                if data and data.get('data'):
-                    repo_data = data['data'].get('repository')
+                if data:
+                    repo_data = data.get('repository')
                     if repo_data:
                         issue_data = repo_data.get('issue')
                         if issue_data:
@@ -264,18 +365,19 @@ class PipelineProgression:
                 }}
             }}'''
 
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
-            )
-
-            data = json.loads(result.stdout)
+            item_ok, data = github_client.graphql(query)
+            if not item_ok:
+                rate_limited = is_rate_limit_failure(data)
+                raise RuntimeError(
+                    f"Could not look up the project item for issue #{issue_number}: "
+                    f"{describe_graphql_failure(data)}"
+                )
 
             # Safely access nested dictionary structure
             project_items = []
             issue_exists = False
-            if data and data.get('data'):
-                repo_data = data['data'].get('repository')
+            if data:
+                repo_data = data.get('repository')
                 if repo_data:
                     issue_data = repo_data.get('issue')
                     if issue_data:
@@ -326,21 +428,41 @@ class PipelineProgression:
                 }}
             '''
 
-            # Retry logic for mutation
+            # Retry logic for mutation.
+            #
+            # A rate-limit failure breaks out immediately instead of burning the
+            # remaining attempts: the client's breaker is already open by then,
+            # so every retry is a guaranteed rejection, and the only thing the
+            # sleeps buy is a later, less informative final error. The caller
+            # (ProjectMonitor._move_card_with_retry) owns the decision about
+            # waiting for the quota window -- see card_move_retry_delay().
             max_retries = 3
+            mutation_error = None
             for attempt in range(max_retries):
-                try:
-                    result = subprocess.run(
-                        ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                        capture_output=True, text=True, check=True, timeout=30
+                mutation_ok, mutation_result = github_client.graphql(mutation)
+                if mutation_ok:
+                    mutation_error = None
+                    break
+                mutation_error = describe_graphql_failure(mutation_result)
+                if is_rate_limit_failure(mutation_result):
+                    rate_limited = True
+                    logger.warning(
+                        f"Card move for issue #{issue_number} hit the GitHub rate limit "
+                        f"(attempt {attempt+1}/{max_retries}): {mutation_error}. Not "
+                        f"retrying inside this window."
                     )
-                    break # Success
-                except subprocess.CalledProcessError as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Failed to move issue (attempt {attempt+1}/{max_retries}): {e.stderr}. Retrying...")
-                        time.sleep(2 * (attempt + 1)) # Exponential backoff
-                    else:
-                        raise # Re-raise on last attempt
+                    break
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Failed to move issue (attempt {attempt+1}/{max_retries}): "
+                        f"{mutation_error}. Retrying..."
+                    )
+                    time.sleep(2 * (attempt + 1))  # Exponential backoff
+
+            if mutation_error:
+                raise RuntimeError(
+                    f"Could not set the Status field for issue #{issue_number}: {mutation_error}"
+                )
 
             # Record status change with trigger (from pipeline progression)
             from services.work_execution_state import work_execution_tracker
@@ -368,8 +490,19 @@ class PipelineProgression:
             return True
 
         except Exception as e:
-            logger.error(f"Error moving issue to column: {e}")
-            
+            # The error text now carries the actual GitHub reason (see
+            # describe_graphql_failure), and says outright when the cause was
+            # the quota rather than leaving that to be inferred from adjacent
+            # log lines hours later.
+            error_text = str(e)
+            if rate_limited:
+                error_text = (
+                    f"{error_text} — this is GitHub GraphQL quota exhaustion, not a "
+                    f"transient error; retrying before the quota window resets cannot "
+                    f"succeed."
+                )
+            logger.error(f"Error moving issue to column: {error_text}")
+
             # EMIT DECISION EVENT: Status progression failed
             self.decision_events.emit_status_progression(
                 issue_number=issue_number,
@@ -379,10 +512,10 @@ class PipelineProgression:
                 to_status=target_column,
                 trigger=trigger,
                 success=False,
-                error=str(e),
+                error=error_text,
                 pipeline_run_id=pipeline_run_id
             )
-            
+
             return False
 
     def _get_issue_details(self, repository: str, issue_number: int, org: str) -> Dict[str, Any]:
@@ -395,6 +528,7 @@ class PipelineProgression:
         genuinely-empty issue.
         """
         last_error = None
+        last_error_text = None
         for attempt in range(3):
             try:
                 result = subprocess.run(
@@ -403,17 +537,25 @@ class PipelineProgression:
                 )
                 return json.loads(result.stdout)
             except Exception as e:
+                # `str(CalledProcessError)` drops stderr, which is where `gh`
+                # writes the reason -- the same blind spot that made the card
+                # move's own failures unreadable. Keep the reason; keep the
+                # exception too, for the `raise ... from` below.
                 last_error = e
+                last_error_text = describe_subprocess_error(e)
                 if attempt < 2:
                     logger.warning(
                         f"Transient failure fetching issue #{issue_number} details "
-                        f"(attempt {attempt + 1}/3): {e}; retrying"
+                        f"(attempt {attempt + 1}/3): {last_error_text}; retrying"
                     )
                     time.sleep(0.5 * (attempt + 1))
 
-        logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
+        logger.error(
+            f"Error fetching issue #{issue_number} details after 3 attempts: {last_error_text}"
+        )
         raise RuntimeError(
-            f"Could not fetch issue #{issue_number} details from GitHub after 3 attempts: {last_error}"
+            f"Could not fetch issue #{issue_number} details from GitHub after 3 attempts: "
+            f"{last_error_text}"
         ) from last_error
 
     def _release_lock_on_exit_column(self, project_name: str, board_name: str, issue_number: int,

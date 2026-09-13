@@ -3014,7 +3014,16 @@ class ReviewCycleExecutor:
         return ReviewStatus.UNKNOWN, column.name
 
     def _get_git_commit_hash(self, project_dir: str, ref: str = 'HEAD') -> str:
-        """Resolve a git ref to its full commit SHA (defaults to HEAD)"""
+        """Resolve a git ref to its full commit SHA (defaults to HEAD)
+
+        Returns "" on any failure, as callers expect -- but logs a MISSING
+        DIRECTORY at ERROR rather than WARNING. The two are not the same
+        severity: a ref that doesn't resolve is ordinary (HEAD~1 on a
+        single-commit branch), while a cwd that doesn't exist means this run's
+        workspace is gone, which is a structural failure whose real cause is
+        invisible by the time the empty string reaches the caller (pipeline
+        run 4cf816cf).
+        """
         import subprocess
         try:
             result = subprocess.run(
@@ -3025,6 +3034,13 @@ class ReviewCycleExecutor:
                 check=True
             )
             return result.stdout.strip()
+        except (FileNotFoundError, NotADirectoryError) as e:
+            logger.error(
+                f"Cannot resolve git ref {ref!r}: the workspace {project_dir} is "
+                f"missing ({e}). Every git read against this run will come back "
+                f"empty, which is NOT the same as 'no changes'."
+            )
+            return ""
         except Exception as e:
             logger.warning(f"Failed to resolve git ref {ref!r}: {e}")
             return ""
@@ -3042,6 +3058,14 @@ class ReviewCycleExecutor:
                 return subprocess.run(
                     cmd, cwd=project_dir, capture_output=True, text=True, check=True
                 ).stdout.strip()
+            except (FileNotFoundError, NotADirectoryError) as e:
+                # See _get_git_commit_hash(): a missing workspace is a
+                # structural failure, not a quiet "nothing to report".
+                logger.error(
+                    f"git command {cmd} could not run: the workspace {project_dir} "
+                    f"is missing ({e})"
+                )
+                return ""
             except Exception as e:
                 logger.warning(f"git command {cmd} failed: {e}")
                 return ""
@@ -3232,9 +3256,28 @@ class ReviewCycleExecutor:
                     logger.info(f"Fallback: generated change manifest from HEAD~1 ({base_commit[:8]})")
 
             if not change_manifest:
+                # WHY the manifest is empty matters, and the two causes need
+                # different fixes. A MISSING DIRECTORY is not "no changes": the
+                # git helpers swallow a missing cwd into a WARNING and an empty
+                # string, so a pruned worktree surfaced here as "no git changes
+                # found" and sent an investigation looking for commits that were
+                # never lost (pipeline run 4cf816cf -- startup's own
+                # epic-worktree prune had deleted this run's worktree four
+                # seconds earlier; the commits were on the branch the whole
+                # time). prune_epic_worktrees() now refuses to remove an active
+                # run's workspace, and this says so when something else does.
+                if not project_dir.exists():
+                    raise RuntimeError(
+                        f"Cannot build reviewer context for issue "
+                        f"#{cycle_state.issue_number}: its resolved workspace "
+                        f"{project_dir} does not exist, so no diff can be taken "
+                        f"against it. The worktree was removed out from under this "
+                        f"run. The work itself is not lost -- it is on the run's "
+                        f"branch -- but this review cycle cannot continue. Aborting."
+                    )
                 raise RuntimeError(
                     f"Cannot build reviewer context for issue #{cycle_state.issue_number}: "
-                    f"no git changes found. pre_maker_commit="
+                    f"no git changes found in {project_dir}. pre_maker_commit="
                     f"{cycle_state.pre_maker_commit!r} and HEAD~1 fallback both returned empty. "
                     f"Aborting review cycle."
                 )

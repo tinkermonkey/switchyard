@@ -89,6 +89,17 @@ class FeatureBranch:
     last_updated: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
+class SubIssueQueryError(RuntimeError):
+    """A parent's sub-issues could not be determined.
+
+    Raised, never returned as an empty list, because the two are opposite
+    answers and one caller acts on the difference irreversibly -- see
+    FeatureBranchManager._get_sub_issues_from_parent() for the incident that
+    put this class here (a rate-limited query read as "standalone work", and a
+    feature PR containing one of five phases marked ready for review).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Batched / aliased cross-parent sub-issue query builder (GitHub issue #95,
 # sub-issue of #36)
@@ -676,13 +687,44 @@ class FeatureBranchManager:
             parent_issue_data: Parent issue data from GitHub API (must contain 'number' key)
 
         Returns:
-            List of issue data dicts for each sub-issue
+            List of issue data dicts for each sub-issue. An EMPTY LIST means the
+            query succeeded and the parent genuinely has no sub-issues -- nothing
+            else.
+
+        Raises:
+            SubIssueQueryError: the question could not be answered (unusable
+                parent data, a failed GraphQL call, an unexpected exception).
+
+        Why this raises instead of returning [] (pipeline run 4cf816cf)
+        -----------------------------------------------------------------
+        It used to return [] for all three of "no sub-issues", "the parent data
+        is unusable" and "the query failed", and one caller acts on that answer
+        irreversibly: finalize_feature_branch_work() reads len(...) == 0 as
+        "standalone work" and marks the feature PR ready for review.
+
+        That is exactly what happened. With the GitHub circuit breaker open on
+        an exhausted quota, get_issue() returned an error dict with no 'number'
+        key, this method logged "cannot query sub-issues" and returned [], and
+        the caller logged "Parent issue #1016 has no sub-issues (standalone
+        work) - marking PR ready" and marked it ready. Epic #1016 had five
+        sub-issues, four of them unfinished; only Phase 1 was on the branch. A
+        rate-limit error had been converted into a positive claim about the
+        world, and then acted on.
+
+        Callers that merely SKIP on an empty result are unaffected in substance
+        -- they now skip on the exception too -- but they no longer do so while
+        recording "no sub-issues" as a fact.
         """
-        parent_number = parent_issue_data.get('number')
+        parent_number = parent_issue_data.get('number') if parent_issue_data else None
 
         if not parent_number:
-            logger.error("parent_issue_data missing 'number' key, cannot query sub-issues")
-            return []
+            raise SubIssueQueryError(
+                "Cannot query sub-issues: the parent issue data has no 'number' key "
+                f"(got {type(parent_issue_data).__name__}: "
+                f"{str(parent_issue_data)[:200]}). This is what a failed get_issue() "
+                "looks like -- an open circuit breaker returns an error dict, not an "
+                "issue -- so it must not be read as 'this parent has no sub-issues'."
+            )
 
         # Query GitHub's structured subIssues field via GraphQL
         # NOTE: GitHub's GraphQL API may cache responses. If stale data is suspected,
@@ -727,11 +769,10 @@ class FeatureBranchManager:
             query_duration = (time.time() - query_start) * 1000  # milliseconds
 
             if not success:
-                logger.error(
+                raise SubIssueQueryError(
                     f"GraphQL query failed for issue #{parent_number} sub-issues "
                     f"(duration={query_duration:.0f}ms): {result}"
                 )
-                return []
 
             # Extract sub-issues from response
             # Note: github_client.graphql() already extracts 'data' field, so access directly
@@ -758,9 +799,15 @@ class FeatureBranchManager:
 
             return sub_issues
 
+        except SubIssueQueryError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to query sub-issues for parent #{parent_number}: {e}")
-            return []
+            # Same reasoning as the explicit raises above: an unexpected failure
+            # is still a failure to ANSWER, and must not be reported as an
+            # answer of "none".
+            raise SubIssueQueryError(
+                f"Failed to query sub-issues for parent #{parent_number}: {e}"
+            ) from e
 
     async def get_sub_issues_for_parents_batched(
         self, github_integration, parent_issue_numbers: List[int]
@@ -1854,6 +1901,18 @@ git push --force-with-lease
                     f"- just finalized issue #{issue_number}"
                 )
                 all_complete = False
+        except SubIssueQueryError as e:
+            # Explicit, ahead of the generic handler, because this is the exact
+            # failure that used to be laundered into "no sub-issues (standalone
+            # work) - marking PR ready". all_complete stays False and the PR
+            # stays a draft; the periodic orphaned-parent sweep re-checks once
+            # GitHub is answering again.
+            logger.error(
+                f"Could not determine whether parent #{feature_branch.parent_issue} "
+                f"still has open sub-issues, so PR #{feature_branch.pr_number} is being "
+                f"LEFT AS A DRAFT rather than marked ready: {e}"
+            )
+            all_complete = False
         except Exception as e:
             logger.error(f"Failed to check sub-issue completion for parent #{feature_branch.parent_issue}: {e}")
             all_complete = False
