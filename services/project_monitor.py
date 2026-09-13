@@ -9,7 +9,7 @@ import logging
 import uuid
 import inspect
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple, Union
+from typing import Dict, Any, List, Optional, Set, Tuple, Union
 from dataclasses import dataclass
 from enum import Enum
 from monitoring.timestamp_utils import utc_isoformat
@@ -8542,6 +8542,38 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             )
             return None
 
+    def _pipeline_exit_columns_for_board(
+        self, config_manager, project_config, board_name: str
+    ) -> Set[str]:
+        """The board's configured pipeline exit columns, or an empty set.
+
+        Same resolution the rest of this module uses (pipeline config for the
+        board -> workflow template -> pipeline_exit_columns); factored out only
+        so the wake can consult it without a second ConfigManager round trip.
+
+        Never raises. An empty set is the SAFE failure direction here: it means
+        the wake treats no column as an exit column, i.e. it behaves exactly as
+        it did before, keeping the wait rather than dropping it on a config it
+        could not read. Dropping is the destructive choice (it discards
+        waiting_since and the escalation state), so it must never be the
+        consequence of a lookup failure.
+        """
+        try:
+            for pipeline in (project_config.pipelines or []):
+                if pipeline.board_name != board_name:
+                    continue
+                workflow_template = config_manager.get_workflow_template(
+                    pipeline.workflow
+                )
+                return set(
+                    getattr(workflow_template, 'pipeline_exit_columns', None) or []
+                )
+        except Exception as e:
+            logger.debug(
+                f"Could not resolve exit columns for board {board_name}: {e}"
+            )
+        return set()
+
     def _dispatch_waiting_board_lock_waiter_locked(
         self, project_name: str, board_name: str, repository, waiters
     ) -> Optional[int]:
@@ -8576,6 +8608,9 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             config_manager = ConfigManager()
             project_config = config_manager.get_project_config(project_name)
             repo = repository or project_config.github['repo']
+            exit_columns = self._pipeline_exit_columns_for_board(
+                config_manager, project_config, board_name
+            )
 
             for waiter in waiters:
                 issue_number = waiter.issue_number
@@ -8604,6 +8639,29 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                     logger.info(
                         f"Waiting {waiter.kind} for issue #{issue_number} is no longer "
                         f"on {project_name}/{board_name}; dropping the wait"
+                    )
+                    get_board_wait_registry().clear_wait(
+                        project_name, board_name, issue_number
+                    )
+                    continue
+
+                if current_column in exit_columns:
+                    # The card has left the pipeline. Dispatching it would not
+                    # start anything -- trigger_agent_for_status()'s exit-column
+                    # branch releases the lock and returns a bare None -- but it
+                    # WOULD re-enter _release_pipeline_lock_and_process_next()
+                    # from inside a release, and the reentrancy guard only blocks
+                    # the nested wake, not the nested Development backfill: the
+                    # release would then run get_next_n_waiting_issues() twice.
+                    # Worse, the bare None it returns is indistinguishable from a
+                    # transient decline below, so the entry would be kept and
+                    # _refresh_board_lock_waits() would keep it alive forever,
+                    # costing a board read plus a `gh issue view` on every single
+                    # lock release for an issue that is not waiting for anything.
+                    logger.info(
+                        f"Waiting {waiter.kind} for issue #{issue_number} has reached "
+                        f"exit column '{current_column}' on {project_name}/{board_name}; "
+                        f"dropping the wait instead of dispatching it"
                     )
                     get_board_wait_registry().clear_wait(
                         project_name, board_name, issue_number
@@ -8642,10 +8700,30 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 if dispatched:
                     return issue_number
 
-                # Nothing started. Leave the entry in place (this issue is still
-                # waiting, and its own next refusal will refresh it) and fall
-                # through to the caller's ordinary Development backfill rather
-                # than leaving the freed board idle.
+                if is_permanent_decline(dispatched):
+                    # A DispatchDecline is falsy, so it lands here with the
+                    # transient declines -- but it means the opposite: no retry
+                    # can ever change the answer (today: the issue is closed).
+                    # Keeping the entry would hand this issue the board on every
+                    # future release, each costing a board read and a
+                    # `gh issue view`, with _refresh_board_lock_waits() renewing
+                    # the entry indefinitely. That per-sweep loop is exactly what
+                    # DispatchDecline was introduced to end (#165); drop the
+                    # entry and offer the board to the next waiter instead.
+                    logger.info(
+                        f"Waiting {waiter.kind} for issue #{issue_number} on "
+                        f"{project_name}/{board_name} declined permanently "
+                        f"({dispatched.value}); dropping the wait"
+                    )
+                    get_board_wait_registry().clear_wait(
+                        project_name, board_name, issue_number
+                    )
+                    continue
+
+                # Nothing started, for a reason a retry may fix. Leave the entry
+                # in place (this issue is still waiting, and its own next refusal
+                # will refresh it) and fall through to the caller's ordinary
+                # Development backfill rather than leaving the freed board idle.
                 logger.info(
                     f"Wake of issue #{issue_number} on {project_name}/{board_name} "
                     f"started nothing; falling through to the Development backfill"

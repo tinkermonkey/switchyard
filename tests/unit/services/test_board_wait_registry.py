@@ -220,7 +220,7 @@ class TestRefreshIsWhatKeepsAWaitAlive:
 
 
 def _monitor(trigger_return='senior_software_engineer', column='Testing',
-             column_reads_ok=True):
+             column_reads_ok=True, exit_columns=()):
     """A ProjectMonitor with only what dispatch_waiting_board_lock_waiter touches.
 
     ConfigManager is patched where project_monitor looks it up, so the wake's
@@ -229,11 +229,20 @@ def _monitor(trigger_return='senior_software_engineer', column='Testing',
     The wake resolves the column through get_issue_column_sync_CHECKED, which
     returns (column, reads_ok) — a board that could not be read must not be
     reported as a card that is gone.
+
+    `exit_columns` populates the board's workflow template, which is how the
+    wake decides a waiter has left the pipeline. The default is empty, i.e. no
+    column is an exit column, which is what every test that is not about that
+    branch wants.
     """
     config_manager = Mock(spec=ConfigManager)
     config_manager.list_projects.return_value = []
     project_config = Mock()
     project_config.github = {'repo': 'test-repo'}
+    project_config.pipelines = [Mock(board_name='dev', workflow='dev_workflow')]
+    workflow_template = Mock()
+    workflow_template.pipeline_exit_columns = list(exit_columns)
+    config_manager.get_workflow_template.return_value = workflow_template
     config_manager.get_project_config.return_value = project_config
 
     from services.project_monitor import ProjectMonitor
@@ -366,9 +375,12 @@ class TestReleaseDrivenWake:
         assert get_board_wait_registry().get_waiters_for_board('proj', 'dev') == []
 
     def test_a_dispatch_that_starts_nothing_keeps_the_wait_and_returns_none(self):
-        """None tells the caller to fall through to its Development backfill,
-        so a declined wake never leaves the freed board idle. The entry stays:
-        the issue is still waiting and its own next refusal will refresh it."""
+        """A TRANSIENT decline (bare None: a duplicate pending task, a review
+        cycle already running, a retained lock). None tells the caller to fall
+        through to its Development backfill, so a declined wake never leaves the
+        freed board idle. The entry stays: the issue is still waiting and its
+        own next refusal will refresh it. Contrast the permanent decline and the
+        exit-column cases below, which must drop the entry."""
         monitor, cm = _monitor(trigger_return=None)
         get_board_wait_registry().record_wait('proj', 'dev', 100)
 
@@ -376,6 +388,111 @@ class TestReleaseDrivenWake:
 
         assert result is None
         monitor.trigger_agent_for_status.assert_called_once()
+        assert [w.issue_number
+                for w in get_board_wait_registry().get_waiters_for_board('proj', 'dev')] == [100]
+
+    def test_a_permanent_decline_drops_the_wait(self):
+        """DispatchDecline is falsy by design, so it arrives at the same branch
+        as a transient None while meaning the opposite: no retry can ever change
+        the answer. Kept, the entry is re-offered the board on every release
+        forever — the per-sweep `gh issue view` loop #165 introduced
+        DispatchDecline to end."""
+        from services.project_monitor import DispatchDecline
+
+        monitor, cm = _monitor(trigger_return=DispatchDecline.ISSUE_CLOSED)
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+
+        result, _ = self._wake(monitor, cm)
+
+        assert result is None
+        monitor.trigger_agent_for_status.assert_called_once()
+        assert get_board_wait_registry().get_waiters_for_board('proj', 'dev') == []
+
+    def test_a_permanently_declined_waiter_costs_nothing_on_the_next_release(self):
+        """The actual cost being removed: with the entry kept, EVERY subsequent
+        lock release spends a board read plus a `gh issue view` on an issue that
+        is not waiting, and _refresh_board_lock_waits() renews the entry
+        indefinitely so it never ages out."""
+        from services.project_monitor import DispatchDecline
+
+        monitor, cm = _monitor(trigger_return=DispatchDecline.ISSUE_CLOSED)
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+        self._wake(monitor, cm)
+
+        monitor.get_issue_column_sync_checked.reset_mock()
+        monitor.trigger_agent_for_status.reset_mock()
+        result, lock_manager = self._wake(monitor, cm)
+
+        assert result is None
+        lock_manager.get_lock.assert_not_called()
+        monitor.get_issue_column_sync_checked.assert_not_called()
+        monitor.trigger_agent_for_status.assert_not_called()
+
+    def test_a_permanent_decline_offers_the_board_to_the_next_waiter(self):
+        """Dropping the dead waiter must not cost the board: the release is
+        still free, so the next-longest waiter gets it in the same pass."""
+        from services.project_monitor import DispatchDecline
+
+        monitor, cm = _monitor()
+        results = {100: DispatchDecline.ISSUE_CLOSED, 200: 'senior_software_engineer'}
+        monitor.trigger_agent_for_status = Mock(
+            side_effect=lambda _p, _b, issue, _c, _r: results[issue]
+        )
+        reg = get_board_wait_registry()
+        import time as _time
+        base = _time.monotonic()
+        with patch('services.board_wait_registry.time.monotonic', return_value=base - 100):
+            reg.record_wait('proj', 'dev', 100)
+        with patch('services.board_wait_registry.time.monotonic', return_value=base - 10):
+            reg.record_wait('proj', 'dev', 200)
+
+        result, _ = self._wake(monitor, cm)
+
+        assert result == 200
+        assert [w.issue_number
+                for w in reg.get_waiters_for_board('proj', 'dev')] == [200]
+
+    def test_a_waiter_that_reached_an_exit_column_is_dropped_not_dispatched(self):
+        """An exit-column card has left the pipeline. Dispatching it starts
+        nothing (trigger_agent_for_status's exit-column branch returns a bare
+        None) but DOES re-enter _release_pipeline_lock_and_process_next from
+        inside a release — and the reentrancy guard blocks only the nested wake,
+        not the nested Development backfill, so get_next_n_waiting_issues() runs
+        twice. The bare None then reads as transient and the entry survives."""
+        monitor, cm = _monitor(column='Staged', exit_columns=('Staged', 'Done'))
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+
+        result, _ = self._wake(monitor, cm)
+
+        assert result is None
+        monitor.trigger_agent_for_status.assert_not_called()
+        assert get_board_wait_registry().get_waiters_for_board('proj', 'dev') == []
+
+    def test_a_mid_pipeline_column_is_never_mistaken_for_an_exit_column(self):
+        """The drop is destructive — it discards waiting_since and the
+        escalation state — so it must fire only on a configured exit column."""
+        monitor, cm = _monitor(column='Testing', exit_columns=('Staged', 'Done'))
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+
+        result, _ = self._wake(monitor, cm)
+
+        assert result == 100
+        monitor.trigger_agent_for_status.assert_called_once_with(
+            'proj', 'dev', 100, 'Testing', 'test-repo'
+        )
+
+    def test_unresolvable_exit_columns_keep_the_wait_rather_than_drop_it(self):
+        """A config the wake cannot read must fail towards the pre-existing
+        behaviour (keep the wait), never towards the destructive one."""
+        monitor, cm = _monitor(column='Staged', exit_columns=('Staged',))
+        cm.get_workflow_template.side_effect = RuntimeError('config unreadable')
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+
+        result, _ = self._wake(monitor, cm)
+
+        # Dispatched (the pre-#219-round-3 behaviour) and, crucially, still
+        # registered: the wait was not silently discarded on a config error.
+        assert result == 100
         assert [w.issue_number
                 for w in get_board_wait_registry().get_waiters_for_board('proj', 'dev')] == [100]
 

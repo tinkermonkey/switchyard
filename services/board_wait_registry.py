@@ -86,14 +86,20 @@ def wake_reentrancy_guard(project: str, board: str):
 
     Not defensive padding -- there is a concrete recursion here. The wake
     dispatches through ProjectMonitor.trigger_agent_for_status(), and that
-    method calls _release_pipeline_lock_and_process_next() itself when the issue
-    it is handed turns out to be sitting in a pipeline EXIT column
-    (services/project_monitor.py, the exit-column branches). That release then
-    calls the wake again. The woken issue's registry entry is only cleared by
-    _start_repair_cycle_for_issue on acquisition, and the exit-column branch
-    returns long before reaching it -- so without this guard the same issue is
-    selected, dispatched and re-released forever, one Python frame deeper each
-    time, until the interpreter's recursion limit fires inside a lock release.
+    method calls _release_pipeline_lock_and_process_next() itself on two of its
+    own branches: when the issue is sitting in a pipeline EXIT column, and when
+    the issue turns out to be CLOSED while still holding the lock. That release
+    then calls the wake again, which re-selects the same still-registered
+    waiter -- one Python frame deeper each time, until the interpreter's
+    recursion limit fires inside a lock release.
+
+    The wake now drops the registry entry for both of those outcomes (an exit
+    column is checked before dispatch; a closed issue is recognised from the
+    DispatchDecline it returns), so neither one loops ACROSS releases any more.
+    This guard is still what stops the recursion WITHIN a single release, and
+    the closed-issue branch still reaches the release path before the decline
+    that clears the entry gets back to the wake -- so it is load-bearing, not
+    historical.
 
     Yields True when the caller may proceed, False when it must not.
     """
