@@ -618,6 +618,96 @@ def _zero_the_agent_retry_backoff():
     agent_executor.RETRY_BACKOFF_BASE_SECONDS = 0
 
 
+def _keep_the_rate_limit_mirror_in_this_process():
+    """Stop the suite reading and writing the DEPLOYMENT's rate-limit mirror.
+
+    GitHubAPIClient publishes every real-response rate-limit reading to two
+    global Redis keys that other processes consume -- the observability server,
+    ephemeral agent containers, and (since #216) the budget pre-flight that
+    decides whether a restarting orchestrator may reconcile its boards. Inside
+    the orchestrator container that Redis is the running deployment's own.
+
+    Both directions were wrong, and they were wrong in a way that cancelled out
+    just enough to look fine:
+
+      WRITE. A unit test that exercises graphql()/rest()/http_request() with a
+      mocked subprocess still runs the real mirror code, so fabricated numbers
+      landed in the keys production reads from.
+
+      DELETE. _purge_redis() therefore deleted those keys to clean up after
+      itself -- which also destroys a real reading the deployment put there.
+      That is not hypothetical tidiness: #216's cold-start fallback reads
+      exactly these keys, because a just-restarted process has no in-memory
+      reading of its own. A restart shortly after any test run found nothing,
+      reported "unknown", and the budget guard stood down. Measured live: a
+      burn-rate sample came back empty mid-measurement because another
+      session's suite run had wiped the key.
+
+    Swapping the client for an in-memory fake fixes both at once and is
+    strictly better than purging: nothing fabricated is ever written, so
+    nothing needs deleting, and the deployment's own reading survives a test
+    run untouched. Tests that want to observe mirror behaviour patch
+    _get_shared_redis_client themselves (see
+    tests/unit/services/test_github_api_rate_limit_redis_mirror.py) and their
+    patch wins over this one, so their coverage is unchanged.
+
+    The fake is shared with the lock tests rather than a second stand-in; it
+    grew get()/set() for this, since the mirror uses string keys where
+    PipelineLockManager uses hashes.
+    """
+    try:
+        import services.github_api_client as github_api_client
+        from tests.utils.fake_redis import ThreadSafeFakeRedis
+    except Exception as e:  # pragma: no cover - import shape, not behaviour
+        logger.debug(f"Could not isolate the rate-limit mirror: {e}")
+        return
+
+    fake = ThreadSafeFakeRedis()
+    github_api_client._shared_redis_client = fake
+    github_api_client._get_shared_redis_client = lambda: fake
+
+
+def _keep_enqueued_tasks_out_of_the_deployments_queue():
+    """Stop the suite putting tasks into the RUNNING orchestrator's work queue.
+
+    TaskQueue defaults to use_redis=True and connects to a hardcoded
+    host='redis', so inside the orchestrator container it is the deployment's
+    own queue. Any test that reaches an enqueue() -- through ProjectMonitor,
+    PipelineProgression, AgentExecutor or pipeline_run, which is a lot of
+    surface -- pushes a real task onto tasks:{priority}, and the live workers
+    pick it up.
+
+    They then fail, because the test's project does not exist:
+
+        [Worker 0] Task 8d09f685... failed after 15.0s:
+        Configuration file not found: /app/config/projects/test-project.yaml
+
+    Measured over 90 minutes on the deployment: 189 such lines, in bursts that
+    line up with suite runs -- including bursts from other sessions, so this is
+    not one person's habit. Each one occupies a real worker for 15 seconds.
+
+    Deliberately NOT wrapped in try/except like the guards above it. The first
+    version of this named the class TaskManager, which does not exist -- the
+    except swallowed the ImportError, the guard installed nothing, and a full
+    green suite said nothing was wrong. A guard that cannot fail loudly is a
+    guard you cannot tell is working; the import either succeeds or the suite
+    does not start. test_test_suite_isolation.py asserts it applied.
+
+    use_redis=False is not a stub: TaskQueue already has a complete in-memory
+    priority-queue fallback for exactly the case where Redis is unavailable,
+    and that path is what a test should exercise anyway. A test that genuinely
+    wants the Redis path passes use_redis=True explicitly and is left alone --
+    _patch_init_defaults only fills in keywords the caller omitted.
+
+    Not covered by _refuse_to_resolve_compose_service_hostnames(): that guard
+    is explicitly off-container, and in-container `redis` resolves to the
+    deployment's server precisely as intended.
+    """
+    from task_queue.task_manager import TaskQueue
+
+    _patch_init_defaults(TaskQueue, use_redis=False)
+
+
 _refuse_to_resolve_compose_service_hostnames()
 _bound_service_client_timeouts()
 _redirect_orchestrator_root_to_scratch()
@@ -626,6 +716,8 @@ _install_a_disabled_observability_singleton()
 _stop_the_background_call_trace_summarizer()
 _install_a_mock_backed_pipeline_run_manager_singleton()
 _zero_the_agent_retry_backoff()
+_keep_the_rate_limit_mirror_in_this_process()
+_keep_enqueued_tasks_out_of_the_deployments_queue()
 
 
 # Import test utilities
@@ -1442,20 +1534,16 @@ def _purge_redis():
                 if cursor == 0:
                     break
 
-        # GitHubAPIClient mirrors real-response-derived rate limit readings
-        # to a couple of small *global* Redis keys (not namespaced by
-        # project, since GitHub's quota is account-wide) that the live
-        # dashboard reads directly - see get_shared_rate_limit_status().
-        # A unit test that exercises graphql()/rest()/http_request() with a
-        # mocked subprocess/response still runs the real mirror code, which
-        # would otherwise leave fabricated numbers sitting in the same keys
-        # production reads from. Purge them explicitly since they don't
-        # match the project-name pattern above.
-        try:
-            from services.github_api_client import RATE_LIMIT_REDIS_KEYS
-            r.delete(*RATE_LIMIT_REDIS_KEYS.values())
-        except Exception as e:
-            logger.warning(f"Test-data purge: rate-limit key cleanup failed: {e}")
+        # The rate-limit mirror keys are deliberately NOT purged here any
+        # more. This used to delete them, because a unit test exercising
+        # graphql() with a mocked subprocess still ran the real mirror code
+        # and left fabricated numbers in the keys production reads from.
+        # _keep_the_rate_limit_mirror_in_this_process() now stops that write
+        # from reaching Redis at all, so there is nothing to clean up -- and
+        # the delete was never free: it also destroyed the DEPLOYMENT's own
+        # reading, which #216's cold-start budget pre-flight depends on. It
+        # also only ever cleared the PAT keys, never RATE_LIMIT_REDIS_KEYS_APP,
+        # so it was not even doing its stated job completely.
     except Exception as e:
         logger.warning(f"Test-data purge: Redis cleanup skipped: {e}")
 

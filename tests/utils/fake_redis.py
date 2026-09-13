@@ -50,12 +50,46 @@ class ThreadSafeFakeRedis:
         with self._global_lock:
             self._store.setdefault(key, {}).update(mapping)
 
-    def delete(self, key):
+    def delete(self, *keys):
+        """Variadic, like the real client. Single-key callers are unaffected;
+        `delete(a, b)` used to raise TypeError, which is not a difference any
+        test should have to know about."""
+        removed = 0
         with self._global_lock:
-            self._store.pop(key, None)
+            for key in keys:
+                if self._store.pop(key, None) is not None:
+                    removed += 1
+        return removed
 
     def expire(self, key, seconds):
         pass  # TTL not needed for these tests -- see TtlFakeRedis for the ones that need it
+
+    # -- string keys --------------------------------------------------------
+    # The hash API above models PipelineLockManager. GitHubAPIClient's
+    # rate-limit mirror uses plain string keys instead (get/set), and the same
+    # store serves both: Redis itself keeps one keyspace, and a test that set a
+    # string key would be entitled to find it with get() and not with
+    # hgetall(). `ex` is accepted and ignored for the same reason expire() is.
+    def get(self, key):
+        with self._global_lock:
+            value = self._store.get(key)
+            return value if isinstance(value, (str, bytes)) else None
+
+    def set(self, key, value, ex=None):
+        with self._global_lock:
+            self._store[key] = value
+        return True
+
+    def ttl(self, key):
+        """Redis' own contract: -2 absent, -1 present with no expiry.
+
+        This class never expires anything (expire() is a no-op), so a present
+        key is always -1. That keeps the one assertion that cares -- the
+        mirror deliberately sets no TTL -- meaning the same thing it meant
+        against a real server.
+        """
+        with self._global_lock:
+            return -1 if key in self._store else -2
 
     # Deliberately no keys(): get_all_locks()' Redis scan is the one caller,
     # and leaving it absent is what makes that method fall back to its YAML
