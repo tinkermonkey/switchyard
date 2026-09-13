@@ -192,105 +192,6 @@ class TestEmptyOutputDetection:
                         last_exec = updated_state['execution_history'][-1]
                         assert last_exec['outcome'] == 'success'  # Still success
 
-    def test_skips_when_already_waiting_in_pipeline_queue(self, tracker, temp_state_dir):
-        """Issue #57 PROTECTION 3 fix: this used to import a nonexistent
-        get_pipeline_queue() (only get_pipeline_queue_manager(project, board)
-        exists), so the queue-status check was a silent no-op (ImportError
-        swallowed by the broad except). Now that it actually calls
-        get_pipeline_queue_manager(...).get_issue_status(), an issue already
-        'waiting' in the queue must be skipped rather than marked failed -
-        it's already about to be legitimately processed."""
-        state_file = temp_state_dir / "test_project_issue_123.yaml"
-        state_data = {
-            'project_name': 'test-project',
-            'issue_number': 123,
-            'execution_history': [
-                {
-                    'agent': 'test-agent',
-                    'column': 'In Progress',
-                    'outcome': 'success',
-                    'completed_at': _EXAMINABLE_COMPLETED_AT,
-                    'timestamp': _EXAMINABLE_TIMESTAMP
-                }
-            ]
-        }
-
-        with open(state_file, 'w') as f:
-            yaml.dump(state_data, f)
-
-        pipeline_cfg = MagicMock()
-        pipeline_cfg.board_name = 'SDLC Execution'
-        project_config = MagicMock()
-        project_config.pipelines = [pipeline_cfg]
-
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.return_value = 'waiting'
-
-        with patch.object(tracker, 'has_active_execution', return_value=False):
-            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
-                with patch.object(tracker, '_has_github_output', return_value=False):
-                    with patch('utils.file_lock.file_lock'):
-                        with patch('config.manager.config_manager') as mock_config_manager:
-                            mock_config_manager.get_project_config.return_value = project_config
-                            with patch(
-                                'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                                return_value=mock_queue_manager
-                            ):
-                                retried_count = tracker.detect_and_retry_empty_successful_executions()
-
-        assert retried_count == 0
-        mock_queue_manager.get_issue_status.assert_called_once_with(123)
-
-        with open(state_file) as f:
-            updated_state = yaml.safe_load(f)
-        assert updated_state['execution_history'][-1]['outcome'] == 'success'
-
-    def test_proceeds_when_not_in_pipeline_queue(self, tracker, temp_state_dir):
-        """Control case: get_issue_status() returns None (not in queue at
-        all) - the watchdog must proceed exactly as before this fix."""
-        state_file = temp_state_dir / "test_project_issue_123.yaml"
-        state_data = {
-            'project_name': 'test-project',
-            'issue_number': 123,
-            'execution_history': [
-                {
-                    'agent': 'test-agent',
-                    'column': 'In Progress',
-                    'outcome': 'success',
-                    'completed_at': _EXAMINABLE_COMPLETED_AT,
-                    'timestamp': _EXAMINABLE_TIMESTAMP
-                }
-            ]
-        }
-
-        with open(state_file, 'w') as f:
-            yaml.dump(state_data, f)
-
-        pipeline_cfg = MagicMock()
-        pipeline_cfg.board_name = 'SDLC Execution'
-        project_config = MagicMock()
-        project_config.pipelines = [pipeline_cfg]
-
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.return_value = None
-
-        with patch.object(tracker, 'has_active_execution', return_value=False):
-            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
-                with patch.object(tracker, '_has_github_output', return_value=False):
-                    with patch('utils.file_lock.file_lock'):
-                        with patch('config.manager.config_manager') as mock_config_manager:
-                            mock_config_manager.get_project_config.return_value = project_config
-                            with patch(
-                                'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                                return_value=mock_queue_manager
-                            ):
-                                retried_count = tracker.detect_and_retry_empty_successful_executions()
-
-        assert retried_count == 1
-        with open(state_file) as f:
-            updated_state = yaml.safe_load(f)
-        assert updated_state['execution_history'][-1]['outcome'] == 'failure'
-
     def test_skips_when_pipeline_lock_held_by_another_issue(self, tracker, temp_state_dir):
         """Issue #57 review: PROTECTION 2 previously called
         project_config.get('pipelines', {}).get('enabled', []) on a
@@ -298,8 +199,7 @@ class TestEmptyOutputDetection:
         lock_manager.get_lock_status(...), a method that doesn't exist on
         PipelineLockManager -- both raised AttributeError on every single
         call, silently swallowed by the broad except, making this
-        protection a permanent no-op (the same bug class already fixed for
-        PROTECTION 3's dead get_pipeline_queue() import). Now uses the real
+        protection a permanent no-op. Now uses the real
         ProjectPipeline.board_name attribute and
         PipelineLockManager.get_lock_holder_fail_closed() -- a pipeline board genuinely
         locked by a different issue must skip marking this execution for
@@ -1802,73 +1702,12 @@ class TestProtection2BoardScoping:
             assert yaml.safe_load(f)['execution_history'][-1]['outcome'] == 'success'
 
 
-class TestQueueManagerCachedPerSweep:
-    """
-    #140 item 17: PROTECTION 3 built a brand-new PipelineQueueManager (state_dir
-    mkdir included) once per board for EVERY state file examined, so an
-    N-file x M-board sweep constructed N*M throwaway managers for the same M
-    boards.
-    """
-
-    @pytest.fixture
-    def temp_state_dir(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    @pytest.fixture
-    def tracker(self, temp_state_dir):
-        return WorkExecutionStateTracker(state_dir=temp_state_dir)
-
-    def test_one_manager_per_board_per_sweep(self, tracker, temp_state_dir):
-        _write_state(temp_state_dir, 123)
-        _write_state(temp_state_dir, 456)
-
-        pipeline_cfg = MagicMock()
-        pipeline_cfg.board_name = 'SDLC Execution'
-        project_config = MagicMock()
-        project_config.pipelines = [pipeline_cfg]
-
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.return_value = None
-        factory = MagicMock(return_value=mock_queue_manager)
-
-        mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-
-        with patch.object(tracker, 'has_active_execution', return_value=False):
-            with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
-                with patch.object(tracker, '_has_github_output', return_value=False):
-                    with patch('utils.file_lock.file_lock'):
-                        with patch('config.manager.config_manager') as mock_config_manager:
-                            mock_config_manager.get_project_config.return_value = project_config
-                            with patch(
-                                'services.pipeline_lock_manager.get_pipeline_lock_manager',
-                                return_value=mock_lock_manager
-                            ):
-                                with patch(
-                                    'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                                    factory
-                                ):
-                                    retried_count = tracker.detect_and_retry_empty_successful_executions()
-
-        assert retried_count == 2
-        # One manager for the one board, reused across both state files AND across
-        # both sweep passes -- the cache is handed to the rewrite pass rather than
-        # rebuilt there (#166 review).
-        factory.assert_called_once_with('test-project', 'SDLC Execution')
-        # ...but the queue itself is still re-read per check, never snapshotted:
-        # PROTECTION 3 is a race guard and must not act on a stale view. Two state
-        # files x two passes (collection, then again immediately before the rewrite).
-        assert mock_queue_manager.get_issue_status.call_count == 4
-
-
 class TestProtectionFailureVisibility:
     """
-    #140 item 31: PROTECTION 2/3 logged every failure at debug. That is exactly
-    how an AttributeError on a dataclass and an import of a function that never
-    existed both survived as permanent silent no-ops through two review rounds.
-    A programming error must now surface at ERROR, distinctly from a transient
-    outage at WARNING.
+    #140 item 31: PROTECTION 2 logged every failure at debug. That is exactly how
+    an AttributeError on a dataclass survived as a permanent silent no-op through
+    two review rounds. A programming error must now surface at ERROR, distinctly
+    from a transient outage at WARNING.
     """
 
     @pytest.fixture
@@ -1880,15 +1719,11 @@ class TestProtectionFailureVisibility:
     def tracker(self, temp_state_dir):
         return WorkExecutionStateTracker(state_dir=temp_state_dir)
 
-    def _run_with_lock_manager(self, tracker, mock_lock_manager, mock_queue_manager=None):
+    def _run_with_lock_manager(self, tracker, mock_lock_manager):
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
         project_config = MagicMock()
         project_config.pipelines = [pipeline_cfg]
-
-        if mock_queue_manager is None:
-            mock_queue_manager = MagicMock()
-            mock_queue_manager.get_issue_status.return_value = None
 
         with patch.object(tracker, 'has_active_execution', return_value=False):
             with patch.object(tracker, '_should_retry_failed_execution', return_value=(True, "eligible")):
@@ -1900,11 +1735,7 @@ class TestProtectionFailureVisibility:
                                 'services.pipeline_lock_manager.get_pipeline_lock_manager',
                                 return_value=mock_lock_manager
                             ):
-                                with patch(
-                                    'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                                    return_value=mock_queue_manager
-                                ):
-                                    return tracker.detect_and_retry_empty_successful_executions()
+                                return tracker.detect_and_retry_empty_successful_executions()
 
     def test_protection_2_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
         _write_state(temp_state_dir, 123)
@@ -1943,42 +1774,8 @@ class TestProtectionFailureVisibility:
             if r.levelno == logging.ERROR and 'PROTECTION 2' in r.getMessage()
         ]
 
-    def test_protection_3_programming_error_logs_at_error(self, tracker, temp_state_dir, caplog):
-        _write_state(temp_state_dir, 123)
-        mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.side_effect = TypeError(
-            "'NoneType' object is not subscriptable"
-        )
-
-        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            retried_count = self._run_with_lock_manager(
-                tracker, mock_lock_manager, mock_queue_manager
-            )
-
-        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert any('PROTECTION 3' in r.getMessage() for r in errors)
-        assert retried_count == 1
-
-    def test_protection_3_transient_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
-        _write_state(temp_state_dir, 123)
-        mock_lock_manager = MagicMock()
-        mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.side_effect = TimeoutError("queue lock timeout")
-
-        with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
-            retried_count = self._run_with_lock_manager(
-                tracker, mock_lock_manager, mock_queue_manager
-            )
-
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any('PROTECTION 3 skipped' in r.getMessage() for r in warnings)
-        assert retried_count == 1
-
     def test_project_config_failure_logs_at_warning(self, tracker, temp_state_dir, caplog):
-        """A config read that fails degrades BOTH protections to no-ops for that
+        """A config read that fails degrades PROTECTION 2 to a no-op for that
         state file -- the same silent-degradation class, so the same visibility."""
         _write_state(temp_state_dir, 123)
 
@@ -1992,7 +1789,7 @@ class TestProtectionFailureVisibility:
                                 tracker.detect_and_retry_empty_successful_executions()
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any('PROTECTION 2/3 degraded' in r.getMessage() for r in warnings)
+        assert any('PROTECTION 2 degraded' in r.getMessage() for r in warnings)
 
 
 class TestCorruptedStateFile:
@@ -2075,8 +1872,6 @@ class TestCorruptedStateFile:
         project_config.pipelines = [pipeline_cfg]
         mock_lock_manager = MagicMock()
         mock_lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        mock_queue_manager = MagicMock()
-        mock_queue_manager.get_issue_status.return_value = None
 
         with caplog.at_level(logging.DEBUG, logger='services.work_execution_state'):
             with patch.object(tracker, 'has_active_execution', return_value=False):
@@ -2089,11 +1884,7 @@ class TestCorruptedStateFile:
                                     'services.pipeline_lock_manager.get_pipeline_lock_manager',
                                     return_value=mock_lock_manager
                                 ):
-                                    with patch(
-                                        'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                                        return_value=mock_queue_manager
-                                    ):
-                                        retried_count = tracker.detect_and_retry_empty_successful_executions()
+                                    retried_count = tracker.detect_and_retry_empty_successful_executions()
 
         # The healthy file is still processed.
         assert retried_count == 1
@@ -2310,7 +2101,7 @@ class TestSweepReachesItsProtectionsForReal:
         record.update(overrides)
         return record
 
-    def _run_sweep(self, tracker, comments):
+    def _run_sweep(self, tracker, comments, queue_manager=None, lock_holder=None):
         """Run the sweep with only the leaves mocked, on a bounded thread.
 
         The workspace resolution is NOT stubbed here: the real
@@ -2318,7 +2109,14 @@ class TestSweepReachesItsProtectionsForReal:
         is why the pipeline carries a real workspace and a real workflow template
         whose columns include the record's own. A config that resolves to nothing
         makes the strict resolver answer None and the gate decline, which is
-        exactly the behaviour TestWorkspaceResolutionIsHonest pins."""
+        exactly the behaviour TestWorkspaceResolutionIsHonest pins.
+
+        get_pipeline_queue_manager is still patched even though the sweep no
+        longer calls it (#212 removed PROTECTION 3). That is the point: it is a
+        tripwire. If anyone reintroduces a queue check in this sweep it gets THIS
+        manager -- which the #212 tests below hand a real queue saying 'active'
+        for the very issue being rescued -- and those tests fail rather than
+        silently losing the rescue again."""
         column_cfg = SimpleNamespace(name='In Progress')
         workflow_template = SimpleNamespace(columns=[column_cfg])
         pipeline_cfg = MagicMock()
@@ -2338,10 +2136,11 @@ class TestSweepReachesItsProtectionsForReal:
         gh_client.rest.return_value = (True, comments)
 
         lock_manager = MagicMock()
-        lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
+        lock_manager.get_lock_holder_fail_closed.return_value = (lock_holder, True)
 
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
+        if queue_manager is None:
+            queue_manager = MagicMock()
+            queue_manager.get_issue_status.return_value = None
 
         result = {}
 
@@ -2448,6 +2247,113 @@ class TestSweepReachesItsProtectionsForReal:
         )
 
         count, gh_client = self._run_sweep(tracker, comments=[])
+
+        assert count == 0
+        gh_client.rest.assert_not_called()
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        assert updated['execution_history'][-1]['outcome'] == 'success'
+
+    @staticmethod
+    def _real_queue_with_this_issue_in_it(queue_root, status):
+        """A REAL PipelineQueueManager whose queue really holds issue 123.
+
+        Not a MagicMock: the claim under test is about what a genuine queue file
+        says, and #212's whole subject is that a live entry for the issue's OWN
+        dispatch is indistinguishable from a stranded one. 'active' is reached
+        through the real mark_issue_active(), the same call
+        project_monitor/pipeline dispatch makes. The queue lives in its own
+        directory, not in the tracker's, so the sweep's *.yaml glob never sees it.
+        """
+        from services.pipeline_queue_manager import PipelineQueueManager
+
+        queue_dir = queue_root / 'pipeline_queues'
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        manager = PipelineQueueManager(
+            'test-project', 'SDLC Execution', state_dir=queue_dir
+        )
+        manager.save_queue([{
+            'issue_number': 123,
+            'queued_at': _EXAMINABLE_TIMESTAMP,
+            'initial_column': 'In Progress',
+            'status': 'waiting',
+            'last_position_check': _EXAMINABLE_TIMESTAMP,
+            'position_in_column': 0,
+        }])
+        if status == 'active':
+            manager.mark_issue_active(123)
+        assert manager.get_issue_status(123) == status, (
+            "precondition: the real queue file has to actually report this status, "
+            "otherwise the test proves nothing about the queue not gating the sweep"
+        )
+        return manager
+
+    @pytest.mark.parametrize('own_queue_status', ['active', 'waiting'])
+    def test_the_issues_own_queue_entry_no_longer_blocks_its_own_rescue(
+        self, tracker, temp_state_dir, tmp_path, own_queue_status
+    ):
+        """#212, and the reason PROTECTION 3 was removed rather than carved out.
+
+        This is the stranded shape the watchdog exists for, assembled exactly as
+        #212 describes it: an agent finished on issue #123, recorded 'success',
+        and then failed to persist a result -- no GitHub comment, no progression.
+        The card never left the trigger column, so nothing removed the queue
+        entry (it is only removed at a pipeline exit column or on issue close)
+        and nothing released the board lock, so BOTH of them still name #123
+        itself.
+
+        PROTECTION 2 lets that through on purpose -- it blocks only on a lock
+        held by a DIFFERENT issue (#58's carve-out). PROTECTION 3 asked
+        get_issue_status() about #123 and blocked on #123's own entry, with no
+        equivalent carve-out, so activating its long-dead import in #59 REMOVED
+        this rescue. _reset_stranded_active_issues() skips the lock holder and
+        should_execute_work() answers 'already_processed_successfully' on a
+        trailing 'success', so nothing else was coming: the record sat until the
+        24h age gate retired it.
+
+        With PROTECTION 3 gone the record is rewritten to 'failure' and the
+        redispatch takes the board's pipeline lock and consults the queue itself
+        -- which is where that question belonged all along.
+        """
+        state_file = self._write_state(tracker, [self._success_record()])
+        queue_manager = self._real_queue_with_this_issue_in_it(
+            tmp_path, own_queue_status
+        )
+
+        count, _ = self._run_sweep(
+            tracker,
+            comments=[],
+            queue_manager=queue_manager,
+            # #123 holding its OWN board lock, the other half of the wedge.
+            lock_holder=123,
+        )
+
+        assert count == 1, (
+            f"a stranded execution whose own queue entry reads "
+            f"'{own_queue_status}' was not rescued -- the queue is gating the "
+            f"watchdog on the very issue it is trying to un-stick (#212)"
+        )
+        assert queue_manager.get_issue_status(123) == own_queue_status, (
+            "the sweep must not mutate the queue; it only rewrites the record"
+        )
+        with open(state_file) as f:
+            updated = yaml.safe_load(f)
+        last_exec = updated['execution_history'][-1]
+        assert last_exec['outcome'] == 'failure'
+        assert last_exec['watchdog_retry_triggered'] is True
+
+    def test_a_different_issues_lock_still_blocks_the_rescue(
+        self, tracker, temp_state_dir, tmp_path
+    ):
+        """The other side of the same coin: removing PROTECTION 3 must not widen
+        PROTECTION 2. With the board locked by a DIFFERENT issue the record is
+        still left alone, queue entry or no queue entry."""
+        state_file = self._write_state(tracker, [self._success_record()])
+        queue_manager = self._real_queue_with_this_issue_in_it(tmp_path, 'active')
+
+        count, gh_client = self._run_sweep(
+            tracker, comments=[], queue_manager=queue_manager, lock_holder=456
+        )
 
         assert count == 0
         gh_client.rest.assert_not_called()
@@ -2629,7 +2535,7 @@ class TestSweepOnProductionShapedRecords:
         workspace_type='issues', discussion_id=None,
         should_retry=(True, 'eligible'),
     ):
-        """Run the real sweep; only PROTECTION 2/3/4's external services are stubbed.
+        """Run the real sweep; only PROTECTION 2/4's external services are stubbed.
 
         has_github_output stays None -- the REAL gate -- unless a test is about a
         protection that sits in front of it and needs the sweep to be able to
@@ -2637,7 +2543,7 @@ class TestSweepOnProductionShapedRecords:
 
         workspace_type/discussion_id are the two inputs the gate resolves from the
         pipeline config and the GitHub state file; they are stubbed here for the
-        same reason the lock and queue managers are.
+        same reason the lock manager is.
         """
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
@@ -2652,8 +2558,6 @@ class TestSweepOnProductionShapedRecords:
 
         lock_manager = MagicMock()
         lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
 
         state_manager = MagicMock()
         state_manager.get_discussion_for_issue.return_value = discussion_id
@@ -2664,10 +2568,6 @@ class TestSweepOnProductionShapedRecords:
              patch(
                  'services.pipeline_lock_manager.get_pipeline_lock_manager',
                  return_value=lock_manager
-             ), \
-             patch(
-                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                 return_value=queue_manager
              ), \
              patch(
                  'claude.docker_runner.resolve_workspace_type_for_column_strict',
@@ -3440,17 +3340,11 @@ class TestTheGateDoesNotRunUnderTheStateFileLock:
         )
         lock_manager = MagicMock()
         lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
 
         with patch('config.manager.config_manager') as mock_config_manager, \
              patch(
                  'services.pipeline_lock_manager.get_pipeline_lock_manager',
                  return_value=lock_manager
-             ), \
-             patch(
-                 'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                 return_value=queue_manager
              ), \
              patch.object(
                  tracker, '_should_retry_failed_execution', return_value=(True, 'eligible')
@@ -3577,7 +3471,7 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
         return WorkExecutionStateTracker(state_dir=temp_state_dir)
 
     @staticmethod
-    def _run(tracker, lock_manager=None, queue_manager=None,
+    def _run(tracker, lock_manager=None,
              should_retry=None, during_verification=None):
         """One sweep over the tmpdir, with the verification step stubbed to "no
         output" and an optional callback fired while it is running -- i.e. exactly
@@ -3585,9 +3479,6 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
         if lock_manager is None:
             lock_manager = MagicMock()
             lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        if queue_manager is None:
-            queue_manager = MagicMock()
-            queue_manager.get_issue_status.return_value = None
         if should_retry is None:
             should_retry = lambda *a, **k: (True, 'eligible')
 
@@ -3606,9 +3497,7 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
              patch.object(tracker, '_has_github_output', side_effect=_verify), \
              patch('config.manager.config_manager') as mock_config_manager, \
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
-                   return_value=lock_manager), \
-             patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
-                   return_value=queue_manager):
+                   return_value=lock_manager):
             mock_config_manager.get_project_config.return_value = project_config
             return tracker.detect_and_retry_empty_successful_executions()
 
@@ -3623,24 +3512,6 @@ class TestEveryProtectionIsRecheckedBeforeTheRewrite:
 
         assert self._run(tracker) == 1
         assert self._outcome(state_file) == 'failure'
-
-    def test_an_issue_queued_during_verification_is_not_rewritten(
-        self, tracker, temp_state_dir
-    ):
-        """PROTECTION 3. An issue enqueued while this sweep was talking to GitHub
-        has no execution record at all -- record_execution_start() runs at dispatch
-        time, after the enqueue -- so PROTECTION 1's re-run cannot see it."""
-        state_file = _write_state(temp_state_dir, 123, board_name='SDLC Execution')
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
-
-        def _enqueue_it():
-            queue_manager.get_issue_status.return_value = 'waiting'
-
-        assert self._run(
-            tracker, queue_manager=queue_manager, during_verification=_enqueue_it
-        ) == 0
-        assert self._outcome(state_file) == 'success'
 
     def test_a_board_lock_taken_during_verification_is_not_rewritten(
         self, tracker, temp_state_dir
@@ -3958,8 +3829,6 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
         )
         lock_manager = MagicMock()
         lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
         gh_client = MagicMock()
         gh_client.rest.return_value = (True, [])
         state_manager = MagicMock()
@@ -3974,10 +3843,6 @@ class TestWatchdogRetryBudgetSurvivesTheRedispatch:
                  patch(
                      'services.pipeline_lock_manager.get_pipeline_lock_manager',
                      return_value=lock_manager
-                 ), \
-                 patch(
-                     'services.pipeline_queue_manager.get_pipeline_queue_manager',
-                     return_value=queue_manager
                  ), \
                  patch(
                      'claude.docker_runner.resolve_workspace_type_for_column_strict',
@@ -4105,8 +3970,6 @@ class TestTheRewriteStopsShortOfTheDispatchFailureBudget:
     def _run(tracker):
         lock_manager = MagicMock()
         lock_manager.get_lock_holder_fail_closed.return_value = (None, True)
-        queue_manager = MagicMock()
-        queue_manager.get_issue_status.return_value = None
         pipeline_cfg = MagicMock()
         pipeline_cfg.board_name = 'SDLC Execution'
         project_config = MagicMock()
@@ -4117,9 +3980,7 @@ class TestTheRewriteStopsShortOfTheDispatchFailureBudget:
              patch.object(tracker, '_has_github_output', return_value=False), \
              patch('config.manager.config_manager') as mock_config_manager, \
              patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
-                   return_value=lock_manager), \
-             patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
-                   return_value=queue_manager):
+                   return_value=lock_manager):
             mock_config_manager.get_project_config.return_value = project_config
             return tracker.detect_and_retry_empty_successful_executions()
 

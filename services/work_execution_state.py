@@ -28,7 +28,7 @@ _STALE_ENQUEUE_PROBE_SECS = 60  # 1 minute — a probe without a task_id stamp a
 # How far back detect_and_retry_empty_successful_executions() will look (#150).
 # The sweep globs EVERY state file ever written, every 15 minutes -- 4700+ of them
 # on the live orchestrator, ~97% months old and terminal -- and each one that gets
-# past the cheap checks costs lock reads, queue reads and a GitHub query. Until
+# past the cheap checks costs lock reads and a GitHub query. Until
 # PROTECTION 1's re-entrant flock was fixed the sweep wedged on the first 'success'
 # record it found, so none of that cost was ever paid and none of it was visible.
 # Overridable with WATCHDOG_MAX_RECORD_AGE_HOURS; <= 0 disables the gate.
@@ -2104,13 +2104,12 @@ class WorkExecutionStateTracker:
         `List[ProjectPipeline]` attribute) and called lock_manager.get_lock_status(...),
         a method that doesn't exist on PipelineLockManager -- both raised
         AttributeError on every single invocation, silently swallowed by the except
-        below exactly like PROTECTION 3's own dead get_pipeline_queue() import,
-        making this protection a permanent no-op too. Separately, the inner
+        below, making this protection a permanent no-op. Separately, the inner
         `continue` only continued the `for pipeline_config` loop, not the outer
         per-state-file loop -- even with a real API call, it would not actually have
         skipped this execution. Fixed to use the real ProjectPipeline.board_name
-        attribute and PipelineLockManager.get_lock_holder(), and to use the same
-        locked-flag + break + early-return shape PROTECTION 3 already gets right.
+        attribute and PipelineLockManager.get_lock_holder(), and to use a
+        locked-flag + break + early-return shape that skips the right loop.
         """
         from services.pipeline_lock_manager import get_pipeline_lock_manager
 
@@ -2221,8 +2220,8 @@ class WorkExecutionStateTracker:
             # transient case below, and loudly, so the next one can't
             # hide the same way.
             #
-            # Both handlers fall THROUGH to PROTECTION 3 rather than
-            # skipping this issue -- the opposite posture to
+            # Both handlers fall THROUGH to the rest of the sweep rather
+            # than skipping this issue -- the opposite posture to
             # services/pipeline_watchdog.py, which bails out on a check
             # it can't verify, and deliberately so. That watchdog ends
             # the run and releases its board lock, so acting on a bad
@@ -2250,87 +2249,6 @@ class WorkExecutionStateTracker:
 
         return False
 
-    def _watchdog_queue_blocks_retry(
-        self, project_name: str, issue_number: int, project_config,
-        queue_manager_cache: dict
-    ) -> bool:
-        """PROTECTION 3: is this issue already waiting or active in a pipeline queue?
-
-        Returns True when the record must be left alone.
-
-        Extracted alongside _watchdog_board_lock_blocks_retry() and re-run for the
-        same reason (#166 review) -- and this one PROTECTION 1 cannot stand in for:
-        an issue sitting 'waiting' in a PipelineQueueManager queue has no execution
-        record at all, because record_execution_start() runs at dispatch time, after
-        the enqueue. A rewrite decided minutes earlier would land on a record whose
-        dispatch is already queued.
-        """
-        # Issue #57: this used to import a nonexistent
-        # get_pipeline_queue() (only get_pipeline_queue_manager
-        # (project, board) / PipelineQueueManager actually exist in
-        # services/pipeline_queue_manager.py), so this protection
-        # was a silent no-op -- the ImportError was swallowed by
-        # the broad except below and only ever logged at debug
-        # level. Implemented properly now that the queue manager
-        # exposes get_issue_status(): skip retry-marking if the
-        # issue is already 'waiting' or 'active' in the queue for
-        # any of its pipelines' boards -- it's already about to be
-        # (or currently being) legitimately processed, so marking
-        # it 'failure' here to force a retry would race with that.
-        try:
-            from services.pipeline_queue_manager import get_pipeline_queue_manager
-
-            already_queued_or_active = False
-            # Uses the project_config the caller fetched once -- see the sweep's
-            # call site for why it is not re-read here.
-            #
-            # Deliberately still checks EVERY board, unlike PROTECTION 2
-            # above: this asks "is this issue already queued anywhere",
-            # and an issue very often sits in a different board's queue
-            # from the one its last execution ran on (that's what a
-            # board-to-board handoff looks like). Narrowing this one to
-            # the recorded board would make the watchdog mark an issue
-            # for retry while it is legitimately queued elsewhere.
-            for pipeline_cfg in getattr(project_config, 'pipelines', None) or []:
-                board_name = getattr(pipeline_cfg, 'board_name', None)
-                if not board_name:
-                    continue
-                queue_manager = queue_manager_cache.get((project_name, board_name))
-                if queue_manager is None:
-                    queue_manager = get_pipeline_queue_manager(project_name, board_name)
-                    queue_manager_cache[(project_name, board_name)] = queue_manager
-                queue_status = queue_manager.get_issue_status(issue_number)
-                if queue_status in ('waiting', 'active'):
-                    logger.debug(
-                        f"Watchdog: Skipping {project_name}/#{issue_number}: "
-                        f"already '{queue_status}' in pipeline queue for board '{board_name}'"
-                    )
-                    already_queued_or_active = True
-                    break
-
-            if already_queued_or_active:
-                return True
-        except (AttributeError, TypeError, ImportError) as e:
-            # See PROTECTION 2's matching handler (#140 item 31) --
-            # including why both of these log and fall through rather
-            # than skipping the issue. ImportError is in the list here
-            # because that is literally how this protection was dead
-            # before #57 -- an import of a function that never existed,
-            # logged at debug and never noticed.
-            logger.error(
-                f"Watchdog: PROTECTION 3 (queue status) failed for "
-                f"{project_name}/#{issue_number} with a programming error "
-                f"-- this protection is not working, continuing without it: {e}",
-                exc_info=True
-            )
-        except Exception as e:
-            logger.warning(
-                f"Watchdog: Could not check queue status for "
-                f"{project_name}/#{issue_number} -- PROTECTION 3 skipped: {e}"
-            )
-
-        return False
-
     def detect_and_retry_empty_successful_executions(self) -> int:
         """
         Detect executions marked as 'success' but with no GitHub output.
@@ -2342,7 +2260,6 @@ class WorkExecutionStateTracker:
            before any I/O is spent on them
         1. has_active_execution() - Checks ALL 4 types of active work
         2. Pipeline lock verification
-        3. Queue status check
         5. 5-minute recency check
         4. Execution eligibility via _should_retry_failed_execution
         6. GitHub-output verification via _has_github_output
@@ -2350,6 +2267,24 @@ class WorkExecutionStateTracker:
         4 and 6 are listed last because they run last: they are the two protections
         that talk to GitHub, and they run in a second pass with no state-file lock
         held. See the comment at the collection site.
+
+        There is no 3, and the gap is deliberate (#212). PROTECTION 3 asked the
+        pipeline queue whether THIS issue was 'waiting' or 'active' and skipped the
+        record if it was -- but a queue entry is created at dispatch and removed only
+        at a pipeline exit column or on issue close, so an issue stranded mid-pipeline
+        still has its own entry sitting there. The guard therefore fired on exactly
+        the shape this sweep exists to rescue, and it had no same-issue carve-out of
+        the kind PROTECTION 2 got in #58. Nor had it ever done useful work to weigh
+        against that: it imported a get_pipeline_queue() that has never existed, so
+        every invocation raised ImportError into its own broad except and the sweep
+        proceeded without it. #59 fixed the import, and the only thing switching the
+        guard on for the first time achieved was taking this rescue away. The
+        question it was asking is still asked, in the right place -- the redispatch
+        this sweep invites goes through project_monitor, which takes the board's
+        pipeline lock and consults the queue itself. The remaining protections keep
+        their original numbers on purpose: 0/1/2/4/5/6 appear by number in the issue
+        history (#57, #58, #140, #150, #166), and renumbering would silently
+        invalidate all of it.
 
         CRITICAL: This method only marks executions as 'failure' - it does NOT
         directly trigger work. The project_monitor picks up failed executions and
@@ -2370,7 +2305,7 @@ class WorkExecutionStateTracker:
         retried_count = 0
         state_files = list(self.state_dir.glob("*.yaml"))
 
-        # Records that survived PROTECTIONS 0-5 and still need the GitHub-output
+        # Records that survived PROTECTIONS 0, 1, 2 and 5 and still need the GitHub-output
         # gate. Collected under each state file's lock and verified after the loop
         # with no lock held -- see the collection site for why.
         candidates = []
@@ -2389,18 +2324,6 @@ class WorkExecutionStateTracker:
         # once per project multiplies disk I/O by issue count rather than
         # project count on this periodic maintenance path).
         project_config_cache = {}
-
-        # Cache PipelineQueueManager instances across the whole sweep, keyed by
-        # (project, board) (#140 item 17): get_pipeline_queue_manager() constructs
-        # a brand-new manager -- state_dir mkdir included -- on every call, and
-        # PROTECTION 3 below calls it once per board for EVERY stuck state file it
-        # examines, so an N-file x M-board sweep built N*M throwaway managers for
-        # the same M boards. Only the manager is cached, deliberately not the
-        # queue contents: get_issue_status() re-reads the queue file under its own
-        # lock on each call, and PROTECTION 3 is a race guard -- acting on a
-        # snapshot taken at the top of a long sweep is exactly the staleness it
-        # exists to avoid.
-        queue_manager_cache = {}
 
         for state_file in state_files:
             try:
@@ -2448,8 +2371,8 @@ class WorkExecutionStateTracker:
                     # PROTECTION 0: Age gate -- see _WATCHDOG_MAX_RECORD_AGE_HOURS.
                     #
                     # Placed ahead of every other protection because it is the only
-                    # one that costs nothing: PROTECTION 2 and 3 read lock and queue
-                    # state per configured board, and PROTECTION 4 issues a GitHub
+                    # one that costs nothing: PROTECTION 2 reads lock state per
+                    # configured board, and PROTECTION 4 issues a GitHub
                     # GraphQL query. On the live orchestrator 4570 of 4721 state
                     # files end in 'success', so an ungated sweep every 15 minutes
                     # is ~18k GraphQL queries an hour against a 5k/hour budget --
@@ -2512,11 +2435,11 @@ class WorkExecutionStateTracker:
                         )
                         continue
 
-                    # PROTECTION 2 (pipeline lock) and PROTECTION 3 (queue status)
-                    # both live in helpers now, because the rewrite pass below re-runs
-                    # them -- see _watchdog_board_lock_blocks_retry().
+                    # PROTECTION 2 (pipeline lock) lives in a helper, because the
+                    # rewrite pass below re-runs it -- see
+                    # _watchdog_board_lock_blocks_retry().
                     #
-                    # project_config is fetched once here and shared with both of them
+                    # project_config is fetched once here and shared with it
                     # and with PROTECTION 4 (found in #58 review: each protection
                     # previously called config_manager.get_project_config(project_name)
                     # separately for the same project in the same loop iteration --
@@ -2531,7 +2454,7 @@ class WorkExecutionStateTracker:
                         # Only cache a SUCCESSFUL lookup, not a failure (found
                         # in final whole-PR review): caching None on the
                         # first exception would silently degrade PROTECTION
-                        # 2/3 to no-ops for every remaining state file of
+                        # 2 to a no-op for every remaining state file of
                         # this project in the same sweep, with no retry --
                         # a transient error on file #1 shouldn't poison
                         # files #2..N when the underlying config read might
@@ -2542,22 +2465,16 @@ class WorkExecutionStateTracker:
                         except Exception as e:
                             project_config = None
                             # Warning, not debug (#140 item 31): a failure here
-                            # silently degrades BOTH PROTECTION 2 and PROTECTION 3
-                            # to no-ops for this state file, which is exactly the
-                            # kind of quiet degradation that hid two real bugs in
-                            # this code.
+                            # silently degrades PROTECTION 2 to a no-op for this
+                            # state file, which is exactly the kind of quiet
+                            # degradation that hid two real bugs in this code.
                             logger.warning(
                                 f"Watchdog: Could not load project config for {project_name} "
-                                f"-- PROTECTION 2/3 degraded for this state file: {e}"
+                                f"-- PROTECTION 2 degraded for this state file: {e}"
                             )
 
                     if self._watchdog_board_lock_blocks_retry(
                         project_name, issue_number, project_config, last_exec
-                    ):
-                        continue
-
-                    if self._watchdog_queue_blocks_retry(
-                        project_name, issue_number, project_config, queue_manager_cache
                     ):
                         continue
 
@@ -2604,7 +2521,7 @@ class WorkExecutionStateTracker:
                     # deliberately NOT run here -- they are the second pass below,
                     # with no lock held.
                     #
-                    # Everything above this point is local file/lock/queue work, and
+                    # Everything above this point is local file/lock work, and
                     # that is the invariant this loop is built on rather than a
                     # description of where the code happens to sit. Both remote
                     # protections make blocking `gh` subprocess calls -- PROTECTION 4
@@ -2628,7 +2545,7 @@ class WorkExecutionStateTracker:
                     # of them (#166 review).
                     #
                     # project_config/agent/column ride along so the second pass can run
-                    # PROTECTION 4 -- and the rewrite re-run it, plus 2/3 -- without
+                    # PROTECTION 4 -- and the rewrite re-run it, plus 2 -- without
                     # re-reading the project's YAML or re-deriving them from a record
                     # it re-reads anyway.
                     candidates.append({
@@ -2681,9 +2598,7 @@ class WorkExecutionStateTracker:
                     )
                     continue
 
-                if self._rewrite_verified_empty_execution(
-                    state_file, candidate, queue_manager_cache
-                ):
+                if self._rewrite_verified_empty_execution(state_file, candidate):
                     retried_count += 1
 
             except Exception as e:
@@ -2695,7 +2610,7 @@ class WorkExecutionStateTracker:
         return retried_count
 
     def _rewrite_verified_empty_execution(
-        self, state_file, candidate: dict, queue_manager_cache: dict = None
+        self, state_file, candidate: dict
     ) -> bool:
         """Rewrite one verified-empty 'success' record to 'failure', under the lock.
 
@@ -2710,11 +2625,11 @@ class WorkExecutionStateTracker:
 
         EVERY protection is re-run here, not just PROTECTION 1 (#166 review). The
         first version re-ran PROTECTION 1 alone, on the theory that a state worth
-        skipping would show up as an in_progress entry -- and none of the other three
-        does. PROTECTION 3's whole subject is an issue sitting 'waiting' in a queue,
-        which has no execution record at all until dispatch time; PROTECTION 4 refuses
-        on a closed issue, a card a human moved, and a pipeline run that ended, none
-        of which touch this file either. The window is not small: phase 2 is serial
+        skipping would show up as an in_progress entry -- and the others do not.
+        PROTECTION 2's subject is another issue taking the board's lock, which writes
+        nothing to this file; PROTECTION 4 refuses on a closed issue, a card a human
+        moved, and a pipeline run that ended, none of which touch it either. The
+        window is not small: phase 2 is serial
         over every candidate and each one can spend minutes inside `gh` (30s
         rate-limit sleeps, a 30s subprocess timeout, a 2/4/8s retry ladder), so the
         last candidate's rewrite can land 15-20 minutes after its eligibility check.
@@ -2726,7 +2641,7 @@ class WorkExecutionStateTracker:
 
         PROTECTION 4 runs BEFORE the lock is taken, because it makes its own GraphQL
         call and holding this issue's flock across a GitHub call is what the two-phase
-        split exists to avoid. PROTECTIONS 1/2/3 are local/Redis reads and run inside
+        split exists to avoid. PROTECTIONS 1 and 2 are local/Redis reads and run inside
         it, as tight to the write as they can be.
 
         The last check before the write is not a protection at all but the budget
@@ -2750,8 +2665,6 @@ class WorkExecutionStateTracker:
         agent = candidate.get('agent') or verified.get('agent')
         column = candidate.get('column') or verified.get('column')
         project_config = candidate.get('project_config')
-        if queue_manager_cache is None:
-            queue_manager_cache = {}
 
         # PROTECTION 4 again, unlocked -- see the docstring. Its Check 1 (the retry
         # budget) short-circuits before it touches GitHub, so a record that has
@@ -2800,16 +2713,11 @@ class WorkExecutionStateTracker:
                 )
                 return False
 
-            # PROTECTIONS 2 and 3 again, for the same reason -- see the docstring.
-            # Both read local/Redis state, so unlike PROTECTION 4 above they are cheap
-            # enough to answer with the lock in hand.
+            # PROTECTION 2 again, for the same reason -- see the docstring. It reads
+            # local/Redis state, so unlike PROTECTION 4 above it is cheap enough to
+            # answer with the lock in hand.
             if self._watchdog_board_lock_blocks_retry(
                 project_name, issue_number, project_config, last_exec
-            ):
-                return False
-
-            if self._watchdog_queue_blocks_retry(
-                project_name, issue_number, project_config, queue_manager_cache
             ):
                 return False
 
@@ -3026,8 +2934,8 @@ class WorkExecutionStateTracker:
             # dataclass with no __getitem__, so project_config['github'] raised
             # TypeError on EVERY call, was swallowed by the broad handler below and
             # returned False -- making this gate unconditionally "no output" for
-            # every project. Same defect class as the .get()-on-a-dataclass bugs
-            # #57/#58 fixed in PROTECTION 2/3.
+            # every project. Same defect class as the .get()-on-a-dataclass bug
+            # #57/#58 fixed in PROTECTION 2.
             project_config = config_manager.get_project_config(project_name)
             org = project_config.github['org']
             repo = project_config.github['repo']
@@ -3146,7 +3054,7 @@ class WorkExecutionStateTracker:
             # A coding bug, not a transient outage -- and the exact shape (dataclass
             # vs dict mixup) that made this gate a permanent "no output" until #150.
             # Surfaced at ERROR with a traceback and distinctly from the transient
-            # case below, the same way PROTECTION 2/3's handlers were narrowed, so
+            # case below, the same way PROTECTION 2's handler was narrowed, so
             # the next one can't hide as another quiet return value.
             logger.error(
                 f"Watchdog: GitHub output check failed for {project_name}/#{issue_number} "

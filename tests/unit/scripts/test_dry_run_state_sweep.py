@@ -1129,7 +1129,7 @@ class TestRegisteredSweepPatterns:
             ('services.work_execution_state', 'DEBUG',
              'Watchdog: Skipping proj/#1: work already in progress'),
             ('services.work_execution_state', 'DEBUG',
-             "Watchdog: Skipping proj/#2: already 'waiting' in pipeline queue for board 'b'"),
+             "Watchdog: Skipping proj/#2: board 'b' locked by issue #9"),
             ('services.work_execution_state', 'DEBUG',
              'Watchdog: Not eligible for retry proj/#3: retry budget exhausted'),
             ('services.work_execution_state', 'WARNING',
@@ -1140,7 +1140,7 @@ class TestRegisteredSweepPatterns:
         assert classified['examined'] == 4
         assert classified['terminal_records'] == ['proj/#4']
         assert classified['gate_records']['PROTECTION 1 (active execution)'] == ['proj/#1']
-        assert classified['gate_records']['PROTECTION 3 (queue status)'] == ['proj/#2']
+        assert classified['gate_records']['PROTECTION 2 (pipeline lock)'] == ['proj/#2']
         assert classified['gate_records']['PROTECTION 4 (retry eligibility)'] == ['proj/#3']
         assert classified['unclassified'] == []
 
