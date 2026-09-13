@@ -22,6 +22,7 @@ from monitoring.health_monitor import HealthMonitor
 from services.github_project_manager import (
     GitHubProjectManager,
     ProjectsPermissionUnavailable,
+    ProjectsBudgetUnavailable,
 )
 from services.project_monitor import ProjectMonitor, register_project_monitor
 from services.project_workspace import workspace_manager
@@ -716,6 +717,7 @@ async def main():
     # credential-global, so it applies to every project at once and only a
     # loop-scoped total says anything meaningful about it.
     projects_permission_skips = 0
+    projects_budget_skips = 0
 
     for project_name in projects:
         failure_count = 0
@@ -757,6 +759,21 @@ async def main():
             )
             projects_permission_skips += 1
             continue
+        except ProjectsBudgetUnavailable as e:
+            # NOT a failure, for the same reason as the permission skip above:
+            # the GraphQL budget is credential-global, so this is true for
+            # every project the moment it is true for one, and counting it
+            # would exit(1) a single-project deployment on a condition that
+            # clears by itself inside the hour. A deferral, not a fault --
+            # boards go stale until the window resets, everything else keeps
+            # running, and the next scheduled reconciliation picks it up.
+            logger.log_warning(
+                f"DEFERRING board reconciliation for '{project_name}': {e} "
+                f"Boards will be reconciled on a later pass; issues, PRs, "
+                f"discussions and agent dispatch are unaffected."
+            )
+            projects_budget_skips += 1
+            continue
         if not success:
             logger.log_error(f"Failed to reconcile project '{project_name}' - GitHub project management is not working")
             failure_count += 1
@@ -793,6 +810,16 @@ async def main():
             f"{len(projects)} project(s): the active GitHub credential cannot write "
             f"Projects v2. Boards will not be created or updated until that "
             f"permission is granted, but every other pipeline stage continues to run."
+        )
+
+    if projects_budget_skips:
+        logger.log_warning(
+            f"Board reconciliation was deferred for {projects_budget_skips} of "
+            f"{len(projects)} project(s) to protect the remaining GraphQL quota. "
+            f"This is self-clearing: the next scheduled reconciliation runs once "
+            f"the hourly window resets. Persisting across several windows means "
+            f"steady-state polling is consuming the budget - reduce the board "
+            f"count, or raise QUEUE_RECONCILIATION_INTERVAL_MINUTES."
         )
 
     # If all of the projects failed to reconcile, exit

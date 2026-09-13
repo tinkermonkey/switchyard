@@ -1401,6 +1401,32 @@ class GitHubAPIClient:
         """The (credential, resource) rate-limit bucket."""
         return self._buckets[(credential, resource)]
 
+    def graphql_budget_fraction_remaining(self) -> Optional[float]:
+        """Fraction (0.0-1.0) of the active credential's GraphQL budget left,
+        or None when that is genuinely unknown.
+
+        Public because the decision "is there enough budget to start this
+        expensive piece of work" belongs to the caller doing the spending,
+        while which bucket answers it is this client's business -- routing
+        makes that a (credential, resource) pair, not a single global number,
+        and a caller reaching into _bucket() would have to duplicate
+        _resolve_credential() to pick the right one.
+
+        None means UNKNOWN, not healthy, and callers must not treat the two
+        alike. A bucket that has never been populated from a real GitHub
+        response still holds its 5000/5000 constructor defaults, which are
+        indistinguishable from a genuinely untouched budget (#103, see
+        GitHubRateLimitStatus.is_stale) -- so a fresh process that has not
+        made its first call yet would otherwise read as "100% available" and
+        any threshold check would pass by accident. Refusing to act on a
+        reading that does not exist is the safe direction: skipping work on a
+        made-up number is worse than doing the work.
+        """
+        bucket = self._bucket(self._resolve_credential(), 'graphql')
+        if not bucket.ever_updated or bucket.limit <= 0:
+            return None
+        return max(0.0, bucket.remaining / bucket.limit)
+
     def _redis_key_for(self, credential: str, resource: str) -> str:
         keys = (
             RATE_LIMIT_REDIS_KEYS_APP if credential == CREDENTIAL_APP

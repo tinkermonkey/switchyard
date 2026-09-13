@@ -27,6 +27,33 @@ logger = logging.getLogger(__name__)
 STRANDED_ACTIVE_GRACE_MINUTES = 15
 
 
+DEFAULT_QUEUE_RECONCILIATION_MINUTES = 30
+
+
+def _interval_minutes_env(name: str, default: int) -> int:
+    """A positive whole number of minutes from the environment, or `default`.
+
+    Falls back rather than raising on anything unusable: this runs during
+    scheduler construction at boot, and a typo in a cadence knob must not stop
+    the orchestrator starting. Zero and negatives are rejected because
+    IntervalTrigger treats them as "no delay" -- a mistyped 0 would turn the
+    most expensive periodic job in the system into a hot loop against the
+    GitHub API, which is the precise failure this cadence exists to avoid.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"{name}={raw!r} is not an integer; using {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"{name}={raw!r} must be positive; using {default}")
+        return default
+    return value
+
+
 class ScheduledTasksService:
     """Manages periodic background tasks for the orchestrator"""
 
@@ -76,10 +103,37 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
-        # Schedule queue state reconciliation with GitHub - every 10 minutes
+        # Schedule queue state reconciliation with GitHub.
+        #
+        # This is the orchestrator's single largest consumer of GraphQL quota:
+        # it force-syncs EVERY project/board pair, so its cost is the board
+        # count, not the amount of work in flight. On the reference deployment
+        # that is 17 projects x 3 boards = 51 full board syncs per run; at the
+        # 10-minute cadence this used to run at, 306 per hour against a
+        # 5,000-point hourly budget, which left the deployment idling at
+        # 60-75% of quota with no headroom to absorb a restart.
+        #
+        # Drift insurance, not the detection path -- ProjectMonitor's 30s poll
+        # is what notices a card actually moving. Thirty minutes of worst-case
+        # drift in a backstop is cheap; a tripped circuit breaker is not,
+        # because it refuses every other subsystem sharing the credential for
+        # the rest of the reset window.
+        #
+        # IntervalTrigger, not CronTrigger(minute='*/N'): '*/N' only divides
+        # the hour evenly for N that divide 60, and every '*/N' job in this
+        # scheduler fires together on the hour. Spacing from start time keeps
+        # this off that pile-up and accepts any N.
+        queue_reconcile_minutes = _interval_minutes_env(
+            'QUEUE_RECONCILIATION_INTERVAL_MINUTES',
+            DEFAULT_QUEUE_RECONCILIATION_MINUTES,
+        )
+        logger.info(
+            f"Queue state reconciliation scheduled every "
+            f"{queue_reconcile_minutes} minutes"
+        )
         self.scheduler.add_job(
             self._reconcile_queue_state,
-            trigger=CronTrigger(minute='*/10'),
+            trigger=IntervalTrigger(minutes=queue_reconcile_minutes),
             id='reconcile_queue_state',
             name='Force sync pipeline queues with GitHub boards',
             replace_existing=True
