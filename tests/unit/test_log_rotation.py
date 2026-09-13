@@ -11,9 +11,10 @@ entirely, weeks later.
 """
 
 import logging
-from pathlib import Path
 
 import pytest
+
+from tests.utils.repo_sources import first_party_python_sources
 
 from monitoring.log_rotation import (  # noqa: E402
     CHECKOUT_LOG_BACKUP_COUNT,
@@ -186,16 +187,19 @@ class TestNoPlainFileHandlersRemain:
 
     def test_no_module_still_constructs_an_unbounded_file_handler(self):
         """The whole point. A new logging.FileHandler anywhere in the tree
-        reintroduces the 9.2GB, and it will not be noticed for months."""
+        reintroduces the 9.2GB, and it will not be noticed for months.
+
+        "The tree" means THIS checkout. The enumerator is shared with the two
+        #181/#203 walks and the #202 grep because this scan used to carry its
+        own skip tuple and had already drifted off theirs -- it was the one
+        missing `.git` -- and because none of the three could exclude a second
+        checkout parked under the root. See tests/utils/repo_sources.py for
+        what it prunes and why it does not simply ask git.
+        """
         import re
 
-        root = Path(__file__).parent.parent.parent
         offenders = []
-        for source in root.rglob('*.py'):
-            relative = source.relative_to(root)
-            parts = relative.parts
-            if parts[0] in ('tests', '.claude', 'node_modules', 'venv', '.venv'):
-                continue
+        for relative, source in first_party_python_sources():
             text = source.read_text(errors='ignore')
             # `\bFileHandler\s*\(` rather than `logging\.FileHandler\s*\(`:
             # the word boundary already excludes RotatingFileHandler and
