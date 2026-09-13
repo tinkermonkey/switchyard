@@ -786,6 +786,85 @@ FIRST_PARTY_PACKAGES = (
 leaked_module_mocks = []
 
 
+# The import-time state-owning singletons a TEST MODULE can still be the first
+# importer of, as (module, singleton attribute, path attribute, subdirectory of
+# $ROOT/state). work_execution_tracker is reached through a function-level
+# `from services.work_execution_state import work_execution_tracker` all over
+# services/ -- roughly twenty such call sites in services/project_monitor.py
+# alone -- so whatever root the module body happened to see is the root every
+# one of those call sites uses for the rest of the process.
+#
+# services.dev_container_state has the identical shape and is deliberately NOT
+# listed. Measured: it is already in sys.modules before the first test module is
+# imported (this conftest pulls it in transitively), so no test file can be its
+# first importer and an entry for it would be a row that can never fire. Checked
+# by making a test module the first in collection order do exactly what #211's
+# watchdog file did -- import it under a patched, about-to-be-deleted
+# ORCHESTRATOR_ROOT -- and observing `'services.dev_container_state' in
+# sys.modules == True` at that module's top and state_dir still resolving to the
+# session root. Add it back the day that stops being true.
+IMPORT_TIME_STATE_SINGLETONS = (
+    ('services.work_execution_state', 'work_execution_tracker', 'state_dir',
+     'execution_history'),
+)
+
+# Filled in at collection finish, read by
+# tests/unit/test_state_root_isolation.py. Same shape and same reasoning as
+# leaked_module_mocks above: sampled at import time, asserted as an ordinary
+# test failure.
+singletons_bound_outside_the_state_root = []
+
+
+def _import_time_singletons_bound_outside_the_state_root():
+    """Import-time singleton(s) whose state path is not under this session's root.
+
+    A test module that imports one of these while ORCHESTRATOR_ROOT points
+    somewhere else binds the process-wide singleton there permanently. #211's
+    sibling fault was exactly that: tests/unit/test_watchdog_retry.py imported
+    services.work_execution_state inside
+
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
+
+    so whenever it was the first importer, work_execution_tracker bound to a
+    directory the `with` block then DELETED. What noticed was
+    tests/unit/scripts/test_dry_run_state_sweep.py's
+    test_step_two_the_restore_fixture_puts_the_real_tracker_back, four
+    directories away, and only in selections that imported the watchdog file
+    first -- never in a full run, where an earlier module always imported
+    work_execution_state under the right root and made the re-import a no-op.
+
+    Sampled at collection finish, for the same reason
+    _first_party_modules_replaced_by_mocks() is: pytest imports every selected
+    test module before running any test, so an import-time binding is already
+    in place and a later test body cannot be relied on to observe it -- in a
+    full run several tests legitimately repoint these singletons for their own
+    duration, so a sample taken mid-run would be reading their business, not
+    this invariant.
+    """
+    import sys
+
+    root = Path(os.environ.get('ORCHESTRATOR_ROOT', '/app'))
+    bound = []
+    for module_name, singleton_name, path_attr, subdir in IMPORT_TIME_STATE_SINGLETONS:
+        module = sys.modules.get(module_name)
+        if module is None:
+            # Not imported during collection -- nothing was bound, nothing to check.
+            continue
+        singleton = getattr(module, singleton_name, None)
+        if singleton is None:
+            continue
+        actual = getattr(singleton, path_attr, None)
+        if actual is None:
+            continue
+        expected = root / 'state' / subdir
+        if Path(actual) != expected:
+            bound.append(
+                (f"{module_name}.{singleton_name}.{path_attr}", str(actual), str(expected))
+            )
+    return bound
+
+
 def _first_party_modules_replaced_by_mocks():
     """Names under FIRST_PARTY_PACKAGES whose sys.modules entry is a mock.
 
@@ -831,6 +910,9 @@ def pytest_collection_finish(session):
     named test failure rather than as somebody else's inexplicable TypeError.
     """
     leaked_module_mocks[:] = _first_party_modules_replaced_by_mocks()
+    singletons_bound_outside_the_state_root[:] = (
+        _import_time_singletons_bound_outside_the_state_root()
+    )
 
 
 def pytest_sessionfinish(session, exitstatus):

@@ -106,6 +106,57 @@ class TestBothHoldoutsUseIt:
             f"env={os.environ.get('ORCHESTRATOR_ROOT')!r}"
         )
 
+    def test_no_test_file_bound_an_import_time_singleton_outside_the_state_root(self):
+        """The same claim as the test above, for the singleton built at IMPORT
+        time -- and it was actually broken (#211's sibling).
+
+        services/work_execution_state.py ends with a module-level singleton
+        constructed against `orchestrator_state_root()`, and it is reached
+        through function-level `from services.work_execution_state import
+        work_execution_tracker` all over services/. Whatever root the module
+        body saw is the root every one of those call sites uses for the rest of
+        the process. (services/dev_container_state.py has the same shape and is
+        deliberately not covered -- see IMPORT_TIME_STATE_SINGLETONS in
+        tests/conftest.py for the measurement that makes a row for it dead.)
+
+        tests/unit/test_watchdog_retry.py imported work_execution_state inside
+        `tempfile.TemporaryDirectory()` + `patch.dict(os.environ,
+        {'ORCHESTRATOR_ROOT': _tmpdir})`, so whenever it was the first importer
+        the singleton bound to a directory the `with` block then DELETED. What
+        noticed was tests/unit/scripts/test_dry_run_state_sweep.py's
+        test_step_two_the_restore_fixture_puts_the_real_tracker_back, four
+        directories away, and only in selections that imported the watchdog file
+        first. This asserts the invariant where it belongs.
+
+        Reads a sample taken at collection finish rather than checking
+        sys.modules here, and the difference is load-bearing. Same reasoning as
+        tests/unit/test_no_cross_file_module_leakage.py, whose shape this
+        copies: pytest imports every selected test module before running any
+        test, so an import-time binding is already in place by collection
+        finish, whereas by the time THIS body runs several tests have
+        legitimately repointed these singletons for their own duration and put
+        them back (tests/unit/services/test_stale_execution_history.py,
+        test_container_redis_tracking.py and test_work_execution_redis_recovery
+        .py all do, via sys.modules.pop + re-import under a tmp_path root).
+        Measured: an in-body version of this assertion failed the full suite on
+        a leftover from tests/unit/scripts/test_dry_run_state_sweep.py, which is
+        that file's own business and not this invariant.
+        """
+        from tests.conftest import singletons_bound_outside_the_state_root
+
+        assert singletons_bound_outside_the_state_root == [], (
+            "A test module bound a state-owning singleton outside this "
+            "session's ORCHESTRATOR_ROOT while pytest was importing test files, "
+            "so every call site that imports it for the rest of the session "
+            "reads and writes there -- typically a tmp/TemporaryDirectory that "
+            "no longer exists: "
+            f"{singletons_bound_outside_the_state_root}. "
+            "tests/conftest.py already points ORCHESTRATOR_ROOT at a writable "
+            "scratch root before any test module is imported (#181), so import "
+            "the module plainly; construct your own instance with an explicit "
+            "state_dir= if you need one under tmp_path."
+        )
+
     def test_an_explicit_state_root_still_beats_the_environment(self, monkeypatch, tmp_path):
         """Callers that pass a root mean it.
 

@@ -1058,46 +1058,71 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
         capture['manager'].end_pipeline_run.assert_not_called()
 
     def test_epic_worktree_collision_records_a_failure_outcome_for_the_retry_counter_to_see(
-        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        self, tmp_path, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
         mock_state_manager, mock_task_queue,
     ):
         """The whole safety argument for NOT releasing the lock rests on
         trigger_agent_for_status's retry/threshold logic actually seeing this
         failure via work_execution_tracker -- assert that directly, not just
-        that end_pipeline_run was skipped. Uses the REAL work_execution_tracker
-        (this file sets ORCHESTRATOR_ROOT at collection time -- see the top of
-        this file), not a mock, so this is a genuine integration check: it
-        would have failed against the original version of this fix, where
-        record_execution_start() ran too late (right before container launch,
-        well after epic-worktree resolution) for record_execution_outcome() to
-        find an in_progress entry to finalize on this exact failure path."""
-        from services.work_execution_state import work_execution_tracker
+        that end_pipeline_run was skipped. Uses a REAL WorkExecutionStateTracker,
+        not a mock, so this is a genuine integration check: it would have failed
+        against the original version of this fix, where record_execution_start()
+        ran too late (right before container launch, well after epic-worktree
+        resolution) for record_execution_outcome() to find an in_progress entry
+        to finalize on this exact failure path.
+
+        REAL but tmp_path-SCOPED, which is the #211 fix. It used to use the
+        module-level `work_execution_tracker` singleton, whose state_dir is
+        $ORCHESTRATOR_ROOT/state/execution_history -- a directory that outlives
+        the process. record_execution_outcome() APPENDS, so a second run against
+        the same scratch root found the first run's record still on disk and the
+        `len(failures) == 1` below saw two. Deterministic, not flaky; measured on
+        origin/main @ 849e54b, three runs of this file against one shared root:
+        41 passed / 1 failed / 1 failed, and five runs against five fresh roots:
+        41 passed each time.
+
+        The assertion is not the problem and is kept exactly as it was -- "this
+        dispatch attempt recorded one failure" is precisely what the retry
+        counter cares about, and counting by id instead would stop noticing a
+        double-record. What was wrong is that the tracker's storage was shared
+        with every past and future process using that root. A tracker rooted in
+        tmp_path makes the count a statement about THIS run, which is what it
+        always meant to be.
+
+        _start_repair_cycle_for_issue does a function-level `from
+        services.work_execution_state import work_execution_tracker` (project_
+        monitor.py, in the method's own preamble), so patching the module
+        attribute is enough to redirect it -- no reload, and the real singleton
+        is left bound to its real root for everyone else."""
+        from services.work_execution_state import WorkExecutionStateTracker
+
+        tracker = WorkExecutionStateTracker(state_dir=tmp_path / 'execution_history')
 
         mock_task_queue.redis_client.get.return_value = None
         mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, "lock_acquired")
         capture = {}
 
-        # A unique issue_number, not the file's shared default (100) -- the real
-        # work_execution_tracker singleton persists execution history to real,
-        # project+issue-scoped files across every test in this module (this file
-        # sets ORCHESTRATOR_ROOT once at collection time, not per-test), so
-        # sharing issue_number=100 with other tests that ALSO now use the same
-        # realistic agent string would let their records leak into this one's
-        # count.
-        result, launch_mock, stage_config = _run_start_repair_cycle(
-            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
-            mock_state_manager, mock_task_queue,
-            issue_number=999001,
-            pipeline_manager_capture=capture,
-            resolve_workspace_side_effect=RuntimeError(
-                "Failed to add worktree for existing branch feature/issue-42-epic: "
-                "fatal: 'feature/issue-42-epic' is already used by worktree at "
-                "'/workspace/test-project'"
-            ),
-        )
+        # A unique issue_number, not the file's shared default (100). Redundant
+        # for cross-RUN isolation now that the tracker is tmp_path-scoped, but
+        # still load-bearing within a single run: other tests in this class share
+        # this module's process and use the same realistic agent string, and
+        # anything that reached this tracker under issue 100 would land in the
+        # same project+issue-scoped file.
+        with patch('services.work_execution_state.work_execution_tracker', tracker):
+            result, launch_mock, stage_config = _run_start_repair_cycle(
+                mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+                mock_state_manager, mock_task_queue,
+                issue_number=999001,
+                pipeline_manager_capture=capture,
+                resolve_workspace_side_effect=RuntimeError(
+                    "Failed to add worktree for existing branch feature/issue-42-epic: "
+                    "fatal: 'feature/issue-42-epic' is already used by worktree at "
+                    "'/workspace/test-project'"
+                ),
+            )
 
         assert result is None
-        history = work_execution_tracker.get_execution_history("test-project", 999001)
+        history = tracker.get_execution_history("test-project", 999001)
         failures = [
             e for e in history
             if e.get('column') == 'Testing' and e.get('outcome') == 'failure'
