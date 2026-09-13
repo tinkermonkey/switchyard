@@ -32,6 +32,7 @@ from unittest.mock import Mock, patch
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from services.pipeline_run import ActiveRunWorkspaces
 from services.project_workspace import ProjectWorkspaceManager
 
 
@@ -75,7 +76,7 @@ class TestActiveRunWorktreesSurvivePrune:
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
-                active_run_workspaces={'codetoreum': {'1016'}},
+                active_run_workspaces=ActiveRunWorkspaces({'codetoreum': {'1016'}}, set()),
             )
 
         assert worktree.is_dir(), "an active run's workspace must not be pruned"
@@ -96,7 +97,7 @@ class TestActiveRunWorktreesSurvivePrune:
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
-                active_run_workspaces={'*paths*': {str(worktree)}},
+                active_run_workspaces=ActiveRunWorkspaces({}, {str(worktree)}),
             )
 
         assert worktree.is_dir()
@@ -110,7 +111,7 @@ class TestActiveRunWorktreesSurvivePrune:
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
-                active_run_workspaces={'*paths*': {str(worktree) + '/'}},
+                active_run_workspaces=ActiveRunWorkspaces({}, {str(worktree) + '/'}),
             )
 
         assert worktree.is_dir()
@@ -129,10 +130,13 @@ class TestActiveRunWorktreesSurvivePrune:
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
-                active_run_workspaces={'heimdall': {'1016'}},
+                active_run_workspaces=ActiveRunWorkspaces({'heimdall': {'1016'}}, set()),
             )
 
-        assert mock_run.called, "an unprotected worktree is still an ordinary candidate"
+        assert any(
+            'remove' in ' '.join(str(a) for a in c.args[0])
+            for c in mock_run.call_args_list
+        ), "an unprotected worktree is still an ordinary removal candidate"
 
     def test_an_idle_worktree_is_still_pruned(self, manager, tmp_path):
         """Control. The rule must protect active runs WITHOUT turning the sweep
@@ -146,10 +150,12 @@ class TestActiveRunWorktreesSurvivePrune:
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
-                active_run_workspaces={'codetoreum': {'1016'}},
+                active_run_workspaces=ActiveRunWorkspaces({'codetoreum': {'1016'}}, set()),
             )
 
-        mock_push.assert_called_once(), "an unprotected worktree still gets its commits saved"
+        # NB: a bare `mock.assert_called_once(), "msg"` is a discarded tuple --
+        # the call still raises if unmet, but the message is inert.
+        mock_push.assert_called_once()
 
     def test_omitting_the_argument_keeps_the_pre_existing_behaviour(
         self, manager, tmp_path
@@ -169,15 +175,41 @@ class TestActiveRunWorktreesSurvivePrune:
         mock_push.assert_called_once()
 
 
-class TestTheSweepStillRunsWhenTheLookupFails:
-    def test_an_unavailable_pipeline_run_manager_does_not_stop_the_sweep(
-        self, manager, tmp_path
-    ):
-        """prune_epic_worktrees() runs unguarded at every startup. A failure to
-        read active runs degrades to the four pre-existing rules — it must not
-        be able to fail the boot."""
+class TestAnIncompleteAnswerAbortsTheSweep:
+    """The unknown-vs-empty rule, applied to a destructive operation.
+
+    An earlier revision degraded to "prune anyway, without the protection" when
+    the active-run lookup failed. That is the same defect this change set
+    removes from _get_sub_issues_from_parent(), pointed at `rm -rf`: an
+    unreadable Redis during a restart — the very moment this sweep runs — would
+    read as "no run owns any of these worktrees" and delete a live workspace,
+    reproducing the incident with the protection silently absent.
+    """
+
+    def test_an_incomplete_lookup_prunes_nothing(self, manager, tmp_path):
         _make_base_clone(tmp_path, "codetoreum")
-        _make_worktree(tmp_path, "codetoreum", "999")
+        worktree = _make_worktree(tmp_path, "codetoreum", "999")
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces.unknown()
+
+        with patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()) as mock_run:
+            manager.prune_epic_worktrees()
+
+        assert worktree.is_dir(), (
+            "an unanswerable lookup must not be read as 'nothing is active'"
+        )
+        mock_push.assert_not_called()
+        assert not mock_run.called
+
+    def test_a_raising_lookup_also_prunes_nothing(self, manager, tmp_path):
+        """prune_epic_worktrees() runs unguarded at every startup, so it must
+        not raise — but "did not raise" must not mean "deleted everything"."""
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "999")
 
         with patch('services.pipeline_run.get_pipeline_run_manager',
                    side_effect=RuntimeError("redis down")), \
@@ -186,6 +218,26 @@ class TestTheSweepStillRunsWhenTheLookupFails:
              patch('services.project_workspace.subprocess.run', return_value=_ok()):
             manager.prune_epic_worktrees()  # must not raise
 
+        assert worktree.is_dir()
+
+    def test_a_complete_answer_still_prunes(self, manager, tmp_path):
+        """Control: the abort must not turn the sweep into a permanent no-op."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "999")
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+
+        with patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            manager.prune_epic_worktrees()
+
+        mock_push.assert_called_once()
+
     def test_the_sweep_passes_the_lookup_result_through_to_each_project(
         self, manager, tmp_path
     ):
@@ -193,7 +245,7 @@ class TestTheSweepStillRunsWhenTheLookupFails:
         Redis/ES read covers every worktree under consideration."""
         _make_base_clone(tmp_path, "codetoreum")
         _make_worktree(tmp_path, "codetoreum", "1016")
-        expected = {'codetoreum': {'1016'}}
+        expected = ActiveRunWorkspaces({'codetoreum': {'1016'}}, set(), complete=True)
 
         seen = {}
 
@@ -208,15 +260,48 @@ class TestTheSweepStillRunsWhenTheLookupFails:
              patch.object(manager, '_prune_project_staging', _capture):
             manager.prune_epic_worktrees()
 
-        assert seen['value'] == expected
+        assert seen['value'] is expected
         run_manager.get_active_run_workspaces.assert_called_once()
+
+
+class TestActiveRunWorkspacesValue:
+    """The value type itself — the magic-key shape it replaced could not
+    express either of the two things the prune decision depends on."""
+
+    def test_protects_matches_on_epic_id(self):
+        w = ActiveRunWorkspaces({'codetoreum': {'1016'}}, set())
+        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+
+    def test_protects_matches_on_recorded_path(self):
+        w = ActiveRunWorkspaces({}, {'/w/worktrees/codetoreum/1016'})
+        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+
+    def test_paths_are_normalised_once_at_construction(self):
+        """The consumer used to re-do this, with a comment explaining that the
+        duplication was deliberate. A value object normalises once."""
+        w = ActiveRunWorkspaces({}, {'/w/worktrees/codetoreum/1016/'})
+        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+
+    def test_another_projects_epic_id_does_not_match(self):
+        w = ActiveRunWorkspaces({'heimdall': {'1016'}}, set())
+        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is False
+
+    def test_a_project_named_like_the_old_magic_key_is_just_a_project(self):
+        """The shape this replaced reserved '*paths*', so a project of that
+        name overwrote its own protection and matched nothing."""
+        w = ActiveRunWorkspaces({'*paths*': {'1016'}}, set())
+        assert w.protects('*paths*', Path('/w/worktrees/*paths*/1016')) is True
+
+    def test_unknown_is_not_empty(self):
+        assert ActiveRunWorkspaces.unknown().complete is False
+        assert ActiveRunWorkspaces({}, set()).complete is True
 
 
 class TestGetActiveRunWorkspaces:
     """PipelineRunManager's side of the rule."""
 
-    def _manager(self, redis_client):
-        """Redis-only, with Elasticsearch explicitly disabled.
+    def _manager(self, redis_client, es_client=None):
+        """Redis-only by default, with Elasticsearch explicitly disabled.
 
         PipelineRunManager's constructor builds a REAL Elasticsearch client
         when elasticsearch_client is None, so these tests would otherwise read
@@ -227,13 +312,12 @@ class TestGetActiveRunWorkspaces:
         with patch('services.pipeline_run.Elasticsearch', side_effect=RuntimeError('no ES')):
             manager = PipelineRunManager(redis_client=redis_client)
         assert manager.es is None
+        manager.es = es_client
         return manager
 
-    def test_an_active_run_contributes_its_epic_id_and_path(self):
+    def _run_blob(self, **overrides):
         import json
-        redis_client = Mock()
-        redis_client.hgetall.return_value = {'codetoreum:1045': 'run-abc'}
-        redis_client.get.return_value = json.dumps({
+        blob = {
             'id': 'run-abc',
             'issue_number': 1045,
             'issue_title': 'Phase 1',
@@ -244,63 +328,106 @@ class TestGetActiveRunWorkspaces:
             'status': 'active',
             'epic_id': '1016',
             'project_dir': '/workspace/.orchestrator/worktrees/codetoreum/1016',
-        })
+        }
+        blob.update(overrides)
+        return json.dumps(blob)
 
-        result = self._manager(redis_client).get_active_run_workspaces()
+    def _es(self, hits):
+        es = Mock()
+        es.search.return_value = {'hits': {'hits': [{'_source': h} for h in hits]}}
+        return es
 
-        assert result['codetoreum'] == {'1016'}
-        assert '/workspace/.orchestrator/worktrees/codetoreum/1016' in result['*paths*']
-
-    def test_a_finished_run_contributes_nothing(self):
-        import json
+    def test_an_active_run_contributes_its_epic_id_and_path(self):
         redis_client = Mock()
         redis_client.hgetall.return_value = {'codetoreum:1045': 'run-abc'}
-        redis_client.get.return_value = json.dumps({
-            'id': 'run-abc',
-            'issue_number': 1045,
-            'issue_title': 'Phase 1',
-            'issue_url': 'https://example.invalid/1045',
-            'project': 'codetoreum',
-            'board': 'SDLC Execution',
-            'started_at': '2026-09-13T13:50:12Z',
-            'ended_at': '2026-09-13T16:00:56Z',
-            'status': 'completed',
-            'epic_id': '1016',
-            'project_dir': '/workspace/.orchestrator/worktrees/codetoreum/1016',
-        })
+        redis_client.get.return_value = self._run_blob()
 
-        assert self._manager(redis_client).get_active_run_workspaces() == {}
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
+
+        assert result.epic_ids_by_project['codetoreum'] == {'1016'}
+        assert '/workspace/.orchestrator/worktrees/codetoreum/1016' in result.paths
+        assert result.complete is True
+
+    def test_a_finished_run_contributes_nothing(self):
+        redis_client = Mock()
+        redis_client.hgetall.return_value = {'codetoreum:1045': 'run-abc'}
+        redis_client.get.return_value = self._run_blob(
+            status='completed', ended_at='2026-09-13T16:00:56Z'
+        )
+
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
+
+        assert result.epic_ids_by_project == {}
+        assert result.complete is True
 
     def test_a_feedback_listening_run_is_protected_too(self):
         """It holds its board's lock and is waiting on a human, which is the
         longest a workspace ever has to survive."""
-        import json
         redis_client = Mock()
         redis_client.hgetall.return_value = {'codetoreum:1045': 'run-abc'}
-        redis_client.get.return_value = json.dumps({
-            'id': 'run-abc',
-            'issue_number': 1045,
-            'issue_title': 'Phase 1',
-            'issue_url': 'https://example.invalid/1045',
-            'project': 'codetoreum',
-            'board': 'SDLC Execution',
-            'started_at': '2026-09-13T13:50:12Z',
-            'status': 'feedback_listening',
-            'epic_id': '1016',
-        })
+        redis_client.get.return_value = self._run_blob(status='feedback_listening')
 
-        assert self._manager(redis_client).get_active_run_workspaces()['codetoreum'] == {'1016'}
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
 
-    def test_a_redis_failure_returns_empty_rather_than_raising(self):
-        """It runs inside a best-effort startup sweep."""
+        assert result.epic_ids_by_project['codetoreum'] == {'1016'}
+
+    def test_a_redis_failure_is_reported_as_incomplete_not_as_empty(self):
+        """THE REGRESSION GUARD. Returning a bare {} here made an unreadable
+        Redis indistinguishable from a healthy system with no active runs — and
+        the caller deletes directories on the difference."""
         redis_client = Mock()
         redis_client.hgetall.side_effect = ConnectionError("redis down")
 
-        assert self._manager(redis_client).get_active_run_workspaces() == {}
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
 
-    def test_unparseable_run_data_does_not_stop_the_scan(self):
+        assert result.complete is False
+        assert result.epic_ids_by_project == {}
+
+    def test_one_unparseable_record_does_not_drop_the_others(self):
+        """The try used to wrap the whole loop, so a single bad blob aborted the
+        scan and every run AFTER it silently lost protection — while the result
+        was returned as though it were complete."""
         redis_client = Mock()
-        redis_client.hgetall.return_value = {'a:1': 'run-a'}
-        redis_client.get.return_value = 'not json'
+        redis_client.hgetall.return_value = {'a:1': 'run-bad', 'b:2': 'run-good'}
+        redis_client.get.side_effect = ['not json', self._run_blob()]
 
-        assert self._manager(redis_client).get_active_run_workspaces() == {}
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
+
+        assert result.epic_ids_by_project['codetoreum'] == {'1016'}, (
+            "the readable run must still be protected"
+        )
+        assert result.complete is False, "but the answer is known to be partial"
+
+    def test_an_elasticsearch_failure_is_also_incomplete(self):
+        redis_client = Mock()
+        redis_client.hgetall.return_value = {}
+        es = Mock()
+        es.search.side_effect = RuntimeError("es down")
+
+        result = self._manager(redis_client, es).get_active_run_workspaces()
+
+        assert result.complete is False
+
+    def test_no_elasticsearch_client_is_incomplete(self):
+        """Runs whose Redis blob expired live only in ES — exactly the
+        long-running mid-pipeline population this protects best."""
+        redis_client = Mock()
+        redis_client.hgetall.return_value = {}
+
+        result = self._manager(redis_client, None).get_active_run_workspaces()
+
+        assert result.complete is False
+
+    def test_an_elasticsearch_only_run_is_protected(self):
+        redis_client = Mock()
+        redis_client.hgetall.return_value = {}
+        es = self._es([{
+            'project': 'codetoreum',
+            'epic_id': '1016',
+            'project_dir': '/w/worktrees/codetoreum/1016',
+            'status': 'active',
+        }])
+
+        result = self._manager(redis_client, es).get_active_run_workspaces()
+
+        assert result.epic_ids_by_project['codetoreum'] == {'1016'}

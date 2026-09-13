@@ -15,10 +15,14 @@ The incident these are written against, in order:
      stderr `gh` writes the reason to. The real cause had to be inferred from
      surrounding log lines hours later.
 
-Three pure decisions come out of that, and they are tested here rather than
-inline for the reason the rest of this file's neighbours are: the live code is
-a closure in a daemon thread, or a branch inside the monitor's main loop, and
-neither is drivable from a test.
+The pure decisions that come out of that are tested here. Two of them --
+card_move_retry_delay() and monitor_budget_backoff_seconds() -- are extracted
+precisely because their live callers are hard to drive: a loop reached only
+from a daemon thread, and a branch inside the monitor's `while True`. The
+classification and rendering helpers ARE reachable through
+PipelineProgression.move_issue_to_column(), and the sibling file
+test_card_move_uses_rate_limited_client.py drives them that way; here they are
+covered directly, at their boundaries.
 
   * describe_graphql_failure() / describe_subprocess_error(): the error text is
     the whole point of (3).
@@ -37,13 +41,16 @@ if not os.path.isdir('/app'):
 
 import subprocess
 
-from services.pipeline_progression import (
+from services.github_api_client import (
     BREAKER_OPEN_ERROR,
+    FAILURE_BREAKER_OPEN,
+    FAILURE_OTHER,
+    FAILURE_RATE_LIMITED,
     RATE_LIMITED_ERROR,
+    classify_graphql_failure,
     describe_graphql_failure,
-    describe_subprocess_error,
-    is_rate_limit_failure,
 )
+from services.pipeline_progression import CardMoveFailure, describe_subprocess_error
 from services.project_monitor import (
     CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS,
     DEFAULT_MONITOR_MIN_BUDGET_FRACTION,
@@ -99,31 +106,78 @@ class TestDescribeGraphqlFailure:
         assert "returned non-zero exit status" not in text
 
 
-class TestIsRateLimitFailure:
-    def test_the_breaker_refusal_counts(self):
-        assert is_rate_limit_failure({"error": BREAKER_OPEN_ERROR}) is True
+class TestClassifyGraphqlFailure:
+    """THE distinction the whole retry policy turns on.
 
-    def test_githubs_own_rejection_counts(self):
-        assert is_rate_limit_failure({"error": RATE_LIMITED_ERROR}) is True
+    The breaker is shared across the client's GraphQL, REST, HTTP and CLI
+    paths, but GitHub meters those as SEPARATE quotas. Conflating "the shared
+    breaker is open" with "this call's quota is exhausted" let a REST
+    exhaustion stop a board whose GraphQL budget was entirely healthy.
+    """
 
-    def test_a_body_level_rate_limit_error_counts(self):
-        assert is_rate_limit_failure(
-            {"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]}
-        ) is True
+    def test_a_breaker_refusal_is_not_confirmed_quota_exhaustion(self):
+        assert classify_graphql_failure({"error": BREAKER_OPEN_ERROR}) == FAILURE_BREAKER_OPEN
 
-    def test_an_ordinary_failure_does_not(self):
-        assert is_rate_limit_failure({"error": "parse_error"}) is False
+    def test_githubs_own_rejection_is(self):
+        assert classify_graphql_failure({"error": RATE_LIMITED_ERROR}) == FAILURE_RATE_LIMITED
+
+    def test_a_body_level_rate_limit_is(self):
+        """How GitHub reports a PRIMARY GraphQL rate limit — and it never trips
+        the breaker, so this is the only signal a caller gets."""
+        assert classify_graphql_failure(
+            {"errors": [{"type": "RATE_LIMIT", "message": "API rate limit already exceeded"}]}
+        ) == FAILURE_RATE_LIMITED
+
+    def test_a_secondary_rate_limit_in_stderr_is(self):
+        assert classify_graphql_failure(
+            {"error": "failed_after_retries", "stderr": "You have exceeded a secondary rate limit"}
+        ) == FAILURE_RATE_LIMITED
+
+    def test_an_ordinary_failure_is_other(self):
+        assert classify_graphql_failure({"error": "parse_error"}) == FAILURE_OTHER
 
     def test_a_scope_error_is_not_a_rate_limit(self):
         """INSUFFICIENT_SCOPES is permanent and retrying is pointless for a
         different reason — it must not be mistaken for a quota wait."""
-        assert is_rate_limit_failure(
+        assert classify_graphql_failure(
             {"errors": [{"type": "INSUFFICIENT_SCOPES", "message": "needs read:project"}]}
-        ) is False
+        ) == FAILURE_OTHER
 
     @pytest.mark.parametrize("payload", [None, "rate limit", 42, []])
-    def test_a_non_dict_payload_is_not_a_rate_limit(self, payload):
-        assert is_rate_limit_failure(payload) is False
+    def test_a_non_dict_payload_is_other(self, payload):
+        assert classify_graphql_failure(payload) == FAILURE_OTHER
+
+    def test_breaker_wording_drift_still_classifies_as_a_refusal(self):
+        """The breaker's message is the one sentinel containing "rate limit"
+        that does NOT mean this call's quota is gone, so the substring fallback
+        must check for the breaker first."""
+        assert classify_graphql_failure(
+            {"error": "GitHub API rate limit guard - circuit breaker open (reworded)"}
+        ) == FAILURE_BREAKER_OPEN
+
+    def test_the_client_builds_its_payloads_from_these_constants(self):
+        """Re-declaring the literals in a consumer meant a rename in the client
+        silently turned every rate-limit classification into 'other'. The
+        constants and the code that emits them now live in one module."""
+        import inspect
+        from services import github_api_client
+
+        source = inspect.getsource(github_api_client)
+        assert 'return False, {"error": BREAKER_OPEN_ERROR}' in source
+        assert '"error": "GitHub API rate limit exceeded - circuit breaker open"}' not in source
+
+
+class TestCardMoveFailure:
+    def test_only_a_confirmed_quota_failure_is_exhaustion(self):
+        assert CardMoveFailure(FAILURE_RATE_LIMITED, "x").is_quota_exhaustion is True
+
+    def test_a_breaker_refusal_is_not(self):
+        """The regression guard, stated on the value itself: a shared-breaker
+        refusal must not drive the terminal quota path."""
+        assert CardMoveFailure(FAILURE_BREAKER_OPEN, "x").is_quota_exhaustion is False
+
+    def test_an_ordinary_failure_is_not(self):
+        assert CardMoveFailure(FAILURE_OTHER, "x").is_quota_exhaustion is False
 
 
 class TestDescribeSubprocessError:
@@ -156,48 +210,66 @@ class TestDescribeSubprocessError:
 
 
 class TestCardMoveRetryDelay:
-    def test_no_rate_limit_keeps_the_original_exponential_ladder(self):
-        """5s, 10s, 20s — unchanged for an ordinary transient GitHub blip."""
-        assert card_move_retry_delay(1, None) == 5.0
-        assert card_move_retry_delay(2, None) == 10.0
-        assert card_move_retry_delay(3, None) == 20.0
+    """Now returns (verdict, seconds). The verdict is returned rather than
+    left for the caller to infer, because the caller got that inference wrong:
+    it branched its operator-facing log on `if reset_seconds:`, which disagrees
+    with this function for any negative value."""
 
-    def test_a_live_rate_limit_waits_for_the_window_not_five_seconds(self):
-        """The incident's own numbers: ~780s left on the window, and the old
-        ladder spent all three attempts inside it."""
-        delay = card_move_retry_delay(1, 780.0)
-        assert delay > 700, "must wait for the quota window, not retry inside it"
+    def test_a_non_quota_failure_keeps_the_exponential_ladder(self):
+        """5s, 10s, 20s — unchanged for an ordinary transient GitHub blip."""
+        assert card_move_retry_delay(1, False, None) == ('exponential', 5.0)
+        assert card_move_retry_delay(2, False, None) == ('exponential', 10.0)
+        assert card_move_retry_delay(3, False, None) == ('exponential', 20.0)
+
+    def test_a_breaker_refusal_takes_the_ladder_not_the_quota_path(self):
+        """THE REGRESSION GUARD, at the decision itself. quota_exhausted=False
+        is what a shared-breaker refusal produces, and it must not be able to
+        reach 'stop' however long the reported window is."""
+        verdict, delay = card_move_retry_delay(1, False, 3600.0)
+        assert verdict == 'exponential'
+        assert delay == 5.0
+
+    def test_a_confirmed_quota_exhaustion_waits_for_the_window(self):
+        """The incident's own numbers: ~780s left, against a ladder that spent
+        all three attempts inside it."""
+        verdict, delay = card_move_retry_delay(1, True, 780.0)
+        assert verdict == 'quota_window'
         assert delay == pytest.approx(785.0)
 
     def test_the_wait_clears_the_reset_boundary(self):
-        """The breaker only half-opens once now >= reset_time; retrying on the
-        exact boundary loses that race often enough to matter."""
-        assert card_move_retry_delay(1, 100.0) > 100.0
+        _verdict, delay = card_move_retry_delay(1, True, 100.0)
+        assert delay > 100.0
 
-    def test_a_reset_further_out_than_the_cap_stops_retrying(self):
-        """None means stop now. Parking a lock-holding daemon thread for most
-        of an hour is its own failure mode — and the caller's exhausted path
-        now ends the run properly instead of leaving it open."""
-        assert card_move_retry_delay(1, CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS + 1) is None
+    def test_a_window_beyond_the_cap_stops(self):
+        assert card_move_retry_delay(
+            1, True, CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS + 1
+        ) == ('stop', None)
 
     def test_the_cap_boundary_itself_still_waits(self):
-        assert card_move_retry_delay(1, CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS) is not None
+        verdict, _delay = card_move_retry_delay(
+            1, True, CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS
+        )
+        assert verdict == 'quota_window'
 
     def test_an_already_elapsed_window_does_not_impose_a_quota_sized_wait(self):
-        """The window turned over; the next attempt can succeed immediately."""
-        assert card_move_retry_delay(1, 0.0) == 5.0
-        assert card_move_retry_delay(1, -30.0) == 5.0
+        assert card_move_retry_delay(1, True, 0.0) == ('exponential', 5.0)
+        assert card_move_retry_delay(1, True, -30.0) == ('exponential', 5.0)
 
     @pytest.mark.parametrize(
         "reset", [None, "780", float('nan'), True, False, object()]
     )
     def test_a_nonsensical_reset_degrades_to_exponential_not_a_raise(self, reset):
-        """This runs on a failure path — a raise here would replace a
-        recoverable card-move failure with a thread crash."""
-        assert card_move_retry_delay(1, reset) == 5.0
+        assert card_move_retry_delay(1, True, reset) == ('exponential', 5.0)
 
     def test_a_custom_base_delay_is_honoured(self):
-        assert card_move_retry_delay(2, None, base_delay=1.0) == 2.0
+        assert card_move_retry_delay(2, False, None, base_delay=1.0) == ('exponential', 2.0)
+
+    @pytest.mark.parametrize("quota", [True, False])
+    @pytest.mark.parametrize("reset", [None, -1.0, 0.0, 100.0, 100000.0])
+    def test_every_combination_yields_a_known_verdict(self, quota, reset):
+        verdict, delay = card_move_retry_delay(1, quota, reset)
+        assert verdict in {'exponential', 'quota_window', 'stop'}
+        assert (delay is None) == (verdict == 'stop')
 
 
 class TestMonitorBudgetBackoff:

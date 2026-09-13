@@ -81,6 +81,7 @@ services:
       # larger and steadier of the two board-count-proportional spenders. Below
       # this fraction the monitor pauses board polling so the quota is left for
       # pipeline-critical calls (card moves, reviewer context, PR operations).
+      # Work already in flight is unaffected; new work waits out the pause.
       # Lower than reconciliation's floor because this throttles a continuous
       # drip rather than gating an all-or-nothing burst.
       - MONITOR_MIN_GRAPHQL_BUDGET_FRACTION=${MONITOR_MIN_GRAPHQL_BUDGET_FRACTION:-0.10}

@@ -10,7 +10,7 @@ system outside every protection GitHubAPIClient provides:
   * the circuit breaker — so while the breaker was open on an exhausted GraphQL
     budget and correctly refusing every OTHER caller in the process, this path
     kept firing into the same exhausted quota;
-  * the adaptive throttle that backs off at 80/90/95% usage;
+  * the adaptive throttle (a warning at >80% usage, a real sleep at >90%);
   * the rate-limit accounting, so these calls were invisible to the budget the
     rest of the system reasons about;
   * and the error text, because `str(CalledProcessError)` drops stderr.
@@ -31,6 +31,11 @@ from unittest.mock import Mock, patch
 if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
+from services.github_api_client import (
+    BREAKER_OPEN_ERROR,
+    FAILURE_BREAKER_OPEN,
+    FAILURE_RATE_LIMITED,
+)
 from services.pipeline_progression import PipelineProgression
 
 
@@ -83,6 +88,16 @@ def wired(progression, board_state):
         cfg.get_project_config.return_value = project_config
         state.load_project_state.return_value = project_state
         yield progression
+
+
+def _move_with_reason(progression):
+    return progression.move_issue_to_column_with_reason(
+        project_name='codetoreum',
+        board_name='SDLC Execution',
+        issue_number=1045,
+        target_column='Testing',
+        trigger='review_cycle_completion',
+    )
 
 
 def _move(progression):
@@ -145,9 +160,7 @@ class TestTheMoveGoesThroughTheRateLimitedClient:
         assert any('rate limit' in e.lower() for e in errors)
         assert not any('returned non-zero exit status' in e for e in errors)
 
-    def test_a_rate_limited_move_says_so_rather_than_leaving_it_to_be_inferred(
-        self, wired
-    ):
+    def test_a_confirmed_quota_failure_says_so(self, wired):
         """The incident's cause had to be reconstructed from adjacent log lines
         hours later. It is now in the error itself."""
         client = Mock()
@@ -158,49 +171,68 @@ class TestTheMoveGoesThroughTheRateLimitedClient:
         ]
 
         with patch('services.github_api_client.get_github_client', return_value=client):
-            assert _move(wired) is False
+            moved, failure = _move_with_reason(wired)
 
-        errors = [
-            call.kwargs.get('error', '')
-            for call in wired.decision_events.emit_status_progression.call_args_list
-            if call.kwargs.get('success') is False
-        ]
-        assert any('quota exhaustion' in e for e in errors)
+        assert moved is False
+        assert failure.kind == FAILURE_RATE_LIMITED
+        assert failure.is_quota_exhaustion is True
+        assert "own quota as exhausted" in failure.reason
 
-    def test_a_rate_limited_mutation_stops_retrying_inside_the_window(self, wired):
-        """Three attempts against an exhausted quota is three guaranteed
-        rejections. The caller owns the decision to wait for the window — see
-        card_move_retry_delay()."""
+    def test_a_breaker_refusal_is_not_described_as_graphql_exhaustion(self, wired):
+        """THE REGRESSION GUARD.
+
+        One breaker gates the client's GraphQL, REST, HTTP and CLI paths, but
+        GitHub meters those as separate quotas — so a refusal is not evidence
+        that the GraphQL budget is gone. Saying it is, in the operator-facing
+        error, points an investigation at the wrong quota; and driving the
+        terminal retry path from it stopped boards over someone else's
+        exhaustion.
+        """
+        client = Mock()
+        client.graphql.return_value = (False, {"error": BREAKER_OPEN_ERROR})
+
+        with patch('services.github_api_client.get_github_client', return_value=client):
+            moved, failure = _move_with_reason(wired)
+
+        assert moved is False
+        assert failure.kind == FAILURE_BREAKER_OPEN
+        assert failure.is_quota_exhaustion is False, (
+            "a shared-breaker refusal must not drive the terminal quota path"
+        )
+        assert "not proof that the" in failure.reason
+
+    def test_the_mutation_is_attempted_once(self, wired):
+        """Three attempts here sat under _move_card_with_retry()'s three and
+        over graphql()'s own internal recursion — up to 36 executions of one
+        idempotent mutation, each re-running the adaptive throttle that sleeps
+        at >90% usage, on a daemon thread holding the board lock. The client
+        owns transient retries and the caller owns the rate-limit policy; this
+        layer owns neither."""
         client = Mock()
         client.graphql.side_effect = [
             (True, ITEM_RESPONSE),
             (True, ITEM_RESPONSE),
-            (False, {"error": "rate_limited", "details": "API rate limit exceeded"}),
+            (False, {"error": "server_error", "stderr": "HTTP 502"}),
         ]
 
         with patch('services.github_api_client.get_github_client', return_value=client):
-            _move(wired)
+            assert _move(wired) is False
 
-        # Exactly three: the two reads plus ONE mutation attempt.
+        # Two reads plus exactly ONE mutation attempt.
         assert client.graphql.call_count == 3
 
-    def test_an_ordinary_mutation_failure_still_retries(self, wired):
-        """Control: the rate-limit short-circuit must not disable retries for a
-        genuine transient blip."""
+    def test_the_boolean_wrapper_still_answers_plainly(self, wired):
+        """Nine call sites want only the bool; the split must not change what
+        they see."""
         client = Mock()
         client.graphql.side_effect = [
             (True, ITEM_RESPONSE),
             (True, ITEM_RESPONSE),
-            (False, {"error": "server_error", "stderr": "HTTP 502"}),
-            (False, {"error": "server_error", "stderr": "HTTP 502"}),
             (True, {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "x"}}}),
         ]
 
-        with patch('services.github_api_client.get_github_client', return_value=client), \
-             patch('services.pipeline_progression.time.sleep'):
+        with patch('services.github_api_client.get_github_client', return_value=client):
             assert _move(wired) is True
-
-        assert client.graphql.call_count == 5
 
     def test_a_missing_project_item_is_still_reported_as_such(self, wired):
         """The pre-existing "issue is not on this board" diagnosis must survive

@@ -3248,7 +3248,7 @@ class ProjectWorkspaceManager:
         self,
         project_staging: Path,
         running_mount_sources: set,
-        active_run_workspaces: Optional[Dict[str, Set[str]]] = None,
+        active_run_workspaces: Optional['ActiveRunWorkspaces'] = None,
     ) -> None:
         """One project's half of prune_epic_worktrees()'s sweep, run with that
         project's project_checkout lock HELD.
@@ -3268,14 +3268,9 @@ class ProjectWorkspaceManager:
         active-run skip rule below.
         """
         repo_path = self.workspace_root / project_staging.name
-        active_run_workspaces = active_run_workspaces or {}
-        active_epic_ids = active_run_workspaces.get(project_staging.name, set())
-        # Normalised HERE as well as where the set is built: this rule's whole
-        # job is to not delete a live workspace, and a trailing slash is not a
-        # reason to delete one.
-        active_paths = {
-            str(path).rstrip('/') for path in active_run_workspaces.get('*paths*', set())
-        }
+        if active_run_workspaces is None:
+            from services.pipeline_run import ActiveRunWorkspaces
+            active_run_workspaces = ActiveRunWorkspaces.unknown()
         try:
             worktree_paths = list(project_staging.iterdir())
         except OSError as e:
@@ -3299,13 +3294,10 @@ class ProjectWorkspaceManager:
             # hard failure whose error ("no git changes found") named neither
             # the directory nor the prune.
             #
-            # Matched on BOTH the epic id (the directory's own name) and the
-            # run's recorded project_dir: the id is robust to path formatting,
-            # the path is robust to a layout change. Either is enough to skip.
-            if (
-                worktree_path.name in active_epic_ids
-                or str(worktree_path).rstrip('/') in active_paths
-            ):
+            # Matching is ActiveRunWorkspaces.protects()'s job -- it owns both
+            # the epic-id and recorded-path forms and the normalisation they
+            # need, so this sweep cannot get half of it right.
+            if active_run_workspaces.protects(project_staging.name, worktree_path):
                 logger.info(
                     f"Skipping prune of {worktree_path} -- it is the resolved "
                     f"workspace of a pipeline run that is still active, which "
@@ -3699,17 +3691,35 @@ class ProjectWorkspaceManager:
             # the run record is the only thing that still knows a mid-pipeline
             # worktree matters after a restart.
             try:
-                from services.pipeline_run import get_pipeline_run_manager
+                from services.pipeline_run import (
+                    ActiveRunWorkspaces,
+                    get_pipeline_run_manager,
+                )
                 active_run_workspaces = get_pipeline_run_manager().get_active_run_workspaces()
             except Exception as e:
-                # Unknown, not empty -- but this sweep is best-effort and runs
-                # unguarded at startup, so it degrades to the pre-existing four
-                # rules rather than refusing to prune anything.
-                logger.warning(
+                from services.pipeline_run import ActiveRunWorkspaces
+                logger.error(
                     f"Could not determine which epic worktrees belong to active "
-                    f"pipeline runs; pruning without that protection: {e}"
+                    f"pipeline runs: {e}"
                 )
-                active_run_workspaces = {}
+                active_run_workspaces = ActiveRunWorkspaces.unknown()
+
+            # ABORT rather than prune blind. An incomplete answer is not an
+            # empty one: an unreadable Redis during a restart -- the very
+            # moment this sweep runs -- would otherwise read as "no run owns
+            # any of these worktrees" and delete a live workspace, which is the
+            # incident this rule exists to prevent, with the protection
+            # silently absent. Leaving worktrees on disk costs one sweep; they
+            # are adopted by get_or_create_epic_worktree() or picked up by the
+            # next startup. Deleting a live one costs the run.
+            if not active_run_workspaces.complete:
+                logger.error(
+                    "Skipping the epic-worktree prune entirely: the active-run "
+                    "lookup was incomplete, so a worktree's absence from it is "
+                    "not proof that no pipeline run owns it. Stale worktrees "
+                    "stay on disk until a later sweep can answer properly."
+                )
+                return
 
             # WAITING time only, not elapsed time -- see the docstring. Deliberately
             # not a `sweep_deadline = now + BUDGET` computed once: that charges the

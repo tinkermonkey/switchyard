@@ -157,29 +157,69 @@ class TestFailureIsRaisedNotReturnedAsEmpty:
 
 class TestSubIssueQueryErrorType:
     def test_it_is_catchable_as_a_runtime_error(self):
-        """Every caller sits inside a broad `except Exception` already; the new
-        type must not slip past those while the explicit handlers are added."""
+        """Every caller sits inside a broad `except Exception` already, and each
+        of those already defaults to the conservative branch (skip, or
+        all_complete=False). So the cost of a caller FORGETTING the specific
+        handler is a mislabelled log line, not a wrong decision — which is what
+        makes raising safe here, and is the property a sentinel or result type
+        would not have given us (`if not result.items` is the natural thing to
+        write, and Python offers no exhaustiveness check to stop it)."""
         assert issubclass(SubIssueQueryError, RuntimeError)
 
 
 class TestPrReadyDoesNotActOnAnUnansweredQuestion:
-    """The end-to-end consequence, at the one call site that acts irreversibly."""
+    """The irreversible call site: finalize_feature_branch_work() reads
+    `len(actual_sub_issues) == 0` as "standalone work" and marks the feature PR
+    ready for review.
 
-    @pytest.mark.asyncio
-    async def test_a_failed_sub_issue_query_leaves_the_pr_a_draft(self, manager):
-        """finalize_feature_branch_work() reads len(sub_issues) == 0 as 'standalone work'
-        and marks the PR ready. With the query failing, it must do neither."""
-        github = Mock()
-        github.github_org = "test-org"
-        github.repo_name = "test-repo"
-        github.get_issue = AsyncMock(
-            return_value={"error": "GitHub API rate limit exceeded - circuit breaker open"}
+    STRUCTURAL, and deliberately labelled as such. Driving that method end to
+    end needs the project_checkout lock, a real git commit, a push and PR
+    creation — a stub surface large enough that the test would mostly assert
+    its own mocks. What these pin instead is the property that actually
+    regressed: that the specific handler EXISTS, sits ahead of the pre-existing
+    broad `except Exception` (behind it, it would be dead code), and cannot
+    reach the mark-ready branch.
+
+    The previous version of this class claimed to be end-to-end and was
+    vacuous: it called _get_sub_issues_from_parent() directly inside
+    pytest.raises and then asserted mark_pr_ready.assert_not_called() on a Mock
+    nothing could ever have reached. It passed by construction, and would have
+    kept passing with the handler deleted.
+    """
+
+    @pytest.fixture
+    def finalize_source(self):
+        import inspect
+        return inspect.getsource(FeatureBranchManager.finalize_feature_branch_work)
+
+    def test_the_specific_handler_exists(self, finalize_source):
+        assert 'except SubIssueQueryError' in finalize_source
+
+    def test_it_precedes_the_broad_handler(self, finalize_source):
+        """Behind `except Exception` it would never run — the specific handling
+        would be dead code while looking entirely correct."""
+        specific = finalize_source.index('except SubIssueQueryError')
+        broad = finalize_source.index('except Exception as e:\n            logger.error(f"Failed to check sub-issue completion')
+        assert specific < broad
+
+    def test_the_handler_leaves_the_pr_a_draft(self, finalize_source):
+        """all_complete=False is what keeps the mark-ready branch unreachable."""
+        import re
+        handler = re.search(
+            r'except SubIssueQueryError as e:(.*?)except Exception as e:',
+            finalize_source,
+            re.DOTALL,
         )
-        github.mark_pr_ready = AsyncMock(return_value=True)
+        assert handler, "expected a SubIssueQueryError handler"
+        body = handler.group(1)
+        assert re.search(r'all_complete\s*=\s*False', body)
+        assert 'mark_pr_ready' not in body
 
-        with pytest.raises(SubIssueQueryError):
-            await manager._get_sub_issues_from_parent(
-                github, await github.get_issue(1016)
-            )
+    def test_the_mark_ready_branch_is_gated_on_a_real_answer(self, finalize_source):
+        """mark_pr_ready() must sit behind the len()==0-or-all_complete gate, so
+        that a raised query cannot reach it by any path."""
+        gate = finalize_source.index('if len(actual_sub_issues) == 0 or all_complete:')
+        mark_ready = finalize_source.index('mark_pr_ready(')
+        assert gate < mark_ready
 
-        github.mark_pr_ready.assert_not_called()
+

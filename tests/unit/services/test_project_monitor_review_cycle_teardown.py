@@ -77,29 +77,29 @@ class TestClassifyReviewCycleThreadException:
 class TestReviewCycleThreadTeardown:
     def test_contention_is_its_own_verdict_not_a_crash(self):
         assert review_cycle_thread_teardown(
-            is_exit_column=False, exception_occurred=False, lock_contention_occurred=True
+            is_exit_column=False, exception_occurred=False, lock_contention_occurred=True, card_move_failed=False
         ) == 'contention'
 
     def test_a_crash_still_wins(self):
         assert review_cycle_thread_teardown(
-            is_exit_column=False, exception_occurred=True, lock_contention_occurred=False
+            is_exit_column=False, exception_occurred=True, lock_contention_occurred=False, card_move_failed=False
         ) == 'crash'
 
     def test_an_exit_column_releases_and_dispatches_regardless(self):
         assert review_cycle_thread_teardown(
-            is_exit_column=True, exception_occurred=True, lock_contention_occurred=True
+            is_exit_column=True, exception_occurred=True, lock_contention_occurred=True, card_move_failed=False
         ) == 'exit'
 
     def test_a_clean_intermediate_run_keeps_the_lock_for_the_next_stage(self):
         assert review_cycle_thread_teardown(
-            is_exit_column=False, exception_occurred=False, lock_contention_occurred=False
+            is_exit_column=False, exception_occurred=False, lock_contention_occurred=False, card_move_failed=False
         ) == 'keep'
 
     def test_contention_is_not_keep(self):
         """The regression that leaves the queue entry stuck at 'active' forever:
         'keep' does no reset, and nothing else ever does one."""
         assert review_cycle_thread_teardown(
-            is_exit_column=False, exception_occurred=False, lock_contention_occurred=True
+            is_exit_column=False, exception_occurred=False, lock_contention_occurred=True, card_move_failed=False
         ) != 'keep'
 
     @pytest.mark.parametrize("exception_occurred", [True, False])
@@ -112,6 +112,7 @@ class TestReviewCycleThreadTeardown:
             is_exit_column=is_exit_column,
             exception_occurred=exception_occurred,
             lock_contention_occurred=lock_contention_occurred,
+            card_move_failed=False,
         ) in {'exit', 'crash', 'contention', 'keep'}
 
     # --- card_move_failed (pipeline run 4cf816cf) ---
@@ -140,12 +141,18 @@ class TestReviewCycleThreadTeardown:
             card_move_failed=False,
         ) == 'keep'
 
-    def test_card_move_failed_defaults_to_false_for_existing_callers(self):
-        """The parameter is additive: every pre-existing 3-argument call keeps
-        its exact previous verdict."""
-        assert review_cycle_thread_teardown(
-            is_exit_column=False, exception_occurred=False, lock_contention_occurred=False
-        ) == 'keep'
+    def test_the_flag_is_required_not_defaulted(self):
+        """No default, deliberately. There is exactly one production caller and
+        it passes the argument explicitly, so a default would serve only the
+        tests — while silently mis-answering a SECOND production caller. The
+        wrong answer there is 'keep': lock retained, run not marked failed,
+        nothing running. That is the original bug, restored by omission."""
+        with pytest.raises(TypeError):
+            review_cycle_thread_teardown(
+                is_exit_column=False,
+                exception_occurred=False,
+                lock_contention_occurred=False,
+            )
 
     def test_an_exit_column_still_wins_over_a_failed_card_move(self):
         assert review_cycle_thread_teardown(

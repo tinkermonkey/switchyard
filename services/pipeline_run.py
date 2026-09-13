@@ -129,6 +129,57 @@ class PipelineRun:
         return self.status in ("active", "feedback_listening") and self.ended_at is None
 
 
+@dataclass(frozen=True)
+class ActiveRunWorkspaces:
+    """The epic worktrees that belong to a pipeline run still in flight.
+
+    A value rather than a bare dict because the consumer
+    (ProjectWorkspaceManager._prune_project_staging) DELETES DIRECTORIES on
+    this answer, and a dict could not express the two things that decision
+    depends on:
+
+      * `complete` -- whether the answer is the whole answer. An earlier
+        revision returned `{}` for both "no runs are active" and "Redis could
+        not be read", which is the unknown-as-empty defect this change set
+        exists to remove, applied to a destructive operation. The prune skips
+        entirely when this is False: leaving worktrees on disk costs one sweep,
+        deleting a live one costs the run.
+      * that epic ids and paths are DIFFERENT KINDS of key. Packing the paths
+        into the same map under a reserved `'*paths*'` key (the shape this
+        replaces) made a project of that name silently overwrite its own
+        protection, and forced the consumer to re-do the normalisation done
+        here.
+
+    `paths` are normalised at construction so no consumer has to remember to.
+    """
+
+    epic_ids_by_project: Dict[str, Set[str]]
+    paths: Set[str]
+    complete: bool = True
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, 'paths', {str(p).rstrip('/') for p in self.paths}
+        )
+
+    @classmethod
+    def unknown(cls) -> 'ActiveRunWorkspaces':
+        """No usable answer. Callers must not read this as "nothing is active"."""
+        return cls(epic_ids_by_project={}, paths=set(), complete=False)
+
+    def protects(self, project: str, worktree_path) -> bool:
+        """Whether this worktree belongs to a run still in flight.
+
+        Matches on BOTH the epic id (the directory's own name, robust to path
+        formatting) and the run's recorded project_dir (robust to a layout
+        change). Either is enough.
+        """
+        if str(worktree_path).rstrip('/') in self.paths:
+            return True
+        name = getattr(worktree_path, 'name', None) or str(worktree_path).rstrip('/').rsplit('/', 1)[-1]
+        return name in self.epic_ids_by_project.get(project, set())
+
+
 class PipelineRunManager:
     """
     Manages pipeline run lifecycle with dual storage:
@@ -1042,24 +1093,19 @@ class PipelineRunManager:
 
         return None
     
-    def get_active_run_workspaces(self) -> Dict[str, Set[str]]:
+    def get_active_run_workspaces(self) -> 'ActiveRunWorkspaces':
         """Which epic worktrees currently belong to an ACTIVE pipeline run.
 
-        Returns {project_name: {epic_id, ...}} plus the same runs' resolved
-        project_dir paths under the reserved key '*paths*', so a caller can
-        match either way. Empty on any failure.
-
         Why this exists (pipeline run 4cf816cf)
-        ------------------------------------------
+        ---------------------------------------
         Startup prunes stale epic worktrees and then, a few seconds later,
         recovers pipeline locks and RE-TRIGGERS their holders. In the observed
         incident those two steps disagreed: the prune removed
         `worktrees/codetoreum/1016` at 16:00:47, and lock recovery re-triggered
         issue #1045 -- whose run's project_dir was exactly that directory -- at
-        16:00:51. The review cycle then failed four seconds later on a
-        directory that no longer existed, and reported it as "no git changes
-        found", because the git helpers swallow a missing cwd into an empty
-        string.
+        16:00:51. The review cycle then failed on a directory that no longer
+        existed, and reported it as "no git changes found", because the git
+        helpers swallow a missing cwd into an empty string.
 
         The prune already knows how to protect a worktree that is tracked
         in-process or bind-mounted into a live container. Neither covers this
@@ -1068,17 +1114,21 @@ class PipelineRunManager:
         thing that still knows the directory matters, which is why the answer
         has to come from here.
 
-        Deliberately permissive. A run whose ES doc still reads 'active' but
-        whose work is really dead costs one worktree left on disk until the
-        next sweep -- get_or_create_epic_worktree() adopts it, and
-        cleanup_stale_active_runs_on_startup() ends the run later in the same
-        startup. Deleting a live run's workspace costs the run.
+        COMPLETENESS IS PART OF THE ANSWER. An earlier revision returned a bare
+        dict and `{}` on any failure -- which is also what a healthy system with
+        no active runs returns. The caller deletes directories on that answer,
+        so an unreadable Redis during a restart (the very moment the prune runs)
+        read as "no run owns any of these worktrees" and the incident
+        reproduced, protection silently absent. That is the same unknown-as-
+        empty defect this change set removes from _get_sub_issues_from_parent();
+        `complete` is what keeps it from being reintroduced two files away.
 
         Never raises: it runs inside a best-effort startup sweep that must not
         be able to fail the boot.
         """
-        workspaces: Dict[str, Set[str]] = {}
+        epic_ids_by_project: Dict[str, Set[str]] = {}
         paths: Set[str] = set()
+        complete = True
 
         def _record(run_data: Dict[str, Any]) -> None:
             project = run_data.get('project')
@@ -1086,25 +1136,40 @@ class PipelineRunManager:
                 return
             epic_id = run_data.get('epic_id')
             if epic_id:
-                workspaces.setdefault(project, set()).add(str(epic_id))
+                epic_ids_by_project.setdefault(project, set()).add(str(epic_id))
             project_dir = run_data.get('project_dir')
             if project_dir:
                 paths.add(str(project_dir).rstrip('/'))
 
-        # Redis first: it is the source of truth for active runs, and it is a
-        # separate always-on service, so it is readable at the point in startup
-        # the prune calls this -- well before lock recovery runs.
+        # Redis first: it is the source of truth for active runs, and unlike
+        # lock state it needs no startup sync to have run before it is
+        # readable, so it is usable at the point in startup the prune calls it.
         try:
             mapping = self.redis.hgetall(self.redis_issue_mapping) or {}
-            for pipeline_run_id in mapping.values():
+        except Exception as e:
+            logger.error(f"Could not list active pipeline runs from Redis: {e}")
+            mapping = {}
+            complete = False
+
+        for pipeline_run_id in mapping.values():
+            # PER RUN, not around the whole loop. With the try outside, one
+            # unparseable blob -- a truncated value, or a run written by an
+            # older schema that PipelineRun.from_dict() rejects -- aborted the
+            # scan, and every run AFTER it silently lost its protection while
+            # the result was returned as though complete.
+            try:
                 raw = self.redis.get(self._get_redis_key(pipeline_run_id))
                 if not raw:
                     continue
                 run_data = json.loads(raw)
                 if PipelineRun.from_dict(run_data).is_active():
                     _record(run_data)
-        except Exception as e:
-            logger.warning(f"Could not read active pipeline runs from Redis: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"Skipping unreadable pipeline run {pipeline_run_id} while "
+                    f"collecting active workspaces: {e}"
+                )
+                complete = False
 
         # Elasticsearch as well, not instead: a run whose Redis blob expired is
         # exactly the long-running, mid-pipeline case whose worktree most needs
@@ -1125,11 +1190,18 @@ class PipelineRunManager:
                     if not source.get('ended_at'):
                         _record(source)
             except Exception as e:
-                logger.warning(f"Could not read active pipeline runs from Elasticsearch: {e}")
+                logger.error(f"Could not read active pipeline runs from Elasticsearch: {e}")
+                complete = False
+        else:
+            # No ES client at all: the runs that live only there are invisible,
+            # which is exactly the population this protects best.
+            complete = False
 
-        if paths:
-            workspaces['*paths*'] = paths
-        return workspaces
+        return ActiveRunWorkspaces(
+            epic_ids_by_project=epic_ids_by_project,
+            paths=paths,
+            complete=complete,
+        )
 
     def get_or_create_pipeline_run(
         self,

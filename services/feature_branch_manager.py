@@ -834,10 +834,23 @@ class FeatureBranchManager:
         error) is simply omitted from the returned dict rather than raising
         - every other parent, in that chunk and every other chunk, is still
         returned. A parent in a chunk that fails entirely (rate limit,
-        timeout, transport error) is likewise omitted. Callers should treat
-        a missing key the same way they already tolerate
-        _get_sub_issues_from_parent() returning an empty list, e.g. via
-        `.get(parent_number, [])`.
+        timeout, transport error) is likewise omitted.
+
+        A MISSING KEY MEANS "COULD NOT ANSWER", NOT "NO SUB-ISSUES", and the
+        difference is not academic: reading it the second way is exactly the
+        defect that marked PR #1051 ready for review with one of five phases on
+        the branch (pipeline run 4cf816cf). This docstring used to instruct
+        callers to do `.get(parent_number, [])` by analogy with
+        _get_sub_issues_from_parent()'s old behaviour; that analogy is dead --
+        the single-parent method now RAISES SubIssueQueryError rather than
+        returning [] for a failure.
+
+        Until this method is given the same treatment (return the failed
+        parents alongside the results, or raise), a caller that acts on the
+        answer -- rather than merely skipping -- must compare the returned keys
+        against the parents it asked for and treat the difference as unknown.
+        There are no production callers today; that is the only reason this is
+        documented rather than fixed.
 
         Args:
             github_integration: GitHubIntegration instance (single-repo
@@ -899,9 +912,14 @@ class FeatureBranchManager:
                     # Total failure for this chunk (rate limit, timeout,
                     # transport error, JSON parse error, etc.) with no
                     # per-alias data to salvage - every parent in this chunk is
-                    # simply omitted from the result, matching
-                    # _get_sub_issues_from_parent()'s failure mode of returning
-                    # [] on total failure.
+                    # simply omitted from the result.
+                    #
+                    # This NO LONGER matches _get_sub_issues_from_parent(),
+                    # which now raises SubIssueQueryError rather than returning
+                    # [] for a failure (pipeline run 4cf816cf). Omission here is
+                    # still "unknown", and a caller doing `.get(parent, [])`
+                    # would re-create the exact bug that raise was added to
+                    # prevent. See this method's Returns section.
                     message = response.get('error', str(response)) if isinstance(response, dict) else str(response)
                     logger.error(
                         f"Batched sub-issues GraphQL query failed for parents {chunk} "
@@ -928,10 +946,13 @@ class FeatureBranchManager:
                 results.update(chunk_results)
 
         except Exception as e:
-            # Matches _get_sub_issues_from_parent()'s own guarantee that this
-            # never raises out to its caller (e.g. a malformed
-            # github_integration missing github_org/repo_name) - degrade to
-            # whatever chunks already succeeded rather than crashing.
+            # This method still never raises out to its caller (e.g. a
+            # malformed github_integration missing github_org/repo_name) -
+            # degrade to whatever chunks already succeeded rather than
+            # crashing. NOTE that _get_sub_issues_from_parent() no longer makes
+            # that guarantee: it raises SubIssueQueryError for a failed query,
+            # deliberately. The two now differ, and a caller must read a
+            # missing key here as UNKNOWN rather than as "no sub-issues".
             logger.error(f"Unexpected error in batched sub-issues fetch for parents {deduped_numbers}: {e}")
 
         return results

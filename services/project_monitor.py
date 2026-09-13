@@ -51,23 +51,25 @@ CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS = 900.0
 
 # Fraction of the GraphQL budget the poll loop leaves for everything else.
 #
-# Board polling is this system's largest and least urgent GraphQL consumer:
-# ~2,000-2,400 board syncs an hour across ~30 boards, against a 5,000-point
-# hourly budget, most of them reporting no change. Pipeline-critical calls --
+# Board polling is this system's largest and least urgent GraphQL consumer. On
+# the deployment this was measured on it issued board syncs at several times
+# the hourly GraphQL budget's worth of requests, most of them reporting no
+# change -- the ratio is what matters, and it grows with the board count while
+# the budget does not. Pipeline-critical calls --
 # moving a card, building a reviewer's context, opening a PR -- are rare,
 # unbatchable, and arrive when they arrive. Spending the last of the quota on
 # polling and then failing a card move (pipeline run 4cf816cf) is the wrong
 # trade in every instance: the poll it funded would have found the same board
-# state 30 seconds later for free, while the card move it starved stopped a
+# state on the next tick for free, while the card move it starved stopped a
 # board until a human intervened.
 #
 # 0.10, not github_project_manager's 0.25, because these two guards protect
 # against different things. Reconciliation is a burst that must either run
 # whole or not at all, so it reserves a burst's worth. This one throttles a
 # continuous background drip, and a floor that high would silence the monitor
-# for a large part of every hour. 10% of 5,000 is ~500 points held back, which
-# is far more than a stage transition needs and small enough that the loop
-# still polls normally in the ordinary case.
+# for a large part of every hour. A tenth of the hourly budget is far more than
+# a stage transition needs and small enough that the loop still polls normally
+# in the ordinary case.
 #
 # Env-tunable, matching RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION, because the
 # right reserve scales with how many boards a deployment polls.
@@ -760,35 +762,53 @@ def monitor_budget_backoff_seconds(
 
 def card_move_retry_delay(
     attempt: int,
+    quota_exhausted: bool,
     rate_limit_reset_seconds: Optional[float],
     base_delay: float = 5.0,
     max_rate_limit_wait: float = CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS,
-) -> Optional[float]:
-    """How long _move_card_with_retry() should wait before its next attempt,
-    or None when waiting cannot help and it should stop retrying now.
+) -> Tuple[str, Optional[float]]:
+    """How _move_card_with_retry() should wait before its next attempt.
 
-    Two regimes, because the two failures are nothing alike:
+    Returns (verdict, seconds), matching this module's house style for
+    extracted decisions -- compare review_cycle_thread_teardown() and
+    classify_review_cycle_thread_exception(), which also return a named verdict
+    rather than an overloaded value:
 
-    - No rate limit in play (rate_limit_reset_seconds is None or already
-      elapsed): plain exponential backoff off `base_delay` -- 5s, 10s, 20s.
-      This is the pre-existing behaviour and it is right for a transient
-      GitHub blip.
+      ('exponential', seconds)   ordinary transient failure: 5s, then 10s.
+                                 (base_delay * 2**(attempt-1); the only
+                                 production caller stops at max_retries=3, so
+                                 the third rung is never reached in practice.)
+      ('quota_window', seconds)  GitHub says this call's quota is gone and the
+                                 window turns over soon enough to wait for.
+      ('stop', None)             waiting cannot help within this path's budget;
+                                 stop retrying now.
 
-    - The GraphQL quota is exhausted: back off to the QUOTA WINDOW, not to a
-      few seconds. This is the confirmed production failure (pipeline run
-      4cf816cf). A review cycle approved issue #1045, the card move to
-      "Testing" failed three times in 16 seconds -- 5s and 10s apart -- and
-      every one of those attempts landed inside the same rate-limit window,
-      which still had ~13 minutes left to run. The retries could not have
-      succeeded. The board's lock was then durably retained and the pipeline
-      stopped until a human intervened, for a condition that would have
-      cleared on its own.
+    The verdict is returned rather than left for the caller to infer because
+    the caller demonstrably got that wrong: it branched its operator-facing log
+    on `if reset_seconds:`, which disagrees with this function for any negative
+    value, so the log could claim "waiting for the quota window" while actually
+    applying a 5-second exponential backoff -- a lie in the record, on the one
+    failure path this change set exists to make readable.
 
-    Returns None (stop now) when the reset is further out than
-    max_rate_limit_wait: parking a lock-holding daemon thread for most of an
-    hour is its own failure mode, and the caller's exhausted-retries path now
-    ends the run properly rather than leaving it open (see
-    review_cycle_thread_teardown's card_move_failed).
+    quota_exhausted must come from the FAILED CALL's own classification
+    (CardMoveFailure.is_quota_exhaustion), NOT from breaker state read
+    afterwards. Two reasons, both load-bearing:
+
+      * The breaker is shared across the client's GraphQL, REST, HTTP and CLI
+        paths, which GitHub meters as SEPARATE quotas. A breaker refusal is
+        therefore not evidence that this call's budget is gone, and treating it
+        as such let a REST exhaustion stop a board whose GraphQL budget was
+        entirely healthy.
+      * GitHub reports a primary GraphQL rate limit as a body-level RATE_LIMIT
+        in the response's `errors` array, which does NOT trip the breaker at
+        all -- so a caller inspecting the breaker afterwards sees a closed
+        breaker and retries straight back into the window, which is exactly the
+        behaviour this function exists to replace.
+
+    The incident (pipeline run 4cf816cf): a review cycle approved issue #1045,
+    the card move to "Testing" failed three times in 16 seconds -- 5s and 10s
+    apart -- and every attempt landed inside the same rate-limit window, which
+    still had ~13 minutes left to run.
 
     Pure and total: `attempt` is 1-based, and a nonsensical
     rate_limit_reset_seconds (negative, NaN, non-numeric) degrades to the
@@ -798,46 +818,81 @@ def card_move_retry_delay(
     """
     exponential = base_delay * (2 ** max(0, attempt - 1))
 
+    # Not a confirmed quota problem -- including a shared-breaker refusal,
+    # which may be another bucket's fault entirely. Retry it like any other
+    # transient failure rather than treating it as terminal.
+    if not quota_exhausted:
+        return 'exponential', exponential
+
     if not isinstance(rate_limit_reset_seconds, (int, float)):
-        return exponential
+        return 'exponential', exponential
     if isinstance(rate_limit_reset_seconds, bool):  # bool is an int subclass
-        return exponential
+        return 'exponential', exponential
     if rate_limit_reset_seconds != rate_limit_reset_seconds:  # NaN
-        return exponential
+        return 'exponential', exponential
     if rate_limit_reset_seconds <= 0:
         # The window has already turned over; the next attempt can succeed
         # immediately, so don't impose a quota-sized wait on it.
-        return exponential
+        return 'exponential', exponential
     if rate_limit_reset_seconds > max_rate_limit_wait:
-        return None
+        return 'stop', None
 
     # A small buffer past the reset: the breaker only moves to HALF_OPEN once
     # `now >= reset_time`, and retrying on the exact boundary loses the race
     # often enough to matter.
-    return rate_limit_reset_seconds + 5.0
-
+    return 'quota_window', rate_limit_reset_seconds + 5.0
 
 def github_rate_limit_reset_seconds() -> Optional[float]:
-    """Seconds until the shared GitHub breaker's rate-limit window resets, or
-    None when no rate limit is in force (or the answer is unavailable).
+    """Seconds until the GraphQL quota window turns over, or None when that is
+    unknown.
 
-    Reads the breaker rather than a bucket because the breaker's reset_time is
-    set from GitHub's own x-ratelimit-reset header at the moment the limit was
-    hit -- it is the authoritative "when can this possibly work again".
+    Two sources, in order, because neither alone covers the cases that matter:
+
+      1. The breaker's reset_time, when the breaker is actually open. This is
+         set from GitHub's own x-ratelimit-reset header at the moment the limit
+         was hit -- WHEN one was supplied. GitHubBreaker.trip() falls back to
+         `now + 1 hour` otherwise, and two of its three call sites pass no
+         reset at all, so a breaker reading can be a 3600s guess rather than a
+         measurement. That guess always exceeds
+         CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS, which turns "back off to the
+         quota window" into "give up immediately" -- the opposite of what the
+         caller intends.
+      2. The GraphQL bucket's own reset, which is refreshed from response
+         headers on every call INCLUDING failed ones (graphql() parses the
+         --include headers before it inspects the return code). This is the
+         only source that exists for GitHub's primary GraphQL rate limit,
+         which arrives as a body-level RATE_LIMIT in the response's `errors`
+         array and never trips the breaker at all.
+
+    A bucket reading is preferred over a breaker reading that has no header
+    behind it, since a real measurement beats a one-hour default.
+
+    None means UNKNOWN, not zero -- callers treat it as "no usable window" and
+    fall back to exponential backoff rather than waiting on a made-up number.
 
     Never raises. Every caller is already on a failure path, and a monitoring
     read must not be able to turn a card-move failure into a crash.
     """
     try:
         from services.github_api_client import get_github_client
-        breaker = get_github_client().breaker
-        if not (breaker.is_open() or breaker.is_half_open()):
-            return None
-        if not breaker.reset_time:
-            return None
-        return max(0.0, (breaker.reset_time - datetime.now()).total_seconds())
+        client = get_github_client()
+
+        bucket_seconds = client.graphql_seconds_until_reset()
+
+        breaker = client.breaker
+        if (breaker.is_open() or breaker.is_half_open()) and breaker.reset_time:
+            breaker_seconds = max(
+                0.0, (breaker.reset_time - datetime.now()).total_seconds()
+            )
+            # Prefer the bucket when the breaker's figure looks like trip()'s
+            # hour-long default rather than a header-derived reset.
+            if bucket_seconds is not None and breaker_seconds > bucket_seconds:
+                return bucket_seconds
+            return breaker_seconds
+
+        return bucket_seconds
     except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"Could not read the GitHub rate-limit reset time: {e}")
+        logger.warning(f"Could not read the GitHub rate-limit reset time: {e}")
         return None
 
 
@@ -845,7 +900,7 @@ def review_cycle_thread_teardown(
     is_exit_column: bool,
     exception_occurred: bool,
     lock_contention_occurred: bool,
-    card_move_failed: bool = False,
+    card_move_failed: bool,
 ) -> str:
     """
     Which teardown the review-cycle thread owes on its way out: 'exit' (release
@@ -876,6 +931,12 @@ def review_cycle_thread_teardown(
     card-move failure as the crash it is ends the run where it really stopped,
     posts the failure comment, and leaves the lock durably retained — which is
     what the CRITICAL log line already claimed was happening.
+
+    No default on card_move_failed, deliberately. There is exactly one
+    production caller and it passes the argument explicitly, so a default would
+    serve only the tests -- while silently mis-answering the SECOND production
+    caller, whose wrong answer is 'keep': lock retained, run not marked failed,
+    nothing running. That is the original bug, restored by omission.
 
     Ordering: card_move_failed is checked with exception_occurred, not after
     'contention'. They are the same verdict, and a thread cannot reach the card
@@ -5416,8 +5477,10 @@ class ProjectMonitor:
             except SubIssueQueryError as e:
                 logger.warning(
                     f"Could not query sub-issues for parent #{parent_issue_number}, "
-                    f"skipping this PR ready check (the periodic orphaned-parent sweep "
-                    f"will retry): {e}"
+                    f"skipping this PR ready check: {e}. NOTE that nothing re-runs "
+                    f"the PR-ready decision on its own -- the orphaned-parent sweep "
+                    f"only re-advances the parent card -- so the PR stays a draft "
+                    f"until another sub-issue exits the pipeline."
                 )
                 return
 
@@ -6286,6 +6349,48 @@ class ProjectMonitor:
             logger.error(traceback.format_exc())
             return None
 
+    # Longest _sleep_interruptibly() goes without re-checking for cancellation.
+    # Small enough that a stop is honoured promptly, large enough that a
+    # quarter-hour wait is not thousands of Redis reads.
+    _CANCELLATION_POLL_SECONDS = 5.0
+
+    def _sleep_interruptibly(
+        self, seconds: float, project_name: str, issue_number: int
+    ) -> None:
+        """Sleep, but notice a cancellation while doing it.
+
+        _move_card_with_retry()'s docstring promises CancellationError is
+        honoured "immediately", and a single time.sleep() of up to
+        CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS (900s) made that false by a
+        quarter of an hour — on a daemon thread holding the board's pipeline
+        lock, where "stop this issue" is exactly the instruction an operator
+        gives when a board is visibly stuck.
+
+        Raises CancellationError if one is signalled during the wait, which the
+        caller already re-raises unchanged per the cancellation contract.
+        """
+        from services.cancellation import CancellationError, get_cancellation_signal
+
+        remaining = float(seconds)
+        while remaining > 0:
+            slice_seconds = min(self._CANCELLATION_POLL_SECONDS, remaining)
+            time.sleep(slice_seconds)
+            remaining -= slice_seconds
+            try:
+                cancelled = get_cancellation_signal().is_cancelled(
+                    project_name, issue_number
+                )
+            except Exception as e:
+                # A cancellation-store read failure must not turn a recoverable
+                # card-move wait into a crash; keep waiting and say so once.
+                logger.debug(f"Could not check the cancellation signal: {e}")
+                continue
+            if cancelled:
+                raise CancellationError(
+                    f"Card move wait for issue #{issue_number} cancelled after "
+                    f"{seconds - remaining:.0f}s of a {seconds:.0f}s backoff"
+                )
+
     def _move_card_with_retry(
         self,
         project_name: str,
@@ -6300,15 +6405,17 @@ class ProjectMonitor:
         pipeline_run,
         loop,
         max_retries: int = 3,
-    ):
+    ) -> bool:
         """Move a card to the next column with retries and error surfacing.
 
         Retries the move up to max_retries times, backing off to the GitHub
-        quota window when the failure is rate limiting and exponentially
-        otherwise — see card_move_retry_delay() for why a fixed 5s/10s ladder
-        was actively harmful here. On final failure, emits an error decision
-        event and posts a GitHub comment. Re-raises CancellationError
-        immediately per the cancellation contract.
+        quota window when GitHub says this call's own quota is exhausted and
+        exponentially otherwise — see card_move_retry_delay() for why a fixed
+        5s/10s ladder was actively harmful here, and why the classification has
+        to come from the failed call rather than from breaker state read
+        afterwards. On final failure, emits an error decision event and posts a
+        GitHub comment. Re-raises CancellationError immediately per the
+        cancellation contract.
 
         Returns True on success, False once retries are exhausted. The caller
         MUST act on False: it feeds review_cycle_thread_teardown()'s
@@ -6322,12 +6429,19 @@ class ProjectMonitor:
         attempts_made = 0
         for attempt in range(1, max_retries + 1):
             attempts_made = attempt
+            # Reset per attempt: a quota verdict from a previous attempt must
+            # not decide how this one backs off.
+            quota_exhausted = False
             try:
                 logger.info(
                     f"Moving issue #{issue_number} from {source_column} to {target_column} "
                     f"(attempt {attempt}/{max_retries})"
                 )
-                result = progression_service.move_issue_to_column(
+                # The _with_reason variant, because a bare False is what left
+                # the operator-facing comment saying "check the logs" — a
+                # milder version of the "returned non-zero exit status 1" this
+                # change set exists to eliminate.
+                result, failure = progression_service.move_issue_to_column_with_reason(
                     project_name=project_name,
                     board_name=board_name,
                     issue_number=issue_number,
@@ -6339,12 +6453,13 @@ class ProjectMonitor:
                     return True
                 else:
                     last_error_detail = (
-                        "move_issue_to_column returned False "
-                        "— check pipeline_progression logs for details"
+                        failure.reason if failure
+                        else "move_issue_to_column reported failure with no reason"
                     )
+                    quota_exhausted = bool(failure and failure.is_quota_exhaustion)
                     logger.warning(
-                        f"move_issue_to_column returned False for issue #{issue_number} "
-                        f"(attempt {attempt}/{max_retries})"
+                        f"Card move failed for issue #{issue_number} "
+                        f"(attempt {attempt}/{max_retries}): {last_error_detail}"
                     )
             except CancellationError:
                 raise
@@ -6358,17 +6473,20 @@ class ProjectMonitor:
 
             if attempt < max_retries:
                 reset_seconds = github_rate_limit_reset_seconds()
-                wait_time = card_move_retry_delay(attempt, reset_seconds)
-                if wait_time is None:
+                verdict, wait_time = card_move_retry_delay(
+                    attempt, quota_exhausted, reset_seconds
+                )
+                if verdict == 'stop':
                     logger.error(
-                        f"Not retrying the card move for issue #{issue_number}: the "
-                        f"GitHub rate limit does not reset for another "
-                        f"{reset_seconds:.0f}s, which is longer than this path will "
-                        f"wait ({CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS:.0f}s). Every "
-                        f"further attempt inside that window would fail identically."
+                        f"Not retrying the card move for issue #{issue_number}: GitHub "
+                        f"reports this call's own quota exhausted and the window does "
+                        f"not reset for another {reset_seconds:.0f}s, which is longer "
+                        f"than this path will wait "
+                        f"({CARD_MOVE_MAX_RATE_LIMIT_WAIT_SECONDS:.0f}s). Every further "
+                        f"attempt inside that window would fail identically."
                     )
                     break
-                if reset_seconds:
+                if verdict == 'quota_window':
                     logger.warning(
                         f"Card move for issue #{issue_number} is rate limited — waiting "
                         f"{wait_time:.0f}s for the GitHub quota window to reset rather "
@@ -6376,7 +6494,7 @@ class ProjectMonitor:
                     )
                 else:
                     logger.info(f"Retrying card move in {wait_time:.0f}s...")
-                time.sleep(wait_time)
+                self._sleep_interruptibly(wait_time, project_name, issue_number)
 
         # All retries exhausted (or abandoned — see the rate-limit break above,
         # which is why this reports attempts MADE rather than max_retries).
@@ -12341,11 +12459,21 @@ _Repair cycle initiated by Switchyard_
                 # github_project_manager.reconcile_project()'s budget guard.
                 #
                 # Deliberately placed BELOW both breaker checks and ABOVE the
-                # board fetching: it is a throttle on polling, not on the
-                # orchestrator. Agent dispatch, review cycles and card moves run
-                # on worker threads that this pause does not touch, which is the
-                # whole point -- the budget the monitor stops spending here is
-                # the budget those paths get to spend instead.
+                # board fetching. The budget the monitor stops spending here is
+                # the budget pipeline-critical calls get to spend instead.
+                #
+                # BE PRECISE ABOUT WHAT IS AND IS NOT PAUSED. Work already
+                # running on worker threads -- an in-flight review cycle and the
+                # card move at the end of it, a running agent -- is genuinely
+                # untouched. But the `continue` below skips the rest of this
+                # loop body, which is what NOTICES a card that has just moved
+                # into an agent column, so starting NEW work is delayed by up to
+                # MONITOR_BUDGET_BACKOFF_MAX_SECONDS. That is a delay rather
+                # than a stall, and it is the trade this guard exists to make --
+                # but an earlier revision of this comment claimed dispatch was
+                # unaffected, which in a change set premised on inaccurate
+                # failure text costing hours of investigation was not a
+                # defensible thing to leave standing.
                 # Both readings taken ONCE and reused in the log below: each one
                 # can reach Redis (the cross-restart rate-limit mirror), and
                 # re-reading them to build a warning would also risk reporting a
@@ -12366,8 +12494,9 @@ _Repair cycle initiated by Switchyard_
                             f"⏳ GraphQL budget at {budget_fraction:.0%} is below the "
                             f"{budget_floor:.0%} floor this poll loop leaves for "
                             f"pipeline-critical calls. Pausing board polling for "
-                            f"{budget_backoff:.0f}s — agent dispatch, review cycles "
-                            f"and card moves are unaffected."
+                            f"{budget_backoff:.0f}s — work already in flight is "
+                            f"unaffected, but NEW work is not picked up until the "
+                            f"pause ends."
                         )
                         self._last_budget_backoff_warning = now
                     time.sleep(budget_backoff)

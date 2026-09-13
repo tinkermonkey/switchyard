@@ -3035,11 +3035,22 @@ class ReviewCycleExecutor:
             )
             return result.stdout.strip()
         except (FileNotFoundError, NotADirectoryError) as e:
-            logger.error(
-                f"Cannot resolve git ref {ref!r}: the workspace {project_dir} is "
-                f"missing ({e}). Every git read against this run will come back "
-                f"empty, which is NOT the same as 'no changes'."
-            )
+            # FileNotFoundError covers BOTH a missing cwd and a missing `git`
+            # executable, and sending an investigation to the wrong one of those
+            # is the mistake this whole change set exists to stop making.
+            import os as _os
+            if not _os.path.isdir(project_dir):
+                logger.error(
+                    f"Cannot resolve git ref {ref!r}: the workspace {project_dir} is "
+                    f"missing ({e}). Every git read against this run will come back "
+                    f"empty, which is NOT the same as 'no changes'."
+                )
+            else:
+                logger.error(
+                    f"Cannot resolve git ref {ref!r}: git could not be executed in "
+                    f"{project_dir} ({e}). The workspace is present — this is an "
+                    f"environment problem, not a missing worktree."
+                )
             return ""
         except Exception as e:
             logger.warning(f"Failed to resolve git ref {ref!r}: {e}")
@@ -3060,11 +3071,20 @@ class ReviewCycleExecutor:
                 ).stdout.strip()
             except (FileNotFoundError, NotADirectoryError) as e:
                 # See _get_git_commit_hash(): a missing workspace is a
-                # structural failure, not a quiet "nothing to report".
-                logger.error(
-                    f"git command {cmd} could not run: the workspace {project_dir} "
-                    f"is missing ({e})"
-                )
+                # structural failure, not a quiet "nothing to report" — and it
+                # is not the same as a missing `git` binary, which raises the
+                # identical exception.
+                import os as _os
+                if not _os.path.isdir(project_dir):
+                    logger.error(
+                        f"git command {cmd} could not run: the workspace "
+                        f"{project_dir} is missing ({e})"
+                    )
+                else:
+                    logger.error(
+                        f"git command {cmd} could not run in {project_dir} ({e}). "
+                        f"The workspace is present — this is an environment problem."
+                    )
                 return ""
             except Exception as e:
                 logger.warning(f"git command {cmd} failed: {e}")
@@ -3258,14 +3278,16 @@ class ReviewCycleExecutor:
             if not change_manifest:
                 # WHY the manifest is empty matters, and the two causes need
                 # different fixes. A MISSING DIRECTORY is not "no changes": the
-                # git helpers swallow a missing cwd into a WARNING and an empty
-                # string, so a pruned worktree surfaced here as "no git changes
-                # found" and sent an investigation looking for commits that were
-                # never lost (pipeline run 4cf816cf -- startup's own
-                # epic-worktree prune had deleted this run's worktree four
-                # seconds earlier; the commits were on the branch the whole
-                # time). prune_epic_worktrees() now refuses to remove an active
-                # run's workspace, and this says so when something else does.
+                # git helpers USED TO swallow a missing cwd into a WARNING and
+                # an empty string, so a pruned worktree surfaced here as "no git
+                # changes found" and sent an investigation looking for commits
+                # that were never lost (pipeline run 4cf816cf -- startup's own
+                # epic-worktree prune had removed this run's worktree seconds
+                # earlier; the commits were on the branch the whole time). Those
+                # helpers now log a missing workspace at ERROR, and
+                # prune_epic_worktrees() refuses to remove an active run's
+                # workspace at all -- this is what says so if something else
+                # does.
                 if not project_dir.exists():
                     raise RuntimeError(
                         f"Cannot build reviewer context for issue "
