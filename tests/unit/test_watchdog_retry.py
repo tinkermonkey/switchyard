@@ -23,15 +23,52 @@ from types import SimpleNamespace
 import tempfile
 import threading
 
-# Mock ORCHESTRATOR_ROOT before importing work_execution_state to avoid /app permission errors
-with tempfile.TemporaryDirectory() as _tmpdir:
-    with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
-        from services.work_execution_state import (
-            WorkExecutionStateTracker,
-            _watchdog_max_retries,
-            _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES,
-            _WATCHDOG_UNATTRIBUTABLE_AGENTS,
-        )
+# Plain import, deliberately. This used to read:
+#
+#     with tempfile.TemporaryDirectory() as _tmpdir:
+#         with patch.dict(os.environ, {'ORCHESTRATOR_ROOT': _tmpdir}):
+#             from services.work_execution_state import (...)
+#
+# to keep the module's import-time `work_execution_tracker =
+# WorkExecutionStateTracker()` from mkdir-ing an unwritable /app. #181 made that
+# unnecessary -- tests/conftest.py calls _redirect_orchestrator_root_to_scratch()
+# at conftest import, i.e. before any test module is imported, so
+# ORCHESTRATOR_ROOT is always a writable scratch root by the time this line runs.
+#
+# It was also actively harmful (#211). If this file is the FIRST importer of
+# services.work_execution_state in the process, the module body runs inside that
+# patch and the process-wide singleton binds to `_tmpdir` -- which the `with`
+# block then DELETES -- so every later test in the same process that touches the
+# real singleton reads and writes a path that no longer exists. Measured on
+# origin/main @ 7b7ebff:
+#
+#     pytest tests/unit/test_watchdog_retry.py tests/unit/scripts/test_dry_run_state_sweep.py
+#       -> 1 failed, 227 passed
+#          test_step_two_the_restore_fixture_puts_the_real_tracker_back saw
+#          state_dir == /tmp/tmpmhil8gv_/state/execution_history
+#
+# The full suite hid it, which is why it went unnoticed: an earlier-collected
+# module imports work_execution_state first, under the correct root, so the
+# import here is a no-op and the patch binds nothing. Re-measured on this
+# container by putting this exact workaround back and running the whole of
+# tests/unit: the same counts as the unmutated tree -- 4115 passed, 2 skipped,
+# 0 failed either way -- with the collection-finish guard below silent. The
+# identity is the claim; the absolute count moves whenever a test is added, so
+# check it against a run of the unmutated tree rather than against this line.
+#
+# test_state_root_isolation.py's
+# test_no_test_file_bound_an_import_time_singleton_outside_the_state_root now
+# asserts the invariant directly instead of leaving it to that accident. With
+# the workaround back and this file the first importer it fires:
+# `pytest tests/unit/test_watchdog_retry.py
+# tests/unit/test_state_root_isolation.py` -> 1 failed, 232 passed, the failure
+# being that guard.
+from services.work_execution_state import (
+    WorkExecutionStateTracker,
+    _watchdog_max_retries,
+    _WATCHDOG_ATTRIBUTABLE_TRIGGER_SOURCES,
+    _WATCHDOG_UNATTRIBUTABLE_AGENTS,
+)
 
 from config.manager import ProjectConfig
 from services.project_monitor import MAX_CONSECUTIVE_DISPATCH_FAILURES

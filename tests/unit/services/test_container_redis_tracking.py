@@ -8,8 +8,6 @@ Tests:
 - _check_redis_tracking_for_agent uses scan_iter (not keys)
 """
 
-import os
-import sys
 import pytest
 from unittest.mock import patch, MagicMock, call
 
@@ -181,15 +179,23 @@ class TestRegisterActiveContainer:
 
 
 def _import_tracker_class(tmp_path):
-    """Import WorkExecutionStateTracker with ORCHESTRATOR_ROOT set to tmp_path.
+    """The tracker CLASS. Plain import, deliberately -- see #211.
 
-    The module-level singleton fires mkdir on import, so we must set the env
-    var before the first import and force re-import if the module was already
-    cached with a different ORCHESTRATOR_ROOT.
+    This used to set ORCHESTRATOR_ROOT to tmp_path and
+    sys.modules.pop('services.work_execution_state') to force a re-import,
+    because the module-level singleton mkdirs on import and /app is not
+    writable. #181 made that unnecessary -- tests/conftest.py repoints
+    ORCHESTRATOR_ROOT at a writable scratch root before any test module is
+    imported -- and it leaked: the re-import builds a new module whose
+    singleton is bound to tmp_path, and conftest's _restore_process_globals
+    cannot put back a name that was absent at the test's setup, so the first
+    such test in a process leaves its replacement standing for the session.
+    See tests/unit/services/test_stale_execution_history.py's
+    _import_tracker_class for the measurement.
+
+    Every caller here passes an explicit `state_dir=`, so nothing needed it.
+    tmp_path is unused now and kept only so the call sites read unchanged.
     """
-    os.environ['ORCHESTRATOR_ROOT'] = str(tmp_path)
-    # Force re-import if already cached (e.g. from another test)
-    sys.modules.pop('services.work_execution_state', None)
     from services.work_execution_state import WorkExecutionStateTracker
     return WorkExecutionStateTracker
 
