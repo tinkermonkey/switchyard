@@ -117,17 +117,25 @@ class TestBothHoldoutsUseIt:
         body saw is the root every one of those call sites uses for the rest of
         the process.
 
-        It is not the only one: services/conversational_session_state.py and
-        state_management/pr_review_state_manager.py end the same way, and a test
-        module can be the first importer of either. All three are covered.
-        services/dev_container_state.py has the identical shape and is
-        deliberately NOT covered, and the two pipeline managers are lazy rather
-        than import-time -- see IMPORT_TIME_STATE_SINGLETONS in tests/conftest.py
-        for the probe that decided each of those, and for the mutation test that
-        showed a row is what makes the difference (a test module doing the
-        anti-pattern against only conversational_session_state and
-        pr_review_state_manager: 83 passed with this guard silent before those
-        two rows existed, 1 failed / 82 passed after).
+        It is not the only one: services/conversational_session_state.py,
+        state_management/pr_review_state_manager.py and
+        services/dev_container_state.py all end the same way, and all four are
+        covered. The two pipeline managers are lazy rather than import-time and
+        are the only deliberate omissions -- see IMPORT_TIME_STATE_SINGLETONS in
+        tests/conftest.py for the probe that decided each of those, and for the
+        mutation test that showed a row is what makes the difference (a test
+        module doing the anti-pattern against only conversational_session_state
+        and pr_review_state_manager: 83 passed with this guard silent before
+        those two rows existed, 1 failed / 82 passed after; the same numbers,
+        separately measured, for dev_container_state's own row).
+
+        dev_container_state is covered even though it is ALREADY in sys.modules
+        when the first test module is imported, which for a while was taken as a
+        reason to leave it out ("no test file can be its first importer, so the
+        row can never fire"). First-importer is not the only way a module body
+        binds the singleton: a module-scope `sys.modules.pop(...)` + re-import,
+        or an importlib.reload, under a foreign ORCHESTRATOR_ROOT does it too,
+        and the row is what sees that.
 
         tests/unit/test_watchdog_retry.py imported work_execution_state inside
         `tempfile.TemporaryDirectory()` + `patch.dict(os.environ,

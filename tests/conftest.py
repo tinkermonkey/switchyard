@@ -808,15 +808,43 @@ leaked_module_mocks = []
 #     services.work_execution_state              False   <- listed
 #     services.conversational_session_state      False   <- listed
 #     state_management.pr_review_state_manager   False   <- listed
-#     services.dev_container_state               True    <- excluded, see below
+#     services.dev_container_state               True    <- listed, see below
 #     services.pipeline_lock_manager             False   <- excluded, see below
 #     services.pipeline_semaphore_manager        False   <- excluded, see below
 #
-# services.dev_container_state has the identical shape and is deliberately NOT
-# listed: it is already in sys.modules before the first test module is imported
-# (this conftest pulls it in transitively, as the probe above shows), so no test
-# file can be its first importer and an entry for it would be a row that can
-# never fire. Add it back the day that stops being true.
+# services.dev_container_state has the identical shape and IS listed, even
+# though the probe shows it already in sys.modules before the first test module
+# is imported (this conftest pulls it in transitively). An earlier version of
+# this comment excluded it on the strength of that measurement -- "no test file
+# can be its first importer, so the row can never fire" -- and the inference
+# does not follow from the measurement. Being the first importer is only ONE of
+# the ways a module body binds this singleton somewhere else. A test module that
+# does `sys.modules.pop('services.dev_container_state')` and re-imports at
+# module scope, or importlib.reload()s it there, under a foreign
+# ORCHESTRATOR_ROOT rebinds the process-wide object exactly as thoroughly, and
+# the row is what notices. Mutation-tested on this container, fresh scratch root
+# each time, with a probe file doing exactly that module-scope pop + re-import
+# under a tempfile root, run as `pytest <probe> tests/unit/test_state_root
+# _isolation.py`:
+#
+#     row absent    83 passed                 <- the rebinding is invisible
+#     row present   1 failed, 82 passed
+#
+# The one failure is test_no_test_file_bound_an_import_time_singleton_outside
+# _the_state_root, reporting
+# services.dev_container_state.dev_container_state.state_dir under the probe's
+# tempdir instead of the session root.
+#
+# What the row does NOT cover, for either this module or the other three: a pop
+# and re-import inside a test BODY. This whole list is sampled at collection
+# finish (see _import_time_singletons_bound_outside_the_state_root), which is
+# before any test has run, and that is deliberate -- a mid-run sample would be
+# reading what earlier tests left behind rather than what test module IMPORTS
+# did. tests/unit/services/test_project_workspace.py::TestEpicWorktreeCreation::
+# test_dev_container_state_import_failure_never_blocks_worktree_creation pops
+# this exact module inside a test body today; it is `with patch.dict(sys.modules)`
+# and under the session's own root, and putting it back is
+# _restore_process_globals's job, not this guard's.
 #
 # The two pipeline managers are excluded for the opposite reason: their module
 # globals are None at import and are built by a getter that reads
@@ -830,6 +858,8 @@ IMPORT_TIME_STATE_SINGLETONS = (
      'state_dir', 'conversational_sessions'),
     ('state_management.pr_review_state_manager', 'pr_review_state_manager',
      'state_root', 'projects'),
+    ('services.dev_container_state', 'dev_container_state', 'state_dir',
+     'dev_containers'),
 )
 
 # Filled in at collection finish, read by
@@ -1865,22 +1895,24 @@ def _restore_process_globals():
 
     for name, module in previous_modules.items():
         current = sys.modules.get(name)
-        if current is module:
-            continue
         if isinstance(current, NonCallableMock):
-            # Leave it. pytest_sessionfinish above exists to FAIL the run when a
-            # first-party module is left replaced by a mock (#133), and it reads
-            # sys.modules to find out. Restoring here would put the module back
-            # before that check runs, so the detector would see a clean session
-            # and the leak it was written for would become undetectable --
-            # verified: a test that assigns a MagicMock and never restores it
-            # goes from "first-party modules left mocked in sys.modules" to
-            # total silence with this fixture in place.
+            # Leave it -- BOTH halves. pytest_sessionfinish above exists to FAIL
+            # the run when a first-party module is left replaced by a mock
+            # (#133), and it reads sys.modules to find out. Restoring here would
+            # put the module back before that check runs, so the detector would
+            # see a clean session and the leak it was written for would become
+            # undetectable -- verified: a test that assigns a MagicMock and
+            # never restores it goes from "first-party modules left mocked in
+            # sys.modules" to total silence with this fixture in place.
             #
             # So: repair an honest re-import, never a mock. Those are different
-            # mistakes and only one of them is the caller's own business.
+            # mistakes and only one of them is the caller's own business. And
+            # repairing only the package attribute under a mocked sys.modules
+            # entry would manufacture the very disagreement the next block
+            # exists to prevent, so this `continue` is above it, not below.
             continue
-        sys.modules[name] = module
+        if current is not module:
+            sys.modules[name] = module
         # sys.modules is only HALF of what an import binds, and restoring only
         # that half leaves the two halves disagreeing -- which is worse than
         # not restoring at all, because it is invisible (#221).
@@ -1890,31 +1922,61 @@ def _restore_process_globals():
         # `getattr(services, 'work_execution_state')`, falling back to
         # sys.modules only if that attribute is missing. The re-import that a
         # test forced set that attribute on the `services` package object, and
-        # nothing above puts it back -- so after this fixture,
+        # nothing above puts it back -- so without the block below,
         # `importlib.import_module(name)` and `from services.x import y` see
         # the restored module while `import services.x as y` still sees the
         # test's replacement.
         #
+        # This runs for every name that was in sys.modules at setup, NOT only
+        # for the ones the block above had to repair, and that is the whole
+        # point of its position. The two halves are damaged by ONE act -- the
+        # re-import -- but they are not repaired by one, and the commonest
+        # responsible-looking spelling of the anti-pattern in this repo repairs
+        # exactly one of them on its own:
+        #
+        #     with patch.dict(sys.modules):
+        #         sys.modules.pop('services.x', None)
+        #         ...                       # something re-imports services.x
+        #
+        # patch.dict puts the sys.modules entry back on exit, so at teardown
+        # `current is module` is already True -- while the package attribute
+        # still points at the replacement. Behind an early `continue` on that
+        # condition (where these lines used to live) the repair never ran for
+        # that shape at all. tests/unit/services/test_project_workspace.py::
+        # TestEpicWorktreeCreation::
+        # test_dev_container_state_import_failure_never_blocks_worktree_creation
+        # writes exactly that today; measured on this container, a probe pair
+        # in that shape left `services.work_execution_state` on the parent
+        # package pointing at the replacement while sys.modules held the
+        # original, and passed as a clean 1-failed/1-passed pair only once
+        # these lines moved above the `continue`.
+        #
         # Measured on this container against
         # `pytest tests/unit/services/test_stale_execution_history.py
         # tests/unit/scripts/test_dry_run_state_sweep.py`, fresh scratch root
-        # each time, while that file still did the sys.modules.pop + re-import
-        # under a tmp_path root:
+        # each time, while that file still did the bare sys.modules.pop +
+        # re-import under a tmp_path root:
         #
         #     neither half repaired            2 failed, 95 passed
-        #     this line added                  1 failed, 96 passed
+        #     this block added                 1 failed, 96 passed
         #     the pop removed at its source   97 passed
         #
         # Both of the first two failures are in
         # tests/unit/scripts/test_dry_run_state_sweep.py's
         # TestRuntimeSingletonBinding, reading a state_dir under a tmp_path
         # pytest had already deleted. #221 removed the pop from all three files
-        # that did it; this line is what keeps the next one from being invisible
-        # -- tests/unit/test_no_cross_file_module_leakage.py's
-        # TestConftestRestoresBothHalvesOfAReimport is its regression test.
+        # that did it; this block is what keeps the next one from being
+        # invisible -- tests/unit/test_no_cross_file_module_leakage.py's
+        # TestConftestRestoresBothHalvesOfAReimport is its regression test, in
+        # both spellings.
         parent_name, _, child_name = name.rpartition('.')
         parent = sys.modules.get(parent_name) if parent_name else None
-        if parent is not None and getattr(parent, child_name, None) is not module:
+        if parent is None or isinstance(parent, NonCallableMock):
+            # No parent package to fix, or one a test has replaced with a mock
+            # -- writing a real submodule onto a mock package repairs nothing
+            # and mutates somebody else's fixture.
+            continue
+        if getattr(parent, child_name, None) is not module:
             setattr(parent, child_name, module)
 
     reloaded = sorted(
