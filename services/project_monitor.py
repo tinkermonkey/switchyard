@@ -9013,6 +9013,7 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 # structured approach get_retained_reason()'s own docstring
                 # documents other direct-lock-object callers already use).
                 _current_lock_for_classification = lock_manager.get_lock(project_name, board_name)
+                _refusal_may_be_a_wait = False
                 if _current_lock_for_classification and _current_lock_for_classification.retained_reason:
                     logger.error(
                         f"Repair cycle for issue #{issue_number} cannot acquire the "
@@ -9030,25 +9031,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"creating a lock while a retained one might actually be held"
                     )
                 else:
-                    # The plain "someone else has it" refusal — the only one of
-                    # these three branches that is a WAIT. The other two are
-                    # error states (a retained lock needs a human;
-                    # lock_state_unknown means both stores failed), and
-                    # recording those as waits would put a fake waiter on the
-                    # board for the release path to wake. Record only here.
-                    self._record_board_lock_wait(
-                        project_name, board_name, issue_number,
-                        holder_issue=(
-                            _current_lock_for_classification.locked_by_issue
-                            if _current_lock_for_classification else None
-                        ),
-                    )
-                    logger.info(
-                        f"Repair cycle for issue #{issue_number} cannot acquire the "
-                        f"pipeline lock for {project_name}/{board_name} yet ({reason}) "
-                        f"— waiting for it to free up rather than evicting the "
-                        f"current holder; will retry on a later poll cycle"
-                    )
+                    # Not one of the two error states above (a retained lock
+                    # needs a human; lock_state_unknown means both stores
+                    # failed), so this MAY be the plain "someone else has it"
+                    # wait. Not decided yet: this arm is the fallthrough, so it
+                    # also catches every refusal in
+                    # LOCK_REFUSAL_REASONS_CALLER_STILL_HOLDS and
+                    # LOCK_REFUSAL_REASONS_HOLDER_UNDECIDED, on which THIS issue
+                    # may still be the recorded holder — a wait recorded for
+                    # those would be a waiter parked on a board it holds itself
+                    # (found in the #214 review round). The holder question is
+                    # answered two statements down by
+                    # refusal_must_not_end_caller_run(), so both the wait and
+                    # the "waiting for it to free up" log line are deferred
+                    # until after it.
+                    _refusal_may_be_a_wait = True
                 # For every refusal EXCEPT the ones refusal_must_not_end_caller_run()
                 # catches, try_acquire_lock() failed outright, so this issue never
                 # actually holds the lock — end_pipeline_run() will correctly no-op
@@ -9077,6 +9074,23 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"NOT released; will retry on a later poll cycle"
                     )
                     return None
+                if _refusal_may_be_a_wait:
+                    # Now decided: still_holding is None, so this issue is NOT
+                    # the recorded holder and the refusal really is "someone
+                    # else has this board" — the one refusal that is a WAIT.
+                    self._record_board_lock_wait(
+                        project_name, board_name, issue_number,
+                        holder_issue=(
+                            _current_lock_for_classification.locked_by_issue
+                            if _current_lock_for_classification else None
+                        ),
+                    )
+                    logger.info(
+                        f"Repair cycle for issue #{issue_number} cannot acquire the "
+                        f"pipeline lock for {project_name}/{board_name} yet ({reason}) "
+                        f"— waiting for it to free up rather than evicting the "
+                        f"current holder; will retry on a later poll cycle"
+                    )
                 if _owned_is_real_run and _owned_run_id and not _settled:
                     _settled = True
                     try:
