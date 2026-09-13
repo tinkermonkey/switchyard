@@ -61,10 +61,53 @@ class TaskQueue:
         
     def enqueue(self, task: Task):
         """Add task to appropriate priority queue"""
+        self._warn_if_the_project_has_no_config(task)
         if self.redis_client:
             self._enqueue_redis(task)
         else:
             self._enqueue_fallback(task)
+
+    @staticmethod
+    def _warn_if_the_project_has_no_config(task: Task):
+        """Name the caller that queued work for a project that cannot run it.
+
+        A task whose project has no config/projects/<name>.yaml can never
+        succeed: every agent resolves its project config first, so the task
+        fails with "Configuration file not found" three attempts and 15 seconds
+        of a real worker later. The failure is logged by the worker, which
+        knows only that it dequeued something bad -- there is no enqueue-side
+        log at all, so nothing records who created it.
+
+        That gap cost a long investigation. 94 such tasks were observed for a
+        project named `test-project` over four hours at a steady rate, on the
+        live deployment, surviving a restart. The Redis queue never held one
+        when sampled, the worker pool does not re-enqueue with fresh ids, and
+        the only dev_environment_setup enqueue site in main.py runs once at
+        startup -- so every structural guess was wrong and the source stayed
+        unidentified. stack_info=True answers it directly the next time.
+
+        Deliberately a WARNING and not a raise. This runs on the dispatch path
+        of a live orchestrator: a bad task should be diagnosable, not a new way
+        to take the queue down. The task is still enqueued and still fails
+        exactly as it did before.
+
+        Never raises. A diagnostic that can break enqueue() is worse than no
+        diagnostic, so an unreadable config directory is silently ignored --
+        the caller is not asking a question about configuration.
+        """
+        try:
+            from config.manager import config_manager
+            if task.project in config_manager.list_projects():
+                return
+            logger.warning(
+                "Task %s queues agent %r for project %r, which has no "
+                "config/projects/%s.yaml. It cannot succeed and will fail "
+                "after ~15s of a worker's time. Stack shows who queued it.",
+                task.id, task.agent, task.project, task.project,
+                stack_info=True,
+            )
+        except Exception as e:  # pragma: no cover - diagnostics must not bite
+            logger.debug(f"Could not check the project config for {task.id}: {e}")
 
     def _enqueue_redis(self, task: Task):
         """Enqueue task using Redis"""
