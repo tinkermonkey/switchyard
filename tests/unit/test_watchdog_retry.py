@@ -1441,11 +1441,17 @@ class TestWatchdogIncrementsRetryCount:
 class TestProjectConfigCacheDoesNotPoisonOnFailure:
     """
     Regression (found in final whole-PR review, #60): the per-sweep
-    project_config_cache added to share one config fetch across PROTECTION
-    2/3 must NOT cache a failure. A transient error on the first state file
-    for a project must not silently degrade both protections into no-ops
+    project_config_cache added to share one config fetch across the
+    protections that need a ProjectConfig -- PROTECTION 2 and PROTECTION 4
+    -- must NOT cache a failure. A transient error on the first state file
+    for a project must not silently degrade those protections into no-ops
     for every OTHER state file of that same project in the same sweep --
     only the state file that hit the actual failure should be affected.
+
+    (#212 removed PROTECTION 3, which was the third consumer of this cache
+    when the guard was written. What the test below observes is PROTECTION
+    2 specifically: PROTECTION 4 is stubbed out here so the lock check is
+    the only thing left that can act on the cached config.)
     """
 
     @pytest.fixture
