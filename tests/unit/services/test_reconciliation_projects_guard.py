@@ -41,6 +41,9 @@ def manager():
 def _client_with_closed_breaker():
     client = MagicMock()
     client.breaker.is_open.return_value = False
+    # Ample quota: this file is about the PERMISSION guard, and the budget
+    # pre-flight beside it would otherwise defer on a MagicMock reading.
+    client.graphql_budget_fraction_remaining.return_value = 0.95
     return client
 
 

@@ -50,6 +50,104 @@ class ProjectsPermissionUnavailable(Exception):
     """
 
 
+# Fraction of the GraphQL budget that must remain before board reconciliation
+# is allowed to start. Reconciling one project costs ~18-27 GraphQL calls, and
+# a cold start reconciles every configured project -- 17 of them on the
+# reference deployment, so roughly 400 calls in a burst on top of whatever the
+# steady-state poll loop is already spending.
+#
+# A quarter of an hourly budget is deliberately generous: it has to cover the
+# whole burst, not one project, and the cost scales with the project count
+# while the budget does not. Tunable because that ratio is deployment-specific
+# -- a two-project deployment needs far less headroom than a twenty-project
+# one.
+RECONCILE_MIN_BUDGET_FRACTION_ENV = 'RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION'
+DEFAULT_RECONCILE_MIN_BUDGET_FRACTION = 0.25
+
+# See _reconciliation_freshness_hours() for why this is 24 and not 1.
+DEFAULT_RECONCILIATION_FRESHNESS_HOURS = 24
+
+
+def _reconcile_min_budget_fraction() -> float:
+    """The configured budget floor, or the default if it is unusable.
+
+    Falls back rather than raising: a typo in a tuning knob must not stop the
+    orchestrator booting, and this runs per project inside the reconciliation
+    loop. A value outside (0, 1) is meaningless as a fraction -- 0 disables
+    the guard silently and 1 defers forever -- so both are treated as typos.
+    """
+    raw = os.environ.get(RECONCILE_MIN_BUDGET_FRACTION_ENV)
+    if raw is None:
+        return DEFAULT_RECONCILE_MIN_BUDGET_FRACTION
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"{RECONCILE_MIN_BUDGET_FRACTION_ENV}={raw!r} is not a number; "
+            f"using {DEFAULT_RECONCILE_MIN_BUDGET_FRACTION}"
+        )
+        return DEFAULT_RECONCILE_MIN_BUDGET_FRACTION
+    if not 0.0 < value < 1.0:
+        logger.warning(
+            f"{RECONCILE_MIN_BUDGET_FRACTION_ENV}={raw!r} is outside (0, 1); "
+            f"using {DEFAULT_RECONCILE_MIN_BUDGET_FRACTION}"
+        )
+        return DEFAULT_RECONCILE_MIN_BUDGET_FRACTION
+    return value
+
+
+def _reconciliation_freshness_hours() -> int:
+    """How long reconciled board state stays trusted.
+
+    24 hours, not the 1 it used to be. Board and column IDs change only when
+    someone edits the board in GitHub, and needs_reconciliation() already
+    detects a changed CONFIG independently of this -- so the one-hour window
+    bought almost nothing and cost a full re-reconciliation of every project
+    on any restart more than an hour after the last one, which is to say
+    nearly every restart. That burst is the single largest thing a restart
+    spends, and it landed on a budget the steady-state poll loop already runs
+    at 60-75% of.
+
+    24 matches the default state_manager.is_state_fresh() itself declares;
+    the 1 was an override that outlived its reason.
+    """
+    raw = os.environ.get('RECONCILIATION_FRESHNESS_HOURS')
+    if raw is None:
+        return DEFAULT_RECONCILIATION_FRESHNESS_HOURS
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"RECONCILIATION_FRESHNESS_HOURS={raw!r} is not an integer; "
+            f"using {DEFAULT_RECONCILIATION_FRESHNESS_HOURS}"
+        )
+        return DEFAULT_RECONCILIATION_FRESHNESS_HOURS
+
+
+class ProjectsBudgetUnavailable(Exception):
+    """Board reconciliation was deferred because too little GraphQL budget
+    remains to run it without exhausting the hour's quota.
+
+    The circuit-breaker check beside this one catches a limit already hit.
+    This catches the one about to be hit, which is the failure that actually
+    hurts: the breaker only opens AFTER GitHub has started refusing calls, and
+    by then every other subsystem sharing the credential -- issue polling, PR
+    updates, discussions, agent dispatch -- is refused too, for the remainder
+    of the reset window. A restart is the reliable way to trigger it, because
+    a restart is the one moment the orchestrator spends several hundred calls
+    in a burst.
+
+    Modelled on ProjectsPermissionUnavailable above, and for the same reason:
+    `return False` is the wrong signal. main.py logs those as "GitHub project
+    management is not working" and counts them toward an exit(1), so a
+    single-project deployment restarting on a low budget would boot-crash-loop
+    on a condition that clears by itself within the hour. This is a DEFERRAL,
+    not a failure -- the next scheduled reconciliation picks the project up
+    once the window resets, and stale board state in the meantime is a far
+    smaller problem than a tripped breaker.
+    """
+
+
 class GitHubProjectManager:
     """
     GitHub Project Manager with Configuration Reconciliation
@@ -86,9 +184,40 @@ class GitHubProjectManager:
                 logger.warning(f"Skipping reconciliation for '{project_name}' - GitHub API circuit breaker is OPEN{wait_msg}")
                 return False
 
+            # Budget pre-flight. The breaker check above refuses work once
+            # GitHub has ALREADY started rejecting calls; this refuses it
+            # while there is still budget left to protect. See
+            # ProjectsBudgetUnavailable for why that ordering matters and why
+            # this raises instead of returning False.
+            #
+            # `None` is unknown, not healthy, and is deliberately allowed
+            # through: on a cold start the bucket has had no real reading yet,
+            # and refusing to reconcile on a number that does not exist would
+            # break the very restart this guard exists to protect.
+            min_fraction = _reconcile_min_budget_fraction()
+            budget_fraction = github_client.graphql_budget_fraction_remaining()
+            if not isinstance(budget_fraction, (int, float)):
+                # Anything that is not a number is "unknown", same as None.
+                # A guard must not be able to fail the thing it guards: this
+                # raise sits inside a try whose `except Exception` returns
+                # False, and main.py reads False as "GitHub project management
+                # is not working" and counts it toward an exit(1). So a
+                # comparison against an unexpected value would turn a quota
+                # SAFEGUARD into a boot crash-loop -- strictly worse than not
+                # having it. Observed, not hypothetical: it broke three
+                # existing tests in exactly that way before this line existed.
+                budget_fraction = None
+            if budget_fraction is not None and budget_fraction < min_fraction:
+                raise ProjectsBudgetUnavailable(
+                    f"Only {budget_fraction:.0%} of the GraphQL budget remains "
+                    f"(floor is {min_fraction:.0%}); deferring board "
+                    f"reconciliation rather than spending the rest of the "
+                    f"hour's quota on it."
+                )
+
             # Check if state is fresh and config hasn't changed - skip reconciliation to save API quota
-            # Freshness threshold: 1 hour (configurable via environment variable)
-            freshness_hours = int(os.environ.get('RECONCILIATION_FRESHNESS_HOURS', '1'))
+            # Freshness threshold: configurable; see _reconciliation_freshness_hours().
+            freshness_hours = _reconciliation_freshness_hours()
 
             config_changed = self.state_manager.needs_reconciliation(project_name)
             state_is_fresh = self.state_manager.is_state_fresh(project_name, max_age_hours=freshness_hours)
@@ -149,11 +278,16 @@ class GitHubProjectManager:
             logger.info(f"Successfully reconciled project: {project_name}")
             return True
 
-        except ProjectsPermissionUnavailable:
-            # Deliberately not caught here: this is a refusal, not a failure,
-            # and only the caller can tell the difference (see the exception's
-            # docstring). Swallowing it into the `return False` below would
-            # reinstate the crash-loop it exists to prevent.
+        except (ProjectsPermissionUnavailable, ProjectsBudgetUnavailable):
+            # Deliberately not caught here: these are refusals, not failures,
+            # and only the caller can tell the difference (see the exceptions'
+            # docstrings). Swallowing either into the `return False` below
+            # would reinstate the crash-loop they exist to prevent -- which is
+            # not hypothetical: the budget guard was written raising from
+            # inside this try with no clause here, and the `except Exception`
+            # below duly turned every deferral into "GitHub project management
+            # is not working". Caught by the test that drives
+            # reconcile_project() rather than the exception type.
             raise
         except Exception as e:
             logger.error(f"Failed to reconcile project '{project_name}': {e}")

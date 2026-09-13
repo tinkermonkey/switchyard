@@ -69,7 +69,14 @@ services:
       - CONTEXT7_MCP_URL=https://mcp.context7.com/mcp
       - CONTEXT7_API_KEY=${CONTEXT7_API_KEY}
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
-      - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-1}
+      # GraphQL quota headroom. Board reconciliation and the queue force-sync
+      # are the two things that spend quota in proportion to the BOARD COUNT
+      # rather than the work in flight, so they are what a growing deployment
+      # runs out of budget on first. Defaults live in the code; these are here
+      # to be turned down on a deployment with many projects.
+      - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-24}
+      - QUEUE_RECONCILIATION_INTERVAL_MINUTES=${QUEUE_RECONCILIATION_INTERVAL_MINUTES:-30}
+      - RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION=${RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION:-0.25}
       # Watchdog retry configuration
       - WATCHDOG_MAX_RETRIES=${WATCHDOG_MAX_RETRIES:-2}
       # Worker pool configuration

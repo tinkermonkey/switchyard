@@ -1401,6 +1401,85 @@ class GitHubAPIClient:
         """The (credential, resource) rate-limit bucket."""
         return self._buckets[(credential, resource)]
 
+    def graphql_budget_fraction_remaining(self) -> Optional[float]:
+        """Fraction (0.0-1.0) of the active credential's GraphQL budget left,
+        or None when that is genuinely unknown.
+
+        Public because the decision "is there enough budget to start this
+        expensive piece of work" belongs to the caller doing the spending,
+        while which bucket answers it is this client's business -- routing
+        makes that a (credential, resource) pair, not a single global number,
+        and a caller reaching into _bucket() would have to duplicate
+        _resolve_credential() to pick the right one.
+
+        None means UNKNOWN, not healthy, and callers must not treat the two
+        alike. A bucket that has never been populated from a real GitHub
+        response still holds its 5000/5000 constructor defaults, which are
+        indistinguishable from a genuinely untouched budget (#103, see
+        GitHubRateLimitStatus.is_stale) -- so a fresh process that has not
+        made its first call yet would otherwise read as "100% available" and
+        any threshold check would pass by accident. Refusing to act on a
+        reading that does not exist is the safe direction: skipping work on a
+        made-up number is worse than doing the work.
+        """
+        credential = self._resolve_credential()
+        bucket = self._bucket(credential, 'graphql')
+        if bucket.ever_updated and bucket.limit > 0:
+            return max(0.0, bucket.remaining / bucket.limit)
+        # This process has made no GitHub call yet, so its in-memory bucket
+        # holds only constructor defaults. That is precisely the moment a
+        # restart is about to spend several hundred calls, so falling back to
+        # the Redis mirror is not an optimisation -- without it this method
+        # returns None for the whole startup burst and any caller gating on it
+        # is inert exactly when it matters. The mirror exists to survive a
+        # restart; this is what makes it do so.
+        return self._budget_fraction_from_mirror(credential, 'graphql')
+
+    def _budget_fraction_from_mirror(
+        self, credential: str, resource: str
+    ) -> Optional[float]:
+        """Last reading for this (credential, resource) as persisted to Redis,
+        or None if there isn't a usable one.
+
+        None for every failure -- no Redis, no key, unparseable JSON, missing
+        or non-numeric fields -- because the caller's contract is that None
+        means "unknown", and a mirror that cannot be read is the definition of
+        unknown. Never raises: this runs on the startup path, and a rate-limit
+        reading is not worth failing a boot over.
+
+        A reading whose window has already reset is also None, not a low
+        number. GitHub's quota refills at reset_time, so a reading of
+        1177/5000 taken at 10:18 says nothing at all about the budget at
+        10:25 if the window turned over at 10:19 -- and reporting it as 24%
+        would defer work against a quota that is actually full. This is the
+        common case after any outage or overnight gap, not a corner.
+        """
+        try:
+            client = _get_shared_redis_client()
+            raw = client.get(self._redis_key_for(credential, resource))
+            if not raw:
+                return None
+            data = json.loads(raw)
+
+            remaining, limit = data.get('remaining'), data.get('limit')
+            if not isinstance(remaining, (int, float)):
+                return None
+            if not isinstance(limit, (int, float)) or limit <= 0:
+                return None
+
+            reset_time = data.get('reset_time')
+            if reset_time:
+                reset_at = datetime.fromisoformat(str(reset_time))
+                if reset_at.tzinfo is None:
+                    reset_at = reset_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= reset_at:
+                    return None
+
+            return max(0.0, remaining / limit)
+        except Exception as e:
+            logger.debug(f"Could not read the {credential}/{resource} rate-limit mirror: {e}")
+            return None
+
     def _redis_key_for(self, credential: str, resource: str) -> str:
         keys = (
             RATE_LIMIT_REDIS_KEYS_APP if credential == CREDENTIAL_APP
