@@ -175,6 +175,44 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
     project" -- must serialize (never overlap) instead of racing, and both
     must eventually complete (this is a mutex, not a one-wins-one-fails
     gate).
+
+    The worst case -- two concurrent callers sharing one holder identity,
+    which PipelineLockManager.try_acquire_lock() would treat as reentrant
+    ("already_holds_lock") if the raw issue number were used as that identity
+    -- used to have its own test here, the byte-for-byte twin of the one #213
+    deleted from test_project_checkout_lock.py. It was deleted in the same
+    change, for the same measured reason.
+
+    Mutation used to measure this: revert #54's fix at all four
+    _mint_unique_holder_id() call sites in services/dev_container_build_lock.py
+    (holder_id = issue_number if issue_number is not None else 0). Under it the
+    deleted test caught the bug 1 time in 25 runs alone and 1 time in 6
+    full-module runs, because whether the second thread reaches
+    acquire_resource() inside the first's 0.1s hold is a scheduling race.
+
+    What holds the line without racing for it, measured over 10 mutated
+    full-module runs after the deletion (10/10 each):
+
+      TestDevContainerBuildLockSyncMechanics::
+          test_acquires_and_releases_when_uncontended
+      TestDevContainerBuildLockSyncMechanics::
+          test_waits_then_acquires_once_the_other_holder_releases
+      TestDevContainerBuildLockAsyncMechanics::
+          test_acquires_and_releases_when_uncontended
+      TestIfFreeSyncVariant::test_yields_true_and_releases_when_free
+          -- all four assert the holder id structurally, self.assertLess(
+          lock.locked_by_issue, 0), reported as "111 not less than 0" /
+          "2 not less than 0" / "7 not less than 0".
+      TestIfFreeSyncVariant::test_a_held_if_free_lock_blocks_the_blocking_variant
+          -- single-threaded and sleep-free, and the closest thing to what the
+          deleted test was reaching for: two callers that share an identity
+          (both issue_number=None) must still serialize. Under the mutation the
+          second is granted the lock reentrantly and the expected
+          DevContainerBuildLockTimeoutError never arrives.
+
+    The two TestYamlOnlyFallbackConcurrency tests also catch the mutation, on
+    their max-concurrent assertion rather than structurally, at 10/10 and 8/10
+    over those same runs -- real coverage, but not what the guarantee rests on.
     """
 
     def setUp(self):
@@ -255,46 +293,6 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
 
         self.assertEqual(sorted(completed), [201, 202])
         self.assertEqual(max_concurrent, 1)
-        self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
-
-    def test_two_callers_with_the_SAME_real_issue_number_still_serialize(self):
-        """Same critical case test_project_checkout_lock.py's equivalent
-        test covers: PipelineLockManager.try_acquire_lock() treats a
-        MATCHING issue_number as reentrant with no other identity check. If
-        this lock passed the caller's real issue_number straight through as
-        the holder identity, two genuinely different concurrent operations
-        sharing a real issue number would each be told they already hold the
-        lock and both would proceed concurrently. Passing the SAME
-        issue_number for both racing callers here proves the reused
-        _mint_unique_holder_id()-based fix holds for this lock too."""
-        concurrent_count = {"value": 0}
-        max_concurrent = {"value": 0}
-        count_lock = threading.Lock()
-        completed = {"count": 0}
-        SAME_ISSUE_NUMBER = 42
-
-        def worker():
-            with dev_container_build_lock_sync(
-                "shared-project", SAME_ISSUE_NUMBER, facade=self.facade,
-                timeout_seconds=5, poll_interval_seconds=0.01,
-            ):
-                with count_lock:
-                    concurrent_count["value"] += 1
-                    max_concurrent["value"] = max(max_concurrent["value"], concurrent_count["value"])
-                time.sleep(0.1)
-                with count_lock:
-                    concurrent_count["value"] -= 1
-                    completed["count"] += 1
-
-        t1 = threading.Thread(target=worker)
-        t2 = threading.Thread(target=worker)
-        t1.start()
-        t2.start()
-        t1.join(timeout=10)
-        t2.join(timeout=10)
-
-        self.assertEqual(completed["count"], 2)  # both got to run
-        self.assertEqual(max_concurrent["value"], 1)  # ...but never at the same time
         self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
 
 

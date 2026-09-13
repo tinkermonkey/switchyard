@@ -317,9 +317,19 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
         project_workspace.initialize_project() at startup) must not prevent
         two genuinely different concurrent callers from serializing --
         every acquisition mints its own internal holder id regardless of
-        what issue_number was passed for logging (see
-        test_two_callers_with_the_SAME_real_issue_number_still_serialize for
-        why this matters even more when issue_number IS given).
+        what issue_number was passed for logging.
+
+        The worst case -- two concurrent callers passing the SAME real
+        issue_number, which PipelineLockManager.try_acquire_lock() would treat
+        as reentrant ("already_holds_lock") if the raw issue number were used
+        as the holder identity -- used to have its own test here. It was
+        deleted in #213: mutation-tested against exactly that regression
+        (holder_id = issue_number instead of _mint_unique_holder_id()) it
+        caught the bug 0 times in 5 runs alone, because whether the second
+        thread reaches acquire_resource() inside the first's 0.1s hold is a
+        scheduling race. The three TestProjectCheckoutLock*Mechanics tests
+        assert the holder id is negative structurally instead of racing for
+        it, and caught that same mutation 5/5 alone and 5/5 in-module.
         """
         concurrent_count = {"value": 0}
         max_concurrent = {"value": 0}
@@ -348,52 +358,6 @@ class TestConcurrentCollisionSerializes(unittest.TestCase):
 
         self.assertEqual(completed["count"], 2)  # both got to run
         self.assertEqual(max_concurrent["value"], 1)  # ...but never at the same time
-        self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
-
-    def test_two_callers_with_the_SAME_real_issue_number_still_serialize(self):
-        """
-        THE critical regression this round of review found:
-        PipelineLockManager.try_acquire_lock() treats a MATCHING issue_number
-        as reentrant ("already_holds_lock") with no other identity check. If
-        this lock passed the caller's real issue_number straight through as
-        the holder identity, two genuinely different concurrent operations
-        that happen to share a real issue number (e.g. a Docker agent run
-        and an unrelated auto-commit/watchdog redispatch both tagged the same
-        issue) would each be told they already hold the lock and both run
-        concurrently -- and whichever finished first would release the lock
-        out from under the other still-running one. Passing the SAME
-        issue_number for both racing callers here (instead of two different
-        ones, as the other tests in this class use) is the whole point: it
-        proves the fix holds even in the worst case the old design got wrong.
-        """
-        concurrent_count = {"value": 0}
-        max_concurrent = {"value": 0}
-        count_lock = threading.Lock()
-        completed = {"count": 0}
-        SAME_ISSUE_NUMBER = 42
-
-        def worker():
-            with project_checkout_lock_sync(
-                "shared-project", SAME_ISSUE_NUMBER, facade=self.facade,
-                timeout_seconds=5, poll_interval_seconds=0.01,
-            ):
-                with count_lock:
-                    concurrent_count["value"] += 1
-                    max_concurrent["value"] = max(max_concurrent["value"], concurrent_count["value"])
-                time.sleep(0.1)
-                with count_lock:
-                    concurrent_count["value"] -= 1
-                    completed["count"] += 1
-
-        t1 = threading.Thread(target=worker)
-        t2 = threading.Thread(target=worker)
-        t1.start()
-        t2.start()
-        t1.join(timeout=10)
-        t2.join(timeout=10)
-
-        self.assertEqual(completed["count"], 2)  # both got to run
-        self.assertEqual(max_concurrent["value"], 1)  # ...but never at the same time (the old bug: this would be 2)
         self.assertIsNone(self.facade.get_resource_lock("shared-project", RESOURCE_NAME))
 
 

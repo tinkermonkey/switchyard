@@ -140,10 +140,16 @@ def check_test_scripts():
     """Check that all required test scripts exist"""
     print("\n🧪 Checking test scripts...")
 
+    # NOTE (#213): this list is already stale and this check already fails --
+    # test_webhook_integration.py and test_kanban_automation.py have not
+    # existed for some time (verified by `ls` at the time of writing).
+    # test_docker_deployment.py was removed here in #213 because it was
+    # deleted along with the other live-machine integration tests; the two
+    # pre-existing dead entries are left alone rather than silently repaired,
+    # since fixing this script is not what #213 is about.
     required_scripts = [
         "tests/integration/test_webhook_integration.py",
         "tests/integration/test_kanban_automation.py",
-        "tests/integration/test_docker_deployment.py"
     ]
 
     for script_path in required_scripts:
@@ -267,7 +273,7 @@ def main():
         print("   1. Configure .env file with your tokens")
         print("   2. Update config/projects.yaml with your repositories")
         print("   3. Run: docker-compose up --build")
-        print("   4. Test with: python tests/integration/test_docker_deployment.py")
+        print("   4. Verify the stack is up: curl http://localhost:5001/health")
         return True
     else:
         print(f"\n❌ Week 3 validation FAILED ({total - passed} issues)")
