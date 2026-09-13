@@ -40,7 +40,7 @@ import threading
 # patch and the process-wide singleton binds to `_tmpdir` -- which the `with`
 # block then DELETES -- so every later test in the same process that touches the
 # real singleton reads and writes a path that no longer exists. Measured on
-# origin/main @ 849e54b:
+# origin/main @ 7b7ebff:
 #
 #     pytest tests/unit/test_watchdog_retry.py tests/unit/scripts/test_dry_run_state_sweep.py
 #       -> 1 failed, 227 passed
@@ -51,7 +51,7 @@ import threading
 # module imports work_execution_state first, under the correct root, so the
 # import here is a no-op and the patch binds nothing. Re-measured on this
 # container by putting this exact workaround back and running the whole of
-# tests/unit: the same counts as the unmutated tree -- 4104 passed, 2 skipped,
+# tests/unit: the same counts as the unmutated tree -- 4115 passed, 2 skipped,
 # 0 failed either way -- with the collection-finish guard below silent. The
 # identity is the claim; the absolute count moves whenever a test is added, so
 # check it against a run of the unmutated tree rather than against this line.

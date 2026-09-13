@@ -1077,7 +1077,7 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
         the process. record_execution_outcome() APPENDS, so a second run against
         the same scratch root found the first run's record still on disk and the
         `len(failures) == 1` below saw two. Deterministic, not flaky; measured on
-        origin/main @ 849e54b, three runs of this file against one shared root:
+        origin/main @ 7b7ebff, three runs of this file against one shared root:
         41 passed / 1 failed / 1 failed, and five runs against five fresh roots:
         41 passed each time.
 

@@ -790,7 +790,7 @@ leaked_module_mocks = []
 # importer of, as (module, singleton attribute, path attribute, subdirectory of
 # $ROOT/state). work_execution_tracker is reached through a function-level
 # `from services.work_execution_state import work_execution_tracker` all over
-# services/ -- roughly twenty such call sites in services/project_monitor.py
+# services/ -- seventeen such call sites in services/project_monitor.py
 # alone -- so whatever root the module body happened to see is the root every
 # one of those call sites uses for the rest of the process.
 #
