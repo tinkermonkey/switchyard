@@ -29,7 +29,7 @@ from unittest.mock import patch, MagicMock, AsyncMock, call
 # ---------------------------------------------------------------------------
 
 def _import_tracker_class(tmp_path):
-    """The tracker CLASS. Plain import, deliberately -- see #221.
+    """The tracker CLASS. Plain import, deliberately -- see #211.
 
     This used to be
 
@@ -475,7 +475,7 @@ class TestCleanupOrphanedExecutionHistory:
 
         # Plain import, explicit state_dir -- see _import_tracker_class above
         # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
-        # was both unnecessary and a session-wide leak (#181, #211, #221).
+        # was both unnecessary and a session-wide leak (#181, #211).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -512,7 +512,7 @@ class TestCleanupOrphanedExecutionHistory:
 
         # Plain import, explicit state_dir -- see _import_tracker_class above
         # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
-        # was both unnecessary and a session-wide leak (#181, #211, #221).
+        # was both unnecessary and a session-wide leak (#181, #211).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -558,7 +558,7 @@ class TestCleanupOrphanedExecutionHistory:
 
         # Plain import, explicit state_dir -- see _import_tracker_class above
         # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
-        # was both unnecessary and a session-wide leak (#181, #211, #221).
+        # was both unnecessary and a session-wide leak (#181, #211).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -592,7 +592,7 @@ class TestCleanupOrphanedExecutionHistory:
 
         # Plain import, explicit state_dir -- see _import_tracker_class above
         # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
-        # was both unnecessary and a session-wide leak (#181, #211, #221).
+        # was both unnecessary and a session-wide leak (#181, #211).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 
@@ -611,7 +611,7 @@ class TestCleanupOrphanedExecutionHistory:
 
         # Plain import, explicit state_dir -- see _import_tracker_class above
         # for why the pop + ORCHESTRATOR_ROOT reassignment that used to be here
-        # was both unnecessary and a session-wide leak (#181, #211, #221).
+        # was both unnecessary and a session-wide leak (#181, #211).
         from services.work_execution_state import WorkExecutionStateTracker
         tracker = WorkExecutionStateTracker(state_dir=state_dir)
 

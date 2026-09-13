@@ -176,7 +176,7 @@ class TestALeakInsertedWhileTestsRanIsCaughtToo:
 
 class TestConftestRestoresBothHalvesOfAReimport:
     """sys.modules is only HALF of what an import binds, and the restore fixture
-    used to put back only that half (#221).
+    used to put back only that half (#211).
 
     `import services.work_execution_state as wes` does not read sys.modules for
     the name it binds: it imports the module, then binds
@@ -191,12 +191,12 @@ class TestConftestRestoresBothHalvesOfAReimport:
     That is not hypothetical: it is why
     tests/unit/scripts/test_dry_run_state_sweep.py's
     TestRuntimeSingletonBinding pair failed in any selection that ran a popping
-    file first. Measured on the pre-#221 tree, fresh root:
+    file first. Measured on the pre-#211 tree, fresh root:
     `pytest tests/unit/services/test_stale_execution_history.py
     tests/unit/scripts/test_dry_run_state_sweep.py` -> 2 failed, 95 passed; with
     the sys.modules half restored but not the package attribute, still 1 failed.
 
-    The three files that did the pop no longer do (#221 removed the workaround
+    The three files that did the pop no longer do (#211 removed the workaround
     at its source), so these pairs are what keep the fixture's other half honest
     for the next one.
 

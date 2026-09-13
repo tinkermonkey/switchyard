@@ -165,7 +165,7 @@ class TestBothHoldoutsUseIt:
             conftest._import_time_singletons_bound_outside_the_state_root()
             live -- FAILS that same selection on the tracker
             test_stale_execution_history.py had left repointed (1 failed, 101
-            passed, before the #221 fix to that file);
+            passed, before the #211 fix to that file);
           * the in-body variant passes the full `pytest tests/unit` run, so the
             full suite would never have shown the difference.
         """

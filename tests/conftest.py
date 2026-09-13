@@ -1915,7 +1915,7 @@ def _restore_process_globals():
             sys.modules[name] = module
         # sys.modules is only HALF of what an import binds, and restoring only
         # that half leaves the two halves disagreeing -- which is worse than
-        # not restoring at all, because it is invisible (#221).
+        # not restoring at all, because it is invisible (#211).
         #
         # `import services.work_execution_state as wes` does NOT read
         # sys.modules for the name it binds: it imports the module, then binds
@@ -1964,7 +1964,7 @@ def _restore_process_globals():
         # Both of the first two failures are in
         # tests/unit/scripts/test_dry_run_state_sweep.py's
         # TestRuntimeSingletonBinding, reading a state_dir under a tmp_path
-        # pytest had already deleted. #221 removed the pop from all three files
+        # pytest had already deleted. #211 removed the pop from all three files
         # that did it; this block is what keeps the next one from being
         # invisible -- tests/unit/test_no_cross_file_module_leakage.py's
         # TestConftestRestoresBothHalvesOfAReimport is its regression test, in

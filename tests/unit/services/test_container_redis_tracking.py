@@ -179,7 +179,7 @@ class TestRegisterActiveContainer:
 
 
 def _import_tracker_class(tmp_path):
-    """The tracker CLASS. Plain import, deliberately -- see #221.
+    """The tracker CLASS. Plain import, deliberately -- see #211.
 
     This used to set ORCHESTRATOR_ROOT to tmp_path and
     sys.modules.pop('services.work_execution_state') to force a re-import,
