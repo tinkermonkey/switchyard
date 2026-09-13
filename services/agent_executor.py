@@ -682,7 +682,7 @@ class AgentExecutor:
                                         f"Cannot continue safely to prevent commits to wrong branch."
                                     )
                                     logger.error(error_msg)
-                                    from agents.non_retryable import NonRetryableAgentError
+                                    from utils.non_retryable import NonRetryableAgentError
                                     raise NonRetryableAgentError(error_msg)
 
                                 logger.info(f"Branch verification passed: confirmed on '{actual_branch}'")
@@ -707,7 +707,7 @@ class AgentExecutor:
                                 )
 
             except Exception as e:
-                from agents.non_retryable import NonRetryableAgentError
+                from utils.non_retryable import NonRetryableAgentError
                 from services.feature_branch_manager import StaleBranchError, BranchPullFailedError
 
                 # Stale branch and pull failures require human intervention:
@@ -952,7 +952,7 @@ class AgentExecutor:
             if issue:
                 issue_body = issue.get('body')
                 if not issue_body or not str(issue_body).strip():
-                    from agents.non_retryable import NonRetryableAgentError
+                    from utils.non_retryable import NonRetryableAgentError
                     raise NonRetryableAgentError(
                         f"Agent {agent_name} cannot execute: issue "
                         f"#{issue.get('number', '?')} ('{issue.get('title', 'unknown')}') "
@@ -1054,7 +1054,7 @@ class AgentExecutor:
                             ) from e
 
                     # NonRetryableAgentError: permanent failure — skip retries
-                    from agents.non_retryable import NonRetryableAgentError
+                    from utils.non_retryable import NonRetryableAgentError
                     if isinstance(e, NonRetryableAgentError):
                         logger.warning(f"Agent {agent_name} hit non-retryable error: {e}")
                         raise
@@ -1273,7 +1273,7 @@ class AgentExecutor:
                                 )
 
                 except Exception as e:
-                    from agents.non_retryable import NonRetryableAgentError
+                    from utils.non_retryable import NonRetryableAgentError
                     if isinstance(e, NonRetryableAgentError):
                         # A deliberate refusal raised by the branch handling above,
                         # not a finalization crash. Must NOT be routed into the
@@ -2373,7 +2373,7 @@ class AgentExecutor:
             build_comment=_lock_timeout_comment,
         )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         raise NonRetryableAgentError(error_detail)
 
     async def _escalate_failsafe_branch_refusal(
@@ -2821,7 +2821,7 @@ class AgentExecutor:
             build_comment=_wrong_branch_comment,
         )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         raise NonRetryableAgentError(error_detail)
 
     def _verify_failsafe_branch(

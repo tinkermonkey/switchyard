@@ -2,7 +2,7 @@ from typing import Dict, Any
 from pipeline.base import PipelineStage
 from claude.claude_integration import run_claude_code
 from prompts import PromptBuilder, PromptContext, IssueContext, ReviewCycleContext
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 from services.cancellation import CancellationError
 from monitoring.claude_code_breaker import ClaudeCodeRateLimitError
 import logging

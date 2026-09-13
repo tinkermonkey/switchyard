@@ -52,7 +52,7 @@ def _require_work_dir(context: Dict[str, Any], agent: str) -> Path:
         )
     return Path(str(raw_work_dir))
 
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 
 
 def _dev_container_state_path(environment: str) -> str:

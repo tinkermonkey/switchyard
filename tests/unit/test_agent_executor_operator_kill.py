@@ -34,7 +34,7 @@ if not os.path.isdir('/app'):
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 from services.agent_executor import AgentExecutor
 from services.cancellation import CancellationError
 

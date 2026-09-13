@@ -118,7 +118,7 @@ class TaskWorker:
                                     break
 
                                 # NonRetryableAgentError: permanent failure — don't retry
-                                from agents.non_retryable import NonRetryableAgentError
+                                from utils.non_retryable import NonRetryableAgentError
                                 if isinstance(e, NonRetryableAgentError):
                                     duration = time.time() - start_time
                                     logger.warning(f"[Worker {self.worker_id}] Task {task.id} non-retryable failure: {e}")

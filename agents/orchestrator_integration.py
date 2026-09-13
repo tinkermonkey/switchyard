@@ -1009,7 +1009,7 @@ async def process_task_integrated(task, state_manager, logger):
                 pipeline_run_id=pipeline_run_id
             )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         raise NonRetryableAgentError(f"Task blocked: {user_message}")
 
     # Record execution start in work execution state.

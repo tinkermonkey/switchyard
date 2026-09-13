@@ -105,7 +105,7 @@ class TestLockTimeoutAbandonsTheReview:
         """phases_completed == 0 raises NonRetryableAgentError, which
         project_monitor treats as requiring human intervention. The timeout must
         reach the caller as itself so the release branch is taken instead."""
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         stage = _stage()
         _, raised = await _run_stage_with_agent_error(

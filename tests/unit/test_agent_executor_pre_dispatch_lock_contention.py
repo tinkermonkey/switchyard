@@ -277,7 +277,7 @@ class TestFinalizationContentionIsNotASuccess:
             mock_config.get_project_config.return_value = project_config
             mock_factory.create.return_value = workspace
 
-            from agents.non_retryable import NonRetryableAgentError
+            from utils.non_retryable import NonRetryableAgentError
             with pytest.raises(NonRetryableAgentError):
                 await agent_executor.execute_agent(
                     agent_name='developer',

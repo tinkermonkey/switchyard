@@ -18,7 +18,7 @@ if not os.path.isdir('/app'):
 from unittest.mock import MagicMock
 
 from services.project_monitor import _end_pr_review_pipeline_run_on_failure
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 
 
 class TestEndPrReviewPipelineRunOnFailure:

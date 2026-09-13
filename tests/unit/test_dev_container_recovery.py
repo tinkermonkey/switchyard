@@ -782,7 +782,7 @@ class TestProcessTaskIntegratedValidation:
     @pytest.mark.asyncio
     async def test_raises_non_retryable_when_needs_dev_setup(self, mock_task, mock_logger):
         """When validation fails with needs_dev_setup, should raise NonRetryableAgentError."""
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with patch('agents.orchestrator_integration.validate_task_can_run', new_callable=AsyncMock) as mock_validate, \
              patch('agents.orchestrator_integration.queue_dev_environment_setup', new_callable=AsyncMock) as mock_queue, \
@@ -809,7 +809,7 @@ class TestProcessTaskIntegratedValidation:
     @pytest.mark.asyncio
     async def test_raises_non_retryable_when_blocked_no_dev_setup(self, mock_task, mock_logger):
         """When validation fails without needs_dev_setup, should still raise NonRetryableAgentError."""
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with patch('agents.orchestrator_integration.validate_task_can_run', new_callable=AsyncMock) as mock_validate, \
              patch('config.manager.config_manager') as mock_config, \
@@ -832,7 +832,7 @@ class TestProcessTaskIntegratedValidation:
     @pytest.mark.asyncio
     async def test_raises_non_retryable_even_when_queue_fails(self, mock_task, mock_logger):
         """If queue_dev_environment_setup fails, should still raise NonRetryableAgentError (not the queue error)."""
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with patch('agents.orchestrator_integration.validate_task_can_run', new_callable=AsyncMock) as mock_validate, \
              patch('agents.orchestrator_integration.queue_dev_environment_setup', new_callable=AsyncMock) as mock_queue, \
@@ -857,7 +857,7 @@ class TestProcessTaskIntegratedValidation:
 
     def test_non_retryable_error_is_runtime_error(self):
         """NonRetryableAgentError is a RuntimeError so worker_pool can distinguish it."""
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert issubclass(NonRetryableAgentError, RuntimeError)
         err = NonRetryableAgentError("test")
         assert isinstance(err, NonRetryableAgentError)

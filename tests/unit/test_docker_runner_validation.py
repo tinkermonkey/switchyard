@@ -256,7 +256,7 @@ class TestSignalTerminationHandling:
         ORCHESTRATOR_ROOT to a scratch directory off-container instead, so the
         real module imports.
         """
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         return NonRetryableAgentError
 
     def test_exit_code_137_raises_non_retryable(self):

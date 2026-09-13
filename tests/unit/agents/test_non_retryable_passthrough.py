@@ -46,7 +46,7 @@ from unittest.mock import AsyncMock, patch
 from agents.base_maker_agent import MakerAgent
 from agents.code_reviewer_agent import CodeReviewerAgent
 from agents.documentation_editor_agent import DocumentationEditorAgent
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 
 
 class _StubMakerAgent(MakerAgent):

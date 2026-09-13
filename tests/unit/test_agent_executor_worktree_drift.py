@@ -110,7 +110,7 @@ class TestADriftedWorktreeBlocksBeforeDispatch:
 
     @pytest.mark.asyncio
     async def test_it_retains_the_board_lock_on_the_first_occurrence(self, agent_executor):
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         harness = await _run(agent_executor, _drift_error())
 
