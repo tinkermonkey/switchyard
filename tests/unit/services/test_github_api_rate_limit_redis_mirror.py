@@ -43,10 +43,22 @@ from services.github_api_client import (
 
 
 def _redis_client():
-    return redis_lib.Redis(
-        host=os.environ.get('REDIS_HOST', 'redis'), port=6379,
-        decode_responses=True, socket_timeout=2,
-    )
+    """Whatever client the production code is actually using right now.
+
+    Was a fresh connection to the real server. That made this file the single
+    largest polluter of the very keys its own fixture docstring worries about:
+    it DELETEs both mirror keys before and after every test in it, and inside
+    the orchestrator container those are the running deployment's, holding the
+    reading #216's cold-start budget pre-flight depends on.
+
+    tests/conftest.py's _keep_the_rate_limit_mirror_in_this_process() swaps in
+    an in-process fake, so asking the module for its client keeps these tests
+    exercising exactly the code path they always did -- a real get/set
+    round-trip through _mirror_rate_limit_to_redis and
+    get_shared_rate_limit_status -- against a store that is this process's own.
+    """
+    import services.github_api_client as github_api_client
+    return github_api_client._get_shared_redis_client()
 
 
 @pytest.fixture
