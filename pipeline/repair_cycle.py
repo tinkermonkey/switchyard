@@ -1396,7 +1396,7 @@ class RepairCycleStage(PipelineStage):
                 # "fix" for a container that was killed, not for a broken test.
                 # Propagated with its type intact, the same way the lock-timeout
                 # clause above and the ClaudeCodeRateLimitError clause earlier do.
-                from agents.non_retryable import NonRetryableAgentError
+                from utils.non_retryable import NonRetryableAgentError
                 if isinstance(e, NonRetryableAgentError):
                     logger.warning(
                         f"Test execution container was terminated (not a test failure) — "

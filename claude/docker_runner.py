@@ -3049,7 +3049,7 @@ class DockerAgentRunner:
                 f"clean. Retryable -- nothing external terminated it: {stderr_excerpt}"
             )
         if exit_code in (137, 143):
-            from agents.non_retryable import NonRetryableAgentError
+            from utils.non_retryable import NonRetryableAgentError
             raise NonRetryableAgentError(
                 f"Agent container was terminated by signal (exit_code={exit_code}): {stderr_excerpt}"
             )

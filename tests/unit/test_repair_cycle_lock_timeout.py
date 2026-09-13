@@ -200,7 +200,7 @@ class TestRunTestsDoesNotRetryATerminatedContainer:
     fix agents against a container that was killed, not a broken test."""
 
     async def test_a_terminated_container_propagates_after_one_attempt(self):
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         stage = _stage()
         executor = _executor_raising(

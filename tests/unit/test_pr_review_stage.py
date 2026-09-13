@@ -586,7 +586,7 @@ async def test_skips_workspace_prep_false(pr_review_stage):
 @pytest.mark.asyncio
 async def test_no_pr_found_raises_error(pr_review_stage):
     """Verify NonRetryableAgentError raised when no PR found"""
-    from agents.non_retryable import NonRetryableAgentError
+    from utils.non_retryable import NonRetryableAgentError
 
     with patch('pipeline.pr_review_stage.pr_review_state_manager') as mock_state, \
          patch.object(pr_review_stage, '_find_pr_url', return_value=None):
@@ -663,7 +663,7 @@ async def test_already_merged_pr_advance_fails_and_comment_fails_escalates(pr_re
     """When the move to Done AND posting the failure warning both fail, the stage
     must raise rather than silently return -- otherwise the issue is stranded
     with zero human-visible signal anywhere."""
-    from agents.non_retryable import NonRetryableAgentError
+    from utils.non_retryable import NonRetryableAgentError
 
     merged_pr = {'number': '77', 'url': 'https://github.com/o/r/pull/77',
                  'headRefName': 'feature/issue-42-thing'}

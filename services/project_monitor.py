@@ -785,7 +785,7 @@ def _end_pr_review_pipeline_run_on_failure(
     # isinstance() below, because it must keep releasing even if a lock timeout
     # ever arrives wrapped in something non-retryable (#148).
     from services.resource_lock_errors import is_lock_timeout_error
-    from agents.non_retryable import NonRetryableAgentError
+    from utils.non_retryable import NonRetryableAgentError
     _is_contention = is_lock_timeout_error(exception)
     if isinstance(exception, NonRetryableAgentError) and not _is_contention:
         marked_ok = pipeline_run_manager.mark_failed(

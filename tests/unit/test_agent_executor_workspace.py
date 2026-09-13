@@ -337,7 +337,7 @@ class TestAgentExecutorWorkspaceIntegration:
         subsequent issue on the board, each repeating the identical failure
         for ~an hour before being reaped.
         """
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         task_context = {
             'issue_number': 793,
@@ -447,7 +447,7 @@ class TestAgentExecutorWorkspaceIntegration:
             mock_prm.mark_failed.return_value = False  # both Redis and YAML writes failed
             mock_get_prm.return_value = mock_prm
 
-            from agents.non_retryable import NonRetryableAgentError
+            from utils.non_retryable import NonRetryableAgentError
             with pytest.raises(NonRetryableAgentError):
                 await agent_executor.execute_agent(
                     agent_name='senior_software_engineer',

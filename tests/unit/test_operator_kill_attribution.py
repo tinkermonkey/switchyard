@@ -36,7 +36,7 @@ if not os.path.isdir('/app'):
 
 from unittest.mock import MagicMock, patch
 
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 from claude.docker_runner import ACTIVE_CONTAINER_TRACKING_TTL_SECONDS, DockerAgentRunner
 
 

@@ -650,7 +650,7 @@ class TestStandDownIsNotRetried:
     message points the operator at."""
 
     def test_it_is_a_non_retryable_agent_error(self):
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         from claude.claude_integration import DevContainerEnvironmentBlocked
 
         assert issubclass(DevContainerEnvironmentBlocked, NonRetryableAgentError), (

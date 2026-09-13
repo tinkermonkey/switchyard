@@ -80,7 +80,7 @@ async def test_validation_error_message_includes_context(mock_task, mock_logger)
         # Import and call process_task_integrated
         from agents.orchestrator_integration import process_task_integrated
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError) as exc_info:
             await process_task_integrated(mock_task, Mock(), mock_logger)
@@ -124,7 +124,7 @@ async def test_recovery_message_is_actionable(mock_task, mock_logger):
         mock_queue.return_value = DevSetupQueueOutcome.QUEUED
 
         from agents.orchestrator_integration import process_task_integrated
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError):
             await process_task_integrated(mock_task, Mock(), mock_logger)
@@ -167,7 +167,7 @@ async def test_in_progress_message_is_clear(mock_task, mock_logger):
         mock_task_queue_cls.return_value.enqueue = Mock(return_value=True)
 
         from agents.orchestrator_integration import process_task_integrated
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError) as exc_info:
             await process_task_integrated(mock_task, Mock(), mock_logger)
@@ -199,7 +199,7 @@ async def test_blocked_message_includes_troubleshooting(mock_task, mock_logger):
         mock_emitter.return_value = mock_decision_emitter
 
         from agents.orchestrator_integration import process_task_integrated
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError):
             await process_task_integrated(mock_task, Mock(), mock_logger)
@@ -348,7 +348,7 @@ async def _dispatch_and_capture_recovery_event(mock_task, mock_logger, outcome):
         mock_queue.return_value = outcome
 
         from agents.orchestrator_integration import process_task_integrated
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
 
         with pytest.raises(NonRetryableAgentError):
             await process_task_integrated(mock_task, Mock(), mock_logger)

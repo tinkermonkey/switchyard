@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.worker_pool import TaskWorker
 from services.cancellation import CancellationError
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 from services.project_checkout_lock import ProjectCheckoutLockTimeoutError
 from services.dev_container_build_lock import DevContainerBuildLockTimeoutError
 

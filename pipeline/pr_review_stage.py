@@ -21,7 +21,7 @@ from config.manager import ConfigManager
 from config.state_manager import GitHubStateManager
 from state_management.pr_review_state_manager import pr_review_state_manager
 from agents.utils import parse_json_block
-from agents.non_retryable import NonRetryableAgentError
+from utils.non_retryable import NonRetryableAgentError
 from monitoring.timestamp_utils import utc_now, utc_isoformat
 from monitoring.observability import EventType
 from monitoring.decision_events import DecisionEventEmitter

@@ -344,7 +344,7 @@ class TestARefusalStopsTheRunInsteadOfAdvancingIt:
             'error': "is on 'scratch' but this dispatch's target is 'feature/issue-5-epic'",
         })
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert isinstance(harness['exception'], NonRetryableAgentError)
 
         outcomes = [
@@ -449,7 +449,7 @@ class TestAnUnverifiableBranchKeepsItsFailsafeRecovery:
         )
 
         harness['failsafe'].assert_called_once()
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert isinstance(harness['exception'], NonRetryableAgentError)
         harness['prm'].mark_failed.assert_called_once()
 
@@ -561,7 +561,7 @@ class TestTheFailsafesOwnRefusalIsNotSilent:
             workspace_context=False,
         )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert isinstance(harness['exception'], NonRetryableAgentError)
         harness['prm'].mark_failed.assert_called_once()
 
@@ -618,7 +618,7 @@ class TestTheFailsafesOwnRefusalIsNotSilent:
             failsafe_refusal=FailsafeBranchCheck(None, True, 'scratch'),
         )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert isinstance(harness['exception'], NonRetryableAgentError)
         harness['prm'].mark_failed.assert_called_once()
 
@@ -634,7 +634,7 @@ class TestTheFailsafesOwnRefusalIsNotSilent:
             failsafe_refusal=FailsafeBranchCheck(None, True, 'scratch'),
         )
 
-        from agents.non_retryable import NonRetryableAgentError
+        from utils.non_retryable import NonRetryableAgentError
         assert isinstance(harness['exception'], NonRetryableAgentError)
         harness['prm'].mark_failed.assert_called_once()
 
