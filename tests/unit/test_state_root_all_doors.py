@@ -33,6 +33,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.utils.repo_sources import first_party_python_sources
+
 # tests/unit/<this file> -> the checkout root.
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -445,9 +447,17 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
         'config/paths.py': 'defines the resolver',
     }
 
-    SKIP_TREES = ('tests', '.claude', '.git', 'node_modules', 'venv', '.venv')
-
     def test_no_module_outside_config_paths_resolves_a_root_itself(self):
+        """Repository-wide, and "repository" means this checkout only (#221).
+
+        The skip tuple this used to carry named five trees and could not
+        express the thing it wanted, which is "a file of this repo": a second
+        checkout under the root -- the ordinary way to measure a before/after
+        -- was scanned as first-party and this guard failed on it. The shared
+        enumerator prunes nested checkouts by looking for their `.git` entry,
+        and deliberately keeps untracked files in scope; see
+        tests/utils/repo_sources.py.
+        """
         import re
 
         pattern = re.compile(
@@ -456,10 +466,7 @@ class TestNothingButTheResolverReadsARootFromTheEnvironment:
 
         offenders = []
         exemptions_used = set()
-        for source in sorted(_REPO_ROOT.rglob('*.py')):
-            relative = source.relative_to(_REPO_ROOT)
-            if relative.parts[0] in self.SKIP_TREES:
-                continue
+        for relative, source in first_party_python_sources(_REPO_ROOT):
             for number, line in enumerate(
                 source.read_text(errors='ignore').splitlines(), 1
             ):

@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from config.state_manager import orchestrator_state_root
+from tests.utils.repo_sources import first_party_python_sources
 
 
 class TestTheResolver:
@@ -970,16 +971,15 @@ EXEMPT_ROOT_OVERRIDES = {
         "the tool",
 }
 
-_SKIP_TREES = ('tests', '.claude', 'node_modules', 'venv', '.venv', '.git',
-               'orchestrator_data', 'state')
-
-
-def _first_party_sources(root):
-    for source in sorted(root.rglob('*.py')):
-        relative = source.relative_to(root)
-        if relative.parts[0] in _SKIP_TREES:
-            continue
-        yield relative, source
+# The two walks below, the #202 grep in test_state_root_all_doors.py and the
+# FileHandler scan in test_log_rotation.py used to keep three different skip
+# tuples between them; this file's was the widest and still could not keep a
+# nested checkout out of the scan (#221). tests/utils/repo_sources.py is now
+# the one enumerator, prunes any directory holding a `.git` entry, and keeps
+# untracked files -- which is the coverage that matters here, since a module
+# written minutes ago and not yet added is exactly where a fresh #181/#203
+# violation lives. Its docstring carries the measurement behind that choice.
+_first_party_sources = first_party_python_sources
 
 
 class TestNoModuleStillDerivesStateFromItsOwnLocation:
