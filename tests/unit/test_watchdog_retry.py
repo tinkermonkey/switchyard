@@ -50,9 +50,11 @@ import threading
 # The full suite hid it, which is why it went unnoticed: an earlier-collected
 # module imports work_execution_state first, under the correct root, so the
 # import here is a no-op and the patch binds nothing. Re-measured on this
-# container after #221 by putting this exact workaround back and running the
-# whole of tests/unit -- 4102 passed, 2 skipped, 0 failed, with the
-# collection-finish guard below silent.
+# container by putting this exact workaround back and running the whole of
+# tests/unit: the same counts as the unmutated tree -- 4104 passed, 2 skipped,
+# 0 failed either way -- with the collection-finish guard below silent. The
+# identity is the claim; the absolute count moves whenever a test is added, so
+# check it against a run of the unmutated tree rather than against this line.
 #
 # test_state_root_isolation.py's
 # test_no_test_file_bound_an_import_time_singleton_outside_the_state_root now
