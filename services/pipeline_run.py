@@ -1737,32 +1737,54 @@ class PipelineRunManager:
 
                     pipeline_queue = get_pipeline_queue_manager(project, pipeline_run.board)
 
-                    # #214: give the freed board to a mid-pipeline dispatch that
-                    # is already waiting on it before falling to the Development
-                    # queue below. get_next_n_waiting_issues() is scoped to the
-                    # pipeline TRIGGER column, so a repair cycle waiting in
-                    # "Testing" cannot appear there; without this the board is
-                    # re-locked for Development work inline and the repair cycle
-                    # finds it busy again on its next poll tick.
+                    # #214: do not re-lock the freed board for Development work
+                    # while a mid-pipeline dispatch is already waiting on it.
+                    # get_next_n_waiting_issues() is scoped to the pipeline
+                    # TRIGGER column, so a repair cycle waiting in "Testing"
+                    # cannot appear there; without this the board is handed
+                    # straight back to Development and the repair cycle finds it
+                    # busy again on its next poll tick, forever.
                     #
-                    # Routed through the process-global ProjectMonitor rather
-                    # than re-implementing dispatch here -- the same accessor and
-                    # the same reasoning as services/pipeline_watchdog.py's use
-                    # of it. None (no monitor registered: unit tests, or any
-                    # process that is not the orchestrator) simply falls through
-                    # to the unchanged Development backfill.
+                    # This site YIELDS the board rather than dispatching the
+                    # waiter itself (found in review). Dispatching would run
+                    # ProjectMonitor.trigger_agent_for_status() ->
+                    # _start_repair_cycle_for_issue() inline on whatever thread
+                    # called end_pipeline_run() -- a GitHub fetch, then
+                    # asyncio.run(resolve_workspace()) taking the project_checkout
+                    # resource lock (10900s budget, services/project_checkout_lock.py),
+                    # then a container launch. end_pipeline_run()'s callers are
+                    # the watchdog's self-heal sweep, review_cycle and the human
+                    # feedback loop; before #214 this site only ever ENQUEUED a
+                    # Task, and a worktree or checkout-lock stall must not start
+                    # blocking those loops. The board simply stays free, and the
+                    # poll-tick failsafe -- which prefers a stalled mid-pipeline
+                    # issue over the Development queue, and runs on the monitor's
+                    # own thread -- dispatches the waiter within one poll
+                    # interval (<= _max_poll_interval, 60s).
+                    #
+                    # A waiter that stops being refreshed ages out of the
+                    # registry (WAIT_ENTRY_STALE_SECONDS), so this can never park
+                    # the Development queue indefinitely.
+                    waiter_has_the_board = False
                     try:
-                        from services.project_monitor import get_project_monitor
-                        _monitor = get_project_monitor()
-                        if _monitor and _monitor.dispatch_waiting_board_lock_waiter(
+                        from services.board_wait_registry import get_board_wait_registry
+                        _waiters = get_board_wait_registry().get_waiters_for_board(
                             project, pipeline_run.board
-                        ):
-                            return True
+                        )
+                        if _waiters:
+                            waiter_has_the_board = True
+                            logger.info(
+                                f"Leaving {project}/{pipeline_run.board} free for waiting "
+                                f"{_waiters[0].kind} issue #{_waiters[0].issue_number} "
+                                f"(waiting {_waiters[0].waited_seconds():.0f}s) rather than "
+                                f"re-locking it for the Development queue after "
+                                f"#{issue_number} ended"
+                            )
                     except Exception as wake_error:
                         logger.warning(
-                            f"Release-driven wake failed for {project}/{pipeline_run.board} "
-                            f"after #{issue_number} ended; falling through to the "
-                            f"Development queue: {wake_error}"
+                            f"Could not check board-lock waiters for "
+                            f"{project}/{pipeline_run.board} after #{issue_number} ended; "
+                            f"falling through to the Development queue: {wake_error}"
                         )
 
                     # Phase 2 (issue #57): "available_slots" is hardcoded to 1 today --
@@ -1772,9 +1794,12 @@ class PipelineRunManager:
                     # the pre-#57 get_next_waiting_issue()-based single attempt. Phase 3a
                     # (out of scope here) is what will eventually make this a real count.
                     available_slots = 1
-                    next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
-                    if not next_issues:
-                        logger.debug(f"No more issues waiting in queue for {project}/{pipeline_run.board}")
+                    if waiter_has_the_board:
+                        next_issues = []
+                    else:
+                        next_issues = pipeline_queue.get_next_n_waiting_issues(available_slots)
+                        if not next_issues:
+                            logger.debug(f"No more issues waiting in queue for {project}/{pipeline_run.board}")
 
                     for next_issue in next_issues:
                         logger.info(f"Attempting to acquire lock for next queued issue #{next_issue['issue_number']} after #{issue_number} completed")

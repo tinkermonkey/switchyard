@@ -1141,7 +1141,9 @@ class TestBoardLockWaitIsRecordedAndReported:
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
         mock_state_manager, mock_task_queue,
     ):
-        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=999)
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(
+            locked_by_issue=999, retained_reason=None
+        )
 
         result, launch_mock, _ = _run_start_repair_cycle(
             mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
@@ -1170,18 +1172,43 @@ class TestBoardLockWaitIsRecordedAndReported:
         assert result is None
         assert self._waiting_issue_numbers() == [100]
 
-    def test_a_retained_lock_is_not_recorded_as_a_wait(
+    def test_a_retained_lock_reaching_the_probe_is_not_recorded_as_a_wait(
         self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
         mock_state_manager, mock_task_queue,
     ):
-        """A retained (mark_failed) lock needs a human to run
-        scripts/release_lock.py — it is not a wait, and registering it would put
-        a waiter on a board the release path will never free, so every release
-        elsewhere would try to wake an issue that cannot run."""
+        """The PRODUCTION shape of a retained lock, and the one the earlier
+        version of this test missed by forcing the probe to read clean.
+
+        mark_lock_failed() sets retained_reason and deliberately leaves
+        lock_status 'locked', so get_lock() hands a retained lock back as an
+        ordinary locked lock and the cheap probe — not the try_acquire_lock()
+        classification below it — is what a retained lock actually reaches.
+
+        It must not be recorded: a retained lock is freed only by a human
+        running scripts/release_lock.py, so a waiter registered against one is a
+        permanent fake that every later release on that board tries to wake.
+        """
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(
+            locked_by_issue=999, retained_reason='repair cycle failed'
+        )
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        assert self._waiting_issue_numbers() == []
+
+    def test_a_retained_lock_found_only_at_the_acquire_is_not_recorded_either(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The narrower race the classification below the probe covers: the
+        probe read clean and the lock was retained between that read and the
+        acquire."""
         retained = Mock(locked_by_issue=999, retained_reason='repair cycle failed')
-        # get_lock() is called twice on this path: once by the cheap probe
-        # (must read clean, so the acquire below is actually reached) and once
-        # to classify the refusal.
         mock_pipeline_lock_manager_auto.get_lock.side_effect = [None, retained]
         mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
             False, 'lock_retained_due_to_failure'
@@ -1242,7 +1269,9 @@ class TestBoardLockWaitIsRecordedAndReported:
         from services.board_wait_registry import get_board_wait_registry
         get_board_wait_registry().record_wait('test-project', 'dev', 100)
 
-        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=100)
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(
+            locked_by_issue=100, retained_reason=None
+        )
         mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, 'already_holds_lock')
 
         result, launch_mock, stage_config = _run_start_repair_cycle(

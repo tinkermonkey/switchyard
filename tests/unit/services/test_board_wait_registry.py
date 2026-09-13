@@ -33,7 +33,6 @@ import pytest
 from config.manager import ConfigManager
 from services.board_wait_registry import (
     WAIT_ENTRY_STALE_SECONDS,
-    WAIT_ESCALATION_SECONDS,
     BoardWaitRegistry,
     get_board_wait_registry,
 )
@@ -132,45 +131,104 @@ class TestBoardWaitRegistry:
         assert is_new is True
         assert waited == 0.0
 
-    def test_a_long_wait_escalates_once_at_warning(self, caplog):
-        """#214: the wait had no escalation of any kind, so a board stalled
-        behind a stuck holder was indistinguishable from an idle one."""
-        reg = BoardWaitRegistry()
-        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
-            reg.record_wait('proj', 'dev', 100, holder_issue=999)
 
-        # Refreshes inside the stale window but past the escalation threshold.
-        # Stepped so the second call is a refresh of the SAME entry, not a
-        # restart -- a restart would reset waiting_since and never escalate.
-        t = 1000.0
-        warnings = []
-        with caplog.at_level(logging.WARNING, logger='services.board_wait_registry'):
-            while t < 1000.0 + WAIT_ESCALATION_SECONDS + 60:
-                t += WAIT_ENTRY_STALE_SECONDS / 2
-                with patch('services.board_wait_registry.time.monotonic', return_value=t):
-                    reg.record_wait('proj', 'dev', 100, holder_issue=999)
-            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+class TestRefreshIsWhatKeepsAWaitAlive:
+    """The review finding this class exists for: nothing on the dispatch path
+    re-records a wait, so an entry is written once and, without an explicit
+    refresher, ages out of WAIT_ENTRY_STALE_SECONDS mid-wait -- silently
+    disabling the wake, the duration report and the escalation for exactly the
+    waits #214 was written for (hours behind senior_software_engineer)."""
 
-        assert len(warnings) == 1, "escalation must fire exactly once, not per tick"
-        assert '#100' in warnings[0].message
-        assert '#999' in warnings[0].message
-
-    def test_a_short_wait_never_escalates(self, caplog):
+    def test_a_wait_longer_than_the_stale_window_survives_if_it_is_refreshed(self):
         reg = BoardWaitRegistry()
         with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
             reg.record_wait('proj', 'dev', 100)
-        with caplog.at_level(logging.WARNING, logger='services.board_wait_registry'):
-            with patch('services.board_wait_registry.time.monotonic',
-                       return_value=1000.0 + WAIT_ESCALATION_SECONDS - 1):
-                reg.record_wait('proj', 'dev', 100)
-        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+        t = 1000.0
+        # Ten stale windows' worth of wait — far longer than the 300s an
+        # unrefreshed entry survives, and the shape of a real wait behind a
+        # multi-hour holder.
+        while t < 1000.0 + WAIT_ENTRY_STALE_SECONDS * 10:
+            t += WAIT_ENTRY_STALE_SECONDS / 2
+            with patch('services.board_wait_registry.time.monotonic', return_value=t):
+                reg.refresh_waiters('proj', 'dev')
+
+        with patch('services.board_wait_registry.time.monotonic', return_value=t):
+            assert [w.issue_number for w in reg.get_waiters_for_board('proj', 'dev')] == [100]
+            # And the duration reported is the WHOLE wait, not the gap since
+            # the last refresh.
+            assert reg.clear_wait('proj', 'dev', 100) == pytest.approx(t - 1000.0)
+
+    def test_an_unrefreshed_wait_is_still_dropped(self):
+        """The refresh must not turn staleness off: a dispatch that stopped
+        waiting stops being refreshed and must stop being woken."""
+        reg = BoardWaitRegistry()
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+        later = 1000.0 + WAIT_ENTRY_STALE_SECONDS + 1
+        with patch('services.board_wait_registry.time.monotonic', return_value=later):
+            assert reg.refresh_waiters('proj', 'dev') == []
+            assert reg._entries == {}
+
+    def test_refresh_is_scoped_to_one_board(self):
+        reg = BoardWaitRegistry()
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+            reg.record_wait('proj', 'other', 101)
+        mid = 1000.0 + WAIT_ENTRY_STALE_SECONDS * 0.75
+        with patch('services.board_wait_registry.time.monotonic', return_value=mid):
+            reg.refresh_waiters('proj', 'dev')
+        later = mid + WAIT_ENTRY_STALE_SECONDS * 0.75
+        with patch('services.board_wait_registry.time.monotonic', return_value=later):
+            assert [w.issue_number for w in reg.get_waiters_for_board('proj', 'dev')] == [100]
+            assert reg.get_waiters_for_board('proj', 'other') == []
+
+    def test_a_long_wait_is_reported_for_escalation_exactly_once(self):
+        """#214: the wait had no escalation of any kind, so a board stalled
+        behind a stuck holder was indistinguishable from an idle one. The
+        threshold is the caller's, so the registry only reports the crossing."""
+        reg = BoardWaitRegistry()
+        threshold = 3600.0
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+
+        t = 1000.0
+        reported = []
+        while t < 1000.0 + threshold + 300.0:
+            t += WAIT_ENTRY_STALE_SECONDS / 2
+            with patch('services.board_wait_registry.time.monotonic', return_value=t):
+                reported.extend(
+                    reg.refresh_waiters('proj', 'dev', escalate_after_seconds=threshold)
+                )
+
+        assert [e.issue_number for e in reported] == [100], \
+            "escalation must be reported exactly once, not on every refresh"
+
+    def test_a_short_wait_is_never_reported_for_escalation(self):
+        reg = BoardWaitRegistry()
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+        with patch('services.board_wait_registry.time.monotonic', return_value=1100.0):
+            assert reg.refresh_waiters('proj', 'dev', escalate_after_seconds=3600.0) == []
+
+    def test_no_threshold_means_no_escalation_reporting(self):
+        reg = BoardWaitRegistry()
+        with patch('services.board_wait_registry.time.monotonic', return_value=1000.0):
+            reg.record_wait('proj', 'dev', 100)
+        with patch('services.board_wait_registry.time.monotonic', return_value=99000.0):
+            assert reg.refresh_waiters('proj', 'dev') == []
 
 
-def _monitor(trigger_return='senior_software_engineer', column='Testing'):
+def _monitor(trigger_return='senior_software_engineer', column='Testing',
+             column_reads_ok=True):
     """A ProjectMonitor with only what dispatch_waiting_board_lock_waiter touches.
 
     ConfigManager is patched where project_monitor looks it up, so the wake's
     repo lookup resolves without any real config on disk.
+
+    The wake resolves the column through get_issue_column_sync_CHECKED, which
+    returns (column, reads_ok) — a board that could not be read must not be
+    reported as a card that is gone.
     """
     config_manager = Mock(spec=ConfigManager)
     config_manager.list_projects.return_value = []
@@ -181,7 +239,9 @@ def _monitor(trigger_return='senior_software_engineer', column='Testing'):
     from services.project_monitor import ProjectMonitor
     monitor = ProjectMonitor(Mock(), config_manager)
     monitor.trigger_agent_for_status = Mock(return_value=trigger_return)
-    monitor.get_issue_column_sync = Mock(return_value=column)
+    monitor.get_issue_column_sync_checked = Mock(
+        return_value=(column, column_reads_ok)
+    )
     return monitor, config_manager
 
 
@@ -206,7 +266,7 @@ class TestReleaseDrivenWake:
         result, lock_manager = self._wake(monitor, cm)
         assert result is None
         monitor.trigger_agent_for_status.assert_not_called()
-        monitor.get_issue_column_sync.assert_not_called()
+        monitor.get_issue_column_sync_checked.assert_not_called()
         lock_manager.get_lock.assert_not_called()
 
     def test_a_registered_waiter_is_dispatched_in_its_current_column(self):
@@ -271,6 +331,22 @@ class TestReleaseDrivenWake:
         assert result is None
         monitor.trigger_agent_for_status.assert_not_called()
         assert get_board_wait_registry().get_waiters_for_board('proj', 'dev') == []
+
+    def test_a_board_that_could_not_be_read_keeps_the_wait(self):
+        """get_issue_column_sync() returns None for a removed card AND for a
+        GraphQL error, a rate limit or an open circuit breaker. Collapsing the
+        two would let one transient board-read failure permanently discard the
+        wait — resetting waiting_since, the duration it will report and its
+        escalation state — and state it in the log as fact."""
+        monitor, cm = _monitor(column=None, column_reads_ok=False)
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+
+        result, _ = self._wake(monitor, cm)
+
+        assert result is None
+        monitor.trigger_agent_for_status.assert_not_called()
+        assert [w.issue_number
+                for w in get_board_wait_registry().get_waiters_for_board('proj', 'dev')] == [100]
 
     def test_a_cancelled_waiter_is_dropped_not_dispatched(self):
         monitor, cm = _monitor()
@@ -352,11 +428,23 @@ class TestReleasePathPrefersTheWaiterOverTheDevelopmentQueue:
         queue.get_next_n_waiting_issues.return_value = []
         return queue
 
-    def test_a_waiting_repair_cycle_wins_the_freed_board(self):
+    def _monitor_for_release(self, wake_result):
         monitor, _cm = _monitor()
         monitor.pipeline_run_manager = Mock()
         monitor.pipeline_run_manager.end_pipeline_run.return_value = True
-        monitor.dispatch_waiting_board_lock_waiter = Mock(return_value=100)
+        monitor.dispatch_waiting_board_lock_waiter = Mock(return_value=wake_result)
+        # The CRITICAL tail of the method under test. Counted, not stubbed away:
+        # a wake that returns out of the function body skips it.
+        pr_checks = []
+
+        async def _record_pr_check(project_name, issue_number, exit_column):
+            pr_checks.append((project_name, issue_number, exit_column))
+
+        monitor._check_pr_ready_on_issue_exit = _record_pr_check
+        return monitor, pr_checks
+
+    def test_a_waiting_repair_cycle_wins_the_freed_board(self):
+        monitor, pr_checks = self._monitor_for_release(wake_result=100)
         queue = self._queue()
 
         self._release(monitor, queue)
@@ -364,18 +452,21 @@ class TestReleasePathPrefersTheWaiterOverTheDevelopmentQueue:
         # The Development backfill must not even be consulted -- consulting it
         # is what re-locked the board out from under the waiter.
         queue.get_next_n_waiting_issues.assert_not_called()
+        # ...but waking a waiter must NOT cost the PR-ready check. It is the
+        # handler that marks an epic's PR ready once its last sub-issue exits,
+        # and a successful wake is exactly the case where an issue just reached
+        # Done/Staged — the case that check exists for.
+        assert pr_checks == [('proj', 50, 'Staged')]
 
     def test_with_no_waiter_the_development_backfill_runs_unchanged(self):
         """The no-op proof for production (capacity 1, nothing waiting)."""
-        monitor, _cm = _monitor()
-        monitor.pipeline_run_manager = Mock()
-        monitor.pipeline_run_manager.end_pipeline_run.return_value = True
-        monitor.dispatch_waiting_board_lock_waiter = Mock(return_value=None)
+        monitor, pr_checks = self._monitor_for_release(wake_result=None)
         queue = self._queue()
 
         self._release(monitor, queue)
 
         queue.get_next_n_waiting_issues.assert_called_once_with(1)
+        assert pr_checks == [('proj', 50, 'Staged')]
 
 
 class TestWakeReentrancy:
@@ -466,15 +557,24 @@ class TestWakeReentrancy:
                 assert same_board is False
 
 
-class TestEndPipelineRunReleaseSitePrefersTheWaiter:
+
+
+class TestEndPipelineRunReleaseSiteYieldsTheBoardToTheWaiter:
     """The SECOND release-time backfill site #214 names:
     PipelineRunManager.end_pipeline_run(). Same trigger-column-only blindness as
     the project_monitor site, reached on a different path (a run ending rather
     than an issue reaching an exit column), so it needs its own wiring and its
     own proof.
 
+    It YIELDS the board rather than dispatching the waiter, and that asymmetry
+    is the point (review round): this method is called from the watchdog's
+    self-heal sweep, review_cycle and the human feedback loop, and a repair-cycle
+    dispatch here would run a GitHub fetch, a worktree resolution under the
+    project_checkout lock and a container launch on those callers' threads.
+    Before #214 this site only ever enqueued a Task.
+
     Driven against a REAL PipelineLockManager holding a real lock, so the
-    release the wake follows is a real release, not a mocked one.
+    release the yield follows is a real release, not a mocked one.
     """
 
     def _manager_and_lock(self, tmp_dir):
@@ -494,7 +594,7 @@ class TestEndPipelineRunReleaseSitePrefersTheWaiter:
         lock_manager = PipelineLockManager(state_dir=Path(tmp_dir), use_redis=False)
         return manager, lock_manager, mock_redis
 
-    def _end_run(self, tmp_path, wake_result):
+    def _end_run(self, tmp_path, caplog, register_waiter):
         import json
         manager, lock_manager, mock_redis = self._manager_and_lock(str(tmp_path))
         assert lock_manager.try_acquire_lock('proj', 'board', 159) == (True, 'lock_acquired')
@@ -508,58 +608,212 @@ class TestEndPipelineRunReleaseSitePrefersTheWaiter:
             json.dumps(run.to_dict()) if key == manager._get_redis_key(run.id) else None
         )
 
+        if register_waiter:
+            get_board_wait_registry().record_wait('proj', 'board', 100)
+
         queue = Mock()
         queue.get_next_n_waiting_issues.return_value = []
+        # A registered global monitor, so "no dispatch happened" is a real
+        # assertion rather than an artifact of there being nothing to call.
         monitor = Mock()
-        monitor.dispatch_waiting_board_lock_waiter = Mock(return_value=wake_result)
 
-        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
+        with caplog.at_level(logging.INFO, logger='services.pipeline_run'), \
+             patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
                    return_value=lock_manager), \
              patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
                    return_value=queue), \
              patch('services.project_monitor.get_project_monitor', return_value=monitor):
-            manager.end_pipeline_run(
+            ended = manager.end_pipeline_run(
                 project='proj', issue_number=159, reason='done', retain_lock=False,
             )
-        return queue, monitor
+        return queue, monitor, ended, caplog.messages
 
-    def test_a_waiting_repair_cycle_wins_the_freed_board(self, tmp_path):
-        queue, monitor = self._end_run(tmp_path, wake_result=100)
+    def test_a_waiting_repair_cycle_keeps_the_freed_board(self, tmp_path, caplog):
+        queue, monitor, ended, messages = self._end_run(
+            tmp_path, caplog, register_waiter=True
+        )
 
-        monitor.dispatch_waiting_board_lock_waiter.assert_called_once_with('proj', 'board')
+        assert ended is True
+        # Consulting the Development queue is what re-locked the board out from
+        # under the waiter.
         queue.get_next_n_waiting_issues.assert_not_called()
+        # ...and the wait is not dispatched from this thread.
+        monitor.dispatch_waiting_board_lock_waiter.assert_not_called()
+        monitor.trigger_agent_for_status.assert_not_called()
+        # The terminal completion line still runs. An early `return True` at the
+        # yield would have skipped it, leaving a run that ended with no "Ended
+        # pipeline run" line anywhere in the log.
+        assert any(m.startswith('Ended pipeline run') for m in messages), messages
 
-    def test_with_no_waiter_the_development_backfill_runs_unchanged(self, tmp_path):
+    def test_with_no_waiter_the_development_backfill_runs_unchanged(self, tmp_path, caplog):
         """The no-op proof for this site: production at capacity 1 with nothing
         waiting must behave exactly as it did before #214."""
-        queue, monitor = self._end_run(tmp_path, wake_result=None)
+        queue, monitor, ended, messages = self._end_run(
+            tmp_path, caplog, register_waiter=False
+        )
 
-        monitor.dispatch_waiting_board_lock_waiter.assert_called_once()
+        assert ended is True
+        queue.get_next_n_waiting_issues.assert_called_once_with(1)
+        monitor.dispatch_waiting_board_lock_waiter.assert_not_called()
+        assert any(m.startswith('Ended pipeline run') for m in messages), messages
+
+    def test_a_waiter_on_a_different_board_does_not_hold_this_one(self, tmp_path, caplog):
+        get_board_wait_registry().record_wait('proj', 'other-board', 100)
+        queue, _monitor, ended, _messages = self._end_run(
+            tmp_path, caplog, register_waiter=False
+        )
+
+        assert ended is True
         queue.get_next_n_waiting_issues.assert_called_once_with(1)
 
-    def test_no_registered_monitor_falls_through_to_the_development_backfill(self, tmp_path):
-        """end_pipeline_run runs in processes that never register a monitor."""
-        import json
-        manager, lock_manager, mock_redis = self._manager_and_lock(str(tmp_path))
-        lock_manager.try_acquire_lock('proj', 'board', 159)
-        run = manager.create_pipeline_run(
-            issue_number=159, issue_title='t', issue_url='u',
-            project='proj', board='board',
-        )
-        mock_redis.hget.return_value = run.id
-        mock_redis.get.side_effect = lambda key: (
-            json.dumps(run.to_dict()) if key == manager._get_redis_key(run.id) else None
-        )
-        queue = Mock()
-        queue.get_next_n_waiting_issues.return_value = []
 
+class TestTheFailsafeIsWhatKeepsWaitsAlive:
+    """Wiring proof for the review finding: the registry's refresh has exactly
+    one production caller, and it is the failsafe's busy-board abort. Without
+    that call every wait longer than WAIT_ENTRY_STALE_SECONDS dies mid-wait,
+    because nothing else on any path re-records it."""
+
+    def _failsafe(self, monitor, lock):
+        lock_manager = Mock()
+        lock_manager.get_lock.return_value = lock
+        pipeline = Mock()
+        pipeline.board_name = 'dev'
+        pipeline.active = True
+        project_config = Mock()
+        project_config.pipelines = [pipeline]
+        project_config.github = {'repo': 'test-repo'}
+        monitor.config_manager.list_visible_projects.return_value = ['proj']
+        monitor.config_manager.get_project_config.return_value = project_config
+        monitor._reconcile_stale_state = Mock()
         with patch('services.pipeline_lock_manager.get_pipeline_lock_manager',
                    return_value=lock_manager), \
              patch('services.pipeline_queue_manager.get_pipeline_queue_manager',
-                   return_value=queue), \
-             patch('services.project_monitor.get_project_monitor', return_value=None):
-            manager.end_pipeline_run(
-                project='proj', issue_number=159, reason='done', retain_lock=False,
-            )
+                   return_value=Mock()):
+            monitor._check_and_process_waiting_issues_failsafe()
 
-        queue.get_next_n_waiting_issues.assert_called_once_with(1)
+    def test_a_busy_board_refreshes_its_registered_waits(self):
+        """Backdated to just inside the stale window first: without the refresh
+        the entry is one tick from being pruned and the wake it exists for stops
+        firing, which is precisely the wait-longer-than-five-minutes case."""
+        import time as _time
+
+        monitor, _cm = _monitor()
+        monitor._find_stalled_issues_for_pipeline = Mock(return_value=[])
+        reg = get_board_wait_registry()
+        reg.record_wait('proj', 'dev', 100)
+        entry = reg.get_waiters_for_board('proj', 'dev')[0]
+        entry.waiting_since = _time.monotonic() - (WAIT_ENTRY_STALE_SECONDS - 1)
+        entry.last_seen_at = entry.waiting_since
+
+        self._failsafe(monitor, Mock(lock_status='locked', locked_by_issue=999))
+
+        assert _time.monotonic() - entry.last_seen_at < 1.0, \
+            "the failsafe's busy-board abort must refresh the board's waits"
+        # And the whole wait is still what gets reported, not the gap since the
+        # refresh.
+        assert reg.clear_wait('proj', 'dev', 100) == pytest.approx(
+            WAIT_ENTRY_STALE_SECONDS - 1, abs=2.0
+        )
+
+    def test_a_free_board_does_not_reach_the_refresh(self):
+        """The refresh hangs off the busy-board abort specifically. On a free
+        board the failsafe proceeds to its stalled scan, which is the path that
+        actually dispatches the waiter."""
+        import time as _time
+
+        monitor, _cm = _monitor()
+        monitor._find_stalled_issues_for_pipeline = Mock(return_value=[])
+        reg = get_board_wait_registry()
+        reg.record_wait('proj', 'dev', 100)
+        entry = reg.get_waiters_for_board('proj', 'dev')[0]
+        stamped_at = _time.monotonic() - 120.0
+        entry.last_seen_at = stamped_at
+
+        self._failsafe(monitor, Mock(lock_status='unlocked', locked_by_issue=None))
+
+        assert entry.last_seen_at == stamped_at
+
+    def test_a_long_wait_is_escalated_once_with_the_holder_named(self, caplog):
+        monitor, _cm = _monitor()
+        monitor._find_stalled_issues_for_pipeline = Mock(return_value=[])
+        monitor._max_agent_timeout_seconds = Mock(return_value=1.0)
+        get_board_wait_registry().record_wait('proj', 'dev', 100)
+        import time as _time
+        entry = get_board_wait_registry().get_waiters_for_board('proj', 'dev')[0]
+        entry.waiting_since = _time.monotonic() - 7200.0
+
+        lock = Mock(lock_status='locked', locked_by_issue=999)
+        with caplog.at_level(logging.WARNING, logger='services.project_monitor'):
+            self._failsafe(monitor, lock)
+            self._failsafe(monitor, lock)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, "escalation must fire once per wait, not per tick"
+        assert '#100' in warnings[0].message
+        assert '#999' in warnings[0].message
+
+
+class TestColumnResolutionSeparatesGoneFromUnreadable:
+    """get_issue_column_sync() answers None for a removed card AND for every
+    failure — no project state, no board state, a GraphQL error, a rate limit,
+    an open circuit breaker. Callers that act destructively on "gone" need the
+    two apart, so the wake uses the _checked variant."""
+
+    def _monitor_with_items(self, items, board_state=True, project_state=True):
+        monitor, _cm = _monitor()
+        # _monitor() stubs the checked resolver for the wake's sake; this class
+        # is testing the real one.
+        del monitor.get_issue_column_sync_checked
+        project_config = Mock()
+        project_config.github = {'org': 'test-org'}
+        monitor.config_manager.get_project_config.return_value = project_config
+        monitor.get_project_items = Mock(return_value=items)
+        state = Mock()
+        state.boards = {'dev': Mock(project_number=7)} if board_state else {}
+        return monitor, (state if project_state else None)
+
+    def _resolve(self, monitor, state):
+        with patch('config.state_manager.state_manager') as sm:
+            sm.load_project_state.return_value = state
+            return monitor.get_issue_column_sync_checked('proj', 'dev', 100)
+
+    def test_a_found_card_reports_its_column_and_a_good_read(self):
+        monitor, state = self._monitor_with_items(
+            [Mock(issue_number=100, status='Testing')]
+        )
+        assert self._resolve(monitor, state) == ('Testing', True)
+
+    def test_a_card_absent_from_a_readable_board_is_genuinely_gone(self):
+        monitor, state = self._monitor_with_items(
+            [Mock(issue_number=101, status='Development')]
+        )
+        assert self._resolve(monitor, state) == (None, True)
+
+    def test_an_empty_item_list_is_an_unreadable_board_not_an_empty_one(self):
+        """get_project_items() returns [] for an open circuit breaker, a failed
+        board query and a parse failure alike. Every caller here is asking about
+        a board that has at least this issue's card on it."""
+        monitor, state = self._monitor_with_items([])
+        assert self._resolve(monitor, state) == (None, False)
+
+    def test_missing_project_state_is_an_unreadable_board(self):
+        monitor, state = self._monitor_with_items([], project_state=False)
+        assert self._resolve(monitor, state) == (None, False)
+
+    def test_missing_board_state_is_an_unreadable_board(self):
+        monitor, state = self._monitor_with_items([], board_state=False)
+        assert self._resolve(monitor, state) == (None, False)
+
+    def test_a_raising_board_query_is_an_unreadable_board(self):
+        monitor, state = self._monitor_with_items([])
+        monitor.get_project_items = Mock(side_effect=RuntimeError('rate limited'))
+        assert self._resolve(monitor, state) == (None, False)
+
+    def test_the_plain_accessor_still_returns_just_the_column(self):
+        """Its several existing callers are unchanged."""
+        monitor, state = self._monitor_with_items(
+            [Mock(issue_number=100, status='Testing')]
+        )
+        with patch('config.state_manager.state_manager') as sm:
+            sm.load_project_state.return_value = state
+            assert monitor.get_issue_column_sync('proj', 'dev', 100) == 'Testing'

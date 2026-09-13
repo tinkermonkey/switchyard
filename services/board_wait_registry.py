@@ -17,9 +17,18 @@ adds is the two properties that rework left open (#214):
    and the waiting repair cycle only gets another chance on the next poll tick
    -- where ``_check_and_process_waiting_issues_failsafe()`` then finds the
    board locked again. This registry is the cheap, GitHub-free channel that
-   lets the release path see the waiter and give it the board first, applying
-   the same "mid-pipeline beats Development" preference the poll-time failsafe
-   already documents.
+   lets the release paths see the waiter, applying the same "mid-pipeline beats
+   Development" preference the poll-time failsafe already documents.
+
+   The two sites use it differently, and deliberately.
+   ``_release_pipeline_lock_and_process_next()`` already dispatches inline (via
+   ``_trigger_next_issue_with_rollback``), so it dispatches the waiter inline
+   too -- ``ProjectMonitor.dispatch_waiting_board_lock_waiter()``.
+   ``end_pipeline_run()`` only ever enqueued a Task, and is called from the
+   watchdog's self-heal sweep, ``review_cycle`` and the human feedback loop; it
+   therefore only *yields* the board (skips its Development backfill) and lets
+   the poll-tick failsafe do the dispatch on the monitor's own thread, rather
+   than blocking those callers on a worktree resolution and a container launch.
 
 2. **Observability.** A wait previously emitted nothing at all on the cheap
    lock-probe path (``_start_repair_cycle_for_issue``'s early-out) -- no log
@@ -29,11 +38,11 @@ adds is the two properties that rework left open (#214):
 
 Scope and lifetime
 ------------------
-Process-global and in-memory, deliberately. Both the recorder (the dispatch
-path) and both readers (the two release paths) run inside the single
-orchestrator process, so shared memory is sufficient and avoids adding a Redis
-dependency -- and therefore a new failure mode -- to the release path, which is
-on the critical path of every stage completion.
+Process-global and in-memory, deliberately. The recorder (the dispatch path)
+and the readers (the two release paths and the poll-tick refresher) all run
+inside the single orchestrator process, so shared memory is sufficient and
+avoids adding a Redis dependency -- and therefore a new failure mode -- to the
+release path, which is on the critical path of every stage completion.
 
 Losing the registry (a restart) costs nothing but the wake: the wait itself
 lives in GitHub board state, and ``_find_stalled_issues_for_pipeline()`` +
@@ -43,12 +52,18 @@ re-validates the column, the cancellation signal and the lock itself, exactly
 as the failsafe's own stalled-issue path does.
 
 Staleness is bounded by ``last_seen_at`` rather than by trying to clear the
-entry on every one of ``_start_repair_cycle_for_issue``'s many return paths. A
-genuinely-still-waiting dispatch re-records on every poll tick (15s on an
-active board, up to the 60s ``_max_poll_interval`` on a fully idle one -- both
-literals read from ``services/project_monitor.py``), so a refresh window
-several times the slowest tick separates "still waiting" from "gone" without
-needing the dispatch path to be exhaustive about cleanup.
+entry on every one of ``_start_repair_cycle_for_issue``'s many return paths.
+
+What refreshes ``last_seen_at`` is ``refresh_waiters()``, called from
+``ProjectMonitor._refresh_board_lock_waits()`` at the poll-tick failsafe's
+busy-board abort. That is deliberate and it is the only refresher, because the
+dispatch path does NOT re-record: while the board is locked the failsafe aborts
+that board before it reaches the stalled-issue scan (``break  # Pipeline busy,
+skip``), and the only other routes into ``_start_repair_cycle_for_issue`` are a
+board status change or ``item_added`` -- and a card parked in "Testing" waiting
+for the lock is not moving. So ``record_wait()`` runs once, at the moment of the
+refusal, and an entry that nothing refreshed would age out mid-wait, taking the
+wake, the waited-duration report and the escalation with it.
 """
 
 import logging
@@ -100,24 +115,23 @@ def wake_reentrancy_guard(project: str, board: str):
 
 
 # An entry not refreshed within this many seconds is treated as gone and is
-# neither woken nor reported. Sized against the poll cadence that does the
-# refreshing, not guessed: a waiting repair cycle re-records once per poll tick,
-# and the slowest tick the monitor will ever take is `_max_poll_interval = 60`
-# (services/project_monitor.py, the fully-idle backoff ceiling). 300s is five of
-# those, so a live waiter cannot age out even if several consecutive ticks are
-# slow or skipped, while a waiter that genuinely stopped waiting stops being
-# woken within a few minutes.
+# neither woken nor reported. Sized against the cadence of the one thing that
+# actually refreshes it -- ProjectMonitor._refresh_board_lock_waits(), driven by
+# the poll-tick failsafe, which runs once per monitor cycle. That cycle's sleep
+# is _next_cycle_sleep_seconds(), the minimum time-until-due across tracked
+# boards, and every per-board interval is capped at `_max_poll_interval = 60`
+# (services/project_monitor.py), so the slowest refresh interval the monitor
+# will take is 60s plus the cycle's own work. 300s is five of those: a live
+# waiter cannot age out over several slow or skipped ticks, while a waiter that
+# genuinely stopped waiting stops being woken within a few minutes.
+#
+# The one window where nothing refreshes is a cycle that never reaches the
+# failsafe at all -- monitor_projects() `continue`s above it while a circuit
+# breaker is open. A wait that spans such a window ages out, and the board falls
+# back to exactly the pre-#214 behaviour: the poll-tick failsafe picks the
+# stalled issue up once the board is free. Degraded, not broken, and not worth
+# a second refresher on the breaker path, where no dispatch is happening anyway.
 WAIT_ENTRY_STALE_SECONDS = 300.0
-
-# A wait longer than this is reported once, at WARNING, as a potential stall.
-# This is an escalation threshold, not a timeout: nothing gives up, nothing is
-# evicted, and the wait continues exactly as before -- the only effect is that
-# the board becomes alertable instead of silent. 1800s (30 min) is above the
-# longest ordinary holder this would legitimately queue behind except
-# senior_software_engineer, whose agent timeout is 10800s
-# (config/foundations/agents.yaml); waits behind that agent are expected to trip
-# this, and a single WARNING naming the holder is the correct outcome there too.
-WAIT_ESCALATION_SECONDS = 1800.0
 
 
 @dataclass
@@ -153,18 +167,20 @@ class BoardWaitRegistry:
         board: str,
         issue_number: int,
         kind: str = "repair_cycle",
-        holder_issue: Optional[int] = None,
     ) -> Tuple[float, bool]:
         """Note that ``issue_number`` is waiting for ``project``/``board``.
 
-        Idempotent across poll ticks: the first call starts the clock, every
-        later call only refreshes ``last_seen_at``, so ``waited_seconds`` keeps
-        measuring the whole wait rather than the gap since the last tick.
+        Idempotent: the first call starts the clock, any later call only
+        refreshes ``last_seen_at``, so ``waited_seconds`` keeps measuring the
+        whole wait rather than the gap since the last call. In practice the
+        dispatch path reaches this exactly once per wait (see the module
+        docstring); keeping it idempotent costs nothing and means a wait that a
+        board move does re-enter is not silently restarted.
 
         Returns:
             ``(waited_seconds, is_new)`` -- ``is_new`` is True only for the call
             that started the wait, which is what lets the caller log "started
-            waiting" once instead of on every tick.
+            waiting" once rather than on every call.
         """
         now = time.monotonic()
         key = (project, board, issue_number)
@@ -185,22 +201,51 @@ class BoardWaitRegistry:
                 return 0.0, True
 
             entry.last_seen_at = now
-            waited = entry.waited_seconds(now)
-            should_escalate = (not entry.escalated) and waited >= WAIT_ESCALATION_SECONDS
-            if should_escalate:
-                entry.escalated = True
+            return entry.waited_seconds(now), False
 
-        if should_escalate:
-            holder = f"issue #{holder_issue}" if holder_issue else "another issue"
-            logger.warning(
-                f"{kind} for issue #{issue_number} has been waiting "
-                f"{waited:.0f}s for the pipeline lock on {project}/{board} "
-                f"(held by {holder}). Not a timeout — the wait continues and the "
-                f"board will be handed over on release — but a wait this long "
-                f"means the holder is long-running or stuck; check the holder "
-                f"before assuming the waiter is at fault."
-            )
-        return waited, False
+    def refresh_waiters(
+        self,
+        project: str,
+        board: str,
+        escalate_after_seconds: Optional[float] = None,
+    ) -> List[BoardWaitEntry]:
+        """Mark every live waiter on this board as still waiting.
+
+        This is what keeps an entry alive, and the only thing that does -- the
+        dispatch path writes an entry once, at the moment of the refusal, and
+        never returns to it (module docstring). Without this call every wait
+        longer than ``WAIT_ENTRY_STALE_SECONDS`` would age out mid-wait: the
+        release-driven wake would stop firing, ``clear_wait()`` would stop
+        returning a duration to report, and no wait could ever grow long enough
+        to escalate.
+
+        ``escalate_after_seconds`` is passed in rather than defined here because
+        the threshold is the caller's to choose -- ProjectMonitor reads it from
+        config/foundations/agents.yaml rather than restating a number.
+
+        Returns:
+            The entries that crossed ``escalate_after_seconds`` on this call, so
+            the caller reports each long wait exactly once. Empty when the
+            threshold is None or nothing crossed it.
+        """
+        now = time.monotonic()
+        newly_escalated: List[BoardWaitEntry] = []
+        with self._lock:
+            for key, entry in list(self._entries.items()):
+                if (now - entry.last_seen_at) > WAIT_ENTRY_STALE_SECONDS:
+                    del self._entries[key]
+                    continue
+                if entry.project != project or entry.board != board:
+                    continue
+                entry.last_seen_at = now
+                if (
+                    escalate_after_seconds is not None
+                    and not entry.escalated
+                    and entry.waited_seconds(now) >= escalate_after_seconds
+                ):
+                    entry.escalated = True
+                    newly_escalated.append(entry)
+        return newly_escalated
 
     def clear_wait(
         self, project: str, board: str, issue_number: int

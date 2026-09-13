@@ -44,7 +44,7 @@ def _monitor():
     cm.get_project_config.return_value = pc
     m = ProjectMonitor(Mock(), cm)
     m.trigger_agent_for_status = Mock(return_value='senior_software_engineer')
-    m.get_issue_column_sync = Mock(return_value='Testing')
+    m.get_issue_column_sync_checked = Mock(return_value=('Testing', True))
     return m, cm
 
 
@@ -84,7 +84,7 @@ def main():
     _report("COST on release with NO waiter (production common case at capacity 1):",
             idle)
 
-    # 2. A waiter present -- the wake actually dispatching. get_issue_column_sync
+    # 2. A waiter present -- the wake actually dispatching. the column lookup
     #    and trigger_agent_for_status are mocked, so this measures the wake's own
     #    overhead, not the dispatch it hands off to.
     monitor, cm = _monitor()
