@@ -1422,10 +1422,63 @@ class GitHubAPIClient:
         reading that does not exist is the safe direction: skipping work on a
         made-up number is worse than doing the work.
         """
-        bucket = self._bucket(self._resolve_credential(), 'graphql')
-        if not bucket.ever_updated or bucket.limit <= 0:
+        credential = self._resolve_credential()
+        bucket = self._bucket(credential, 'graphql')
+        if bucket.ever_updated and bucket.limit > 0:
+            return max(0.0, bucket.remaining / bucket.limit)
+        # This process has made no GitHub call yet, so its in-memory bucket
+        # holds only constructor defaults. That is precisely the moment a
+        # restart is about to spend several hundred calls, so falling back to
+        # the Redis mirror is not an optimisation -- without it this method
+        # returns None for the whole startup burst and any caller gating on it
+        # is inert exactly when it matters. The mirror exists to survive a
+        # restart; this is what makes it do so.
+        return self._budget_fraction_from_mirror(credential, 'graphql')
+
+    def _budget_fraction_from_mirror(
+        self, credential: str, resource: str
+    ) -> Optional[float]:
+        """Last reading for this (credential, resource) as persisted to Redis,
+        or None if there isn't a usable one.
+
+        None for every failure -- no Redis, no key, unparseable JSON, missing
+        or non-numeric fields -- because the caller's contract is that None
+        means "unknown", and a mirror that cannot be read is the definition of
+        unknown. Never raises: this runs on the startup path, and a rate-limit
+        reading is not worth failing a boot over.
+
+        A reading whose window has already reset is also None, not a low
+        number. GitHub's quota refills at reset_time, so a reading of
+        1177/5000 taken at 10:18 says nothing at all about the budget at
+        10:25 if the window turned over at 10:19 -- and reporting it as 24%
+        would defer work against a quota that is actually full. This is the
+        common case after any outage or overnight gap, not a corner.
+        """
+        try:
+            client = _get_shared_redis_client()
+            raw = client.get(self._redis_key_for(credential, resource))
+            if not raw:
+                return None
+            data = json.loads(raw)
+
+            remaining, limit = data.get('remaining'), data.get('limit')
+            if not isinstance(remaining, (int, float)):
+                return None
+            if not isinstance(limit, (int, float)) or limit <= 0:
+                return None
+
+            reset_time = data.get('reset_time')
+            if reset_time:
+                reset_at = datetime.fromisoformat(str(reset_time))
+                if reset_at.tzinfo is None:
+                    reset_at = reset_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= reset_at:
+                    return None
+
+            return max(0.0, remaining / limit)
+        except Exception as e:
+            logger.debug(f"Could not read the {credential}/{resource} rate-limit mirror: {e}")
             return None
-        return max(0.0, bucket.remaining / bucket.limit)
 
     def _redis_key_for(self, credential: str, resource: str) -> str:
         keys = (

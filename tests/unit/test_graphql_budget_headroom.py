@@ -31,13 +31,30 @@ import services.github_project_manager as gpm
 from services.github_api_client import GitHubAPIClient
 
 
+@pytest.fixture
+def _no_mirror():
+    """Isolate from the Redis rate-limit mirror.
+
+    Not optional. These tests are about what the IN-MEMORY bucket reports, and
+    the mirror is consulted whenever that bucket is unpopulated -- so without
+    this they assert None while the suite's live Redis may or may not hold a
+    real reading, depending on whether conftest's purge ran between them. Two
+    of them passed alone and failed in the full suite before this existed.
+    """
+    redis_client = MagicMock()
+    redis_client.get.return_value = None
+    with patch('services.github_api_client._get_shared_redis_client',
+               return_value=redis_client):
+        yield
+
+
 class TestTheBudgetReadingIsHonestAboutNotKnowing:
     """None means unknown. Treating it as healthy is the accident this
     prevents: a bucket that has never seen a real GitHub response still holds
     its 5000/5000 constructor defaults."""
 
     @pytest.fixture
-    def client(self):
+    def client(self, _no_mirror):
         with patch('services.github_api_client.GitHubAPIClient._start_call_trace_summarizer'):
             return GitHubAPIClient()
 
@@ -234,3 +251,104 @@ class TestTheGuardActuallyFires:
                           return_value=True):
 
             assert await manager.reconcile_project('any-project') is True
+
+
+class TestTheColdStartReadsTheMirror:
+    """The gap that made the pre-flight inert on the path it was written for.
+
+    A fresh process has an unpopulated in-memory bucket, so without this the
+    reading is None -- unknown, allowed through -- for the entire startup
+    burst. Caught by deploying it: a restart with the budget at 27% sailed
+    straight past a 25% floor because the guard could not see the 27%.
+    """
+
+    @pytest.fixture
+    def client(self):
+        with patch('services.github_api_client.GitHubAPIClient._start_call_trace_summarizer'):
+            c = GitHubAPIClient()
+        c._bucket(c._resolve_credential(), 'graphql').ever_updated = False
+        return c
+
+    def _mirror(self, payload):
+        redis_client = MagicMock()
+        redis_client.get.return_value = (
+            None if payload is None else __import__('json').dumps(payload)
+        )
+        return patch('services.github_api_client._get_shared_redis_client',
+                     return_value=redis_client)
+
+    def _future(self):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+
+    def _past(self):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+
+    def test_a_cold_start_sees_the_persisted_reading(self, client):
+        with self._mirror({'remaining': 1374, 'limit': 5000,
+                           'reset_time': self._future()}):
+            assert client.graphql_budget_fraction_remaining() == pytest.approx(0.2748)
+
+    def test_a_reading_from_an_expired_window_is_unknown_not_low(self, client):
+        """Quota refills at reset_time. Reporting the old number would defer
+        work against a budget that is actually full."""
+        with self._mirror({'remaining': 12, 'limit': 5000,
+                           'reset_time': self._past()}):
+            assert client.graphql_budget_fraction_remaining() is None
+
+    def test_a_live_in_memory_reading_wins_over_the_mirror(self):
+        with patch('services.github_api_client.GitHubAPIClient._start_call_trace_summarizer'):
+            c = GitHubAPIClient()
+        bucket = c._bucket(c._resolve_credential(), 'graphql')
+        bucket.ever_updated, bucket.limit, bucket.remaining = True, 5000, 4000
+
+        with self._mirror({'remaining': 10, 'limit': 5000,
+                           'reset_time': self._future()}):
+            assert c.graphql_budget_fraction_remaining() == pytest.approx(0.8)
+
+    @pytest.mark.parametrize("payload", [
+        None,
+        {},
+        {'remaining': 100},
+        {'remaining': None, 'limit': 5000},
+        {'remaining': 'lots', 'limit': 5000},
+        {'remaining': 100, 'limit': 0},
+    ])
+    def test_an_unusable_mirror_is_unknown(self, client, payload):
+        with self._mirror(payload):
+            assert client.graphql_budget_fraction_remaining() is None
+
+    def test_redis_being_down_is_unknown_not_a_crash(self, client):
+        """Runs on the startup path; a rate-limit reading is not worth a boot."""
+        with patch('services.github_api_client._get_shared_redis_client',
+                   side_effect=ConnectionError("no redis")):
+            assert client.graphql_budget_fraction_remaining() is None
+
+    def test_the_mirror_key_follows_the_routed_credential(self, client):
+        """An App-routed deployment must not read the PAT's bucket (#168).
+
+        Pinned against the APP key specifically, and asserted as a literal
+        rather than by re-deriving it. Both were wrong at first: this
+        deployment resolves to 'pat', where the two keys are the same string,
+        so `assert get(_redis_key_for(resolved, ...))` passed happily with the
+        lookup hardcoded to the PAT bucket. Mutation caught it; the test now
+        forces the credential that makes the two differ.
+        """
+        from services.github_api_client import (
+            RATE_LIMIT_REDIS_KEYS, RATE_LIMIT_REDIS_KEYS_APP, CREDENTIAL_APP,
+        )
+        assert RATE_LIMIT_REDIS_KEYS_APP['graphql'] != RATE_LIMIT_REDIS_KEYS['graphql'], (
+            "precondition: the two buckets must have distinct keys for this to test anything"
+        )
+
+        redis_client = MagicMock()
+        redis_client.get.return_value = None
+        with patch.object(type(client), '_resolve_credential',
+                          return_value=CREDENTIAL_APP), \
+             patch('services.github_api_client._get_shared_redis_client',
+                   return_value=redis_client):
+            client._bucket(CREDENTIAL_APP, 'graphql').ever_updated = False
+            client.graphql_budget_fraction_remaining()
+
+        redis_client.get.assert_called_once_with(RATE_LIMIT_REDIS_KEYS_APP['graphql'])
