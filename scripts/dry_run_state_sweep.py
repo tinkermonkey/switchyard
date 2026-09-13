@@ -252,11 +252,6 @@ _EMPTY_OUTPUT_GATES: Tuple[Gate, ...] = (
         ),
     ),
     Gate(
-        name='PROTECTION 3 (queue status)',
-        why='the issue is already waiting/active in the pipeline queue',
-        patterns=(r"Skipping \S+/#\d+: already '\w+' in pipeline queue",),
-    ),
-    Gate(
         name='PROTECTION 4 (retry eligibility)',
         why='_should_retry_failed_execution() refused, or the record names no agent/column',
         patterns=(
@@ -276,8 +271,8 @@ _EMPTY_OUTPUT_GATES: Tuple[Gate, ...] = (
     ),
     Gate(
         name='DEGRADED: project config unavailable',
-        why='PROTECTION 2 and 3 both ran without project config for this record',
-        patterns=(r'Could not load project config for .* PROTECTION 2/3 degraded',),
+        why='PROTECTION 2 ran without project config for this record',
+        patterns=(r'Could not load project config for .* PROTECTION 2 degraded',),
         degradation=True,
     ),
     Gate(
@@ -285,7 +280,7 @@ _EMPTY_OUTPUT_GATES: Tuple[Gate, ...] = (
         why='a protection raised and the sweep continued WITHOUT it',
         patterns=(
             r'PROTECTION \d+ \([^)]+\) failed for',
-            r'Could not check (pipeline lock|queue status) for .* PROTECTION \d+ skipped',
+            r'Could not check pipeline lock for .* PROTECTION \d+ skipped',
         ),
         degradation=True,
     ),
