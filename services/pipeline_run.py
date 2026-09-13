@@ -1736,6 +1736,35 @@ class PipelineRunManager:
                     import time
 
                     pipeline_queue = get_pipeline_queue_manager(project, pipeline_run.board)
+
+                    # #214: give the freed board to a mid-pipeline dispatch that
+                    # is already waiting on it before falling to the Development
+                    # queue below. get_next_n_waiting_issues() is scoped to the
+                    # pipeline TRIGGER column, so a repair cycle waiting in
+                    # "Testing" cannot appear there; without this the board is
+                    # re-locked for Development work inline and the repair cycle
+                    # finds it busy again on its next poll tick.
+                    #
+                    # Routed through the process-global ProjectMonitor rather
+                    # than re-implementing dispatch here -- the same accessor and
+                    # the same reasoning as services/pipeline_watchdog.py's use
+                    # of it. None (no monitor registered: unit tests, or any
+                    # process that is not the orchestrator) simply falls through
+                    # to the unchanged Development backfill.
+                    try:
+                        from services.project_monitor import get_project_monitor
+                        _monitor = get_project_monitor()
+                        if _monitor and _monitor.dispatch_waiting_board_lock_waiter(
+                            project, pipeline_run.board
+                        ):
+                            return True
+                    except Exception as wake_error:
+                        logger.warning(
+                            f"Release-driven wake failed for {project}/{pipeline_run.board} "
+                            f"after #{issue_number} ended; falling through to the "
+                            f"Development queue: {wake_error}"
+                        )
+
                     # Phase 2 (issue #57): "available_slots" is hardcoded to 1 today --
                     # PipelineLockManager still enforces exactly one concurrent issue per
                     # (project, board) -- so get_next_n_waiting_issues(1) returns at most

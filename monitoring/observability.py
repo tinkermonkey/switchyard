@@ -186,6 +186,15 @@ class EventType(Enum):
     REPAIR_CYCLE_SYSTEMIC_FIX_STARTED = "repair_cycle_systemic_fix_started"
     REPAIR_CYCLE_SYSTEMIC_FIX_COMPLETED = "repair_cycle_systemic_fix_completed"
 
+    # Repair Cycle Board Pipeline-Lock Wait (#214)
+    # #58 made a repair cycle that finds the board busy WAIT rather than steal
+    # the lock, which is correct — but the wait itself emitted nothing, so a
+    # board stalled behind a long or stuck holder was indistinguishable from an
+    # idle one. STARTED is emitted once per wait (not once per poll tick);
+    # ACQUIRED carries waited_seconds, and only when there was a wait to report.
+    REPAIR_CYCLE_LOCK_WAIT_STARTED = "repair_cycle_lock_wait_started"
+    REPAIR_CYCLE_LOCK_WAIT_ACQUIRED = "repair_cycle_lock_wait_acquired"
+
     # Repair Cycle Container Lifecycle
     REPAIR_CYCLE_CONTAINER_STARTED = "repair_cycle_container_started"
     REPAIR_CYCLE_CONTAINER_CHECKPOINT_UPDATED = "repair_cycle_container_checkpoint_updated"
@@ -529,6 +538,11 @@ class ObservabilityManager:
             EventType.REPAIR_CYCLE_ENV_REBUILD_COMPLETED,
             EventType.REPAIR_CYCLE_SYSTEMIC_FIX_STARTED,
             EventType.REPAIR_CYCLE_SYSTEMIC_FIX_COMPLETED,
+            # Deciding to wait for a busy board, and how long that wait cost,
+            # is a dispatch decision — it belongs in decision-events alongside
+            # the rest of the repair cycle's routing (#214).
+            EventType.REPAIR_CYCLE_LOCK_WAIT_STARTED,
+            EventType.REPAIR_CYCLE_LOCK_WAIT_ACQUIRED,
             # Conversational Loop Routing
             EventType.CONVERSATIONAL_LOOP_STARTED,
             EventType.CONVERSATIONAL_QUESTION_ROUTED,

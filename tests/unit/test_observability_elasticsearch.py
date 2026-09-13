@@ -1009,6 +1009,10 @@ class TestEventTypeCompleteness:
             'repair_cycle_file_fix_started',
             'repair_cycle_fix_cycle_completed',
             'repair_cycle_fix_cycle_started', 'repair_cycle_iteration',
+            # Board pipeline-lock wait (#214) — deciding to wait for a busy
+            # board, and what that wait cost, is a dispatch decision.
+            'repair_cycle_lock_wait_acquired',
+            'repair_cycle_lock_wait_started',
             'repair_cycle_started',
             'repair_cycle_systemic_analysis_completed',
             'repair_cycle_systemic_analysis_started',

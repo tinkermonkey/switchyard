@@ -1105,3 +1105,167 @@ class TestRepairCycleStartupErrorDoesNotReleaseLock:
         ]
         assert len(failures) == 1, f"expected exactly one failure record, got: {history}"
         assert 'worktree' in failures[0].get('error', '')
+
+
+class TestBoardLockWaitIsRecordedAndReported:
+    """#214 finding 2: the wait was completely unobservable.
+
+    The cheap-probe early-out above emitted no log line of its own — it calls
+    _end_owned_run_if_pending(), which returns immediately when there is no
+    phantom run to end (the usual case once the run already exists) — so a
+    repair cycle waiting behind a long-running holder returned None silently,
+    every poll tick, forever. No log, no event, no metric, no escalation.
+
+    These assert on the REGISTRY rather than on log text: the registry entry is
+    what the release-driven wake reads, so it is the load-bearing artifact.
+    Logging and event emission hang off the same record_wait()/clear_wait()
+    calls (see ProjectMonitor._record_board_lock_wait).
+    """
+
+    @pytest.fixture(autouse=True)
+    def clean_registry(self):
+        from services.board_wait_registry import get_board_wait_registry
+        get_board_wait_registry().clear_all()
+        yield
+        get_board_wait_registry().clear_all()
+
+    @staticmethod
+    def _waiting_issue_numbers():
+        from services.board_wait_registry import get_board_wait_registry
+        return [
+            w.issue_number
+            for w in get_board_wait_registry().get_waiters_for_board('test-project', 'dev')
+        ]
+
+    def test_the_cheap_probe_refusal_records_a_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=999)
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result is None
+        launch_mock.assert_not_called()
+        assert self._waiting_issue_numbers() == [100]
+
+    def test_the_try_acquire_busy_refusal_records_a_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """The probe read clean but the acquire then lost the race."""
+        mock_pipeline_lock_manager_auto.get_lock.return_value = None
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
+            False, 'locked_by_another_issue'
+        )
+
+        result, launch_mock, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result is None
+        assert self._waiting_issue_numbers() == [100]
+
+    def test_a_retained_lock_is_not_recorded_as_a_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """A retained (mark_failed) lock needs a human to run
+        scripts/release_lock.py — it is not a wait, and registering it would put
+        a waiter on a board the release path will never free, so every release
+        elsewhere would try to wake an issue that cannot run."""
+        retained = Mock(locked_by_issue=999, retained_reason='repair cycle failed')
+        # get_lock() is called twice on this path: once by the cheap probe
+        # (must read clean, so the acquire below is actually reached) and once
+        # to classify the refusal.
+        mock_pipeline_lock_manager_auto.get_lock.side_effect = [None, retained]
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
+            False, 'lock_retained_due_to_failure'
+        )
+
+        result, _launch, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result is None
+        assert self._waiting_issue_numbers() == []
+
+    def test_lock_state_unknown_is_not_recorded_as_a_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Both stores failed to read. That is an error state, not a queue
+        position, and nothing is freeing a lock that may not exist."""
+        mock_pipeline_lock_manager_auto.get_lock.side_effect = [None, None]
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (
+            False, 'lock_state_unknown_failing_closed'
+        )
+
+        result, _launch, _ = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result is None
+        assert self._waiting_issue_numbers() == []
+
+    def test_acquiring_clears_a_wait_left_by_an_earlier_tick(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Without this the release path would keep waking an issue that is
+        already running, once per lock release, until the entry aged out."""
+        from services.board_wait_registry import get_board_wait_registry
+        get_board_wait_registry().record_wait('test-project', 'dev', 100)
+        assert self._waiting_issue_numbers() == [100]
+
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, 'lock_acquired')
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result == stage_config.default_agent
+        launch_mock.assert_called_once()
+        assert self._waiting_issue_numbers() == []
+
+    def test_carrying_the_lock_over_from_a_prior_stage_also_clears_a_wait(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        from services.board_wait_registry import get_board_wait_registry
+        get_board_wait_registry().record_wait('test-project', 'dev', 100)
+
+        mock_pipeline_lock_manager_auto.get_lock.return_value = Mock(locked_by_issue=100)
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, 'already_holds_lock')
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result == stage_config.default_agent
+        assert self._waiting_issue_numbers() == []
+
+    def test_an_uncontended_dispatch_registers_nothing_at_all(
+        self, mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+        mock_state_manager, mock_task_queue,
+    ):
+        """Production's common case at capacity 1: board free, acquires on the
+        first attempt. No wait is recorded, so there is nothing for any release
+        elsewhere to wake and nothing logged about a wait that never happened."""
+        mock_pipeline_lock_manager_auto.try_acquire_lock.return_value = (True, 'lock_acquired')
+
+        result, launch_mock, stage_config = _run_start_repair_cycle(
+            mock_pipeline_lock_manager_auto, mock_github, mock_config_manager,
+            mock_state_manager, mock_task_queue, issue_number=100,
+        )
+
+        assert result == stage_config.default_agent
+        assert self._waiting_issue_numbers() == []

@@ -4910,6 +4910,24 @@ class ProjectMonitor:
             if not keep_cancelled:
                 signal.clear(project_name, issue_number)
 
+            # #214: offer the freed board to a mid-pipeline dispatch that is
+            # already waiting on it BEFORE pulling from the Development queue.
+            # The get_next_n_waiting_issues() call below only ever sees the
+            # pipeline TRIGGER column, so without this a repair cycle waiting in
+            # "Testing" is skipped here and then finds the board re-locked by the
+            # time its next poll tick runs -- the priority inversion #214 finding
+            # 1 describes. This is the same "mid-pipeline beats Development"
+            # preference _check_and_process_waiting_issues_failsafe() already
+            # applies at poll time, just applied on the release path too.
+            #
+            # No-op when nothing is waiting (the production case at capacity 1):
+            # one in-memory dict scan, returns None, and the Development backfill
+            # below runs exactly as it did before.
+            if self.dispatch_waiting_board_lock_waiter(
+                project_name, board_name, repository
+            ):
+                return
+
             # Process next waiting issue(s). "available_slots" is hardcoded to 1
             # today -- PipelineLockManager still enforces exactly one concurrent
             # issue per (project, board), so get_next_n_waiting_issues(1) returns
@@ -8221,6 +8239,305 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 )
             return None
 
+    def _record_board_lock_wait(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        holder_issue: Optional[int] = None,
+        kind: str = "repair_cycle",
+    ) -> None:
+        """Note that a dispatch is waiting on a busy board lock, and say so once.
+
+        #214. Two jobs, both of which the wait previously did without:
+
+        - Observability. Logs (and emits) exactly once per wait, on the tick
+          that starts it, not on every tick of it. A repair cycle behind
+          senior_software_engineer's 10800s timeout would otherwise produce
+          hundreds of identical lines (one per 15s poll tick) and train
+          operators to filter them out, which is the same as having none.
+          The per-tick refresh still happens -- it is what keeps the entry
+          alive and what drives the long-wait escalation -- it just does not
+          re-log.
+        - The wake. The entry it leaves is what
+          _dispatch_waiting_board_lock_waiter() reads on lock release, and is
+          the only channel by which the release path can see a repair cycle at
+          all: the release backfill asks PipelineQueueManager, which is scoped
+          to the pipeline trigger column ("Development"), and a repair cycle
+          waits in "Testing".
+
+        Never raises. This sits on the dispatch path's refusal branch, where an
+        observability failure must not become a dispatch failure.
+        """
+        try:
+            from services.board_wait_registry import get_board_wait_registry
+
+            waited, is_new = get_board_wait_registry().record_wait(
+                project_name, board_name, issue_number,
+                kind=kind, holder_issue=holder_issue,
+            )
+            if not is_new:
+                return
+
+            held_by = f" (held by issue #{holder_issue})" if holder_issue else ""
+            logger.info(
+                f"⏸️  {kind} for issue #{issue_number} is WAITING for the pipeline "
+                f"lock on {project_name}/{board_name}{held_by}. It will be woken "
+                f"when the lock is released, and re-checked on each poll cycle "
+                f"as a failsafe."
+            )
+            try:
+                from monitoring.observability import get_observability_manager, EventType
+                get_observability_manager().emit(
+                    EventType.REPAIR_CYCLE_LOCK_WAIT_STARTED,
+                    "orchestrator",
+                    f"board_lock_wait_{project_name}_{board_name}_{issue_number}",
+                    project_name,
+                    {
+                        "issue_number": issue_number,
+                        "board": board_name,
+                        "kind": kind,
+                        "holder_issue": holder_issue,
+                    },
+                )
+            except Exception as emit_error:
+                logger.debug(f"Could not emit board-lock wait event: {emit_error}")
+        except Exception as e:
+            logger.debug(f"Could not record board-lock wait for #{issue_number}: {e}")
+
+    def _report_board_lock_wait_acquired(
+        self,
+        project_name: str,
+        board_name: str,
+        issue_number: int,
+        reason: str,
+        kind: str = "repair_cycle",
+    ) -> None:
+        """Close an open board-lock wait and report how long it lasted (#214).
+
+        Silent when there was no wait to close, which is the normal production
+        path: at capacity 1 with a free board the first try_acquire_lock()
+        succeeds, clear_wait() finds nothing and this returns without logging or
+        emitting anything at all.
+
+        Never raises, for the same reason _record_board_lock_wait does not.
+        """
+        try:
+            from services.board_wait_registry import get_board_wait_registry
+
+            waited = get_board_wait_registry().clear_wait(
+                project_name, board_name, issue_number
+            )
+            if waited is None:
+                return
+
+            logger.info(
+                f"▶️  {kind} for issue #{issue_number} ACQUIRED the pipeline lock on "
+                f"{project_name}/{board_name} after waiting {waited:.1f}s ({reason})"
+            )
+            try:
+                from monitoring.observability import get_observability_manager, EventType
+                get_observability_manager().emit(
+                    EventType.REPAIR_CYCLE_LOCK_WAIT_ACQUIRED,
+                    "orchestrator",
+                    f"board_lock_wait_{project_name}_{board_name}_{issue_number}",
+                    project_name,
+                    {
+                        "issue_number": issue_number,
+                        "board": board_name,
+                        "kind": kind,
+                        "waited_seconds": round(waited, 3),
+                        "acquire_reason": reason,
+                    },
+                )
+            except Exception as emit_error:
+                logger.debug(f"Could not emit board-lock acquire event: {emit_error}")
+        except Exception as e:
+            logger.debug(f"Could not report board-lock wait for #{issue_number}: {e}")
+
+    def dispatch_waiting_board_lock_waiter(
+        self, project_name: str, board_name: str, repository: str = None
+    ) -> Optional[int]:
+        """Release-time wake for a mid-pipeline dispatch waiting on this board.
+
+        #214, finding 1. Both release-time backfill sites hand the freed board
+        to ``PipelineQueueManager.get_next_n_waiting_issues()``, which only ever
+        offers issues sitting in the pipeline TRIGGER column ("Development" for
+        sdlc_execution_workflow). A repair cycle waits in "Testing", so it is
+        structurally invisible there: the release path re-locks the board for
+        the next Development issue inline, and the waiting repair cycle's next
+        chance -- the poll-tick failsafe -- then finds the board locked again
+        and breaks. The failsafe's own documented "mid-pipeline beats
+        Development" preference only applies at poll time on a free board, and
+        the release path always gets there first.
+
+        This restores that same preference on the release path, which is what
+        makes the wake prompt (at release, rather than on the next poll tick)
+        AND removes the priority inversion. It deliberately does NOT change
+        wait-vs-steal: nothing is evicted here, this only runs when the board
+        has just been freed.
+
+        Costs nothing on the common path: with no waiter registered for this
+        board it is one in-memory dict scan and an immediate None, with no
+        GitHub call and no lock operation. That is why the wake reads the
+        in-memory registry rather than calling
+        _find_stalled_issues_for_pipeline(), which would add a board fetch to
+        every single lock release.
+
+        Returns:
+            The issue number dispatched, or None if there was no waiter, the
+            board was not actually free, or the dispatch declined. None is
+            always safe: the caller then proceeds to its normal Development
+            backfill exactly as before.
+        """
+        try:
+            from services.board_wait_registry import (
+                get_board_wait_registry,
+                wake_reentrancy_guard,
+            )
+
+            waiters = get_board_wait_registry().get_waiters_for_board(
+                project_name, board_name
+            )
+            if not waiters:
+                return None
+
+            with wake_reentrancy_guard(project_name, board_name) as may_proceed:
+                if not may_proceed:
+                    # The dispatch this wake performs goes through
+                    # trigger_agent_for_status(), which re-enters the release
+                    # path itself when the issue turns out to be in a pipeline
+                    # exit column (those branches call
+                    # _release_pipeline_lock_and_process_next), and that calls
+                    # this method again. See wake_reentrancy_guard's docstring
+                    # for why that recursion does not terminate on its own --
+                    # reverting the guard makes the reentrancy test above die
+                    # with "maximum recursion depth exceeded", measured, not
+                    # theorised.
+                    logger.debug(
+                        f"Wake for {project_name}/{board_name} is already in "
+                        f"progress on this thread; not re-entering"
+                    )
+                    return None
+                return self._dispatch_waiting_board_lock_waiter_locked(
+                    project_name, board_name, repository, waiters
+                )
+        except Exception as e:
+            # Never let the wake break a lock release. The poll-tick failsafe is
+            # still the backstop it has always been, so the worst case here is
+            # the pre-#214 behaviour: the waiter wakes on its next poll tick.
+            logger.warning(
+                f"Release-driven wake failed for {project_name}/{board_name}: {e}"
+            )
+            return None
+
+    def _dispatch_waiting_board_lock_waiter_locked(
+        self, project_name: str, board_name: str, repository, waiters
+    ) -> Optional[int]:
+        """The body of dispatch_waiting_board_lock_waiter, inside its guard.
+
+        Split out purely so the reentrancy guard's `with` wraps the whole
+        dispatch (including every early return) without indenting it all one
+        further level. Not a separate entry point -- call the public method.
+
+        `waiters` is the already-fetched, longest-waiting-first list; it is
+        passed in rather than re-read so the emptiness check that makes the
+        common path free stays above the guard.
+        """
+        try:
+            from services.board_wait_registry import get_board_wait_registry
+            from services.pipeline_lock_manager import get_pipeline_lock_manager
+            lock_manager = get_pipeline_lock_manager()
+
+            # Confirm the board is genuinely free before offering it. The caller
+            # has just released, but "released" and "free" are not the same
+            # thing: a concurrent acquire can land in between, and a retained
+            # lock (mark_failed) is deliberately NOT released at all. Same
+            # predicate the failsafe uses.
+            lock = lock_manager.get_lock(project_name, board_name)
+            if lock and lock.lock_status == 'locked':
+                logger.debug(
+                    f"Not waking a waiter for {project_name}/{board_name}: the board "
+                    f"is already locked again by issue #{lock.locked_by_issue}"
+                )
+                return None
+
+            config_manager = ConfigManager()
+            project_config = config_manager.get_project_config(project_name)
+            repo = repository or project_config.github['repo']
+
+            for waiter in waiters:
+                issue_number = waiter.issue_number
+
+                # The waiter's column is NOT taken from the registry: the entry
+                # is a hint about who is waiting, never an authority on board
+                # state, and the issue may have been moved by a human since.
+                current_column = self.get_issue_column_sync(
+                    project_name, board_name, issue_number
+                )
+                if not current_column:
+                    logger.info(
+                        f"Waiting {waiter.kind} for issue #{issue_number} is no longer "
+                        f"on {project_name}/{board_name}; dropping the wait"
+                    )
+                    get_board_wait_registry().clear_wait(
+                        project_name, board_name, issue_number
+                    )
+                    continue
+
+                from services.cancellation import get_cancellation_signal
+                if get_cancellation_signal().is_cancelled(project_name, issue_number):
+                    logger.info(
+                        f"Waiting {waiter.kind} for issue #{issue_number} on "
+                        f"{project_name}/{board_name} is cancelled; dropping the wait"
+                    )
+                    get_board_wait_registry().clear_wait(
+                        project_name, board_name, issue_number
+                    )
+                    continue
+
+                logger.info(
+                    f"🔓 Lock released on {project_name}/{board_name} — waking "
+                    f"{waiter.kind} for issue #{issue_number} in '{current_column}' "
+                    f"after {waiter.waited_seconds():.1f}s, ahead of the "
+                    f"Development-column backfill"
+                )
+
+                # Dispatched through the same trigger_agent_for_status() path the
+                # poll-tick failsafe uses for a stalled mid-pipeline issue, with
+                # lock_already_acquired=False: this method has deliberately NOT
+                # taken the lock, so the repair cycle's own try_acquire_lock()
+                # remains the sole authority on acquisition, unchanged. Nothing
+                # to roll back here for the same reason -- no lock was taken, and
+                # a repair cycle has no queue entry to reset (it is not in the
+                # trigger-column queue at all, which is the whole premise).
+                dispatched = self.trigger_agent_for_status(
+                    project_name, board_name, issue_number, current_column, repo
+                )
+                if dispatched:
+                    return issue_number
+
+                # Nothing started. Leave the entry in place (this issue is still
+                # waiting, and its own next refusal will refresh it) and fall
+                # through to the caller's ordinary Development backfill rather
+                # than leaving the freed board idle.
+                logger.info(
+                    f"Wake of issue #{issue_number} on {project_name}/{board_name} "
+                    f"started nothing; falling through to the Development backfill"
+                )
+                return None
+
+            return None
+        except Exception as e:
+            # Same contract as the caller's own handler: never let the wake break
+            # a lock release. Caught here too so the reentrancy guard's finally
+            # still runs and the board is not left permanently marked "wake in
+            # progress" on this thread.
+            logger.warning(
+                f"Release-driven wake dispatch failed for {project_name}/{board_name}: {e}"
+            )
+            return None
+
     def _start_repair_cycle_for_issue(
         self,
         project_name: str,
@@ -8350,6 +8667,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
             from services.pipeline_lock_manager import get_pipeline_lock_manager
             _lock_probe = get_pipeline_lock_manager().get_lock(project_name, board_name)
             if _lock_probe and _lock_probe.locked_by_issue != issue_number:
+                # #214: this early-out used to be completely silent. The probe
+                # is the branch a waiting repair cycle takes on EVERY poll tick
+                # after the first (the full try_acquire_lock() refusal below is
+                # only reached when the probe read came back clean and the
+                # acquire then lost the race), so it is where the wait actually
+                # lives -- and it emitted no log line, no event and no
+                # escalation. _end_owned_run_if_pending() returns immediately
+                # when there is no phantom run to end, which is the usual case
+                # once the run already exists, so nothing downstream logged it
+                # either. Record the wait before returning: it is what makes the
+                # wait visible AND what lets the release path wake it.
+                self._record_board_lock_wait(
+                    project_name, board_name, issue_number,
+                    holder_issue=_lock_probe.locked_by_issue,
+                )
                 _end_owned_run_if_pending(
                     f"Pipeline lock for {project_name}/{board_name} busy "
                     f"(held by issue #{_lock_probe.locked_by_issue}) -- skipping this cycle"
@@ -8561,6 +8893,19 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                         f"creating a lock while a retained one might actually be held"
                     )
                 else:
+                    # The plain "someone else has it" refusal — the only one of
+                    # these three branches that is a WAIT. The other two are
+                    # error states (a retained lock needs a human;
+                    # lock_state_unknown means both stores failed), and
+                    # recording those as waits would put a fake waiter on the
+                    # board for the release path to wake. Record only here.
+                    self._record_board_lock_wait(
+                        project_name, board_name, issue_number,
+                        holder_issue=(
+                            _current_lock_for_classification.locked_by_issue
+                            if _current_lock_for_classification else None
+                        ),
+                    )
                     logger.info(
                         f"Repair cycle for issue #{issue_number} cannot acquire the "
                         f"pipeline lock for {project_name}/{board_name} yet ({reason}) "
@@ -8611,9 +8956,26 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 logger.info(
                     f"Repair cycle for issue #{issue_number} acquired pipeline lock ({reason})"
                 )
+                # Closes whatever wait the refusal paths above opened, and is the
+                # only place the total waited duration is known (#214). Returns
+                # None when there was no wait -- the overwhelmingly common
+                # production case at capacity 1, where the board is free and the
+                # very first attempt acquires -- and the report is skipped
+                # entirely rather than logging a wait of zero that never happened.
+                self._report_board_lock_wait_acquired(
+                    project_name, board_name, issue_number, reason
+                )
             else:
                 # Already hold the lock (may have held it from Development stage)
                 logger.debug(f"Repair cycle for issue #{issue_number} already holds pipeline lock")
+                # Carrying the lock over from a previous stage is not a wait, but
+                # a wait recorded on an earlier tick could still be open (the
+                # handoff completed between ticks). Clear it so the release path
+                # does not keep trying to wake an issue that is already running;
+                # reported for the same reason the acquire branch reports.
+                self._report_board_lock_wait_acquired(
+                    project_name, board_name, issue_number, reason
+                )
 
             # NOTE: no separate "repair-failed marker" to clear here any more — the
             # durable failure signal lives directly on the PipelineLock
