@@ -295,6 +295,24 @@ CLAUDE_OTEL_LOGS_TEMPLATE = {
     "template": {
         "settings": {
             "index": {
+                # 0, like every other template in this file. Not cosmetic here:
+                # a replica that can never be allocated JAMS ILM. The warm
+                # phase's migrate action waits at check-migration for "all
+                # shard copies to be active", a single-node cluster can never
+                # activate a replica, and the wait has no timeout -- so the
+                # index never reaches the delete phase and retention silently
+                # stops applying to it.
+                #
+                # Observed, not theoretical: both OTEL backing indices sat at
+                # warm/migrate/check-migration for 68 days under a 30-day
+                # policy, holding data the rest of the cluster had long since
+                # aged out, and the cluster read yellow the whole time.
+                #
+                # It has to be set HERE rather than left to composed_of: the
+                # built-in logs@settings / metrics@tsdb-settings component
+                # templates default it to 1, and this block is what overrides
+                # them.
+                "number_of_replicas": 0,
                 "lifecycle": {
                     "name": "claude-otel-ilm-policy"
                 }
@@ -317,6 +335,24 @@ CLAUDE_OTEL_METRICS_TEMPLATE = {
     "template": {
         "settings": {
             "index": {
+                # 0, like every other template in this file. Not cosmetic here:
+                # a replica that can never be allocated JAMS ILM. The warm
+                # phase's migrate action waits at check-migration for "all
+                # shard copies to be active", a single-node cluster can never
+                # activate a replica, and the wait has no timeout -- so the
+                # index never reaches the delete phase and retention silently
+                # stops applying to it.
+                #
+                # Observed, not theoretical: both OTEL backing indices sat at
+                # warm/migrate/check-migration for 68 days under a 30-day
+                # policy, holding data the rest of the cluster had long since
+                # aged out, and the cluster read yellow the whole time.
+                #
+                # It has to be set HERE rather than left to composed_of: the
+                # built-in logs@settings / metrics@tsdb-settings component
+                # templates default it to 1, and this block is what overrides
+                # them.
+                "number_of_replicas": 0,
                 "lifecycle": {
                     "name": "claude-otel-ilm-policy"
                 }
