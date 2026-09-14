@@ -94,6 +94,27 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule pipeline-run mapping cleanup - every 30 minutes.
+        #
+        # The issue->run mapping hash has no TTL while the records it points at
+        # do, so entries outlive their runs. This existed as an unscheduled
+        # method for long enough that the reference deployment reached 9
+        # dangling pointers out of 13 (#233).
+        #
+        # Now load-bearing rather than tidy: get_active_run_workspaces() reports
+        # an unaccountable pointer as an unknown, and the startup sweep declines
+        # to prune a project it cannot answer for -- so uncollected rubble would
+        # suppress epic-worktree collection for that project indefinitely.
+        # Purely local (Redis + one ES lookup per already-expired entry), so it
+        # costs no GraphQL quota.
+        self.scheduler.add_job(
+            self._cleanup_expired_run_mappings,
+            trigger=CronTrigger(minute='*/30'),
+            id='cleanup_expired_run_mappings',
+            name='Cleanup pipeline run mappings whose run record is gone',
+            replace_existing=True
+        )
+
         # Schedule orphaned testcontainers reaper - every 15 minutes
         self.scheduler.add_job(
             self._reap_orphaned_test_containers,
@@ -477,6 +498,28 @@ class ScheduledTasksService:
 
         except Exception as e:
             logger.error(f"Error in orphaned container cleanup: {e}", exc_info=True)
+
+    async def _cleanup_expired_run_mappings(self):
+        """Drop issue->run pointers whose run record no longer exists anywhere.
+
+        See PipelineRunManager.cleanup_expired_mappings() for the safety rule
+        (two stores must agree the run is gone) and why this matters beyond
+        tidiness: an unaccountable pointer makes the startup epic-worktree sweep
+        skip that whole project (#233).
+
+        Off the event loop: it is Redis plus one ES lookup per already-expired
+        entry, both blocking clients.
+        """
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+
+            loop = asyncio.get_event_loop()
+            cleaned = await loop.run_in_executor(
+                None, get_pipeline_run_manager().cleanup_expired_mappings
+            )
+            logger.info(f"Pipeline run mapping cleanup complete: {cleaned} removed")
+        except Exception as e:
+            logger.error(f"Error in pipeline run mapping cleanup: {e}", exc_info=True)
 
     async def _reap_orphaned_test_containers(self):
         """

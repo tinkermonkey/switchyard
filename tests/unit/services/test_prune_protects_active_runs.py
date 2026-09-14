@@ -654,3 +654,51 @@ class TestACorruptedWorktreeIsReportedAsSuch:
         assert [r['corrupted'] for r in rows] == [True]
         assert [r['prune_verdict'] for r in rows] == ['skipped_corrupted']
 
+
+class TestAProjectWithAnUnaccountableRunIsNotPruned:
+    """#233: the whole-answer abort does not cover a lookup that SUCCEEDED but
+    could not account for one run. That run's record is gone, so its worktree
+    cannot be protected by name -- the only honest move is to leave the project
+    alone, and only that project."""
+
+    def _sweep(self, manager, tmp_path, workspaces):
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = workspaces
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            manager.prune_epic_worktrees()
+
+    def test_its_worktrees_survive(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "1016")
+
+        self._sweep(manager, tmp_path, ActiveRunWorkspaces(
+            {}, set(), complete=True, unresolved_projects={'codetoreum'}
+        ))
+
+        assert worktree.is_dir(), (
+            "a project whose run mapping references a run neither store knows "
+            "must not have its worktrees deleted"
+        )
+
+    def test_an_unaffected_project_is_still_pruned(self, manager, tmp_path):
+        """The reason this is per-project: production had 9 dangling pointers,
+        so a global abort would have made the sweep a permanent no-op."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_base_clone(tmp_path, "heimdall")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+        heimdall_worktree = _make_worktree(tmp_path, "heimdall", "237")
+
+        self._sweep(manager, tmp_path, ActiveRunWorkspaces(
+            {}, set(), complete=True, unresolved_projects={'codetoreum'}
+        ))
+
+        assert not heimdall_worktree.is_dir(), (
+            "one project's dangling pointer must not stop every other "
+            "project's worktrees being collected"
+        )
+

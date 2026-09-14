@@ -3880,6 +3880,23 @@ class ProjectWorkspaceManager:
             for project_staging in project_stagings:
                 if not project_staging.is_dir():
                     continue
+                # A project whose run mapping holds a pointer neither Redis nor
+                # Elasticsearch can account for (#233). The whole-answer abort
+                # above does not cover this: the lookup SUCCEEDED, it just could
+                # not account for one run -- and that run's record is gone, so
+                # its worktree cannot be protected by name. Skipping this
+                # project is the same trade the abort makes, taken at the only
+                # scope the doubt actually applies to, so one stale pointer
+                # cannot stop every other project's worktrees being collected.
+                if not active_run_workspaces.answers_for(project_staging.name):
+                    logger.warning(
+                        f"Skipping the epic-worktree prune for "
+                        f"{project_staging.name}: its run mapping references a "
+                        f"pipeline run that exists in neither store, so no "
+                        f"worktree here can be shown to be unowned. Its stale "
+                        f"worktrees stay on disk until that resolves."
+                    )
+                    continue
                 # project_checkout lock, taken per project with a bounded wait --
                 # see this method's docstring for why that placement and not the
                 # other two, and why the wait is safe here (#169). The per-project
