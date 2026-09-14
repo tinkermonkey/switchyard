@@ -3089,6 +3089,67 @@ class ProjectWorkspaceManager:
             else:
                 self._worktree_paths_in_use.pop(key, None)
 
+    @staticmethod
+    def _prune_verdict(
+        *,
+        active_runs_known: bool,
+        active_run_protected: Optional[bool],
+        container_live: Optional[bool],
+        corrupted: bool,
+        drift_holds_work: bool,
+    ) -> str:
+        """What the startup sweep would do with one worktree, as a single value.
+
+        Computed HERE rather than in each consumer, which is the actual lesson
+        of #231: the script and /api/epic-worktrees each derived their own
+        answer from a subset of the fields, so when #229 added a rule both were
+        silently wrong, and the out-of-repo web UI still is. A consumer that
+        renders this string cannot drift from the sweep by forgetting a rule;
+        one that recomputes it can, and did.
+
+        The branches are in _prune_project_staging()'s own order, so the two can
+        be diffed against each other:
+
+          'unknown'          the active-run lookup failed. The sweep aborts in
+                             FULL on that (not per-worktree), so nothing is
+                             removed anywhere -- this is never "eligible".
+          'skipped_active_run'  a pipeline run still in flight owns it.
+          'skipped_container'   an agent container is bind-mounted inside.
+          'skipped_corrupted'   no .git at all but non-empty.
+          'skipped_drift'       drifted, holding work the sweep cannot preserve.
+          'eligible_liveness_unknown'
+                             every rule above says remove -- but docker could
+                             not be asked whether a container is inside. The
+                             sweep DOES prune this (it fails open on `is True`,
+                             deliberately, or a docker outage would pin the
+                             staging tree on disk forever). Reported apart from
+                             plain 'eligible' because an operator deleting by
+                             hand has no such deadline to trade against, and
+                             "eligible" would be the one word that tells them
+                             the directory is safe to touch.
+          'eligible'         no rule this survey can evaluate would stop it.
+
+        One rule is genuinely absent and cannot be added: the sweep also skips
+        worktrees tracked in the ORCHESTRATOR process's in-process state
+        (_epic_worktrees / _epic_worktrees_pending / _worktree_paths_in_use),
+        and this method runs in the script's or the observability server's
+        process, where those maps are empty. So 'eligible' means "no rule this
+        survey can evaluate would stop it" -- a strong hint, never a promise.
+        """
+        if not active_runs_known:
+            return 'unknown'
+        if active_run_protected:
+            return 'skipped_active_run'
+        if container_live is True:
+            return 'skipped_container'
+        if corrupted:
+            return 'skipped_corrupted'
+        if drift_holds_work:
+            return 'skipped_drift'
+        if container_live is None:
+            return 'eligible_liveness_unknown'
+        return 'eligible'
+
     def survey_epic_worktrees(self, project_name: Optional[str] = None) -> List[Dict[str, Any]]:
         """Read-only report of every epic worktree currently staged on disk.
 
@@ -3132,19 +3193,26 @@ class ProjectWorkspaceManager:
             its own), unmerged_commits (commits the drifted branch holds that
             expected_branch does not; None when unanswerable or not applicable),
             uncommitted (True/False/None for unreadable), uncommitted_files (the
-            porcelain lines, capped), prune_skipped (whether the startup sweep's
-            DRIFT rule alone would leave it alone), and active_run_protected
-            (whether the sweep's fifth rule would, i.e. a pipeline run still in
-            flight owns this workspace -- None when the run store could not be
-            asked, which the sweep treats as "prune nothing", not "prune this").
+            porcelain lines, capped), prune_skipped (the sweep's DRIFT rule
+            alone), active_run_protected (a pipeline run still in flight owns
+            this workspace -- None when the run store could not be asked, which
+            the sweep treats as "prune nothing", not "prune this"), corrupted
+            (non-empty with no .git at all), and prune_verdict.
 
-            No single field is the whole prune verdict, and one rule cannot be
-            read as one: the sweep also skips anything tracked in THIS process's
-            _epic_worktrees, which a separate process cannot see at all. Callers
-            rendering a verdict for an operator should compose the fields and say
-            what they could not check -- scripts/inspect_epic_worktrees.py's
-            _describe_prune() is the reference. Empty when nothing is staged.
-            Never raises.
+            **Render prune_verdict; do not recompute it from the other fields.**
+            Each of those is ONE rule, and a consumer that ANDs a few of them
+            together silently stops matching the sweep the next time a rule is
+            added -- which is exactly how a worktree owned by an active run came
+            to be reported as removable (#231). _prune_verdict() documents the
+            values and which sweep rule each corresponds to.
+
+            The one rule no consumer can evaluate is the orchestrator process's
+            in-process tracking state (_epic_worktrees / _epic_worktrees_pending
+            / _worktree_paths_in_use): this method runs in the script's or the
+            observability server's process, where those maps are empty. So an
+            'eligible' verdict is a strong hint, not a promise.
+
+            Empty when nothing is staged. Never raises.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         rows: List[Dict[str, Any]] = []
@@ -3156,20 +3224,37 @@ class ProjectWorkspaceManager:
         # for only some of the rules -- which is how an active run's workspace
         # came to be printed as "prune: eligible" (#231). One read for the whole
         # survey, for the same reason running_mount_sources is one round trip.
+        #
+        # Nothing is re-imported in the handler: if the failure IS the import
+        # (a circular import during startup, a missing transitive dependency in
+        # the script's environment), Python has already dropped the half-built
+        # module from sys.modules, so importing again inside `except` re-raises
+        # the same error -- out of a method that promises twice that it never
+        # raises, into a 500 on /api/epic-worktrees. The sweep's copy of this
+        # block survives that only because it sits inside an outer try; this one
+        # has none, so it carries its own.
+        #
+        # ERROR with a traceback, not WARNING: get_active_run_workspaces()
+        # already absorbs every SERVICE failure internally and reports it as
+        # complete=False, so nothing an outage causes reaches here. What reaches
+        # here is an import or construction defect -- a code or deployment bug,
+        # where str(ImportError) alone is routinely unusable.
+        active_run_workspaces = None
         try:
-            from services.pipeline_run import (
-                ActiveRunWorkspaces,
-                get_pipeline_run_manager,
-            )
-            active_run_workspaces = get_pipeline_run_manager().get_active_run_workspaces()
+            from services.pipeline_run import get_pipeline_run_reader
+            active_run_workspaces = get_pipeline_run_reader().get_active_run_workspaces()
         except Exception as e:
-            from services.pipeline_run import ActiveRunWorkspaces
-            logger.warning(
-                f"Could not determine which epic worktrees belong to active "
-                f"pipeline runs; their prune verdict is reported as unknown "
-                f"rather than eligible: {e}"
+            logger.error(
+                f"Could not load the pipeline-run reader, so no epic worktree "
+                f"can be checked against the active-run store; every prune "
+                f"verdict in this survey is reported as unknown: {e}",
+                exc_info=True,
             )
-            active_run_workspaces = ActiveRunWorkspaces.unknown()
+        # None (the import failed) and complete=False (the store could not be
+        # read) are the same answer to the only question asked here.
+        active_runs_known = bool(
+            active_run_workspaces is not None and active_run_workspaces.complete
+        )
         try:
             if not staging_root.is_dir():
                 return rows
@@ -3220,6 +3305,13 @@ class ProjectWorkspaceManager:
                 container_live = self._worktree_is_bind_mounted(
                     worktree_path, running_mount_sources
                 )
+                drift_holds_work = (
+                    self._is_drift_evidence(worktree_path, current_branch)
+                    and self._drift_worktree_holds_work(
+                        worktree_path, epic_id, current_branch, uncommitted
+                    )
+                )
+                corrupted = self._is_corrupted_non_empty_worktree(worktree_path)
                 rows.append({
                     'project': project_staging.name,
                     'epic_id': epic_id,
@@ -3240,12 +3332,7 @@ class ProjectWorkspaceManager:
                     # active_run_protected below and _describe_prune() in
                     # scripts/inspect_epic_worktrees.py, which is what an operator
                     # actually reads (#231).
-                    'prune_skipped': (
-                        self._is_drift_evidence(worktree_path, current_branch)
-                        and self._drift_worktree_holds_work(
-                            worktree_path, epic_id, current_branch, uncommitted
-                        )
-                    ),
+                    'prune_skipped': drift_holds_work,
                     # The fifth rule's answer for this directory. None is "could
                     # not be asked", which is emphatically NOT "no run owns it":
                     # the sweep aborts in full on an incomplete lookup, so an
@@ -3253,7 +3340,25 @@ class ProjectWorkspaceManager:
                     # this one is free to go (#231).
                     'active_run_protected': (
                         active_run_workspaces.protects(project_staging.name, worktree_path)
-                        if active_run_workspaces.complete else None
+                        if active_runs_known else None
+                    ),
+                    # A .git-less but non-empty directory, which the sweep
+                    # refuses to remove because it cannot be told apart from
+                    # real uncommitted work. Cheap, purely local, and
+                    # answerable from any process -- it was missing from this
+                    # survey for no better reason than that nobody wired it,
+                    # which left the shape MOST likely to hold unrecoverable
+                    # work reporting as removable (review on #231).
+                    'corrupted': corrupted,
+                    'prune_verdict': self._prune_verdict(
+                        active_runs_known=active_runs_known,
+                        active_run_protected=(
+                            active_run_workspaces.protects(project_staging.name, worktree_path)
+                            if active_runs_known else None
+                        ),
+                        container_live=container_live,
+                        corrupted=corrupted,
+                        drift_holds_work=drift_holds_work,
                     ),
                 })
 

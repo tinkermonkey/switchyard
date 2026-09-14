@@ -13,7 +13,7 @@ perform (code review on #163).
 
 import pytest
 
-from scripts.inspect_epic_worktrees import _describe_prune, _print_row
+from scripts.inspect_epic_worktrees import _describe_prune, _is_problem, _print_row
 
 
 def _row(**overrides) -> dict:
@@ -33,6 +33,8 @@ def _row(**overrides) -> dict:
         'uncommitted_files': [],
         'prune_skipped': False,
         'active_run_protected': False,
+        'corrupted': False,
+        'prune_verdict': 'eligible',
     }
     row.update(overrides)
     return row
@@ -199,66 +201,113 @@ class TestALiveContainerOverWorkIsNotPromisedToSelfResolve:
         assert 'nothing else to run' in out
 
 
-class TestThePruneVerdictCoversEveryRuleItCanSee:
-    """#231: the verdict was built from the drift rule alone, so a worktree the
-    sweep would skip for any other reason was printed as "eligible".
-
-    Observed in production on 2026-09-14: documentation_robotics epic #767 was
-    reported eligible while it held an active pipeline run. The failure
-    direction is the dangerous one -- an operator acting on "eligible" removes
-    the workspace of a mid-pipeline run by hand, which is the incident #229's
-    fifth rule exists to prevent, re-entered through the diagnostic.
-    """
+class TestTheVerdictIsRenderedNotRederived:
+    """#231 was caused by each consumer deriving its own answer from a subset of
+    the row's fields, so a rule added in #229 left this script confidently
+    disagreeing with the sweep. The verdict is now composed once, beside the
+    sweep; this script renders it."""
 
     def test_an_active_run_is_reported_as_skipped(self):
-        verdict = _describe_prune(_row(drifted=False, active_run_protected=True))
-        assert verdict.startswith("SKIPPED")
-        assert "in flight" in verdict
+        verdict = _describe_prune(_row(prune_verdict='skipped_active_run'))
+        assert verdict.startswith("SKIPPED") and "in flight" in verdict
 
-    def test_the_production_row_that_was_wrong_is_no_longer_eligible(self):
-        """The exact shape observed: clean, undrifted, no container, active run."""
-        row = _row(
-            project='documentation_robotics', epic_id='767',
-            current_branch='feature/issue-767-feature',
-            expected_branch='feature/issue-767-feature',
-            epic_branches=['feature/issue-767-feature'],
-            belongs_to_epic=True, drifted=False, unmerged_commits=None,
-            container_live=False, prune_skipped=False,
-            active_run_protected=True,
-        )
-        assert _describe_prune(row) != "eligible"
+    def test_a_corrupted_worktree_is_not_eligible(self):
+        """The shape the sweep refuses because it "may hold real uncommitted
+        work" -- and the one this script used to call removable."""
+        verdict = _describe_prune(_row(prune_verdict='skipped_corrupted'))
+        assert verdict.startswith("SKIPPED") and "no .git" in verdict
 
-    def test_a_live_container_is_reported_as_skipped(self):
-        assert _describe_prune(
-            _row(drifted=False, container_live=True)
-        ).startswith("SKIPPED")
+    def test_an_unanswerable_lookup_is_not_eligible(self):
+        assert _describe_prune(_row(prune_verdict='unknown')).startswith("UNKNOWN")
 
-    def test_the_drift_rule_still_reports(self):
-        assert _describe_prune(
-            _row(drifted=True, prune_skipped=True)
-        ).startswith("SKIPPED")
+    def test_an_unanswerable_liveness_check_is_not_a_bare_eligible(self):
+        """The sweep does prune this (it fails open), but an operator deleting
+        by hand has no outage deadline to trade against."""
+        verdict = _describe_prune(_row(prune_verdict='eligible_liveness_unknown'))
+        assert "do not remove it by hand" in verdict
 
     def test_nothing_holding_it_reads_as_eligible(self):
         """Control: the verdict must not collapse into always-skipped."""
-        assert _describe_prune(
-            _row(drifted=False, prune_skipped=False,
-                 container_live=False, active_run_protected=False)
-        ) == "eligible"
+        assert _describe_prune(_row(prune_verdict='eligible')) == "eligible"
 
-    def test_an_unanswerable_lookup_is_not_eligible(self):
-        """None is "could not ask". The sweep aborts in full rather than prune
-        without that answer, so reporting "eligible" would be doubly wrong."""
-        verdict = _describe_prune(_row(drifted=False, active_run_protected=None))
-        assert verdict.startswith("UNKNOWN")
-        assert "eligible" not in verdict
+    def test_a_verdict_this_script_does_not_know_is_surfaced_not_defaulted(self):
+        """A rule added to the sweep must read as "this script is out of date",
+        never as "eligible" -- the failure direction that makes #231 dangerous."""
+        verdict = _describe_prune(_row(prune_verdict='skipped_some_future_rule'))
+        assert "UNKNOWN" in verdict and verdict != "eligible"
 
-    def test_an_active_run_outranks_a_drift_skip_in_the_wording(self):
-        """Both skip; the transient reason is the one an operator can act on."""
-        assert "in flight" in _describe_prune(
-            _row(drifted=True, prune_skipped=True, active_run_protected=True)
-        )
+    def test_a_row_with_no_verdict_at_all_is_not_eligible(self):
+        row = _row()
+        del row['prune_verdict']
+        assert _describe_prune(row) != "eligible"
 
     def test_the_printed_row_carries_the_verdict(self, capsys):
-        _print_row(_row(drifted=False, active_run_protected=True))
+        _print_row(_row(drifted=False, prune_verdict='skipped_active_run'))
         assert "in flight" in capsys.readouterr().out
+
+
+class TestProblemsOnlyDoesNotHideTheNewerRules:
+    """--problems-only is the flag reached for when there are too many worktrees
+    to read. It filtered on drift alone, so it dropped exactly the rows the
+    #231 fix added -- including the case where NOTHING will be pruned."""
+
+    def test_an_unanswerable_lookup_is_a_problem(self):
+        assert _is_problem(_row(drifted=False, prune_skipped=False,
+                                prune_verdict='unknown')) is True
+
+    def test_a_corrupted_worktree_is_a_problem(self):
+        assert _is_problem(_row(drifted=False, prune_skipped=False,
+                                prune_verdict='skipped_corrupted')) is True
+
+    def test_an_unanswerable_liveness_check_is_a_problem(self):
+        assert _is_problem(_row(drifted=False, prune_skipped=False,
+                                prune_verdict='eligible_liveness_unknown')) is True
+
+    def test_a_healthy_active_run_is_NOT_a_problem(self):
+        """An in-flight run keeping its own workspace is the system working.
+        Listing it here would train operators to ignore the flag."""
+        assert _is_problem(_row(drifted=False, prune_skipped=False,
+                                prune_verdict='skipped_active_run')) is False
+
+    def test_a_plain_eligible_row_is_NOT_a_problem(self):
+        assert _is_problem(_row(drifted=False, prune_skipped=False,
+                                prune_verdict='eligible')) is False
+
+    def test_drift_is_still_a_problem(self):
+        assert _is_problem(_row(drifted=True, prune_verdict='eligible')) is True
+
+
+class TestAnActiveRunsWorkspaceIsNeverOfferedADestructiveCommand:
+    """The verdict line was the weaker half of this surface. The stronger half
+    is the copy-pasteable `reset --hard` in the recovery block, which gated on
+    container liveness alone -- and a run between agent containers is exactly
+    container_live=False."""
+
+    def _drifted_dirty(self, **over):
+        return _row(drifted=True, uncommitted=True, uncommitted_files=[' M f.py'],
+                    container_live=False, unmerged_commits=0, **over)
+
+    def test_no_reset_hard_while_a_run_is_in_flight(self, capsys):
+        _print_row(self._drifted_dirty(
+            active_run_protected=True, prune_verdict='skipped_active_run'))
+        out = capsys.readouterr().out
+        assert 'reset --hard' not in out
+        assert 'stash' not in out
+
+    def test_it_says_why_there_is_nothing_to_run(self, capsys):
+        _print_row(self._drifted_dirty(
+            active_run_protected=True, prune_verdict='skipped_active_run'))
+        assert "resolves when that run ends" in capsys.readouterr().out
+
+    def test_an_unanswerable_ownership_check_also_suppresses_it(self, capsys):
+        """We cannot show a destructive command on a maybe."""
+        _print_row(self._drifted_dirty(
+            active_run_protected=None, prune_verdict='unknown'))
+        assert 'reset --hard' not in capsys.readouterr().out
+
+    def test_an_unowned_drifted_worktree_still_gets_its_recovery(self, capsys):
+        """Control: the guard must not silence the advice for everyone."""
+        _print_row(self._drifted_dirty(
+            active_run_protected=False, prune_verdict='skipped_drift'))
+        assert 'reset --hard' in capsys.readouterr().out
 

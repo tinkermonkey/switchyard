@@ -190,7 +190,8 @@ class PipelineRunManager:
     def __init__(
         self,
         redis_client: Optional[redis.Redis] = None,
-        elasticsearch_client: Optional[Elasticsearch] = None
+        elasticsearch_client: Optional[Elasticsearch] = None,
+        manage_schema: bool = True
     ):
         """
         Initialize pipeline run manager
@@ -225,8 +226,13 @@ class PipelineRunManager:
         # Elasticsearch index pattern (date-based for ILM)
         self.es_index_pattern = "pipeline-runs"
 
-        # Setup Elasticsearch ILM and templates if available
-        if self.es:
+        # Setup Elasticsearch ILM and templates if available.
+        # Skipped for a read-only consumer: this is a cluster-level WRITE
+        # (put_lifecycle + put_index_template), and survey_epic_worktrees()
+        # reaches this class from a CLI script and an HTTP handler that both
+        # document that nothing on their path writes (#163). See
+        # get_pipeline_run_reader().
+        if self.es and manage_schema:
             self._setup_elasticsearch()
 
         logger.info("PipelineRunManager initialized")
@@ -2796,6 +2802,28 @@ class PipelineRunManager:
 
 # Global pipeline run manager instance
 _pipeline_run_manager: Optional[PipelineRunManager] = None
+
+
+def get_pipeline_run_reader() -> PipelineRunManager:
+    """A PipelineRunManager for callers that only read and must not write.
+
+    get_pipeline_run_manager() lazily CONSTRUCTS on first use in a process, and
+    construction installs the ILM policy and index template against the shared
+    cluster. That is right for the orchestrator, which owns that schema, and
+    wrong for survey_epic_worktrees(): it backs scripts/inspect_epic_worktrees.py
+    (its own process, documented "Deliberately READ-ONLY") and the observability
+    server's /api/epic-worktrees, and its docstring spends a paragraph defending
+    "nothing here writes" -- a claim #163 already had to restore once, by
+    removing a `git fetch --prune` from the same method.
+
+    Reusing the process's existing manager when there is one keeps the common
+    path free; otherwise this builds a reader that skips the schema write. It
+    deliberately does NOT populate the singleton -- a reader must not become the
+    instance the writers then share.
+    """
+    if _pipeline_run_manager is not None:
+        return _pipeline_run_manager
+    return PipelineRunManager(manage_schema=False)
 
 
 def get_pipeline_run_manager() -> PipelineRunManager:
