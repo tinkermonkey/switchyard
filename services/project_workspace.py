@@ -3094,6 +3094,7 @@ class ProjectWorkspaceManager:
         *,
         active_runs_known: bool,
         active_run_protected: Optional[bool],
+        project_answerable: Optional[bool] = None,
         container_live: Optional[bool],
         corrupted: bool,
         drift_holds_work: bool,
@@ -3113,6 +3114,11 @@ class ProjectWorkspaceManager:
           'unknown'          the active-run lookup failed. The sweep aborts in
                              FULL on that (not per-worktree), so nothing is
                              removed anywhere -- this is never "eligible".
+          'unknown_project'  the lookup SUCCEEDED but could not account for a
+                             run in THIS project, so the sweep skips the project
+                             (#233). Distinct from 'unknown' because the rest of
+                             the report is trustworthy; distinct from 'eligible'
+                             because this directory's owner is unproven.
           'skipped_active_run'  a pipeline run still in flight owns it.
           'skipped_container'   an agent container is bind-mounted inside.
           'skipped_corrupted'   no .git at all but non-empty.
@@ -3138,6 +3144,8 @@ class ProjectWorkspaceManager:
         """
         if not active_runs_known:
             return 'unknown'
+        if project_answerable is False:
+            return 'unknown_project'
         if active_run_protected:
             return 'skipped_active_run'
         if container_live is True:
@@ -3252,6 +3260,11 @@ class ProjectWorkspaceManager:
             )
         # None (the import failed) and complete=False (the store could not be
         # read) are the same answer to the only question asked here.
+        # Whole-answer knownness only. The per-project gate is evaluated inside
+        # the loop below, where the project name exists -- computing one bool up
+        # here is what let the sweep's newer per-project rule (#233) go
+        # unrepresented in the operator's verdict, which is the #231 defect
+        # exactly: a rule added to the sweep that this survey never learned.
         active_runs_known = bool(
             active_run_workspaces is not None and active_run_workspaces.complete
         )
@@ -3273,6 +3286,11 @@ class ProjectWorkspaceManager:
             except OSError as e:
                 logger.warning(f"Failed to list epic worktrees under {project_staging}: {e}")
                 continue
+
+            # Per project, because that is the scope the answer has (#233).
+            project_answerable = active_runs_known and active_run_workspaces.answers_for(
+                project_staging.name
+            )
 
             for worktree_path in worktree_paths:
                 if not worktree_path.is_dir():
@@ -3338,9 +3356,15 @@ class ProjectWorkspaceManager:
                     # the sweep aborts in full on an incomplete lookup, so an
                     # unknown here means nothing gets pruned this cycle, not that
                     # this one is free to go (#231).
+                    # None is "could not be asked", which is emphatically NOT
+                    # "no run owns it". Two ways to get there: the whole lookup
+                    # failed, or it succeeded but could not account for a run in
+                    # THIS project (#233) -- in which case the sweep skips the
+                    # project, so reporting False here would print "eligible"
+                    # for a directory it will not touch.
                     'active_run_protected': (
                         active_run_workspaces.protects(project_staging.name, worktree_path)
-                        if active_runs_known else None
+                        if project_answerable else None
                     ),
                     # A .git-less but non-empty directory, which the sweep
                     # refuses to remove because it cannot be told apart from
@@ -3352,9 +3376,10 @@ class ProjectWorkspaceManager:
                     'corrupted': corrupted,
                     'prune_verdict': self._prune_verdict(
                         active_runs_known=active_runs_known,
+                        project_answerable=project_answerable,
                         active_run_protected=(
                             active_run_workspaces.protects(project_staging.name, worktree_path)
-                            if active_runs_known else None
+                            if project_answerable else None
                         ),
                         container_live=container_live,
                         corrupted=corrupted,

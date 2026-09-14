@@ -187,6 +187,35 @@ class TestScheduledJobConfiguration:
 
         scheduled_tasks_service.stop()
 
+    async def test_mapping_cleanup_job_is_registered(self, scheduled_tasks_service):
+        """The whole premise of #233 is that this cleanup existed as an
+        unscheduled method for long enough that dangling pointers accumulated.
+        Nothing but this test stops the add_job call being dropped again -- and
+        the symptom (projects silently never pruned) surfaces in
+        project_workspace.py, nowhere near the cause.
+        """
+        scheduled_tasks_service.start()
+
+        job = scheduled_tasks_service.scheduler.get_job('cleanup_expired_run_mappings')
+
+        assert job is not None, "the pipeline-run mapping cleanup is not scheduled"
+        assert job.func == scheduled_tasks_service._cleanup_expired_run_mappings
+
+        scheduled_tasks_service.stop()
+
+    async def test_a_failing_mapping_cleanup_never_escapes_the_job(
+        self, scheduled_tasks_service, caplog
+    ):
+        """Runs unattended; a throw here would take the scheduler down with it."""
+        from unittest.mock import patch, Mock
+
+        manager = Mock()
+        manager.cleanup_expired_mappings.side_effect = RuntimeError("redis down")
+        with patch('services.pipeline_run.get_pipeline_run_manager', return_value=manager):
+            await scheduled_tasks_service._cleanup_expired_run_mappings()
+
+        assert any('mapping cleanup' in r.message.lower() for r in caplog.records)
+
     def test_a_failing_sweep_never_escapes_the_job(self, scheduled_tasks_service, caplog):
         """Housekeeping, and nothing depends on it having run -- so a failure
         in here must not be allowed to take the scheduler down with it."""

@@ -96,6 +96,10 @@ def _describe_uncommitted(row: dict) -> str:
 #: train operators to ignore the flag.
 _VERDICTS_NEEDING_ATTENTION = frozenset({
     'unknown',
+    # A whole project the sweep will not touch until its mapping resolves, on a
+    # row that otherwise looks perfectly healthy -- exactly the shape
+    # --problems-only exists to surface (#233).
+    'unknown_project',
     'skipped_corrupted',
     'eligible_liveness_unknown',
 })
@@ -146,6 +150,11 @@ _VERDICT_TEXT = {
         "a pipeline run owns this workspace is unanswerable here. Do not remove "
         "it by hand. (The sweep makes its own lookup; if that one also fails it "
         "prunes nothing at all.)"
+    ),
+    'unknown_project': (
+        "UNKNOWN — this project's run mapping references a pipeline run that "
+        "exists in neither store, so nothing here can be shown to be unowned. "
+        "The sweep skips the whole project. Do not remove it by hand."
     ),
     'skipped_active_run': "SKIPPED (a pipeline run still in flight owns this workspace)",
     'skipped_container': "SKIPPED (an agent container is still mounted inside)",

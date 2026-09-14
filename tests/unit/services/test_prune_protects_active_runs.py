@@ -686,8 +686,8 @@ class TestAProjectWithAnUnaccountableRunIsNotPruned:
         )
 
     def test_an_unaffected_project_is_still_pruned(self, manager, tmp_path):
-        """The reason this is per-project: production had 9 dangling pointers,
-        so a global abort would have made the sweep a permanent no-op."""
+        """The reason this is per-project: a global abort against a mapping
+        full of dangling pointers makes the sweep a permanent no-op."""
         _make_base_clone(tmp_path, "codetoreum")
         _make_base_clone(tmp_path, "heimdall")
         _make_worktree(tmp_path, "codetoreum", "1016")
@@ -701,4 +701,68 @@ class TestAProjectWithAnUnaccountableRunIsNotPruned:
             "one project's dangling pointer must not stop every other "
             "project's worktrees being collected"
         )
+
+
+class TestTheSurveyAgreesWithTheSweepAboutAnUnresolvedProject:
+    """The sweep gained a per-project rule (#233) and the survey derived its
+    verdict from `complete` alone, so the operator diagnostic printed "eligible"
+    for a directory the sweep refuses to touch.
+
+    That is #231 verbatim, reintroduced by the very PR that added the rule --
+    which is why the verdict is composed once and consumers render it."""
+
+    def _survey(self, manager, workspaces):
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = workspaces
+        with patch('services.pipeline_run.get_pipeline_run_reader',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            return manager.survey_epic_worktrees()
+
+    def test_an_unresolved_project_is_never_reported_eligible(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(manager, ActiveRunWorkspaces(
+            {}, set(), complete=True, unresolved_projects={'codetoreum'}
+        ))
+
+        assert [r['prune_verdict'] for r in rows] == ['unknown_project']
+        assert [r['active_run_protected'] for r in rows] == [None]
+
+    def test_an_unaffected_project_still_reports_normally(self, manager, tmp_path):
+        """Control: the new branch must not swallow every verdict."""
+        _make_base_clone(tmp_path, "heimdall")
+        _make_worktree(tmp_path, "heimdall", "237")
+
+        rows = self._survey(manager, ActiveRunWorkspaces(
+            {}, set(), complete=True, unresolved_projects={'codetoreum'}
+        ))
+
+        assert [r['prune_verdict'] for r in rows] == ['eligible']
+
+    def test_the_verdict_matches_what_the_sweep_will_do(self, manager, tmp_path):
+        """The property that was broken: survey and sweep must not disagree."""
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "1016")
+        workspaces = ActiveRunWorkspaces(
+            {}, set(), complete=True, unresolved_projects={'codetoreum'}
+        )
+
+        verdict = self._survey(manager, workspaces)[0]['prune_verdict']
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = workspaces
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            manager.prune_epic_worktrees()
+
+        assert verdict != 'eligible'
+        assert worktree.is_dir(), "the sweep kept it; the verdict must not say otherwise"
 

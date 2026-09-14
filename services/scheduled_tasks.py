@@ -98,8 +98,8 @@ class ScheduledTasksService:
         #
         # The issue->run mapping hash has no TTL while the records it points at
         # do, so entries outlive their runs. This existed as an unscheduled
-        # method for long enough that the reference deployment reached 9
-        # dangling pointers out of 13 (#233).
+        # method for long enough that most of the reference deployment's entries
+        # had outlived their runs (#233).
         #
         # Now load-bearing rather than tidy: get_active_run_workspaces() reports
         # an unaccountable pointer as an unknown, and the startup sweep declines
