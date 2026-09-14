@@ -760,6 +760,21 @@ class TestSweepRunsBeforeTheCircuitBreakerChecks(unittest.TestCase):
         self.assertLess(heartbeat_at, github_breaker_at)
         self.assertLess(heartbeat_at, claude_breaker_at)
 
+    def test_the_heartbeat_also_precedes_the_graphql_budget_pause(self):
+        """There are three `continue`s in the loop now, not two. The budget
+        pause (pipeline run 4cf816cf) sleeps up to
+        MONITOR_BUDGET_BACKOFF_MAX_SECONDS and skips the rest of the body, so
+        the heartbeat has to be above it for the same reason it is above the
+        other two: an agent that was already running keeps holding its board
+        lock while the monitor is paused."""
+        source = inspect.getsource(ProjectMonitor.monitor_projects)
+        loop_body = source.split("while True:", 1)[1]
+
+        heartbeat_at = loop_body.index("self._refresh_held_board_locks()")
+        budget_pause_at = loop_body.index("monitor_budget_backoff_seconds(")
+
+        self.assertLess(heartbeat_at, budget_pause_at)
+
 
 if __name__ == '__main__':
     unittest.main()

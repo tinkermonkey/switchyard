@@ -1089,9 +1089,25 @@ class ScheduledTasksService:
                             if not parent_issue_data:
                                 continue
 
-                            sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
-                                github, parent_issue_data
-                            )
+                            # A failed query is not "not a sub-issue-bearing
+                            # parent". Counting it as one silently drops the
+                            # parent from the sweep that exists to re-check
+                            # parents the live path could not finish — and a
+                            # failing GitHub query is precisely when the live
+                            # path could not finish.
+                            from services.feature_branch_manager import SubIssueQueryError
+                            try:
+                                sub_issues = await feature_branch_manager._get_sub_issues_from_parent(
+                                    github, parent_issue_data
+                                )
+                            except SubIssueQueryError as e:
+                                logger.warning(
+                                    f"Could not query sub-issues for parent "
+                                    f"#{item.issue_number} in {project_name}; it stays in "
+                                    f"scope for the next sweep: {e}"
+                                )
+                                error_count += 1
+                                continue
                             if not sub_issues:
                                 # Not a sub-issue-bearing parent — out of scope for this sweep
                                 continue

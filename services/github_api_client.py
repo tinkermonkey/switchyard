@@ -183,6 +183,104 @@ def is_graphql_rate_limit_error(errors: Any) -> bool:
         return False
 
 
+# The sentinel `error` values graphql()/rest()/gh_cli() put in their failure
+# payloads. Named constants, and BUILT FROM here by the code that returns them,
+# because a consumer that re-declares the literal is one rename away from
+# silently misclassifying every rate limit -- see classify_graphql_failure().
+BREAKER_OPEN_ERROR = "GitHub API rate limit exceeded - circuit breaker open"
+RATE_LIMITED_ERROR = "rate_limited"
+
+# What classify_graphql_failure() can say about a failed call.
+FAILURE_BREAKER_OPEN = 'breaker_open'
+FAILURE_RATE_LIMITED = 'rate_limited'
+FAILURE_OTHER = 'other'
+
+
+def describe_graphql_failure(result: Any) -> str:
+    """Render a graphql()/rest() failure payload as one readable line.
+
+    Exists because of a confirmed production incident (pipeline run 4cf816cf):
+    callers that ran `gh` themselves logged the resulting CalledProcessError as
+    `str(e)`, which is "Command '[...]' returned non-zero exit status 1." and
+    NOTHING else -- `gh` writes the actual reason to stderr, which the string
+    form drops. Three consecutive card-move failures were recorded that way,
+    and the real cause had to be inferred hours later from surrounding log
+    lines rather than read off the error.
+
+    Never raises and never returns an empty string: this renders text that goes
+    into operator-facing decision events and GitHub comments, so an unexpected
+    payload shape must degrade to something printable rather than become a
+    second failure on the failure path.
+    """
+    if isinstance(result, dict):
+        error = result.get('error')
+        detail = result.get('stderr') or result.get('details') or result.get('raw_output')
+        if error and detail:
+            return f"{error}: {str(detail).strip()[:500]}"
+        if error:
+            return str(error)
+        if 'errors' in result:
+            # Body-level GraphQL errors on an otherwise well-formed response --
+            # where GitHub reports RATE_LIMIT and INSUFFICIENT_SCOPES.
+            return f"GraphQL errors: {str(result['errors'])[:500]}"
+    return str(result)[:500] if result else "unknown GraphQL failure (no detail returned)"
+
+
+def classify_graphql_failure(result: Any) -> str:
+    """Why a graphql() call failed: 'breaker_open', 'rate_limited' or 'other'.
+
+    The distinction between the first two is load-bearing and was got wrong
+    once already. THE BREAKER IS SHARED across this client's GraphQL, REST,
+    HTTP and CLI paths (one GitHubBreaker, tripped from four places), while
+    GitHub meters GraphQL points and REST core requests as SEPARATE quotas. So
+    a breaker refusal means "somebody's bucket is exhausted", NOT "this call's
+    bucket is exhausted" -- a REST exhaustion opens the same breaker that then
+    refuses a GraphQL card move whose own budget is entirely healthy.
+
+    Conflating the two is not cosmetic: a caller that reads a breaker refusal
+    as confirmed GraphQL exhaustion will attribute the failure to the wrong
+    quota in its operator-facing error, and -- if it treats confirmed
+    exhaustion as terminal -- will stop a board over a quota that board never
+    touched.
+
+    'rate_limited' is reserved for the cases where GITHUB said so about THIS
+    call: the client's own rate-limit sentinel, or a body-level RATE_LIMIT in
+    the response's `errors` array (which is how GitHub reports a primary
+    GraphQL rate limit -- see is_graphql_rate_limit_error).
+
+    Total: anything unrecognised is 'other', never a raise. Callers are on a
+    failure path.
+    """
+    if not isinstance(result, dict):
+        return FAILURE_OTHER
+
+    error = result.get('error')
+    if error == BREAKER_OPEN_ERROR:
+        return FAILURE_BREAKER_OPEN
+    if error == RATE_LIMITED_ERROR:
+        return FAILURE_RATE_LIMITED
+    # Defensive against wording drift in the breaker's own message, which is
+    # the one sentinel whose text contains "rate limit" but does NOT mean this
+    # call's quota is gone.
+    if isinstance(error, str) and 'circuit breaker open' in error.lower():
+        return FAILURE_BREAKER_OPEN
+    if isinstance(error, str) and 'rate limit' in error.lower():
+        return FAILURE_RATE_LIMITED
+
+    errors = result.get('errors')
+    if errors and is_graphql_rate_limit_error(errors):
+        return FAILURE_RATE_LIMITED
+
+    # A secondary rate limit can arrive as prose in stderr/details on an
+    # otherwise unclassified failure. graphql() normally catches these first;
+    # this is the backstop for the shapes it does not.
+    detail = result.get('stderr') or result.get('details') or ''
+    if isinstance(detail, str) and 'rate limit' in detail.lower():
+        return FAILURE_RATE_LIMITED
+
+    return FAILURE_OTHER
+
+
 class GitHubRateLimitStatus:
     """Track GitHub API rate limit status and remaining quota."""
     
@@ -514,7 +612,7 @@ class GitHubAPIClient:
             time_until_reset = self.breaker.reset_time - datetime.now() if self.breaker.reset_time else None
             wait_msg = f" (will retry in {time_until_reset.total_seconds():.0f}s)" if time_until_reset else ""
             logger.error(f"🔴 GitHub API breaker is OPEN - rejecting request{wait_msg}")
-            return False, {"error": "GitHub API rate limit exceeded - circuit breaker open"}
+            return False, {"error": BREAKER_OPEN_ERROR}
         
         # Check if we should do adaptive throttling
         # Resolve the credential BEFORE the throttle check so the sleep
@@ -610,7 +708,7 @@ class GitHubAPIClient:
                     reset_time = self._extract_reset_time(body, result.stderr, headers=headers)
                     self.breaker.trip(reset_time)
 
-                    return False, {"error": "rate_limited", "details": body}
+                    return False, {"error": RATE_LIMITED_ERROR, "details": body}
 
                 self.failed_requests += 1
                 logger.error(f"GraphQL query failed: {result.stderr}")
@@ -696,7 +794,7 @@ class GitHubAPIClient:
             time_until_reset = self.breaker.reset_time - datetime.now() if self.breaker.reset_time else None
             wait_msg = f" (will retry in {time_until_reset.total_seconds():.0f}s)" if time_until_reset else ""
             logger.error(f"🔴 GitHub API breaker is OPEN - rejecting REST request{wait_msg}")
-            return False, {"error": "GitHub API rate limit exceeded - circuit breaker open"}
+            return False, {"error": BREAKER_OPEN_ERROR}
         
         # Check usage and apply throttling (REST bucket - GraphQL and REST
         # are separate GitHub rate-limit buckets, and the App and PAT REST
@@ -759,7 +857,7 @@ class GitHubAPIClient:
                     self.rate_limited_requests += 1
                     logger.error("🔴 GitHub API rate limit hit (REST)")
                     self.breaker.trip()
-                    return False, {"error": "rate_limited", "details": result.stderr}
+                    return False, {"error": RATE_LIMITED_ERROR, "details": result.stderr}
 
                 self.failed_requests += 1
 
@@ -843,7 +941,7 @@ class GitHubAPIClient:
             time_until_reset = self.breaker.reset_time - datetime.now() if self.breaker.reset_time else None
             wait_msg = f" (will retry in {time_until_reset.total_seconds():.0f}s)" if time_until_reset else ""
             logger.error(f"🔴 GitHub API breaker is OPEN - rejecting HTTP request{wait_msg}")
-            return False, {"error": "GitHub API rate limit exceeded - circuit breaker open"}
+            return False, {"error": BREAKER_OPEN_ERROR}
         
         # Check usage and apply throttling (REST bucket - this method makes
         # direct REST/HTTP calls, never GraphQL)
@@ -930,7 +1028,7 @@ class GitHubAPIClient:
                     self.rate_limited_requests += 1
                     logger.error("🔴 GitHub API rate limit hit (HTTP)")
                     self.breaker.trip()
-                    return False, {"error": "rate_limited", "status_code": 403}
+                    return False, {"error": RATE_LIMITED_ERROR, "status_code": 403}
             
             # Check for other errors
             if response.status_code >= 400:
@@ -1435,6 +1533,31 @@ class GitHubAPIClient:
         # restart; this is what makes it do so.
         return self._budget_fraction_from_mirror(credential, 'graphql')
 
+    def graphql_seconds_until_reset(self) -> Optional[float]:
+        """Seconds until the active credential's GraphQL quota window turns
+        over, or None when that is unknown.
+
+        The companion to graphql_budget_fraction_remaining(), and public for
+        the same reason: a caller deciding "how long should I hold off" needs
+        the window, and which bucket answers is this client's business, not
+        theirs. A caller reaching into _bucket() would have to duplicate
+        _resolve_credential() to pick the right one.
+
+        None means UNKNOWN, not zero -- a bucket that has never seen a real
+        response has no reset time, and treating that as "resets now" would
+        make a budget-aware pause a no-op exactly on a cold start.
+
+        Never raises: every caller is using this to decide how long to sleep.
+        """
+        try:
+            bucket = self._bucket(self._resolve_credential(), 'graphql')
+            if not bucket.ever_updated:
+                return None
+            return bucket.get_time_until_reset()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(f"Could not read the GraphQL reset time: {e}")
+            return None
+
     def _budget_fraction_from_mirror(
         self, credential: str, resource: str
     ) -> Optional[float]:
@@ -1571,7 +1694,7 @@ class GitHubAPIClient:
             time_until_reset = self.breaker.reset_time - datetime.now() if self.breaker.reset_time else None
             wait_msg = f" (will retry in {time_until_reset.total_seconds():.0f}s)" if time_until_reset else ""
             logger.error(f"🔴 GitHub API breaker is OPEN - rejecting CLI command{wait_msg}")
-            return False, {"error": "GitHub API rate limit exceeded - circuit breaker open"}
+            return False, {"error": BREAKER_OPEN_ERROR}
         
         # Apply backoff
         self._apply_backoff()
@@ -1626,7 +1749,7 @@ class GitHubAPIClient:
                 self.rate_limited_requests += 1
                 logger.error("🔴 GitHub API rate limit hit (CLI command)")
                 self.breaker.trip()
-                return False, {"error": "rate_limited", "stderr": e.stderr}
+                return False, {"error": RATE_LIMITED_ERROR, "stderr": e.stderr}
 
             # Check for HTTP 410 (Gone/Deleted) - permanent error, don't retry
             if 'HTTP 410' in e.stderr or 'was deleted' in e.stderr:

@@ -756,6 +756,7 @@ Variables are listed by their `.env` name (uppercase with underscores). The `Env
 | `ORCHESTRATOR_ROOT` | no | `/app` (in container) | Path to the switchyard repository root. Used by scripts and state managers to locate `state/` and `config/`. |
 | `ORCHESTRATOR_WORKERS` | no | `1` | Number of worker threads for parallel task execution. The default of `1` is single-threaded. |
 | `RECONCILIATION_FRESHNESS_HOURS` | no | `1` | Skip board reconciliation if `github_state.yaml` was written within this many hours. |
+| `MONITOR_MIN_GRAPHQL_BUDGET_FRACTION` | no | `0.10` | Fraction of the hourly GraphQL budget the poll loop leaves unspent. Below it, board polling pauses so the remaining quota is available for pipeline-critical calls (card moves, reviewer context, PR operations). Work already in flight is unaffected; new work is not picked up until the pause ends (at most 300s). Raise it on a deployment with many boards. |
 | `PROGRAMMATIC_CHANGE_WINDOW_SECONDS` | no | `60` | Seconds during which a board event is attributed to an orchestrator action (suppresses duplicate triggers). |
 | `WATCHDOG_MAX_RETRIES` | no | `3` | Maximum retries the watchdog applies before giving up on a stuck task. |
 | `TOKEN_METRICS_INTERVAL_HOURS` | no | `3` | Hours between token metrics collection runs. |

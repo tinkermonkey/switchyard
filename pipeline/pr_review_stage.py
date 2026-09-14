@@ -1360,9 +1360,14 @@ class PRReviewStage(PipelineStage):
                 )
 
                 # Set status to Backlog
-                self._set_issue_status_on_board(
+                if not self._set_issue_status_on_board(
                     issue_number, repo, github_config, sdlc_board, backlog_column
-                )
+                ):
+                    logger.error(
+                        f"Issue #{issue_number} was added to the SDLC board but its "
+                        f"status could NOT be set to '{backlog_column.name}'. It will "
+                        f"sit in the board's default column until someone moves it."
+                    )
 
                 # Link as sub-issue to parent, with retry on transient failures.
                 # Sentinel covers the parent_issue_id is None case so it also emits a failure event.
@@ -1500,8 +1505,30 @@ class PRReviewStage(PipelineStage):
         return created_issues
 
     def _set_issue_status_on_board(self, issue_number: str, repo: str,
-                                    github_config: Dict, board, column):
-        """Set an issue's status on a project board."""
+                                    github_config: Dict, board, column) -> bool:
+        """Set an issue's status on a project board. True if the card moved.
+
+        Returns a bool rather than None because "the card move failed while the
+        caller carried on as though it had not" is the shape of the incident
+        this change set is about, and this method had it too: every failure
+        landed in the outer `except Exception`, became a log line, and both
+        callers proceeded believing the board reflected the new state. The
+        sibling method eight lines below (_link_sub_issue) already returns its
+        failure for exactly this reason.
+
+        The sibling of PipelineProgression.move_issue_to_column(), and routed
+        through GitHubAPIClient for the same reason (pipeline run 4cf816cf): a
+        raw `gh api graphql` subprocess bypasses the shared circuit breaker, so
+        it keeps firing into an exhausted GraphQL quota while every other
+        caller is correctly being refused — and reports the failure as
+        "returned non-zero exit status 1", because CalledProcessError's string
+        form drops the stderr `gh` wrote the reason to. Leaving one card-move
+        path un-routed would just move the incident.
+        """
+        from services.github_api_client import get_github_client
+        from services.pipeline_progression import describe_graphql_failure
+
+        github_client = get_github_client()
         try:
             query = f'''{{
                 repository(owner: "{github_config['org']}", name: "{github_config['repo']}") {{
@@ -1516,12 +1543,14 @@ class PRReviewStage(PipelineStage):
                 }}
             }}'''
 
-            result = subprocess.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
-            )
-            data = json.loads(result.stdout)
-            items = data['data']['repository']['issue']['projectItems']['nodes']
+            # graphql() already unwraps the 'data' envelope on success.
+            ok, data = github_client.graphql(query)
+            if not ok:
+                raise RuntimeError(
+                    f"Could not look up the project item for issue #{issue_number}: "
+                    f"{describe_graphql_failure(data)}"
+                )
+            items = data['repository']['issue']['projectItems']['nodes']
 
             item_id = None
             for item in items:
@@ -1531,10 +1560,10 @@ class PRReviewStage(PipelineStage):
 
             if not item_id:
                 logger.warning(f"Issue #{issue_number} not found on board (project #{board.project_number})")
-                return
+                return False
             if not board.status_field_id:
                 logger.warning(f"No status_field_id for board, cannot set status for #{issue_number}")
-                return
+                return False
             if item_id and board.status_field_id:
                 mutation = f'''
                 mutation {{
@@ -1550,13 +1579,23 @@ class PRReviewStage(PipelineStage):
                     }}
                 }}
                 '''
-                subprocess.run(
-                    ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                    capture_output=True, text=True, check=True, timeout=30
-                )
+                mutation_ok, mutation_result = github_client.graphql(mutation)
+                if not mutation_ok:
+                    raise RuntimeError(
+                        f"Could not set the Status field for issue #{issue_number}: "
+                        f"{describe_graphql_failure(mutation_result)}"
+                    )
                 logger.info(f"Set issue #{issue_number} to {column.name} on board")
+                return True
+            return False
         except Exception as e:
-            logger.error(f"Failed to set status for issue #{issue_number}: {e}", exc_info=True)
+            logger.error(
+                f"Failed to set status for issue #{issue_number}: {e}. The board does "
+                f"NOT reflect the intended column, so downstream state is divergent "
+                f"from what the pipeline believes.",
+                exc_info=True,
+            )
+            return False
 
     def _link_sub_issue(self, parent_issue_id: str, child_issue_id: str,
                         child_number: str, parent_number: int) -> Optional[Exception]:
@@ -1625,9 +1664,14 @@ class PRReviewStage(PipelineStage):
                     f"sub-issue link failed"
                 )
                 continue
-            self._set_issue_status_on_board(
+            if not self._set_issue_status_on_board(
                 issue['number'], repo, github_config, sdlc_board, dev_column
-            )
+            ):
+                logger.error(
+                    f"Issue #{issue['number']} could NOT be moved to "
+                    f"'{dev_column.name}' — it will not be picked up by the poll "
+                    f"loop from wherever it actually is."
+                )
 
     def _advance_parent_to_documentation(self, project_name: str, parent_issue_number: int) -> bool:
         """Advance the parent issue from 'In Review' to 'Done' on the Planning board.

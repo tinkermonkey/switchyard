@@ -77,6 +77,14 @@ services:
       - RECONCILIATION_FRESHNESS_HOURS=${RECONCILIATION_FRESHNESS_HOURS:-24}
       - QUEUE_RECONCILIATION_INTERVAL_MINUTES=${QUEUE_RECONCILIATION_INTERVAL_MINUTES:-30}
       - RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION=${RECONCILE_MIN_GRAPHQL_BUDGET_FRACTION:-0.25}
+      # The same headroom idea applied to the poll loop itself, which is the
+      # larger and steadier of the two board-count-proportional spenders. Below
+      # this fraction the monitor pauses board polling so the quota is left for
+      # pipeline-critical calls (card moves, reviewer context, PR operations).
+      # Work already in flight is unaffected; new work waits out the pause.
+      # Lower than reconciliation's floor because this throttles a continuous
+      # drip rather than gating an all-or-nothing burst.
+      - MONITOR_MIN_GRAPHQL_BUDGET_FRACTION=${MONITOR_MIN_GRAPHQL_BUDGET_FRACTION:-0.10}
       # Watchdog retry configuration
       - WATCHDOG_MAX_RETRIES=${WATCHDOG_MAX_RETRIES:-2}
       # Worker pool configuration
