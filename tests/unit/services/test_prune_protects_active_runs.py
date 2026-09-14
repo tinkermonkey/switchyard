@@ -26,6 +26,7 @@ reads.
 
 import os
 import pytest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -42,6 +43,33 @@ def _ok(stdout: str = "") -> Mock:
     result.stdout = stdout
     result.stderr = ""
     return result
+
+
+@pytest.fixture(autouse=True)
+def _uncontended_checkout_lock():
+    """Keep this module's sweeps off the live deployment's lock store.
+
+    prune_epic_worktrees() takes each project's project_checkout lock before
+    touching that project (#169). The lock is backed by Redis, and
+    ORCHESTRATOR_ROOT redirects only the YAML store -- so an unstubbed acquire
+    here polls the *running* orchestrator's lock and blocks for the whole
+    timeout whenever it happens to be held, which made two of these cases a
+    120s pass/fail coin flip on production state (#230). It also meant a unit
+    test sat in the queue for a lock real dispatch waits on.
+
+    Locking is #169's subject and is covered against a stubbed store in
+    test_epic_worktree_checkout_lock.py; here it is a seam, held by no one.
+    Autouse rather than per-test so a case added later cannot reintroduce the
+    leak by forgetting it.
+    """
+    @contextmanager
+    def _acquire(project, issue_number=None, **kwargs):
+        yield None
+
+    with patch(
+        'services.project_checkout_lock.project_checkout_lock_sync', _acquire
+    ):
+        yield
 
 
 @pytest.fixture
