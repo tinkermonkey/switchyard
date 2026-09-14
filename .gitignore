@@ -16,7 +16,8 @@ orchestrator_data/
 
 # local state tracking (these are ephemeral and user-specific)
 state/
-config/projects/
+config/projects/*
+!config/projects/example.yaml.template
 
 # Python
 __pycache__/
@@ -48,6 +49,6 @@ temp/
 .DS_Store
 
 # But DO track these:
-!config/pipelines.yaml
-!config/agents.yaml
-!config/projects.example.yaml
+!config/foundations/pipelines.yaml
+!config/foundations/agents.yaml
+!config/foundations/workflows.yaml
