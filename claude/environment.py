@@ -75,10 +75,20 @@ class ClaudeEnvironmentBuilder:
         """Claude Code authentication and third-party API keys."""
         vars: dict = {}
 
+        bedrock_bearer = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip()
         oauth = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
         api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
-        if oauth:
+        if bedrock_bearer:
+            vars["CLAUDE_CODE_USE_BEDROCK"] = os.environ.get("CLAUDE_CODE_USE_BEDROCK", "1").strip()
+            vars["AWS_BEARER_TOKEN_BEDROCK"] = bedrock_bearer
+            if region := os.environ.get("AWS_REGION", "").strip():
+                vars["AWS_REGION"] = region
+            if provider := os.environ.get("CLAUDE_API_PROVIDER", "").strip():
+                vars["CLAUDE_API_PROVIDER"] = provider
+            vars["ANTHROPIC_API_KEY"] = ""  # clear any image-layer placeholder
+            logger.info("Using AWS_BEARER_TOKEN_BEDROCK (Bedrock billing)")
+        elif oauth:
             vars["CLAUDE_CODE_OAUTH_TOKEN"] = oauth
             vars["ANTHROPIC_API_KEY"] = ""  # clear any image-layer placeholder
             logger.info("Using CLAUDE_CODE_OAUTH_TOKEN (subscription billing)")
