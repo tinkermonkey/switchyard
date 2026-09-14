@@ -4991,7 +4991,9 @@ def get_epic_worktrees():
     Read-only and lock-free by design (see survey_epic_worktrees()): every field
     is a snapshot that may already have moved. Runs three or four short, purely
     local git subprocesses per staged worktree — no fetch, nothing that writes the
-    shared base clone — so it is a diagnostic endpoint, not something to poll
+    shared base clone — plus one Redis + Elasticsearch read for the whole request
+    (shared across every worktree) to resolve which of them belong to pipeline
+    runs still in flight. So it is a diagnostic endpoint, not something to poll
     tightly.
 
     Query params:
@@ -5024,6 +5026,36 @@ def get_epic_worktrees():
             'container_liveness_unknown': sum(
                 1 for w in worktrees
                 if w['drifted'] and w.get('container_live') is None
+            ),
+            # The composed answer, and the one a consumer should render.
+            # 'drifted'/'prune_skipped'/'container_live' above are each ONE of
+            # the sweep's rules; anything built by combining a few of them stops
+            # matching the sweep the next time a rule is added, which is how a
+            # worktree owned by an in-flight run came to be reported as
+            # removable (#231). Keys are ProjectWorkspaceManager._prune_verdict()'s
+            # values, so a new rule shows up here as a new key rather than as a
+            # silently wrong count.
+            #
+            # prune_skipped is retained above for compatibility with existing
+            # consumers, but it counts the DRIFT rule alone -- it undercounts
+            # what the sweep keeps by, among others, active runs, corrupted
+            # worktrees, and non-drifted worktrees with a live container (the
+            # container count above is itself gated on drifted). Prefer this.
+            'prune_verdicts': {
+                verdict: sum(1 for w in worktrees if w.get('prune_verdict') == verdict)
+                for verdict in sorted(
+                    {w.get('prune_verdict') for w in worktrees if w.get('prune_verdict')}
+                )
+            },
+            'active_run_protected': sum(
+                1 for w in worktrees if w.get('active_run_protected') is True
+            ),
+            # Split out rather than folded in, for the same reason the container
+            # unknown is: None means the run store could not be asked, and the
+            # sweep aborts in full on that answer, so these are neither
+            # protected nor eligible -- nothing is pruned at all while it holds.
+            'active_run_unknown': sum(
+                1 for w in worktrees if w.get('active_run_protected') is None
             ),
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }), 200

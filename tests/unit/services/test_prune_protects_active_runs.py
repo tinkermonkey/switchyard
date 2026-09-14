@@ -26,6 +26,7 @@ reads.
 
 import os
 import pytest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -42,6 +43,33 @@ def _ok(stdout: str = "") -> Mock:
     result.stdout = stdout
     result.stderr = ""
     return result
+
+
+@pytest.fixture(autouse=True)
+def _uncontended_checkout_lock():
+    """Keep this module's sweeps off the live deployment's lock store.
+
+    prune_epic_worktrees() takes each project's project_checkout lock before
+    touching that project (#169). The lock is backed by Redis, and
+    ORCHESTRATOR_ROOT redirects only the YAML store -- so an unstubbed acquire
+    here polls the *running* orchestrator's lock and blocks for the whole
+    timeout whenever it happens to be held, which made two of these cases a
+    120s pass/fail coin flip on production state (#230). It also meant a unit
+    test sat in the queue for a lock real dispatch waits on.
+
+    Locking is #169's subject and is covered against a stubbed store in
+    test_epic_worktree_checkout_lock.py; here it is a seam, held by no one.
+    Autouse rather than per-test so a case added later cannot reintroduce the
+    leak by forgetting it.
+    """
+    @contextmanager
+    def _acquire(project, issue_number=None, **kwargs):
+        yield None
+
+    with patch(
+        'services.project_checkout_lock.project_checkout_lock_sync', _acquire
+    ):
+        yield
 
 
 @pytest.fixture
@@ -431,3 +459,198 @@ class TestGetActiveRunWorkspaces:
         result = self._manager(redis_client, es).get_active_run_workspaces()
 
         assert result.epic_ids_by_project['codetoreum'] == {'1016'}
+
+
+class TestTheSurveyAsksTheSameQuestionTheSweepDoes:
+    """#231: survey_epic_worktrees() backs the operator diagnostic and the
+    /api/epic-worktrees endpoint, but reported a verdict derived from the drift
+    rule alone -- so the fifth rule, which is the whole subject of this module,
+    was invisible to the one place an operator looks before removing a
+    directory by hand.
+    """
+
+    def _survey(self, manager, workspaces):
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = workspaces
+        with patch('services.pipeline_run.get_pipeline_run_reader',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            return manager.survey_epic_worktrees()
+
+    def test_an_active_runs_worktree_is_reported_as_protected(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(
+            manager, ActiveRunWorkspaces({'codetoreum': {'1016'}}, set())
+        )
+
+        assert [r['active_run_protected'] for r in rows] == [True]
+
+    def test_an_unowned_worktree_is_not(self, manager, tmp_path):
+        """Control: the field must not be constant."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "999")
+
+        rows = self._survey(manager, ActiveRunWorkspaces({}, set(), complete=True))
+
+        assert [r['active_run_protected'] for r in rows] == [False]
+
+    def test_an_unanswerable_lookup_reports_none_not_false(self, manager, tmp_path):
+        """False would read as "no run owns it" and license "prune: eligible".
+        The sweep's actual behaviour on this answer is to prune nothing at all,
+        so the only honest report is "could not ask"."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(manager, ActiveRunWorkspaces.unknown())
+
+        assert [r['active_run_protected'] for r in rows] == [None]
+
+    def test_a_raising_run_store_keeps_the_survey_alive(self, manager, tmp_path):
+        """survey_epic_worktrees() promises it never raises -- it backs an HTTP
+        handler. An unreadable run store must degrade to "unknown", not 500."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        with patch('services.pipeline_run.get_pipeline_run_reader',
+                   side_effect=RuntimeError("redis down")), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert [r['active_run_protected'] for r in rows] == [None]
+
+    def test_the_run_store_is_read_once_for_the_whole_survey(self, manager, tmp_path):
+        """Same reason running_mount_sources is one round trip: this backs a web
+        request handler, and a per-worktree read would scale with the board."""
+        _make_base_clone(tmp_path, "codetoreum")
+        for epic in ("1015", "1016", "1017"):
+            _make_worktree(tmp_path, "codetoreum", epic)
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+        with patch('services.pipeline_run.get_pipeline_run_reader',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert len(rows) == 3
+        run_manager.get_active_run_workspaces.assert_called_once()
+
+    def test_the_recorded_path_alone_is_enough_to_protect(self, manager, tmp_path):
+        """ActiveRunWorkspaces matches on epic id OR recorded project_dir, and
+        _record() populates them independently -- a run carrying project_dir but
+        no epic id is protected by the path form alone. The sweep's side covers
+        both; without this the survey's side covered only the epic-id map, and a
+        mutation killing path matching passed the whole file."""
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(
+            manager, ActiveRunWorkspaces({}, {str(worktree)})
+        )
+
+        assert [r['active_run_protected'] for r in rows] == [True]
+        assert [r['prune_verdict'] for r in rows] == ['skipped_active_run']
+
+    def test_a_failing_import_still_does_not_raise(self, manager, tmp_path):
+        """The contract is "Never raises", and the handler used to re-import the
+        very module whose import may have failed -- which re-raises, out of a
+        method backing an HTTP endpoint."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        import builtins
+        real_import = builtins.__import__
+
+        def _boom(name, *args, **kwargs):
+            if name == 'services.pipeline_run':
+                raise ImportError("circular import during startup")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, '__import__', _boom), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert [r['active_run_protected'] for r in rows] == [None]
+        assert [r['prune_verdict'] for r in rows] == ['unknown']
+
+
+class TestTheVerdictMirrorsTheSweepsOwnRules:
+    """One composed answer, computed beside the sweep, so no consumer has to
+    re-derive it -- the arrangement that caused #231."""
+
+    def _verdict(self, **kw):
+        kw.setdefault('active_runs_known', True)
+        kw.setdefault('active_run_protected', False)
+        kw.setdefault('container_live', False)
+        kw.setdefault('corrupted', False)
+        kw.setdefault('drift_holds_work', False)
+        return ProjectWorkspaceManager._prune_verdict(**kw)
+
+    def test_an_unreadable_run_store_outranks_everything(self):
+        """The sweep aborts in FULL on that answer, so no row is eligible."""
+        assert self._verdict(active_runs_known=False, corrupted=True) == 'unknown'
+
+    def test_an_active_run_outranks_the_later_rules(self):
+        assert self._verdict(active_run_protected=True,
+                             drift_holds_work=True) == 'skipped_active_run'
+
+    def test_a_corrupted_worktree_is_skipped(self):
+        assert self._verdict(corrupted=True) == 'skipped_corrupted'
+
+    def test_a_live_container_is_skipped(self):
+        assert self._verdict(container_live=True) == 'skipped_container'
+
+    def test_drift_holding_work_is_skipped(self):
+        assert self._verdict(drift_holds_work=True) == 'skipped_drift'
+
+    def test_an_unanswerable_liveness_check_is_flagged_not_plain_eligible(self):
+        """The sweep prunes this -- it fails open on `is True`, deliberately, or
+        a docker outage would pin the staging tree on disk forever. But an
+        operator has no such deadline, so it must not read as a bare
+        "eligible"."""
+        assert self._verdict(container_live=None) == 'eligible_liveness_unknown'
+
+    def test_nothing_holding_it_is_eligible(self):
+        """Control: the verdict must not collapse into always-skipped."""
+        assert self._verdict() == 'eligible'
+
+
+class TestACorruptedWorktreeIsReportedAsSuch:
+    """The sweep's corruption rule skips a non-empty directory with no .git
+    because it "may hold real uncommitted work". It is a pure filesystem check,
+    answerable from any process -- it was simply never wired into the survey,
+    leaving the shape most likely to hold unrecoverable work reported as
+    removable."""
+
+    def test_a_git_less_non_empty_worktree_is_not_eligible(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "codetoreum")
+        path = tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum' / '1016'
+        path.mkdir(parents=True)
+        (path / 'uncommitted_work.py').write_text("# real work, no .git\n")
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+        with patch('services.pipeline_run.get_pipeline_run_reader',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert [r['corrupted'] for r in rows] == [True]
+        assert [r['prune_verdict'] for r in rows] == ['skipped_corrupted']
+
