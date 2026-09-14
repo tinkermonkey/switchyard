@@ -5025,6 +5025,21 @@ def get_epic_worktrees():
                 1 for w in worktrees
                 if w['drifted'] and w.get('container_live') is None
             ),
+            # The sweep's fifth rule (#229), surfaced here for the same reason
+            # the script prints it (#231): prune_skipped above counts the DRIFT
+            # rule only, so a consumer reading it as "what the sweep keeps"
+            # undercounts by exactly the worktrees that belong to runs still in
+            # flight -- the ones it is most dangerous to treat as abandoned.
+            'active_run_protected': sum(
+                1 for w in worktrees if w.get('active_run_protected') is True
+            ),
+            # Split out rather than folded in, for the same reason the container
+            # unknown is: None means the run store could not be asked, and the
+            # sweep aborts in full on that answer, so these are neither
+            # protected nor eligible -- nothing is pruned at all while it holds.
+            'active_run_unknown': sum(
+                1 for w in worktrees if w.get('active_run_protected') is None
+            ),
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }), 200
 

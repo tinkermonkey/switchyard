@@ -459,3 +459,89 @@ class TestGetActiveRunWorkspaces:
         result = self._manager(redis_client, es).get_active_run_workspaces()
 
         assert result.epic_ids_by_project['codetoreum'] == {'1016'}
+
+
+class TestTheSurveyAsksTheSameQuestionTheSweepDoes:
+    """#231: survey_epic_worktrees() backs the operator diagnostic and the
+    /api/epic-worktrees endpoint, but reported a verdict derived from the drift
+    rule alone -- so the fifth rule, which is the whole subject of this module,
+    was invisible to the one place an operator looks before removing a
+    directory by hand.
+    """
+
+    def _survey(self, manager, workspaces):
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = workspaces
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            return manager.survey_epic_worktrees()
+
+    def test_an_active_runs_worktree_is_reported_as_protected(self, manager, tmp_path):
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(
+            manager, ActiveRunWorkspaces({'codetoreum': {'1016'}}, set())
+        )
+
+        assert [r['active_run_protected'] for r in rows] == [True]
+
+    def test_an_unowned_worktree_is_not(self, manager, tmp_path):
+        """Control: the field must not be constant."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "999")
+
+        rows = self._survey(manager, ActiveRunWorkspaces({}, set(), complete=True))
+
+        assert [r['active_run_protected'] for r in rows] == [False]
+
+    def test_an_unanswerable_lookup_reports_none_not_false(self, manager, tmp_path):
+        """False would read as "no run owns it" and license "prune: eligible".
+        The sweep's actual behaviour on this answer is to prune nothing at all,
+        so the only honest report is "could not ask"."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        rows = self._survey(manager, ActiveRunWorkspaces.unknown())
+
+        assert [r['active_run_protected'] for r in rows] == [None]
+
+    def test_a_raising_run_store_keeps_the_survey_alive(self, manager, tmp_path):
+        """survey_epic_worktrees() promises it never raises -- it backs an HTTP
+        handler. An unreadable run store must degrade to "unknown", not 500."""
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   side_effect=RuntimeError("redis down")), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert [r['active_run_protected'] for r in rows] == [None]
+
+    def test_the_run_store_is_read_once_for_the_whole_survey(self, manager, tmp_path):
+        """Same reason running_mount_sources is one round trip: this backs a web
+        request handler, and a per-worktree read would scale with the board."""
+        _make_base_clone(tmp_path, "codetoreum")
+        for epic in ("1015", "1016", "1017"):
+            _make_worktree(tmp_path, "codetoreum", epic)
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            rows = manager.survey_epic_worktrees()
+
+        assert len(rows) == 3
+        run_manager.get_active_run_workspaces.assert_called_once()
+

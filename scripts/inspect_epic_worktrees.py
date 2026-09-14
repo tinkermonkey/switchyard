@@ -70,6 +70,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+_UNCHECKABLE_RULE_NOTE = (
+    "  Note: 'eligible' means no rule this script can check would stop the "
+    "sweep.\n"
+    "  It cannot see worktrees the running orchestrator is tracking in its own "
+    "process state,\n"
+    "  which the sweep also skips — so treat it as a strong hint, not a "
+    "guarantee."
+)
+
+
 def _describe_uncommitted(row: dict) -> str:
     if row['uncommitted'] is None:
         return "unreadable"
@@ -105,6 +115,37 @@ def _describe_unmerged(row: dict) -> str:
     return str(row['unmerged_commits'])
 
 
+def _describe_prune(row: dict) -> str:
+    """What the startup sweep would actually do with this directory.
+
+    Composed from every rule the survey can see, because reporting one rule's
+    share of the answer is how an active run's workspace came to be printed as
+    "eligible" while the sweep would in fact have skipped it (#231). The failure
+    direction is what makes this worth spelling out: an operator who reads
+    "eligible" next to a mid-pipeline epic may remove it by hand, which is the
+    incident the fifth rule exists to prevent, re-entered through the diagnostic
+    instead of the code path.
+
+    One rule stays invisible here by construction: the sweep also skips
+    worktrees tracked in the orchestrator's own in-process state, which this
+    script, in a separate process, cannot read. So "eligible" is "no rule this
+    script can check would stop it", never a promise. _UNCHECKABLE_RULE_NOTE
+    prints that caveat once per report rather than per row.
+    """
+    if row.get('active_run_protected') is None:
+        return (
+            "UNKNOWN — the active-run lookup failed, and the sweep aborts "
+            "entirely rather than prune without it, so nothing is removed"
+        )
+    if row['active_run_protected']:
+        return "SKIPPED (a pipeline run still in flight owns this workspace)"
+    if row.get('container_live'):
+        return "SKIPPED (an agent container is still mounted inside)"
+    if row['prune_skipped']:
+        return "SKIPPED (drifted + work this sweep cannot preserve)"
+    return "eligible"
+
+
 def _describe_branch(row: dict) -> str:
     if row['current_branch']:
         return row['current_branch']
@@ -123,7 +164,7 @@ def _print_row(row: dict) -> None:
         # committed its own work onto the drifted branch leaves an empty
         # porcelain and commits that exist nowhere else.
         print(f"    unmerged:     {_describe_unmerged(row)} commit(s) not on the epic's branch")
-    print(f"    prune:        {'SKIPPED (drifted + work this sweep cannot preserve)' if row['prune_skipped'] else 'eligible'}")
+    print(f"    prune:        {_describe_prune(row)}")
 
     if row['drifted']:
         print(
@@ -302,12 +343,22 @@ def main():
     drifted = sum(1 for row in rows if row['drifted'])
     skipped = sum(1 for row in rows if row['prune_skipped'])
     live = sum(1 for row in rows if row['drifted'] and row.get('container_live') is not False)
+    active = sum(1 for row in rows if row.get('active_run_protected'))
+    unknown = sum(1 for row in rows if row.get('active_run_protected') is None)
     print(
         f"{len(rows)} worktree(s): {drifted} drifted, "
         f"{skipped} holding work the startup sweep cannot preserve (prune skips "
         f"these), {live} with a container still (or possibly) live inside — those "
-        "need no action."
+        f"need no action, {active} owned by a pipeline run still in flight (prune "
+        "skips these too)."
     )
+    if unknown:
+        print(
+            f"  ⚠️  {unknown} worktree(s) could not be checked against the active-run "
+            "store. The sweep aborts rather than prune without that answer, so "
+            "nothing is removed while this persists."
+        )
+    print(_UNCHECKABLE_RULE_NOTE)
     return 0
 
 

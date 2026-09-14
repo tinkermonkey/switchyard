@@ -3132,15 +3132,44 @@ class ProjectWorkspaceManager:
             its own), unmerged_commits (commits the drifted branch holds that
             expected_branch does not; None when unanswerable or not applicable),
             uncommitted (True/False/None for unreadable), uncommitted_files (the
-            porcelain lines, capped), and prune_skipped (whether the startup
-            sweep's drift rule would leave it alone). Empty when nothing is
-            staged. Never raises.
+            porcelain lines, capped), prune_skipped (whether the startup sweep's
+            DRIFT rule alone would leave it alone), and active_run_protected
+            (whether the sweep's fifth rule would, i.e. a pipeline run still in
+            flight owns this workspace -- None when the run store could not be
+            asked, which the sweep treats as "prune nothing", not "prune this").
+
+            No single field is the whole prune verdict, and one rule cannot be
+            read as one: the sweep also skips anything tracked in THIS process's
+            _epic_worktrees, which a separate process cannot see at all. Callers
+            rendering a verdict for an operator should compose the fields and say
+            what they could not check -- scripts/inspect_epic_worktrees.py's
+            _describe_prune() is the reference. Empty when nothing is staged.
+            Never raises.
         """
         staging_root = self.workspace_root / '.orchestrator' / 'worktrees'
         rows: List[Dict[str, Any]] = []
         # One docker round-trip for the whole survey, not one per worktree --
         # this backs an HTTP handler, same reason the porcelain read is shared.
         running_mount_sources = self._get_running_container_mount_sources()
+        # The fifth prune rule (#229) reads the run store rather than the
+        # filesystem, so a survey that does not ask it is reporting a verdict
+        # for only some of the rules -- which is how an active run's workspace
+        # came to be printed as "prune: eligible" (#231). One read for the whole
+        # survey, for the same reason running_mount_sources is one round trip.
+        try:
+            from services.pipeline_run import (
+                ActiveRunWorkspaces,
+                get_pipeline_run_manager,
+            )
+            active_run_workspaces = get_pipeline_run_manager().get_active_run_workspaces()
+        except Exception as e:
+            from services.pipeline_run import ActiveRunWorkspaces
+            logger.warning(
+                f"Could not determine which epic worktrees belong to active "
+                f"pipeline runs; their prune verdict is reported as unknown "
+                f"rather than eligible: {e}"
+            )
+            active_run_workspaces = ActiveRunWorkspaces.unknown()
         try:
             if not staging_root.is_dir():
                 return rows
@@ -3205,15 +3234,26 @@ class ProjectWorkspaceManager:
                     'unmerged_commits': unmerged,
                     'uncommitted': uncommitted,
                     'uncommitted_files': uncommitted_files,
-                    # The sweep's own predicate, not a second approximation of it
-                    # -- an operator reading this has to be able to trust that
-                    # "prune: eligible" means the directory really does go away on
-                    # the next restart.
+                    # The sweep's own drift predicate, not a second approximation
+                    # of it. Note the scope: this is the DRIFT rule alone, and on
+                    # its own it does not license "prune: eligible" -- see
+                    # active_run_protected below and _describe_prune() in
+                    # scripts/inspect_epic_worktrees.py, which is what an operator
+                    # actually reads (#231).
                     'prune_skipped': (
                         self._is_drift_evidence(worktree_path, current_branch)
                         and self._drift_worktree_holds_work(
                             worktree_path, epic_id, current_branch, uncommitted
                         )
+                    ),
+                    # The fifth rule's answer for this directory. None is "could
+                    # not be asked", which is emphatically NOT "no run owns it":
+                    # the sweep aborts in full on an incomplete lookup, so an
+                    # unknown here means nothing gets pruned this cycle, not that
+                    # this one is free to go (#231).
+                    'active_run_protected': (
+                        active_run_workspaces.protects(project_staging.name, worktree_path)
+                        if active_run_workspaces.complete else None
                     ),
                 })
 

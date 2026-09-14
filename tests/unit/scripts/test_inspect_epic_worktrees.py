@@ -13,7 +13,7 @@ perform (code review on #163).
 
 import pytest
 
-from scripts.inspect_epic_worktrees import _print_row
+from scripts.inspect_epic_worktrees import _describe_prune, _print_row
 
 
 def _row(**overrides) -> dict:
@@ -32,6 +32,7 @@ def _row(**overrides) -> dict:
         'uncommitted': False,
         'uncommitted_files': [],
         'prune_skipped': False,
+        'active_run_protected': False,
     }
     row.update(overrides)
     return row
@@ -196,3 +197,68 @@ class TestALiveContainerOverWorkIsNotPromisedToSelfResolve:
         out = capsys.readouterr().out
         assert 'this resolves on its own once that container exits' in out
         assert 'nothing else to run' in out
+
+
+class TestThePruneVerdictCoversEveryRuleItCanSee:
+    """#231: the verdict was built from the drift rule alone, so a worktree the
+    sweep would skip for any other reason was printed as "eligible".
+
+    Observed in production on 2026-09-14: documentation_robotics epic #767 was
+    reported eligible while it held an active pipeline run. The failure
+    direction is the dangerous one -- an operator acting on "eligible" removes
+    the workspace of a mid-pipeline run by hand, which is the incident #229's
+    fifth rule exists to prevent, re-entered through the diagnostic.
+    """
+
+    def test_an_active_run_is_reported_as_skipped(self):
+        verdict = _describe_prune(_row(drifted=False, active_run_protected=True))
+        assert verdict.startswith("SKIPPED")
+        assert "in flight" in verdict
+
+    def test_the_production_row_that_was_wrong_is_no_longer_eligible(self):
+        """The exact shape observed: clean, undrifted, no container, active run."""
+        row = _row(
+            project='documentation_robotics', epic_id='767',
+            current_branch='feature/issue-767-feature',
+            expected_branch='feature/issue-767-feature',
+            epic_branches=['feature/issue-767-feature'],
+            belongs_to_epic=True, drifted=False, unmerged_commits=None,
+            container_live=False, prune_skipped=False,
+            active_run_protected=True,
+        )
+        assert _describe_prune(row) != "eligible"
+
+    def test_a_live_container_is_reported_as_skipped(self):
+        assert _describe_prune(
+            _row(drifted=False, container_live=True)
+        ).startswith("SKIPPED")
+
+    def test_the_drift_rule_still_reports(self):
+        assert _describe_prune(
+            _row(drifted=True, prune_skipped=True)
+        ).startswith("SKIPPED")
+
+    def test_nothing_holding_it_reads_as_eligible(self):
+        """Control: the verdict must not collapse into always-skipped."""
+        assert _describe_prune(
+            _row(drifted=False, prune_skipped=False,
+                 container_live=False, active_run_protected=False)
+        ) == "eligible"
+
+    def test_an_unanswerable_lookup_is_not_eligible(self):
+        """None is "could not ask". The sweep aborts in full rather than prune
+        without that answer, so reporting "eligible" would be doubly wrong."""
+        verdict = _describe_prune(_row(drifted=False, active_run_protected=None))
+        assert verdict.startswith("UNKNOWN")
+        assert "eligible" not in verdict
+
+    def test_an_active_run_outranks_a_drift_skip_in_the_wording(self):
+        """Both skip; the transient reason is the one an operator can act on."""
+        assert "in flight" in _describe_prune(
+            _row(drifted=True, prune_skipped=True, active_run_protected=True)
+        )
+
+    def test_the_printed_row_carries_the_verdict(self, capsys):
+        _print_row(_row(drifted=False, active_run_protected=True))
+        assert "in flight" in capsys.readouterr().out
+
