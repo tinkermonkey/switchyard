@@ -1,0 +1,131 @@
+# Example project configuration.
+#
+# config/projects/ is gitignored because it holds real, per-deployment project
+# configs (org names, repo URLs, tech stacks). This file is the tracked
+# exception: copy it to config/projects/<project-name>.yaml and fill it in.
+# See documentation/adding-a-project.md for the full field-by-field walkthrough.
+#
+# The filename (without .yaml) must match project.name below.
+
+project:
+  name: "my-project"
+  description: "One-line description of the project"
+
+  github:
+    org: "my-org"
+    repo: "my-project"
+    repo_url: "git@github.com:my-org/my-project.git"
+    branch: "main"
+
+  # Set true to exclude this project from board reconciliation, monitoring,
+  # and the web UI while still loading its config. Defaults to false.
+  # hidden: false
+
+  ci:
+    enabled: false
+
+  # Free-form key/value pairs describing the tech stack. Passed to the
+  # dev_environment_setup agent as context when generating Dockerfile.agent.
+  # Any keys are valid.
+  tech_stacks:
+    backend: "python, fastapi, postgresql"
+    frontend: "react, typescript"
+
+  # Controls the repair cycle behavior of the testing stage. max_iterations
+  # is the fix-and-retry cap before escalating; max_file_iterations caps
+  # retries on a single file.
+  testing:
+    types:
+      - type: "compilation"
+        max_iterations: 5
+        review_warnings: false
+        max_file_iterations: 3
+
+      - type: "unit"
+        max_iterations: 5
+        review_warnings: false
+        max_file_iterations: 3
+
+      - type: "integration"
+        max_iterations: 5
+        review_warnings: false
+        max_file_iterations: 3
+
+      - type: "ci"
+        max_iterations: 5
+        review_warnings: false
+        max_file_iterations: 3
+
+    max_file_iterations: 3
+    failure_escalation_threshold: 2
+
+  # Which pipeline templates (config/foundations/pipelines.yaml) and workflow
+  # templates (config/foundations/workflows.yaml) this project uses. These
+  # three are the canonical set used by every existing project — don't change
+  # `template` or `workflow` unless introducing a custom pipeline template.
+  pipelines:
+    enabled:
+      - template: "planning_design"
+        name: "planning-design"
+        board_name: "Planning & Design"
+        description: "Planning & Design"
+        workflow: "planning_design_workflow"
+        active: true
+
+      - template: "sdlc_execution"
+        name: "sdlc-execution"
+        board_name: "SDLC Execution"
+        description: "SDLC Execution"
+        workflow: "sdlc_execution_workflow"
+        active: true
+
+      - template: "environment_support"
+        name: "environment-support"
+        board_name: "Environment Support"
+        description: "Development Environment Support"
+        workflow: "environment_support_workflow"
+        active: true
+
+  # Maps GitHub labels to the pipeline names declared above. label_routing
+  # keys must exactly match the pipeline labels the orchestrator creates.
+  pipeline_routing:
+    default_pipeline: "planning-design"
+    label_routing:
+      "pipeline:planning-design": "planning-design"
+      "pipeline:sdlc-execution": "sdlc-execution"
+      "pipeline:environment-support": "environment-support"
+
+  # Optional: read-only reference repositories synced and mounted into every
+  # agent container at launch, hard-reset to origin/<branch> before each run.
+  # reference_repos:
+  #   - name: "some_reference_repo"
+  #     path: "/workspace/some_reference_repo"
+  #     branch: "main"
+  #     description: >
+  #       What this reference repo is and why agents should read it.
+  #       Available read-only at /reference/some_reference_repo in the
+  #       container.
+
+  # Optional: per-project overrides of agent config from
+  # config/foundations/agents.yaml. Keys are agent names from AGENT_REGISTRY.
+  # agent_customizations:
+  #   software_architect:
+  #     filesystem_write_allowed: true
+
+orchestrator:
+  # How often (seconds) the project monitor polls the GitHub board for card
+  # movements. 15 is standard for all existing projects.
+  polling_interval: 15
+
+  # Maps board columns to task queue priority. Column names must match the
+  # workflow template's column names exactly.
+  priority_mapping:
+    high_priority_columns:
+      - "Code Review"
+      - "Testing"
+    medium_priority_columns:
+      - "Development"
+      - "Design"
+    low_priority_columns:
+      - "Research"
+      - "Requirements"
