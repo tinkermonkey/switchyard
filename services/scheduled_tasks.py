@@ -214,6 +214,25 @@ class ScheduledTasksService:
             replace_existing=True
         )
 
+        # Schedule issue->run mapping sweep - every 30 minutes.
+        #
+        # The mapping hash has no TTL while the run records it points at do, so
+        # nothing else ever removes an entry whose run has ended (#238). The
+        # sweep is cheap (one HGETALL plus a lookup per entry) and deliberately
+        # slow to delete: entries nothing can account for are collected only
+        # after a day of OBSERVED unresolvability, which needs the job to run
+        # often enough to actually observe it.
+        #
+        # IntervalTrigger rather than CronTrigger(minute='*/30') to stay off
+        # the on-the-hour pile-up every '*/N' job in this scheduler shares.
+        self.scheduler.add_job(
+            self._cleanup_pipeline_run_mappings,
+            trigger=IntervalTrigger(minutes=30),
+            id='pipeline_run_mapping_cleanup',
+            name='Sweep issue->pipeline_run mappings whose runs have ended',
+            replace_existing=True
+        )
+
         # Schedule Docker disk cleanup - weekly on Sunday at 3 AM
         self.scheduler.add_job(
             self._cleanup_docker_disk,
@@ -266,6 +285,7 @@ class ScheduledTasksService:
         logger.info("- Project metrics rollup: Daily at 3:30 AM")
         logger.info(f"- Project metrics backfill: Once at startup in ~{jitter_seconds:.0f}s")
         logger.info("- Zombie pipeline run cleanup: Every 30 minutes")
+        logger.info("- Issue->run mapping sweep: Every 30 minutes")
         logger.info("- Docker disk cleanup: Weekly on Sunday at 3 AM")
         logger.info("- Test-cycle stats rollup: Weekly on Sunday at 4 AM")
         from config.retention import describe as _describe_retention
@@ -1248,6 +1268,24 @@ class ScheduledTasksService:
         except Exception as e:
             logger.error(f"Zombie pipeline run cleanup failed: {e}", exc_info=True)
 
+    async def _cleanup_pipeline_run_mappings(self):
+        """Sweep issue->pipeline_run mapping entries whose runs have ended.
+
+        PipelineRunManager.cleanup_expired_mappings() does the work and logs its
+        own disposition every pass -- including the steady state where entries
+        are being HELD as unaccountable, which is the condition that suppresses
+        epic-worktree collection and so the one worth seeing. This wrapper only
+        keeps the blocking Redis/ES calls off the event loop and makes sure a
+        failure cannot take the scheduler down with it.
+        """
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            manager = get_pipeline_run_manager()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, manager.cleanup_expired_mappings)
+        except Exception as e:
+            logger.error(f"Issue->run mapping sweep failed: {e}", exc_info=True)
+
     async def _cleanup_docker_disk(self):
         """Remove dangling images, non-latest agent tags, and build cache."""
         import subprocess
@@ -1391,6 +1429,11 @@ class ScheduledTasksService:
         """Run project metrics 7-day backfill immediately (for testing/manual trigger)."""
         logger.info("Manually triggering project metrics backfill")
         self._run_project_metrics_backfill()
+
+    def run_mapping_cleanup_now(self):
+        """Run the issue->run mapping sweep immediately (for testing/manual trigger)."""
+        logger.info("Manually triggering issue->run mapping sweep")
+        asyncio.create_task(self._cleanup_pipeline_run_mappings())
 
     def run_docker_cleanup_now(self):
         """Run Docker disk cleanup immediately (for testing/manual trigger)."""
