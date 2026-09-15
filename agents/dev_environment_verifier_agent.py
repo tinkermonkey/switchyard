@@ -150,6 +150,7 @@ class DevEnvironmentVerifierAgent(PipelineStage):
         # CHANGES_NEEDED result must NOT advance the issue to Done regardless of
         # whether the agent process itself exited cleanly.
         verifier_verdict = "BLOCKED"  # conservative default; overwritten on APPROVED
+        status_match = re.search(r"### Status\s*\*\*([^*\n]+)\*\*", review_text, re.IGNORECASE)
         if status_match:
             status = status_match.group(1).strip().upper()
             if status == "APPROVED":
@@ -238,10 +239,14 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
-                error_message = error_match.group(1).strip() if error_match else "Verification failed"
-                # Not truncated -- this is the operator's only persistent record of
-                # why the environment was blocked (see APPROVED branch above for the
-                # same reasoning applied to the image-tag mismatch path).
+                raw = error_match.group(1).strip() if error_match else "Verification failed"
+                # Cap LLM-derived content to 1000 chars so the state YAML and log
+                # remain human-readable, while still giving far more context than
+                # the old [:200]/[:100] limits did. Short enough to be a YAML value,
+                # long enough to hold a complete "Issues Found" section.
+                error_message = raw[:1000] + " ... (truncated)" if len(raw) > 1000 else raw
+                # Not truncated below 1000 chars -- this is the operator's only
+                # persistent record of why the environment was blocked.
                 self._record_status(
                     project_name,
                     DevContainerStatus.BLOCKED,
@@ -255,8 +260,9 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
-                error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
-                # Not truncated -- same reasoning as BLOCKED branch above.
+                raw = error_match.group(1).strip() if error_match else "Could not confirm required fix"
+                # Same 1000-char cap as BLOCKED above.
+                error_message = raw[:1000] + " ... (truncated)" if len(raw) > 1000 else raw
                 self._record_status(
                     project_name,
                     DevContainerStatus.CHANGES_NEEDED,
