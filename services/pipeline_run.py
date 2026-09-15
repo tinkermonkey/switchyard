@@ -50,6 +50,28 @@ else
 end
 """
 
+#: How long an ACTIVE run's Redis record survives without being rewritten.
+#:
+#: Must outlive the RUN, not any one agent. The record is written at creation
+#: and on status changes; a run spans several agents plus review cycles and
+#: feedback waits, so nothing bounds its wall-clock life to an agent timeout.
+#: Measured over the 160 runs that had ended on the reference deployment
+#: (2026-09-15; 153 completed, 7 failed): median 34m, p90 2.8h, max 51.1h, with
+#: 41 past two hours -- and none past seven days, which is where this value
+#: comes from.
+#:
+#: When it expires under a live run, that run reads as "not active" to
+#: get_active_run_workspaces(), the check that stops the startup sweep deleting
+#: its epic worktree (#233). At the previous values that was routine rather than
+#: rare: 7200 at creation, and 3600 on the status-update, restore and
+#: feedback-reuse paths, against runs that pass an hour a third of the time.
+#:
+#: Same value feedback_listening runs already used, and for the same reason: a
+#: record that outlives an abandoned run is collected by
+#: cleanup_stale_active_runs_on_startup() and the zombie-run sweep, whereas one
+#: that expires under a LIVE run costs that run its workspace.
+ACTIVE_RUN_REDIS_TTL_SECONDS = 604800
+
 # ILM Policy for pipeline-runs-%Y-%m-%d (daily indices).
 # Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
 # by default), so Elasticsearch and the filesystem sweep in
@@ -380,7 +402,7 @@ class PipelineRunManager:
         redis_key = self._get_redis_key(pipeline_run_id)
         self.redis.setex(
             redis_key,
-            7200,  # 2 hour TTL
+            ACTIVE_RUN_REDIS_TTL_SECONDS,
             json.dumps(pipeline_run.to_dict())
         )
         
@@ -414,7 +436,7 @@ class PipelineRunManager:
         redis_key = self._get_redis_key(pipeline_run.id)
         self.redis.setex(
             redis_key,
-            7200,  # 2 hour TTL
+            ACTIVE_RUN_REDIS_TTL_SECONDS,
             json.dumps(pipeline_run.to_dict())
         )
         self._persist_to_elasticsearch(pipeline_run)
@@ -1074,13 +1096,15 @@ class PipelineRunManager:
                             pass
 
                     if restore_to_redis:
-                        # Restore to Redis. feedback_listening runs get a 7-day TTL to cover
-                        # any realistic human review window; active runs get a 1-hour refresh.
+                        # Restore with the full active-run TTL. This is the
+                        # ES-only long-running run -- the population #233 is
+                        # about -- and a 1-hour refresh here recreated the
+                        # expiry-under-a-live-run it exists to prevent.
                         restore_key = self._get_redis_key(pipeline_run.id)
-                        if pipeline_run.status == 'feedback_listening':
-                            self.redis.setex(restore_key, 604800, json.dumps(pipeline_run.to_dict()))
-                        else:
-                            self.redis.setex(restore_key, 3600, json.dumps(pipeline_run.to_dict()))
+                        self.redis.setex(
+                            restore_key, ACTIVE_RUN_REDIS_TTL_SECONDS,
+                            json.dumps(pipeline_run.to_dict())
+                        )
                         # Restore under the board-scoped key when board was given (matches
                         # what create_pipeline_run() writes), else the legacy key — NOT
                         # whatever `issue_key` last held from the Redis loop above.
@@ -1336,7 +1360,10 @@ class PipelineRunManager:
                                 run_data, _ = feedback_run_to_reuse
                                 pipeline_run = PipelineRun.from_dict(run_data)
                                 redis_key = self._get_redis_key(pipeline_run.id)
-                                self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+                                self.redis.setex(
+                                    redis_key, ACTIVE_RUN_REDIS_TTL_SECONDS,
+                                    json.dumps(pipeline_run.to_dict())
+                                )
                                 self.redis.hset(self.redis_issue_mapping, self._get_issue_key(project, issue_number, board), pipeline_run.id)
                                 # Same reasoning as the Redis fast-path above — a new trigger
                                 # is reusing a feedback_listening run restored from ES, so
@@ -1558,12 +1585,15 @@ class PipelineRunManager:
         # Persist to Redis
         try:
             redis_key = self._get_redis_key(pipeline_run.id)
-            if new_status == 'feedback_listening':
-                # 7-day TTL — long enough for any realistic human review window.
-                # Prevents indefinite accumulation if the run is abandoned without being ended.
-                self.redis.setex(redis_key, 604800, json.dumps(pipeline_run.to_dict()))
-            else:
-                self.redis.setex(redis_key, 3600, json.dumps(pipeline_run.to_dict()))
+            # One TTL either way now. An active run's record has to outlive the
+            # run for the same reason a feedback_listening one has to outlive the
+            # human. This branch gave active runs an hour, which a third of real
+            # runs exceed -- and it ran on every status change, so it undid the
+            # longer TTL written at creation (#233).
+            self.redis.setex(
+                redis_key, ACTIVE_RUN_REDIS_TTL_SECONDS,
+                json.dumps(pipeline_run.to_dict())
+            )
         except Exception as e:
             logger.warning(f"Failed to update pipeline run status in Redis: {e}")
 
