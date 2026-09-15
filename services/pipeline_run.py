@@ -7,8 +7,10 @@ All observability events and logs are tagged with pipeline_run_id for traceabili
 
 import asyncio
 import logging
+import math
 import redis
 import json
+import time
 import uuid
 from typing import Optional, Dict, Any, Set, Tuple
 from datetime import datetime
@@ -18,6 +20,16 @@ from monitoring.observability import es_index_with_retry
 from config.retention import RETENTION_DAYS, build_ilm_policy
 
 logger = logging.getLogger(__name__)
+
+
+def _now_epoch_seconds() -> float:
+    """Wall clock as a single seam.
+
+    cleanup_expired_mappings() reasons about elapsed time, and tests need to
+    move that clock (forwards, backwards, and implausibly) without patching the
+    `time` module for everything else running in the process.
+    """
+    return time.time()
 
 
 def format_pipeline_run_issue_key(project: str, issue_number: int, board: Optional[str] = None) -> str:
@@ -71,6 +83,51 @@ end
 #: cleanup_stale_active_runs_on_startup() and the zombie-run sweep, whereas one
 #: that expires under a LIVE run costs that run its workspace.
 ACTIVE_RUN_REDIS_TTL_SECONDS = 604800
+
+#: Statuses that mean a run may still be in flight. Mirrors
+#: PipelineRun.is_active()'s status set and get_active_pipeline_run()'s ES
+#: filter; kept as a constant so the mapping sweep classifies an ES document
+#: exactly the way every other reader does.
+ACTIVE_RUN_STATUSES = ("active", "feedback_listening")
+
+#: Statuses that mean end_pipeline_run() (or the stale-run path that stands in
+#: for it) has already run. Only these license removing a mapping entry on
+#: evidence rather than on a grace period.
+TERMINAL_RUN_STATUSES = ("completed", "failed")
+
+#: How much OBSERVED unresolvability an issue-mapping entry must accumulate
+#: before cleanup_expired_mappings() will collect it.
+#:
+#: "Observed" is the load-bearing word. An entry that neither Redis nor
+#: Elasticsearch can account for is not evidence that its run is gone --
+#: _persist_to_elasticsearch() logs and continues on failure, and ILM reaps
+#: indices -- so zero hits is absence of testimony, not agreement (#238). The
+#: sweep therefore never deletes on a single unresolved look; it accrues the
+#: time it has actually WATCHED the entry stay unresolvable and collects only
+#: past this much.
+#:
+#: The cost of that honesty is that debris already in the hash at deploy starts
+#: from zero and waits one full window. That is deliberate: the alternative is
+#: inferring an age the data does not contain. The sweep logs what it is
+#: holding on every pass so the wait is visible rather than silent.
+MAPPING_UNRESOLVED_GRACE_SECONDS = 86400
+
+#: Distinct sweep passes that must have seen an entry unresolvable, on top of
+#: the grace above. Wall-clock can jump forward; a pass count cannot, so this
+#: is what stops a clock jump past the grace window from licensing an
+#: immediate delete (#238 constraint 4).
+MAPPING_UNRESOLVED_MIN_OBSERVATIONS = 3
+
+#: Longest gap between two sweeps that is counted as watched time. A larger
+#: gap means the orchestrator was down, the job was blocked, or the clock
+#: moved -- none of which is evidence that the entry sat unresolvable
+#: throughout, so the interval accrues nothing and only the pass itself counts.
+MAPPING_MAX_PLAUSIBLE_SWEEP_GAP_SECONDS = 6 * 3600
+
+#: Cap on how many entries the sweep names individually when it logs what it is
+#: holding. The counts are always logged in full; this bounds the detail line.
+MAPPING_HELD_LOG_SAMPLE = 10
+
 
 # ILM Policy for pipeline-runs-%Y-%m-%d (daily indices).
 # Retention comes from config/retention.py's single RETENTION_DAYS value (30 days
@@ -2404,35 +2461,401 @@ class PipelineRunManager:
         except Exception as e:
             logger.error(f"Failed to persist pipeline run to Elasticsearch: {e}")
     
-    def cleanup_expired_mappings(self, max_age_seconds: int = 7200):
+    def _unresolved_stamp_hash(self) -> str:
+        """Redis hash holding cleanup_expired_mappings()'s first-sighting state.
+
+        Derived from the mapping key rather than stored as an attribute so the
+        two can never be pointed at different namespaces by a caller that
+        overrides `redis_issue_mapping` (several tests and the MCP server do).
         """
-        Clean up expired pipeline run mappings from Redis
-        
-        This is a maintenance function that should be called periodically.
-        It removes stale mappings where the pipeline run data no longer exists.
-        
-        Args:
-            max_age_seconds: Maximum age in seconds before cleanup
+        return f"{self.redis_issue_mapping}:unresolved_since"
+
+    def _classify_mapping_entry(self, pipeline_run_id: str) -> str:
+        """What is known about the run an issue-mapping entry points at.
+
+        Returns one of:
+          'active'        -- the run may still be in flight; the entry is doing
+                             its job and must be left alone.
+          'terminal'      -- positive evidence the run has ended (a Redis blob
+                             or an ES document that says so). The entry is
+                             collectable immediately.
+          'unresolvable'  -- both stores were consulted and NEITHER has ever
+                             heard of this run id. Note the difference from
+                             'terminal': this is silence, not testimony, so it
+                             only ever feeds the grace-period accounting in
+                             cleanup_expired_mappings().
+          'undetermined'  -- the question could not be put. No Elasticsearch
+                             client, or a blob that would not parse. Nothing is
+                             learned, so the caller must leave the entry AND
+                             its accrued state exactly as they were.
+
+        Store or transport failures are not caught here: they propagate so the
+        caller books them per entry rather than aborting the sweep.
         """
+        data = self.redis.get(self._get_redis_key(pipeline_run_id))
+        if data:
+            try:
+                run = PipelineRun.from_dict(json.loads(data))
+            except Exception as e:
+                # A blob we cannot read says nothing about whether the run is
+                # over. Deleting here would be deleting on our own bug.
+                logger.warning(
+                    f"Issue mapping sweep: run {pipeline_run_id} has an unreadable "
+                    f"Redis record ({e}) -- treating as undetermined"
+                )
+                return 'undetermined'
+            return 'active' if run.is_active() else 'terminal'
+
+        if not self.es:
+            # Redis alone cannot distinguish "run finished and its record
+            # expired" from "run never existed": both look like a missing key.
+            return 'undetermined'
+
+        result = self.es.search(
+            index=f"{self.es_index_pattern}-*",
+            body={
+                # Match the document however it was written: _persist_to_elasticsearch()
+                # uses the run id as the document id, and the id is also a keyword
+                # field, so either form finds it without depending on which
+                # mapping a given daily index happens to have.
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"ids": {"values": [pipeline_run_id]}},
+                            {"term": {"id": pipeline_run_id}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+                "size": 5,
+            }
+        )
+        hits = (result.get('hits') or {}).get('hits') or []
+        if not hits:
+            return 'unresolvable'
+
+        statuses = [(hit.get('_source') or {}).get('status') for hit in hits]
+        # Duplicates across daily indices are possible; prefer the answer that
+        # keeps the entry. Being wrong about "active" costs one more sweep,
+        # being wrong about "ended" costs a live run its mapping.
+        if any(status in ACTIVE_RUN_STATUSES for status in statuses):
+            return 'active'
+        if any(status in TERMINAL_RUN_STATUSES for status in statuses):
+            return 'terminal'
+        logger.warning(
+            f"Issue mapping sweep: run {pipeline_run_id} found in Elasticsearch with "
+            f"unrecognised status(es) {statuses!r} -- treating as undetermined"
+        )
+        return 'undetermined'
+
+    def _compare_and_delete_mapping(self, issue_key: str, pipeline_run_id: str) -> bool:
+        """Delete one mapping field, but only while it still points at this run.
+
+        HDEL is the wrong primitive here: get_or_create_pipeline_run() (and
+        get_active_pipeline_run()'s ES-restore path) can repoint the field
+        between the HGETALL this sweep works from and this call, and an
+        unconditional delete would then drop a BRAND NEW run's mapping while
+        believing it had dropped the old one's.
+        """
+        deleted = self.redis.eval(
+            _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+            1,
+            self.redis_issue_mapping,
+            issue_key,
+            pipeline_run_id,
+        )
+        return bool(deleted)
+
+    @staticmethod
+    def _parse_unresolved_stamp(
+        raw: Any,
+        pipeline_run_id: str,
+        accrual_cap_seconds: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Validate a stored first-sighting record, or None if it cannot be trusted.
+
+        Rejecting a record costs one grace window; accepting a bad one licenses
+        an immediate delete, which is why every field is checked rather than
+        merely parsed. `0:`/`-inf`-style corruption, a record left behind for a
+        DIFFERENT run id after the field was repointed, a non-finite or
+        negative accrual, and an accrual larger than this sweep could ever have
+        written are all rejected.
+        """
+        if not raw:
+            return None
         try:
-            # Get all issue mappings
-            all_mappings = self.redis.hgetall(self.redis_issue_mapping)
-            
-            cleaned = 0
-            for issue_key, pipeline_run_id in all_mappings.items():
-                redis_key = self._get_redis_key(pipeline_run_id)
-                
-                # Check if pipeline run data still exists
-                if not self.redis.exists(redis_key):
-                    self.redis.hdel(self.redis_issue_mapping, issue_key)
-                    cleaned += 1
-            
-            if cleaned > 0:
-                logger.info(f"Cleaned up {cleaned} expired pipeline run mappings")
-                
+            record = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        if record.get('pipeline_run_id') != pipeline_run_id:
+            return None
+
+        accrued = record.get('unresolved_seconds')
+        if isinstance(accrued, bool) or not isinstance(accrued, (int, float)):
+            return None
+        accrued = float(accrued)
+        if not math.isfinite(accrued) or accrued < 0 or accrued > accrual_cap_seconds:
+            return None
+
+        observations = record.get('observations')
+        if isinstance(observations, bool) or not isinstance(observations, int):
+            return None
+        if observations < 1:
+            return None
+
+        last_seen = record.get('last_seen_at')
+        if isinstance(last_seen, bool) or not isinstance(last_seen, (int, float)):
+            last_seen = None
+        else:
+            last_seen = float(last_seen)
+            if not math.isfinite(last_seen) or last_seen <= 0:
+                last_seen = None
+
+        return {
+            'unresolved_seconds': accrued,
+            'observations': observations,
+            'last_seen_at': last_seen,
+            'pipeline_run_id': pipeline_run_id,
+        }
+
+    def cleanup_expired_mappings(
+        self,
+        unresolved_grace_seconds: int = MAPPING_UNRESOLVED_GRACE_SECONDS,
+        min_observations: int = MAPPING_UNRESOLVED_MIN_OBSERVATIONS,
+    ) -> Dict[str, Any]:
+        """Collect issue->run mapping entries whose runs are over.
+
+        The mapping hash has no TTL of its own while the run records it points
+        at do, so without this sweep every entry outlives its run and the hash
+        only grows (#238). That is not merely untidy: an entry nothing can
+        account for reads as an unknown to the workspace-protection path, and
+        an unknown suppresses epic-worktree collection for its project
+        indefinitely while looking exactly like protection working.
+
+        Two different licences to delete, deliberately kept apart:
+
+        * Evidence. A Redis blob or an ES document that says the run ended.
+          Collected on the spot.
+        * Grace. NOTHING anywhere has heard of the run. That is silence, not a
+          death certificate -- it is reachable whenever an ES write was
+          swallowed or ILM reaped the index -- so the entry is only collected
+          after this sweep has WATCHED it stay unresolvable for
+          `unresolved_grace_seconds` of plausible, observed time across at
+          least `min_observations` separate passes. Time the sweep was not
+          running does not count, and neither does a pass that errored.
+
+        What is deliberately NOT done:
+
+        * An entry is never deleted because Elasticsearch failed to answer, or
+          because there is no Elasticsearch client, or because a blob would not
+          parse. Those are 'undetermined': they leave the entry and its accrued
+          state untouched, so a transient blip costs one pass, not the clock.
+        * Deletes go through compare-and-delete, never HDEL -- see
+          _compare_and_delete_mapping().
+
+        Every pass logs its full disposition, including the steady state where
+        nothing was collected and entries are being held as unaccountable:
+        that state is the one that suppresses pruning, and it is exactly what a
+        summary guarded by "if anything changed" would stay silent about.
+
+        Cost is one HGETALL plus, per entry that Redis cannot answer for, one
+        Elasticsearch lookup. Deliberately one query per entry rather than one
+        batched query per pass: a batch that fails takes every entry's verdict
+        with it, and "the store was unreachable" has to stay attributable to
+        the single entry it was asked about. The hash is 13 entries on the
+        reference deployment and this job is what keeps it that size.
+
+        Returns a summary dict (also the shape the scheduled job logs from).
+        """
+        summary: Dict[str, Any] = {
+            'examined': 0,
+            'deleted_ended': 0,
+            'deleted_unaccountable': 0,
+            'held_active': 0,
+            'held_unaccountable': 0,
+            'undetermined': 0,
+            'raced': 0,
+            'errors': 0,
+            'stamps_pruned': 0,
+            'held_keys': [],
+        }
+
+        stamp_hash = self._unresolved_stamp_hash()
+        # An accrual larger than this cannot have been written by this sweep,
+        # so it is corruption rather than a very old entry.
+        accrual_cap = float(unresolved_grace_seconds) * 2
+
+        try:
+            mapping = self.redis.hgetall(self.redis_issue_mapping) or {}
         except Exception as e:
-            logger.error(f"Error cleaning up pipeline run mappings: {e}")
-    
+            logger.error(f"Issue mapping sweep: could not read {self.redis_issue_mapping}: {e}")
+            summary['errors'] += 1
+            return summary
+
+        try:
+            stamps = self.redis.hgetall(stamp_hash) or {}
+        except Exception as e:
+            # Not fatal: an unreadable stamp hash means every unresolvable
+            # entry restarts its grace window, which delays collection but
+            # never accelerates it.
+            logger.warning(f"Issue mapping sweep: could not read {stamp_hash}: {e}")
+            stamps = {}
+
+        summary['examined'] = len(mapping)
+        now = _now_epoch_seconds()
+
+        for issue_key, pipeline_run_id in sorted(mapping.items()):
+            # Per entry, not around the loop: one unreachable run must not stop
+            # the other twelve being considered.
+            try:
+                if not pipeline_run_id:
+                    # A field with no run id points nowhere; there is no run to
+                    # be wrong about, and compare-and-delete still guards
+                    # against a concurrent writer filling it in.
+                    if self._compare_and_delete_mapping(issue_key, pipeline_run_id or ""):
+                        summary['deleted_ended'] += 1
+                    else:
+                        summary['raced'] += 1
+                    continue
+
+                verdict = self._classify_mapping_entry(pipeline_run_id)
+
+                if verdict == 'undetermined':
+                    summary['undetermined'] += 1
+                    continue
+
+                if verdict == 'active':
+                    summary['held_active'] += 1
+                    self._clear_unresolved_stamp(stamp_hash, issue_key, stamps, summary)
+                    continue
+
+                if verdict == 'terminal':
+                    if self._compare_and_delete_mapping(issue_key, pipeline_run_id):
+                        summary['deleted_ended'] += 1
+                    else:
+                        summary['raced'] += 1
+                    self._clear_unresolved_stamp(stamp_hash, issue_key, stamps, summary)
+                    continue
+
+                # 'unresolvable' -- the grace path.
+                record = self._parse_unresolved_stamp(
+                    stamps.get(issue_key), pipeline_run_id, accrual_cap
+                )
+                if record is None:
+                    accrued = 0.0
+                    observations = 1
+                else:
+                    observations = record['observations'] + 1
+                    last_seen = record['last_seen_at']
+                    gap = None if last_seen is None else now - last_seen
+                    if gap is not None and 0 <= gap <= MAPPING_MAX_PLAUSIBLE_SWEEP_GAP_SECONDS:
+                        accrued = min(record['unresolved_seconds'] + gap, accrual_cap)
+                    else:
+                        # Downtime, a blocked loop, or a clock that moved. None
+                        # of it was watched, so none of it counts.
+                        accrued = record['unresolved_seconds']
+
+                if accrued >= unresolved_grace_seconds and observations >= min_observations:
+                    if self._compare_and_delete_mapping(issue_key, pipeline_run_id):
+                        summary['deleted_unaccountable'] += 1
+                        logger.info(
+                            f"Issue mapping sweep: collected {issue_key} -> {pipeline_run_id} "
+                            f"after {accrued / 3600:.1f}h unaccountable across "
+                            f"{observations} passes"
+                        )
+                    else:
+                        summary['raced'] += 1
+                    self._clear_unresolved_stamp(stamp_hash, issue_key, stamps, summary)
+                    continue
+
+                self.redis.hset(stamp_hash, issue_key, json.dumps({
+                    'pipeline_run_id': pipeline_run_id,
+                    'unresolved_seconds': accrued,
+                    'observations': observations,
+                    'last_seen_at': now,
+                }))
+                summary['held_unaccountable'] += 1
+                if len(summary['held_keys']) < MAPPING_HELD_LOG_SAMPLE:
+                    summary['held_keys'].append(
+                        f"{issue_key} -> {pipeline_run_id} ({accrued / 3600:.1f}h/{observations}x)"
+                    )
+            except Exception as e:
+                summary['errors'] += 1
+                logger.warning(
+                    f"Issue mapping sweep: {issue_key} could not be evaluated ({e}) -- "
+                    f"left in place, grace state untouched"
+                )
+
+        # The stamp hash must not become the thing it exists to fix: drop state
+        # for fields that are no longer in the mapping at all.
+        for stale_key in set(stamps) - set(mapping):
+            try:
+                self.redis.hdel(stamp_hash, stale_key)
+                summary['stamps_pruned'] += 1
+            except Exception as e:
+                logger.warning(f"Issue mapping sweep: could not prune stamp {stale_key}: {e}")
+
+        self._log_mapping_sweep_summary(summary)
+        return summary
+
+    def _clear_unresolved_stamp(
+        self,
+        stamp_hash: str,
+        issue_key: str,
+        stamps: Dict[str, Any],
+        summary: Dict[str, Any],
+    ) -> None:
+        """Forget an entry's accrued grace, for entries that are accounted for."""
+        if issue_key not in stamps:
+            return
+        try:
+            self.redis.hdel(stamp_hash, issue_key)
+            summary['stamps_pruned'] += 1
+        except Exception as e:
+            logger.warning(f"Issue mapping sweep: could not clear stamp {issue_key}: {e}")
+
+    @staticmethod
+    def _log_mapping_sweep_summary(summary: Dict[str, Any]) -> None:
+        """Log every pass, including the one where nothing happened.
+
+        "N entries held as unaccountable, nothing collected" IS the condition
+        worth seeing -- it is what suppresses workspace pruning -- so this is
+        deliberately not guarded by "if anything was deleted".
+        """
+        logger.info(
+            "Issue mapping sweep: %d entries examined; deleted %d ended + %d unaccountable-past-grace; "
+            "held %d active + %d unaccountable; %d undetermined; %d raced; %d stamps pruned; %d errors",
+            summary['examined'],
+            summary['deleted_ended'],
+            summary['deleted_unaccountable'],
+            summary['held_active'],
+            summary['held_unaccountable'],
+            summary['undetermined'],
+            summary['raced'],
+            summary['stamps_pruned'],
+            summary['errors'],
+        )
+        if summary['held_unaccountable']:
+            sample = summary['held_keys'][:MAPPING_HELD_LOG_SAMPLE]
+            more = summary['held_unaccountable'] - len(sample)
+            logger.warning(
+                "Issue mapping sweep: %d entr%s neither Redis nor Elasticsearch can account for, "
+                "held pending grace: %s%s",
+                summary['held_unaccountable'],
+                'y' if summary['held_unaccountable'] == 1 else 'ies',
+                ', '.join(sample),
+                f" (+{more} more)" if more > 0 else "",
+            )
+        if summary['undetermined']:
+            logger.warning(
+                "Issue mapping sweep: %d entr%s could not be classified at all "
+                "(no Elasticsearch, or an unreadable record); grace state untouched",
+                summary['undetermined'],
+                'y' if summary['undetermined'] == 1 else 'ies',
+            )
+
     def cleanup_stale_active_runs_on_startup(self, retriggered_issues: set = None):
         """
         Clean up stale 'active' pipeline runs on orchestrator startup.
