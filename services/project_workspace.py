@@ -373,6 +373,23 @@ class WorktreeBranchDriftError(RuntimeError):
         self.container_live = container_live
 
 
+class WorktreeAddError(RuntimeError):
+    """A `git worktree add` command failed while creating an epic worktree.
+
+    Raised by _add_epic_worktree() when `git worktree add` exits non-zero.
+    Distinct from WorktreeBranchDriftError (which describes a worktree that
+    was created successfully but has since drifted) and from the corrupted-
+    directory RuntimeError raised when the directory exists with no .git.
+
+    This class exists so callers can tell a transient git-command failure
+    (network timeout, stale index.lock, etc.) from a permanently-broken
+    workspace state.  On a transient failure the pipeline lock should be
+    released so the next poll retries, not retained indefinitely the way a
+    genuine workspace corruption should be.  See
+    services/review_cycle.py's exception handler for how this is routed.
+    """
+
+
 class ProjectWorkspaceManager:
     """Manages project repository checkouts and branch management"""
 
@@ -2691,7 +2708,7 @@ class ProjectWorkspaceManager:
                 capture_output=True, text=True, timeout=30
             )
             if result.returncode != 0:
-                raise RuntimeError(
+                raise WorktreeAddError(
                     f"Failed to add worktree for existing branch {branch_name}: {result.stderr.strip()}"
                 )
             return
@@ -2702,7 +2719,7 @@ class ProjectWorkspaceManager:
             capture_output=True, text=True, timeout=30
         )
         if fetch_default.returncode != 0:
-            raise RuntimeError(
+            raise WorktreeAddError(
                 f"Failed to fetch origin/{default_branch} while creating worktree "
                 f"branch {branch_name}: {fetch_default.stderr.strip()}"
             )
@@ -2749,7 +2766,7 @@ class ProjectWorkspaceManager:
                     capture_output=True, text=True, timeout=30
                 )
             if result.returncode != 0:
-                raise RuntimeError(
+                raise WorktreeAddError(
                     f"Failed to create worktree branch {branch_name}: {result.stderr.strip()}"
                 )
 

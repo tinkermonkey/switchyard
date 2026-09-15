@@ -2069,6 +2069,7 @@ class AgentExecutor:
                 not post_result.get('success')
                 and attempt < 3
                 and 'circuit breaker open' not in str(post_result.get('error', '')).lower()
+                and '404' not in str(post_result.get('error', '')).lower()
             ):
                 backoff_seconds = 3 * attempt
                 logger.warning(
