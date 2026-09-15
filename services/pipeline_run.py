@@ -12,7 +12,7 @@ import json
 import uuid
 from typing import Optional, Dict, Any, Set, Tuple
 from datetime import datetime
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
 from services.run_ownership import RunOwnership
@@ -36,6 +36,37 @@ def format_pipeline_run_issue_key(project: str, issue_number: int, board: Option
     if board:
         return f"{project}:{board}:{issue_number}"
     return f"{project}:{issue_number}"
+
+
+def project_of_pipeline_run_issue_key(issue_key) -> Optional[str]:
+    """The PROJECT a mapping field belongs to, or None if it cannot be read.
+
+    The inverse of format_pipeline_run_issue_key()'s first field, and the whole
+    inverse that is needed: both key forms -- legacy `project:issue_number` and
+    board-scoped `project:board:issue_number` -- put the project first, and a
+    board containing a ':' (they are human board titles, e.g. "Planning &
+    Design") moves only the fields AFTER it. Nothing here needs the board or
+    the issue number, so the ambiguous tail is never parsed.
+
+    Why it exists: get_active_run_workspaces() has to scope the doubt raised by
+    an unresolvable mapping entry to ONE project (#233). The entry's own key is
+    the only thing left that says which project the vanished run belonged to --
+    the run record that would have said so is exactly what is missing.
+
+    None for anything that is not a usable project name -- no ':' at all, an
+    empty first field, or a key this cannot decode. The caller must treat that
+    as doubt about the WHOLE answer, since a doubt that cannot be attributed
+    cannot be scoped.
+    """
+    if isinstance(issue_key, bytes):
+        try:
+            issue_key = issue_key.decode('utf-8')
+        except Exception:
+            return None
+    if not isinstance(issue_key, str) or ':' not in issue_key:
+        return None
+    project = issue_key.split(':', 1)[0].strip()
+    return project or None
 
 
 # Atomically delete a hash field only if its current value matches — used by
@@ -167,6 +198,17 @@ class ActiveRunWorkspaces:
         exists to remove, applied to a destructive operation. The prune skips
         entirely when this is False: leaving worktrees on disk costs one sweep,
         deleting a live one costs the run.
+      * `projects_with_unaccountable_runs` -- the SAME doubt, scoped to the
+        projects it is actually about (#233). The lookup can fail for one
+        issue->run mapping entry rather than for the store: the entry names a
+        run whose record is gone from Redis and which Elasticsearch never saw,
+        so whether that run is still active is unanswerable -- but only for
+        the project that entry belongs to. Spending the whole-answer flag on
+        it was measured to set `complete=False` on essentially every startup
+        (9 of 13 mapping entries on the reference deployment were unresolvable),
+        which turns the sweep into a permanent no-op that still LOOKS like
+        protection -- strictly worse than the defect. A dangling pointer in
+        `test-project` is no reason to stop collecting `heimdall`'s worktrees.
       * that epic ids and paths are DIFFERENT KINDS of key. Packing the paths
         into the same map under a reserved `'*paths*'` key (the shape this
         replaces) made a project of that name silently overwrite its own
@@ -186,6 +228,11 @@ class ActiveRunWorkspaces:
     epic_ids_by_project: Dict[str, Set[str]]
     paths: Set[str]
     complete: bool = True
+    #: Projects the answer is only PARTIAL for. Keep it last and defaulted: the
+    #: three fields above are positional at a dozen call sites, and a value
+    #: built without this one must mean "no scoped doubt", not "doubt about
+    #: something unnamed".
+    projects_with_unaccountable_runs: Set[str] = field(default_factory=set)
 
     def __post_init__(self):
         # BOTH fields, and the inner sets too. `frozen=True` freezes the
@@ -209,6 +256,14 @@ class ActiveRunWorkspaces:
                 str(project): {str(epic_id) for epic_id in epic_ids}
                 for project, epic_ids in self.epic_ids_by_project.items()
             },
+        )
+        # Copied and stringified for the same two reasons as the fields above:
+        # it is a container behind a frozen binding, and it is matched against
+        # the same project name (a staging DIRECTORY name) they are.
+        object.__setattr__(
+            self,
+            'projects_with_unaccountable_runs',
+            {str(project) for project in self.projects_with_unaccountable_runs},
         )
 
     @classmethod
@@ -237,11 +292,31 @@ class ActiveRunWorkspaces:
         Matching (once the answer is known to be usable) is on BOTH the epic id
         -- the directory's own name, robust to path formatting -- and the run's
         recorded project_dir, robust to a layout change. Either is enough.
+
+        THERE ARE TWO GATES, WITH THE MATCH BETWEEN THEM, and that order is
+        deliberate (#233):
+
+          1. `complete` -- the whole answer is unusable, so every worktree is
+             UNKNOWN whatever project it is in.
+          2. the match -- a POSITIVE hit is a definite answer, and it stays
+             definite in a project that also carries doubt. A run we can see
+             owns this directory is not made less certain by a sibling mapping
+             entry we cannot resolve; reporting OWNED also tells the operator
+             the true reason the directory is being kept.
+          3. `projects_with_unaccountable_runs` -- nothing here claims this
+             directory, but THIS PROJECT has a run we could not account for,
+             and an unaccounted-for run is exactly the one whose project_dir we
+             cannot see. So "nothing claims it" is not "nothing owns it", and
+             the answer is UNKNOWN rather than UNOWNED -- for this project
+             only, which is what keeps one project's debris from disarming
+             every other project's sweep.
         """
         if not self.complete:
             return RunOwnership.UNKNOWN
         if self._protects(project, worktree_path):
             return RunOwnership.OWNED
+        if str(project) in self.projects_with_unaccountable_runs:
+            return RunOwnership.UNKNOWN
         return RunOwnership.UNOWNED
 
     def _protects(self, project: str, worktree_path) -> bool:
@@ -1200,6 +1275,23 @@ class PipelineRunManager:
         thing that still knows the directory matters, which is why the answer
         has to come from here.
 
+        AN UNRESOLVABLE MAPPING ENTRY IS AN UNKNOWN, NOT A NON-ANSWER (#233).
+        The issue->run mapping can name a run whose record is gone from Redis.
+        That says nothing about whether the run was active -- only that we
+        cannot tell from Redis -- and the Elasticsearch pass below is what was
+        meant to answer it. When ES has not seen the run either (a run written
+        while ES was down, whose Redis record later expired), it is invisible
+        to both passes, and `continue` alone reported that silence as "no run
+        owns that worktree" to a caller that deletes directories.
+
+        It is reported as doubt about THAT ENTRY'S PROJECT, not about the whole
+        answer. On the reference deployment 9 of 13 mapping entries were
+        unresolvable, so spending `complete` on them would have disabled the
+        sweep permanently while still looking like protection -- the one
+        outcome worse than the defect. Their debris is collected separately
+        (#238); until it is, those projects' worktrees are kept, and every
+        other project's sweep runs normally.
+
         COMPLETENESS IS PART OF THE ANSWER. An earlier revision returned a bare
         dict and `{}` on any failure -- which is also what a healthy system with
         no active runs returns. The caller deletes directories on that answer,
@@ -1215,17 +1307,56 @@ class PipelineRunManager:
         epic_ids_by_project: Dict[str, Set[str]] = {}
         paths: Set[str] = set()
         complete = True
+        # project -> the run ids its mapping entries point at that Redis could
+        # not resolve. Held as run ids, not just project names, so the
+        # Elasticsearch pass can CLEAR the ones it accounts for; what survives
+        # to the end is the doubt that neither store could answer.
+        unresolved_run_ids_by_project: Dict[str, Set[str]] = {}
+        # Every run id the ES pass saw, whether or not it recorded the run: a
+        # hit carrying an ended_at is still ACCOUNTED FOR -- we know it is not
+        # active, which is exactly what an unresolved entry asks.
+        #
+        # This is why clearing matters rather than being a nicety: an expired
+        # Redis record is the case the ES pass EXISTS for, so a long-running
+        # run that ES can see must not leave doubt hanging over its own
+        # project's other worktrees. The query is active-only, so a run ES
+        # holds in a terminal state is not cleared here -- it stays doubt,
+        # which is the conservative direction and, measured against the
+        # reference deployment, an empty population: the unresolvable entries
+        # there are absent from Elasticsearch entirely.
+        es_seen_run_ids: Set[str] = set()
 
-        def _record(run_data: Dict[str, Any]) -> None:
+        def _record(run_data: Dict[str, Any]) -> bool:
+            """Index one active run's workspace. False = it named one we could
+            not index, which is an unknown and must not pass as "nothing".
+
+            The early return this replaces dropped any record without a
+            `project` and left the answer looking complete (#233) -- the same
+            unknown-as-answer shape as the mapping entry above it, one branch
+            away. Most such records are not actually unindexable: _protects()
+            matches `paths` WITHOUT consulting the project, so a recorded
+            project_dir protects on its own and only the epic-id half needs a
+            project to key it under.
+            """
             project = run_data.get('project')
-            if not project:
-                return
             epic_id = run_data.get('epic_id')
-            if epic_id:
-                epic_ids_by_project.setdefault(project, set()).add(str(epic_id))
             project_dir = run_data.get('project_dir')
             if project_dir:
                 paths.add(str(project_dir).rstrip('/'))
+            if epic_id and not project and not project_dir:
+                # Active, names a worktree by epic id, and nothing in the
+                # record says which project's staging directory that id lives
+                # under -- so this workspace cannot be protected by either
+                # matching form.
+                logger.warning(
+                    f"Active pipeline run {run_data.get('id')} names epic "
+                    f"{epic_id} but no project and no project_dir, so its "
+                    f"workspace cannot be identified"
+                )
+                return False
+            if epic_id and project:
+                epic_ids_by_project.setdefault(project, set()).add(str(epic_id))
+            return True
 
         # Redis first: it is the source of truth for active runs, and unlike
         # lock state it needs no startup sync to have run before it is
@@ -1237,7 +1368,11 @@ class PipelineRunManager:
             mapping = {}
             complete = False
 
-        for pipeline_run_id in mapping.values():
+        # .items(), not .values(): when the record a field points at is gone,
+        # the FIELD NAME is the only thing left that says which project the
+        # vanished run belonged to, and scoping the resulting doubt to that
+        # project is what keeps it from disabling every project's sweep (#233).
+        for issue_key, pipeline_run_id in mapping.items():
             # PER RUN, not around the whole loop. With the try outside, one
             # unparseable blob -- a truncated value, or a run written by an
             # older schema that PipelineRun.from_dict() rejects -- aborted the
@@ -1246,10 +1381,32 @@ class PipelineRunManager:
             try:
                 raw = self.redis.get(self._get_redis_key(pipeline_run_id))
                 if not raw:
+                    # AN UNKNOWN, not a no-op. Held rather than acted on: the
+                    # ES pass below may still account for this run, and that
+                    # backstop is the whole reason an expired record is
+                    # ordinarily harmless.
+                    project = project_of_pipeline_run_issue_key(issue_key)
+                    if project:
+                        unresolved_run_ids_by_project.setdefault(
+                            project, set()
+                        ).add(str(pipeline_run_id))
+                    else:
+                        # A doubt that cannot be attributed cannot be scoped,
+                        # so it has to be spent on the whole answer. Reaching
+                        # here means the mapping holds a field no writer in
+                        # this file produces.
+                        logger.error(
+                            f"Active-run mapping field {issue_key!r} names no "
+                            f"project, so the run {pipeline_run_id} it points "
+                            f"at -- whose record is gone from Redis -- cannot "
+                            f"be attributed to one"
+                        )
+                        complete = False
                     continue
                 run_data = json.loads(raw)
                 if PipelineRun.from_dict(run_data).is_active():
-                    _record(run_data)
+                    if not _record(run_data):
+                        complete = False
             except Exception as e:
                 logger.warning(
                     f"Skipping unreadable pipeline run {pipeline_run_id} while "
@@ -1273,8 +1430,12 @@ class PipelineRunManager:
                 )
                 for hit in result.get('hits', {}).get('hits', []):
                     source = hit.get('_source') or {}
+                    run_id = source.get('id')
+                    if run_id:
+                        es_seen_run_ids.add(str(run_id))
                     if not source.get('ended_at'):
-                        _record(source)
+                        if not _record(source):
+                            complete = False
             except Exception as e:
                 logger.error(f"Could not read active pipeline runs from Elasticsearch: {e}")
                 complete = False
@@ -1283,10 +1444,32 @@ class PipelineRunManager:
             # which is exactly the population this protects best.
             complete = False
 
+        # What neither store could account for. An unresolvable mapping entry
+        # whose run Elasticsearch DID see is answered -- if that run is active
+        # the pass above recorded its workspace, and if it is not, it owns
+        # nothing to protect. What is left is the population #233 is about: a
+        # run written while ES was unavailable whose Redis record later
+        # expired, invisible to both passes and indistinguishable from a run
+        # that ended cleanly.
+        projects_with_unaccountable_runs: Set[str] = set()
+        for project, run_ids in unresolved_run_ids_by_project.items():
+            unaccountable = run_ids - es_seen_run_ids
+            if not unaccountable:
+                continue
+            projects_with_unaccountable_runs.add(project)
+            logger.warning(
+                f"Active-run mapping for project '{project}' points at "
+                f"{len(unaccountable)} run(s) with no record in Redis and none "
+                f"in Elasticsearch ({', '.join(sorted(unaccountable))}) -- "
+                f"cannot tell whether they are still active, so this project's "
+                f"epic worktrees are treated as possibly owned and kept"
+            )
+
         return ActiveRunWorkspaces(
             epic_ids_by_project=epic_ids_by_project,
             paths=paths,
             complete=complete,
+            projects_with_unaccountable_runs=projects_with_unaccountable_runs,
         )
 
     def get_or_create_pipeline_run(
