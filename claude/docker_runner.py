@@ -1410,10 +1410,17 @@ class DockerAgentRunner:
         """Resolve execution_type from context the same way regardless of whether
         it was set on the nested task_context (context['context'], the dict
         agent_executor.py actually stores it on) or copied onto the top-level
-        context dict some caller assembled directly. Mirrors the inline lookup
-        _build_docker_command() already does for the org.switchyard.execution_type
-        container label -- pulled out here so both call sites, and anything else
-        that needs it, resolve it identically instead of drifting apart."""
+        context dict some caller assembled directly.
+
+        Same fallback pattern as the inline lookups _build_docker_command() uses
+        for the org.switchyard.execution_type container label and the one used
+        for container_info['execution_type'] further down this file -- but those
+        two are standalone copies, not calls to this method, so a change here
+        does not propagate to them. This method exists so the --disallowedTools
+        call sites in _execute_in_container share one implementation; it is not
+        (yet) a single source of truth for every execution_type lookup in this
+        file.
+        """
         task_context = context.get('context', {})
         return task_context.get('execution_type') or context.get('execution_type', '')
 
@@ -1425,14 +1432,19 @@ class DockerAgentRunner:
         and test_output_format.md, which explicitly forbid backgrounding the test
         run or deferring the result to a later turn.
 
-        Those are prompt-only instructions, and a 2026-09-14 heimdall run
-        (pipeline_run_id 4963b5b7) showed the agent disregarding them anyway: it
-        used Monitor/ScheduleWakeup to watch a backgrounded Playwright run and
-        repeatedly returned a "still waiting" status update instead of the
-        required JSON result, burning ~70 minutes across retries before a later
-        attempt finally complied. _execute_in_container() passes
-        _REPAIR_TEST_DISALLOWED_TOOLS to --disallowedTools when this is true,
-        removing the option structurally instead of relying on prompt text alone.
+        Those are prompt-only instructions, and a production run showed the agent
+        disregarding them anyway: it used Monitor/ScheduleWakeup to watch a
+        backgrounded Playwright run and repeatedly returned a "still waiting"
+        status update instead of the required JSON result, burning significant
+        wall-clock time across repeated retries before a later attempt finally
+        complied. _execute_in_container() passes _REPAIR_TEST_DISALLOWED_TOOLS to
+        --disallowedTools when this is true, which removes Monitor/ScheduleWakeup
+        specifically -- the tools used to wait on or poll a backgrounded run.
+        It does NOT prevent backgrounding itself: Bash's own run_in_background
+        option is still available, so an agent can still detach the test command
+        and return early. The prompt guidance above remains the backstop against
+        that; this only closes off the "watch it from the background" path that
+        actually caused the incident.
         """
         return execution_type == 'repair_test'
 
@@ -2045,34 +2057,13 @@ class DockerAgentRunner:
         execution_type = self._resolve_execution_type(context)
         deny_backgrounding_tools = self._should_deny_backgrounding_tools(execution_type)
 
-        claude_cmd = [
-            'claude',
-            '--print',
-            '--verbose',
-            '--output-format', 'stream-json',
-            '--model', claude_model,
-        ]
-
-        # Add MCP config if provided
-        if mcp_config_path:
-            # Always use the fixed mount point inside the agent container
-            claude_cmd.extend(['--mcp-config', '/home/orchestrator/.mcp_config.json'])
-            logger.info("Using MCP config: /home/orchestrator/.mcp_config.json")
-
-        # Use bypassPermissions for all agents in containerized environment
-        claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
-
-        if deny_backgrounding_tools:
-            claude_cmd.extend(['--disallowedTools', self._REPAIR_TEST_DISALLOWED_TOOLS])
-
-        # Add --resume flag if continuing an existing session
-        if existing_session_id:
-            claude_cmd.extend(['--resume', existing_session_id])
-            logger.info(f"Resuming Claude Code session: {existing_session_id}")
-
         # Read prompt from the mounted file
         # We use 'cat file | wrapper | claude -' pattern
-        # NEW: Use wrapper to enable container-side Redis writes
+        # Use wrapper to enable container-side Redis writes -- this is the
+        # command that is actually executed (see full_cmd/subprocess.run below).
+        # There used to be a second, unused 'claude_cmd' list built in parallel
+        # here for direct invocation without the wrapper; it was never wired
+        # into shell_cmd/full_cmd and has been removed rather than kept in sync.
         wrapper_cmd = [
             '/usr/local/bin/python3', '/app/scripts/docker-claude-wrapper.py',
             '--print', '--verbose', '--output-format', 'stream-json',
@@ -2089,14 +2080,15 @@ class DockerAgentRunner:
         if deny_backgrounding_tools:
             logger.info(
                 f"{execution_type} execution: denying tools "
-                f"[{self._REPAIR_TEST_DISALLOWED_TOOLS}] to structurally block "
-                f"backgrounding the test run"
+                f"[{self._REPAIR_TEST_DISALLOWED_TOOLS}] to remove the "
+                f"wait/poll-on-a-backgrounded-run path"
             )
             wrapper_cmd.extend(['--disallowedTools', self._REPAIR_TEST_DISALLOWED_TOOLS])
 
         # Add --resume flag if continuing an existing session
         if existing_session_id:
             wrapper_cmd.extend(['--resume', existing_session_id])
+            logger.info(f"Resuming Claude Code session: {existing_session_id}")
 
         wrapper_cmd.append('-')
         claude_exec_cmd = ' '.join(wrapper_cmd)

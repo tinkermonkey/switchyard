@@ -2,23 +2,35 @@
 Unit tests for DockerAgentRunner's repair_test tool-denial wiring
 (claude/docker_runner.py's _execute_in_container).
 
-A 2026-09-14 heimdall run (pipeline_run_id 4963b5b7) showed the repair
-cycle's test-runner agent ignoring its prompt's explicit "do not background
-the test run" instructions: it used Monitor/ScheduleWakeup to watch a
-backgrounded Playwright run and repeatedly returned a "still waiting" status
-update instead of the required JSON result, burning ~70 minutes across
-retries. _execute_in_container() now passes --disallowedTools for
-execution_type == "repair_test" invocations to remove that option
-structurally rather than relying on prompt text alone.
+The repair cycle's test-runner agent (execution_type="repair_test") is meant
+to run one test command in the foreground and block until it exits -- a
+production incident showed the agent backgrounding the run instead, using
+Monitor/ScheduleWakeup to poll it and repeatedly returning a "still waiting"
+status update rather than the required result. See
+DockerAgentRunner._should_deny_backgrounding_tools's docstring for the full
+rationale. _execute_in_container() now passes --disallowedTools for
+execution_type == "repair_test" invocations to remove that specific
+wait/poll path rather than relying on prompt text alone.
 
 Covers:
 - _resolve_execution_type() reads the nested task_context first, falls back
-  to the top-level context, and mirrors _build_docker_command()'s own
-  label-resolution behavior for other execution types.
+  to the top-level context, and mirrors (without calling into) the inline
+  lookups elsewhere in this file.
 - _should_deny_backgrounding_tools() is true only for "repair_test".
+- _execute_in_container() actually puts --disallowedTools into the command
+  it executes for repair_test, and omits it otherwise -- exercising the
+  wiring end-to-end rather than just the two helpers in isolation, which
+  would not have caught the previously-dead 'claude_cmd' list this file's
+  suite of helper-only tests passed against.
 """
 
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
 from claude.docker_runner import DockerAgentRunner
+from config.manager import ConfigurationError
 
 
 class TestResolveExecutionType:
@@ -67,3 +79,76 @@ class TestDisallowedToolsConstant:
         # later turn that never comes in a one-shot --print container).
         tools = DockerAgentRunner._REPAIR_TEST_DISALLOWED_TOOLS.split(",")
         assert tools == ["Monitor", "ScheduleWakeup"]
+
+
+def _minimal_execute_in_container_context(execution_type: str) -> dict:
+    """A context dict just complete enough for _execute_in_container() to
+    reach the subprocess.run() that launches the container -- filesystem
+    write verification is skipped by making get_project_agent_config() raise
+    (see the test below), which is the same fallback path a project with no
+    matching agent config takes in production."""
+    return {
+        "agent": "senior_software_engineer",
+        "task_id": "task-1",
+        "project": "phone-home",
+        "context": {"execution_type": execution_type},
+    }
+
+
+class TestExecuteInContainerDisallowedTools:
+    """Drives _execute_in_container() itself, rather than just the two pure
+    helpers, so a regression in the wiring between them (e.g. the flag being
+    appended to a command list that's never actually executed) fails a test
+    instead of passing silently."""
+
+    @staticmethod
+    def _run_and_capture_launched_command(execution_type: str, tmp_path: Path) -> str:
+        """Runs _execute_in_container() far enough to build the real launch
+        command, then aborts it via subprocess.run raising, and returns that
+        command joined into one string to search. filesystem_write_allowed
+        is forced False by making get_project_agent_config() raise
+        ConfigurationError with no 'agent_config' in context (docker_runner.py
+        falls back to False in that case), which skips
+        _verify_container_write_access() entirely -- the only thing standing
+        between context construction and the subprocess.run() call this test
+        intercepts.
+        """
+        runner = DockerAgentRunner()
+        mock_subprocess_run = MagicMock(side_effect=RuntimeError("stop-test-here"))
+
+        with patch(
+            "config.manager.config_manager.get_project_agent_config",
+            side_effect=ConfigurationError("no agent config for this test"),
+        ), patch("claude.docker_runner.subprocess.run", mock_subprocess_run):
+            with pytest.raises(RuntimeError, match="stop-test-here"):
+                import asyncio
+
+                asyncio.run(
+                    runner._execute_in_container(
+                        docker_cmd=["docker", "run", "-i", "--name", "test-container", "test-image"],
+                        prompt="run the tests",
+                        container_name="test-container",
+                        stream_callback=None,
+                        context=_minimal_execute_in_container_context(execution_type),
+                        project_dir=tmp_path,
+                        image_name="test-image",
+                    )
+                )
+
+        # The RuntimeError propagates into _execute_in_container's own cleanup
+        # path, which calls subprocess.run again ('docker rm -f ...') to tear
+        # down the container it believes it just launched -- so more than one
+        # call is expected here. The launch command (the one this test cares
+        # about) is always the first.
+        assert mock_subprocess_run.call_count >= 1
+        full_cmd = mock_subprocess_run.call_args_list[0][0][0]
+        return " ".join(full_cmd)
+
+    def test_repair_test_execution_denies_monitor_and_schedule_wakeup(self, tmp_path):
+        launched = self._run_and_capture_launched_command("repair_test", tmp_path)
+        assert "--disallowedTools" in launched
+        assert DockerAgentRunner._REPAIR_TEST_DISALLOWED_TOOLS in launched
+
+    def test_standard_execution_does_not_deny_any_tools(self, tmp_path):
+        launched = self._run_and_capture_launched_command("standard", tmp_path)
+        assert "--disallowedTools" not in launched
