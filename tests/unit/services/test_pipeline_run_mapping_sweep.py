@@ -813,6 +813,37 @@ class TestTheSweepDoesNotGrowItsOwnDebris:
         assert summary['examined'] == 0
         assert redis_client.eval_calls == []
 
+    def test_an_unreadable_mapping_hash_does_not_discard_accrued_grace(self):
+        """Constraint 3 again, at the one place it is easy to miss.
+
+        If the sweep cannot read the mapping it knows NOTHING about which
+        entries still exist -- so it must abort, not carry on with an empty
+        mapping. Carrying on looks harmless (it deletes nothing) but every
+        stamp then reads as state for a vanished entry and is pruned, so one
+        unreadable HGETALL per window resets every entry's clock and nothing is
+        ever collected. Pinning "deleted nothing" alone does not catch that.
+        """
+        manager, redis_client, _ = make_manager()
+        redis_client.hset(MAPPING, 'test-project:dev:500', 'run-ghost')
+        stamp = json.dumps({
+            'pipeline_run_id': 'run-ghost',
+            'unresolved_seconds': MAPPING_UNRESOLVED_GRACE_SECONDS - 60,
+            'observations': 9,
+            'last_seen_at': 1_780_000_000.0,
+        })
+        redis_client.hset(STAMPS, 'test-project:dev:500', stamp)
+        redis_client.fail_hgetall_keys.add(MAPPING)
+
+        summary = sweep(manager, Clock())
+
+        assert summary['errors'] == 1
+        assert summary['stamps_pruned'] == 0
+        assert redis_client.hashes[STAMPS] == {'test-project:dev:500': stamp}, (
+            "an unreadable mapping hash must not be read as 'no entries exist' "
+            "and take every accrued grace window with it"
+        )
+        assert redis_client.hdel_calls == []
+
 
 class TestSteadyStateIsLogged:
     """Constraint 6: the silent state is the one that matters."""
