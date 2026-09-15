@@ -1222,6 +1222,38 @@ class ReviewCycleExecutor:
                             )
                             raise
 
+                        # Transient `git worktree add` failure: not a permanent workspace
+                        # corruption — release the pipeline lock for the next poll to retry
+                        # (same end_pipeline_run(retain_lock=False) treatment as lock
+                        # contention) rather than retaining the board lock indefinitely via
+                        # mark_failed().  Three consecutive WorktreeAddErrors through the
+                        # normal dispatch/retry loop will still reach MAX_CONSECUTIVE_
+                        # DISPATCH_FAILURES → mark_failed() if the git issue persists.
+                        from services.project_workspace import WorktreeAddError
+                        if isinstance(e, WorktreeAddError):
+                            logger.warning(
+                                f"Transient worktree creation failure for {project_name} "
+                                f"issue #{issue_number} — releasing pipeline lock for retry: {e}"
+                            )
+                            pipeline_run_id_for_release = getattr(cycle_state, 'pipeline_run_id', None)
+                            if pipeline_run_id_for_release:
+                                try:
+                                    from services.pipeline_run import get_pipeline_run_manager
+                                    get_pipeline_run_manager().end_pipeline_run(
+                                        project=project_name,
+                                        board=board_name,
+                                        issue_number=issue_number,
+                                        reason=f"Transient worktree creation failure: {e}",
+                                        retain_lock=False,
+                                        suppress_cancellation=True,
+                                    )
+                                except Exception as release_err:
+                                    logger.error(
+                                        f"Failed to release pipeline run for {project_name}/"
+                                        f"#{issue_number} after WorktreeAddError: {release_err}"
+                                    )
+                            raise
+
                         logger.error(f"Review cycle failed for issue #{issue_number}: {e}")
 
                         # EMIT ERROR EVENT for UI visibility

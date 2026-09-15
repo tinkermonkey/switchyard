@@ -144,6 +144,12 @@ class DevEnvironmentVerifierAgent(PipelineStage):
         # [^*\n]+ (not \w+) because "CHANGES NEEDED" is two words separated by a
         # space, which \w doesn't match -- \w+ would fail to match the marker at
         # all for that status and fall through to the "could not parse" branch below.
+        #
+        # `verifier_verdict` tracks the final verdict so the return value can gate
+        # orchestrator_integration.py's auto_advance_on_approval: a BLOCKED or
+        # CHANGES_NEEDED result must NOT advance the issue to Done regardless of
+        # whether the agent process itself exited cleanly.
+        verifier_verdict = "BLOCKED"  # conservative default; overwritten on APPROVED
         status_match = re.search(r"### Status\s*\*\*([^*\n]+)\*\*", review_text, re.IGNORECASE)
         if status_match:
             status = status_match.group(1).strip().upper()
@@ -228,17 +234,25 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         ),
                         image_name=expected_tag,
                     )
+                    verifier_verdict = "APPROVED"
             elif status == "BLOCKED":
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
-                error_message = error_match.group(1).strip() if error_match else "Verification failed"
+                raw = error_match.group(1).strip() if error_match else "Verification failed"
+                # Cap LLM-derived content to 1000 chars so the state YAML and log
+                # remain human-readable, while still giving far more context than
+                # the old [:200]/[:100] limits did. Short enough to be a YAML value,
+                # long enough to hold a complete "Issues Found" section.
+                error_message = raw[:1000] + " ... (truncated)" if len(raw) > 1000 else raw
+                # Not truncated below 1000 chars -- this is the operator's only
+                # persistent record of why the environment was blocked.
                 self._record_status(
                     project_name,
                     DevContainerStatus.BLOCKED,
-                    error_message=error_message[:200],
+                    error_message=error_message,
                 )
-                logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message[:100])
+                logger.info("Marked %s dev container as BLOCKED: %s", project_name, error_message)
             elif status == "CHANGES NEEDED":
                 # Distinct from BLOCKED: used when the verifier could not independently
                 # confirm a REQUIRED FIX (rather than confirming it's still broken).
@@ -246,13 +260,15 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
                 )
-                error_message = error_match.group(1).strip() if error_match else "Could not confirm required fix"
+                raw = error_match.group(1).strip() if error_match else "Could not confirm required fix"
+                # Same 1000-char cap as BLOCKED above.
+                error_message = raw[:1000] + " ... (truncated)" if len(raw) > 1000 else raw
                 self._record_status(
                     project_name,
                     DevContainerStatus.CHANGES_NEEDED,
-                    error_message=error_message[:200],
+                    error_message=error_message,
                 )
-                logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message[:100])
+                logger.info("Marked %s dev container as CHANGES_NEEDED: %s", project_name, error_message)
             else:
                 # Found the "### Status **WORD**" marker but WORD wasn't one we handle.
                 error_message = f"Verifier returned unrecognized status '{status}' (expected APPROVED, BLOCKED, or CHANGES NEEDED)"
@@ -263,7 +279,7 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         "%s for %s -- marking dev container BLOCKED instead of leaving it stuck",
                         error_message, project_name
                     ),
-                    error_message=error_message[:200],
+                    error_message=error_message,
                 )
         else:
             # No "### Status **X**" marker in the final response text. Before
@@ -319,9 +335,14 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                     "honoring that instead of forcing BLOCKED.",
                     project_name, status_after_session.value
                 )
+                if status_after_session == DevContainerStatus.VERIFIED:
+                    verifier_verdict = "APPROVED"
+                # BLOCKED stays as the conservative default set above
             else:
                 snippet = review_text.strip()[:300]
                 error_message = f"Could not parse a status marker from verifier output. Output began: {snippet}"
+                # Not truncated -- this is the operator's only persistent record of
+                # what the verifier produced.
                 self._record_status(
                     project_name,
                     DevContainerStatus.BLOCKED,
@@ -331,7 +352,15 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         "output excerpt)",
                         project_name, project_name
                     ),
-                    error_message=error_message[:200],
+                    error_message=error_message,
                 )
 
-        return {"status": "success", "agent_output": review_text}
+        # verifier_verdict drives orchestrator_integration.py's auto_advance_on_approval
+        # gate: only "APPROVED" permits the issue to advance to the next column.
+        # BLOCKED and CHANGES_NEEDED leave the issue in Verification so a human or
+        # repair_cycle can intervene.
+        return {
+            "status": "success",
+            "agent_output": review_text,
+            "verifier_verdict": verifier_verdict,
+        }
