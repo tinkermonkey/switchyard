@@ -970,9 +970,11 @@ class PipelineRunManager:
                 writes the issue mapping under the board-less legacy key, so a
                 crashed run whose ES doc still reads 'active' would be resurrected
                 on every pass and could then shadow a board-scoped lookup. Stale
-                mappings found in Redis are still cleaned up either way -- that is
-                removal of state ES positively reports as dead (#239), not
-                resurrection of it.
+                mappings found in Redis are still cleaned up either way: the entry
+                for a run whose own Redis record says it finished, the entry whose
+                record is too corrupt to interpret, and -- only on that positive
+                evidence (#239) -- the entry for a run Elasticsearch reports ended.
+                That is removal of dead state, not resurrection of it.
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -1066,9 +1068,16 @@ class PipelineRunManager:
         # unknown leaves the entry exactly where it is -- a run that died without
         # end_pipeline_run() is collected by cleanup_stale_active_runs_on_startup(),
         # not by a read.
+        # One ES lookup per distinct run id: the board-scoped and legacy keys can
+        # both point at the same run (the restore path below backfills the legacy
+        # key), and that run's state is the same answer for both entries. Nothing
+        # is cached ACROSS calls: while the answer stays "unknown" the entry stays,
+        # so every later lookup for this issue re-asks -- deliberately, since the
+        # only thing that can change the verdict is ES itself.
+        es_verdicts: dict = {}  # run id -> PipelineRun ES holds, or None
         for expired_key, expired_run_id in expired_mappings:
-            ended_run = None
-            if self.es:
+            ended_run = es_verdicts.get(expired_run_id)
+            if self.es and expired_run_id not in es_verdicts:
                 try:
                     by_id = self.es.search(
                         index=f"{self.es_index_pattern}-*",
@@ -1086,6 +1095,7 @@ class PipelineRunManager:
                         f"mapping {expired_key}"
                     )
                     ended_run = None
+                es_verdicts[expired_run_id] = ended_run
 
             if ended_run is None or ended_run.is_active():
                 continue
