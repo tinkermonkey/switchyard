@@ -1402,6 +1402,40 @@ class DockerAgentRunner:
             return f'{host_workspace}/switchyard/{container_path[len("/app/"):]}'
         return container_path
 
+    # Tools denied to repair_test invocations -- see _should_deny_backgrounding_tools.
+    _REPAIR_TEST_DISALLOWED_TOOLS = 'Monitor,ScheduleWakeup'
+
+    @staticmethod
+    def _resolve_execution_type(context: Dict[str, Any]) -> str:
+        """Resolve execution_type from context the same way regardless of whether
+        it was set on the nested task_context (context['context'], the dict
+        agent_executor.py actually stores it on) or copied onto the top-level
+        context dict some caller assembled directly. Mirrors the inline lookup
+        _build_docker_command() already does for the org.switchyard.execution_type
+        container label -- pulled out here so both call sites, and anything else
+        that needs it, resolve it identically instead of drifting apart."""
+        task_context = context.get('context', {})
+        return task_context.get('execution_type') or context.get('execution_type', '')
+
+    @staticmethod
+    def _should_deny_backgrounding_tools(execution_type: str) -> bool:
+        """True for repair_test invocations (pipeline/repair_cycle.py's _run_tests),
+        which run a single test command and MUST block on it in the foreground
+        until it exits -- see prompts/content/workflows/repair/runner_integration.md
+        and test_output_format.md, which explicitly forbid backgrounding the test
+        run or deferring the result to a later turn.
+
+        Those are prompt-only instructions, and a 2026-09-14 heimdall run
+        (pipeline_run_id 4963b5b7) showed the agent disregarding them anyway: it
+        used Monitor/ScheduleWakeup to watch a backgrounded Playwright run and
+        repeatedly returned a "still waiting" status update instead of the
+        required JSON result, burning ~70 minutes across retries before a later
+        attempt finally complied. _execute_in_container() passes
+        _REPAIR_TEST_DISALLOWED_TOOLS to --disallowedTools when this is true,
+        removing the option structurally instead of relying on prompt text alone.
+        """
+        return execution_type == 'repair_test'
+
     @staticmethod
     def _is_base_clone_label(context: Dict[str, Any], project_dir: Path) -> str:
         """'true'/'false' for the org.switchyard.base_clone label -- does this
@@ -2008,6 +2042,9 @@ class DockerAgentRunner:
         except Exception as e:
             logger.error(f"DEBUG: Error checking prompt file: {e}")
 
+        execution_type = self._resolve_execution_type(context)
+        deny_backgrounding_tools = self._should_deny_backgrounding_tools(execution_type)
+
         claude_cmd = [
             'claude',
             '--print',
@@ -2024,6 +2061,9 @@ class DockerAgentRunner:
 
         # Use bypassPermissions for all agents in containerized environment
         claude_cmd.extend(['--permission-mode', 'bypassPermissions'])
+
+        if deny_backgrounding_tools:
+            claude_cmd.extend(['--disallowedTools', self._REPAIR_TEST_DISALLOWED_TOOLS])
 
         # Add --resume flag if continuing an existing session
         if existing_session_id:
@@ -2045,6 +2085,14 @@ class DockerAgentRunner:
 
         # Use bypassPermissions for all agents
         wrapper_cmd.extend(['--permission-mode', 'bypassPermissions'])
+
+        if deny_backgrounding_tools:
+            logger.info(
+                f"{execution_type} execution: denying tools "
+                f"[{self._REPAIR_TEST_DISALLOWED_TOOLS}] to structurally block "
+                f"backgrounding the test run"
+            )
+            wrapper_cmd.extend(['--disallowedTools', self._REPAIR_TEST_DISALLOWED_TOOLS])
 
         # Add --resume flag if continuing an existing session
         if existing_session_id:
