@@ -12,6 +12,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from config.manager import config_manager
+# Module level, unlike every other services.* import in this file, and from a
+# stdlib-only leaf module rather than from services.pipeline_run: the survey
+# below must be able to name RunOwnership.UNKNOWN in the branch where importing
+# services.pipeline_run is itself the failure. See services/run_ownership.py.
+from services.run_ownership import RunOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +99,27 @@ _epic_worktree_executor_guard = threading.Lock()
 # down inside that call -- startup init runs exactly once per process, so a
 # module-level pool would just hold idle threads forever.
 _PROJECT_INIT_MAX_WORKERS = 8
+
+
+def _active_run_protected(ownership: RunOwnership) -> Optional[bool]:
+    """survey_epic_worktrees()' `active_run_protected` row field, from the
+    ownership answer the verdict was composed from.
+
+    The field predates RunOwnership and is part of /api/epic-worktrees'
+    published shape and inspect_epic_worktrees.py's `is False` tests, so it
+    stays a tri-state bool -- but it is now DERIVED from the same single answer
+    the verdict uses, instead of being computed a second time beside it. Two
+    reads of the store could disagree; one cannot.
+
+    None is "could not be asked", never "no run owns it". Anything that is not a
+    definite OWNED/UNOWNED -- including a narrower unknown added to the enum
+    later -- lands there, so the default is the conservative one.
+    """
+    if ownership is RunOwnership.OWNED:
+        return True
+    if ownership is RunOwnership.UNOWNED:
+        return False
+    return None
 
 
 def _get_epic_worktree_executor() -> ThreadPoolExecutor:
@@ -3092,8 +3118,7 @@ class ProjectWorkspaceManager:
     @staticmethod
     def _prune_verdict(
         *,
-        active_runs_known: bool,
-        active_run_protected: Optional[bool],
+        ownership: RunOwnership,
         container_live: Optional[bool],
         corrupted: bool,
         drift_holds_work: bool,
@@ -3106,6 +3131,13 @@ class ProjectWorkspaceManager:
         silently wrong, and the out-of-repo web UI still is. A consumer that
         renders this string cannot drift from the sweep by forgetting a rule;
         one that recomputes it can, and did.
+
+        `ownership` is ONE argument rather than the correlated
+        (active_runs_known, active_run_protected) pair it replaces (#240). Those
+        two had an unrepresentable-but-constructible combination -- known=False
+        with protected=True -- and a caller that got the pairing wrong got a
+        verdict that disagreed with the sweep. RunOwnership.UNOWNED is the only
+        value that can reach an 'eligible' verdict at all.
 
         The branches are in _prune_project_staging()'s own order, so the two can
         be diffed against each other:
@@ -3136,10 +3168,16 @@ class ProjectWorkspaceManager:
         process, where those maps are empty. So 'eligible' means "no rule this
         survey can evaluate would stop it" -- a strong hint, never a promise.
         """
-        if not active_runs_known:
-            return 'unknown'
-        if active_run_protected:
-            return 'skipped_active_run'
+        if ownership is not RunOwnership.UNOWNED:
+            # UNOWNED is the only answer any rule below may act on, so every
+            # other value -- including a narrower unknown added to the enum
+            # after this was written -- is caught here and the fall-through
+            # fails closed rather than reaching 'eligible'.
+            return (
+                'skipped_active_run'
+                if ownership is RunOwnership.OWNED
+                else 'unknown'
+            )
         if container_live is True:
             return 'skipped_container'
         if corrupted:
@@ -3250,11 +3288,23 @@ class ProjectWorkspaceManager:
                 f"verdict in this survey is reported as unknown: {e}",
                 exc_info=True,
             )
-        # None (the import failed) and complete=False (the store could not be
-        # read) are the same answer to the only question asked here.
-        active_runs_known = bool(
-            active_run_workspaces is not None and active_run_workspaces.complete
-        )
+
+        def _ownership(project: str, worktree_path: Path) -> RunOwnership:
+            """This survey's single source of the fifth rule's answer.
+
+            The import failing and the store being unreadable are the same
+            answer to the only question asked here, and folding them together
+            HERE -- rather than into a knownness flag the rows below have to
+            remember to consult -- is what keeps a row from reporting "no run
+            owns it" on a lookup that never happened (#231, #240). RunOwnership
+            is bound at module import, so this branch needs nothing from
+            services.pipeline_run, which is the module that may not have
+            imported.
+            """
+            if active_run_workspaces is None:
+                return RunOwnership.UNKNOWN
+            return active_run_workspaces.ownership_of(project, worktree_path)
+
         try:
             if not staging_root.is_dir():
                 return rows
@@ -3312,6 +3362,9 @@ class ProjectWorkspaceManager:
                     )
                 )
                 corrupted = self._is_corrupted_non_empty_worktree(worktree_path)
+                # One call for both the reported field and the verdict: asking
+                # twice is how the two came to be able to disagree.
+                ownership = _ownership(project_staging.name, worktree_path)
                 rows.append({
                     'project': project_staging.name,
                     'epic_id': epic_id,
@@ -3338,10 +3391,7 @@ class ProjectWorkspaceManager:
                     # the sweep aborts in full on an incomplete lookup, so an
                     # unknown here means nothing gets pruned this cycle, not that
                     # this one is free to go (#231).
-                    'active_run_protected': (
-                        active_run_workspaces.protects(project_staging.name, worktree_path)
-                        if active_runs_known else None
-                    ),
+                    'active_run_protected': _active_run_protected(ownership),
                     # A .git-less but non-empty directory, which the sweep
                     # refuses to remove because it cannot be told apart from
                     # real uncommitted work. Cheap, purely local, and
@@ -3351,11 +3401,7 @@ class ProjectWorkspaceManager:
                     # work reporting as removable (review on #231).
                     'corrupted': corrupted,
                     'prune_verdict': self._prune_verdict(
-                        active_runs_known=active_runs_known,
-                        active_run_protected=(
-                            active_run_workspaces.protects(project_staging.name, worktree_path)
-                            if active_runs_known else None
-                        ),
+                        ownership=ownership,
                         container_live=container_live,
                         corrupted=corrupted,
                         drift_holds_work=drift_holds_work,
@@ -3393,7 +3439,7 @@ class ProjectWorkspaceManager:
         self,
         project_staging: Path,
         running_mount_sources: set,
-        active_run_workspaces: Optional['ActiveRunWorkspaces'] = None,
+        active_run_workspaces: 'ActiveRunWorkspaces',
     ) -> None:
         """One project's half of prune_epic_worktrees()'s sweep, run with that
         project's project_checkout lock HELD.
@@ -3411,11 +3457,18 @@ class ProjectWorkspaceManager:
         active_run_workspaces is PipelineRunManager.get_active_run_workspaces()'s
         result, computed once for the whole sweep by the caller. See the
         active-run skip rule below.
+
+        IT IS REQUIRED, with no default (#240). It used to default to
+        ActiveRunWorkspaces.unknown(), which made the same value mean "abort the
+        sweep" to prune_epic_worktrees() and "delete everything you are allowed
+        to" here -- a doubt-carrying argument whose default was the destructive
+        reading. The one production caller has always passed it; the default
+        only ever served callers who had not thought about the question, which
+        is precisely the population that must not get the deleting answer. A
+        TypeError from a forgotten argument is the cheapest possible failure
+        here.
         """
         repo_path = self.workspace_root / project_staging.name
-        if active_run_workspaces is None:
-            from services.pipeline_run import ActiveRunWorkspaces
-            active_run_workspaces = ActiveRunWorkspaces.unknown()
         try:
             worktree_paths = list(project_staging.iterdir())
         except OSError as e:
@@ -3439,16 +3492,36 @@ class ProjectWorkspaceManager:
             # hard failure whose error ("no git changes found") named neither
             # the directory nor the prune.
             #
-            # Matching is ActiveRunWorkspaces.protects()'s job -- it owns both
-            # the epic-id and recorded-path forms and the normalisation they
-            # need, so this sweep cannot get half of it right.
-            if active_run_workspaces.protects(project_staging.name, worktree_path):
-                logger.info(
-                    f"Skipping prune of {worktree_path} -- it is the resolved "
-                    f"workspace of a pipeline run that is still active, which "
-                    f"startup's lock recovery may re-trigger an agent into "
-                    f"moments from now"
-                )
+            # Matching is ActiveRunWorkspaces.ownership_of()'s job -- it owns
+            # both the epic-id and recorded-path forms, the normalisation they
+            # need, AND the completeness gate in front of them, so this sweep
+            # cannot get half of it right.
+            #
+            # `is not UNOWNED`, not `if owned`. UNOWNED is the single answer
+            # that licenses a removal, so every other answer -- an unreadable
+            # run store, or a member added to the enum after this was written --
+            # keeps the directory. prune_epic_worktrees() aborts the whole sweep
+            # before reaching here on an incomplete lookup, and that gate stays
+            # for what only it can do (one log line for the operator instead of
+            # one per worktree); it is no longer what makes this correct (#240).
+            ownership = active_run_workspaces.ownership_of(
+                project_staging.name, worktree_path
+            )
+            if ownership is not RunOwnership.UNOWNED:
+                if ownership is RunOwnership.OWNED:
+                    logger.info(
+                        f"Skipping prune of {worktree_path} -- it is the resolved "
+                        f"workspace of a pipeline run that is still active, which "
+                        f"startup's lock recovery may re-trigger an agent into "
+                        f"moments from now"
+                    )
+                else:
+                    logger.error(
+                        f"Skipping prune of {worktree_path} -- the active-run "
+                        f"lookup could not say whether a pipeline run owns it "
+                        f"({ownership}), and absence of proof is not proof of "
+                        f"absence for a directory this sweep would delete"
+                    )
                 continue
             # Re-check right before acting on each worktree, not once
             # up front (review pass 2 on #87): container recovery can
@@ -3857,6 +3930,15 @@ class ProjectWorkspaceManager:
             # silently absent. Leaving worktrees on disk costs one sweep; they
             # are adopted by get_or_create_epic_worktree() or picked up by the
             # next startup. Deleting a live one costs the run.
+            #
+            # This gate is no longer what makes the sweep SAFE -- since #240
+            # _prune_project_staging() removes only what the value type calls
+            # UNOWNED, so an incomplete answer protects every worktree even if
+            # this block is deleted. It stays for what only it can do: turn a
+            # whole-sweep condition into ONE operator-facing log line and one
+            # early return, instead of a per-worktree line and a full pass over
+            # every project's staging directory taking each project_checkout
+            # lock to decide nothing.
             if not active_run_workspaces.complete:
                 logger.error(
                     "Skipping the epic-worktree prune entirely: the active-run "

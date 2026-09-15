@@ -35,6 +35,7 @@ if not os.path.isdir('/app'):
 
 from services.pipeline_run import ActiveRunWorkspaces
 from services.project_workspace import ProjectWorkspaceManager
+from services.run_ownership import RunOwnership
 
 
 def _ok(stdout: str = "") -> Mock:
@@ -110,7 +111,11 @@ class TestActiveRunWorktreesSurvivePrune:
         assert worktree.is_dir(), "an active run's workspace must not be pruned"
         mock_push.assert_not_called()
         assert not any(
-            'remove' in ' '.join(str(a) for a in call.args[0])
+            # `remove` as an ARGV ELEMENT, not as a substring of the joined
+            # command: tmp_path carries the test's own name, so a test whose
+            # name contains "remove" made this assertion fire on `git worktree
+            # prune` in the checkout path.
+            'remove' in [str(a) for a in call.args[0]]
             for call in mock_run.call_args_list
         ), "no `git worktree remove` may be issued for a protected worktree"
 
@@ -162,7 +167,7 @@ class TestActiveRunWorktreesSurvivePrune:
             )
 
         assert any(
-            'remove' in ' '.join(str(a) for a in c.args[0])
+            'remove' in [str(a) for a in c.args[0]]
             for c in mock_run.call_args_list
         ), "an unprotected worktree is still an ordinary removal candidate"
 
@@ -185,22 +190,99 @@ class TestActiveRunWorktreesSurvivePrune:
         # the call still raises if unmet, but the message is inert.
         mock_push.assert_called_once()
 
-    def test_omitting_the_argument_keeps_the_pre_existing_behaviour(
+    def test_the_active_run_answer_is_a_required_argument(self, manager, tmp_path):
+        """DELIBERATELY REPLACES test_omitting_the_argument_keeps_the_pre_existing
+        _behaviour (#229), which pinned the opposite (#240).
+
+        That test was written when the parameter was genuinely additive, and it
+        asserted that a two-argument call still pruned. What it actually pinned,
+        once the parameter became the input to a rule, was a doubt-carrying
+        argument defaulting to ActiveRunWorkspaces.unknown() — i.e. the default
+        for a caller who had not thought about active runs was "delete". The
+        same value meant "abort the sweep" one method up and "prune everything"
+        here.
+
+        There is no pre-existing behaviour left to keep: the one production
+        caller has always passed the argument. A forgotten argument must be a
+        TypeError, not a deletion.
+        """
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "999")
+
+        with patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            with pytest.raises(TypeError):
+                manager._prune_project_staging(
+                    tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
+                    running_mount_sources=set(),
+                )
+
+        assert worktree.is_dir()
+        mock_push.assert_not_called()
+
+    def test_an_unknown_answer_deletes_nothing_with_no_outer_gate_at_all(
         self, manager, tmp_path
     ):
-        """The parameter is additive — every pre-existing two-argument call
-        prunes exactly as it did before."""
+        """THE #240 test. Driven through _prune_project_staging() DIRECTLY, so
+        prune_epic_worktrees()'s `if not complete: return` never runs.
+
+        Before ownership_of(), an unknown answer reaching this method — by a
+        caller forgetting the gate, by the gate being removed, or by the old
+        permissive default — matched nothing and therefore deleted everything.
+        The rule is now inside the value: UNOWNED is the only removable answer,
+        so this method is safe on its own.
+        """
         _make_base_clone(tmp_path, "codetoreum")
-        _make_worktree(tmp_path, "codetoreum", "999")
+        worktree = _make_worktree(tmp_path, "codetoreum", "999")
+
+        with patch.object(manager, '_push_local_commits_if_any') as mock_push, \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()) as mock_run:
+            manager._prune_project_staging(
+                tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
+                running_mount_sources=set(),
+                active_run_workspaces=ActiveRunWorkspaces.unknown(),
+            )
+
+        assert worktree.is_dir(), (
+            "an unanswerable lookup must not be read as 'nothing is active', "
+            "even with no outer gate in front of this method"
+        )
+        mock_push.assert_not_called()
+        assert not any(
+            # `remove` as an ARGV ELEMENT, not as a substring of the joined
+            # command: tmp_path carries the test's own name, so a test whose
+            # name contains "remove" made this assertion fire on `git worktree
+            # prune` in the checkout path.
+            'remove' in [str(a) for a in call.args[0]]
+            for call in mock_run.call_args_list
+        )
+
+    def test_a_future_unknown_member_also_removes_nothing(self, manager, tmp_path):
+        """`is not UNOWNED`, not `if owned`. #240 sketched splitting the unknown
+        into UNKNOWN_ALL/UNKNOWN_PROJECT; whatever member is added next must
+        fail closed here WITHOUT this call site being revisited, which is the
+        whole point of a closed set of answers. Stands in for that member with
+        an answer this sweep has never seen.
+        """
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "999")
+
+        class _FutureAnswer:
+            value = 'unknown_project'
+
+        workspaces = Mock()
+        workspaces.ownership_of.return_value = _FutureAnswer()
 
         with patch.object(manager, '_push_local_commits_if_any') as mock_push, \
              patch('services.project_workspace.subprocess.run', return_value=_ok()):
             manager._prune_project_staging(
                 tmp_path / '.orchestrator' / 'worktrees' / 'codetoreum',
                 running_mount_sources=set(),
+                active_run_workspaces=workspaces,
             )
 
-        mock_push.assert_called_once()
+        assert worktree.is_dir()
+        mock_push.assert_not_called()
 
 
 class TestAnIncompleteAnswerAbortsTheSweep:
@@ -266,6 +348,39 @@ class TestAnIncompleteAnswerAbortsTheSweep:
 
         mock_push.assert_called_once()
 
+    def test_the_abort_happens_before_any_project_checkout_lock_is_taken(
+        self, manager, tmp_path
+    ):
+        """What the outer gate is FOR, now that it is not what makes the sweep
+        safe (#240): _prune_project_staging() protects every worktree on an
+        unknown answer all by itself, so the early return exists to turn a
+        whole-sweep condition into one operator-facing log line instead of a
+        full pass that takes every project's project_checkout lock to decide
+        nothing."""
+        for project in ("codetoreum", "heimdall"):
+            _make_base_clone(tmp_path, project)
+            _make_worktree(tmp_path, project, "999")
+
+        acquired = []
+
+        @contextmanager
+        def _counting_lock(project, issue_number=None, **kwargs):
+            acquired.append(project)
+            yield None
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces.unknown()
+
+        with patch('services.project_checkout_lock.project_checkout_lock_sync',
+                   _counting_lock), \
+             patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources', return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', return_value=_ok()):
+            manager.prune_epic_worktrees()
+
+        assert acquired == []
+
     def test_the_sweep_passes_the_lookup_result_through_to_each_project(
         self, manager, tmp_path
     ):
@@ -277,7 +392,10 @@ class TestAnIncompleteAnswerAbortsTheSweep:
 
         seen = {}
 
-        def _capture(project_staging, running_mount_sources, active_run_workspaces=None):
+        def _capture(project_staging, running_mount_sources, active_run_workspaces):
+            # No default: the real method has none either (#240), and a stub
+            # that keeps one would let the sweep stop passing the argument
+            # without this test noticing.
             seen['value'] = active_run_workspaces
 
         run_manager = Mock()
@@ -296,33 +414,139 @@ class TestActiveRunWorkspacesValue:
     """The value type itself — the magic-key shape it replaced could not
     express either of the two things the prune decision depends on."""
 
-    def test_protects_matches_on_epic_id(self):
+    def test_ownership_matches_on_epic_id(self):
         w = ActiveRunWorkspaces({'codetoreum': {'1016'}}, set())
-        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
 
-    def test_protects_matches_on_recorded_path(self):
+    def test_ownership_matches_on_recorded_path(self):
         w = ActiveRunWorkspaces({}, {'/w/worktrees/codetoreum/1016'})
-        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
 
     def test_paths_are_normalised_once_at_construction(self):
         """The consumer used to re-do this, with a comment explaining that the
         duplication was deliberate. A value object normalises once."""
         w = ActiveRunWorkspaces({}, {'/w/worktrees/codetoreum/1016/'})
-        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is True
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
 
-    def test_another_projects_epic_id_does_not_match(self):
+    def test_another_projects_epic_id_is_unowned(self):
         w = ActiveRunWorkspaces({'heimdall': {'1016'}}, set())
-        assert w.protects('codetoreum', Path('/w/worktrees/codetoreum/1016')) is False
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.UNOWNED
 
     def test_a_project_named_like_the_old_magic_key_is_just_a_project(self):
         """The shape this replaced reserved '*paths*', so a project of that
         name overwrote its own protection and matched nothing."""
         w = ActiveRunWorkspaces({'*paths*': {'1016'}}, set())
-        assert w.protects('*paths*', Path('/w/worktrees/*paths*/1016')) is True
+        assert w.ownership_of(
+            '*paths*', Path('/w/worktrees/*paths*/1016')
+        ) is RunOwnership.OWNED
 
     def test_unknown_is_not_empty(self):
         assert ActiveRunWorkspaces.unknown().complete is False
         assert ActiveRunWorkspaces({}, set()).complete is True
+
+
+class TestTheGateIsInsideTheAnswer:
+    """#240. The predicate this replaced was public, returned a bare bool, and
+    returned False when the lookup had FAILED — indistinguishable, at a call
+    site that deletes directories, from "no run owns it". Every caller had to
+    remember to test `complete` first and the type could not see whether they
+    had; three review rounds on #237 each found another consumer that had not.
+    """
+
+    def test_an_incomplete_answer_is_unknown_not_unowned(self):
+        """The exact substitution the old bool could not express: nothing
+        matches, and the honest answer is still not "remove it"."""
+        w = ActiveRunWorkspaces({}, set(), complete=False)
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.UNKNOWN
+
+    def test_an_incomplete_answer_is_unknown_even_where_it_would_have_matched(self):
+        """A partial answer is not a partial licence either. Whatever it
+        happens to contain, it cannot be read per-worktree."""
+        w = ActiveRunWorkspaces({'codetoreum': {'1016'}}, set(), complete=False)
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.UNKNOWN
+
+    def test_unknown_is_unknown_for_every_worktree(self):
+        assert ActiveRunWorkspaces.unknown().ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/999')
+        ) is RunOwnership.UNKNOWN
+
+    def test_the_ungated_match_is_not_public(self):
+        """`protects()` was the whole hazard: a public, ungated bool. It may
+        survive as a private helper, but nothing outside the type may reach an
+        answer that has not been through the completeness gate.
+
+        Asserted as the type's whole public callable surface rather than as
+        `not hasattr(w, 'protects')` alone, so re-exposing the ungated match
+        under any other name fails here too.
+        """
+        import inspect
+
+        public = {
+            name
+            for name, _member in inspect.getmembers(ActiveRunWorkspaces, callable)
+            if not name.startswith('_')
+        }
+        assert public == {'unknown', 'ownership_of'}, (
+            f"unexpected public surface on ActiveRunWorkspaces: {sorted(public)}"
+        )
+
+    def test_only_one_answer_licenses_a_removal(self):
+        """The closed set exists so the removal site can be `is not UNOWNED`.
+        Keep the membership honest: an answer added later is not removable
+        unless someone deliberately says so here."""
+        assert {o.name for o in RunOwnership} == {'OWNED', 'UNOWNED', 'UNKNOWN'}
+
+
+class TestTheValueIsActuallyImmutable:
+    """`frozen=True` freezes the bindings, not the containers. `paths` was
+    copied at construction; `epic_ids_by_project` and its inner sets — the half
+    that GRANTS protection — were left aliased to whatever the caller passed
+    (#240)."""
+
+    def test_mutating_the_caller_s_dict_cannot_grant_protection(self):
+        source = {}
+        w = ActiveRunWorkspaces(source, set())
+        source['codetoreum'] = {'1016'}
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.UNOWNED
+
+    def test_mutating_a_caller_s_inner_set_cannot_revoke_protection(self):
+        ids = {'1016'}
+        w = ActiveRunWorkspaces({'codetoreum': ids}, set())
+        ids.clear()
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
+
+    def test_mutating_the_caller_s_path_set_cannot_revoke_protection(self):
+        paths = {'/w/worktrees/codetoreum/1016'}
+        w = ActiveRunWorkspaces({}, paths)
+        paths.clear()
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
+
+    def test_epic_ids_are_matched_as_strings(self):
+        """Ids are compared against a DIRECTORY NAME. A run record whose
+        epic_id came back from JSON as an int would otherwise never match the
+        directory it named."""
+        w = ActiveRunWorkspaces({'codetoreum': {1016}}, set())
+        assert w.ownership_of(
+            'codetoreum', Path('/w/worktrees/codetoreum/1016')
+        ) is RunOwnership.OWNED
 
 
 class TestGetActiveRunWorkspaces:
@@ -591,8 +815,7 @@ class TestTheVerdictMirrorsTheSweepsOwnRules:
     re-derive it -- the arrangement that caused #231."""
 
     def _verdict(self, **kw):
-        kw.setdefault('active_runs_known', True)
-        kw.setdefault('active_run_protected', False)
+        kw.setdefault('ownership', RunOwnership.UNOWNED)
         kw.setdefault('container_live', False)
         kw.setdefault('corrupted', False)
         kw.setdefault('drift_holds_work', False)
@@ -600,11 +823,43 @@ class TestTheVerdictMirrorsTheSweepsOwnRules:
 
     def test_an_unreadable_run_store_outranks_everything(self):
         """The sweep aborts in FULL on that answer, so no row is eligible."""
-        assert self._verdict(active_runs_known=False, corrupted=True) == 'unknown'
+        assert self._verdict(
+            ownership=RunOwnership.UNKNOWN, corrupted=True
+        ) == 'unknown'
 
     def test_an_active_run_outranks_the_later_rules(self):
-        assert self._verdict(active_run_protected=True,
+        assert self._verdict(ownership=RunOwnership.OWNED,
                              drift_holds_work=True) == 'skipped_active_run'
+
+    def test_the_verdict_takes_one_ownership_argument_not_a_correlated_pair(self):
+        """#240. The pair it replaced had a combination that could be
+        constructed but not meant — known=False with protected=True — so a
+        caller that got the pairing wrong got a verdict the sweep did not
+        share. One argument has no invalid combinations."""
+        import inspect
+
+        params = inspect.signature(ProjectWorkspaceManager._prune_verdict).parameters
+        assert 'ownership' in params
+        assert 'active_runs_known' not in params
+        assert 'active_run_protected' not in params
+
+    def test_an_unanswerable_lookup_can_never_reach_eligible(self):
+        """Every other rule saying "remove" must still not produce an eligible
+        verdict while the fifth rule is unanswerable."""
+        for container_live in (True, False, None):
+            assert self._verdict(
+                ownership=RunOwnership.UNKNOWN, container_live=container_live
+            ) == 'unknown'
+
+    def test_an_answer_this_verdict_has_never_seen_is_not_eligible(self):
+        """Same fail-closed rule as the sweep's own gate: only UNOWNED may
+        reach the later branches, so a member added to the enum after this was
+        written reports as unknown rather than silently becoming removable."""
+
+        class _FutureAnswer:
+            value = 'unknown_project'
+
+        assert self._verdict(ownership=_FutureAnswer()) == 'unknown'
 
     def test_a_corrupted_worktree_is_skipped(self):
         assert self._verdict(corrupted=True) == 'skipped_corrupted'
