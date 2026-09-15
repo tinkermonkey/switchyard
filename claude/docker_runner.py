@@ -1416,10 +1416,10 @@ class DockerAgentRunner:
         for the org.switchyard.execution_type container label and the one used
         for container_info['execution_type'] further down this file -- but those
         two are standalone copies, not calls to this method, so a change here
-        does not propagate to them. This method exists so the --disallowedTools
-        call sites in _execute_in_container share one implementation; it is not
-        (yet) a single source of truth for every execution_type lookup in this
-        file.
+        does not propagate to them. This method exists so _execute_in_container's
+        --disallowedTools decision (the one call site, on wrapper_cmd) is a
+        single testable unit; it is not (yet) a single source of truth for
+        every execution_type lookup in this file.
         """
         task_context = context.get('context', {})
         return task_context.get('execution_type') or context.get('execution_type', '')
@@ -2073,6 +2073,7 @@ class DockerAgentRunner:
         # Add MCP config if provided
         if mcp_config_path:
             wrapper_cmd.extend(['--mcp-config', '/home/orchestrator/.mcp_config.json'])
+            logger.info("Using MCP config: /home/orchestrator/.mcp_config.json")
 
         # Use bypassPermissions for all agents
         wrapper_cmd.extend(['--permission-mode', 'bypassPermissions'])
