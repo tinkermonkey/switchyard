@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-from services.project_workspace import ProjectWorkspaceManager
+from services.project_workspace import ProjectWorkspaceManager, WorktreeAddError
 
 
 def _ok(stdout: str = "") -> Mock:
@@ -112,8 +112,9 @@ class TestCreateNewEpicWorktree:
         # default_branch) succeeds. worktree add -b succeeds, followed by an
         # immediate `push -u` of the brand-new branch.
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _fail("couldn't find remote ref"), _ok(),
-                                     _fail("no local ref"), _ok(), _ok()]
+            # calls[2] is ls-remote returning empty stdout (branch not yet on origin)
+            mock_run.side_effect = [_ok(), _ok(), _ok(),
+                                     _ok(), _fail("no local ref"), _ok(), _ok()]
 
             result = manager.get_project_dir(
                 "my-project", epic_id="100", branch_name="feature/issue-100-epic"
@@ -124,9 +125,8 @@ class TestCreateNewEpicWorktree:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         # calls[0:2] are the branch-freeing check's status/rev-parse
-        assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
-                             'feature/issue-100-epic:refs/remotes/origin/feature/issue-100-epic',
-                             '--quiet']
+        assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'ls-remote',
+                             '--heads', 'origin', 'feature/issue-100-epic']
         assert calls[3] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
                              'main', '--quiet']
         # calls[4] is the stray-branch-with-real-commits guard's rev-parse --verify
@@ -145,8 +145,9 @@ class TestCreateNewEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _fail("couldn't find remote ref"), _ok(),
-                                     _fail("no local ref"), _ok(),
+            # calls[2] is ls-remote returning empty stdout (branch not yet on origin)
+            mock_run.side_effect = [_ok(), _ok(), _ok(),
+                                     _ok(), _fail("no local ref"), _ok(),
                                      _fail("connection reset")]
             result = manager.get_project_dir(
                 "my-project", epic_id="101", branch_name="feature/issue-101-epic"
@@ -160,7 +161,7 @@ class TestCreateNewEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
 
             result = manager.get_project_dir(
                 "my-project", epic_id="200", branch_name="feature/issue-200-existing"
@@ -171,11 +172,13 @@ class TestCreateNewEpicWorktree:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         # calls[0:2] are the branch-freeing check's status/rev-parse
-        assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
+        assert calls[2] == ['git', '-C', str(tmp_path / 'my-project'), 'ls-remote',
+                             '--heads', 'origin', 'feature/issue-200-existing']
+        assert calls[3] == ['git', '-C', str(tmp_path / 'my-project'), 'fetch', 'origin',
                              'feature/issue-200-existing:refs/remotes/origin/feature/issue-200-existing',
                              '--quiet']
-        # calls[3] is the stray-branch-with-real-commits guard's rev-parse --verify
-        assert calls[4] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
+        # calls[4] is the stray-branch-with-real-commits guard's rev-parse --verify
+        assert calls[5] == ['git', '-C', str(tmp_path / 'my-project'), 'worktree', 'add',
                              '-B', 'feature/issue-200-existing', str(expected_path),
                              'origin/feature/issue-200-existing']
 
@@ -193,12 +196,31 @@ class TestCreateNewEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _fail("fatal: some git error")]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _fail("fatal: some git error")]
 
             with pytest.raises(RuntimeError):
                 manager.get_project_dir(
                     "my-project", epic_id="400", branch_name="feature/issue-400"
                 )
+
+    def test_ls_remote_error_raises_immediately_without_creating_branch(self, manager, tmp_path):
+        """ls-remote returning non-zero is a genuine connectivity/auth error and must
+        raise WorktreeAddError immediately -- it must NOT silently fall through to
+        new-branch creation from default_branch, which was the original bug."""
+        _make_base_clone(tmp_path, "my-project")
+
+        with patch('services.project_workspace.subprocess.run') as mock_run:
+            # calls[0:2] are the _free_branch_from_base_clone status/rev-parse;
+            # calls[2] is the ls-remote probe failing with a genuine error.
+            mock_run.side_effect = [_ok(), _ok(), _fail("ssh: connect to host github.com port 22: Connection refused")]
+
+            with pytest.raises(WorktreeAddError):
+                manager.get_project_dir(
+                    "my-project", epic_id="450", branch_name="feature/issue-450"
+                )
+
+        # Must have stopped after ls-remote -- no fetch or worktree-add calls.
+        assert mock_run.call_count == 3
 
 
 class TestFreeBranchFromBaseClone:
@@ -324,7 +346,7 @@ class TestFreeBranchFromBaseClone:
             ProjectWorkspaceManager, '_free_branch_from_base_clone'
         ) as mock_free, \
              patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             ProjectWorkspaceManager._add_epic_worktree(
                 base_repo_dir, worktree_path, "feature/issue-100-epic", "main"
             )
@@ -344,7 +366,8 @@ class TestFreeBranchFromBaseClone:
                 _ok(),                              # status --porcelain -- clean
                 _ok("feature/issue-100-epic\n"),  # rev-parse -- checked out here
                 _ok(),                              # checkout --detach main -- freed
-                _ok(),                              # fetch origin <branch> -- exists
+                _ok("sha\trefs/heads/feature/issue-100-epic\n"),  # ls-remote -- exists
+                _ok(),                              # fetch origin <branch> -- success
                 _fail("no local ref"),              # stray-branch-ahead guard
                 _ok(),                              # worktree add -- now succeeds
             ]
@@ -354,7 +377,7 @@ class TestFreeBranchFromBaseClone:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2] == ['git', '-C', str(base_repo_dir), 'checkout', '--detach', 'main']
-        assert calls[5] == ['git', '-C', str(base_repo_dir), 'worktree', 'add',
+        assert calls[6] == ['git', '-C', str(base_repo_dir), 'worktree', 'add',
                              '-B', 'feature/issue-100-epic', str(worktree_path),
                              'origin/feature/issue-100-epic']
 
@@ -367,7 +390,7 @@ class TestReuseExistingEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             first = manager.get_project_dir(
                 "my-project", epic_id="500", branch_name="feature/issue-500"
             )
@@ -391,7 +414,7 @@ class TestReuseExistingEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             sub_issue_1_dir = manager.get_project_dir(
                 "my-project", epic_id="600", branch_name="feature/issue-600"
             )
@@ -400,7 +423,7 @@ class TestReuseExistingEpicWorktree:
         (sub_issue_1_dir / '.git').mkdir()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]  # would be used if (wrongly) recreated
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]  # would be used if (wrongly) recreated
             sub_issue_2_dir = manager.get_project_dir(
                 "my-project", epic_id="600", branch_name="feature/issue-600"
             )
@@ -412,7 +435,7 @@ class TestReuseExistingEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok(), _ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok(), _ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             epic_a = manager.get_project_dir("my-project", epic_id="700", branch_name="feature/issue-700")
             epic_b = manager.get_project_dir("my-project", epic_id="701", branch_name="feature/issue-701")
 
@@ -540,7 +563,7 @@ class TestReuseExistingEpicWorktree:
         assert list(empty_dir.iterdir()) == []
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             result = manager.get_or_create_epic_worktree(
                 "my-project", "903", branch_name="feature/issue-903"
             )
@@ -574,7 +597,7 @@ class TestCleanupEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             worktree_path = manager.get_project_dir(
                 "my-project", epic_id="800", branch_name="feature/issue-800"
             )
@@ -598,7 +621,7 @@ class TestCleanupEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             worktree_path = manager.get_project_dir(
                 "my-project", epic_id="810", branch_name="feature/issue-810"
             )
@@ -628,7 +651,7 @@ class TestCleanupEpicWorktree:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             worktree_path = manager.get_project_dir(
                 "my-project", epic_id="820", branch_name="feature/issue-820"
             )
@@ -651,7 +674,7 @@ class TestEpicWorktreeConcurrencySafety:
         _make_base_clone(tmp_path, "my-project")
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+            mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
             first = manager.get_project_dir(
                 "my-project", epic_id="900", branch_name="feature/issue-900"
             )
@@ -1387,7 +1410,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]  # existing-branch case
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]  # existing-branch case
                     result = manager.get_project_dir(
                         "my-project", epic_id="300", branch_name="feature/issue-300"
                     )
@@ -1402,7 +1425,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                     manager.get_project_dir(
                         "my-project", epic_id="301", branch_name="feature/issue-301"
                     )
@@ -1417,7 +1440,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                     manager.get_project_dir(
                         "my-project", epic_id="302", branch_name="feature/issue-302"
                     )
@@ -1436,7 +1459,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                     manager.get_project_dir(
                         "my-project", epic_id="304", branch_name="feature/issue-304"
                     )
@@ -1450,7 +1473,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.baked_dependency_extractor.extract_baked_dependencies') as mock_extract:
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                     created = manager.get_project_dir(
                         "my-project", epic_id="303", branch_name="feature/issue-303"
                     )
@@ -1501,7 +1524,7 @@ class TestBakedDependencyExtractionIntegration:
                 side_effect=RuntimeError("boom"),
             ):
                 with patch('services.project_workspace.subprocess.run') as mock_run:
-                    mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                    mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                     result = manager.get_project_dir(
                         "my-project", epic_id="305", branch_name="feature/issue-305"
                     )
@@ -1522,7 +1545,7 @@ class TestBakedDependencyExtractionIntegration:
 
         with patch.dict(sys.modules, {'services.dev_container_state': fake_module}):
             with patch('services.project_workspace.subprocess.run') as mock_run:
-                mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                 result = manager.get_project_dir(
                     "my-project", epic_id="306", branch_name="feature/issue-306"
                 )
@@ -1542,7 +1565,7 @@ class TestBakedDependencyExtractionIntegration:
         with patch.dict(sys.modules):
             sys.modules.pop('services.dev_container_state', None)
             with patch('services.project_workspace.subprocess.run') as mock_run:
-                mock_run.side_effect = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+                mock_run.side_effect = [_ok(), _ok(), _ok("sha\trefs/heads/branch\n"), _ok(), _fail("no local ref"), _ok()]
                 result = manager.get_project_dir(
                     "my-project", epic_id="307", branch_name="feature/issue-307"
                 )
