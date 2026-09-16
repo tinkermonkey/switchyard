@@ -89,6 +89,10 @@ class Environment(BaseSettings):
     host_gid: Optional[int] = 1000
     docker_gid: Optional[int] = 0
     host_home: Optional[str] = None  # Host user home dir for Docker-in-Docker SSH mounts (set in .env)
+    # DECLARED, NOT USED by Python, and deliberately left that way: these are
+    # consumed by docker-compose on the host, but still need to be listed here
+    # so pydantic-settings' strict BaseSettings validation (extra='forbid')
+    # does not reject them when they appear in .env.
     host_ssh_key_path: Optional[str] = None
     switchyard_mcp_bind_host: Optional[str] = None
 
