@@ -2684,9 +2684,23 @@ class ProjectWorkspaceManager:
     def _add_epic_worktree(base_repo_dir: Path, worktree_path: Path, branch_name: str, default_branch: str) -> None:
         """Run the actual `git worktree add` for a new epic worktree.
 
-        Tries the existing-branch path first (fetch origin/<branch_name> then a plain
-        `worktree add`); falls back to creating a brand-new branch from
+        Tries the existing-branch path first (ls-remote probe, then fetch, then a
+        plain `worktree add`); falls back to creating a brand-new branch from
         origin/<default_branch> when branch_name doesn't exist on origin yet.
+
+        The existence check is done with `git ls-remote --heads` rather than a
+        speculative `git fetch` + treating non-zero as "not found".  A speculative
+        fetch conflates two very different failure modes:
+          • returncode != 0 because the branch genuinely doesn't exist on remote
+            (correct: fall through to new-branch creation), and
+          • returncode != 0 because of a transient network/auth/lock error
+            (wrong: we would silently create a brand-new branch from
+            origin/<default_branch>, permanently diverging from any real history
+            that exists or will exist under branch_name).
+        `git ls-remote` exits 0 with empty stdout when the branch is absent, exits
+        0 with non-empty stdout when the branch exists, and exits non-zero only on
+        genuine connectivity errors — making the three outcomes unambiguous without
+        inspecting stderr text.
 
         Frees branch_name from the base clone first if it's checked out there --
         see _free_branch_from_base_clone's own docstring for why this is needed
@@ -2694,13 +2708,31 @@ class ProjectWorkspaceManager:
         """
         ProjectWorkspaceManager._free_branch_from_base_clone(base_repo_dir, branch_name, default_branch)
 
-        fetch_existing = subprocess.run(
-            ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
-             f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+        # Single ls-remote probe: cleanly separates "branch not found" (exit 0,
+        # empty stdout) from "fetch error" (exit != 0).  No speculative fetch that
+        # could be misread.
+        ls_remote = subprocess.run(
+            ['git', '-C', str(base_repo_dir), 'ls-remote', '--heads', 'origin', branch_name],
             capture_output=True, text=True, timeout=30
         )
+        if ls_remote.returncode != 0:
+            raise WorktreeAddError(
+                f"Could not query origin for branch {branch_name}: "
+                f"{ls_remote.stderr.strip()}"
+            )
+        branch_exists_on_remote = bool(ls_remote.stdout.strip())
 
-        if fetch_existing.returncode == 0:
+        if branch_exists_on_remote:
+            fetch_existing = subprocess.run(
+                ['git', '-C', str(base_repo_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+                capture_output=True, text=True, timeout=30
+            )
+            if fetch_existing.returncode != 0:
+                raise WorktreeAddError(
+                    f"Failed to fetch existing branch {branch_name} from origin: "
+                    f"{fetch_existing.stderr.strip()}"
+                )
             ProjectWorkspaceManager._push_stray_branch_if_ahead(base_repo_dir, branch_name)
             result = subprocess.run(
                 ['git', '-C', str(base_repo_dir), 'worktree', 'add', '-B', branch_name,
