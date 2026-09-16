@@ -58,6 +58,7 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/test-project'))
+            mock_wm.get_default_branch.return_value = 'main'
             mock_shared_wm.is_base_clone_dir.return_value = True  # this IS the shared base clone (epic_id=None)
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
@@ -71,7 +72,7 @@ class TestRunClaudeCodeProjectDirResolution:
             # lock must not sit in it. epic_id and branch_name go positionally;
             # issue_number is the wait's watchdog-exemption key.
             mock_wm.get_project_dir_off_loop.assert_called_once_with(
-                'test-project', None, None, issue_number=100
+                'test-project', None, None, default_branch='main', issue_number=100
             )
             assert result == 'output'
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
@@ -94,13 +95,14 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/42'))
+            mock_wm.get_default_branch.return_value = 'dev'
             mock_shared_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
 
             mock_wm.get_project_dir_off_loop.assert_called_once_with(
-                'test-project', '42', 'feature/issue-42-shared', issue_number=100
+                'test-project', '42', 'feature/issue-42-shared', default_branch='dev', issue_number=100
             )
             mount_dir = mock_runner.run_agent_in_container.call_args.kwargs['project_dir']
             assert mount_dir == Path('/workspace/.orchestrator/worktrees/test-project/42')
@@ -151,13 +153,14 @@ class TestRunClaudeCodeProjectDirResolution:
              patch('services.project_checkout_lock.project_checkout_lock_async', _noop_project_checkout_lock), \
              patch('pathlib.Path.exists', return_value=True):
             mock_wm.get_project_dir_off_loop = AsyncMock(return_value=Path('/workspace/.orchestrator/worktrees/test-project/200'))
+            mock_wm.get_default_branch.return_value = 'dev'
             mock_shared_wm.is_base_clone_dir.return_value = False  # isolated epic worktree, not the base clone
             mock_runner.run_agent_in_container = AsyncMock(return_value='output')
 
             await run_claude_code('do the thing', context)
 
             mock_wm.get_project_dir_off_loop.assert_called_once_with(
-                'test-project', '200', None, issue_number=200
+                'test-project', '200', None, default_branch='dev', issue_number=200
             )
 
 
