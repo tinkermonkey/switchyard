@@ -897,7 +897,7 @@ class ProjectWorkspaceManager:
         except Exception:
             return 'main'
         github_cfg = getattr(cfg, 'github', None) if cfg else None
-        if github_cfg:
+        if isinstance(github_cfg, dict):
             return github_cfg.get('branch', 'main')
         return 'main'
 
