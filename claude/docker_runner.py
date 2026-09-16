@@ -11,6 +11,21 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
+#: The image every agent runs in unless its project has a verified dev
+#: container. Also the FROM of every project's Dockerfile.agent, so a wrong
+#: image here is a wrong image everywhere (#251).
+ORCHESTRATOR_BASE_IMAGE = 'switchyard-orchestrator:latest'
+
+
+class BaseImageIdentityError(RuntimeError):
+    """The base image tag does not refer to an image switchyard built.
+
+    Its own name is what makes this reachable: `switchyard-orchestrator` is what
+    `docker compose` generates for a service called `orchestrator` in a project
+    called `switchyard`, and other compose files in this workspace define a
+    service by that name too.
+    """
+
 # Marker pair agents are instructed to wrap their true final deliverable in
 # (see prompts/content/workflows/output/*.md). Lets us recover the intended
 # output even when a session runs extra turns after posting it — e.g. a
@@ -1886,8 +1901,78 @@ class DockerAgentRunner:
                 status = dev_container_state.get_status(project)
                 logger.warning(f"Agent {agent} requires dev container but project status is {status.value}, using orchestrator image")
 
-        # Default: use orchestrator image
-        return 'switchyard-orchestrator:latest'
+        # Default: use orchestrator image -- but verify the tag still refers to
+        # an image we built before handing it to a container (#251).
+        self._assert_base_image_is_ours(ORCHESTRATOR_BASE_IMAGE)
+        return ORCHESTRATOR_BASE_IMAGE
+
+    @staticmethod
+    def _assert_base_image_is_ours(image_name: str) -> None:
+        """Refuse to launch from the base tag if it is not one of our images.
+
+        `switchyard-orchestrator` is exactly the image name `docker compose`
+        generates for a service called `orchestrator` in a project called
+        `switchyard` -- and it is not the only compose file in this workspace
+        with a service by that name. On 2026-09-15 a managed project's compose
+        build took the tag, and for seven hours every agent that runs in the
+        base image (analysis agents, which need no dev container) launched a
+        different project's application image instead. They died on
+
+            FileNotFoundError: [Errno 2] No such file or directory: 'claude'
+
+        which names neither the image nor the tag, and the real orchestrator
+        image was left dangling -- alive only because the running container
+        pinned it by id, one `docker image prune` from being collected.
+
+        dev_container_state.verify_image_exists() has guarded PROJECT images
+        against this since #199, using the same label. The base image -- the one
+        shared by every project, and the FROM of every Dockerfile.agent -- was
+        the only image with no identity check at all.
+
+        Raises rather than warning: the launch fails either way, and failing
+        here costs a clear message instead of a mystery inside the container.
+
+        Note what this does and does not prove. The label says "switchyard built
+        this"; it does not say "this is the orchestrator", because an agent image
+        built FROM the orchestrator inherits it. Tagging an agent image as the
+        base would pass -- a far less likely mix-up, and a mostly harmless one,
+        since those images carry Claude too.
+        """
+        from services.dev_container_state import SWITCHYARD_AGENT_ENV_LABEL
+
+        try:
+            result = subprocess.run(
+                ['docker', 'image', 'inspect', image_name, '--format',
+                 '{{ index .Config.Labels "%s" }}' % SWITCHYARD_AGENT_ENV_LABEL],
+                capture_output=True, text=True, timeout=15
+            )
+        except Exception as e:
+            # An unanswerable probe is not proof of a bad image; say so and
+            # carry on rather than grounding every agent on a docker hiccup.
+            logger.warning(
+                f"Could not verify that {image_name} is a switchyard image "
+                f"({e}); proceeding, but a tag collision would go undetected"
+            )
+            return
+
+        if result.returncode != 0:
+            raise BaseImageIdentityError(
+                f"{image_name} could not be inspected "
+                f"(rc={result.returncode}: {(result.stderr or '').strip()[:160]}). "
+                f"Agents cannot be launched until the base image is present."
+            )
+
+        if result.stdout.strip() != "true":
+            raise BaseImageIdentityError(
+                f"{image_name} exists but was not built by switchyard: it is "
+                f"missing the {SWITCHYARD_AGENT_ENV_LABEL} label. Another "
+                f"docker-compose project with a service named 'orchestrator' "
+                f"generates this exact image name and will silently take the "
+                f"tag. Rebuild with `docker compose build orchestrator`, or "
+                f"re-point the tag at the real image "
+                f"(`docker tag <id> {image_name}`) -- and check that the "
+                f"genuine image has not been left dangling."
+            )
 
     def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
         """
