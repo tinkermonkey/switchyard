@@ -1361,7 +1361,7 @@ def kill_pipeline_run(pipeline_run_id):
                         'Its pipeline-run record was closed in Elasticsearch. '
                         if forced_es_close else ''
                     )
-                    + 'verify the lock state manually before retrying this issue.'
+                    + 'Verify the lock state manually before retrying this issue.'
                 ),
                 'requires_manual_verification': True,
             }), 500
