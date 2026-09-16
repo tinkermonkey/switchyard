@@ -896,8 +896,9 @@ class ProjectWorkspaceManager:
             cfg = config_manager.get_project_config(project_name)
         except Exception:
             return 'main'
-        if cfg and hasattr(cfg, 'github'):
-            return cfg.github.get('branch', 'main')
+        github_cfg = getattr(cfg, 'github', None) if cfg else None
+        if github_cfg:
+            return github_cfg.get('branch', 'main')
         return 'main'
 
     def is_base_clone_dir(self, project_name: str, project_dir) -> bool:
