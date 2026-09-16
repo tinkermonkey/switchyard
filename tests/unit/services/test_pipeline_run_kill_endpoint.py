@@ -75,6 +75,12 @@ class TestKillPipelineRun:
             response = client.post('/pipeline-runs/run-123/kill')
 
         assert response.status_code == 200
+        manager.mark_failed.assert_called_once_with(
+            project='proj',
+            board='BoardB',
+            issue_number=42,
+            reason='Killed by user via Web UI',
+        )
         manager._end_run_in_elasticsearch.assert_called_once_with(
             run.to_dict.return_value,
             'Killed by user via Web UI (forced update)',
