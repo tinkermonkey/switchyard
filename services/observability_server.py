@@ -1302,7 +1302,8 @@ def kill_pipeline_run(pipeline_run_id):
         project = pipeline_run.project
         issue_number = pipeline_run.issue_number
 
-        # 1. Set cancellation signal FIRST to block any re-dispatch during lock release
+        # 1. Set cancellation signal FIRST so no retry/re-dispatch path can race
+        # this kill while the run and lock state are being updated.
         from services.cancellation import cancel_issue_work, get_cancellation_signal
         get_cancellation_signal().cancel(project, issue_number, "Pipeline run killed via Web UI")
 
@@ -1316,6 +1317,7 @@ def kill_pipeline_run(pipeline_run_id):
         )
 
         refreshed_run = None
+        forced_es_close = False
         try:
             refreshed_run = pipeline_run_manager.get_pipeline_run_by_id(pipeline_run_id)
         except Exception as e:
@@ -1334,6 +1336,7 @@ def kill_pipeline_run(pipeline_run_id):
                     "Killed by user via Web UI (forced update)",
                     outcome='failed',
                 )
+                forced_es_close = True
             except Exception as e:
                 logger.error(f"Failed to force update pipeline run in ES after kill: {e}")
 
@@ -1341,6 +1344,9 @@ def kill_pipeline_run(pipeline_run_id):
         cancel_issue_work(project, issue_number, "Pipeline run killed via Web UI")
 
         if not marked_ok:
+            # Closing the run record in Elasticsearch repairs operator visibility,
+            # but it is NOT a substitute for durably retaining the board lock.
+            # The safety property the kill path needs is the retained lock.
             logger.error(
                 f"Kill request for pipeline run {pipeline_run_id} cancelled work for "
                 f"{project}/#{issue_number} but could NOT durably retain the "
@@ -1351,7 +1357,11 @@ def kill_pipeline_run(pipeline_run_id):
                 'error': (
                     f'Pipeline run {pipeline_run_id} was cancelled, but the '
                     f'{pipeline_run.board} lock could not be durably retained. '
-                    f'Verify the lock state manually before retrying this issue.'
+                    + (
+                        'Its pipeline-run record was closed in Elasticsearch, but '
+                        if forced_es_close else ''
+                    )
+                    + 'verify the lock state manually before retrying this issue.'
                 ),
                 'requires_manual_verification': True,
             }), 500
