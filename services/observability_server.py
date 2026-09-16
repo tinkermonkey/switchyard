@@ -1315,20 +1315,27 @@ def kill_pipeline_run(pipeline_run_id):
             reason="Killed by user via Web UI",
         )
 
+        refreshed_run = None
         try:
             refreshed_run = pipeline_run_manager.get_pipeline_run_by_id(pipeline_run_id)
-            if refreshed_run and refreshed_run.status == 'active':
-                logger.warning(
-                    f"Pipeline run {pipeline_run_id} still reads active after mark_failed(); "
-                    f"forcing its Elasticsearch record closed"
-                )
+        except Exception as e:
+            logger.warning(
+                f"Could not re-read pipeline run {pipeline_run_id} after kill: {e}"
+            )
+
+        if refreshed_run and refreshed_run.status == 'active':
+            logger.warning(
+                f"Pipeline run {pipeline_run_id} still reads active after mark_failed(); "
+                f"forcing its Elasticsearch record closed"
+            )
+            try:
                 pipeline_run_manager._end_run_in_elasticsearch(
                     refreshed_run.to_dict(),
                     "Killed by user via Web UI (forced update)",
                     outcome='failed',
                 )
-        except Exception as e:
-            logger.error(f"Failed to force update pipeline run in ES after kill: {e}")
+            except Exception as e:
+                logger.error(f"Failed to force update pipeline run in ES after kill: {e}")
 
         # 3. Full cleanup (containers, review cycles, execution state)
         cancel_issue_work(project, issue_number, "Pipeline run killed via Web UI")
