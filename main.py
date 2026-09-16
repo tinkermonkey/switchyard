@@ -168,6 +168,86 @@ def _enforce_dev_container_config(config_manager, logger) -> None:
     raise SystemExit(1)
 
 
+def _report_base_image_identity(logger) -> bool:
+    """Report at STARTUP whether the base image tag is still ours (#257).
+
+    #254 put this check on the dispatch path, so a hijacked tag now fails a
+    launch with a message naming the image, the colliding compose service and
+    two remediation commands. But dispatch-time is the FIRST time anything
+    asks, which means the first signal is a pipeline run failing on a live
+    issue. Asking at boot costs one `docker image inspect` and moves the
+    detection window ahead of the damage.
+
+    WARNS rather than failing, unlike _enforce_dev_container_config() directly
+    above, and for that function's own stated reason: it fails closed because
+    a bad dev_container config is a STATIC error an operator must fix, whose
+    consequence is silent. This is neither. A tag collision is a runtime
+    condition that a rebuild clears, it can be transient (a concurrent
+    `docker compose build` is briefly mid-flight), and its consequence is no
+    longer silent -- the dispatch guard refuses the launch and says why.
+    Refusing to boot would also ground the agents that DON'T need the base
+    image, and take the observability server's view of the system down with
+    it, at the exact moment an operator needs both to diagnose the problem.
+
+    Returns True if the tag is ours, False otherwise; the bool is what makes
+    the decision testable rather than buried in an async entrypoint, which is
+    the lesson _enforce_dev_container_config() records.
+    """
+    from claude.docker_runner import (
+        ORCHESTRATOR_BASE_IMAGE,
+        BaseImageIdentityError,
+        DockerAgentRunner,
+    )
+
+    try:
+        DockerAgentRunner._assert_base_image_is_ours(ORCHESTRATOR_BASE_IMAGE)
+    except BaseImageIdentityError as e:
+        logger.log_error(f"Base image check failed at startup: {e}")
+
+        # The id is the recovery handle, and it is precisely what an operator
+        # does not have at the moment they need it: our real image is still
+        # there, untagged, one `docker image prune` from being collected.
+        dangling = DockerAgentRunner.find_dangling_base_images()
+        if len(dangling) == 1:
+            logger.log_error(
+                f"One untagged image carries our label -- most likely the real "
+                f"orchestrator image, left dangling when the tag was taken. "
+                f"Recover with `docker tag {dangling[0]} "
+                f"{ORCHESTRATOR_BASE_IMAGE}`, and do it before anything runs "
+                f"`docker image prune`."
+            )
+        elif dangling:
+            # Deliberately does NOT pick one. Every <project>-agent image is
+            # built FROM the orchestrator and inherits the label, so their
+            # superseded builds pile up here -- 9 of them on the box this was
+            # written on. Naming a candidate at random would be worse than
+            # naming none: retagging the wrong image reproduces #251 exactly,
+            # with switchyard's own blessing.
+            logger.log_error(
+                f"{len(dangling)} untagged images carry our label: "
+                f"{', '.join(dangling)}. One may be the real orchestrator "
+                f"image; the rest are most likely superseded agent-image "
+                f"builds, which inherit the label via FROM. Identify it with "
+                f"`docker image inspect <id> --format '{{{{.Config.Cmd}}}}'` "
+                f"(the orchestrator runs `python main.py`) before retagging, "
+                f"and do it before anything runs `docker image prune`."
+            )
+        else:
+            logger.log_error(
+                f"No untagged image carrying our label was found, so the real "
+                f"orchestrator image may already have been collected. Rebuild: "
+                f"`docker compose build orchestrator`."
+            )
+        logger.log_error(
+            "Continuing startup: agents that need the base image will refuse "
+            "to launch with this same diagnosis rather than failing obscurely."
+        )
+        return False
+
+    logger.info(f"Base image {ORCHESTRATOR_BASE_IMAGE} verified as ours")
+    return True
+
+
 async def main():
     # Setup zombie process reaper FIRST before any other initialization
     # This prevents accumulation of defunct child processes from subprocess calls
@@ -329,6 +409,10 @@ async def main():
     # persistent Redis queue before the process refused to start -- which, in a
     # restart loop, accumulated a fresh set of them on every attempt.
     _enforce_dev_container_config(config_manager, logger)
+
+    # Same place, for the same reason: this is the last point before
+    # initialize_all_projects() starts resolving environments and images.
+    _report_base_image_identity(logger)
 
     logger.info("Initializing project workspaces")
     projects_needing_setup = await asyncio.to_thread(workspace_manager.initialize_all_projects)

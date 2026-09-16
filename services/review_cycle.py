@@ -1791,6 +1791,10 @@ class ReviewCycleExecutor:
             if isinstance(e, CancellationError):
                 raise
             logger.error(f"Failed to continue cycle from review: {e}", exc_info=True)
+            # Without this the cycle keeps whatever status it had -- never
+            # 'completed' -- so the watchdog reads it as legitimately active and
+            # never touches it. Permanent, invisible stall (#137).
+            await self._escalate_resume_failure_safely(cycle_state, e)
 
     async def _continue_cycle_from_maker(self, cycle_state: ReviewCycleState, org: str):
         """Continue a stuck cycle that completed maker work but state wasn't updated"""
@@ -1801,7 +1805,14 @@ class ReviewCycleExecutor:
             cycle_state.status = 'initialized'
             self._save_cycle_state(cycle_state)
         except Exception as e:
+            # CancellationError must propagate: a cancelled run is not a failed
+            # one, and escalating it would ask a human to resolve a shutdown.
+            # The sibling handler in _continue_cycle_from_review() has always
+            # exempted it; this one never did (#137).
+            if isinstance(e, CancellationError):
+                raise
             logger.error(f"Failed to continue cycle from maker: {e}", exc_info=True)
+            await self._escalate_resume_failure_safely(cycle_state, e)
 
     async def resume_review_cycle_with_feedback(
         self,
@@ -3763,6 +3774,149 @@ _Automated review cycle by Switchyard_
                 cycle_state.repository,
                 pipeline_run_id=cycle_state.pipeline_run_id,
             )
+
+    async def _escalate_resume_failure_safely(self, cycle_state: ReviewCycleState, error: Exception):
+        """_escalate_resume_failure() that cannot itself raise (#137).
+
+        Both call sites are inside an `except` that has already logged the real
+        cause. If escalation fails there -- GitHub unreachable, a malformed
+        cycle_state -- raising would replace the original diagnosis with a
+        secondary one and, in resume_active_cycles()'s loop, abandon every
+        remaining cycle for that project. The escalation is an improvement on
+        silence, not a new way to fail.
+        """
+        try:
+            await self._escalate_resume_failure(cycle_state, error)
+        except CancellationError:
+            raise
+        except Exception as escalation_error:
+            logger.error(
+                f"Could not escalate unresumable review cycle for issue "
+                f"#{cycle_state.issue_number}: {escalation_error}. The original "
+                f"failure was: {type(error).__name__}: {error}",
+                exc_info=True,
+            )
+
+    async def _escalate_resume_failure(self, cycle_state: ReviewCycleState, error: Exception):
+        """Escalate a cycle that could not be resumed (#137).
+
+        resume_active_cycles() runs at every orchestrator startup. Both
+        _continue_cycle_from_* used to end in a bare `logger.error` with no
+        re-raise and no escalation, so a resume that failed left the cycle in
+        whatever status it already had -- never 'completed'. pipeline_watchdog's
+        zombie check reads that as a cycle legitimately still in flight and so
+        never cleans it up or alerts anyone.
+
+        The result was a permanent, invisible stall: the same failure on every
+        restart forever, its only trace one ERROR line an operator would have
+        to already be looking for. A corrupted epic worktree (#250) is the
+        concrete trigger -- get_or_create_epic_worktree() raises, and this is
+        where it lands.
+
+        Escalates to the SAME place a blocking review does -- the
+        needs-human-review label, a comment on the issue, and
+        'awaiting_human_feedback' -- so the existing machinery (the feedback
+        listener, the watchdog's treatment of escalated cycles) applies with no
+        new states to reason about. Deliberately immediate rather than after N
+        consecutive failures: this class of failure does not self-resolve on a
+        plain retry, and a restart is already the retry.
+
+        Best-effort by construction. It runs inside an `except` whose whole
+        purpose is that the cycle already failed, so a failure HERE must not
+        replace the original error with its own -- the caller logs that first,
+        and this only ever adds.
+        """
+        import subprocess
+
+        self.decision_events.emit_review_cycle_decision(
+            issue_number=cycle_state.issue_number,
+            project=cycle_state.project_name,
+            board=cycle_state.board_name,
+            cycle_iteration=cycle_state.current_iteration,
+            decision_type='escalate',
+            maker_agent=cycle_state.maker_agent,
+            reviewer_agent=cycle_state.reviewer_agent,
+            reason=f"Escalating: review cycle could not be resumed ({type(error).__name__})",
+            additional_data={
+                'escalation_reason': 'resume_failed',
+                'error_type': type(error).__name__,
+                'error': str(error)[:500],
+            },
+            pipeline_run_id=cycle_state.pipeline_run_id
+        )
+
+        if cycle_state.workspace_type == 'issues':
+            subprocess.run(
+                ['gh', 'issue', 'edit', str(cycle_state.issue_number),
+                 '--repo', cycle_state.repository,
+                 '--add-label', 'needs-human-review'],
+                capture_output=True
+            )
+
+        escalation_comment = f"""## \u26a0\ufe0f Review Cycle Could Not Be Resumed - Human Review Required
+
+The orchestrator tried to resume this review cycle at startup and could not.
+
+### What failed
+```
+{type(error).__name__}: {str(error)[:1500]}
+```
+
+### Why you are seeing this
+The cycle was mid-flight when the orchestrator last stopped. Resuming it failed,
+and it will fail the same way on every restart until the cause is addressed --
+this is not a transient condition that clears on its own.
+
+A common cause is an epic worktree the orchestrator can no longer read. If so,
+check `.orchestrator/unreadable-worktrees/` -- the startup sweep moves such a
+directory aside rather than deleting it, and the work will be in there.
+
+### Next steps
+1. Resolve the underlying cause above
+2. Post a comment with your guidance (the orchestrator detects your response automatically)
+3. The cycle resumes from your feedback
+
+**Iteration**: {cycle_state.current_iteration}/{cycle_state.max_iterations}
+
+---
+_Escalated by Switchyard - Monitoring for your response..._
+"""
+
+        if cycle_state.workspace_type == 'discussions' and cycle_state.discussion_id:
+            from services.github_discussions import GitHubDiscussions
+            discussions = GitHubDiscussions()
+            discussions.add_discussion_comment(
+                cycle_state.discussion_id, escalation_comment,
+                pipeline_run_id=cycle_state.pipeline_run_id
+            )
+        else:
+            github = self._get_github_integration(cycle_state)
+            await github.post_issue_comment(
+                cycle_state.issue_number,
+                escalation_comment,
+                cycle_state.repository,
+                pipeline_run_id=cycle_state.pipeline_run_id,
+            )
+
+        cycle_state.status = 'awaiting_human_feedback'
+        cycle_state.escalation_time = datetime.now().isoformat()
+        self._save_cycle_state(cycle_state)
+
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            get_pipeline_run_manager().update_run_status(
+                cycle_state.project_name, cycle_state.issue_number, "feedback_listening"
+            )
+        except Exception as _e:
+            logger.warning(
+                f"Failed to set feedback_listening status after resume-failure "
+                f"escalation: {_e}"
+            )
+
+        logger.warning(
+            f"Escalated unresumable review cycle for issue "
+            f"#{cycle_state.issue_number}: {type(error).__name__}: {error}"
+        )
 
     async def _escalate_blocked(self, cycle_state: ReviewCycleState, review_result):
         """Escalate when blocking issues are found (workspace-aware)"""
