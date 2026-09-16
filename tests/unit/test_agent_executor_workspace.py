@@ -475,6 +475,7 @@ class TestBuildExecutionContextEpicWorktree:
                    return_value=Path('/workspace/test-project')) as mock_get_dir, \
              patch('services.agent_executor.config_manager') as mock_config:
             mock_config.get_project_agent_config.return_value = MagicMock()
+            mock_config.get_project_config.return_value = None
 
             context = agent_executor._build_execution_context(
                 agent_name='test_agent',
@@ -483,7 +484,9 @@ class TestBuildExecutionContextEpicWorktree:
                 task_context={'issue_number': 100},
             )
 
-            mock_get_dir.assert_called_once_with('test-project', epic_id=None, branch_name=None)
+            mock_get_dir.assert_called_once_with(
+                'test-project', epic_id=None, branch_name=None, default_branch='main'
+            )
             assert context['work_dir'] == '/workspace/test-project'
 
     def test_scopes_work_dir_to_the_epic_worktree_when_epic_id_given(self, agent_executor):
@@ -491,6 +494,7 @@ class TestBuildExecutionContextEpicWorktree:
                    return_value=Path('/workspace/.orchestrator/worktrees/test-project/42')) as mock_get_dir, \
              patch('services.agent_executor.config_manager') as mock_config:
             mock_config.get_project_agent_config.return_value = MagicMock()
+            mock_config.get_project_config.return_value = None
 
             context = agent_executor._build_execution_context(
                 agent_name='test_agent',
@@ -502,7 +506,8 @@ class TestBuildExecutionContextEpicWorktree:
             )
 
             mock_get_dir.assert_called_once_with(
-                'test-project', epic_id='42', branch_name='feature/issue-42-epic'
+                'test-project', epic_id='42', branch_name='feature/issue-42-epic',
+                default_branch='main'
             )
             assert context['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
 
