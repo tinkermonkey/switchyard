@@ -15,6 +15,17 @@ class Environment(BaseSettings):
     context7_api_key: Optional[SecretStr] = None  # For Context7 MCP server
     switchyard_mcp_token: Optional[SecretStr] = None  # For Switchyard MCP server authentication
 
+    # AWS Bedrock auth for Claude Code (alternative to ANTHROPIC_API_KEY /
+    # CLAUDE_CODE_OAUTH_TOKEN above). Read directly via os.environ.get() in
+    # claude/environment.py's ClaudeEnvironmentBuilder, not through this
+    # Environment object - declared here anyway so pydantic-settings' strict
+    # BaseSettings validation (extra='forbid') doesn't reject them when
+    # present in .env, same reason use_batched_board_queries is declared below.
+    claude_code_use_bedrock: Optional[str] = None
+    aws_bearer_token_bedrock: Optional[SecretStr] = None
+    aws_region: Optional[str] = None
+    claude_api_provider: Optional[str] = None
+
     # Webhook Configuration
     webhook_secret: Optional[SecretStr] = None
     github_webhook_secret: Optional[SecretStr] = None  # Alternative name
@@ -85,6 +96,14 @@ class Environment(BaseSettings):
     host_gid: Optional[int] = 1000
     docker_gid: Optional[int] = 0
     host_home: Optional[str] = None  # Host user home dir for Docker-in-Docker SSH mounts (set in .env)
+    # docker-compose.yml volume-mount source override for the orchestrator's
+    # dedicated SSH deploy key. Consumed only by docker-compose's own ${...}
+    # interpolation on the host, never read inside the container - declared
+    # here anyway so it doesn't hit extra='forbid' when present in .env.
+    host_ssh_key_path: Optional[str] = None
+    # docker-compose.yml port-bind host override for the switchyard-mcp
+    # service. Same story as host_ssh_key_path above: host-side only.
+    switchyard_mcp_bind_host: Optional[str] = None
 
     class Config:
         env_file = ".env"
