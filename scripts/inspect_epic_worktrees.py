@@ -142,10 +142,13 @@ def _describe_unmerged(row: dict) -> str:
 
 _VERDICT_TEXT = {
     'unknown': (
-        "UNKNOWN — this process could not read the active-run store, so whether "
-        "a pipeline run owns this workspace is unanswerable here. Do not remove "
-        "it by hand. (The sweep makes its own lookup; if that one also fails it "
-        "prunes nothing at all.)"
+        "UNKNOWN — the active-run store could not say whether a pipeline run "
+        "owns this workspace: either it was unreadable from this process, or "
+        "this project's issue→run mapping names a run that neither Redis nor "
+        "Elasticsearch can account for, which no worktree of the project can be "
+        "cleared against. Do not remove it by hand. (The sweep makes its own "
+        "lookup and keeps everything it gets this answer for; the orchestrator "
+        "log names the runs.)"
     ),
     'skipped_active_run': "SKIPPED (a pipeline run still in flight owns this workspace)",
     'skipped_container': "SKIPPED (an agent container is still mounted inside)",
@@ -431,9 +434,11 @@ def main():
     )
     if unknown:
         print(
-            f"  ⚠️  {unknown} worktree(s) could not be checked against the "
-            "active-run store from this process, so whether a run owns them is "
-            "unanswerable here. Do not remove them by hand."
+            f"  ⚠️  {unknown} worktree(s) could not be cleared against the "
+            "active-run store — it was unreadable here, or their project's "
+            "issue→run mapping names a run neither store can account for. "
+            "Whether a run owns them is unanswerable; do not remove them by "
+            "hand."
         )
     print(_UNCHECKABLE_RULE_NOTE)
     return 0

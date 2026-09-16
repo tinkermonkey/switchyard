@@ -3159,9 +3159,14 @@ class ProjectWorkspaceManager:
         The branches are in _prune_project_staging()'s own order, so the two can
         be diffed against each other:
 
-          'unknown'          the active-run lookup failed. The sweep aborts in
-                             FULL on that (not per-worktree), so nothing is
-                             removed anywhere -- this is never "eligible".
+          'unknown'          the active-run lookup could not answer for this
+                             worktree -- either it failed outright (the sweep
+                             then aborts in FULL, so nothing is removed
+                             anywhere) or this worktree's PROJECT has an
+                             issue->run mapping entry naming a run neither
+                             store can account for, in which case the sweep
+                             runs but keeps every worktree of that project
+                             (#233). Never "eligible" under either reading.
           'skipped_active_run'  a pipeline run still in flight owns it.
           'skipped_container'   an agent container is bind-mounted inside.
           'skipped_corrupted'   no .git at all but non-empty.
@@ -3250,8 +3255,9 @@ class ProjectWorkspaceManager:
             uncommitted (True/False/None for unreadable), uncommitted_files (the
             porcelain lines, capped), prune_skipped (the sweep's DRIFT rule
             alone), active_run_protected (a pipeline run still in flight owns
-            this workspace -- None when the run store could not be asked, which
-            the sweep treats as "prune nothing", not "prune this"), corrupted
+            this workspace -- None when the run store could not answer for it,
+            which the sweep treats as "keep this one", never "prune this"),
+            corrupted
             (non-empty with no .git at all), and prune_verdict.
 
             **Render prune_verdict; do not recompute it from the other fields.**
@@ -3404,10 +3410,12 @@ class ProjectWorkspaceManager:
                     # actually reads (#231).
                     'prune_skipped': drift_holds_work,
                     # The fifth rule's answer for this directory. None is "could
-                    # not be asked", which is emphatically NOT "no run owns it":
-                    # the sweep aborts in full on an incomplete lookup, so an
-                    # unknown here means nothing gets pruned this cycle, not that
-                    # this one is free to go (#231).
+                    # not be answered", which is emphatically NOT "no run owns
+                    # it": the sweep keeps every worktree it gets this answer
+                    # for -- all of them if the lookup failed outright, this
+                    # project's if its mapping holds a run neither store can
+                    # account for (#233). Either way this one is not free to go
+                    # (#231).
                     'active_run_protected': _active_run_protected(ownership),
                     # A .git-less but non-empty directory, which the sweep
                     # refuses to remove because it cannot be told apart from
@@ -3516,11 +3524,14 @@ class ProjectWorkspaceManager:
             #
             # `is not UNOWNED`, not `if owned`. UNOWNED is the single answer
             # that licenses a removal, so every other answer -- an unreadable
-            # run store, or a member added to the enum after this was written --
-            # keeps the directory. prune_epic_worktrees() aborts the whole sweep
-            # before reaching here on an incomplete lookup, and that gate stays
-            # for what only it can do (one log line for the operator instead of
-            # one per worktree); it is no longer what makes this correct (#240).
+            # run store, a project whose mapping names a run neither store can
+            # account for (#233), or a member added to the enum after this was
+            # written -- keeps the directory. prune_epic_worktrees()'s own
+            # abort catches only the WHOLE-answer failure, and stays for what
+            # only it can do (one log line for the operator instead of one per
+            # worktree); a doubt scoped to one project reaches here and is
+            # caught here, which is the case that shows why this line rather
+            # than that gate is what makes the sweep correct (#240).
             ownership = active_run_workspaces.ownership_of(
                 project_staging.name, worktree_path
             )
@@ -3956,6 +3967,14 @@ class ProjectWorkspaceManager:
             # early return, instead of a per-worktree line and a full pass over
             # every project's staging directory taking each project_checkout
             # lock to decide nothing.
+            #
+            # WHOLE-ANSWER doubt only, deliberately. A lookup that could not
+            # account for one project's runs (#233) leaves `complete` True and
+            # falls through to here: that project's worktrees are kept by the
+            # ownership answer itself in _prune_project_staging(), and every
+            # other project's sweep runs. Widening this gate to cover it was
+            # measured to disable the sweep on essentially every startup --
+            # see ActiveRunWorkspaces.
             if not active_run_workspaces.complete:
                 logger.error(
                     "Skipping the epic-worktree prune entirely: the active-run "
