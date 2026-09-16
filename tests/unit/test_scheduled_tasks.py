@@ -164,6 +164,35 @@ class TestScheduledJobConfiguration:
         scheduled_tasks_service.stop()
 
     @pytest.mark.asyncio
+    async def test_mapping_sweep_tolerates_being_late(self, scheduled_tasks_service):
+        """Scheduled is not the same as runnable.
+
+        #238 revived cleanup_expired_mappings() by scheduling it. In production
+        it then fired ~20s late every time and APScheduler's one-second default
+        grace dropped every run: 15 consecutive misses, zero executions, no
+        state ever written, over twelve hours. The sweep was dead code with a
+        cron entry in front of it -- the same failure #238 set out to fix.
+
+        The grace matters more here than for a nightly job: this one is what
+        collects the mapping debris that otherwise suppresses epic-worktree
+        pruning for a whole project indefinitely (#233).
+        """
+        scheduled_tasks_service.start()
+
+        job = scheduled_tasks_service.scheduler.get_job('pipeline_run_mapping_cleanup')
+
+        assert job is not None, "the mapping sweep is not scheduled"
+        assert job.func == scheduled_tasks_service._cleanup_pipeline_run_mappings
+        assert job.misfire_grace_time is not None and job.misfire_grace_time >= 60, (
+            "a one-second grace means a job that fires even slightly late never "
+            "runs at all -- which is exactly what was observed in production"
+        )
+        assert job.coalesce is True, (
+            "a restart backlog must collapse into one run, not one per missed interval"
+        )
+
+        scheduled_tasks_service.stop()
+
     async def test_data_retention_job_schedule(self, scheduled_tasks_service):
         """The nightly sweep must be registered, and must tolerate being late.
 

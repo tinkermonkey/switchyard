@@ -230,6 +230,16 @@ class ScheduledTasksService:
             trigger=IntervalTrigger(minutes=30),
             id='pipeline_run_mapping_cleanup',
             name='Sweep issue->pipeline_run mappings whose runs have ended',
+            # APScheduler's default grace is ONE SECOND, and this job was
+            # observed firing ~20s late every single time -- 15 consecutive
+            # misses, zero executions, over twelve hours of production. A sweep
+            # that is scheduled but can never run is the same dead code #238
+            # existed to revive, so the grace is explicit here rather than
+            # inherited. Same reasoning as the data-retention job below; a
+            # shorter window because this runs every 30 minutes rather than
+            # daily, and coalesce so a restart backlog is one run, not nine.
+            misfire_grace_time=600,
+            coalesce=True,
             replace_existing=True
         )
 
