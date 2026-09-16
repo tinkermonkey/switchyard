@@ -145,6 +145,43 @@ class TestGitWorkflowManagerPRCreation:
         assert 'PR #42' in call_args[0][1]
         assert 'issue #123' in call_args[0][1]
 
+    @pytest.mark.asyncio
+    @patch('services.git_workflow_manager.subprocess.run')
+    @patch('services.git_workflow_manager.get_github_client')
+    @patch('services.project_workspace.workspace_manager.get_default_branch')
+    async def test_create_pr_uses_project_default_branch(
+        self,
+        mock_get_default_branch,
+        mock_get_client,
+        mock_run,
+        manager,
+        tmp_path,
+    ):
+        """PR creation should use the configured project default branch."""
+        mock_get_default_branch.return_value = 'master'
+        mock_get_client.return_value = Mock(spec=GitHubAPIClient)
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout='https://github.com/owner/repo/pull/42\n',
+            stderr='',
+        )
+        manager.track_branch('test-project', 123, 'feature/issue-123')
+
+        result = await manager.create_or_update_pr(
+            project='test-project',
+            issue_number=123,
+            project_dir=tmp_path,
+            org='owner',
+            repo='repo',
+            issue_title='Add fix',
+            issue_body='',
+            draft=True,
+        )
+
+        assert result['success'] is True
+        cmd = mock_run.call_args.args[0]
+        assert cmd[cmd.index('--base') + 1] == 'master'
+
 
 class TestGitWorkflowManagerPRStatusUpdate:
     """
