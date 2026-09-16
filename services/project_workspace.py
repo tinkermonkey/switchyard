@@ -890,6 +890,13 @@ class ProjectWorkspaceManager:
         epic-worktree pool -- see get_project_dir_off_loop()."""
         return await self._off_loop(self.get_or_create_epic_worktree, *args, **kwargs)
 
+    def get_default_branch(self, project_name: str) -> str:
+        """Return *project_name*'s configured default branch, else 'main'."""
+        cfg = config_manager.get_project_config(project_name)
+        if cfg and hasattr(cfg, 'github'):
+            return cfg.github.get('branch', 'main')
+        return 'main'
+
     def is_base_clone_dir(self, project_name: str, project_dir) -> bool:
         """
         True if `project_dir` IS project_name's shared base clone (the

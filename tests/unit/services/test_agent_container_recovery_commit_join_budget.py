@@ -83,7 +83,7 @@ def _recovery():
 
 def _process(commit_agent_changes, commit_join_deadline=None,
              is_base_clone=True, join_floor=TEST_JOIN_FLOOR,
-             thread_class=None, workspace_manager=None):
+             thread_class=None, workspace_manager=None, context_overrides=None):
     """
     Drive _process_completed_repair_cycle() on a successful repair cycle, with
     `commit_agent_changes` as the auto-commit coroutine function.
@@ -120,10 +120,14 @@ def _process(commit_agent_changes, commit_join_deadline=None,
         workspace_manager = MagicMock()
     workspace_manager.is_base_clone_dir.return_value = is_base_clone
 
+    context = dict(CONTEXT)
+    if context_overrides:
+        context.update(context_overrides)
+
     with patch.object(recovery_module, '_COMMIT_JOIN_FLOOR_SECONDS', join_floor), \
          patch('threading.Thread', thread_class or threading.Thread), \
          patch('pathlib.Path.exists', return_value=True), \
-         patch('builtins.open', mock_open(read_data=json.dumps(CONTEXT))), \
+         patch('builtins.open', mock_open(read_data=json.dumps(context))), \
          patch('services.pipeline_run.PipelineRunManager', return_value=run_manager), \
          patch('services.pipeline_run.get_pipeline_run_manager', return_value=run_manager), \
          patch('config.manager.ConfigManager', return_value=MagicMock()), \
@@ -633,4 +637,28 @@ class TestTheCommitDirectoryIsHeldAgainstThePruneSweep:
 
         workspace_manager.clear_worktree_path_in_use.assert_called_once_with(
             CONTEXT['project_dir']
+        )
+
+
+class TestRestartRecoveryWorktreeReregistration:
+    def test_reregistration_uses_the_configured_default_branch(self):
+        async def commit_agent_changes(**kwargs):
+            return CommitResult.COMMITTED
+
+        workspace_manager = MagicMock()
+        workspace_manager.get_default_branch.return_value = 'dev'
+
+        _process(
+            commit_agent_changes,
+            is_base_clone=False,
+            workspace_manager=workspace_manager,
+            context_overrides={'epic_id': '5150', 'branch_name': 'feature/issue-5150-epic'},
+        )
+
+        workspace_manager.get_or_create_epic_worktree.assert_called_once_with(
+            PROJECT,
+            '5150',
+            'feature/issue-5150-epic',
+            default_branch='dev',
+            issue_number=ISSUE,
         )
