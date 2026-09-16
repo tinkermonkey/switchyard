@@ -678,6 +678,42 @@ class ProjectWorkspaceManager:
             project_dir = self.workspace_root / project_name
             was_cloned = False
 
+            # "exists" is not "readable", the same distinction #250 turned on
+            # one level down at the epic-worktree level. Both branches below
+            # assume this directory is either a working clone or absent, and
+            # neither is true for a base clone git cannot identify: the `if`
+            # calls _update_repository() on it (git fetch/checkout fail with
+            # whatever git says about the broken metadata), and the `else`
+            # calls git clone into a non-empty directory, which refuses with
+            # "destination path already exists and is not an empty directory".
+            # Both name the symptom and not the cause (#136).
+            if self._is_corrupted_non_empty_worktree(project_dir):
+                # NOT removed, and deliberately not quarantined either.
+                #
+                # #136 was filed suggesting this "remove the corrupted
+                # directory before falling through to git clone". That was
+                # written before #250, which is the same bug one level down and
+                # taught the opposite lesson: a directory git cannot read is a
+                # directory whose contents cannot be shown to be expendable.
+                #
+                # Quarantining is what the epic-worktree sweep does, and it is
+                # right there because that path is unattended -- a wedged epic
+                # would otherwise stall until a human noticed. This path is
+                # different in the way that matters: it runs at startup, its
+                # caller already isolates the failure to one project, and a base
+                # clone can be very large, so silently moving one aside and
+                # re-cloning is a lot of disruption to choose on a machine's own
+                # judgement. Refusing loudly costs one project's startup and
+                # keeps the decision with the operator.
+                raise RuntimeError(
+                    f"Base clone for {project_name} at {project_dir} exists and "
+                    f"is not empty, but git cannot identify it as a repository. "
+                    f"Not touching it: it may hold work that was never pushed. "
+                    f"Inspect it, recover anything that matters, then move or "
+                    f"remove it -- the next startup will re-clone from "
+                    f"{self._redact_url(repo_url)}."
+                )
+
             if project_dir.exists() and (project_dir / '.git').exists():
                 logger.info(f"Project {project_name} found at {project_dir}")
                 # Ensure we're on the default branch and up to date

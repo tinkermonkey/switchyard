@@ -2012,6 +2012,38 @@ class DockerAgentRunner:
                 f"genuine image has not been left dangling."
             )
 
+    @staticmethod
+    def find_dangling_base_images() -> list:
+        """Image ids that carry our label but have no tag (#257).
+
+        The recovery handle for #251's second failure shape. When another
+        compose project takes `switchyard-orchestrator:latest`, our real image
+        is not deleted -- it is left with `tags: []`, alive only because the
+        running container pins it by id, and one `docker image prune` from
+        being collected permanently. Recovering it needs its id, which is
+        exactly what an operator does not have at the moment they need it.
+
+        Best-effort and never raises: this only ever decorates a diagnostic
+        that has already been decided, so a docker hiccup here must not turn a
+        clear message into a stack trace.
+        """
+        from services.dev_container_state import SWITCHYARD_AGENT_ENV_LABEL
+
+        try:
+            result = subprocess.run(
+                ['docker', 'images', '--filter', 'dangling=true',
+                 '--filter', f'label={SWITCHYARD_AGENT_ENV_LABEL}=true',
+                 '--format', '{{.ID}}'],
+                capture_output=True, text=True, timeout=10
+            )
+        except Exception as e:
+            logger.debug(f"Could not list dangling switchyard images: {e}")
+            return []
+
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
     def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
         """
         Detect Claude Code rate limit reset time by querying Elasticsearch for recent rate limit errors.
