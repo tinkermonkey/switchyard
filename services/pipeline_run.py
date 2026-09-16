@@ -1164,9 +1164,11 @@ class PipelineRunManager:
                 whether a run is active: the restore refreshes the blob's TTL and
                 writes the issue mapping under the board-less legacy key, so a
                 crashed run whose ES doc still reads 'active' would be resurrected
-                on every pass and could then shadow a board-scoped lookup. Stale
-                mappings found in Redis are still cleaned up either way -- that is
-                removal of state known to be dead, not resurrection of it.
+                on every pass and could then shadow a board-scoped lookup. A
+                mapping entry is still retired either way -- but only once
+                something can say the run it names is OVER; see
+                _retire_mapping_entries_elasticsearch_accounts_for() for why an
+                entry nothing can account for is kept instead (#233).
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -1181,6 +1183,13 @@ class PipelineRunManager:
             *([self._get_issue_key(project, issue_number, board)] if board else []),
             self._get_issue_key(project, issue_number),
         ]))
+
+        # Mapping entries this pass could not resolve, held for the
+        # accounted-for check below INSTEAD of being deleted on the spot. An
+        # entry whose record cannot be read is an unknown, and it is the only
+        # surviving evidence that a run for this issue may still be live
+        # (#233) -- see _retire_mapping_entries_elasticsearch_accounts_for().
+        unresolvable_entries: list = []
 
         for issue_key in issue_keys:
             pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
@@ -1216,14 +1225,19 @@ class PipelineRunManager:
                         continue
                     return pipeline_run
                 except Exception as e:
-                    # Don't leave a corrupted mapping in place — every subsequent
-                    # call for this issue would otherwise re-hit this same error and
-                    # never self-heal (it only ever falls through to the ES fallback).
+                    # An unreadable record says nothing about whether the run
+                    # is active, so the entry is offered for retirement rather
+                    # than deleted here: Elasticsearch retires it if it can say
+                    # the run is over (which is also what lets this self-heal
+                    # instead of re-hitting the same error forever), and keeps
+                    # it otherwise, because the sweep that protects epic
+                    # worktrees reads this hash and an unparseable record is
+                    # doubt there too (#233).
                     logger.error(
                         f"Error deserializing pipeline run {pipeline_run_id} for {project} "
-                        f"issue #{issue_number} (key={issue_key}): {e} — removing corrupted mapping"
+                        f"issue #{issue_number} (key={issue_key}): {e}"
                     )
-                    self.redis.hdel(self.redis_issue_mapping, issue_key)
+                    unresolvable_entries.append((issue_key, pipeline_run_id))
                     continue
             else:
                 # Redis data has expired (TTL) while the issue mapping survived.
@@ -1234,8 +1248,18 @@ class PipelineRunManager:
                     f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
                     f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
                 )
-                self.redis.hdel(self.redis_issue_mapping, issue_key)
+                # NOT an hdel. See
+                # _retire_mapping_entries_elasticsearch_accounts_for(): this
+                # entry is the last thing that still says a run may own this
+                # issue's worktree, and deleting it here runs EARLIER in
+                # startup than the sweep that reads it (#233).
+                unresolvable_entries.append((issue_key, pipeline_run_id))
                 # Fall through to try the next key / ES lookup below
+
+        # Retire the entries above that are genuinely debris, and keep the
+        # ones nothing can account for. Runs before the fallback returns, so a
+        # lookup that finds its run in Elasticsearch still leaves a tidy hash.
+        self._retire_mapping_entries_elasticsearch_accounts_for(unresolvable_entries)
 
         # ES fallback: mapping was absent OR Redis data expired.
         # Include "feedback_listening" so human-feedback loops survive restarts
@@ -1317,7 +1341,88 @@ class PipelineRunManager:
                 logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")
 
         return None
-    
+
+    def _retire_mapping_entries_elasticsearch_accounts_for(
+        self, entries: list
+    ) -> None:
+        """Delete only those unresolvable issue->run mapping entries whose run
+        Elasticsearch can positively say is OVER.
+
+        WHY THIS IS NOT THE UNCONDITIONAL HDEL IT REPLACES (#233). An entry
+        whose Redis record cannot be read is an UNKNOWN, not a dead entry --
+        and it is the last surviving evidence that a run for that issue may
+        still be live. get_active_run_workspaces() reads exactly this hash to
+        decide whether an epic worktree still belongs to someone, and startup
+        reaches that sweep LATE: main.py runs container recovery first, and
+        recover_or_cleanup_repair_cycle_containers() calls
+        get_active_pipeline_run() for every project/issue holding an orphaned
+        repair-cycle result -- precisely the mid-pipeline restart case --
+        before prune_epic_worktrees() runs. Deleting the entry on the spot
+        therefore erased the sweep's only doubt signal minutes before the sweep
+        went looking for it: the hgetall then saw nothing, the answer came back
+        complete, ownership_of() returned UNOWNED for a live run's worktree,
+        and the prune removed it. That is the #233 deletion, reached by the
+        neighbouring writer rather than by the sweep's own logic.
+
+        So an entry is retired only by something that can ACCOUNT FOR the run
+        it names -- the same rule the sweep applies to its own doubt (see
+        es_seen_run_ids). A doc Elasticsearch holds in a terminal state says
+        the run is over and owns no workspace, so that entry really is debris
+        and goes. Two shapes are kept instead:
+
+          * no ES doc at all -- the #233 population exactly, a run written
+            while Elasticsearch was unavailable whose Redis record later
+            expired. Nothing anywhere can say it ended.
+          * an ES doc that is still active -- that run is not dead either, and
+            the fallback below may be about to restore it.
+
+        Unavailable or failing Elasticsearch accounts for nothing, so it
+        retires nothing. Never raises: the lookup that calls this does not
+        depend on its outcome.
+        """
+        if not entries:
+            return
+        run_ids = sorted({
+            decoded for decoded in (
+                decode_redis_text(run_id) for _, run_id in entries
+            ) if decoded
+        })
+        if not run_ids or not self.es:
+            return
+
+        try:
+            result = self.es.search(
+                index=f"{self.es_index_pattern}-*",
+                body={"query": {"ids": {"values": run_ids}}, "size": len(run_ids)},
+            )
+            hits = (result.get('hits', {}) or {}).get('hits', []) or []
+        except Exception as e:
+            logger.debug(
+                f"Could not ask Elasticsearch about {len(run_ids)} unresolvable "
+                f"active-run mapping entr(ies): {e} — keeping them, since "
+                f"nothing has said their runs are over"
+            )
+            return
+
+        ended_run_ids: Set[str] = set()
+        for hit in hits:
+            source = hit.get('_source') or {}
+            run_id = decode_redis_text(source.get('id') or hit.get('_id'))
+            if not run_id:
+                continue
+            if source.get('ended_at') or source.get('status') not in (
+                'active', 'feedback_listening'
+            ):
+                ended_run_ids.add(run_id)
+
+        for issue_key, raw_run_id in entries:
+            if decode_redis_text(raw_run_id) in ended_run_ids:
+                logger.debug(
+                    f"Retiring active-run mapping entry {issue_key!r}: "
+                    f"Elasticsearch shows run {raw_run_id} as ended"
+                )
+                self.redis.hdel(self.redis_issue_mapping, issue_key)
+
     def get_active_run_workspaces(self) -> 'ActiveRunWorkspaces':
         """Which epic worktrees currently belong to an ACTIVE pipeline run.
 
@@ -1347,6 +1452,17 @@ class PipelineRunManager:
         while ES was down, whose Redis record later expired), it is invisible
         to both passes, and `continue` alone reported that silence as "no run
         owns that worktree" to a caller that deletes directories.
+
+        THE SIGNAL IS A SHARED RESOURCE. The doubt above has exactly one
+        observable -- the mapping field itself -- so any writer that deletes
+        such a field deletes the protection with it. get_active_pipeline_run()
+        did, on the same condition, from a caller (container recovery) that
+        runs EARLIER in the same startup than this sweep; it now retires a
+        field only once something can say the run it names is over
+        (_retire_mapping_entries_elasticsearch_accounts_for). Anything else
+        that learns to prune this hash -- cleanup_expired_mappings() is the
+        obvious candidate -- has to honour the same rule or the population
+        below becomes invisible again.
 
         It is reported as doubt about THAT ENTRY'S PROJECT, not about the whole
         answer. On the reference deployment (2026-09-15) 9 of the 11 fields in
@@ -2788,30 +2904,49 @@ class PipelineRunManager:
     
     def cleanup_expired_mappings(self, max_age_seconds: int = 7200):
         """
-        Clean up expired pipeline run mappings from Redis
-        
+        Clean up pipeline run mappings whose run is known to be over.
+
         This is a maintenance function that should be called periodically.
-        It removes stale mappings where the pipeline run data no longer exists.
-        
+
+        "The record is gone" is NOT the condition it may act on (#233).
+        get_active_run_workspaces() raises doubt about a project's epic
+        worktrees from precisely those fields -- an entry Redis cannot resolve
+        is the last thing that still says a run may own a directory -- so
+        deleting one on that condition alone is the worktree deletion #233 is
+        about, just reached from a maintenance sweep instead. The entries are
+        therefore offered to
+        _retire_mapping_entries_elasticsearch_accounts_for(), which deletes
+        only those whose run Elasticsearch holds in a terminal state and keeps
+        the rest.
+
         Args:
-            max_age_seconds: Maximum age in seconds before cleanup
+            max_age_seconds: Maximum age in seconds before cleanup (unused;
+                the mapping carries no timestamp, so age is not a signal this
+                can read. Kept for the existing signature.)
         """
         try:
             # Get all issue mappings
             all_mappings = self.redis.hgetall(self.redis_issue_mapping)
-            
-            cleaned = 0
-            for issue_key, pipeline_run_id in all_mappings.items():
-                redis_key = self._get_redis_key(pipeline_run_id)
-                
-                # Check if pipeline run data still exists
-                if not self.redis.exists(redis_key):
-                    self.redis.hdel(self.redis_issue_mapping, issue_key)
-                    cleaned += 1
-            
+
+            unresolvable = [
+                (issue_key, pipeline_run_id)
+                for issue_key, pipeline_run_id in all_mappings.items()
+                if not self.redis.exists(self._get_redis_key(pipeline_run_id))
+            ]
+            before = len(self.redis.hgetall(self.redis_issue_mapping) or {})
+            self._retire_mapping_entries_elasticsearch_accounts_for(unresolvable)
+            cleaned = before - len(self.redis.hgetall(self.redis_issue_mapping) or {})
+
             if cleaned > 0:
                 logger.info(f"Cleaned up {cleaned} expired pipeline run mappings")
-                
+            kept = len(unresolvable) - cleaned
+            if kept > 0:
+                logger.info(
+                    f"Kept {kept} unresolvable pipeline run mapping(s): nothing "
+                    f"can say those runs ended, and they are what stops a live "
+                    f"run's epic worktree being pruned (#233)"
+                )
+
         except Exception as e:
             logger.error(f"Error cleaning up pipeline run mappings: {e}")
     

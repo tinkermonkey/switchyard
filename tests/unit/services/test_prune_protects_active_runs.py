@@ -872,9 +872,12 @@ class TestGetActiveRunWorkspaces:
         records are not unindexable at all -- path matching does not consult
         the project.
 
-        Driven through Elasticsearch because the Redis pass cannot reach it:
-        PipelineRun.from_dict() requires `project`, so a projectless Redis blob
-        raises into the per-run handler and is already reported as incomplete.
+        Driven through Elasticsearch because that is where a record with the
+        `project` KEY MISSING lands: PipelineRun.from_dict() has no default for
+        it, so such a Redis blob raises into the per-run handler and is already
+        reported as incomplete. An EMPTY project is a different matter -- it
+        deserializes cleanly and reaches this branch through Redis too; see
+        test_a_redis_record_with_an_empty_project_is_also_incomplete.
         """
         redis_client = Mock()
         redis_client.hgetall.return_value = {}
@@ -891,6 +894,26 @@ class TestGetActiveRunWorkspaces:
         assert result.ownership_of(
             'codetoreum', Path('/w/worktrees/codetoreum/1016')
         ) is RunOwnership.OWNED
+
+    def test_a_redis_record_with_an_empty_project_is_also_incomplete(self):
+        """The Redis pass reaches _record()'s unindexable branch too.
+
+        `project: str` on PipelineRun has no default, so a MISSING key raises
+        -- but an empty string satisfies it, deserializes, and then names a
+        worktree by epic id with nothing to key it under. Untested, the Redis
+        pass's own `complete = False` was a mutation survivor: deleting it
+        broke nothing.
+        """
+        redis_client = Mock()
+        redis_client.hgetall.return_value = {'codetoreum:1045': 'run-abc'}
+        redis_client.get.return_value = self._run_blob(project='', project_dir=None)
+
+        result = self._manager(redis_client, self._es([])).get_active_run_workspaces()
+
+        assert result.complete is False
+        assert result.epic_ids_by_project == {}, (
+            "and it is not keyed under the empty project either"
+        )
 
     def test_an_active_run_naming_only_an_epic_id_is_reported_as_incomplete(self):
         """The residue of the same early return: an active run that names a
@@ -1440,3 +1463,266 @@ class TestOneProjectsDoubtDoesNotDisarmTheOthers:
         )
         assert rows['heimdall']['prune_verdict'] == 'eligible'
         assert rows['heimdall']['active_run_protected'] is False
+
+
+class _FakeRedisStore:
+    """A plain dict-backed stand-in for the hash and key space this path uses.
+
+    It stores and returns, and that is all: none of the retirement rules under
+    test are re-derived inside it. (A fake that reimplements the logic it is
+    meant to check is how an earlier round's compare-and-delete tests passed
+    against gutted Lua.)
+    """
+
+    def __init__(self, mapping=None):
+        self.mapping = dict(mapping or {})
+        self.kv = {}
+
+    def hget(self, name, field):
+        return self.mapping.get(field)
+
+    def hset(self, name, field, value):
+        self.mapping[field] = value
+
+    def hdel(self, name, field):
+        return 1 if self.mapping.pop(field, None) is not None else 0
+
+    def hgetall(self, name):
+        return dict(self.mapping)
+
+    def get(self, key):
+        return self.kv.get(key)
+
+    def setex(self, key, ttl, value):
+        self.kv[key] = value
+
+    def exists(self, key):
+        return 1 if key in self.kv else 0
+
+
+class TestALookupCannotEraseTheSweepsDoubt:
+    """#233, the half the doubt signal itself depends on.
+
+    get_active_run_workspaces() raises its doubt from ONE observable: an
+    issue->run mapping field whose record Redis can no longer resolve. That
+    signal is only as good as its survival, and get_active_pipeline_run() --
+    a neighbouring writer on the same hash -- used to HDEL exactly those
+    fields, under exactly the condition that raises the doubt.
+
+    Ordering made it a live path rather than a theoretical one: main.py runs
+    container recovery BEFORE prune_epic_worktrees(), and
+    recover_or_cleanup_repair_cycle_containers() /
+    _process_completed_repair_cycle() both call get_active_pipeline_run() for
+    any project/issue holding an orphaned repair-cycle result -- the
+    mid-pipeline restart case, which is the #233 case. By the time the sweep
+    ran its hgetall, the field it needed was gone, the answer looked complete,
+    and the live run's worktree came back UNOWNED.
+
+    The fix is at the lookup, not at the ordering, so these cases drive the
+    lookup directly; no call order can reintroduce it.
+    """
+
+    def _manager(self, redis_client, es_client=None):
+        from services.pipeline_run import PipelineRunManager
+        with patch('services.pipeline_run.Elasticsearch',
+                   side_effect=RuntimeError('no ES')):
+            manager = PipelineRunManager(redis_client=redis_client)
+        assert manager.es is None
+        manager.es = es_client
+        return manager
+
+    def _es(self, docs):
+        """A double that answers BOTH searches this path makes: the id lookup
+        that retires accounted-for entries, and the active-run fallback.
+
+        Dispatching on the query shape is load-bearing. A double that answered
+        everything with one empty page would make the fallback raise on its
+        missing `total`, and these assertions would pass without the
+        retirement having been reached at all -- the failure mode that made an
+        earlier round's ES test prove nothing.
+        """
+        def search(index=None, body=None, **kwargs):
+            query = (body or {}).get('query', {})
+            if 'ids' in query:
+                wanted = set(query['ids']['values'])
+                hits = [d for d in docs if d.get('id') in wanted]
+            else:
+                hits = [d for d in docs
+                        if d.get('status') in ('active', 'feedback_listening')]
+            return {
+                'hits': {
+                    'total': {'value': len(hits), 'relation': 'eq'},
+                    'hits': [{'_id': d.get('id'), '_source': d} for d in hits],
+                }
+            }
+
+        es = Mock()
+        es.search.side_effect = search
+        return es
+
+    def _ownership(self, manager):
+        return manager.get_active_run_workspaces().ownership_of(
+            'context-studio', Path('/w/worktrees/context-studio/1140')
+        )
+
+    def test_a_lookup_for_the_same_issue_leaves_the_doubt_standing(self):
+        """THE #233 INTERACTION GUARD.
+
+        Nothing has learned anything about run-vanished between the two
+        sweeps: Elasticsearch has never heard of it either. The lookup in
+        between must therefore not be able to turn UNKNOWN into UNOWNED, which
+        is the one answer prune_epic_worktrees() removes on.
+        """
+        redis_client = _FakeRedisStore({
+            'context-studio:SDLC Execution:1140': 'run-vanished',
+            'context-studio:1140': 'run-vanished',
+        })
+        manager = self._manager(redis_client, self._es([]))
+
+        assert self._ownership(manager) is RunOwnership.UNKNOWN
+
+        assert manager.get_active_pipeline_run(
+            'context-studio', 1140, board='SDLC Execution'
+        ) is None
+
+        assert self._ownership(manager) is RunOwnership.UNKNOWN, (
+            "the lookup deleted the only field that still said a run might "
+            "own this worktree"
+        )
+        assert redis_client.mapping, "and it deleted it from the hash itself"
+
+    def test_an_unreadable_record_keeps_its_entry_too(self):
+        """Same rule one branch over: a record that will not parse says
+        nothing about whether its run is active either, and the sweep treats
+        an unparseable blob as doubt only for as long as the field pointing at
+        it survives."""
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-corrupt'})
+        manager = self._manager(redis_client, self._es([]))
+        # Through the manager's own key builder: a hand-written key that does
+        # not match simply reads as "no record", which is the NEIGHBOURING
+        # branch -- the test would then pass while never reaching the
+        # deserialization failure it names.
+        redis_client.kv[manager._get_redis_key('run-corrupt')] = 'not json at all'
+        assert manager.get_active_run_workspaces().complete is False, (
+            "precondition: the record is present and unparseable, which is "
+            "whole-answer doubt rather than the scoped kind"
+        )
+
+        assert manager.get_active_pipeline_run('context-studio', 1140) is None
+
+        assert redis_client.mapping == {'context-studio:1140': 'run-corrupt'}
+        assert manager.get_active_run_workspaces().complete is False
+
+    def test_the_entry_is_retired_once_elasticsearch_says_the_run_ended(self):
+        """The retirement path is not disabled, only conditioned. An ended run
+        owns no workspace, so its field is debris and the hash still
+        self-heals -- otherwise every expired mapping would accumulate
+        forever."""
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-over'})
+        es = self._es([{
+            'id': 'run-over',
+            'project': 'context-studio',
+            'issue_number': 1140,
+            'status': 'completed',
+            'ended_at': '2026-09-14T10:00:00Z',
+        }])
+        manager = self._manager(redis_client, es)
+
+        assert manager.get_active_pipeline_run('context-studio', 1140) is None
+
+        assert redis_client.mapping == {}
+        assert self._ownership(manager) is RunOwnership.UNOWNED
+
+    def test_an_entry_elasticsearch_still_shows_as_active_is_kept(self):
+        """An active doc accounts for nothing that would license removing the
+        field: that run is not over.
+
+        Driven through the read-only lookup (restore_to_redis=False, what the
+        maintenance sweeps in project_monitor pass). On the restoring path the
+        fallback HSETs the same field back a moment later, so a retirement
+        here would be invisible -- the assertion would hold while the rule it
+        names had been deleted.
+        """
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-live'})
+        es = self._es([{
+            'id': 'run-live',
+            'project': 'context-studio',
+            'issue_number': 1140,
+            'issue_title': 'Phase 1',
+            'issue_url': 'https://example.invalid/1140',
+            'board': 'SDLC Execution',
+            'started_at': '2026-09-13T13:50:12Z',
+            'status': 'active',
+        }])
+        manager = self._manager(redis_client, es)
+
+        assert manager.get_active_pipeline_run(
+            'context-studio', 1140, restore_to_redis=False
+        ) is not None
+        assert redis_client.mapping.get('context-studio:1140') == 'run-live'
+        assert redis_client.kv == {}, (
+            "precondition: nothing was restored, so nothing could mask a "
+            "retirement of the field"
+        )
+
+    def test_a_failing_elasticsearch_retires_nothing(self):
+        """It accounts for nothing while it is down, and "I could not ask" is
+        not "the run ended"."""
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-vanished'})
+        es = Mock()
+        es.search.side_effect = RuntimeError('es down')
+        manager = self._manager(redis_client, es)
+
+        assert manager.get_active_pipeline_run('context-studio', 1140) is None
+
+        assert redis_client.mapping == {'context-studio:1140': 'run-vanished'}
+        assert self._ownership(manager) is RunOwnership.UNKNOWN
+
+    def test_no_elasticsearch_client_retires_nothing_either(self):
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-vanished'})
+        manager = self._manager(redis_client, None)
+
+        assert manager.get_active_pipeline_run('context-studio', 1140) is None
+
+        assert redis_client.mapping == {'context-studio:1140': 'run-vanished'}
+
+    # The same hash has a second pruner. It has no callers today, which is
+    # exactly why it is worth pinning: wiring it up is the obvious way to
+    # retire the doubt, and on its old rule ("the record is gone") that
+    # wiring would have been #233 all over again, from a periodic sweep.
+
+    def test_the_periodic_cleanup_keeps_what_it_cannot_account_for(self):
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-vanished'})
+        manager = self._manager(redis_client, self._es([]))
+
+        manager.cleanup_expired_mappings()
+
+        assert redis_client.mapping == {'context-studio:1140': 'run-vanished'}
+        assert self._ownership(manager) is RunOwnership.UNKNOWN
+
+    def test_the_periodic_cleanup_still_collects_real_debris(self):
+        """It is still a cleanup: an entry whose run Elasticsearch shows as
+        ended names no workspace anyone could lose."""
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-over'})
+        es = self._es([{
+            'id': 'run-over',
+            'project': 'context-studio',
+            'issue_number': 1140,
+            'status': 'completed',
+            'ended_at': '2026-09-14T10:00:00Z',
+        }])
+        manager = self._manager(redis_client, es)
+
+        manager.cleanup_expired_mappings()
+
+        assert redis_client.mapping == {}
+
+    def test_the_periodic_cleanup_leaves_resolvable_entries_alone(self):
+        """Control: a live run's field is not even a candidate."""
+        redis_client = _FakeRedisStore({'context-studio:1140': 'run-live'})
+        manager = self._manager(redis_client, self._es([]))
+        redis_client.kv[manager._get_redis_key('run-live')] = '{}'
+
+        manager.cleanup_expired_mappings()
+
+        assert redis_client.mapping == {'context-studio:1140': 'run-live'}
