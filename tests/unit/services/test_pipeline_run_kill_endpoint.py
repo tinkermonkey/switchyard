@@ -83,7 +83,7 @@ class TestKillPipelineRun:
             reason='Killed by user via Web UI',
         )
         manager._end_run_in_elasticsearch.assert_called_once_with(
-            refreshed_run.to_dict.return_value,
+            refreshed_run.to_dict(),
             'Killed by user via Web UI (forced update)',
             outcome='failed',
         )
