@@ -67,6 +67,7 @@ class TestKillPipelineRun:
         body = response.get_json()
         assert body['success'] is False
         assert 'could not be durably retained' in body['error'].lower()
+        assert body['requires_manual_verification'] is True
         signal.cancel.assert_called_once_with('proj', 42, 'Pipeline run killed via Web UI')
         manager.mark_failed.assert_called_once_with(
             project='proj',

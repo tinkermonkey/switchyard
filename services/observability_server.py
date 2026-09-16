@@ -1328,8 +1328,10 @@ def kill_pipeline_run(pipeline_run_id):
                 'success': False,
                 'error': (
                     f'Pipeline run {pipeline_run_id} was cancelled, but the '
-                    f'{pipeline_run.board} lock could not be durably retained'
-                )
+                    f'{pipeline_run.board} lock could not be durably retained. '
+                    f'Verify the lock state manually before retrying this issue.'
+                ),
+                'requires_manual_verification': True,
             }), 500
 
         return jsonify({
