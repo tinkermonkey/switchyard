@@ -505,11 +505,12 @@ def _launch_repair_cycle_container(
             '-e', 'ELASTICSEARCH_HOST=elasticsearch',  # Elasticsearch host for observability events
             '-e', f'ANTHROPIC_API_KEY={env.anthropic_api_key.get_secret_value() if env.anthropic_api_key else ""}',
             '-e', f'CLAUDE_CODE_OAUTH_TOKEN={env.claude_code_oauth_token.get_secret_value() if env.claude_code_oauth_token else ""}',
-            # AWS Bedrock auth (forwarded so nested agent containers can authenticate;
-            # omitting these caused 100% auth failures on Bedrock deployments — see PR #236)
+            # AWS Bedrock token is always forwarded (empty string is fine; the absence
+            # of the other two vars is what disables Bedrock, not an empty token).
+            # CLAUDE_CODE_USE_BEDROCK and AWS_REGION are appended conditionally below
+            # so that passing an explicit empty string cannot shadow the default of "1"
+            # in claude/environment.py's ClaudeEnvironmentBuilder.
             '-e', f'AWS_BEARER_TOKEN_BEDROCK={env.aws_bearer_token_bedrock.get_secret_value() if env.aws_bearer_token_bedrock else ""}',
-            '-e', f'CLAUDE_CODE_USE_BEDROCK={env.claude_code_use_bedrock or ""}',
-            '-e', f'AWS_REGION={env.aws_region or ""}',
             '-e', f'GITHUB_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',
             '-e', f'GH_TOKEN={env.github_token.get_secret_value() if env.github_token else ""}',  # For gh CLI
             # GITHUB_ORG (#188). This container runs real GitHub writes -- every
@@ -541,7 +542,16 @@ def _launch_repair_cycle_container(
             '--stage', stage_name,
             '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
         ]
-        
+
+        # Forward CLAUDE_CODE_USE_BEDROCK and AWS_REGION only when set: passing an
+        # explicit empty string via -e KEY= would override the "1" default in
+        # claude/environment.py's ClaudeEnvironmentBuilder (os.environ.get(KEY, "1")
+        # only fires when the key is absent, not present-but-empty).
+        if env.claude_code_use_bedrock:
+            docker_cmd += ['-e', f'CLAUDE_CODE_USE_BEDROCK={env.claude_code_use_bedrock}']
+        if env.aws_region:
+            docker_cmd += ['-e', f'AWS_REGION={env.aws_region}']
+
         # Launch container
         logger.debug(f"Docker command: {' '.join(docker_cmd)}")
         result = subprocess.run(
