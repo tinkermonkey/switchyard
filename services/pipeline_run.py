@@ -12,7 +12,8 @@ import json
 import uuid
 from typing import Optional, Dict, Any, Set, Tuple
 from datetime import datetime
-from dataclasses import dataclass, asdict, fields
+from dataclasses import dataclass, asdict, field, fields
+from enum import Enum
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
 from services.run_ownership import RunOwnership
@@ -36,6 +37,58 @@ def format_pipeline_run_issue_key(project: str, issue_number: int, board: Option
     if board:
         return f"{project}:{board}:{issue_number}"
     return f"{project}:{issue_number}"
+
+
+def decode_redis_text(value) -> Optional[str]:
+    """One decoding rule for a value read out of a Redis hash.
+
+    A client built without `decode_responses=True` hands back bytes for BOTH
+    halves of the issue->run mapping. Decoding only the field name (which is
+    all this module used to do) left the run id as `str(b'run-x')` ==
+    "b'run-x'", which is not a run id: the Redis key built from it can never
+    hit, the id can never equal one read out of Elasticsearch, so the doubt
+    that id represents can never be cleared, and the operator warning names a
+    run that does not exist.
+
+    None when there is nothing usable -- no value, or bytes that are not
+    UTF-8. The caller decides what that means; here it only means "not text".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return value.decode('utf-8')
+        except Exception:
+            return None
+    return str(value)
+
+
+def project_of_pipeline_run_issue_key(issue_key) -> Optional[str]:
+    """The PROJECT a mapping field belongs to, or None if it cannot be read.
+
+    The inverse of format_pipeline_run_issue_key()'s first field, and the whole
+    inverse that is needed: both key forms -- legacy `project:issue_number` and
+    board-scoped `project:board:issue_number` -- put the project first, and a
+    board containing a ':' (they are human board titles, e.g. "Planning &
+    Design") moves only the fields AFTER it. Nothing here needs the board or
+    the issue number, so the ambiguous tail is never parsed.
+
+    Why it exists: get_active_run_workspaces() has to scope the doubt raised by
+    an unresolvable mapping entry to ONE project (#233). The entry's own key is
+    the only thing left that says which project the vanished run belonged to --
+    the run record that would have said so is exactly what is missing.
+
+    None for anything that is not a usable project name -- no ':' at all, an
+    empty first field, or a key this cannot decode. The caller must treat that
+    as doubt about the WHOLE answer, since a doubt that cannot be attributed
+    cannot be scoped.
+    """
+    if isinstance(issue_key, bytes):
+        issue_key = decode_redis_text(issue_key)
+    if not isinstance(issue_key, str) or ':' not in issue_key:
+        return None
+    project = issue_key.split(':', 1)[0].strip()
+    return project or None
 
 
 # Atomically delete a hash field only if its current value matches — used by
@@ -152,6 +205,47 @@ class PipelineRun:
         return self.status in ("active", "feedback_listening") and self.ended_at is None
 
 
+class WorkspaceIndexOutcome(Enum):
+    """What one run record told get_active_run_workspaces() about a worktree.
+
+    Three outcomes, not a bool, because the two ways a record can fail to
+    contribute a key mean opposite things to the two passes that call it:
+
+      * WORKSPACE -- the record named a worktree AND it could be keyed
+        (a `project_dir` path, or an `epic_id` under a `project`). This is the
+        only outcome that proves the store holding the record knows where the
+        run's workspace is.
+      * NO_WORKSPACE -- the record names no worktree at all. Harmless from
+        Redis, which is the source of truth: the run has not resolved a
+        workspace yet. NOT harmless from Elasticsearch, where the same shape is
+        what a STALE creation-time doc looks like after the later write that
+        would have carried `project_dir` was swallowed by
+        _persist_to_elasticsearch()'s except-and-log.
+      * UNIDENTIFIABLE -- the record names a worktree by epic id and nothing
+        says which project's staging directory that id lives under, so neither
+        matching form can protect it. An unknown, and must not pass as
+        "nothing owns it".
+
+    The bool this replaces collapsed WORKSPACE and NO_WORKSPACE, which let a
+    stale ES doc clear a project's doubt while contributing no protection --
+    exactly the deletion #233 is about, one `return True` away.
+    """
+
+    WORKSPACE = "workspace"
+    NO_WORKSPACE = "no_workspace"
+    UNIDENTIFIABLE = "unidentifiable"
+
+
+#: How many active-run docs one Elasticsearch scan asks for.
+#:
+#: Read back in get_active_run_workspaces(): a result that fills this page may
+#: have been truncated, and a truncated read of a protection list is a partial
+#: answer, so it spends `complete` rather than passing as the whole answer.
+#: Raising it without keeping that check is how active runs past the limit
+#: silently lose protection.
+ES_ACTIVE_RUN_SCAN_SIZE = 1000
+
+
 @dataclass(frozen=True)
 class ActiveRunWorkspaces:
     """The epic worktrees that belong to a pipeline run still in flight.
@@ -167,6 +261,18 @@ class ActiveRunWorkspaces:
         exists to remove, applied to a destructive operation. The prune skips
         entirely when this is False: leaving worktrees on disk costs one sweep,
         deleting a live one costs the run.
+      * `projects_with_unaccountable_runs` -- the SAME doubt, scoped to the
+        projects it is actually about (#233). The lookup can fail for one
+        issue->run mapping entry rather than for the store: the entry names a
+        run whose record is gone from Redis and which Elasticsearch never saw,
+        so whether that run is still active is unanswerable -- but only for
+        the project that entry belongs to. Spending the whole-answer flag on
+        it was measured to set `complete=False` on essentially every startup
+        (2026-09-15: 9 of the 11 mapping entries on the reference deployment
+        named a run whose Redis record was already gone),
+        which turns the sweep into a permanent no-op that still LOOKS like
+        protection -- strictly worse than the defect. A dangling pointer in
+        `test-project` is no reason to stop collecting `heimdall`'s worktrees.
       * that epic ids and paths are DIFFERENT KINDS of key. Packing the paths
         into the same map under a reserved `'*paths*'` key (the shape this
         replaces) made a project of that name silently overwrite its own
@@ -186,6 +292,11 @@ class ActiveRunWorkspaces:
     epic_ids_by_project: Dict[str, Set[str]]
     paths: Set[str]
     complete: bool = True
+    #: Projects the answer is only PARTIAL for. Keep it last and defaulted: the
+    #: three fields above are positional at a dozen call sites, and a value
+    #: built without this one must mean "no scoped doubt", not "doubt about
+    #: something unnamed".
+    projects_with_unaccountable_runs: Set[str] = field(default_factory=set)
 
     def __post_init__(self):
         # BOTH fields, and the inner sets too. `frozen=True` freezes the
@@ -209,6 +320,14 @@ class ActiveRunWorkspaces:
                 str(project): {str(epic_id) for epic_id in epic_ids}
                 for project, epic_ids in self.epic_ids_by_project.items()
             },
+        )
+        # Copied and stringified for the same two reasons as the fields above:
+        # it is a container behind a frozen binding, and it is matched against
+        # the same project name (a staging DIRECTORY name) they are.
+        object.__setattr__(
+            self,
+            'projects_with_unaccountable_runs',
+            {str(project) for project in self.projects_with_unaccountable_runs},
         )
 
     @classmethod
@@ -237,11 +356,31 @@ class ActiveRunWorkspaces:
         Matching (once the answer is known to be usable) is on BOTH the epic id
         -- the directory's own name, robust to path formatting -- and the run's
         recorded project_dir, robust to a layout change. Either is enough.
+
+        THERE ARE TWO GATES, WITH THE MATCH BETWEEN THEM, and that order is
+        deliberate (#233):
+
+          1. `complete` -- the whole answer is unusable, so every worktree is
+             UNKNOWN whatever project it is in.
+          2. the match -- a POSITIVE hit is a definite answer, and it stays
+             definite in a project that also carries doubt. A run we can see
+             owns this directory is not made less certain by a sibling mapping
+             entry we cannot resolve; reporting OWNED also tells the operator
+             the true reason the directory is being kept.
+          3. `projects_with_unaccountable_runs` -- nothing here claims this
+             directory, but THIS PROJECT has a run we could not account for,
+             and an unaccounted-for run is exactly the one whose project_dir we
+             cannot see. So "nothing claims it" is not "nothing owns it", and
+             the answer is UNKNOWN rather than UNOWNED -- for this project
+             only, which is what keeps one project's debris from disarming
+             every other project's sweep.
         """
         if not self.complete:
             return RunOwnership.UNKNOWN
         if self._protects(project, worktree_path):
             return RunOwnership.OWNED
+        if str(project) in self.projects_with_unaccountable_runs:
+            return RunOwnership.UNKNOWN
         return RunOwnership.UNOWNED
 
     def _protects(self, project: str, worktree_path) -> bool:
@@ -1025,9 +1164,11 @@ class PipelineRunManager:
                 whether a run is active: the restore refreshes the blob's TTL and
                 writes the issue mapping under the board-less legacy key, so a
                 crashed run whose ES doc still reads 'active' would be resurrected
-                on every pass and could then shadow a board-scoped lookup. Stale
-                mappings found in Redis are still cleaned up either way -- that is
-                removal of state known to be dead, not resurrection of it.
+                on every pass and could then shadow a board-scoped lookup. A
+                mapping entry is still retired either way -- but only once
+                something can say the run it names is OVER; see
+                _retire_mapping_entries_elasticsearch_accounts_for() for why an
+                entry nothing can account for is kept instead (#233).
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -1042,6 +1183,13 @@ class PipelineRunManager:
             *([self._get_issue_key(project, issue_number, board)] if board else []),
             self._get_issue_key(project, issue_number),
         ]))
+
+        # Mapping entries this pass could not resolve, held for the
+        # accounted-for check below INSTEAD of being deleted on the spot. An
+        # entry whose record cannot be read is an unknown, and it is the only
+        # surviving evidence that a run for this issue may still be live
+        # (#233) -- see _retire_mapping_entries_elasticsearch_accounts_for().
+        unresolvable_entries: list = []
 
         for issue_key in issue_keys:
             pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
@@ -1077,14 +1225,19 @@ class PipelineRunManager:
                         continue
                     return pipeline_run
                 except Exception as e:
-                    # Don't leave a corrupted mapping in place — every subsequent
-                    # call for this issue would otherwise re-hit this same error and
-                    # never self-heal (it only ever falls through to the ES fallback).
+                    # An unreadable record says nothing about whether the run
+                    # is active, so the entry is offered for retirement rather
+                    # than deleted here: Elasticsearch retires it if it can say
+                    # the run is over (which is also what lets this self-heal
+                    # instead of re-hitting the same error forever), and keeps
+                    # it otherwise, because the sweep that protects epic
+                    # worktrees reads this hash and an unparseable record is
+                    # doubt there too (#233).
                     logger.error(
                         f"Error deserializing pipeline run {pipeline_run_id} for {project} "
-                        f"issue #{issue_number} (key={issue_key}): {e} — removing corrupted mapping"
+                        f"issue #{issue_number} (key={issue_key}): {e}"
                     )
-                    self.redis.hdel(self.redis_issue_mapping, issue_key)
+                    unresolvable_entries.append((issue_key, pipeline_run_id))
                     continue
             else:
                 # Redis data has expired (TTL) while the issue mapping survived.
@@ -1095,8 +1248,18 @@ class PipelineRunManager:
                     f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
                     f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
                 )
-                self.redis.hdel(self.redis_issue_mapping, issue_key)
+                # NOT an hdel. See
+                # _retire_mapping_entries_elasticsearch_accounts_for(): this
+                # entry is the last thing that still says a run may own this
+                # issue's worktree, and deleting it here runs EARLIER in
+                # startup than the sweep that reads it (#233).
+                unresolvable_entries.append((issue_key, pipeline_run_id))
                 # Fall through to try the next key / ES lookup below
+
+        # Retire the entries above that are genuinely debris, and keep the
+        # ones nothing can account for. Runs before the fallback returns, so a
+        # lookup that finds its run in Elasticsearch still leaves a tidy hash.
+        self._retire_mapping_entries_elasticsearch_accounts_for(unresolvable_entries)
 
         # ES fallback: mapping was absent OR Redis data expired.
         # Include "feedback_listening" so human-feedback loops survive restarts
@@ -1178,7 +1341,88 @@ class PipelineRunManager:
                 logger.debug(f"Error searching Elasticsearch for active pipeline run: {e}")
 
         return None
-    
+
+    def _retire_mapping_entries_elasticsearch_accounts_for(
+        self, entries: list
+    ) -> None:
+        """Delete only those unresolvable issue->run mapping entries whose run
+        Elasticsearch can positively say is OVER.
+
+        WHY THIS IS NOT THE UNCONDITIONAL HDEL IT REPLACES (#233). An entry
+        whose Redis record cannot be read is an UNKNOWN, not a dead entry --
+        and it is the last surviving evidence that a run for that issue may
+        still be live. get_active_run_workspaces() reads exactly this hash to
+        decide whether an epic worktree still belongs to someone, and startup
+        reaches that sweep LATE: main.py runs container recovery first, and
+        recover_or_cleanup_repair_cycle_containers() calls
+        get_active_pipeline_run() for every project/issue holding an orphaned
+        repair-cycle result -- precisely the mid-pipeline restart case --
+        before prune_epic_worktrees() runs. Deleting the entry on the spot
+        therefore erased the sweep's only doubt signal minutes before the sweep
+        went looking for it: the hgetall then saw nothing, the answer came back
+        complete, ownership_of() returned UNOWNED for a live run's worktree,
+        and the prune removed it. That is the #233 deletion, reached by the
+        neighbouring writer rather than by the sweep's own logic.
+
+        So an entry is retired only by something that can ACCOUNT FOR the run
+        it names -- the same rule the sweep applies to its own doubt (see
+        es_seen_run_ids). A doc Elasticsearch holds in a terminal state says
+        the run is over and owns no workspace, so that entry really is debris
+        and goes. Two shapes are kept instead:
+
+          * no ES doc at all -- the #233 population exactly, a run written
+            while Elasticsearch was unavailable whose Redis record later
+            expired. Nothing anywhere can say it ended.
+          * an ES doc that is still active -- that run is not dead either, and
+            the fallback below may be about to restore it.
+
+        Unavailable or failing Elasticsearch accounts for nothing, so it
+        retires nothing. Never raises: the lookup that calls this does not
+        depend on its outcome.
+        """
+        if not entries:
+            return
+        run_ids = sorted({
+            decoded for decoded in (
+                decode_redis_text(run_id) for _, run_id in entries
+            ) if decoded
+        })
+        if not run_ids or not self.es:
+            return
+
+        try:
+            result = self.es.search(
+                index=f"{self.es_index_pattern}-*",
+                body={"query": {"ids": {"values": run_ids}}, "size": len(run_ids)},
+            )
+            hits = (result.get('hits', {}) or {}).get('hits', []) or []
+        except Exception as e:
+            logger.debug(
+                f"Could not ask Elasticsearch about {len(run_ids)} unresolvable "
+                f"active-run mapping entr(ies): {e} — keeping them, since "
+                f"nothing has said their runs are over"
+            )
+            return
+
+        ended_run_ids: Set[str] = set()
+        for hit in hits:
+            source = hit.get('_source') or {}
+            run_id = decode_redis_text(source.get('id') or hit.get('_id'))
+            if not run_id:
+                continue
+            if source.get('ended_at') or source.get('status') not in (
+                'active', 'feedback_listening'
+            ):
+                ended_run_ids.add(run_id)
+
+        for issue_key, raw_run_id in entries:
+            if decode_redis_text(raw_run_id) in ended_run_ids:
+                logger.debug(
+                    f"Retiring active-run mapping entry {issue_key!r}: "
+                    f"Elasticsearch shows run {raw_run_id} as ended"
+                )
+                self.redis.hdel(self.redis_issue_mapping, issue_key)
+
     def get_active_run_workspaces(self) -> 'ActiveRunWorkspaces':
         """Which epic worktrees currently belong to an ACTIVE pipeline run.
 
@@ -1200,6 +1444,36 @@ class PipelineRunManager:
         thing that still knows the directory matters, which is why the answer
         has to come from here.
 
+        AN UNRESOLVABLE MAPPING ENTRY IS AN UNKNOWN, NOT A NON-ANSWER (#233).
+        The issue->run mapping can name a run whose record is gone from Redis.
+        That says nothing about whether the run was active -- only that we
+        cannot tell from Redis -- and the Elasticsearch pass below is what was
+        meant to answer it. When ES has not seen the run either (a run written
+        while ES was down, whose Redis record later expired), it is invisible
+        to both passes, and `continue` alone reported that silence as "no run
+        owns that worktree" to a caller that deletes directories.
+
+        THE SIGNAL IS A SHARED RESOURCE. The doubt above has exactly one
+        observable -- the mapping field itself -- so any writer that deletes
+        such a field deletes the protection with it. get_active_pipeline_run()
+        did, on the same condition, from a caller (container recovery) that
+        runs EARLIER in the same startup than this sweep; it now retires a
+        field only once something can say the run it names is over
+        (_retire_mapping_entries_elasticsearch_accounts_for). Anything else
+        that learns to prune this hash -- cleanup_expired_mappings() is the
+        obvious candidate -- has to honour the same rule or the population
+        below becomes invisible again.
+
+        It is reported as doubt about THAT ENTRY'S PROJECT, not about the whole
+        answer. On the reference deployment (2026-09-15) 9 of the 11 fields in
+        the mapping hash named a run with no Redis record -- reproducible with
+        HGETALL on the mapping key and EXISTS on each id it names -- so
+        spending `complete` on them would have disabled the sweep permanently
+        while still looking like protection, the one outcome worse than the
+        defect. Their debris is collected separately
+        (#238); until it is, those projects' worktrees are kept, and every
+        other project's sweep runs normally.
+
         COMPLETENESS IS PART OF THE ANSWER. An earlier revision returned a bare
         dict and `{}` on any failure -- which is also what a healthy system with
         no active runs returns. The caller deletes directories on that answer,
@@ -1215,17 +1489,64 @@ class PipelineRunManager:
         epic_ids_by_project: Dict[str, Set[str]] = {}
         paths: Set[str] = set()
         complete = True
+        # project -> the run ids its mapping entries point at that Redis could
+        # not resolve. Held as run ids, not just project names, so the
+        # Elasticsearch pass can CLEAR the ones it accounts for; what survives
+        # to the end is the doubt that neither store could answer.
+        unresolved_run_ids_by_project: Dict[str, Set[str]] = {}
+        # Every run id the ES pass could ANSWER FOR -- not merely every id it
+        # saw. Two shapes answer: a hit carrying an ended_at (the run is over,
+        # so it owns nothing), and an active hit that contributed a key
+        # (WorkspaceIndexOutcome.WORKSPACE -- its worktree is now protected
+        # above). An active hit naming no workspace answers nothing and is
+        # deliberately absent from this set; see the ES loop.
+        #
+        # This is why clearing matters rather than being a nicety: an expired
+        # Redis record is the case the ES pass EXISTS for, so a long-running
+        # run that ES can see must not leave doubt hanging over its own
+        # project's other worktrees. The query is active-only, so a run ES
+        # holds in a terminal state is not cleared here -- it stays doubt,
+        # which is the conservative direction and, measured against the
+        # reference deployment, an empty population: the unresolvable entries
+        # there are absent from Elasticsearch entirely.
+        es_seen_run_ids: Set[str] = set()
 
-        def _record(run_data: Dict[str, Any]) -> None:
+        def _record(run_data: Dict[str, Any]) -> WorkspaceIndexOutcome:
+            """Index one active run's workspace, and say WHICH of the three
+            things happened -- see WorkspaceIndexOutcome. UNIDENTIFIABLE means
+            it named a workspace we could not index, which is an unknown and
+            must not pass as "nothing".
+
+            The early return this replaces dropped any record without a
+            `project` and left the answer looking complete (#233) -- the same
+            unknown-as-answer shape as the mapping entry above it, one branch
+            away. Most such records are not actually unindexable: _protects()
+            matches `paths` WITHOUT consulting the project, so a recorded
+            project_dir protects on its own and only the epic-id half needs a
+            project to key it under.
+            """
             project = run_data.get('project')
-            if not project:
-                return
             epic_id = run_data.get('epic_id')
-            if epic_id:
-                epic_ids_by_project.setdefault(project, set()).add(str(epic_id))
             project_dir = run_data.get('project_dir')
             if project_dir:
                 paths.add(str(project_dir).rstrip('/'))
+            if epic_id and not project and not project_dir:
+                # Active, names a worktree by epic id, and nothing in the
+                # record says which project's staging directory that id lives
+                # under -- so this workspace cannot be protected by either
+                # matching form.
+                logger.warning(
+                    f"Active pipeline run {run_data.get('id')} names epic "
+                    f"{epic_id} but no project and no project_dir, so its "
+                    f"workspace cannot be identified"
+                )
+                return WorkspaceIndexOutcome.UNIDENTIFIABLE
+            if epic_id and project:
+                epic_ids_by_project.setdefault(project, set()).add(str(epic_id))
+            if project_dir or (epic_id and project):
+                return WorkspaceIndexOutcome.WORKSPACE
+            # No project_dir and no epic_id: this record names no worktree.
+            return WorkspaceIndexOutcome.NO_WORKSPACE
 
         # Redis first: it is the source of truth for active runs, and unlike
         # lock state it needs no startup sync to have run before it is
@@ -1237,7 +1558,26 @@ class PipelineRunManager:
             mapping = {}
             complete = False
 
-        for pipeline_run_id in mapping.values():
+        # .items(), not .values(): when the record a field points at is gone,
+        # the FIELD NAME is the only thing left that says which project the
+        # vanished run belonged to, and scoping the resulting doubt to that
+        # project is what keeps it from disabling every project's sweep (#233).
+        for issue_key, raw_pipeline_run_id in mapping.items():
+            # Both halves of the field decode by the same rule. Only the key
+            # half used to, which under a client without decode_responses made
+            # the run id the string "b'run-x'" -- a Redis key that cannot hit,
+            # an id that cannot match Elasticsearch, and a warning that names
+            # no real run.
+            pipeline_run_id = decode_redis_text(raw_pipeline_run_id)
+            if pipeline_run_id is None:
+                logger.error(
+                    f"Active-run mapping field {issue_key!r} holds a run id "
+                    f"that is not decodable text ({raw_pipeline_run_id!r}), so "
+                    f"the run it points at can be neither looked up nor "
+                    f"matched against Elasticsearch"
+                )
+                complete = False
+                continue
             # PER RUN, not around the whole loop. With the try outside, one
             # unparseable blob -- a truncated value, or a run written by an
             # older schema that PipelineRun.from_dict() rejects -- aborted the
@@ -1246,10 +1586,36 @@ class PipelineRunManager:
             try:
                 raw = self.redis.get(self._get_redis_key(pipeline_run_id))
                 if not raw:
+                    # AN UNKNOWN, not a no-op. Held rather than acted on: the
+                    # ES pass below may still account for this run, and that
+                    # backstop is the whole reason an expired record is
+                    # ordinarily harmless.
+                    project = project_of_pipeline_run_issue_key(issue_key)
+                    if project:
+                        unresolved_run_ids_by_project.setdefault(
+                            project, set()
+                        ).add(str(pipeline_run_id))
+                    else:
+                        # A doubt that cannot be attributed cannot be scoped,
+                        # so it has to be spent on the whole answer. Reaching
+                        # here means the mapping holds a field no writer in
+                        # this file produces.
+                        logger.error(
+                            f"Active-run mapping field {issue_key!r} names no "
+                            f"project, so the run {pipeline_run_id} it points "
+                            f"at -- whose record is gone from Redis -- cannot "
+                            f"be attributed to one"
+                        )
+                        complete = False
                     continue
                 run_data = json.loads(raw)
                 if PipelineRun.from_dict(run_data).is_active():
-                    _record(run_data)
+                    # NO_WORKSPACE is fine HERE and only here: Redis is the
+                    # source of truth for an active run, so a record with no
+                    # workspace fields has no workspace yet, rather than being
+                    # a stale copy of one that has.
+                    if _record(run_data) is WorkspaceIndexOutcome.UNIDENTIFIABLE:
+                        complete = False
             except Exception as e:
                 logger.warning(
                     f"Skipping unreadable pipeline run {pipeline_run_id} while "
@@ -1268,13 +1634,64 @@ class PipelineRunManager:
                     index=f"{self.es_index_pattern}-*",
                     body={
                         "query": {"terms": {"status": ["active", "feedback_listening"]}},
-                        "size": 1000,
+                        "size": ES_ACTIVE_RUN_SCAN_SIZE,
                     },
                 )
-                for hit in result.get('hits', {}).get('hits', []):
+                hits_body = result.get('hits', {}) or {}
+                hits = hits_body.get('hits', []) or []
+                # A FULL PAGE IS NOT AN ANSWER. One un-paginated search reports
+                # at most ES_ACTIVE_RUN_SCAN_SIZE docs; past that the rest are
+                # simply absent from the result, with nothing in the shape of
+                # the response to say so. Consuming that as the whole ES answer
+                # is the same "partial answer reported as the whole answer"
+                # that `complete` exists to prevent -- every active run past
+                # the limit would lose protection silently. `total` is the
+                # cheaper signal when the cluster sends one (ES 7+ sends a
+                # dict; a `gte` relation means "at least", which is still
+                # enough to know the read may be short), and the page-full
+                # test covers the case where it does not.
+                total = hits_body.get('total')
+                if isinstance(total, dict):
+                    total = total.get('value')
+                truncated = len(hits) >= ES_ACTIVE_RUN_SCAN_SIZE or (
+                    isinstance(total, int) and not isinstance(total, bool)
+                    and total > len(hits)
+                )
+                if truncated:
+                    logger.error(
+                        f"Elasticsearch returned {len(hits)} active pipeline "
+                        f"run(s) against a scan size of "
+                        f"{ES_ACTIVE_RUN_SCAN_SIZE} (reported total "
+                        f"{total!r}); the active-run list is truncated, so it "
+                        f"cannot be treated as the whole answer"
+                    )
+                    complete = False
+                for hit in hits:
                     source = hit.get('_source') or {}
-                    if not source.get('ended_at'):
-                        _record(source)
+                    run_id = source.get('id')
+                    if source.get('ended_at'):
+                        # ACCOUNTED FOR: the run is over, so it owns nothing to
+                        # protect, which is exactly what an unresolved mapping
+                        # entry asks about it.
+                        if run_id:
+                            es_seen_run_ids.add(str(run_id))
+                        continue
+                    outcome = _record(source)
+                    if outcome is WorkspaceIndexOutcome.UNIDENTIFIABLE:
+                        complete = False
+                    elif outcome is WorkspaceIndexOutcome.WORKSPACE and run_id:
+                        # Only a doc that actually contributed a key clears the
+                        # doubt. An ACTIVE doc naming no workspace clears
+                        # nothing: it is indistinguishable from the stale
+                        # creation-time doc left behind when the later write
+                        # carrying `project_dir` was swallowed by
+                        # _persist_to_elasticsearch(), and treating it as an
+                        # answer let the sweep delete a live run's worktree
+                        # (#233). A run whose Redis record has already expired
+                        # under the 7-day TTL and which ES still shows with no
+                        # resolved workspace is far likelier stale than
+                        # genuinely workspace-less.
+                        es_seen_run_ids.add(str(run_id))
             except Exception as e:
                 logger.error(f"Could not read active pipeline runs from Elasticsearch: {e}")
                 complete = False
@@ -1283,10 +1700,35 @@ class PipelineRunManager:
             # which is exactly the population this protects best.
             complete = False
 
+        # What neither store could account for. An unresolvable mapping entry
+        # whose run Elasticsearch could ANSWER FOR is answered -- either the
+        # pass above recorded that run's workspace, or the run had ended and
+        # owns nothing to protect. A hit that did neither (active, naming no
+        # workspace) never entered es_seen_run_ids, so it leaves the doubt
+        # standing rather than spending it. What is left is the population #233 is about: a
+        # run written while ES was unavailable whose Redis record later
+        # expired, invisible to both passes and indistinguishable from a run
+        # that ended cleanly.
+        projects_with_unaccountable_runs: Set[str] = set()
+        for project, run_ids in unresolved_run_ids_by_project.items():
+            unaccountable = run_ids - es_seen_run_ids
+            if not unaccountable:
+                continue
+            projects_with_unaccountable_runs.add(project)
+            logger.warning(
+                f"Active-run mapping for project '{project}' points at "
+                f"{len(unaccountable)} run(s) with no record in Redis and "
+                f"nothing in Elasticsearch that accounts for them "
+                f"({', '.join(sorted(unaccountable))}) -- "
+                f"cannot tell whether they are still active, so this project's "
+                f"epic worktrees are treated as possibly owned and kept"
+            )
+
         return ActiveRunWorkspaces(
             epic_ids_by_project=epic_ids_by_project,
             paths=paths,
             complete=complete,
+            projects_with_unaccountable_runs=projects_with_unaccountable_runs,
         )
 
     def get_or_create_pipeline_run(
@@ -2462,30 +2904,49 @@ class PipelineRunManager:
     
     def cleanup_expired_mappings(self, max_age_seconds: int = 7200):
         """
-        Clean up expired pipeline run mappings from Redis
-        
+        Clean up pipeline run mappings whose run is known to be over.
+
         This is a maintenance function that should be called periodically.
-        It removes stale mappings where the pipeline run data no longer exists.
-        
+
+        "The record is gone" is NOT the condition it may act on (#233).
+        get_active_run_workspaces() raises doubt about a project's epic
+        worktrees from precisely those fields -- an entry Redis cannot resolve
+        is the last thing that still says a run may own a directory -- so
+        deleting one on that condition alone is the worktree deletion #233 is
+        about, just reached from a maintenance sweep instead. The entries are
+        therefore offered to
+        _retire_mapping_entries_elasticsearch_accounts_for(), which deletes
+        only those whose run Elasticsearch holds in a terminal state and keeps
+        the rest.
+
         Args:
-            max_age_seconds: Maximum age in seconds before cleanup
+            max_age_seconds: Maximum age in seconds before cleanup (unused;
+                the mapping carries no timestamp, so age is not a signal this
+                can read. Kept for the existing signature.)
         """
         try:
             # Get all issue mappings
             all_mappings = self.redis.hgetall(self.redis_issue_mapping)
-            
-            cleaned = 0
-            for issue_key, pipeline_run_id in all_mappings.items():
-                redis_key = self._get_redis_key(pipeline_run_id)
-                
-                # Check if pipeline run data still exists
-                if not self.redis.exists(redis_key):
-                    self.redis.hdel(self.redis_issue_mapping, issue_key)
-                    cleaned += 1
-            
+
+            unresolvable = [
+                (issue_key, pipeline_run_id)
+                for issue_key, pipeline_run_id in all_mappings.items()
+                if not self.redis.exists(self._get_redis_key(pipeline_run_id))
+            ]
+            before = len(self.redis.hgetall(self.redis_issue_mapping) or {})
+            self._retire_mapping_entries_elasticsearch_accounts_for(unresolvable)
+            cleaned = before - len(self.redis.hgetall(self.redis_issue_mapping) or {})
+
             if cleaned > 0:
                 logger.info(f"Cleaned up {cleaned} expired pipeline run mappings")
-                
+            kept = len(unresolvable) - cleaned
+            if kept > 0:
+                logger.info(
+                    f"Kept {kept} unresolvable pipeline run mapping(s): nothing "
+                    f"can say those runs ended, and they are what stops a live "
+                    f"run's epic worktree being pruned (#233)"
+                )
+
         except Exception as e:
             logger.error(f"Error cleaning up pipeline run mappings: {e}")
     

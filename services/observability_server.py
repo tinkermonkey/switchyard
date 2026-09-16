@@ -5051,9 +5051,11 @@ def get_epic_worktrees():
                 1 for w in worktrees if w.get('active_run_protected') is True
             ),
             # Split out rather than folded in, for the same reason the container
-            # unknown is: None means the run store could not be asked, and the
-            # sweep aborts in full on that answer, so these are neither
-            # protected nor eligible -- nothing is pruned at all while it holds.
+            # unknown is: None means the run store could not answer for this
+            # worktree, so it is neither protected nor eligible. The sweep keeps
+            # every worktree with this answer -- all of them when the lookup
+            # failed outright, that project's when its issue->run mapping names
+            # a run neither store can account for (#233).
             'active_run_unknown': sum(
                 1 for w in worktrees if w.get('active_run_protected') is None
             ),

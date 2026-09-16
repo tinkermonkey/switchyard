@@ -44,11 +44,19 @@ class RunOwnership(Enum):
     not for correctness.
 
     There is deliberately ONE unknown member rather than the UNKNOWN_ALL /
-    UNKNOWN_PROJECT pair sketched in #240: `ActiveRunWorkspaces.complete` is a
-    single whole-answer flag today, so a per-project unknown has no producer,
-    and the lookup's unknown REPORTING is #233's subject, not this one. Adding a
-    narrower unknown later is purely additive: every call site already branches
-    on `is not UNOWNED`, so a new member fails closed by construction.
+    UNKNOWN_PROJECT pair sketched in #240, even though #233 has since given the
+    per-project unknown a producer (`ActiveRunWorkspaces.projects_with_
+    unaccountable_runs`, raised when an issue->run mapping entry names a run
+    neither store can account for). Splitting the member would buy nothing a
+    consumer acts on: every one of them branches on `is not UNOWNED`, both
+    unknowns are equally unremovable, and both would render as the same
+    'unknown' prune verdict. What an operator needs in order to tell the two
+    apart -- which store failed, or which project's mapping holds debris -- is
+    the lookup's own log line, where the run ids are, not a wider enum every
+    call site would have to learn.
+
+    Adding a narrower unknown later stays purely additive for the same reason:
+    a new member fails closed by construction.
     """
 
     OWNED = 'owned'
