@@ -543,18 +543,12 @@ class AgentExecutor:
         try:
             resolved_project_dir = task_context.get('project_dir')
             if not resolved_project_dir:
-                _cfg_for_branch = config_manager.get_project_config(project_name)
-                _default_branch = (
-                    _cfg_for_branch.github.get('branch', 'main')
-                    if _cfg_for_branch and hasattr(_cfg_for_branch, 'github')
-                    else 'main'
-                )
                 resolved_project_dir = str(await workspace_manager.get_project_dir_off_loop(
                     project_name,
                     epic_id,
                     epic_branch_name,
                     issue_number=task_context.get('issue_number'),
-                    default_branch=_default_branch,
+                    default_branch=self._resolve_default_branch(project_name),
                 ))
         except Exception as resolve_dir_err:
             self._record_pre_dispatch_failure_outcome(
@@ -1801,6 +1795,13 @@ class AgentExecutor:
         except Exception as e:
             logger.warning(f"Could not check for a resumable frozen session: {e}")
 
+    def _resolve_default_branch(self, project_name: str) -> str:
+        """Return the configured default branch for *project_name*, falling back to 'main'."""
+        cfg = config_manager.get_project_config(project_name)
+        if cfg and hasattr(cfg, 'github'):
+            return cfg.github.get('branch', 'main')
+        return 'main'
+
     def _record_pre_dispatch_failure_outcome(
         self,
         agent_name: str,
@@ -1937,15 +1938,9 @@ class AgentExecutor:
             # Get project directory from workspace manager -- an isolated
             # per-epic worktree when epic_id is known, otherwise the shared base
             # clone.
-            _cfg_for_branch = config_manager.get_project_config(project_name)
-            _default_branch = (
-                _cfg_for_branch.github.get('branch', 'main')
-                if _cfg_for_branch and hasattr(_cfg_for_branch, 'github')
-                else 'main'
-            )
             project_dir = workspace_manager.get_project_dir(
                 project_name, epic_id=epic_id, branch_name=branch_name,
-                default_branch=_default_branch,
+                default_branch=self._resolve_default_branch(project_name),
             )
 
         # Build context with ALL required fields for agents
@@ -3076,18 +3071,12 @@ class AgentExecutor:
                 # project_workspace._get_epic_worktree_executor().
                 from services.project_workspace import workspace_manager
 
-                _cfg_for_branch = config_manager.get_project_config(project_name)
-                _default_branch = (
-                    _cfg_for_branch.github.get('branch', 'main')
-                    if _cfg_for_branch and hasattr(_cfg_for_branch, 'github')
-                    else 'main'
-                )
                 project_dir = str(await workspace_manager.get_project_dir_off_loop(
                     project_name,
                     task_context.get('epic_id'),
                     task_context.get('branch_name'),
                     issue_number=task_context.get('issue_number'),
-                    default_branch=_default_branch,
+                    default_branch=self._resolve_default_branch(project_name),
                 ))
             issue_number = task_context.get('issue_number')
 
