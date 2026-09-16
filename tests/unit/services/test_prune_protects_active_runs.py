@@ -1451,18 +1451,30 @@ class TestAFailedRegistrationCleanupIsNotSilent:
     FAILS TO DELETE. With an unwritable .git/worktrees it prints
         error: failed to delete '.git/worktrees/<id>': Permission denied
     to stderr and still returns 0, so the only signal was the stream being
-    thrown away. A registration that survives is not harmless: git then refuses
-    to re-create a worktree under that name, and the next repair cycle dies with
-    "could not create directory of '.git/worktrees/<id>1'" -- naming neither the
-    stale entry nor the permissions behind it.
+    thrown away.
+
+    Why it matters, stated correctly (the first draft had the causality
+    backwards -- review on #253): a surviving registration does NOT by itself
+    make git refuse the next worktree, because each one is registered under a
+    fresh id. What breaks the next dispatch is the CAUSE of the failed prune,
+    almost always that .git/worktrees is not writable by the orchestrator. The
+    same permissions that stopped the delete stop the create:
+
+        fatal: could not create directory of '.git/worktrees/2361': Permission denied
+
+    naming neither the directory nor the ownership. The stale entry is a
+    symptom; this stderr is the first place that symptom appears with its cause
+    still attached.
     """
 
     def _sweep_with_prune_result(self, manager, tmp_path, prune_result):
         _make_base_clone(tmp_path, "codetoreum")
-        _make_worktree(tmp_path, "codetoreum", "1016")
+        worktree = _make_worktree(tmp_path, "codetoreum", "1016")
 
         def _run(args, **kwargs):
             if 'prune' in args:
+                if isinstance(prune_result, BaseException):
+                    raise prune_result
                 return prune_result
             return _ok()
 
@@ -1475,8 +1487,16 @@ class TestAFailedRegistrationCleanupIsNotSilent:
              patch.object(manager, '_get_running_container_mount_sources',
                           return_value=set()), \
              patch.object(manager, '_push_local_commits_if_any'), \
-             patch('services.project_workspace.subprocess.run', side_effect=_run):
+             patch('services.project_workspace.subprocess.run', side_effect=_run) as run:
             manager.prune_epic_worktrees()
+
+        # Non-vacuity: the prune runs OUTSIDE the per-worktree loop, so a sweep
+        # that skipped every worktree would still reach it and every assertion
+        # below would pass on a sweep that did nothing.
+        assert not worktree.exists(), (
+            "the sweep must have actually removed the worktree"
+        )
+        return run
 
     def test_stderr_from_a_zero_exit_prune_is_surfaced(self, manager, tmp_path, caplog):
         """The exact production shape: rc=0, but nothing was actually deleted."""
@@ -1494,6 +1514,49 @@ class TestAFailedRegistrationCleanupIsNotSilent:
         assert any('Permission denied' in r.getMessage() for r in caplog.records), (
             "the operator needs git's own reason, not a generic message"
         )
+
+    def test_a_nonzero_prune_exit_is_surfaced_even_with_no_stderr(
+        self, manager, tmp_path, caplog
+    ):
+        """The condition is `rc != 0 OR stderr`. Only the stderr half was
+        pinned, so narrowing it to stderr alone survived every test -- and a
+        prune that fails loudly with an exit code but says nothing would then
+        pass silently."""
+        failed = Mock()
+        failed.returncode = 1
+        failed.stdout = ""
+        failed.stderr = ""
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, failed)
+
+        assert any('were NOT fully' in r.getMessage() for r in caplog.records)
+
+    def test_a_prune_that_raises_is_not_swallowed(self, manager, tmp_path, caplog):
+        """Re-swallowing this path (`except Exception: pass`) was the original
+        defect, and nothing pinned the fix."""
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(
+                manager, tmp_path, OSError("git vanished mid-sweep")
+            )
+
+        assert any('Could not prune stale worktree registrations' in r.getMessage()
+                   for r in caplog.records)
+
+    def test_the_prune_asks_git_for_text_not_bytes(self, manager, tmp_path):
+        """Drop `text=True` and stderr comes back as bytes, so the operator
+        reads b"error: failed to delete...". The stub hands back a str whatever
+        the production call actually requests, so nothing noticed."""
+        clean = Mock()
+        clean.returncode = 0
+        clean.stdout = ""
+        clean.stderr = ""
+
+        run = self._sweep_with_prune_result(manager, tmp_path, clean)
+
+        prune_calls = [c for c in run.call_args_list if 'prune' in c.args[0]]
+        assert prune_calls, "the sweep must run `git worktree prune`"
+        assert prune_calls[0].kwargs.get('text') is True
 
     def test_a_clean_prune_says_nothing(self, manager, tmp_path, caplog):
         """Control: the common case must not log an error every startup."""

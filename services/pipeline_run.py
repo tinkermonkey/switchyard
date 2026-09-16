@@ -835,7 +835,7 @@ class PipelineRunManager:
                 MAX_CONSECUTIVE_DISPATCH_FAILURES (#148).
             RuntimeError: The underlying git worktree add command failed, OR (code
                 review finding on a later fix) the epic's worktree directory exists
-                but has no .git at all -- a corrupted state get_or_create_epic_worktree()
+                but git cannot identify it as a worktree -- a state get_or_create_epic_worktree()
                 deliberately does not attempt to auto-recover from; see that
                 method's own docstring for why. Unlike a transient `worktree add`
                 failure, this one is not expected to self-resolve on a plain

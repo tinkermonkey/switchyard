@@ -153,8 +153,10 @@ _VERDICT_TEXT = {
     'skipped_active_run': "SKIPPED (a pipeline run still in flight owns this workspace)",
     'skipped_container': "SKIPPED (an agent container is still mounted inside)",
     'skipped_corrupted': (
-        "SKIPPED (no .git at all but not empty — may hold unrecoverable work, "
-        "needs manual inspection)"
+        "QUARANTINED (git cannot identify it and it is not empty, so it may "
+        "hold uncommitted work — moved to .orchestrator/unreadable-worktrees/ "
+        "rather than deleted; inspect it, recover anything that matters, then "
+        "delete it. Nothing there is collected automatically.)"
     ),
     'skipped_drift': "SKIPPED (drifted + work this sweep cannot preserve)",
     'eligible_liveness_unknown': (
@@ -420,7 +422,7 @@ def main():
         f"{shown} worktree(s) shown. Across all {len(all_rows)}: {drifted} drifted; "
         f"{skipped} holding work the startup sweep cannot preserve; "
         f"{live} with a container still (or possibly) live inside; "
-        f"{corrupted} with no .git at all but not empty; "
+        f"{corrupted} git cannot identify but not empty; "
         f"{active} owned by a pipeline run still in flight."
     )
     # Deliberately does NOT summarise what the sweep would do. Each count above
