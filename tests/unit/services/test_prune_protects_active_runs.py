@@ -24,6 +24,7 @@ thing that still knows the directory matters, which is what the fifth rule
 reads.
 """
 
+import logging
 import os
 import pytest
 from contextlib import contextmanager
@@ -1440,3 +1441,69 @@ class TestOneProjectsDoubtDoesNotDisarmTheOthers:
         )
         assert rows['heimdall']['prune_verdict'] == 'eligible'
         assert rows['heimdall']['active_run_protected'] is False
+
+
+class TestAFailedRegistrationCleanupIsNotSilent:
+    """#250, second half. The sweep already ran `git worktree prune` after
+    removing worktrees -- but discarded its output and ignored its result.
+
+    That is not a theoretical gap: `git worktree prune` EXITS 0 EVEN WHEN IT
+    FAILS TO DELETE. With an unwritable .git/worktrees it prints
+        error: failed to delete '.git/worktrees/<id>': Permission denied
+    to stderr and still returns 0, so the only signal was the stream being
+    thrown away. A registration that survives is not harmless: git then refuses
+    to re-create a worktree under that name, and the next repair cycle dies with
+    "could not create directory of '.git/worktrees/<id>1'" -- naming neither the
+    stale entry nor the permissions behind it.
+    """
+
+    def _sweep_with_prune_result(self, manager, tmp_path, prune_result):
+        _make_base_clone(tmp_path, "codetoreum")
+        _make_worktree(tmp_path, "codetoreum", "1016")
+
+        def _run(args, **kwargs):
+            if 'prune' in args:
+                return prune_result
+            return _ok()
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', side_effect=_run):
+            manager.prune_epic_worktrees()
+
+    def test_stderr_from_a_zero_exit_prune_is_surfaced(self, manager, tmp_path, caplog):
+        """The exact production shape: rc=0, but nothing was actually deleted."""
+        failed = Mock()
+        failed.returncode = 0
+        failed.stdout = ""
+        failed.stderr = "error: failed to delete '.git/worktrees/236': Permission denied"
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, failed)
+
+        assert any('were NOT fully' in r.getMessage() for r in caplog.records), (
+            "a prune that failed while exiting 0 must not pass silently"
+        )
+        assert any('Permission denied' in r.getMessage() for r in caplog.records), (
+            "the operator needs git's own reason, not a generic message"
+        )
+
+    def test_a_clean_prune_says_nothing(self, manager, tmp_path, caplog):
+        """Control: the common case must not log an error every startup."""
+        clean = Mock()
+        clean.returncode = 0
+        clean.stdout = ""
+        clean.stderr = ""
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, clean)
+
+        assert not any('were NOT fully' in r.getMessage() for r in caplog.records)
+

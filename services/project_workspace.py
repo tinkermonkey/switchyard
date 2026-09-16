@@ -1634,17 +1634,77 @@ class ProjectWorkspaceManager:
         directory turns out to actually be by the time that runs.
         """
         try:
-            return (
-                worktree_path.exists()
-                and not (worktree_path / '.git').exists()
-                and any(worktree_path.iterdir())
-            )
+            if not worktree_path.exists() or not any(worktree_path.iterdir()):
+                return False
         except OSError as e:
             logger.warning(
                 f"Could not determine whether {worktree_path} is a corrupted "
                 f"worktree (treating as no): {e}"
             )
             return False
+
+        # "No .git at all" was the whole test until #250. It misses the shape
+        # that actually cost us a worktree: in a LINKED worktree `.git` is a
+        # file holding `gitdir: <base>/.git/worktrees/<id>`, and that file is
+        # still there when the directory it names has been emptied or is
+        # unreadable. `.git` exists, so the worktree read as healthy, and a
+        # directory git itself could not identify was removed -- while the
+        # orchestrator's own retained-lock reason said it held an uncommitted
+        # repair-cycle fix.
+        #
+        # So ask the question the rule is actually about: can git identify this
+        # as a worktree at all? An unreadable one is not "not corrupted", and
+        # "could not tell" is not a licence to delete.
+        git_entry = worktree_path / '.git'
+        if not git_entry.exists():
+            return True
+
+        # Only a LINKED worktree is at risk here: its `.git` is a FILE naming an
+        # admin directory in the base clone, and that file outlives the
+        # directory it names. A `.git` DIRECTORY is a standalone clone carrying
+        # its own metadata, so it is not the shape that failed and is left to
+        # the rules that already cover it.
+        if not git_entry.is_file():
+            return False
+
+        # Nothing but the dangling pointer itself? Then there is genuinely
+        # nothing to lose, and the sweep should still collect it -- that is
+        # pre-existing behaviour and deliberate. Only real content makes an
+        # unreadable worktree unsafe to remove.
+        try:
+            has_content_beyond_pointer = any(
+                child.name != '.git' for child in worktree_path.iterdir()
+            )
+        except OSError:
+            return False
+        if not has_content_beyond_pointer:
+            return False
+
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-parse', '--git-dir'],
+                capture_output=True, text=True, timeout=15
+            )
+        except Exception as e:
+            # Including a timeout: an unanswerable probe is an unknown, and this
+            # method's answer gates an `rm -rf`.
+            logger.warning(
+                f"Could not ask git about {worktree_path} (treating it as "
+                f"corrupted, so the sweep leaves it alone): {e}"
+            )
+            return True
+
+        if result.returncode != 0:
+            logger.warning(
+                f"{worktree_path} has a .git entry but git cannot identify it "
+                f"as a worktree (rc={result.returncode}: "
+                f"{(result.stderr or '').strip()[:160]}). Treating it as "
+                f"corrupted rather than prunable -- its contents cannot be "
+                f"read, so they cannot be shown to be expendable (#250)."
+            )
+            return True
+
+        return False
 
     @staticmethod
     def _read_worktree_head(worktree_path: Path) -> Tuple[Optional[str], bool]:
@@ -3765,14 +3825,42 @@ class ProjectWorkspaceManager:
                 pass
             if worktree_path.is_dir():
                 shutil.rmtree(worktree_path, ignore_errors=True)
-        # Prune any remaining stale metadata entries
+        # Prune any remaining stale metadata entries.
+        #
+        # `git worktree prune` EXITS 0 EVEN WHEN IT FAILS TO DELETE (#250) --
+        # verified: with an unwritable .git/worktrees it prints
+        #   error: failed to delete '.git/worktrees/<id>': Permission denied
+        # to stderr and still returns 0. This call used to discard stderr and
+        # ignore the result entirely, so a registration that survived was
+        # invisible. It is not harmless: git then refuses to re-create a
+        # worktree under that name, and the next repair cycle for the epic dies
+        # with "could not create directory of '.git/worktrees/<id>1'", which
+        # names neither the stale entry nor the permissions that caused it.
+        pruned = None
         try:
-            subprocess.run(
+            pruned = subprocess.run(
                 ['git', '-C', str(repo_path), 'worktree', 'prune'],
-                capture_output=True, timeout=15
+                capture_output=True, text=True, timeout=15
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(
+                f"Could not prune stale worktree registrations under "
+                f"{repo_path}: {e}. Git will refuse to re-create a worktree "
+                f"under any name left registered, so the next dispatch for that "
+                f"epic fails with an unrelated-looking error."
+            )
+
+        stderr = (pruned.stderr or '').strip() if pruned is not None else ''
+        if pruned is not None and (pruned.returncode != 0 or stderr):
+            logger.error(
+                f"Stale worktree registrations under {repo_path} were NOT fully "
+                f"cleaned (rc={pruned.returncode}): {stderr[:200] or 'no stderr'}. "
+                f"Git will refuse to re-create a worktree under any name left "
+                f"registered, so the next dispatch for that epic fails with an "
+                f"unrelated-looking error. Usually this is ownership: the "
+                f"orchestrator must be able to write {repo_path}/.git/worktrees "
+                f"(a container running as root can leave it owned by root)."
+            )
         # Remove the now-empty staging directory for this project
         try:
             if project_staging.is_dir() and not any(project_staging.iterdir()):

@@ -901,6 +901,61 @@ class TestIsCorruptedNonEmptyWorktree:
 
         assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(healthy) is False
 
+    def test_true_for_a_linked_worktree_git_cannot_identify(self, tmp_path):
+        """#250, the shape that actually cost a worktree.
+
+        In a linked worktree `.git` is a FILE naming an admin directory in the
+        base clone. That file survives the directory it names being emptied or
+        made unreadable, so the old "no .git at all" test read the worktree as
+        healthy and the sweep removed it -- while the orchestrator's own
+        retained-lock reason said it held an uncommitted repair-cycle fix.
+        """
+        wt = tmp_path / 'linked'
+        wt.mkdir()
+        (wt / '.git').write_text(f"gitdir: {tmp_path}/nowhere/.git/worktrees/236\n")
+        (wt / 'precious.py').write_text("uncommitted work")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_false_for_a_linked_worktree_git_can_identify(self, tmp_path):
+        """Control: a working linked worktree must stay prunable, or the sweep
+        becomes a no-op and staging grows without bound."""
+        import subprocess
+        base = tmp_path / 'base'
+        base.mkdir()
+        subprocess.run(['git', 'init', '-q', str(base)], check=True)
+        subprocess.run(['git', '-C', str(base), 'commit', '-q', '--allow-empty',
+                        '-m', 'x'], check=True,
+                       env={'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+                            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+                            'PATH': '/usr/bin:/bin'})
+        wt = tmp_path / 'live'
+        subprocess.run(['git', '-C', str(base), 'worktree', 'add', '-q', str(wt)],
+                       check=True)
+        (wt / 'file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is False
+
+    def test_false_when_the_dangling_pointer_is_all_there_is(self, tmp_path):
+        """An unreadable worktree holding nothing but its own dead pointer has
+        nothing to lose, so it stays collectable. Without this the fix would
+        leave orphaned pointers on disk forever."""
+        wt = tmp_path / 'pointer-only'
+        wt.mkdir()
+        (wt / '.git').write_text(f"gitdir: {tmp_path}/nowhere/.git/worktrees/964\n")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is False
+
+    def test_a_clone_with_its_own_git_directory_is_left_to_the_other_rules(self, tmp_path):
+        """A `.git` DIRECTORY is a standalone clone carrying its own metadata --
+        not the shape that failed, and deliberately not probed."""
+        wt = tmp_path / 'clone'
+        wt.mkdir()
+        (wt / '.git').mkdir()
+        (wt / 'file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is False
+
     def test_false_for_a_genuinely_empty_directory(self, tmp_path):
         empty = tmp_path / 'empty'
         empty.mkdir()
