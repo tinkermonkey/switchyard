@@ -892,7 +892,10 @@ class ProjectWorkspaceManager:
 
     def get_default_branch(self, project_name: str) -> str:
         """Return *project_name*'s configured default branch, else 'main'."""
-        cfg = config_manager.get_project_config(project_name)
+        try:
+            cfg = config_manager.get_project_config(project_name)
+        except Exception:
+            return 'main'
         if cfg and hasattr(cfg, 'github'):
             return cfg.github.get('branch', 'main')
         return 'main'
