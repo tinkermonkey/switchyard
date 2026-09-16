@@ -473,6 +473,8 @@ class TestBuildExecutionContextEpicWorktree:
         exactly: a plain base-clone path, no epic/branch kwargs threaded."""
         with patch('services.project_workspace.workspace_manager.get_project_dir',
                    return_value=Path('/workspace/test-project')) as mock_get_dir, \
+             patch('services.project_workspace.workspace_manager.get_default_branch',
+                   return_value='main') as mock_default_branch, \
              patch('services.agent_executor.config_manager') as mock_config:
             mock_config.get_project_agent_config.return_value = MagicMock()
             mock_config.get_project_config.return_value = None
@@ -487,11 +489,14 @@ class TestBuildExecutionContextEpicWorktree:
             mock_get_dir.assert_called_once_with(
                 'test-project', epic_id=None, branch_name=None, default_branch='main'
             )
+            mock_default_branch.assert_called_once_with('test-project')
             assert context['work_dir'] == '/workspace/test-project'
 
     def test_scopes_work_dir_to_the_epic_worktree_when_epic_id_given(self, agent_executor):
         with patch('services.project_workspace.workspace_manager.get_project_dir',
                    return_value=Path('/workspace/.orchestrator/worktrees/test-project/42')) as mock_get_dir, \
+             patch('services.project_workspace.workspace_manager.get_default_branch',
+                   return_value='dev') as mock_default_branch, \
              patch('services.agent_executor.config_manager') as mock_config:
             mock_config.get_project_agent_config.return_value = MagicMock()
             mock_config.get_project_config.return_value = None
@@ -507,8 +512,9 @@ class TestBuildExecutionContextEpicWorktree:
 
             mock_get_dir.assert_called_once_with(
                 'test-project', epic_id='42', branch_name='feature/issue-42-epic',
-                default_branch='main'
+                default_branch='dev'
             )
+            mock_default_branch.assert_called_once_with('test-project')
             assert context['work_dir'] == '/workspace/.orchestrator/worktrees/test-project/42'
 
     def test_reuses_an_already_resolved_project_dir_without_rederiving(self, agent_executor):

@@ -1796,6 +1796,7 @@ class AgentContainerRecovery:
                         from services.project_workspace import workspace_manager
                         workspace_manager.get_or_create_epic_worktree(
                             project, epic_id_for_recovery, branch_name_for_recovery,
+                            default_branch=workspace_manager.get_default_branch(project),
                             # Attribution for the (unlikely, this worktree is on
                             # disk already) creation path's project_checkout wait
                             # -- see that method's issue_number docs (#151/WI-6).

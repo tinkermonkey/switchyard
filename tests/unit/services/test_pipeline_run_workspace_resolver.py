@@ -109,7 +109,8 @@ class TestResolveWorkspaceExistingBranchHit:
         from services.feature_branch_manager import feature_branch_manager
         from services.project_workspace import workspace_manager
 
-        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=10)), \
+        with patch('services.project_workspace.config_manager') as mock_config, \
+             patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=10)), \
              patch.object(feature_branch_manager, 'resolve_epic_branch_name',
                            return_value="feature/issue-10-existing-epic") as mock_resolve_branch, \
              patch.object(feature_branch_manager, 'create_feature_branch_name') as mock_create_name, \
@@ -117,6 +118,7 @@ class TestResolveWorkspaceExistingBranchHit:
                            return_value="/workspace/.orchestrator/worktrees/context-studio/10") as mock_worktree, \
              patch.object(workspace_manager, '_current_worktree_branch',
                            return_value="feature/issue-10-existing-epic"):
+            mock_config.get_project_config.return_value = MagicMock(github={'branch': 'dev'})
 
             result = await pipeline_run_manager.resolve_workspace(
                 pipeline_run, mock_github_integration, workspace_type='issues'
@@ -129,7 +131,7 @@ class TestResolveWorkspaceExistingBranchHit:
         # wait under, and the run pipeline_watchdog must not reap is the
         # sub-issue's.
         mock_worktree.assert_called_once_with(
-            "context-studio", "10", "feature/issue-10-existing-epic", issue_number=42,
+            "context-studio", "10", "feature/issue-10-existing-epic", default_branch='dev', issue_number=42,
             checkout_lock_timeout_seconds=None,
         )
 
@@ -152,7 +154,8 @@ class TestResolveWorkspaceColdStart:
         from services.feature_branch_manager import feature_branch_manager
         from services.project_workspace import workspace_manager
 
-        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+        with patch('services.project_workspace.config_manager') as mock_config, \
+             patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
              patch.object(feature_branch_manager, 'resolve_epic_branch_name', return_value=None), \
              patch.object(feature_branch_manager, 'create_feature_branch_name',
                            return_value="feature/issue-42-feature") as mock_create_name, \
@@ -160,6 +163,7 @@ class TestResolveWorkspaceColdStart:
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42") as mock_worktree, \
              patch.object(workspace_manager, '_current_worktree_branch',
                            return_value="feature/issue-42-feature"):
+            mock_config.get_project_config.return_value = MagicMock(github={'branch': 'dev'})
 
             result = await pipeline_run_manager.resolve_workspace(
                 pipeline_run, mock_github_integration, workspace_type='issues'
@@ -167,7 +171,7 @@ class TestResolveWorkspaceColdStart:
 
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-feature", issue_number=42,
+            "context-studio", "42", "feature/issue-42-feature", default_branch='dev', issue_number=42,
             checkout_lock_timeout_seconds=None,
         )
 
@@ -206,7 +210,8 @@ class TestResolveWorkspaceRepairCycleReachesUnresolvedRunFirst:
         assert pipeline_run.project_dir is None
         assert pipeline_run.epic_id is None
 
-        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
+        with patch('services.project_workspace.config_manager') as mock_config, \
+             patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=42)), \
              patch.object(feature_branch_manager, 'resolve_epic_branch_name', return_value=None), \
              patch.object(feature_branch_manager, 'create_feature_branch_name',
                            return_value="feature/issue-42-repair-target") as mock_create_name, \
@@ -214,6 +219,7 @@ class TestResolveWorkspaceRepairCycleReachesUnresolvedRunFirst:
                            return_value="/workspace/.orchestrator/worktrees/context-studio/42") as mock_worktree, \
              patch.object(workspace_manager, '_current_worktree_branch',
                            return_value="feature/issue-42-repair-target"):
+            mock_config.get_project_config.return_value = MagicMock(github={'branch': 'dev'})
 
             # Simulates project_monitor.py's repair-cycle dispatch reaching
             # this run before any implementation-equivalent stage ever has.
@@ -397,7 +403,8 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
         from services.feature_branch_manager import feature_branch_manager
         from services.project_workspace import workspace_manager
 
-        with patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=None)), \
+        with patch('services.project_workspace.config_manager') as mock_config, \
+             patch.object(feature_branch_manager, 'get_parent_issue', new=AsyncMock(return_value=None)), \
              patch.object(feature_branch_manager, 'resolve_epic_branch_name', return_value=None) as mock_resolve_branch, \
              patch.object(feature_branch_manager, 'create_feature_branch_name',
                            return_value="feature/issue-42-standalone") as mock_create_name, \
@@ -405,6 +412,7 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
                            return_value="/workspace/.orchestrator/worktrees/test-project/42") as mock_worktree, \
              patch.object(workspace_manager, '_current_worktree_branch',
                            return_value="feature/issue-42-standalone"):
+            mock_config.get_project_config.return_value = MagicMock(github={'branch': 'dev'})
 
             result = await pipeline_run_manager.resolve_workspace(
                 pipeline_run, mock_github_integration, workspace_type='issues'
@@ -415,7 +423,7 @@ class TestResolveWorkspaceNoParentUsesOwnNumber:
         mock_resolve_branch.assert_called_once_with("context-studio", "42")
         mock_create_name.assert_called_once_with(42, "")
         mock_worktree.assert_called_once_with(
-            "context-studio", "42", "feature/issue-42-standalone", issue_number=42,
+            "context-studio", "42", "feature/issue-42-standalone", default_branch='dev', issue_number=42,
             checkout_lock_timeout_seconds=None,
         )
         assert result.branch_name == "feature/issue-42-standalone"

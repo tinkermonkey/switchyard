@@ -213,6 +213,7 @@ async def run_claude_code(prompt: str, context: Dict[str, Any]) -> str:
                 project,
                 epic_id,
                 branch_name,
+                default_branch=workspace_manager.get_default_branch(project),
                 issue_number=task_context_for_dir.get('issue_number') or context.get('issue_number'),
             )
 

@@ -950,6 +950,7 @@ class PipelineRunManager:
             pipeline_run.project,
             epic_id,
             branch_name,
+            default_branch=workspace_manager.get_default_branch(pipeline_run.project),
             issue_number=pipeline_run.issue_number,
             checkout_lock_timeout_seconds=checkout_lock_timeout_seconds,
         )
