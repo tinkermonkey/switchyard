@@ -31,6 +31,10 @@ class Environment(BaseSettings):
     temperature: float = 0.3
     claude_code_weekly_token_quota: Optional[int] = 630000000  # Weekly token quota (630M tokens, resets Wed 5PM)
     claude_code_session_token_quota: Optional[int] = 50000000  # Session token quota (50M tokens per 5-hour block)
+    claude_code_use_bedrock: Optional[bool] = None
+    claude_api_provider: Optional[str] = None
+    aws_bearer_token_bedrock: Optional[SecretStr] = None
+    aws_region: Optional[str] = None
 
     # GitHub Configuration
     github_org: Optional[str] = None
@@ -85,6 +89,8 @@ class Environment(BaseSettings):
     host_gid: Optional[int] = 1000
     docker_gid: Optional[int] = 0
     host_home: Optional[str] = None  # Host user home dir for Docker-in-Docker SSH mounts (set in .env)
+    host_ssh_key_path: Optional[str] = None
+    switchyard_mcp_bind_host: Optional[str] = None
 
     class Config:
         env_file = ".env"
