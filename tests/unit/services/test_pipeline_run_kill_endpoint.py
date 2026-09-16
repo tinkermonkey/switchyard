@@ -62,9 +62,10 @@ class TestKillPipelineRun:
         cancel_issue_work.assert_called_once_with('proj', 42, 'Pipeline run killed via Web UI')
 
     def test_it_force_closes_the_specific_run_when_it_still_reads_active(self, client):
-        run = _pipeline_run(run_id='run-123', board='BoardB', status='active')
+        initial_run = _pipeline_run(run_id='run-123', board='BoardB', status='active')
+        refreshed_run = _pipeline_run(run_id='run-123', board='BoardB', status='active')
         manager = MagicMock()
-        manager.get_pipeline_run_by_id.side_effect = [run, run]
+        manager.get_pipeline_run_by_id.side_effect = [initial_run, refreshed_run]
         manager.mark_failed.return_value = True
 
         signal = MagicMock()
@@ -82,7 +83,7 @@ class TestKillPipelineRun:
             reason='Killed by user via Web UI',
         )
         manager._end_run_in_elasticsearch.assert_called_once_with(
-            run.to_dict.return_value,
+            refreshed_run.to_dict.return_value,
             'Killed by user via Web UI (forced update)',
             outcome='failed',
         )
