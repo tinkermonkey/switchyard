@@ -1358,7 +1358,7 @@ def kill_pipeline_run(pipeline_run_id):
                     f'Pipeline run {pipeline_run_id} was cancelled, but the '
                     f'{pipeline_run.board} lock could not be durably retained. '
                     + (
-                        'Its pipeline-run record was closed in Elasticsearch, but '
+                        'Its pipeline-run record was closed in Elasticsearch. '
                         if forced_es_close else ''
                     )
                     + 'verify the lock state manually before retrying this issue.'
