@@ -134,13 +134,21 @@ class TestBedrockAuthForwarding:
         assert any("AWS_BEARER_TOKEN_BEDROCK=" in arg for arg in docker_cmd)
 
     def test_use_bedrock_forwarded_when_set(self):
-        """CLAUDE_CODE_USE_BEDROCK must appear when set, so the container enables Bedrock."""
+        """CLAUDE_CODE_USE_BEDROCK must appear when set, so the container enables Bedrock,
+        AND it must appear before the image name so Docker treats it as a -e flag rather
+        than an argument to the container process."""
         env = _mock_env(use_bedrock="1")
 
         docker_cmd = _run_launch("/workspace/my-project", env=env)
 
         assert "CLAUDE_CODE_USE_BEDROCK=1" in docker_cmd, (
             f"CLAUDE_CODE_USE_BEDROCK not forwarded; docker_cmd: {docker_cmd}"
+        )
+        image_idx = docker_cmd.index("switchyard-orchestrator:latest")
+        bedrock_flag_idx = docker_cmd.index("CLAUDE_CODE_USE_BEDROCK=1")
+        assert bedrock_flag_idx < image_idx, (
+            f"CLAUDE_CODE_USE_BEDROCK=1 must come before the image name "
+            f"(flag at {bedrock_flag_idx}, image at {image_idx}); docker_cmd: {docker_cmd}"
         )
 
     def test_use_bedrock_omitted_when_unset(self):
@@ -156,13 +164,20 @@ class TestBedrockAuthForwarding:
         )
 
     def test_aws_region_forwarded_when_set(self):
-        """AWS_REGION must appear when set."""
+        """AWS_REGION must appear when set, AND it must appear before the image name
+        so Docker treats it as a -e flag rather than an argument to the container process."""
         env = _mock_env(aws_region="us-east-1")
 
         docker_cmd = _run_launch("/workspace/my-project", env=env)
 
         assert "AWS_REGION=us-east-1" in docker_cmd, (
             f"AWS_REGION not forwarded; docker_cmd: {docker_cmd}"
+        )
+        image_idx = docker_cmd.index("switchyard-orchestrator:latest")
+        region_flag_idx = docker_cmd.index("AWS_REGION=us-east-1")
+        assert region_flag_idx < image_idx, (
+            f"AWS_REGION=us-east-1 must come before the image name "
+            f"(flag at {region_flag_idx}, image at {image_idx}); docker_cmd: {docker_cmd}"
         )
 
     def test_aws_region_omitted_when_unset(self):
