@@ -19,22 +19,27 @@ from unittest.mock import patch, MagicMock
 from services.project_monitor import _launch_repair_cycle_container
 
 
-def _mock_env():
+def _mock_env(*, bedrock_token=None, use_bedrock=None, aws_region=None):
     env = MagicMock()
     env.redis_url = "redis://localhost:6379"
     env.anthropic_api_key = None
     env.claude_code_oauth_token = None
     env.github_token = None
+    env.aws_bearer_token_bedrock = bedrock_token
+    env.claude_code_use_bedrock = use_bedrock
+    env.aws_region = aws_region
     return env
 
 
-def _run_launch(project_dir: str):
+def _run_launch(project_dir: str, env=None):
+    if env is None:
+        env = _mock_env()
     # DockerAgentRunner is imported locally inside _launch_repair_cycle_container
     # (`from claude.docker_runner import DockerAgentRunner`), so it must be patched
     # at its defining module -- patching services.project_monitor.DockerAgentRunner
     # has no effect (that attribute doesn't exist until the function runs).
     with patch("claude.docker_runner.DockerAgentRunner") as mock_runner_cls, \
-         patch("config.environment.load_environment", return_value=_mock_env()), \
+         patch("config.environment.load_environment", return_value=env), \
          patch("services.project_monitor.subprocess.run") as mock_subprocess_run:
 
         mock_runner = mock_runner_cls.return_value
@@ -99,3 +104,73 @@ class TestMountUsesResolvedProjectDir:
 
         assert "/host/workspace/my-project:/workspace/my-project" in docker_cmd
         assert not any("/some/other/path" in arg for arg in docker_cmd)
+
+
+class TestBedrockAuthForwarding:
+    """Bedrock auth env vars must be forwarded into the repair-cycle container
+    so nested senior_software_engineer sub-containers can authenticate. The
+    original bug (100% auth failures on Bedrock deployments) was caused by
+    these vars never being passed at all."""
+
+    def test_bedrock_token_forwarded_when_set(self):
+        """AWS_BEARER_TOKEN_BEDROCK must appear in docker_cmd when the env var is set."""
+        mock_token = MagicMock()
+        mock_token.get_secret_value.return_value = "test-bedrock-token"
+        env = _mock_env(bedrock_token=mock_token)
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert "AWS_BEARER_TOKEN_BEDROCK=test-bedrock-token" in docker_cmd, (
+            f"AWS_BEARER_TOKEN_BEDROCK not forwarded; docker_cmd: {docker_cmd}"
+        )
+
+    def test_bedrock_token_empty_when_unset(self):
+        """AWS_BEARER_TOKEN_BEDROCK should still appear (as empty string) when unset,
+        so the var is consistently present in the container's environment."""
+        env = _mock_env(bedrock_token=None)
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert any("AWS_BEARER_TOKEN_BEDROCK=" in arg for arg in docker_cmd)
+
+    def test_use_bedrock_forwarded_when_set(self):
+        """CLAUDE_CODE_USE_BEDROCK must appear when set, so the container enables Bedrock."""
+        env = _mock_env(use_bedrock="1")
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert "CLAUDE_CODE_USE_BEDROCK=1" in docker_cmd, (
+            f"CLAUDE_CODE_USE_BEDROCK not forwarded; docker_cmd: {docker_cmd}"
+        )
+
+    def test_use_bedrock_omitted_when_unset(self):
+        """CLAUDE_CODE_USE_BEDROCK must NOT be forwarded when unset, so the
+        container's own ClaudeEnvironmentBuilder default ('1') is not shadowed
+        by a present-but-empty env var."""
+        env = _mock_env(use_bedrock=None)
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert not any("CLAUDE_CODE_USE_BEDROCK" in arg for arg in docker_cmd), (
+            f"CLAUDE_CODE_USE_BEDROCK should be absent but found in docker_cmd: {docker_cmd}"
+        )
+
+    def test_aws_region_forwarded_when_set(self):
+        """AWS_REGION must appear when set."""
+        env = _mock_env(aws_region="us-east-1")
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert "AWS_REGION=us-east-1" in docker_cmd, (
+            f"AWS_REGION not forwarded; docker_cmd: {docker_cmd}"
+        )
+
+    def test_aws_region_omitted_when_unset(self):
+        """AWS_REGION must NOT be forwarded when unset (omit-if-absent pattern)."""
+        env = _mock_env(aws_region=None)
+
+        docker_cmd = _run_launch("/workspace/my-project", env=env)
+
+        assert not any("AWS_REGION" in arg for arg in docker_cmd), (
+            f"AWS_REGION should be absent but found in docker_cmd: {docker_cmd}"
+        )
