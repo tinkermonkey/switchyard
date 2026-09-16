@@ -17,6 +17,7 @@ from datetime import datetime
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
+from services.run_ownership import RunOwnership
 from config.retention import RETENTION_DAYS, build_ilm_policy
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,14 @@ class ActiveRunWorkspaces:
         protection, and forced the consumer to re-do the normalisation done
         here.
 
-    `paths` are normalised at construction so no consumer has to remember to.
+    `paths` are normalised at construction so no consumer has to remember to,
+    and both collections are copied so a `frozen=True` value cannot be mutated
+    through the dict a caller kept a reference to.
+
+    Ask it `ownership_of()`. The gate and the match are one call, and
+    `_protects()` -- the match on its own -- is private, so "I could not tell"
+    cannot arrive at a destructive consumer wearing the same face as "nothing
+    owns it" (#240).
     """
 
     epic_ids_by_project: Dict[str, Set[str]]
@@ -237,21 +245,69 @@ class ActiveRunWorkspaces:
     complete: bool = True
 
     def __post_init__(self):
+        # BOTH fields, and the inner sets too. `frozen=True` freezes the
+        # bindings, not the containers behind them: a caller that kept a
+        # reference to the dict it passed in could still add a project, or
+        # mutate one project's id set, and silently change what a value this
+        # type promises is immutable protects. Copying `paths` alone left the
+        # field that GRANTS protection as the one aliased one (#240).
+        #
+        # Epic ids are stringified for the same reason _record() stringifies
+        # them: they are matched against a DIRECTORY NAME, and a run record
+        # whose epic_id round-tripped through JSON as an int would otherwise
+        # never match the directory it named.
         object.__setattr__(
             self, 'paths', {str(p).rstrip('/') for p in self.paths}
+        )
+        object.__setattr__(
+            self,
+            'epic_ids_by_project',
+            {
+                str(project): {str(epic_id) for epic_id in epic_ids}
+                for project, epic_ids in self.epic_ids_by_project.items()
+            },
         )
 
     @classmethod
     def unknown(cls) -> 'ActiveRunWorkspaces':
-        """No usable answer. Callers must not read this as "nothing is active"."""
+        """No usable answer. Callers must not read this as "nothing is active".
+
+        `ownership_of()` turns this into RunOwnership.UNKNOWN for every
+        worktree, so a consumer cannot mistake it for UNOWNED however it is
+        obtained.
+        """
         return cls(epic_ids_by_project={}, paths=set(), complete=False)
 
-    def protects(self, project: str, worktree_path) -> bool:
-        """Whether this worktree belongs to a run still in flight.
+    def ownership_of(self, project: str, worktree_path) -> RunOwnership:
+        """Who owns this worktree, as one value that already carries the gate.
 
-        Matches on BOTH the epic id (the directory's own name, robust to path
-        formatting) and the run's recorded project_dir (robust to a layout
-        change). Either is enough.
+        THE GATE AND THE MATCH ARE ONE CALL ON PURPOSE (#240). The predicate
+        this replaces was public, returned a bare bool, and returned False when
+        the lookup had failed -- which a caller deleting directories reads as
+        "no run owns it, remove it". Nothing required a caller to test
+        `complete` first, every call site re-implemented that test by hand, and
+        three review rounds on #237 each found another destructive consumer
+        that had not. Folding the two together removes the class of defect
+        rather than fixing another instance of it: the only removable answer
+        now has its own name.
+
+        Matching (once the answer is known to be usable) is on BOTH the epic id
+        -- the directory's own name, robust to path formatting -- and the run's
+        recorded project_dir, robust to a layout change. Either is enough.
+        """
+        if not self.complete:
+            return RunOwnership.UNKNOWN
+        if self._protects(project, worktree_path):
+            return RunOwnership.OWNED
+        return RunOwnership.UNOWNED
+
+    def _protects(self, project: str, worktree_path) -> bool:
+        """The match alone, WITHOUT the completeness gate -- hence private.
+
+        Public callers get ownership_of(), which cannot be invoked without the
+        gate. Keeping this separate keeps the two matching forms in one place;
+        making it private keeps "did it match" from being mistaken for "is it
+        safe to delete".
         """
         if str(worktree_path).rstrip('/') in self.paths:
             return True
@@ -1027,8 +1083,11 @@ class PipelineRunManager:
                 writes the issue mapping under the board-less legacy key, so a
                 crashed run whose ES doc still reads 'active' would be resurrected
                 on every pass and could then shadow a board-scoped lookup. Stale
-                mappings found in Redis are still cleaned up either way -- that is
-                removal of state known to be dead, not resurrection of it.
+                mappings found in Redis are still cleaned up either way: the entry
+                for a run whose own Redis record says it finished, the entry whose
+                record is too corrupt to interpret, and -- only on that positive
+                evidence (#239) -- the entry for a run Elasticsearch reports ended.
+                That is removal of dead state, not resurrection of it.
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -1043,6 +1102,10 @@ class PipelineRunManager:
             *([self._get_issue_key(project, issue_number, board)] if board else []),
             self._get_issue_key(project, issue_number),
         ]))
+
+        # Mapping entries whose run record is gone from Redis. Collected, not
+        # deleted, while iterating -- see the else-branch below (#239).
+        expired_mappings: list = []  # (issue_key, pipeline_run_id)
 
         for issue_key in issue_keys:
             pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
@@ -1088,16 +1151,88 @@ class PipelineRunManager:
                     self.redis.hdel(self.redis_issue_mapping, issue_key)
                     continue
             else:
-                # Redis data has expired (TTL) while the issue mapping survived.
-                # This can happen if the orchestrator was restarted and the initial
-                # 2-hour creation TTL expired before the run was restored/updated.
-                # Clean up the stale mapping and fall through to the next key / ES lookup.
+                # The run's Redis record is gone while its issue mapping survived.
+                # That needs a run to go ACTIVE_RUN_REDIS_TTL_SECONDS (seven days)
+                # without a status write, or the record to be lost some other way
+                # -- eviction, a flushed Redis, a hand-deleted key.
+                #
+                # DO NOT DELETE THE MAPPING HERE (#239). Redis silence is not
+                # evidence that the run ended, and once the record is gone this
+                # entry is the last thing that knows the run existed at all:
+                # get_active_run_workspaces() iterates this same hash, and it is
+                # what stops the startup sweep pruning an in-flight run's epic
+                # worktree (#233). Deleting on absence of testimony -- at lookup
+                # frequency, before Elasticsearch has even been asked -- destroys
+                # that evidence and makes the sweep's answer come back falsely
+                # clean. Drop the entry from THIS lookup only; the reap below
+                # removes it from Redis if, and only if, ES positively reports
+                # the run as ended.
                 logger.debug(
                     f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
                     f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
                 )
-                self.redis.hdel(self.redis_issue_mapping, issue_key)
+                expired_mappings.append((issue_key, pipeline_run_id))
                 # Fall through to try the next key / ES lookup below
+
+        # Positive evidence, not absence of testimony (#239): an expired mapping
+        # entry is removed only when Elasticsearch still holds that run's document
+        # AND that document says the run has ended. No ES client, an ES error, no
+        # document, or a document that still reads active all mean "unknown", and
+        # unknown leaves the entry exactly where it is -- a run that died without
+        # end_pipeline_run() is collected by cleanup_stale_active_runs_on_startup(),
+        # not by a read.
+        # One ES lookup per distinct run id: the board-scoped and legacy keys can
+        # both point at the same run (the restore path below backfills the legacy
+        # key), and that run's state is the same answer for both entries. Nothing
+        # is cached ACROSS calls: while the answer stays "unknown" the entry stays,
+        # so every later lookup for this issue re-asks -- deliberately, since the
+        # only thing that can change the verdict is ES itself.
+        es_verdicts: dict = {}  # run id -> PipelineRun ES holds, or None
+        for expired_key, expired_run_id in expired_mappings:
+            ended_run = es_verdicts.get(expired_run_id)
+            if self.es and expired_run_id not in es_verdicts:
+                try:
+                    by_id = self.es.search(
+                        index=f"{self.es_index_pattern}-*",
+                        body={
+                            "query": {"bool": {"must": [{"term": {"_id": expired_run_id}}]}},
+                            "size": 1
+                        }
+                    )
+                    if by_id['hits']['total']['value'] > 0:
+                        ended_run = PipelineRun.from_dict(by_id['hits']['hits'][0]['_source'])
+                except Exception as e:
+                    logger.debug(
+                        f"Could not confirm the state of expired pipeline run "
+                        f"{expired_run_id} in Elasticsearch: {e} — keeping its issue "
+                        f"mapping {expired_key}"
+                    )
+                    ended_run = None
+                es_verdicts[expired_run_id] = ended_run
+
+            if ended_run is None or ended_run.is_active():
+                continue
+
+            try:
+                # Compare-and-delete, never a bare HDEL: create_pipeline_run() may
+                # have written a NEW run into this same field since it was read
+                # above, and that run's mapping must survive this cleanup.
+                self.redis.eval(
+                    _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                    1,
+                    self.redis_issue_mapping,
+                    expired_key,
+                    expired_run_id,
+                )
+                logger.debug(
+                    f"Removed issue mapping {expired_key} for pipeline run "
+                    f"{expired_run_id} — Elasticsearch reports it "
+                    f"{ended_run.status}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clean up expired issue mapping {expired_key}: {e}"
+                )
 
         # ES fallback: mapping was absent OR Redis data expired.
         # Include "feedback_listening" so human-feedback loops survive restarts

@@ -975,7 +975,13 @@ class GitHubIntegration:
 
             if result.returncode == 0:
                 pr_url = result.stdout.strip()
-                pr_number = int(pr_url.rstrip('/').split('/')[-1])
+                last_segment = pr_url.rstrip('/').split('/')[-1]
+                if not last_segment.isdigit():
+                    raise ValueError(
+                        f"gh pr create returned URL {pr_url!r} whose last path "
+                        f"segment {last_segment!r} is not a PR number"
+                    )
+                pr_number = int(last_segment)
 
                 logger.info(f"Created PR #{pr_number}: {pr_url}")
 

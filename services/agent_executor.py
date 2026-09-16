@@ -1802,8 +1802,8 @@ class AgentExecutor:
         error: Exception,
         what: str,
     ) -> None:
-        """Close out the 'in_progress' entry for a failure raised BEFORE
-        execute_agent()'s own big try/except starts.
+        """Close out the 'in_progress' entry and release the board lock for a
+        failure raised BEFORE execute_agent()'s own big try/except starts.
 
         Everything between record_execution_start() and that try -- workspace
         resolution, working-directory resolution -- propagates straight out of
@@ -1824,6 +1824,22 @@ class AgentExecutor:
         through both of the call sites above; before that, no lock timeout could
         be raised this early, so the hand-written 'failure' this replaces had
         never been exercised with one.
+
+        Also ends the pipeline run and releases the board lock immediately,
+        mirroring project_monitor.py's silent-launch-failure handling. Without
+        this, the run stays "active" and the lock stays held until either the
+        60-second no-container watchdog or the 30-minute zombie sweep detects
+        that no container was ever launched. Since no container was launched and
+        no work was done, retain_lock=False is always safe here -- the issue
+        should be retried by the next board poll, not left stuck.
+
+        suppress_cancellation=True is required: the 1-hour cancellation signal
+        that end_pipeline_run normally sets would blind every automatic re-
+        dispatch path (_find_stalled_issues_for_pipeline, the failsafe poll,
+        and the queue purge in _check_and_process_waiting_issues_failsafe) for
+        the full TTL -- turning "release for retry" silently into "invisible for
+        an hour". This is the same reasoning as the WorktreeAddError handler in
+        review_cycle.py and every other lock-contention teardown (#148).
 
         Never raises: the caller re-raises the original error, and a failure to
         record must not replace it.
@@ -1848,6 +1864,28 @@ class AgentExecutor:
             logger.warning(
                 f"Failed to record {what.lower()} {outcome} outcome for "
                 f"{project_name}/#{task_context['issue_number']}: {record_err}"
+            )
+
+        # End the pipeline run immediately and release the board lock so the
+        # next poll can retry, without waiting for the 60s/30min watchdogs.
+        # No container was ever launched, so no work was done — retain_lock=False
+        # is always correct here.
+        try:
+            from services.pipeline_run import get_pipeline_run_manager
+            get_pipeline_run_manager().end_pipeline_run(
+                project=project_name,
+                issue_number=task_context['issue_number'],
+                board=task_context.get('board'),
+                reason=f"{what} failed before container launch: {error}",
+                outcome="failed",
+                retain_lock=False,
+                suppress_cancellation=True,
+            )
+        except Exception as end_err:
+            logger.warning(
+                f"Failed to end pipeline run after pre-dispatch {what.lower()} failure for "
+                f"{project_name}/#{task_context['issue_number']}: {end_err}. "
+                f"The 60s no-container watchdog will release the lock instead."
             )
 
     def _build_execution_context(
@@ -2069,6 +2107,7 @@ class AgentExecutor:
                 not post_result.get('success')
                 and attempt < 3
                 and 'circuit breaker open' not in str(post_result.get('error', '')).lower()
+                and '404' not in str(post_result.get('error', '')).lower()
             ):
                 backoff_seconds = 3 * attempt
                 logger.warning(
