@@ -13,7 +13,23 @@ moment of each launch, not just trust the cached status.
 
 from unittest.mock import MagicMock, patch
 
-from claude.docker_runner import DockerAgentRunner
+import pytest
+from claude.docker_runner import DockerAgentRunner, ORCHESTRATOR_BASE_IMAGE
+
+
+@pytest.fixture(autouse=True)
+def _stub_base_image_guard():
+    """Keep these tests hermetic.
+
+    _get_image_for_agent now shells out to `docker image inspect` to verify the
+    base tag is ours (#251). These tests are about image SELECTION and command
+    WIRING, not image identity, and they pass on a developer box only because it
+    happens to have a correctly-labelled image: with docker installed and the
+    image absent -- i.e. CI -- all of them fail on a guard they never meant to
+    exercise. tests/unit/test_base_image_identity.py owns the guard's behaviour.
+    """
+    with patch.object(DockerAgentRunner, '_assert_base_image_is_ours'):
+        yield
 
 
 def _agent_config(requires_dev_container=True):
@@ -52,7 +68,7 @@ class TestGetImageForAgent:
             mock_get_status.return_value.value = 'unverified'
             image = runner._get_image_for_agent('senior_software_engineer', 'phone-home')
 
-        assert image == 'switchyard-orchestrator:latest'
+        assert image == ORCHESTRATOR_BASE_IMAGE
 
     def test_uses_orchestrator_image_when_dev_container_not_required(self):
         runner = DockerAgentRunner()
@@ -61,4 +77,4 @@ class TestGetImageForAgent:
                    return_value=_agent_config(False)):
             image = runner._get_image_for_agent('code_reviewer', 'phone-home')
 
-        assert image == 'switchyard-orchestrator:latest'
+        assert image == ORCHESTRATOR_BASE_IMAGE

@@ -33,6 +33,37 @@ logger = logging.getLogger(__name__)
 # unrelated image ends up holding the tag.
 SWITCHYARD_AGENT_ENV_LABEL = "io.switchyard.agent-environment"
 
+# Substrings in `docker image inspect` stderr that mean Docker did not answer
+# the question, as opposed to answering "no". Shared by _probe_image() (project
+# images) and docker_runner._assert_base_image_is_ours() (the base image): both
+# turn a negative into a refusal, and neither may do that on a probe that was
+# never answered (#199 review). Kept as one list because the two were allowed to
+# drift once already -- the base-image guard originally classified every
+# non-zero exit as "image absent", which is the wrong diagnosis for an
+# unreachable daemon and the right one for nothing.
+#
+# "failed to connect to the docker api" and "if the daemon is running" are the
+# current CLI's wording; the older phrasings are kept because the daemon and the
+# CLI are versioned independently here.
+_DOCKER_UNANSWERED_MARKERS = (
+    'cannot connect to the docker daemon',
+    'failed to connect to the docker api',
+    'is the docker daemon running',
+    'if the daemon is running',
+    'permission denied',
+)
+
+
+def docker_probe_unanswered(stderr: str) -> bool:
+    """True when `docker image inspect` stderr means "I could not look".
+
+    A True here is never evidence about the image -- only that the question
+    went unanswered, so the caller must fall back to whatever it would have
+    done without asking.
+    """
+    lowered = (stderr or '').lower()
+    return any(marker in lowered for marker in _DOCKER_UNANSWERED_MARKERS)
+
 # How long a pending-operation marker is believed before it is treated as
 # abandoned. Bounded by what can legitimately keep one alive: the only writer is
 # /api/projects/<p>/rebuild-image, whose worker clears it the moment it takes
@@ -814,12 +845,7 @@ class DevContainerStateManager:
             # image" produced byte-identical output, so an operator reading a
             # BLOCKED verdict could not tell them apart.
             stderr = (result.stderr or '').strip()
-            lowered = stderr.lower()
-            unanswered = (
-                'cannot connect to the docker daemon' in lowered
-                or 'permission denied' in lowered
-                or 'is the docker daemon running' in lowered
-            )
+            unanswered = docker_probe_unanswered(stderr)
             logger.warning(
                 f"`docker image inspect {image_name}` failed "
                 f"(rc={result.returncode}): {stderr[:200] or 'no stderr'}"
