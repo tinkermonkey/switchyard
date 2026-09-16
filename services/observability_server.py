@@ -1306,34 +1306,31 @@ def kill_pipeline_run(pipeline_run_id):
         from services.cancellation import cancel_issue_work, get_cancellation_signal
         get_cancellation_signal().cancel(project, issue_number, "Pipeline run killed via Web UI")
 
-        # 2. End the pipeline run (releases lock — safe because signal is already set)
-        success = pipeline_run_manager.end_pipeline_run(
+        # 2. Mark the run failed through the shared entry point so the board lock
+        # is durably retained and the specific board-scoped run is ended.
+        marked_ok = pipeline_run_manager.mark_failed(
             project=project,
+            board=pipeline_run.board,
             issue_number=issue_number,
             reason="Killed by user via Web UI",
-            outcome="failed",
-            retain_lock=False  # Intentional kill: release the lock so the pipeline can continue
         )
-
-        if not success:
-            # It might have been already ended, but we should still clean up execution state
-            logger.warning(f"Pipeline run {pipeline_run_id} was not active in Redis, forcing update in Elasticsearch")
-
-            # Force update in Elasticsearch using the run details we fetched earlier
-            # This handles "zombie" runs that exist in ES but not in Redis
-            try:
-                run_data = pipeline_run.to_dict()
-                pipeline_run_manager._end_run_in_elasticsearch(
-                    run_data,
-                    "Killed by user via Web UI (forced update)",
-                    outcome='failed',
-                )
-                success = True # Mark as success since we updated ES
-            except Exception as e:
-                logger.error(f"Failed to force update pipeline run in ES: {e}")
 
         # 3. Full cleanup (containers, review cycles, execution state)
         cancel_issue_work(project, issue_number, "Pipeline run killed via Web UI")
+
+        if not marked_ok:
+            logger.error(
+                f"Kill request for pipeline run {pipeline_run_id} cancelled work for "
+                f"{project}/#{issue_number} but could NOT durably retain the "
+                f"{pipeline_run.board} lock"
+            )
+            return jsonify({
+                'success': False,
+                'error': (
+                    f'Pipeline run {pipeline_run_id} was cancelled, but the '
+                    f'{pipeline_run.board} lock could not be durably retained'
+                )
+            }), 500
 
         return jsonify({
             'success': True,
