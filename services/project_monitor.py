@@ -541,15 +541,6 @@ def _launch_repair_cycle_container(
             '-e', f'HOST_HOME={host_home_path}',  # Pass host home for SSH/git mounts
             '-e', 'PYTHONUNBUFFERED=1',  # Ensure logs are flushed
             '-e', f'PIPELINE_RUN_ID={pipeline_run_id}',  # Pass pipeline_run_id for event tracking
-            
-            # Image and command
-            repair_cycle_image,
-            'python', '-m', 'pipeline.repair_cycle_runner',
-            '--project', project_name,
-            '--issue', str(issue_number),
-            '--pipeline-run-id', pipeline_run_id,
-            '--stage', stage_name,
-            '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
         ]
 
         # Forward CLAUDE_CODE_USE_BEDROCK and AWS_REGION only when set: passing an
@@ -560,6 +551,17 @@ def _launch_repair_cycle_container(
             docker_cmd += ['-e', f'CLAUDE_CODE_USE_BEDROCK={env.claude_code_use_bedrock}']
         if env.aws_region:
             docker_cmd += ['-e', f'AWS_REGION={env.aws_region}']
+
+        docker_cmd += [
+            # Image and command
+            repair_cycle_image,
+            'python', '-m', 'pipeline.repair_cycle_runner',
+            '--project', project_name,
+            '--issue', str(issue_number),
+            '--pipeline-run-id', pipeline_run_id,
+            '--stage', stage_name,
+            '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
+        ]
 
         # Launch container
         logger.debug(f"Docker command: {' '.join(docker_cmd)}")
