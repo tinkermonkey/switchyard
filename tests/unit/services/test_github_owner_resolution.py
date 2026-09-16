@@ -322,6 +322,13 @@ class TestRepairCycleContainerEnvironment:
             def _detect_host_home_path():
                 return '/host/home'
 
+            @staticmethod
+            def _assert_base_image_is_ours(image_name):
+                """The repair cycle verifies the base tag is ours before
+                launching (#251). This double stands in for the whole class, so
+                it has to model that too -- these tests are about GITHUB_ORG
+                forwarding, not image identity."""
+
             def _detect_host_workspace_path(self):
                 return '/host/workspace'
 

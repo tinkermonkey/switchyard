@@ -27,7 +27,23 @@ import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from claude.docker_runner import DockerAgentRunner
+
+
+@pytest.fixture(autouse=True)
+def _stub_base_image_guard():
+    """Keep these tests hermetic.
+
+    _get_image_for_agent now shells out to `docker image inspect` to verify the
+    base tag is ours (#251). These tests are about image SELECTION and command
+    WIRING, not image identity, and they pass on a developer box only because it
+    happens to have a correctly-labelled image: with docker installed and the
+    image absent -- i.e. CI -- all of them fail on a guard they never meant to
+    exercise. tests/unit/test_base_image_identity.py owns the guard's behaviour.
+    """
+    with patch.object(DockerAgentRunner, '_assert_base_image_is_ours'):
+        yield
 
 from services.project_checkout_lock import BASE_CLONE_LABEL
 

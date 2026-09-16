@@ -9,6 +9,8 @@ from typing import Dict, Any, Optional, Callable, NamedTuple
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+from utils.non_retryable import NonRetryableAgentError
+
 logger = logging.getLogger(__name__)
 
 #: The image every agent runs in unless its project has a verified dev
@@ -17,8 +19,20 @@ logger = logging.getLogger(__name__)
 ORCHESTRATOR_BASE_IMAGE = 'switchyard-orchestrator:latest'
 
 
-class BaseImageIdentityError(RuntimeError):
+class BaseImageIdentityError(NonRetryableAgentError):
     """The base image tag does not refer to an image switchyard built.
+
+    Subclasses `NonRetryableAgentError` rather than `RuntimeError`, because
+    "non-retryable" is not a property a type has by existing -- it is a
+    property the retry loops implement, and all four of them
+    (`services/agent_executor.py`, `services/worker_pool.py`,
+    `pipeline/repair_cycle.py`, `agents/base_maker_agent.py`) key off that one
+    name. A wrong image sitting on disk is permanent; as a bare RuntimeError
+    this bought 3 x 4 retried container launches, ~45s of dead backoff, and an
+    opened per-agent circuit breaker whose generic "Circuit is open" message
+    then REPLACED the diagnosis below -- trading one unhelpful error for
+    another. `claude_integration.py` records the identical mistake being made
+    and fixed once already.
 
     Its own name is what makes this reachable: `switchyard-orchestrator` is what
     `docker compose` generates for a service called `orchestrator` in a project
@@ -515,7 +529,7 @@ class DockerAgentRunner:
             # Test writes to /workspace (the project directory), NOT to /home/orchestrator/.ssh (which is read-only)
             # Use unique filename to prevent race conditions between concurrent agents
             test_cmd.extend([
-                'switchyard-orchestrator:latest',  # Use simple base image for quick test
+                ORCHESTRATOR_BASE_IMAGE,  # simple base image for a quick test
                 'sh', '-c',
                 f'echo "test" > /workspace/{test_filename} && cat /workspace/{test_filename} && rm /workspace/{test_filename} && echo "SUCCESS"'
             ])
@@ -1925,12 +1939,16 @@ class DockerAgentRunner:
         pinned it by id, one `docker image prune` from being collected.
 
         dev_container_state.verify_image_exists() has guarded PROJECT images
-        against this since #199, using the same label. The base image -- the one
-        shared by every project, and the FROM of every Dockerfile.agent -- was
-        the only image with no identity check at all.
+        against this since #17 (697685d), using the same label; #199 later split
+        out _probe_image() to tell "Docker says no" apart from "Docker did not
+        answer". The base image -- the one shared by every project, and the FROM
+        of every Dockerfile.agent -- was the only image with no identity check
+        at all.
 
-        Raises rather than warning: the launch fails either way, and failing
-        here costs a clear message instead of a mystery inside the container.
+        Raises rather than warning when Docker gives a conclusive answer: the
+        launch fails either way, and failing here costs a clear message instead
+        of a mystery inside the container. An unanswered probe is not a
+        conclusive answer, and is classified as such -- see below.
 
         Note what this does and does not prove. The label says "switchyard built
         this"; it does not say "this is the orchestrator", because an agent image
@@ -1938,28 +1956,48 @@ class DockerAgentRunner:
         base would pass -- a far less likely mix-up, and a mostly harmless one,
         since those images carry Claude too.
         """
-        from services.dev_container_state import SWITCHYARD_AGENT_ENV_LABEL
+        from services.dev_container_state import (
+            SWITCHYARD_AGENT_ENV_LABEL,
+            docker_probe_unanswered,
+        )
 
         try:
             result = subprocess.run(
                 ['docker', 'image', 'inspect', image_name, '--format',
                  '{{ index .Config.Labels "%s" }}' % SWITCHYARD_AGENT_ENV_LABEL],
-                capture_output=True, text=True, timeout=15
+                # Parity with _probe_image's 10s against the same daemon.
+                capture_output=True, text=True, timeout=10
             )
         except Exception as e:
-            # An unanswerable probe is not proof of a bad image; say so and
-            # carry on rather than grounding every agent on a docker hiccup.
-            logger.warning(
+            # TimeoutExpired, or no `docker` binary at all. Neither is proof of
+            # a bad image; say so and carry on rather than grounding every
+            # agent on a docker hiccup.
+            logger.error(
                 f"Could not verify that {image_name} is a switchyard image "
                 f"({e}); proceeding, but a tag collision would go undetected"
             )
             return
 
         if result.returncode != 0:
+            stderr = (result.stderr or '').strip()
+            # An unreachable daemon exits 1, exactly like "No such image". The
+            # first version of this guard read every non-zero exit as "the
+            # image is absent" -- which is the wrong diagnosis for a daemon
+            # blip AND grounds every agent on one, the outage this was
+            # explicitly designed not to cause. Classify before concluding.
+            if docker_probe_unanswered(stderr):
+                logger.error(
+                    f"Docker did not answer whether {image_name} is ours "
+                    f"(rc={result.returncode}: {stderr[:250] or 'no stderr'}); "
+                    f"proceeding, but a tag collision would go undetected"
+                )
+                return
+
             raise BaseImageIdentityError(
-                f"{image_name} could not be inspected "
-                f"(rc={result.returncode}: {(result.stderr or '').strip()[:160]}). "
-                f"Agents cannot be launched until the base image is present."
+                f"{image_name} is not present "
+                f"(rc={result.returncode}: {stderr[:250] or 'no stderr'}). "
+                f"Agents cannot be launched until the base image is built: "
+                f"`docker compose build orchestrator`."
             )
 
         if result.stdout.strip() != "true":

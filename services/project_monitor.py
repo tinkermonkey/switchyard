@@ -382,7 +382,7 @@ def _launch_repair_cycle_container(
     Returns:
         Container name if successful, None otherwise
     """
-    from claude.docker_runner import DockerAgentRunner
+    from claude.docker_runner import DockerAgentRunner, ORCHESTRATOR_BASE_IMAGE
     
     # Generate container name
     # Format: repair-cycle-{project}-{issue}-{run_id[:8]}
@@ -439,7 +439,16 @@ def _launch_repair_cycle_container(
         # (which contains the repair cycle runner code)
         # The project workspace is mounted to provide project files
         # Agents are launched as sub-containers with the project's agent image
-        repair_cycle_image = "switchyard-orchestrator"
+        #
+        # Guarded for the same reason agent launches are (#251): this runs
+        # `python -m pipeline.repair_cycle_runner`, which only exists in OUR
+        # image, so a hijacked tag dies on "No module named
+        # pipeline.repair_cycle_runner" -- naming neither the image nor the
+        # tag. The raise lands in this function's own `except Exception`
+        # below, which logs it verbatim and returns None, the established
+        # launch-failure contract here.
+        repair_cycle_image = ORCHESTRATOR_BASE_IMAGE
+        DockerAgentRunner._assert_base_image_is_ours(repair_cycle_image)
         
         # Build Docker run command
         docker_cmd = [
@@ -3399,6 +3408,17 @@ class ProjectMonitor:
                                     f"{consecutive_failures} consecutive dispatch failures "
                                     f"for {current_column_agent} in '{status}'"
                                 )
+                                # The count alone names neither what failed nor
+                                # why, and this comment is the only thing most
+                                # operators ever read. record_execution_outcome()
+                                # has always stored the error; nothing surfaced
+                                # it, so a precise diagnosis (e.g. #251's base
+                                # image guard naming the hijacked tag and its
+                                # remedy) died in the logs while the issue said
+                                # only "3 consecutive dispatch failures".
+                                last_error = (last_execution or {}).get('error')
+                                if last_error:
+                                    fail_reason += f"\n\nLast error: {str(last_error).strip()[:1500]}"
                                 logger.error(
                                     f"Issue #{issue_number} failed {consecutive_failures} consecutive "
                                     f"dispatches for {current_column_agent} in '{status}' — marking "
