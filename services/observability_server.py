@@ -1280,7 +1280,8 @@ def kill_pipeline_run(pipeline_run_id):
     This endpoint:
     1. Ends the pipeline run in Redis/Elasticsearch
     2. Marks any in-progress execution state as failed
-    3. Allows the system to start a fresh run for the issue
+    3. Retains the pipeline lock so the issue is blocked from automatic re-dispatch;
+       manual intervention is required to release the lock and allow a new run to start
     """
     try:
         from services.pipeline_run import get_pipeline_run_manager
