@@ -215,7 +215,14 @@ class TestTheVerdictIsRenderedNotRederived:
         """The shape the sweep refuses because it "may hold real uncommitted
         work" -- and the one this script used to call removable."""
         verdict = _describe_prune(_row(prune_verdict='skipped_corrupted'))
-        assert verdict.startswith("SKIPPED") and "no .git" in verdict
+        assert verdict.startswith("QUARANTINED"), (
+            "an unreadable worktree is moved aside, not skipped in place -- a "
+            "skip had no clearing condition and pinned it forever (#163)"
+        )
+        assert "git cannot identify it" in verdict
+        assert "unreadable-worktrees" in verdict, (
+            "the operator needs to be told where it went"
+        )
 
     def test_an_unanswerable_lookup_is_not_eligible(self):
         assert _describe_prune(_row(prune_verdict='unknown')).startswith("UNKNOWN")

@@ -71,6 +71,29 @@ def manager(tmp_path):
     return ProjectWorkspaceManager(workspace_root=tmp_path)
 
 
+_GIT_ENV = {
+    'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+    'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+    'PATH': '/usr/bin:/bin',
+    # No global/system config, and no inherited GIT_DIR: the guard scrubs GIT_*
+    # from its own probe, and a fixture that does not do the same can pass or
+    # fail on the developer's environment rather than on the code.
+    'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_SYSTEM': '/dev/null',
+    'HOME': '/nonexistent',
+}
+
+
+def _git_init(path: Path) -> None:
+    """A real repository, for fixtures that need git to actually answer."""
+    import shutil as _shutil
+    import subprocess as _subprocess
+    if _shutil.which('git') is None:
+        pytest.skip("git not available")
+    _subprocess.run(['git', 'init', '-q', str(path)], check=True, env=_GIT_ENV)
+    _subprocess.run(['git', '-C', str(path), 'commit', '-q', '--allow-empty',
+                     '-m', 'x'], check=True, env=_GIT_ENV)
+
+
 def _make_base_clone(workspace_root: Path, project_name: str) -> Path:
     """Create a fake base clone (just needs a .git dir to pass the existence check)."""
     project_dir = workspace_root / project_name
@@ -499,21 +522,100 @@ class TestReuseExistingEpicWorktree:
         assert not (corrupted / '.git').exists()
 
         with patch('services.project_workspace.subprocess.run') as mock_run:
-            with pytest.raises(RuntimeError, match="no .git at all"):
-                manager.get_or_create_epic_worktree(
-                    "my-project", "901", branch_name="feature/issue-901"
-                )
-            # No git subprocess calls at all -- must fail before ever
-            # attempting `worktree add` against the corrupted path.
-            mock_run.assert_not_called()
+            mock_run.return_value = _ok()
+            manager.get_or_create_epic_worktree(
+                "my-project", "901", branch_name="feature/issue-901"
+            )
 
-        # The directory and its real content must be completely untouched --
-        # the whole point of raising instead of cleaning up automatically.
+        # Never removed. That guarantee is the whole point and it is unchanged.
+        quarantine = tmp_path / '.orchestrator' / 'unreadable-worktrees'
+        moved = list(quarantine.iterdir())
+        assert len(moved) == 1
+        assert (moved[0] / 'some_real_file.txt').read_text() == "leftover project content\n"
+
+        # But the epic is no longer wedged on it. The first draft raised here,
+        # which preserved the directory and then failed identically on every
+        # retry until a human moved it by hand -- for a directory whose content
+        # is now safely elsewhere. The staging path is free and the normal
+        # creation path ran.
+        assert not corrupted.exists()
+
+    def test_the_250_shape_is_not_adopted_as_healthy(self, manager, tmp_path):
+        """The adopt path ran BEFORE the corruption guard and tested only that
+        `.git` EXISTED -- so for the one shape #250 is about, the guard was
+        unreachable.
+
+        In a linked worktree `.git` is a FILE naming an admin directory in the
+        base clone, and it outlives that directory. So `.git` exists, the
+        worktree is adopted as healthy, and then _current_worktree_branch()
+        fails on the same unreadable metadata and the caller silently falls back
+        to the REQUESTED branch name: the epic proceeds against a worktree
+        nobody can read, on a branch it may not be on.
+
+        The other tests in this class use a worktree with NO `.git` at all,
+        which never reaches the adopt path -- which is exactly why this gap
+        survived a full suite.
+        """
+        _make_base_clone(tmp_path, "my-project")
+        wt = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '903'
+        wt.mkdir(parents=True)
+        (wt / '.git').write_text("gitdir: /nonexistent/.git/worktrees/903\n")
+        (wt / 'precious.py').write_text("# uncommitted\n")
+        assert (wt / '.git').exists(), "the shape under test: .git IS present"
+
+        # git must answer the way REAL git answers for this shape: rc=128 for
+        # any command run inside it, because the admin directory its `.git`
+        # names does not exist. A blanket rc=0 stub here would make the probe
+        # say "git can identify it", and the test would pass by describing a
+        # worktree that cannot exist.
+        def _run(cmd, **kwargs):
+            # Only commands run INSIDE the broken worktree fail. Once it has
+            # been moved aside the path is empty again, so the `worktree add`
+            # that recreates it succeeds -- which is the self-healing this
+            # change is for, and it has to be reachable for the test to be
+            # about adoption rather than about a failed create.
+            # `-C <wt>` specifically, not merely "wt appears in argv": the
+            # `worktree add` that recreates it names wt as its TARGET while
+            # running -C against the base clone, and matching that would fail
+            # the very self-healing this asserts.
+            if '-C' in cmd and cmd[cmd.index('-C') + 1] == str(wt):
+                return _fail("fatal: not a git repository: "
+                             "/nonexistent/.git/worktrees/903")
+            return _ok()
+
+        with patch('services.project_workspace.subprocess.run', side_effect=_run):
+            manager.get_or_create_epic_worktree(
+                "my-project", "903", branch_name="feature/issue-903"
+            )
+
+        # Not adopted: the content was preserved rather than used in place.
+        quarantine = tmp_path / '.orchestrator' / 'unreadable-worktrees'
+        moved = list(quarantine.iterdir())
+        assert len(moved) == 1, "an unreadable worktree must not be adopted as healthy"
+        assert (moved[0] / 'precious.py').read_text() == "# uncommitted\n"
+
+    def test_an_unreadable_worktree_that_cannot_be_moved_still_refuses(
+        self, manager, tmp_path
+    ):
+        """If the content could NOT be preserved, refusing is correct again --
+        the directory is still there, still unreadable, and still possibly the
+        only copy of an agent's work."""
+        _make_base_clone(tmp_path, "my-project")
+        corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '902'
+        corrupted.mkdir(parents=True)
+        (corrupted / 'some_real_file.txt').write_text("leftover project content\n")
+
+        with patch('services.project_workspace.subprocess.run', return_value=_ok()), \
+             patch('services.project_workspace.shutil.move',
+                   side_effect=OSError("cross-device link")):
+            with pytest.raises(RuntimeError, match="could not be moved aside"):
+                manager.get_or_create_epic_worktree(
+                    "my-project", "902", branch_name="feature/issue-902"
+                )
+
         assert corrupted.exists()
         assert (corrupted / 'some_real_file.txt').read_text() == "leftover project content\n"
-        # Not adopted into the in-memory cache either -- a later retry must
-        # see the same unresolved state, not a poisoned "already handled" one.
-        assert ("my-project", "901") not in manager._epic_worktrees
+        assert ("my-project", "902") not in manager._epic_worktrees
 
     def test_corruption_after_being_cached_this_process_is_also_caught(self, manager, tmp_path):
         """Second-pass code review finding: the corruption check above only ran
@@ -803,9 +905,17 @@ class TestPruneEpicWorktrees:
         orphan = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '900'
         orphan.mkdir(parents=True)
         (orphan / "leftover.txt").write_text("stale")
-        # A normal, non-corrupted (just untracked) worktree has .git -- distinct
-        # from TestPruneCorruptedWorktreeSkip below, which covers the "no .git
-        # at all" case this method must NOT blindly remove.
+        # A normal, untracked-but-READABLE worktree -- distinct from
+        # TestPruneCorruptedWorktreeSkip below, which covers the shape this
+        # method must not blindly remove.
+        #
+        # Read the stub carefully before trusting this fixture (review on #253):
+        # this `gitdir:` names a path that does not exist, so under REAL git the
+        # probe exits 128 and this is precisely the #250 shape. What makes it
+        # healthy here is the rc=0 `rev-parse` answer below, nothing about the
+        # directory. Keep the two in step: if that stub is ever narrowed, this
+        # test flips from "a readable worktree is collected" into "an unreadable
+        # one is collected" -- an assertion pointing the wrong way.
         (orphan / '.git').write_text("gitdir: /fake/base/.git/worktrees/900\n")
 
         # Fresh manager instance (simulating orchestrator restart) has no in-memory
@@ -894,12 +1004,166 @@ class TestIsCorruptedNonEmptyWorktree:
         assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(corrupted) is True
 
     def test_false_for_a_healthy_worktree(self, tmp_path):
+        """A REAL repository, not a directory named `.git`.
+
+        This fixture used to be `(healthy / '.git').mkdir()` -- an EMPTY .git
+        directory, which is not a repository git can read. The first draft of
+        #250 carved `.git`-as-a-directory out of the probe entirely so that this
+        fixture kept passing, i.e. it changed production behaviour to preserve a
+        fixture's wrong assumption (review on #253), and in doing so left every
+        standalone clone with broken metadata unprotected. The fixture is the
+        thing that was wrong.
+        """
         healthy = tmp_path / 'healthy'
         healthy.mkdir()
-        (healthy / '.git').mkdir()
+        _git_init(healthy)
         (healthy / 'real_file.txt').write_text("content")
 
         assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(healthy) is False
+
+    def test_true_for_a_linked_worktree_git_cannot_identify(self, tmp_path):
+        """#250, the shape that actually cost a worktree.
+
+        In a linked worktree `.git` is a FILE naming an admin directory in the
+        base clone. That file survives the directory it names being emptied or
+        made unreadable, so the old "no .git at all" test read the worktree as
+        healthy and the sweep removed it -- while the orchestrator's own
+        retained-lock reason said it held an uncommitted repair-cycle fix.
+        """
+        wt = tmp_path / 'linked'
+        wt.mkdir()
+        (wt / '.git').write_text(f"gitdir: {tmp_path}/nowhere/.git/worktrees/236\n")
+        (wt / 'precious.py').write_text("uncommitted work")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_false_for_a_linked_worktree_git_can_identify(self, tmp_path):
+        """Control: a working linked worktree must stay prunable, or the sweep
+        becomes a no-op and staging grows without bound."""
+        import subprocess
+        base = tmp_path / 'base'
+        base.mkdir()
+        subprocess.run(['git', 'init', '-q', str(base)], check=True)
+        subprocess.run(['git', '-C', str(base), 'commit', '-q', '--allow-empty',
+                        '-m', 'x'], check=True,
+                       env={'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+                            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+                            'PATH': '/usr/bin:/bin'})
+        wt = tmp_path / 'live'
+        subprocess.run(['git', '-C', str(base), 'worktree', 'add', '-q', str(wt)],
+                       check=True)
+        (wt / 'file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is False
+
+    def test_false_when_the_dangling_pointer_is_all_there_is(self, tmp_path):
+        """An unreadable worktree holding nothing but its own dead pointer has
+        nothing to lose, so it stays collectable. Without this the fix would
+        leave orphaned pointers on disk forever."""
+        wt = tmp_path / 'pointer-only'
+        wt.mkdir()
+        (wt / '.git').write_text(f"gitdir: {tmp_path}/nowhere/.git/worktrees/964\n")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is False
+
+    def test_true_for_a_standalone_clone_git_cannot_identify(self, tmp_path):
+        """The carve-out this replaces was the review's sharpest finding.
+
+        The first draft probed only when `.git` was a FILE, reasoning that only
+        a linked worktree's pointer can outlive what it names. But a standalone
+        clone whose `.git` DIRECTORY has been emptied or corrupted is just as
+        unidentifiable to git and just as full of work -- and the carve-out sent
+        it straight down the delete path, which is #250 again in the one shape
+        the fix claimed to have closed.
+        """
+        wt = tmp_path / 'clone'
+        wt.mkdir()
+        (wt / '.git').mkdir()          # present, but empty: not a repository
+        (wt / 'file.txt').write_text("content")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_true_for_a_dangling_git_symlink(self, tmp_path):
+        """A `.git` symlink whose target is gone. Reached by a different route
+        than the pointer-file case (exists() follows the link and reports
+        False, so this answers at the missing-.git branch rather than at the
+        probe) but it must land on the same answer: content present, git cannot
+        read it, do not delete."""
+        wt = tmp_path / 'symlinked'
+        wt.mkdir()
+        (wt / '.git').symlink_to(tmp_path / 'nowhere' / 'gone')
+        (wt / 'work.py').write_text("uncommitted")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_an_unanswerable_probe_is_an_unknown_not_a_licence_to_delete(self, tmp_path):
+        """The PR's own headline claim, which nothing tested (review on #253).
+
+        Flipping this branch to `return False` restored #250 for the timeout
+        case and the entire 4459-test suite still passed -- a slow or failing
+        `git` during the startup sweep, and the worktree is collected. This
+        answer gates an `rm -rf`; "could not ask" must never read as "nothing
+        to lose".
+        """
+        import subprocess
+        wt = tmp_path / 'slow'
+        wt.mkdir()
+        (wt / '.git').write_text("gitdir: /nowhere/.git/worktrees/1\n")
+        (wt / 'work.py').write_text("uncommitted")
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(cmd='git', timeout=15)):
+            assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+        with patch('services.project_workspace.subprocess.run',
+                   side_effect=OSError("git not found")):
+            assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_the_probe_is_bounded_by_a_timeout(self, tmp_path):
+        """Unbounded, a wedged git hangs the whole startup sweep rather than
+        failing one worktree. Nothing asserted the timeout was passed."""
+        wt = tmp_path / 'wt'
+        wt.mkdir()
+        (wt / '.git').write_text("gitdir: /nowhere\n")
+        (wt / 'work.py').write_text("x")
+
+        with patch('services.project_workspace.subprocess.run',
+                   return_value=_ok("/some/.git")) as run:
+            ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt)
+
+        assert run.call_args.kwargs.get('timeout'), "the probe must be bounded"
+
+    def test_the_probe_does_not_inherit_git_env(self, tmp_path, monkeypatch):
+        """With GIT_DIR exported, `git -C <broken> rev-parse --git-dir` answers
+        rc=0 about a repository it never looked at -- so the guard reports
+        "healthy" and the sweep deletes a broken worktree. #250, reopened by an
+        environment variable (review on #253).
+
+        GIT_DIR must name a REAL repository here: pointed at a path that does
+        not exist, git fails for that reason instead and the test passes whether
+        or not the environment is scrubbed.
+        """
+        unrelated = tmp_path / 'unrelated'
+        unrelated.mkdir()
+        _git_init(unrelated)
+        monkeypatch.setenv('GIT_DIR', str(unrelated / '.git'))
+
+        wt = tmp_path / 'linked'
+        wt.mkdir()
+        (wt / '.git').write_text("gitdir: /nowhere/.git/worktrees/236\n")
+        (wt / 'precious.py').write_text("uncommitted work")
+
+        assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
+
+    def test_an_unreadable_directory_is_not_reported_as_nothing_to_lose(self, tmp_path):
+        """A PermissionError reading the directory means it is THERE and cannot
+        be read -- the opposite of empty. Returning False here (the first draft)
+        sent it down the delete path without a word in the log."""
+        wt = tmp_path / 'locked'
+        wt.mkdir()
+
+        with patch.object(Path, 'iterdir', side_effect=PermissionError("denied")):
+            assert ProjectWorkspaceManager._is_corrupted_non_empty_worktree(wt) is True
 
     def test_false_for_a_genuinely_empty_directory(self, tmp_path):
         empty = tmp_path / 'empty'
@@ -1223,7 +1487,18 @@ class TestPruneCorruptedWorktreeSkip:
     against, so the "safe to remove, cheaply recreated" assumption the rest of
     this method's design relies on does not hold for this specific shape."""
 
-    def test_skips_a_non_empty_corrupted_worktree_instead_of_removing_it(self, manager, tmp_path):
+    def test_quarantines_a_non_empty_unreadable_worktree_instead_of_removing_it(
+        self, manager, tmp_path
+    ):
+        """Moved aside: the content survives AND the staging path is freed.
+
+        The first draft `continue`d here, which preserved the content but had no
+        clearing condition -- every subsequent sweep found the same directory
+        and kept it again, forever. That is the unbounded growth the code review
+        on #163 wrote _is_drift_evidence to avoid; the drift rule immediately
+        below this one is careful to re-derive its skip from the live tree every
+        time, for exactly that reason.
+        """
         _make_base_clone(tmp_path, "my-project")
         corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '960'
         corrupted.mkdir(parents=True)
@@ -1234,13 +1509,36 @@ class TestPruneCorruptedWorktreeSkip:
             mock_run.return_value = _ok()
             manager.prune_epic_worktrees()
 
-        # Left completely untouched, same guarantee get_or_create_epic_worktree()
-        # makes for the identical shape.
-        assert corrupted.exists()
-        assert (corrupted / 'real_uncommitted_work.py').read_text() == "# precious\n"
-        # No `worktree remove`/`rmtree` attempted against it at all.
+        # The staging path is free -- this is what the first draft never did.
+        assert not corrupted.exists()
+
+        # And the work is intact somewhere a human can find it.
+        quarantine = tmp_path / '.orchestrator' / 'unreadable-worktrees'
+        moved = list(quarantine.iterdir())
+        assert len(moved) == 1, f"expected exactly one quarantined worktree, got {moved}"
+        assert moved[0].name.startswith('my-project-960-'), (
+            "the quarantined name must say which project and epic it came from"
+        )
+        assert (moved[0] / 'real_uncommitted_work.py').read_text() == "# precious\n"
+
+        # Never deleted, by any path.
         remove_calls = [c for c in mock_run.call_args_list if 'remove' in c.args[0]]
         assert remove_calls == []
+
+    def test_a_failed_quarantine_falls_back_to_leaving_it_alone(self, manager, tmp_path):
+        """Being unable to preserve it is never a reason to remove it."""
+        _make_base_clone(tmp_path, "my-project")
+        corrupted = tmp_path / '.orchestrator' / 'worktrees' / 'my-project' / '965'
+        corrupted.mkdir(parents=True)
+        (corrupted / 'precious.py').write_text("# work\n")
+
+        with patch('services.project_workspace.subprocess.run', return_value=_ok()), \
+             patch('services.project_workspace.shutil.move',
+                   side_effect=OSError("cross-device link")):
+            manager.prune_epic_worktrees()
+
+        assert corrupted.exists()
+        assert (corrupted / 'precious.py').read_text() == "# work\n"
 
     def test_still_removes_a_genuinely_empty_corrupted_worktree(self, manager, tmp_path):
         """No .git AND nothing in it either -- has nothing to lose, so this
@@ -1308,7 +1606,12 @@ class TestPruneCorruptedWorktreeSkip:
             mock_run.return_value = _ok()
             manager.prune_epic_worktrees()
 
-        assert corrupted.exists()
+        # The unreadable one was quarantined (moved out of staging) and the
+        # orphan next to it was still evaluated and removed on its own merits.
+        assert not corrupted.exists()
+        quarantined = list((tmp_path / '.orchestrator' / 'unreadable-worktrees').iterdir())
+        assert [q.name.split('-20')[0] for q in quarantined] == ['my-project-962']
+        assert (quarantined[0] / 'real_work.txt').read_text() == "precious"
         assert not healthy_orphan.exists()
 
 

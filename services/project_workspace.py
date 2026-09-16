@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import os
 import subprocess
 import logging
 import shutil
@@ -8,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -1243,7 +1245,7 @@ class ProjectWorkspaceManager:
             RuntimeError: Either the underlying `git worktree add` command failed
                 (the pre-existing cause), OR (issue found investigating a
                 code-wrapper dev-container block, 2026-09-06) the worktree
-                directory exists on disk, non-empty, but has no .git at all --
+                directory exists on disk, non-empty, but git cannot identify it --
                 corrupted, checked both on a fresh resolution and on a cache hit
                 for an epic already tracked in this process (e.g. a container's
                 own git-state self-repair can remove a worktree's .git with no
@@ -1390,7 +1392,17 @@ class ProjectWorkspaceManager:
                 # ("already used by worktree at ...") since it's already registered --
                 # confirmed via the #48 review to otherwise crash restart-recovery's
                 # auto-commit path outright.
-                if worktree_path.exists() and (worktree_path / '.git').exists():
+                # `.git` EXISTING is not the same as git being able to read
+                # it, and this test ran BEFORE the corruption guard below, so
+                # the #250 shape -- a dangling pointer file plus content -- was
+                # adopted as healthy and the guard was unreachable for the one
+                # shape it was added for. _current_worktree_branch() then fails
+                # on the same unreadable metadata and the caller falls back to
+                # the REQUESTED branch name, so the epic proceeds against a
+                # worktree nobody can read, under a branch it may not be on.
+                if (worktree_path.exists()
+                        and (worktree_path / '.git').exists()
+                        and not self._is_corrupted_non_empty_worktree(worktree_path)):
                     actual_branch = self._current_worktree_branch(worktree_path) or branch_name
                     if branch_name and actual_branch and branch_name != actual_branch:
                         logger.warning(
@@ -1409,26 +1421,33 @@ class ProjectWorkspaceManager:
                     return worktree_path
 
                 if self._is_corrupted_non_empty_worktree(worktree_path):
-                    # On disk, non-empty, but .git is completely missing --
-                    # corrupted, not a recognized worktree to adopt above. See
-                    # this method's own docstring (Raises section) for the full
-                    # rationale on why this deliberately does not attempt any
-                    # automatic cleanup, and _is_corrupted_non_empty_worktree()'s
-                    # own docstring for why non-empty is the specific condition
-                    # that matters (a genuinely empty pre-existing directory has
-                    # nothing to lose -- `git worktree add` succeeds into it
-                    # exactly as it always has, self-healing via the normal path
-                    # below instead of being needlessly escalated).
-                    raise RuntimeError(
-                        f"Epic worktree directory for {project_name} epic #{epic_id} "
-                        f"exists at {worktree_path} but has no .git at all -- corrupted "
-                        "(not a recognized worktree, and not safely auto-recoverable: "
-                        "see this method's docstring for why). Needs manual inspection "
-                        "(the directory may hold real uncommitted work) followed by "
-                        f"`git worktree remove --force {worktree_path}` (or `git "
-                        "worktree prune`) run against the base clone before this epic "
-                        "can be retried."
-                    )
+                    # On disk with content, but git cannot identify it as a
+                    # worktree -- so it cannot be adopted above, and it must not
+                    # be built over: `git worktree add` into a non-empty
+                    # directory would either refuse or bury whatever is in it.
+                    # (A genuinely EMPTY pre-existing directory never reaches
+                    # here; `git worktree add` succeeds into it exactly as it
+                    # always has, self-healing via the normal path below.)
+                    #
+                    # Quarantining rather than raising is what makes this
+                    # recoverable without a human. The first draft raised, which
+                    # preserved the directory but wedged the epic on it: every
+                    # retry hit the same unreadable directory and raised again,
+                    # until someone moved it by hand. Since the content is
+                    # preserved by the move, there is nothing left to protect by
+                    # refusing -- so the epic proceeds on a fresh worktree and
+                    # the operator inspects the quarantined copy at their
+                    # leisure. If the move FAILS the directory is still there
+                    # and still unreadable, and then refusing is correct.
+                    if self._quarantine_unreadable_worktree(worktree_path) is None:
+                        raise RuntimeError(
+                            f"Epic worktree directory for {project_name} epic "
+                            f"#{epic_id} exists at {worktree_path}, but git cannot "
+                            "identify it as a worktree and it could not be moved "
+                            "aside. It is left in place because it may hold real "
+                            "uncommitted work. Needs manual inspection, then move "
+                            "or remove it before this epic can be retried."
+                        )
 
                 worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1607,7 +1626,8 @@ class ProjectWorkspaceManager:
 
     @staticmethod
     def _is_corrupted_non_empty_worktree(worktree_path: Path) -> bool:
-        """True if worktree_path exists, has real content, but no .git at all --
+        """True if worktree_path exists, has real content, and git cannot identify
+        it as a worktree --
         the specific shape get_or_create_epic_worktree() and
         prune_epic_worktrees() both refuse to auto-clean-up (see
         get_or_create_epic_worktree()'s own docstring for the full rationale:
@@ -1634,17 +1654,166 @@ class ProjectWorkspaceManager:
         directory turns out to actually be by the time that runs.
         """
         try:
-            return (
-                worktree_path.exists()
-                and not (worktree_path / '.git').exists()
-                and any(worktree_path.iterdir())
+            if not worktree_path.exists():
+                return False
+            # Content BEYOND the pointer is the real question; asked once, here,
+            # so every branch below can rely on the answer.
+            has_content_beyond_pointer = any(
+                child.name != '.git' for child in worktree_path.iterdir()
             )
-        except OSError as e:
-            logger.warning(
-                f"Could not determine whether {worktree_path} is a corrupted "
-                f"worktree (treating as no): {e}"
+        except (FileNotFoundError, NotADirectoryError) as e:
+            # The TOCTOU race ONLY: the directory was removed or replaced under
+            # us, so there is nothing to protect and nothing to preserve, and
+            # the caller's own next operation raises its own clear error for
+            # whatever the path has become. Deliberately split from the clause
+            # below -- this is the one OSError family that really does mean
+            # "no worktree here".
+            logger.debug(
+                f"{worktree_path} vanished while being classified ({e}); "
+                f"treating as not present"
             )
             return False
+        except OSError as e:
+            # Every other OSError -- permission denied above all, which is how
+            # this shape actually arrives -- means the directory IS there and
+            # cannot be read. Answering "no" here was a silent failure (review
+            # on #253): this answer gates an `rm -rf`, so "could not look" must
+            # never be reported as "nothing to lose".
+            logger.warning(
+                f"Could not read {worktree_path} to classify it ({e}); treating "
+                f"it as unreadable rather than prunable -- its contents cannot "
+                f"be read, so they cannot be shown to be expendable"
+            )
+            return True
+
+        if not has_content_beyond_pointer:
+            return False
+
+        # "No .git at all" was the whole test until #250. It misses the shape
+        # that actually cost us a worktree: in a LINKED worktree `.git` is a
+        # file holding `gitdir: <base>/.git/worktrees/<id>`, and that file is
+        # still there when the directory it names has been emptied or is
+        # unreadable. `.git` exists, so the worktree read as healthy, and a
+        # directory git itself could not identify was removed -- while the
+        # orchestrator's own retained-lock reason said it held an uncommitted
+        # repair-cycle fix.
+        #
+        # So ask the question the rule is actually about: can git identify this
+        # as a worktree at all? An unreadable one is not "not corrupted", and
+        # "could not tell" is not a licence to delete.
+        git_entry = worktree_path / '.git'
+        if not git_entry.exists():
+            return True
+
+        # No carve-out for a `.git` DIRECTORY. The first draft skipped those,
+        # reasoning that only a linked worktree's pointer FILE can outlive what
+        # it names -- but a standalone clone whose .git directory has been
+        # emptied or made unreadable is equally unidentifiable and equally full
+        # of work. That carve-out existed only to satisfy a fixture that models
+        # a healthy worktree as an EMPTY .git dir: it encoded a bad fixture's
+        # assumption as production behaviour (review on #253). The fixture is
+        # fixed instead, and every shape is put to git.
+
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(worktree_path), 'rev-parse', '--git-dir'],
+                capture_output=True, text=True, timeout=15,
+                # Scrubbed, not inherited. With GIT_DIR set in the environment
+                # this probe answers rc=0 -- "git can identify it" -- for a
+                # worktree it never looked at, and the sweep deletes it: #250,
+                # reopened by an env var. Verified in the container (review on
+                # #253). This probe is the only thing between the sweep and an
+                # `rm -rf`, so it asks about the path and nothing else.
+                env={k: v for k, v in os.environ.items()
+                     if not k.startswith('GIT_')},
+            )
+        except Exception as e:
+            # Including a timeout: an unanswerable probe is an unknown, and this
+            # method's answer gates an `rm -rf`.
+            logger.warning(
+                f"Could not ask git about {worktree_path} (treating it as "
+                f"corrupted, so the sweep leaves it alone): {e}"
+            )
+            return True
+
+        if result.returncode != 0:
+            logger.warning(
+                f"{worktree_path} has a .git entry but git cannot identify it "
+                f"as a worktree (rc={result.returncode}: "
+                f"{(result.stderr or '').strip()[:160]}). Treating it as "
+                f"corrupted rather than prunable -- its contents cannot be "
+                f"read, so they cannot be shown to be expendable (#250)."
+            )
+            return True
+
+        return False
+
+    def _quarantine_unreadable_worktree(self, worktree_path: Path) -> Optional[Path]:
+        """Move an unreadable worktree aside instead of keeping or deleting it.
+
+        The rule this serves has two constraints that look contradictory:
+
+          * #250: a worktree git cannot identify may hold an agent's real
+            uncommitted work, so it must not be deleted. "Could not tell" is
+            not a licence to `rm -rf`.
+          * #163: a worktree that is merely orphaned -- fully committed, its
+            registration pruned -- must stay collectable, or every sweep pins
+            one more directory on disk forever.
+
+        A skip satisfies the first and violates the second. The first draft of
+        #250 did exactly that, reinstating the unbounded growth the code review
+        on #163 wrote `_is_drift_evidence` to avoid; the rule immediately below
+        the prune's drift skip states the principle plainly -- "Nothing durable
+        outlives the drift" -- because that skip self-clears the moment a human
+        commits or discards. A skip with no clearing condition is not a rule,
+        it is a leak.
+
+        Moving satisfies both. The content survives for whoever needs it, and
+        the staging path is freed, so the next dispatch creates a fresh worktree
+        and self-heals instead of wedging on a directory nobody can read. What
+        accumulates accumulates OUTSIDE the staging namespace the sweep walks,
+        under a name that says what it is and when it happened, where an
+        operator can see it and clear it -- not silently, on the path the system
+        needs back.
+
+        Deliberately NOT auto-deleted on any timer. An age cutoff would be a
+        second rule that deletes work nobody has looked at, which is the defect
+        this exists to fix, one indirection further away.
+
+        Returns the quarantine path, or None if the move failed -- in which case
+        the caller must fall back to leaving the directory alone, because
+        failing to preserve it is never a reason to remove it.
+        """
+        # Outside `.orchestrator/worktrees/`, which prune_epic_worktrees() and
+        # survey_epic_worktrees() both walk as <project>/<epic_id>: a quarantine
+        # directory inside it would be enumerated as a project.
+        quarantine_root = self.workspace_root / '.orchestrator' / 'unreadable-worktrees'
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        destination = quarantine_root / (
+            f"{worktree_path.parent.name}-{worktree_path.name}-{stamp}"
+        )
+        try:
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(worktree_path), str(destination))
+        except OSError as e:
+            logger.error(
+                f"Could not quarantine unreadable worktree {worktree_path} "
+                f"({e}); leaving it in place. It still may hold uncommitted "
+                f"work, so it is NOT removed -- but the staging path stays "
+                f"occupied, and the next dispatch for this epic will fail on "
+                f"it until someone moves or deletes it by hand."
+            )
+            return None
+
+        logger.error(
+            f"Quarantined {worktree_path} -> {destination}: git could not "
+            f"identify it as a worktree, but it holds content, so it was "
+            f"moved rather than deleted (#250) and rather than left in place "
+            f"forever (#163). Nothing here is collected automatically. Inspect "
+            f"it, recover anything that matters, then delete it. The staging "
+            f"path is now free and the next dispatch recreates the worktree."
+        )
+        return destination
 
     @staticmethod
     def _read_worktree_head(worktree_path: Path) -> Tuple[Optional[str], bool]:
@@ -3212,7 +3381,7 @@ class ProjectWorkspaceManager:
                              (#233). Never "eligible" under either reading.
           'skipped_active_run'  a pipeline run still in flight owns it.
           'skipped_container'   an agent container is bind-mounted inside.
-          'skipped_corrupted'   no .git at all but non-empty.
+          'skipped_corrupted'   git cannot identify it, but non-empty.
           'skipped_drift'       drifted, holding work the sweep cannot preserve.
           'eligible_liveness_unknown'
                              every rule above says remove -- but docker could
@@ -3301,7 +3470,7 @@ class ProjectWorkspaceManager:
             this workspace -- None when the run store could not answer for it,
             which the sweep treats as "keep this one", never "prune this"),
             corrupted
-            (non-empty with no .git at all), and prune_verdict.
+            (non-empty and unidentifiable to git), and prune_verdict.
 
             **Render prune_verdict; do not recompute it from the other fields.**
             Each of those is ONE rule, and a consumer that ANDs a few of them
@@ -3663,7 +3832,7 @@ class ProjectWorkspaceManager:
             # path to the identical destructive operation that guard
             # exists to prevent -- neither the tracked-check nor the
             # liveness check above catches a worktree that's corrupted
-            # (no .git at all) but currently untracked and unmounted,
+            # (unidentifiable to git) but currently untracked and unmounted,
             # and _push_local_commits_if_any() below is a no-op with no
             # .git to run git commands against, so the safety net that
             # normally justifies "safe to remove unconditionally, cheaply
@@ -3678,13 +3847,17 @@ class ProjectWorkspaceManager:
             # asks them to -- unless it's genuinely empty, which has
             # nothing to lose either way.
             if self._is_corrupted_non_empty_worktree(worktree_path):
-                logger.warning(
-                    f"Skipping prune of {worktree_path} -- has no .git at all "
-                    "(corrupted, not a recognized worktree) but is non-empty, so "
-                    "it may hold real uncommitted work. Needs manual inspection, "
-                    f"then `git worktree remove --force {worktree_path}` (or "
-                    "`git worktree prune`) run against the base clone."
-                )
+                # Moved aside, not skipped. A bare `continue` here was the first
+                # draft, and it had no clearing condition: every sweep would
+                # find the same directory and keep it again, forever -- the
+                # unbounded growth the code review on #163 wrote
+                # _is_drift_evidence to avoid, and which the drift rule just
+                # below is careful to avoid by re-deriving its skip from the
+                # live tree every time. Quarantining preserves the content #250
+                # is about AND frees the path, so the rule clears itself.
+                # A failed move falls back to the old skip: being unable to
+                # preserve it is not a reason to remove it.
+                self._quarantine_unreadable_worktree(worktree_path)
                 continue
 
             # Fourth skip rule (#163), and the one that makes a wrong-branch
@@ -3765,14 +3938,60 @@ class ProjectWorkspaceManager:
                 pass
             if worktree_path.is_dir():
                 shutil.rmtree(worktree_path, ignore_errors=True)
-        # Prune any remaining stale metadata entries
+        # Prune any remaining stale metadata entries.
+        #
+        # `git worktree prune` EXITS 0 EVEN WHEN IT FAILS TO DELETE (#250) --
+        # verified: with an unwritable .git/worktrees it prints
+        #   error: failed to delete '.git/worktrees/<id>': Permission denied
+        # to stderr and still returns 0. This call used to discard stderr and
+        # ignore the result entirely, so a registration that survived was
+        # invisible.
+        #
+        # Be precise about WHY that matters, because the first draft of this
+        # comment got the causality backwards (review on #253). A surviving
+        # registration does NOT by itself make git refuse the next worktree:
+        # each epic worktree is registered under its own id, so git simply
+        # allocates a fresh one and proceeds. What actually breaks the next
+        # dispatch is the CAUSE of the failed prune -- almost always that
+        # .git/worktrees is not writable by the orchestrator (a container
+        # running as root can leave it owned by root). The same permissions that
+        # stopped git deleting the old entry stop it creating the new one:
+        #
+        #   fatal: could not create directory of '.git/worktrees/2361': Permission denied
+        #
+        # which names neither the directory nor the ownership behind it. So the
+        # stale entry is a SYMPTOM, and this stderr is the earliest place that
+        # symptom is visible with the real cause still attached -- which is
+        # exactly why discarding it cost heimdall #245 its diagnosis.
+        pruned = None
         try:
-            subprocess.run(
+            pruned = subprocess.run(
                 ['git', '-C', str(repo_path), 'worktree', 'prune'],
-                capture_output=True, timeout=15
+                capture_output=True, text=True, timeout=15
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(
+                f"Could not prune stale worktree registrations under "
+                f"{repo_path}: {e}. Stale entries are usually harmless on their "
+                f"own, but whatever prevented the prune -- ownership of "
+                f"{repo_path}/.git/worktrees above all -- will also prevent the "
+                f"next worktree being created there, with an error that names "
+                f"neither."
+            )
+
+        stderr = (pruned.stderr or '').strip() if pruned is not None else ''
+        if pruned is not None and (pruned.returncode != 0 or stderr):
+            logger.error(
+                f"Stale worktree registrations under {repo_path} were NOT fully "
+                f"cleaned (rc={pruned.returncode}): {stderr[:200] or 'no stderr'}. "
+                f"The leftover entries are usually harmless on their own -- git "
+                f"registers each new worktree under a fresh id. The cause is "
+                f"not: the orchestrator must be able to write "
+                f"{repo_path}/.git/worktrees (a container running as root can "
+                f"leave it owned by root), and whatever blocked the delete will "
+                f"block the next create too, as "
+                f"\"could not create directory of '.git/worktrees/<id>'\"."
+            )
         # Remove the now-empty staging directory for this project
         try:
             if project_staging.is_dir() and not any(project_staging.iterdir()):

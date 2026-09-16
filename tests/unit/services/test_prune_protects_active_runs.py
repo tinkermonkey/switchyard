@@ -24,6 +24,7 @@ thing that still knows the directory matters, which is what the fifth rule
 reads.
 """
 
+import logging
 import os
 import pytest
 from contextlib import contextmanager
@@ -1440,3 +1441,132 @@ class TestOneProjectsDoubtDoesNotDisarmTheOthers:
         )
         assert rows['heimdall']['prune_verdict'] == 'eligible'
         assert rows['heimdall']['active_run_protected'] is False
+
+
+class TestAFailedRegistrationCleanupIsNotSilent:
+    """#250, second half. The sweep already ran `git worktree prune` after
+    removing worktrees -- but discarded its output and ignored its result.
+
+    That is not a theoretical gap: `git worktree prune` EXITS 0 EVEN WHEN IT
+    FAILS TO DELETE. With an unwritable .git/worktrees it prints
+        error: failed to delete '.git/worktrees/<id>': Permission denied
+    to stderr and still returns 0, so the only signal was the stream being
+    thrown away.
+
+    Why it matters, stated correctly (the first draft had the causality
+    backwards -- review on #253): a surviving registration does NOT by itself
+    make git refuse the next worktree, because each one is registered under a
+    fresh id. What breaks the next dispatch is the CAUSE of the failed prune,
+    almost always that .git/worktrees is not writable by the orchestrator. The
+    same permissions that stopped the delete stop the create:
+
+        fatal: could not create directory of '.git/worktrees/2361': Permission denied
+
+    naming neither the directory nor the ownership. The stale entry is a
+    symptom; this stderr is the first place that symptom appears with its cause
+    still attached.
+    """
+
+    def _sweep_with_prune_result(self, manager, tmp_path, prune_result):
+        _make_base_clone(tmp_path, "codetoreum")
+        worktree = _make_worktree(tmp_path, "codetoreum", "1016")
+
+        def _run(args, **kwargs):
+            if 'prune' in args:
+                if isinstance(prune_result, BaseException):
+                    raise prune_result
+                return prune_result
+            return _ok()
+
+        run_manager = Mock()
+        run_manager.get_active_run_workspaces.return_value = ActiveRunWorkspaces(
+            {}, set(), complete=True
+        )
+        with patch('services.pipeline_run.get_pipeline_run_manager',
+                   return_value=run_manager), \
+             patch.object(manager, '_get_running_container_mount_sources',
+                          return_value=set()), \
+             patch.object(manager, '_push_local_commits_if_any'), \
+             patch('services.project_workspace.subprocess.run', side_effect=_run) as run:
+            manager.prune_epic_worktrees()
+
+        # Non-vacuity: the prune runs OUTSIDE the per-worktree loop, so a sweep
+        # that skipped every worktree would still reach it and every assertion
+        # below would pass on a sweep that did nothing.
+        assert not worktree.exists(), (
+            "the sweep must have actually removed the worktree"
+        )
+        return run
+
+    def test_stderr_from_a_zero_exit_prune_is_surfaced(self, manager, tmp_path, caplog):
+        """The exact production shape: rc=0, but nothing was actually deleted."""
+        failed = Mock()
+        failed.returncode = 0
+        failed.stdout = ""
+        failed.stderr = "error: failed to delete '.git/worktrees/236': Permission denied"
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, failed)
+
+        assert any('were NOT fully' in r.getMessage() for r in caplog.records), (
+            "a prune that failed while exiting 0 must not pass silently"
+        )
+        assert any('Permission denied' in r.getMessage() for r in caplog.records), (
+            "the operator needs git's own reason, not a generic message"
+        )
+
+    def test_a_nonzero_prune_exit_is_surfaced_even_with_no_stderr(
+        self, manager, tmp_path, caplog
+    ):
+        """The condition is `rc != 0 OR stderr`. Only the stderr half was
+        pinned, so narrowing it to stderr alone survived every test -- and a
+        prune that fails loudly with an exit code but says nothing would then
+        pass silently."""
+        failed = Mock()
+        failed.returncode = 1
+        failed.stdout = ""
+        failed.stderr = ""
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, failed)
+
+        assert any('were NOT fully' in r.getMessage() for r in caplog.records)
+
+    def test_a_prune_that_raises_is_not_swallowed(self, manager, tmp_path, caplog):
+        """Re-swallowing this path (`except Exception: pass`) was the original
+        defect, and nothing pinned the fix."""
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(
+                manager, tmp_path, OSError("git vanished mid-sweep")
+            )
+
+        assert any('Could not prune stale worktree registrations' in r.getMessage()
+                   for r in caplog.records)
+
+    def test_the_prune_asks_git_for_text_not_bytes(self, manager, tmp_path):
+        """Drop `text=True` and stderr comes back as bytes, so the operator
+        reads b"error: failed to delete...". The stub hands back a str whatever
+        the production call actually requests, so nothing noticed."""
+        clean = Mock()
+        clean.returncode = 0
+        clean.stdout = ""
+        clean.stderr = ""
+
+        run = self._sweep_with_prune_result(manager, tmp_path, clean)
+
+        prune_calls = [c for c in run.call_args_list if 'prune' in c.args[0]]
+        assert prune_calls, "the sweep must run `git worktree prune`"
+        assert prune_calls[0].kwargs.get('text') is True
+
+    def test_a_clean_prune_says_nothing(self, manager, tmp_path, caplog):
+        """Control: the common case must not log an error every startup."""
+        clean = Mock()
+        clean.returncode = 0
+        clean.stdout = ""
+        clean.stderr = ""
+
+        with caplog.at_level(logging.ERROR):
+            self._sweep_with_prune_result(manager, tmp_path, clean)
+
+        assert not any('were NOT fully' in r.getMessage() for r in caplog.records)
+
