@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from services.run_ownership import RunOwnership
 from services.pipeline_run import (
     _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
     PipelineRunManager,
@@ -664,7 +665,9 @@ class TestStartupSweepStillSeesTheRun:
         workspaces = manager.get_active_run_workspaces()
 
         assert workspaces.complete is True
-        assert workspaces.protects('proj', '/workspace/proj/worktrees/proj/1016'), (
+        assert workspaces.ownership_of(
+            'proj', '/workspace/proj/worktrees/proj/1016'
+        ) is RunOwnership.OWNED, (
             "a live run's epic worktree lost its protection because a routine "
             "lookup deleted the mapping entry that indexes it (#233/#239)"
         )
