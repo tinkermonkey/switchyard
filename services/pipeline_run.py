@@ -15,6 +15,7 @@ from datetime import datetime
 from dataclasses import dataclass, asdict, fields
 from elasticsearch import Elasticsearch
 from monitoring.observability import es_index_with_retry
+from services.run_ownership import RunOwnership
 from config.retention import RETENTION_DAYS, build_ilm_policy
 
 logger = logging.getLogger(__name__)
@@ -172,7 +173,14 @@ class ActiveRunWorkspaces:
         protection, and forced the consumer to re-do the normalisation done
         here.
 
-    `paths` are normalised at construction so no consumer has to remember to.
+    `paths` are normalised at construction so no consumer has to remember to,
+    and both collections are copied so a `frozen=True` value cannot be mutated
+    through the dict a caller kept a reference to.
+
+    Ask it `ownership_of()`. The gate and the match are one call, and
+    `_protects()` -- the match on its own -- is private, so "I could not tell"
+    cannot arrive at a destructive consumer wearing the same face as "nothing
+    owns it" (#240).
     """
 
     epic_ids_by_project: Dict[str, Set[str]]
@@ -180,21 +188,69 @@ class ActiveRunWorkspaces:
     complete: bool = True
 
     def __post_init__(self):
+        # BOTH fields, and the inner sets too. `frozen=True` freezes the
+        # bindings, not the containers behind them: a caller that kept a
+        # reference to the dict it passed in could still add a project, or
+        # mutate one project's id set, and silently change what a value this
+        # type promises is immutable protects. Copying `paths` alone left the
+        # field that GRANTS protection as the one aliased one (#240).
+        #
+        # Epic ids are stringified for the same reason _record() stringifies
+        # them: they are matched against a DIRECTORY NAME, and a run record
+        # whose epic_id round-tripped through JSON as an int would otherwise
+        # never match the directory it named.
         object.__setattr__(
             self, 'paths', {str(p).rstrip('/') for p in self.paths}
+        )
+        object.__setattr__(
+            self,
+            'epic_ids_by_project',
+            {
+                str(project): {str(epic_id) for epic_id in epic_ids}
+                for project, epic_ids in self.epic_ids_by_project.items()
+            },
         )
 
     @classmethod
     def unknown(cls) -> 'ActiveRunWorkspaces':
-        """No usable answer. Callers must not read this as "nothing is active"."""
+        """No usable answer. Callers must not read this as "nothing is active".
+
+        `ownership_of()` turns this into RunOwnership.UNKNOWN for every
+        worktree, so a consumer cannot mistake it for UNOWNED however it is
+        obtained.
+        """
         return cls(epic_ids_by_project={}, paths=set(), complete=False)
 
-    def protects(self, project: str, worktree_path) -> bool:
-        """Whether this worktree belongs to a run still in flight.
+    def ownership_of(self, project: str, worktree_path) -> RunOwnership:
+        """Who owns this worktree, as one value that already carries the gate.
 
-        Matches on BOTH the epic id (the directory's own name, robust to path
-        formatting) and the run's recorded project_dir (robust to a layout
-        change). Either is enough.
+        THE GATE AND THE MATCH ARE ONE CALL ON PURPOSE (#240). The predicate
+        this replaces was public, returned a bare bool, and returned False when
+        the lookup had failed -- which a caller deleting directories reads as
+        "no run owns it, remove it". Nothing required a caller to test
+        `complete` first, every call site re-implemented that test by hand, and
+        three review rounds on #237 each found another destructive consumer
+        that had not. Folding the two together removes the class of defect
+        rather than fixing another instance of it: the only removable answer
+        now has its own name.
+
+        Matching (once the answer is known to be usable) is on BOTH the epic id
+        -- the directory's own name, robust to path formatting -- and the run's
+        recorded project_dir, robust to a layout change. Either is enough.
+        """
+        if not self.complete:
+            return RunOwnership.UNKNOWN
+        if self._protects(project, worktree_path):
+            return RunOwnership.OWNED
+        return RunOwnership.UNOWNED
+
+    def _protects(self, project: str, worktree_path) -> bool:
+        """The match alone, WITHOUT the completeness gate -- hence private.
+
+        Public callers get ownership_of(), which cannot be invoked without the
+        gate. Keeping this separate keeps the two matching forms in one place;
+        making it private keeps "did it match" from being mistaken for "is it
+        safe to delete".
         """
         if str(worktree_path).rstrip('/') in self.paths:
             return True

@@ -1072,6 +1072,18 @@ async def process_task_integrated(task, state_manager, logger):
             f"agent made manual progression during execution"
         )
 
+    # CRITICAL: Skip auto-advancement if the verifier did not approve the environment.
+    # A BLOCKED or CHANGES_NEEDED verdict means the dev container is not ready; the
+    # issue must stay in the Verification column so repair_cycle or an operator can
+    # intervene.  Checking only "did the agent process exit cleanly?" is insufficient.
+    verifier_verdict = result.get('verifier_verdict')
+    if verifier_verdict is not None and verifier_verdict != "APPROVED":
+        logger.info(
+            f"Skipping auto-advancement for issue #{issue_number}: "
+            f"dev_environment_verifier verdict is {verifier_verdict!r} (not APPROVED)"
+        )
+        manual_progression_made = True
+
     current_column_name = task_context.get('column')
     if current_column_name and issue_number and not manual_progression_made:
         try:
