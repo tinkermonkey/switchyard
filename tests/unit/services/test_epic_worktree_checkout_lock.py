@@ -92,7 +92,30 @@ def _fail(stderr: str = "error") -> Mock:
 # it: _free_branch_from_base_clone's status/rev-parse, the fetch of the target
 # branch, _push_stray_branch_if_ahead's rev-parse --verify (no local ref), then
 # `worktree add`.
-_EXISTING_BRANCH_SEQUENCE = [_ok(), _ok(), _ok(), _fail("no local ref"), _ok()]
+#: The base-clone git calls the existing-branch creation path makes, IN ORDER,
+#: because this file feeds subprocess results positionally:
+#:
+#:   0  status --porcelain
+#:   1  rev-parse --abbrev-ref HEAD
+#:   2  ls-remote --heads origin <branch>      <- added by #246
+#:   3  fetch origin <branch>:refs/remotes/...
+#:   4  rev-parse --verify refs/heads/<branch> -- fails: no LOCAL branch yet,
+#:      which is what makes the rev-list ahead-count below be skipped
+#:   5  worktree add -B
+#:
+#: The ls-remote entry must carry non-empty STDOUT: #246's probe reads existence
+#: from stdout, not from the exit code, so a bare _ok() reads as "branch absent"
+#: and sends the whole file down the create-a-new-branch path -- where these
+#: positional results land on the wrong commands. That is what took main red
+#: after #246, which updated its own tests but not this sibling file.
+_EXISTING_BRANCH_SEQUENCE = [
+    _ok(),
+    _ok(),
+    _ok("a1b2c3d4\trefs/heads/feature/issue-100-epic"),
+    _ok(),
+    _fail("no local ref"),
+    _ok(),
+]
 
 
 @pytest.fixture
