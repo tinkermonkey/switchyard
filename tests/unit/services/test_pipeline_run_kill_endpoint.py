@@ -22,13 +22,14 @@ def _pipeline_run(run_id='run-1', project='proj', board='BoardA', issue_number=4
     run.board = board
     run.issue_number = issue_number
     run.status = status
-    run.to_dict.return_value = {
+    run.run_data = {
         'id': run_id,
         'project': project,
         'board': board,
         'issue_number': issue_number,
         'status': status,
     }
+    run.to_dict.return_value = run.run_data
     return run
 
 
@@ -83,7 +84,7 @@ class TestKillPipelineRun:
             reason='Killed by user via Web UI',
         )
         manager._end_run_in_elasticsearch.assert_called_once_with(
-            refreshed_run.to_dict(),
+            refreshed_run.run_data,
             'Killed by user via Web UI (forced update)',
             outcome='failed',
         )
