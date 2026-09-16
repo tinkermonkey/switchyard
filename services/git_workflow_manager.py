@@ -211,12 +211,14 @@ class GitWorkflowManager:
             # Build PR title and body
             pr_title = issue_title if not issue_title.startswith('#') else issue_title[issue_title.find(' ')+1:]
             pr_body = self._build_pr_body(issue_number, issue_body, org, repo)
+            from services.project_workspace import workspace_manager
+            base_branch = workspace_manager.get_default_branch(project)
 
             # Create PR using gh CLI
             cmd = [
                 'gh', 'pr', 'create',
                 '--repo', f"{org}/{repo}",
-                '--base', 'main',
+                '--base', base_branch,
                 '--head', branch_name,
                 '--title', pr_title,
                 '--body', pr_body
