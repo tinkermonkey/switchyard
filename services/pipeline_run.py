@@ -1026,8 +1026,11 @@ class PipelineRunManager:
                 writes the issue mapping under the board-less legacy key, so a
                 crashed run whose ES doc still reads 'active' would be resurrected
                 on every pass and could then shadow a board-scoped lookup. Stale
-                mappings found in Redis are still cleaned up either way -- that is
-                removal of state known to be dead, not resurrection of it.
+                mappings found in Redis are still cleaned up either way: the entry
+                for a run whose own Redis record says it finished, the entry whose
+                record is too corrupt to interpret, and -- only on that positive
+                evidence (#239) -- the entry for a run Elasticsearch reports ended.
+                That is removal of dead state, not resurrection of it.
 
         Returns:
             PipelineRun if active run exists, None otherwise
@@ -1042,6 +1045,10 @@ class PipelineRunManager:
             *([self._get_issue_key(project, issue_number, board)] if board else []),
             self._get_issue_key(project, issue_number),
         ]))
+
+        # Mapping entries whose run record is gone from Redis. Collected, not
+        # deleted, while iterating -- see the else-branch below (#239).
+        expired_mappings: list = []  # (issue_key, pipeline_run_id)
 
         for issue_key in issue_keys:
             pipeline_run_id = self.redis.hget(self.redis_issue_mapping, issue_key)
@@ -1087,16 +1094,88 @@ class PipelineRunManager:
                     self.redis.hdel(self.redis_issue_mapping, issue_key)
                     continue
             else:
-                # Redis data has expired (TTL) while the issue mapping survived.
-                # This can happen if the orchestrator was restarted and the initial
-                # 2-hour creation TTL expired before the run was restored/updated.
-                # Clean up the stale mapping and fall through to the next key / ES lookup.
+                # The run's Redis record is gone while its issue mapping survived.
+                # That needs a run to go ACTIVE_RUN_REDIS_TTL_SECONDS (seven days)
+                # without a status write, or the record to be lost some other way
+                # -- eviction, a flushed Redis, a hand-deleted key.
+                #
+                # DO NOT DELETE THE MAPPING HERE (#239). Redis silence is not
+                # evidence that the run ended, and once the record is gone this
+                # entry is the last thing that knows the run existed at all:
+                # get_active_run_workspaces() iterates this same hash, and it is
+                # what stops the startup sweep pruning an in-flight run's epic
+                # worktree (#233). Deleting on absence of testimony -- at lookup
+                # frequency, before Elasticsearch has even been asked -- destroys
+                # that evidence and makes the sweep's answer come back falsely
+                # clean. Drop the entry from THIS lookup only; the reap below
+                # removes it from Redis if, and only if, ES positively reports
+                # the run as ended.
                 logger.debug(
                     f"Pipeline run data for {project} issue #{issue_number} expired from Redis "
                     f"(run_id: {pipeline_run_id[:8]}...), falling back to Elasticsearch"
                 )
-                self.redis.hdel(self.redis_issue_mapping, issue_key)
+                expired_mappings.append((issue_key, pipeline_run_id))
                 # Fall through to try the next key / ES lookup below
+
+        # Positive evidence, not absence of testimony (#239): an expired mapping
+        # entry is removed only when Elasticsearch still holds that run's document
+        # AND that document says the run has ended. No ES client, an ES error, no
+        # document, or a document that still reads active all mean "unknown", and
+        # unknown leaves the entry exactly where it is -- a run that died without
+        # end_pipeline_run() is collected by cleanup_stale_active_runs_on_startup(),
+        # not by a read.
+        # One ES lookup per distinct run id: the board-scoped and legacy keys can
+        # both point at the same run (the restore path below backfills the legacy
+        # key), and that run's state is the same answer for both entries. Nothing
+        # is cached ACROSS calls: while the answer stays "unknown" the entry stays,
+        # so every later lookup for this issue re-asks -- deliberately, since the
+        # only thing that can change the verdict is ES itself.
+        es_verdicts: dict = {}  # run id -> PipelineRun ES holds, or None
+        for expired_key, expired_run_id in expired_mappings:
+            ended_run = es_verdicts.get(expired_run_id)
+            if self.es and expired_run_id not in es_verdicts:
+                try:
+                    by_id = self.es.search(
+                        index=f"{self.es_index_pattern}-*",
+                        body={
+                            "query": {"bool": {"must": [{"term": {"_id": expired_run_id}}]}},
+                            "size": 1
+                        }
+                    )
+                    if by_id['hits']['total']['value'] > 0:
+                        ended_run = PipelineRun.from_dict(by_id['hits']['hits'][0]['_source'])
+                except Exception as e:
+                    logger.debug(
+                        f"Could not confirm the state of expired pipeline run "
+                        f"{expired_run_id} in Elasticsearch: {e} — keeping its issue "
+                        f"mapping {expired_key}"
+                    )
+                    ended_run = None
+                es_verdicts[expired_run_id] = ended_run
+
+            if ended_run is None or ended_run.is_active():
+                continue
+
+            try:
+                # Compare-and-delete, never a bare HDEL: create_pipeline_run() may
+                # have written a NEW run into this same field since it was read
+                # above, and that run's mapping must survive this cleanup.
+                self.redis.eval(
+                    _COMPARE_AND_DELETE_HASH_FIELD_SCRIPT,
+                    1,
+                    self.redis_issue_mapping,
+                    expired_key,
+                    expired_run_id,
+                )
+                logger.debug(
+                    f"Removed issue mapping {expired_key} for pipeline run "
+                    f"{expired_run_id} — Elasticsearch reports it "
+                    f"{ended_run.status}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to clean up expired issue mapping {expired_key}: {e}"
+                )
 
         # ES fallback: mapping was absent OR Redis data expired.
         # Include "feedback_listening" so human-feedback loops survive restarts
