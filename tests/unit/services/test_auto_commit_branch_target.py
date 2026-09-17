@@ -21,14 +21,23 @@ import logging
 import subprocess
 import pytest
 from contextlib import asynccontextmanager
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from services.auto_commit import AutoCommitService, CommitResult
 
 
 @pytest.fixture
 def service():
-    return AutoCommitService()
+    patcher = patch(
+        'services.git_workflow_manager.git_workflow_manager.sync_epic_worktree_before_commit',
+        new=AsyncMock(return_value=SimpleNamespace(ok=True, detail="", reset_to_remote=False)),
+    )
+    patcher.start()
+    try:
+        yield AutoCommitService()
+    finally:
+        patcher.stop()
 
 
 def _async_noop_lock_cm(*args, **kwargs):

@@ -488,17 +488,25 @@ class AutoCommitService:
                 f"{agent}, Issue: {issue_number}."
             )
             return CommitResult.FAILED
+        if current_branch is None:
+            logger.error(
+                f"WORKFLOW BUG: _commit_and_push() reached its post-guard path with "
+                f"current_branch=None for {project_dir}. Project: {project}, Agent: "
+                f"{agent}, Issue: {issue_number}."
+            )
+            return CommitResult.FAILED
+        branch_name = current_branch
 
         if not is_shared_dir:
             from services.git_workflow_manager import git_workflow_manager
 
             sync_result = await git_workflow_manager.sync_epic_worktree_before_commit(
-                str(project_dir), current_branch
+                str(project_dir), branch_name
             )
             if not sync_result.ok:
                 logger.error(
                     f"Refusing to commit in epic worktree {project_dir} on "
-                    f"{current_branch!r}: {sync_result.detail}"
+                    f"{branch_name!r}: {sync_result.detail}"
                 )
                 return CommitResult.FAILED
 
@@ -542,12 +550,15 @@ class AutoCommitService:
             logger.info(f"No changes to commit for {project} after {agent} execution")
 
         # Always push branch to remote (even if no new commits, there may be unpushed commits)
-        if current_branch and current_branch not in ['main', 'master']:
-            push_success = self._push_branch(project_dir, current_branch)
+        # Defensive truthiness check left in place even after the explicit None
+        # guards above: a future caller/refactor that weakens them must still not
+        # fall through to `_push_branch(..., None)`.
+        if branch_name and branch_name not in ['main', 'master']:
+            push_success = self._push_branch(project_dir, branch_name)
             if push_success:
-                logger.info(f"Successfully pushed branch {current_branch} to remote")
+                logger.info(f"Successfully pushed branch {branch_name} to remote")
             else:
-                logger.warning(f"Failed to push branch {current_branch}, continuing anyway")
+                logger.warning(f"Failed to push branch {branch_name}, continuing anyway")
 
         # NOTE: a failed push is deliberately still not a FAILED result -- that
         # was true of the bool contract too (it only warns). The commit itself

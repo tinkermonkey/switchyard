@@ -3091,7 +3091,7 @@ class AgentExecutor:
                 from services.git_workflow_manager import git_workflow_manager
 
                 sync_result = await git_workflow_manager.sync_epic_worktree_before_commit(
-                    project_dir, commit_branch
+                    str(project_dir), commit_branch
                 )
                 if not sync_result.ok:
                     refusal = (
@@ -3109,7 +3109,8 @@ class AgentExecutor:
                             current_branch=commit_branch,
                             unverifiable=False,
                         )
-                    logger.warning(f"❌ FAILSAFE: {refusal}")
+                    else:
+                        logger.warning(f"❌ FAILSAFE: {refusal}")
                     return FailsafeBranchCheck(None, False, commit_branch)
 
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")

@@ -961,7 +961,13 @@ class GitWorkflowManager:
 
             ahead_count = int(ahead_result.stdout.strip() or '0')
             behind_count = int(behind_result.stdout.strip() or '0')
+            if behind_count == 0 and ahead_count == 0:
+                return EpicWorktreeSyncResult(True)
             if behind_count == 0:
+                logger.info(
+                    f"Epic worktree {project_dir} is {ahead_count} commit(s) ahead of "
+                    f"{remote_ref} and not behind it; proceeding to commit and push."
+                )
                 return EpicWorktreeSyncResult(True)
 
             status_result = subprocess.run(
@@ -990,19 +996,6 @@ class GitWorkflowManager:
                         False,
                         f"Failed to reset {project_dir} to {remote_ref}: "
                         f"{reset_result.stderr.strip()}",
-                    )
-
-                clean_result = subprocess.run(
-                    ['git', '-C', str(project_dir), 'clean', '-fd'],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                if clean_result.returncode != 0:
-                    return EpicWorktreeSyncResult(
-                        False,
-                        f"Failed to clean {project_dir} after resetting to {remote_ref}: "
-                        f"{clean_result.stderr.strip()}",
                     )
 
                 logger.info(

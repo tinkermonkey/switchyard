@@ -25,7 +25,15 @@ from services.auto_commit import AutoCommitService, CommitResult
 
 @pytest.fixture
 def service():
-    return AutoCommitService()
+    patcher = patch(
+        'services.git_workflow_manager.git_workflow_manager.sync_epic_worktree_before_commit',
+        new=AsyncMock(return_value=SimpleNamespace(ok=True, detail="", reset_to_remote=False)),
+    )
+    patcher.start()
+    try:
+        yield AutoCommitService()
+    finally:
+        patcher.stop()
 
 
 class TestCommitAgentChangesProjectDir:
