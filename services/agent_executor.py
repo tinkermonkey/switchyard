@@ -2482,6 +2482,7 @@ class AgentExecutor:
         expected_branch: Optional[str],
         current_branch: Optional[str],
         unverifiable: bool = False,
+        origin_sync_detail: Optional[str] = None,
         worktree_dir: Optional[str] = None,
         pre_dispatch: bool = False,
         drift_dirty: Optional[bool] = None,
@@ -2512,6 +2513,10 @@ class AgentExecutor:
         an operator must do instead, is in the comment's own step 3).
 
         Args:
+            origin_sync_detail: When set, this refusal is NOT a wrong checked-out
+                branch. HEAD is already on the expected branch, but that branch
+                could not be safely committed because the epic worktree is stale
+                or diverged relative to origin.
             worktree_dir: The directory the refusal is about, when the caller knows
                 it independently of task_context -- the pre-dispatch case, where
                 resolution failed before task_context['project_dir'] was set.
@@ -2546,6 +2551,8 @@ class AgentExecutor:
         """
         project_dir = worktree_dir or task_context.get('project_dir', '<worktree>')
         heading = (
+            "## ❌ Epic Worktree Out of Sync with Origin — Pipeline Blocked"
+            if origin_sync_detail is not None else
             "## ❌ Branch Unverifiable — Pipeline Blocked" if unverifiable
             else "## ❌ Wrong Branch — Pipeline Blocked"
         )
@@ -2773,6 +2780,30 @@ class AgentExecutor:
                 "not its own, or on top of work nobody has claimed. No agent ran, "
                 "nothing was committed, and nothing was discarded."
             )
+        elif origin_sync_detail is not None:
+            sync_branch = expected_branch or current_branch or '<branch>'
+            summary = (
+                "The agent completed its work, and the workspace is on this issue's "
+                "branch, but that branch is stale or diverged relative to `origin`, "
+                "so nothing was staged, committed, pushed, or turned into a PR. The "
+                "changes are still sitting uncommitted on disk."
+            )
+            drift_step = (
+                f"2. Inspect the worktree at `{project_dir}` and preserve anything "
+                f"worth keeping (`git -C {project_dir} status`, `git -C {project_dir} diff`). "
+                f"Compare local and remote history with `git -C {project_dir} log "
+                f"--oneline {sync_branch}..origin/{sync_branch}` and `git -C {project_dir} "
+                f"log --oneline origin/{sync_branch}..{sync_branch}`."
+            )
+            drift_clearing_step = (
+                f"3. Reconcile `{sync_branch}` with `origin/{sync_branch}` before "
+                "releasing the lock. If the worktree is only behind and you do not "
+                f"need its local uncommitted state, `git -C {project_dir} fetch origin` "
+                f"then `git -C {project_dir} reset --hard origin/{sync_branch}`. If "
+                "local changes or local commits must be kept, move them onto a branch "
+                "based on current origin and leave this worktree clean on the epic's "
+                "branch before retrying."
+            )
         elif unverifiable:
             summary = (
                 "The agent completed its work, but the workspace's checked-out branch "
@@ -2856,6 +2887,7 @@ class AgentExecutor:
             pipeline_run_id=pipeline_run_id,
             reason=error_detail,
             failure_label=(
+                "an origin-sync refusal" if origin_sync_detail is not None else
                 "an unverifiable-branch refusal" if unverifiable
                 else "a wrong-branch refusal"
             ),
@@ -3108,6 +3140,7 @@ class AgentExecutor:
                             expected_branch=task_context.get('branch_name'),
                             current_branch=commit_branch,
                             unverifiable=False,
+                            origin_sync_detail=sync_result.detail,
                         )
                     else:
                         logger.warning(f"❌ FAILSAFE: {refusal}")
