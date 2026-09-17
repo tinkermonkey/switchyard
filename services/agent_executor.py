@@ -3086,6 +3086,32 @@ class AgentExecutor:
                 return branch_check
             commit_branch = branch_check.commit_branch
 
+            from services.project_workspace import workspace_manager
+            if not workspace_manager.is_base_clone_dir(project_name, project_dir):
+                from services.git_workflow_manager import git_workflow_manager
+
+                sync_result = await git_workflow_manager.sync_epic_worktree_before_commit(
+                    project_dir, commit_branch
+                )
+                if not sync_result.ok:
+                    refusal = (
+                        f"Refusing failsafe commit in epic worktree {project_dir} on "
+                        f"{commit_branch!r}: {sync_result.detail}"
+                    )
+                    if task_context.get('branch_name'):
+                        logger.error(f"❌ FAILSAFE: {refusal}")
+                        await self._handle_wrong_branch_refusal(
+                            project_name=project_name,
+                            task_context=task_context,
+                            pipeline_run_id=task_context.get('pipeline_run_id'),
+                            error_detail=refusal,
+                            expected_branch=task_context.get('branch_name'),
+                            current_branch=commit_branch,
+                            unverifiable=False,
+                        )
+                    logger.warning(f"❌ FAILSAFE: {refusal}")
+                    return FailsafeBranchCheck(None, False, commit_branch)
+
             logger.info(f"🔍 FAILSAFE: Checking git status in {project_dir}")
 
             # Get git status

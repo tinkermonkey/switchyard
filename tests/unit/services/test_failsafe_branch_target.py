@@ -24,6 +24,7 @@ if not os.path.isdir('/app'):
     pytest.skip("Requires Docker container environment", allow_module_level=True)
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 
 @pytest.fixture
@@ -242,6 +243,32 @@ class TestFailsafeCommitCheckHonorsTheExpectation:
                 task_id='task-1',
             )
             assert refusal is None
+
+    @pytest.mark.asyncio
+    async def test_epic_worktree_sync_failure_refuses_before_status(self, executor):
+        with patch('subprocess.run', side_effect=_git_stub()) as mock_run, \
+             patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=False), \
+             patch('services.git_workflow_manager.git_workflow_manager.sync_epic_worktree_before_commit',
+                   AsyncMock(return_value=SimpleNamespace(
+                       ok=False,
+                       detail='Epic worktree is behind origin and dirty',
+                   ))):
+
+            refusal = await executor._failsafe_commit_check(
+                project_name='test-project',
+                agent_name='repair_fix',
+                task_context={
+                    'issue_number': 7,
+                    'project_dir': '/workspace/x',
+                    'branch_name': None,
+                },
+                task_id='task-1',
+            )
+
+        assert refusal is not None
+        assert refusal.escalate is False
+        assert refusal.current_branch == 'feature/issue-5-epic'
+        assert all('status' not in call.args[0] for call in mock_run.call_args_list)
 
 
 class TestFailsafePushUsesTheVerifiedBranch:

@@ -42,6 +42,14 @@ class BranchInfo:
     pr_state: Optional[str] = None  # 'draft', 'open', 'merged', 'closed'
 
 
+@dataclass
+class EpicWorktreeSyncResult:
+    """Outcome of checking whether an epic worktree is safe to commit on."""
+    ok: bool
+    detail: str = ""
+    reset_to_remote: bool = False
+
+
 def validate_no_unwanted_docs(project_dir: str, staged_files: List[str]) -> Dict[str, Any]:
     """
     Validate that no unwanted documentation markdown files are being committed.
@@ -885,6 +893,143 @@ class GitWorkflowManager:
 
         except subprocess.TimeoutExpired:
             raise Exception("Workspace sync timed out")
+
+    async def sync_epic_worktree_before_commit(
+        self, project_dir: str, branch_name: str
+    ) -> EpicWorktreeSyncResult:
+        """Fetch origin/<branch> and refuse or repair stale epic worktrees before commit."""
+        remote_ref = f'origin/{branch_name}'
+        try:
+            ls_remote = subprocess.run(
+                ['git', '-C', str(project_dir), 'ls-remote', '--heads', 'origin', branch_name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if ls_remote.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not query origin for branch {branch_name!r}: "
+                    f"{ls_remote.stderr.strip()}",
+                )
+            if not ls_remote.stdout.strip():
+                logger.info(
+                    f"Epic worktree {project_dir} has no remote branch {remote_ref} yet; "
+                    "skipping pre-commit alignment."
+                )
+                return EpicWorktreeSyncResult(True)
+
+            fetch_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if fetch_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Failed to fetch {remote_ref} before commit: "
+                    f"{fetch_result.stderr.strip()}",
+                )
+
+            ahead_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count', f'{remote_ref}..HEAD'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if ahead_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not compare local commits ahead of {remote_ref}: "
+                    f"{ahead_result.stderr.strip()}",
+                )
+
+            behind_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count', f'HEAD..{remote_ref}'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if behind_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not compare commits behind {remote_ref}: "
+                    f"{behind_result.stderr.strip()}",
+                )
+
+            ahead_count = int(ahead_result.stdout.strip() or '0')
+            behind_count = int(behind_result.stdout.strip() or '0')
+            if behind_count == 0:
+                return EpicWorktreeSyncResult(True)
+
+            status_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'status', '--porcelain'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if status_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not determine whether {project_dir} is dirty before aligning "
+                    f"to {remote_ref}: {status_result.stderr.strip()}",
+                )
+            dirty = bool(status_result.stdout.strip())
+
+            if ahead_count == 0 and not dirty:
+                reset_result = subprocess.run(
+                    ['git', '-C', str(project_dir), 'reset', '--hard', remote_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if reset_result.returncode != 0:
+                    return EpicWorktreeSyncResult(
+                        False,
+                        f"Failed to reset {project_dir} to {remote_ref}: "
+                        f"{reset_result.stderr.strip()}",
+                    )
+
+                clean_result = subprocess.run(
+                    ['git', '-C', str(project_dir), 'clean', '-fd'],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if clean_result.returncode != 0:
+                    return EpicWorktreeSyncResult(
+                        False,
+                        f"Failed to clean {project_dir} after resetting to {remote_ref}: "
+                        f"{clean_result.stderr.strip()}",
+                    )
+
+                logger.info(
+                    f"Reset clean epic worktree {project_dir} to {remote_ref} before commit."
+                )
+                return EpicWorktreeSyncResult(True, reset_to_remote=True)
+
+            if ahead_count > 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Epic worktree {project_dir} has diverged from {remote_ref} "
+                    f"(ahead {ahead_count}, behind {behind_count}); refusing to commit "
+                    "until a human reconciles it.",
+                )
+
+            return EpicWorktreeSyncResult(
+                False,
+                f"Epic worktree {project_dir} is {behind_count} commit(s) behind "
+                f"{remote_ref} and has uncommitted changes; refusing to commit on top "
+                "of a stale base.",
+            )
+        except Exception as e:
+            return EpicWorktreeSyncResult(
+                False,
+                f"Unexpected error while syncing epic worktree {project_dir} against "
+                f"{remote_ref}: {e}",
+            )
 
     async def get_current_branch(self, project_dir: str) -> str:
         """Get the current branch name"""

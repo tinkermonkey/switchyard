@@ -360,6 +360,7 @@ class TestUnknownBranchIsRefused:
             result = await service._commit_and_push(
                 'test-project', 'senior_software_engineer', 'task-1',
                 tmp_path, None, 7, None,
+                is_shared_dir=True,
             )
 
             assert result is CommitResult.FAILED
@@ -450,6 +451,7 @@ class TestUnknownBranchIsRefused:
             result = await service._commit_and_push(
                 'test-project', 'repair_cycle', 'task-1',
                 tmp_path, 'HEAD', 7, None,
+                is_shared_dir=False,
             )
 
             assert result is CommitResult.FAILED
@@ -502,6 +504,7 @@ class TestSingleCommitAndPushCallSite:
             mock_cp.assert_called_once_with(
                 'test-project', 'senior_software_engineer', 'task-1', tmp_path,
                 'feature/issue-7-epic', 7, 'msg',
+                is_shared_dir=False,
             )
 
     @pytest.mark.asyncio
@@ -528,6 +531,7 @@ class TestSingleCommitAndPushCallSite:
             mock_cp.assert_called_once_with(
                 'test-project', 'senior_software_engineer', 'task-1', tmp_path,
                 'feature/issue-7-epic', 7, 'msg',
+                is_shared_dir=True,
             )
 
 

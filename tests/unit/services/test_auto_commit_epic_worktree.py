@@ -17,7 +17,8 @@ bare Mock/fake path.
 
 import pytest
 from contextlib import asynccontextmanager
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 from services.auto_commit import AutoCommitService, CommitResult
 
@@ -282,3 +283,37 @@ class TestCurrentBranchReReadAfterTheLock:
             mock_check.assert_not_called()
             mock_stage.assert_not_called()
             mock_commit.assert_not_called()
+
+
+class TestEpicWorktreeOriginAlignment:
+    @pytest.mark.asyncio
+    async def test_epic_worktree_sync_failure_refuses_before_staging(self, service, tmp_path):
+        sync_result = AsyncMock(return_value=SimpleNamespace(
+            ok=False,
+            detail="Epic worktree is behind origin and dirty",
+        ))
+
+        with patch('services.project_workspace.workspace_manager.is_base_clone_dir', return_value=False), \
+             patch.object(service, '_get_current_branch', return_value='feature/issue-7-epic'), \
+             patch('services.git_workflow_manager.git_workflow_manager.sync_epic_worktree_before_commit',
+                   sync_result), \
+             patch.object(service, '_check_for_changes') as mock_check, \
+             patch.object(service, '_stage_changes') as mock_stage, \
+             patch.object(service, '_commit') as mock_commit, \
+             patch.object(service, '_push_branch') as mock_push:
+
+            result = await service.commit_agent_changes(
+                project='test-project',
+                agent='senior_software_engineer',
+                task_id='task-1',
+                project_dir=tmp_path,
+                issue_number=7,
+                expected_branch='feature/issue-7-epic',
+            )
+
+        assert result is CommitResult.FAILED
+        sync_result.assert_awaited_once_with(str(tmp_path), 'feature/issue-7-epic')
+        mock_check.assert_not_called()
+        mock_stage.assert_not_called()
+        mock_commit.assert_not_called()
+        mock_push.assert_not_called()

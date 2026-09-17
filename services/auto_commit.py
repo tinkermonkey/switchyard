@@ -232,7 +232,8 @@ class AutoCommitService:
                     return CommitResult.FAILED
 
                 return await self._commit_and_push(
-                    project, agent, task_id, project_dir, commit_branch, issue_number, custom_message
+                    project, agent, task_id, project_dir, commit_branch, issue_number,
+                    custom_message, is_shared_dir=is_shared_dir
                 )
 
         except Exception as e:
@@ -452,6 +453,8 @@ class AutoCommitService:
         current_branch: Optional[str],
         issue_number: Optional[int],
         custom_message: Optional[str],
+        *,
+        is_shared_dir: bool,
     ) -> CommitResult:
         """
         The actual git add/commit/push sequence, split out of
@@ -485,6 +488,19 @@ class AutoCommitService:
                 f"{agent}, Issue: {issue_number}."
             )
             return CommitResult.FAILED
+
+        if not is_shared_dir:
+            from services.git_workflow_manager import git_workflow_manager
+
+            sync_result = await git_workflow_manager.sync_epic_worktree_before_commit(
+                str(project_dir), current_branch
+            )
+            if not sync_result.ok:
+                logger.error(
+                    f"Refusing to commit in epic worktree {project_dir} on "
+                    f"{current_branch!r}: {sync_result.detail}"
+                )
+                return CommitResult.FAILED
 
         # Check if there are changes to commit
         has_changes = self._check_for_changes(project_dir)
