@@ -21,14 +21,23 @@ import logging
 import subprocess
 import pytest
 from contextlib import asynccontextmanager
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from services.auto_commit import AutoCommitService, CommitResult
 
 
 @pytest.fixture
 def service():
-    return AutoCommitService()
+    patcher = patch(
+        'services.git_workflow_manager.git_workflow_manager.sync_epic_worktree_before_commit',
+        new=AsyncMock(return_value=SimpleNamespace(ok=True, detail="", reset_to_remote=False)),
+    )
+    patcher.start()
+    try:
+        yield AutoCommitService()
+    finally:
+        patcher.stop()
 
 
 def _async_noop_lock_cm(*args, **kwargs):
@@ -360,6 +369,7 @@ class TestUnknownBranchIsRefused:
             result = await service._commit_and_push(
                 'test-project', 'senior_software_engineer', 'task-1',
                 tmp_path, None, 7, None,
+                is_shared_dir=True,
             )
 
             assert result is CommitResult.FAILED
@@ -450,6 +460,7 @@ class TestUnknownBranchIsRefused:
             result = await service._commit_and_push(
                 'test-project', 'repair_cycle', 'task-1',
                 tmp_path, 'HEAD', 7, None,
+                is_shared_dir=False,
             )
 
             assert result is CommitResult.FAILED
@@ -502,6 +513,7 @@ class TestSingleCommitAndPushCallSite:
             mock_cp.assert_called_once_with(
                 'test-project', 'senior_software_engineer', 'task-1', tmp_path,
                 'feature/issue-7-epic', 7, 'msg',
+                is_shared_dir=False,
             )
 
     @pytest.mark.asyncio
@@ -528,6 +540,7 @@ class TestSingleCommitAndPushCallSite:
             mock_cp.assert_called_once_with(
                 'test-project', 'senior_software_engineer', 'task-1', tmp_path,
                 'feature/issue-7-epic', 7, 'msg',
+                is_shared_dir=True,
             )
 
 

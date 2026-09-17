@@ -496,3 +496,62 @@ class TestPullRebase:
         manager.push_branch.assert_not_called()
         reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
         assert reset_calls == []
+
+
+class TestSyncEpicWorktreeBeforeCommit:
+    @pytest.fixture
+    def manager(self):
+        return GitWorkflowManager()
+
+    @staticmethod
+    def _run_factory(*, remote_exists=True, ahead=0, behind=0, dirty=False):
+        def _run(cmd, **kwargs):
+            if cmd[:5] == ['git', '-C', '/workspace/test-project', 'ls-remote', '--heads']:
+                return Mock(returncode=0, stdout=('sha\n' if remote_exists else ''), stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'fetch']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'rev-list'] and cmd[-1] == 'origin/feature/test..HEAD':
+                return Mock(returncode=0, stdout=f'{ahead}\n', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'rev-list'] and cmd[-1] == 'HEAD..origin/feature/test':
+                return Mock(returncode=0, stdout=f'{behind}\n', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'status']:
+                return Mock(returncode=0, stdout=(' M app.py\n' if dirty else ''), stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'reset']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'clean']:
+                return Mock(returncode=0, stdout='', stderr='')
+            raise AssertionError(f"Unexpected subprocess.run call: {cmd}")
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_clean_branch_behind_origin_is_reset_before_commit(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(behind=3)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is True
+        assert result.reset_to_remote is True
+
+    @pytest.mark.asyncio
+    async def test_dirty_branch_behind_origin_is_refused(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(behind=2, dirty=True)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is False
+        assert "behind origin/feature/test" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_diverged_branch_is_refused(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(ahead=1, behind=2)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is False
+        assert "has diverged" in result.detail
