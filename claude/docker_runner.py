@@ -1629,8 +1629,18 @@ class DockerAgentRunner:
         if pr_review_phase:
             cmd.extend(['--label', f'org.switchyard.pr_review_phase={pr_review_phase}'])
 
+        # NOTE: 'review_cycle' is overloaded across the codebase. pr_review_stage.py's
+        # multi-phase PR review puts a plain cycle-number scalar here (what this label
+        # is for -- see agent_container_recovery.py's pr_review_cycle_label consumer).
+        # services/review_cycle.py's generic maker-checker cycle puts a whole state
+        # dict here instead (iteration, maker_agent, previous_maker_output, ...), which
+        # can carry the full prior maker output -- multiple hundred KB of text. Passing
+        # that through str()/f-string into a `docker run --label` argument blew past the
+        # kernel's per-argument exec limit (MAX_ARG_STRLEN, 128KB) and made every
+        # detached container launch fail with "Argument list too long: 'docker'" before
+        # docker even ran. Only emit the label for the scalar form.
         review_cycle = task_context.get('review_cycle')
-        if review_cycle is not None:
+        if isinstance(review_cycle, (str, int)):
             cmd.extend(['--label', f'org.switchyard.pr_review_cycle={review_cycle}'])
 
         # Add -i (interactive) flag if we need stdin for large prompts
