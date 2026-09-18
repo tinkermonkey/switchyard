@@ -384,3 +384,89 @@ class TestTheCheckSaysWhichAnswerItGave:
         assert 'No pre-agent HEAD captured' in caplog.text
         assert 'will NOT be' in caplog.text, "must say detection is disabled"
         assert 'senior_software_engineer' in caplog.text, "name the agent it applies to"
+
+
+class TestAnInheritedGitEnvCannotRedirectTheCheck:
+    """#271 follow-up. `git -C <path>` is overridden by GIT_DIR / GIT_WORK_TREE
+    in the environment, so an inherited one silently points every command at a
+    DIFFERENT repository.
+
+    The failure mode is the worst available here: the pre-snapshot and the
+    post-read both come from the wrong repo, compare equal, and the check
+    reports a clean tree for a worktree that was just rewritten. Measured
+    against the unscrubbed version, the detector returned False for a genuinely
+    dropped published commit.
+
+    project_workspace's own git probe scrubs for exactly this reason (#253).
+    This one did not.
+    """
+
+    def _m(self):
+        return GitWorkflowManager.__new__(GitWorkflowManager)
+
+    @pytest.fixture
+    def unrelated_repo(self, tmp_path):
+        other = tmp_path / 'unrelated'
+        other.mkdir()
+        subprocess.run(['git', 'init', '-q', str(other)], check=True, env=_ENV)
+        (other / 'x.txt').write_text('x\n')
+        _git(other, 'add', '-A')
+        _git(other, 'commit', '-qm', 'unrelated')
+        return other
+
+    def test_the_detector_still_sees_the_rewrite(self, repo, unrelated_repo, monkeypatch):
+        (repo / 'f.txt').write_text('b\n')
+        _git(repo, 'commit', '-qam', 'published work')
+        _git(repo, 'push', '-q', 'origin', 'main')
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        _git(repo, 'reset', '--hard', 'HEAD~1')
+
+        monkeypatch.setenv('GIT_DIR', str(unrelated_repo / '.git'))
+
+        dropped = self._m().find_dropped_pushed_commits(str(repo), pre)
+        assert [s for _, s in dropped] == ['published work'], (
+            "an inherited GIT_DIR must not redirect the check at another repo"
+        )
+
+    def test_read_head_still_reads_the_right_repo(self, repo, unrelated_repo, monkeypatch):
+        expected = _git(repo, 'rev-parse', 'HEAD')
+        monkeypatch.setenv('GIT_DIR', str(unrelated_repo / '.git'))
+
+        assert self._m().read_head(str(repo)) == expected
+
+    def test_git_work_tree_is_scrubbed_too(self, repo, unrelated_repo, monkeypatch):
+        expected = _git(repo, 'rev-parse', 'HEAD')
+        monkeypatch.setenv('GIT_WORK_TREE', str(unrelated_repo))
+        monkeypatch.setenv('GIT_DIR', str(unrelated_repo / '.git'))
+
+        assert self._m().read_head(str(repo)) == expected
+
+
+class TestTheQuietExitsAreVisibleAtInfo:
+    """#271's remaining blind spot. These two were the only exits still at
+    `debug`, which the orchestrator does not emit -- so a run where the snapshot
+    logged correctly and the agent demonstrably rewrote history still produced
+    nothing readable either way. One line per agent run is a cheap price."""
+
+    def _m(self):
+        return GitWorkflowManager.__new__(GitWorkflowManager)
+
+    def test_head_unchanged_logs_at_info(self, repo, caplog):
+        import logging
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        with caplog.at_level(logging.INFO):
+            assert self._m().find_dropped_pushed_commits(str(repo), pre) == []
+        assert 'HEAD unchanged' in caplog.text
+        assert any(r.levelno >= logging.INFO for r in caplog.records)
+
+    def test_still_an_ancestor_logs_at_info(self, repo, caplog):
+        import logging
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        (repo / 'k.txt').write_text('x\n')
+        _git(repo, 'add', '-A')
+        _git(repo, 'commit', '-qm', 'ordinary work')
+
+        with caplog.at_level(logging.INFO):
+            assert self._m().find_dropped_pushed_commits(str(repo), pre) == []
+        assert 'still an ancestor' in caplog.text
+        assert any(r.levelno >= logging.INFO for r in caplog.records)
