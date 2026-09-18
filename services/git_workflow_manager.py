@@ -1371,10 +1371,22 @@ class GitWorkflowManager:
             )
             return []
 
+        # Scrubbed, not inherited. `git -C <path>` is overridden by GIT_DIR /
+        # GIT_WORK_TREE in the environment, so an inherited one makes every
+        # command below answer about a DIFFERENT repository -- HEAD, the branch
+        # name, the remote ref and the ancestry checks all silently shift to it.
+        # The failure mode is the worst kind here: pre and post would both read
+        # from the wrong repo, compare equal, and the check would take its
+        # "HEAD unchanged" path and report a clean tree for a worktree that had
+        # just been rewritten. project_workspace's own git probe scrubs for
+        # exactly this reason (#253); this one did not, which is a latent
+        # version of the same defect whether or not it caused #271.
+        _env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+
         def _git(*args):
             return subprocess.run(
                 ['git', '-C', str(project_dir), *args],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, env=_env,
             )
 
         try:
@@ -1393,15 +1405,21 @@ class GitWorkflowManager:
                 )
                 return []
             if post_head == pre_head:
-                logger.debug(
-                    f"{project_dir} HEAD unchanged at {post_head[:8]}; no history "
-                    f"to check"
+                # info, not debug: these two exits were the ONLY ones left
+                # silent at the orchestrator's log level, and #271 turned on
+                # precisely that -- the snapshot logged correctly, the agent
+                # demonstrably rewrote history, and the check reported nothing
+                # that could be read either way. One line per agent run is a
+                # cheap price for never being in that position again.
+                logger.info(
+                    f"{project_dir} HEAD unchanged at {post_head[:8]} across the "
+                    f"agent run; no history to check"
                 )
                 return []
 
             # Still a descendant? Then nothing was dropped, whatever else moved.
             if _git('merge-base', '--is-ancestor', pre_head, post_head).returncode == 0:
-                logger.debug(
+                logger.info(
                     f"{project_dir} moved {pre_head[:8]} -> {post_head[:8]} and the "
                     f"old HEAD is still an ancestor; nothing dropped"
                 )
@@ -1473,9 +1491,13 @@ class GitWorkflowManager:
         all, and a missing repo there is ordinary rather than exceptional.
         """
         try:
+            # Scrubbed for the same reason as the detector below: an
+            # inherited GIT_DIR would snapshot the wrong repository's HEAD, and
+            # the resulting pre/post pair would compare equal and read as clean.
             result = subprocess.run(
                 ['git', '-C', str(project_dir), 'rev-parse', 'HEAD'],
                 capture_output=True, text=True, timeout=15,
+                env={k: v for k, v in os.environ.items() if not k.startswith('GIT_')},
             )
             if result.returncode != 0:
                 logger.debug(
