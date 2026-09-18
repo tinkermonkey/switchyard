@@ -1998,3 +1998,58 @@ def _restore_process_globals():
         "pattern. If the module genuinely has nothing process-wide to damage, "
         "add it to RELOADABLE_FIRST_PARTY_MODULES in this file with the reason."
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_github_api_breaker():
+    """Reset GitHubAPIClient's shared singleton breaker before and after
+    every test (GitHub circuit breaker consolidation).
+
+    get_github_client() returns one process-wide GitHubAPIClient, and its
+    breaker now trips on sustained UNCLASSIFIED failures
+    (GitHubBreaker.record_generic_failure()), not just an explicit rate-limit
+    response the way it used to. That is a much easier bar to clear by
+    accident: any test anywhere in the suite that mocks `subprocess.run` (or
+    `requests.*`) to simulate a failed `gh`/HTTP call -- for a reason that has
+    nothing to do with GitHub API behavior -- now silently spends part of
+    this shared counter if that code path happens to touch
+    gh_cli()/rest()/graphql()/http_request(). Five such tests in a row trip
+    the breaker for real, on a real wall-clock timer
+    (GitHubBreaker.GENERIC_FAILURE_RECOVERY_SECONDS), and every test that
+    happens to run within that window afterward inherits a breaker that is
+    already open for a reason that has nothing to do with what IT is
+    testing.
+
+    Confirmed root cause of one such leak: `subprocess.run` is the same
+    module-level function object regardless of which module's name is used
+    to patch it, so
+    tests/unit/orchestrator/test_repair_cycle_lock_steal.py patching
+    `services.project_monitor.subprocess.run` with
+    `side_effect=CalledProcessError(...)` (to keep an unrelated lock-gate
+    test from making a real `gh` shellout) also makes every subprocess.run
+    call inside services/github_api_client.py raise the same way --
+    including from inside its own generic `except Exception` handler, which
+    is exactly where record_generic_failure() was added. Its
+    TestLockAcquisitionGate class spent the counter by exactly one per test
+    across 5 tests, tripping the breaker on the 5th with nothing in that
+    file aware it was touching GitHub API state at all -- and the next test
+    file to run within GENERIC_FAILURE_RECOVERY_SECONDS inherited an
+    already-open breaker.
+
+    Same instinct as _restore_process_globals above: one shared object every
+    test reaches through the same accessor, so no single test can be
+    expected to know it must reset it for whichever one runs after it.
+    """
+    from services.github_api_client import get_github_client, GitHubBreaker
+
+    def _reset():
+        breaker = get_github_client().breaker
+        breaker.state = GitHubBreaker.CLOSED
+        breaker.opened_at = None
+        breaker.reset_time = None
+        breaker.trip_reason = None
+        breaker._generic_failure_count = 0
+
+    _reset()
+    yield
+    _reset()

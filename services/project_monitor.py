@@ -1415,8 +1415,6 @@ class ProjectMonitor:
             Set of valid column names, or empty set if all methods fail
         """
         from config.state_manager import state_manager
-        import subprocess
-        import json
 
         # Try reverse lookup first
         for project_name in self.config_manager.list_visible_projects():
@@ -1455,12 +1453,13 @@ class ProjectMonitor:
         # FALLBACK: Query GitHub API directly for board columns
         try:
             # Use gh CLI to get project field values
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'project', 'field-list', str(project_number),
-                 '--owner', project_owner, '--format', 'json'],
-                capture_output=True, text=True, check=True, timeout=30
+                 '--owner', project_owner, '--format', 'json']
             )
-            fields = json.loads(result.stdout)
+            if not success or not isinstance(result.data, list):
+                raise RuntimeError(f"gh project field-list failed: {result}")
+            fields = result.data
 
             # Find Status field
             status_field = next((f for f in fields if f['name'] == 'Status'), None)
@@ -2165,48 +2164,41 @@ class ProjectMonitor:
         the downstream empty-description guard with a misleading message,
         instead of surfacing the real fetch failure to the caller.
         """
-        # Uses a raw subprocess call (not the tracked GitHubAPIClient) because
-        # the retry semantics here are deliberately different from gh_cli()'s:
-        # an empty-stdout success must be retried rather than silently
-        # swallowed (see docstring above).
-        github_client = get_github_client()
+        # Routed through GitHubAPIClient.gh_cli() (GitHub circuit breaker
+        # consolidation) so this call respects the shared breaker like every
+        # other GitHub access -- but the retry loop below stays caller-side
+        # rather than gh_cli()'s own generic retries=N: an empty-stdout
+        # SUCCESS must still be retried (see docstring above), which is a
+        # different predicate than gh_cli()'s "unclassified failure" retry.
+        # gh_cli() already tracks each attempt generically (as 'gh_cli'), so
+        # this no longer needs its own separate track_gh_operation() call.
         last_error = None
         for attempt in range(3):
-            try:
-                result = subprocess.run(
-                    ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url'],
-                    capture_output=True, text=True, check=True
-                )
-                parsed = json.loads(result.stdout)
-            except Exception as e:
-                last_error = e
-                if attempt < 2:
-                    logger.warning(
-                        f"Transient failure fetching issue #{issue_number} details "
-                        f"(attempt {attempt + 1}/3): {e}; retrying"
-                    )
-                    time.sleep(0.5 * (attempt + 1))
-                continue
+            success, result = get_github_client().gh_cli(
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'title,body,labels,state,author,createdAt,updatedAt,url']
+            )
+            if success and isinstance(result.data, dict):
+                return result.data
 
-            # Tracked outside the retry try/except above, on its own try:
-            # a bug in track_gh_operation() itself must never be misread as
-            # a GitHub fetch failure - that would discard an already-fetched
-            # real result, trigger a needless retry that re-issues the (now
-            # redundant) `gh issue view` call, and could ultimately raise
-            # "could not fetch" for an issue that was actually fetched fine
-            # every single attempt. This only makes the call visible in the
-            # Call Summary logging (issue #103); it does not itself update
-            # rate_limit_graphql/rate_limit_rest, which only reflect
-            # GitHubAPIClient's own graphql()/rest() calls and the periodic
-            # /rate_limit poll. `gh issue view` uses GraphQL under the hood.
-            try:
-                github_client.track_gh_operation(
-                    'gh_issue_view', f'gh issue view #{issue_number} in {org}/{repository}'
+            if success:
+                # gh exited 0 but stdout wasn't valid JSON -- gh_cli() falls
+                # back to raw stdout rather than raising on a decode failure
+                # the way json.loads() used to. Treat it as the same
+                # transient-failure signal bc70ac46 was about: retry, then
+                # raise, rather than silently returning that raw string (or
+                # '' on empty stdout) as if it were the issue.
+                last_error = RuntimeError(
+                    f"gh exited 0 but returned non-JSON output: {result.stdout[:200]!r}"
                 )
-            except Exception as track_err:
-                logger.warning(f"Failed to record gh_issue_view tracking (non-fatal): {track_err}")
+            else:
+                last_error = RuntimeError(result.stderr.strip() if result.stderr else (result.error_kind or "unknown error"))
 
-            return parsed
+            if attempt < 2:
+                logger.warning(
+                    f"Transient failure fetching issue #{issue_number} details "
+                    f"(attempt {attempt + 1}/3): {last_error}; retrying"
+                )
+                time.sleep(0.5 * (attempt + 1))
 
         logger.error(f"Error fetching issue #{issue_number} details after 3 attempts: {last_error}")
         raise RuntimeError(
@@ -2297,15 +2289,14 @@ class ProjectMonitor:
                             # This might be a sub-issue, look for parent issue's discussion
                             # Get parent issue number from GitHub (sub-issues have trackedIn field)
                             try:
-                                import subprocess
-                                result = subprocess.run(
+                                success, result = get_github_client().gh_cli(
                                     ['gh', 'issue', 'view', str(issue_number),
                                      '--repo', f"{org}/{repository}",
-                                     '--json', 'body'],
-                                    capture_output=True, text=True, check=True
+                                     '--json', 'body']
                                 )
-                                issue_data = json.loads(result.stdout)
-                                body = issue_data.get('body', '')
+                                if not success or not isinstance(result.data, dict):
+                                    raise RuntimeError(f"gh issue view failed: {result}")
+                                body = result.data.get('body', '')
 
                                 # Look for "Part of #NNN" pattern in issue body
                                 import re
@@ -2499,11 +2490,12 @@ class ProjectMonitor:
         """
         try:
             # Fetch all comments
-            result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments'],
-                capture_output=True, text=True, check=True
+            success, result = get_github_client().gh_cli(
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments']
             )
-            data = json.loads(result.stdout)
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh issue view failed: {result}")
+            data = result.data
 
             from dateutil import parser as date_parser
             from datetime import timezone
@@ -2898,16 +2890,15 @@ class ProjectMonitor:
             Formatted context string with all specified agent outputs
         """
         try:
-            import subprocess
-            import json
             from dateutil import parser as date_parser
 
             # Fetch all comments from the issue
-            result = subprocess.run(
-                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments'],
-                capture_output=True, text=True, check=True
+            success, result = get_github_client().gh_cli(
+                ['gh', 'issue', 'view', str(issue_number), '--repo', f"{org}/{repository}", '--json', 'comments']
             )
-            data = json.loads(result.stdout)
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh issue view failed: {result}")
+            data = result.data
             all_comments = data.get('comments', [])
 
             # Find outputs from each requested agent
@@ -2969,9 +2960,6 @@ class ProjectMonitor:
 
             return "\n\n---\n\n".join(context_parts) if context_parts else ""
 
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error fetching issue comments: {e}")
-            return ""
         except Exception as e:
             logger.error(f"Error fetching agent outputs from issue: {e}")
             import traceback
@@ -2990,18 +2978,17 @@ class ProjectMonitor:
             "DEBUG" if output is optional for this issue type
         """
         try:
-            import subprocess
-            import json
             import re
 
             # Get issue metadata
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'issue', 'view', str(issue_number),
                  '--repo', f"{org}/{repository}",
-                 '--json', 'body,labels'],
-                capture_output=True, text=True, check=True
+                 '--json', 'body,labels']
             )
-            issue_data = json.loads(result.stdout)
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh issue view failed: {result}")
+            issue_data = result.data
             body = issue_data.get('body', '')
             labels = [label['name'] for label in issue_data.get('labels', [])]
 
@@ -7363,8 +7350,6 @@ _Review cycle initiated by Switchyard_
         False, an extra warning is appended so this comment doesn't imply
         protection that may not actually be in place.
         """
-        import subprocess
-
         try:
             # Build detailed comment
             comment = f"""## 🔴 Repair Cycle Failed
@@ -7395,12 +7380,13 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
 """
 
             # Post comment to issue using gh CLI
-            subprocess.run(
+            comment_success, comment_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'comment', str(issue_number),
                  '--repo', repository,
-                 '--body', comment],
-                capture_output=True, text=True, check=True, timeout=30
+                 '--body', comment]
             )
+            if not comment_success:
+                raise RuntimeError(f"gh issue comment failed: {comment_result}")
 
             logger.info(
                 f"Posted repair cycle failure summary to {project_name} issue #{issue_number}"
@@ -7411,21 +7397,21 @@ lock state manually via `scripts/list_failed_pipeline_runs.py`.
                 label_name = 'repair-cycle:failed'
 
                 # First, try to create the label if it doesn't exist (ignore error if it does)
-                subprocess.run(
+                get_github_client().gh_cli(
                     ['gh', 'label', 'create', label_name,
                      '--repo', repository,
                      '--color', 'd73a4a',  # Red
-                     '--description', 'Repair cycle failed, manual intervention required'],
-                    capture_output=True, text=True, timeout=30
+                     '--description', 'Repair cycle failed, manual intervention required']
                 )
 
                 # Add label to issue
-                subprocess.run(
+                edit_success, edit_result = get_github_client().gh_cli(
                     ['gh', 'issue', 'edit', str(issue_number),
                      '--repo', repository,
-                     '--add-label', label_name],
-                    capture_output=True, text=True, check=True, timeout=30
+                     '--add-label', label_name]
                 )
+                if not edit_success:
+                    raise RuntimeError(f"gh issue edit --add-label failed: {edit_result}")
 
                 logger.info(f"Added '{label_name}' label to issue #{issue_number}")
             except Exception as label_error:
@@ -11194,13 +11180,13 @@ _Repair cycle initiated by Switchyard_
                                                 )
                                 else:
                                     # For issues workspace (default), check issue comments
-                                    result = subprocess.run(
+                                    success, result = get_github_client().gh_cli(
                                         ['gh', 'issue', 'view', str(item.issue_number), '--repo',
-                                         f"{project_config.github['org']}/{item.repository}", '--json', 'comments'],
-                                        capture_output=True, text=True, check=True
+                                         f"{project_config.github['org']}/{item.repository}", '--json', 'comments']
                                     )
-                                    comments_data = json.loads(result.stdout)
-                                    comments = comments_data.get('comments', [])
+                                    if not success or not isinstance(result.data, dict):
+                                        raise RuntimeError(f"gh issue view failed: {result}")
+                                    comments = result.data.get('comments', [])
                                     
                                     agent_name = column_config.agent
                                     last_agent_idx = -1
@@ -13179,20 +13165,19 @@ _Repair cycle initiated by Switchyard_
         """
         try:
             # Fetch issue details to get its title
-            import subprocess
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'api', f'repos/{owner}/{repo}/issues/{issue_number}'],
-                capture_output=True,
-                text=True,
-                timeout=10
+                timeout=10,
             )
 
-            if result.returncode != 0:
+            if not success:
                 logger.warning(f"Could not fetch issue #{issue_number} details: {result.stderr}")
                 return None
+            if not isinstance(result.data, dict):
+                logger.warning(f"gh api returned non-JSON output for issue #{issue_number}: {result.stdout[:200]!r}")
+                return None
 
-            import json
-            issue_data = json.loads(result.stdout)
+            issue_data = result.data
             issue_title = issue_data.get('title', '')
 
             if not issue_title:
@@ -13338,12 +13323,13 @@ This issue will be updated with final requirements when ready for implementation
 
 _Link: {discussion_url}_"""
 
-            subprocess.run(
+            link_success, link_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'comment', str(issue_number),
                  '--repo', f"{project_config.github['org']}/{repository}",
-                 '--body', comment_body],
-                capture_output=True, text=True, check=True
+                 '--body', comment_body]
             )
+            if not link_success:
+                raise RuntimeError(f"gh issue comment failed: {link_result}")
 
             logger.info(f"Added link comment to issue #{issue_number}")
 
@@ -13421,21 +13407,22 @@ When complete, Issue #{issue_number} will be updated with final requirements.
             )
 
             # Update issue body
-            result = subprocess.run(
+            body_success, body_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'edit', str(issue_number),
                  '--repo', f"{project_config.github['org']}/{repository}",
-                 '--body', new_issue_body],
-                capture_output=True, text=True, check=True
+                 '--body', new_issue_body]
             )
+            if not body_success:
+                raise RuntimeError(f"gh issue edit --body failed: {body_result}")
 
             logger.info(f"Updated issue #{issue_number} with finalized requirements")
 
-            # Add "ready-for-implementation" label
-            subprocess.run(
+            # Add "ready-for-implementation" label (best-effort, same as before:
+            # no check on the outcome)
+            get_github_client().gh_cli(
                 ['gh', 'issue', 'edit', str(issue_number),
                  '--repo', f"{project_config.github['org']}/{repository}",
-                 '--add-label', 'ready-for-implementation'],
-                capture_output=True, text=True
+                 '--add-label', 'ready-for-implementation']
             )
 
             # Post completion comment to discussion

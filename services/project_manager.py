@@ -170,21 +170,24 @@ class ProjectManager:
             logger.warning("No GITHUB_ORG configured for project discovery")
             return {}
 
-        try:
-            # Use GitHub CLI to list repositories
-            cmd = ['gh', 'repo', 'list', github_org, '--limit', '100', '--json', 'name,sshUrl']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        from services.github_api_client import get_github_client
 
-            import json
-            repos = json.loads(result.stdout)
+        cmd = ['gh', 'repo', 'list', github_org, '--limit', '100', '--json', 'name,sshUrl']
+        success, result = get_github_client().gh_cli(cmd)
 
-            discovered = {}
-            for repo in repos:
-                discovered[repo['name']] = repo['sshUrl']
-
-            logger.info(f"Discovered {len(discovered)} repositories in {github_org}")
-            return discovered
-
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            logger.error(f"Could not discover GitHub projects: {e}")
+        if not success or not isinstance(result.data, list):
+            # The isinstance check catches gh exiting 0 with non-JSON stdout
+            # -- gh_cli() falls back to the raw string rather than raising,
+            # which would otherwise crash the loop below (`for repo in
+            # <str>` iterates characters, then `repo['name']` raises
+            # TypeError) instead of degrading like every other failure here.
+            logger.error(f"Could not discover GitHub projects: {result}")
             return {}
+
+        repos = result.data
+        discovered = {}
+        for repo in repos:
+            discovered[repo['name']] = repo['sshUrl']
+
+        logger.info(f"Discovered {len(discovered)} repositories in {github_org}")
+        return discovered

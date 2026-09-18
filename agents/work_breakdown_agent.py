@@ -20,7 +20,6 @@ from config.state_manager import GitHubStateManager
 from monitoring.decision_events import get_decision_event_emitter
 from prompts import PromptContext
 import logging
-import json
 import re
 
 logger = logging.getLogger(__name__)
@@ -201,7 +200,7 @@ class WorkBreakdownAgent(AnalysisAgent):
         Called after successful sub-issue creation so the parent enters the tracking phase.
         """
         try:
-            import subprocess as sp
+            from services.github_api_client import get_github_client
 
             # Determine parent issue number
             workspace_type = task_context.get('workspace_type', 'issues')
@@ -269,11 +268,13 @@ class WorkBreakdownAgent(AnalysisAgent):
                 }}
             }}'''
 
-            result = sp.run(
-                ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True, text=True, check=True, timeout=30
+            success, result = get_github_client().gh_cli(
+                ['gh', 'api', 'graphql', '-f', f'query={query}']
             )
-            data = json.loads(result.stdout)
+            if not success:
+                logger.warning(f"Failed to query parent #{parent_issue_number} project items: {result}")
+                return
+            data = result.data
             items = data['data']['repository']['issue']['projectItems']['nodes']
 
             item_id = None
@@ -302,10 +303,14 @@ class WorkBreakdownAgent(AnalysisAgent):
             }}
             '''
 
-            sp.run(
-                ['gh', 'api', 'graphql', '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True, timeout=30
+            success, result = get_github_client().gh_cli(
+                ['gh', 'api', 'graphql', '-f', f'query={mutation}']
             )
+            if not success:
+                logger.warning(
+                    f"Failed to advance parent #{parent_issue_number} to 'In Development': {result}"
+                )
+                return
 
             logger.info(
                 f"Auto-advanced parent #{parent_issue_number} to 'In Development' "
@@ -366,15 +371,16 @@ class WorkBreakdownAgent(AnalysisAgent):
                 else:
                     logger.warning("No discussion_id in task_context — cannot post comment")
             else:
-                import subprocess as sp
+                from services.github_api_client import get_github_client
                 project_config = self.config_manager.get_project_config(project_name)
                 github_config = project_config.github
                 repo = f"{github_config['org']}/{github_config['repo']}"
                 issue_number = task_context.get('issue_number')
-                sp.run(
-                    ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body],
-                    check=True, capture_output=True, text=True,
+                success, result = get_github_client().gh_cli(
+                    ['gh', 'issue', 'comment', str(issue_number), '--repo', repo, '--body', body]
                 )
+                if not success:
+                    raise RuntimeError(f"gh issue comment failed: {result}")
                 try:
                     from monitoring.decision_events import get_decision_event_emitter
                     from services.github_integration import _extract_comment_title
@@ -683,9 +689,8 @@ class WorkBreakdownAgent(AnalysisAgent):
 
         Returns list of created issue metadata (number, url, etc.)
         """
-        import subprocess
-        import json as json_lib
         import asyncio
+        from services.github_api_client import get_github_client
 
         pipeline_run_id = task_context.get('pipeline_run_id')
 
@@ -738,15 +743,12 @@ class WorkBreakdownAgent(AnalysisAgent):
         parent_issue_id = None
         if parent_issue_number:
             try:
-                result = subprocess.run(
-                    ['gh', 'issue', 'view', parent_issue_number, '-R', repo, '--json', 'id'],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=30
+                success, result = get_github_client().gh_cli(
+                    ['gh', 'issue', 'view', parent_issue_number, '-R', repo, '--json', 'id']
                 )
-                parent_data = json_lib.loads(result.stdout)
-                parent_issue_id = parent_data['id']
+                if not success:
+                    raise RuntimeError(f"gh issue view failed: {result}")
+                parent_issue_id = result.data['id']
                 logger.info(f"Parent issue #{parent_issue_number} has ID: {parent_issue_id}")
             except Exception as e:
                 logger.error(f"Failed to get parent issue ID: {e}")
@@ -762,15 +764,11 @@ class WorkBreakdownAgent(AnalysisAgent):
                     # Escape quotes in title for search
                     search_title = sub_issue['title'].replace('"', '\\"')
                     search_cmd = ['gh', 'issue', 'list', '-R', repo, '--search', f'"{search_title}" in:title', '--json', 'number,title,id,url', '--state', 'all']
-                    search_result = subprocess.run(
-                        search_cmd,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=30
-                    )
-                    search_data = json_lib.loads(search_result.stdout)
-                    
+                    success, search_result = get_github_client().gh_cli(search_cmd)
+                    if not success:
+                        raise RuntimeError(f"gh issue list search failed: {search_result}")
+                    search_data = search_result.data if isinstance(search_result.data, list) else []
+
                     # Find exact match
                     for item in search_data:
                         if item['title'] == sub_issue['title']:
@@ -788,43 +786,43 @@ class WorkBreakdownAgent(AnalysisAgent):
                     logger.info(f"Skipping creation of '{sub_issue['title']}' - using existing issue #{issue_number}")
                 else:
                     # Create issue using GitHub CLI (returns URL directly)
-                    result = subprocess.run(
+                    success, result = get_github_client().gh_cli(
                         ['gh', 'issue', 'create',
                          '-R', repo,
                          '--title', sub_issue['title'],
-                         '--body', sub_issue['body']],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=30
+                         '--body', sub_issue['body']]
                     )
+                    if not success:
+                        raise RuntimeError(f"gh issue create failed: {result}")
 
-                    # gh issue create returns the issue URL
+                    # gh issue create returns the issue URL as plain text -- use
+                    # raw stdout directly rather than result.data, which would be
+                    # the same string anyway (a URL never parses as JSON).
                     issue_url = result.stdout.strip()
-                    
+
                     # Extract issue number from URL (e.g., https://github.com/org/repo/issues/123)
                     import re as regex
                     url_match = regex.search(r'/issues/(\d+)$', issue_url)
                     if not url_match:
                         raise Exception(f"Could not extract issue number from URL: {issue_url}")
-                    
+
                     issue_number = url_match.group(1)
-                    
+
                     # Get full issue details including node ID using gh issue view
                     # Retry with backoff since GitHub's API can lag immediately after
-                    # a rapid series of issue creations.
+                    # a rapid series of issue creations. Stays caller-side (not
+                    # gh_cli()'s own retries=N) because its predicate is "not yet
+                    # visible after creation", not a generic transient error.
                     issue_data = None
+                    view_result = None
                     for _attempt in range(3):
-                        view_result = subprocess.run(
+                        view_success, view_result = get_github_client().gh_cli(
                             ['gh', 'issue', 'view', issue_number,
                              '-R', repo,
-                             '--json', 'id,number,url'],
-                            capture_output=True,
-                            text=True,
-                            timeout=30
+                             '--json', 'id,number,url']
                         )
-                        if view_result.returncode == 0:
-                            issue_data = json_lib.loads(view_result.stdout)
+                        if view_success and isinstance(view_result.data, dict):
+                            issue_data = view_result.data
                             break
                         delay = 2 ** _attempt
                         if _attempt < 2:
@@ -836,21 +834,19 @@ class WorkBreakdownAgent(AnalysisAgent):
                     if issue_data is None:
                         raise RuntimeError(
                             f"gh issue view {issue_number} failed after 3 attempts: "
-                            f"{view_result.stderr.strip()}"
+                            f"{view_result.stderr.strip() if view_result else 'no result'}"
                         )
                     issue_id = issue_data['id']
                     issue_number = str(issue_data['number'])
 
                 # Add issue to SDLC board's Backlog column (idempotent-ish, but good to ensure)
-                subprocess.run(
+                success, item_add_result = get_github_client().gh_cli(
                     ['gh', 'project', 'item-add', str(sdlc_board.project_number),
                      '--owner', github_config['org'],
-                     '--url', issue_url],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=30
+                     '--url', issue_url]
                 )
+                if not success:
+                    raise RuntimeError(f"gh project item-add failed: {item_add_result}")
 
                 # Get the project item ID and set status to "Backlog"
                 try:
@@ -872,15 +868,13 @@ class WorkBreakdownAgent(AnalysisAgent):
                         }}
                     }}'''
 
-                    result = subprocess.run(
-                        ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=30
+                    success, result = get_github_client().gh_cli(
+                        ['gh', 'api', 'graphql', '-f', f'query={query}']
                     )
+                    if not success:
+                        raise RuntimeError(f"gh api graphql (project items query) failed: {result}")
 
-                    query_data = json_lib.loads(result.stdout)
+                    query_data = result.data
                     project_items = query_data['data']['repository']['issue']['projectItems']['nodes']
 
                     logger.info(f"Issue #{issue_number} is in {len(project_items)} project(s): {[p['project']['title'] for p in project_items]}")
@@ -913,13 +907,11 @@ class WorkBreakdownAgent(AnalysisAgent):
                                     }}
                                 }}
                                 '''
-                                delete_result = subprocess.run(
-                                    ['gh', 'api', 'graphql', '-f', f'query={delete_mutation}'],
-                                    capture_output=True,
-                                    text=True,
-                                    check=True,
-                                    timeout=30
+                                delete_success, delete_result = get_github_client().gh_cli(
+                                    ['gh', 'api', 'graphql', '-f', f'query={delete_mutation}']
                                 )
+                                if not delete_success:
+                                    raise RuntimeError(f"deleteProjectV2Item failed: {delete_result}")
                                 logger.info(f"✓ Removed issue #{issue_number} from project '{item['project']['title']}' (#{item['project']['number']})")
                             except Exception as e:
                                 logger.warning(f"✗ Failed to remove issue #{issue_number} from project #{item['project']['number']}: {e}")
@@ -954,13 +946,11 @@ class WorkBreakdownAgent(AnalysisAgent):
                             }}
                             '''
 
-                            subprocess.run(
-                                ['gh', 'api', 'graphql', '-f', f'query={status_mutation}'],
-                                capture_output=True,
-                                text=True,
-                                check=True,
-                                timeout=30
+                            status_success, status_result = get_github_client().gh_cli(
+                                ['gh', 'api', 'graphql', '-f', f'query={status_mutation}']
                             )
+                            if not status_success:
+                                raise RuntimeError(f"updateProjectV2ItemFieldValue failed: {status_result}")
                             logger.info(f"Set issue #{issue_number} status to Backlog in SDLC board")
                     else:
                         logger.warning(f"Could not find project item ID for issue #{issue_number} in SDLC board")
@@ -987,15 +977,13 @@ class WorkBreakdownAgent(AnalysisAgent):
                     }}
                     """
 
-                    subprocess.run(
+                    link_success, link_result = get_github_client().gh_cli(
                         ['gh', 'api', 'graphql',
                          '-H', 'GraphQL-Features: sub_issues',
-                         '-f', f'query={graphql_query}'],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        timeout=30
+                         '-f', f'query={graphql_query}']
                     )
+                    if not link_success:
+                        raise RuntimeError(f"addSubIssue failed: {link_result}")
                     logger.info(f"Linked issue #{issue_number} as sub-issue of #{parent_issue_number}")
 
                     # Emit SUCCESS event

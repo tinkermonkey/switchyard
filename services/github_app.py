@@ -14,6 +14,12 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 
 from services.github_api_client import is_graphql_rate_limit_error
+from services.circuit_breaker import CircuitBreakerOpen
+from services.github_app_breaker import (
+    check_github_app_breaker,
+    record_github_app_failure,
+    record_github_app_success,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +133,8 @@ class GitHubApp:
 
         # Generate new token
         try:
+            check_github_app_breaker()
+
             jwt_token = self._generate_jwt()
             headers = {
                 'Authorization': f'Bearer {jwt_token}',
@@ -141,6 +149,7 @@ class GitHubApp:
             # line and runs no error path.
             response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
+            record_github_app_success()
 
             data = response.json()
             self._installation_token = data['token']
@@ -153,6 +162,13 @@ class GitHubApp:
             logger.info(f"Generated new GitHub App installation token (expires: {self._token_expires_at})")
             return self._installation_token
 
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping installation token request: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            record_github_app_failure()
+            logger.error(f"Failed to get installation token: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to get installation token: {e}")
             return None
@@ -352,6 +368,12 @@ class GitHubApp:
     def graphql_request(self, query: str, variables: Dict[str, Any] = None) -> Optional[Dict]:
         """Execute a GraphQL request using GitHub App authentication (with PAT fallback)"""
 
+        try:
+            check_github_app_breaker()
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping GraphQL request: {e}")
+            return None
+
         token = self._get_token()
         if not token:
             logger.error("No installation token or PAT available for GraphQL request")
@@ -487,14 +509,17 @@ class GitHubApp:
                 return None
 
             self._report_call(headers=app_headers)
+            record_github_app_success()
             return data.get('data')
 
         except requests.exceptions.HTTPError as e:
             self._report_call(failed=True, headers=app_headers)
+            record_github_app_failure()
             logger.error(f"GraphQL request failed: {e}")
             return None
         except Exception as e:
             self._report_call(failed=True, headers=app_headers)
+            record_github_app_failure()
             logger.error(f"GraphQL request failed (unexpected): {e}", exc_info=True)
             return None
 
@@ -514,6 +539,12 @@ class GitHubApp:
 
     def rest_request(self, method: str, path: str, data: Dict = None) -> Optional[Dict]:
         """Execute a REST API request using GitHub App authentication (with PAT fallback)"""
+
+        try:
+            check_github_app_breaker()
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping REST request: {e}")
+            return None
 
         token = self._get_token()
         if not token:
@@ -552,6 +583,7 @@ class GitHubApp:
 
             response.raise_for_status()
             self._report_call()
+            record_github_app_success()
             return response.json() if response.text else {}
 
         except requests.exceptions.HTTPError as e:
@@ -567,10 +599,12 @@ class GitHubApp:
                 and 'rate limit' in (rest_response.text or '').lower()
             )
             self._report_call(rate_limited=rate_limited, failed=not rate_limited)
+            record_github_app_failure()
             logger.error(f"REST request failed: {e}")
             return None
         except Exception as e:
             self._report_call(failed=True)
+            record_github_app_failure()
             logger.error(f"REST request failed (unexpected): {e}", exc_info=True)
             return None
 

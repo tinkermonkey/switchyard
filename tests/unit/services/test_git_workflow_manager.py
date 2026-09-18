@@ -208,31 +208,45 @@ class TestGitWorkflowManagerPRStatusUpdate:
 
 
 class TestGitWorkflowManagerGetExistingPR:
-    """Test existing PR retrieval with tracking."""
-    
+    """Test existing PR retrieval with tracking.
+
+    Migrated onto GitHubAPIClient.gh_cli() (GitHub circuit breaker
+    consolidation): _get_existing_pr() now calls get_github_client().gh_cli()
+    for the actual `gh pr list` data fetch, not just for
+    track_gh_operation() afterward -- so these tests can no longer replace
+    get_github_client() wholesale (that mock's auto-generated .gh_cli()
+    return value can't be unpacked as the real (bool, GhCliResult) tuple,
+    and it never reaches the subprocess.run mock at all). They now patch
+    only `subprocess.run` (what gh_cli() actually calls) and spy on the
+    real singleton's track_gh_operation() instead of replacing the client.
+    """
+
     @pytest.fixture
     def manager(self):
         """Create a fresh workflow manager for each test."""
         return GitWorkflowManager()
-    
+
     @pytest.fixture
     def project_dir(self, tmp_path):
         """Create a temporary project directory."""
         return tmp_path
-    
+
+    @pytest.fixture
+    def track_gh_operation_spy(self):
+        client = get_github_client()
+        with patch.object(client, 'track_gh_operation') as spy:
+            yield spy
+
     @patch('subprocess.run')
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_get_existing_pr_tracks_operation(self, mock_get_client, mock_run, manager, project_dir):
+    def test_get_existing_pr_tracks_operation(self, mock_run, manager, project_dir, track_gh_operation_spy):
         """Test that retrieving existing PR tracks the operation."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
         pr_data = [{'number': 42, 'url': 'https://github.com/owner/repo/pull/42', 'state': 'OPEN'}]
         mock_run.return_value = Mock(
             returncode=0,
-            stdout=json.dumps(pr_data)
+            stdout=json.dumps(pr_data),
+            stderr='',
         )
-        
+
         import asyncio
         result = asyncio.run(manager._get_existing_pr(
             project_dir=project_dir,
@@ -240,30 +254,33 @@ class TestGitWorkflowManagerGetExistingPR:
             org='owner',
             repo='repo'
         ))
-        
+
         assert result is not None
         assert result['number'] == 42
         assert result['url'] == 'https://github.com/owner/repo/pull/42'
-        
-        # Verify tracking was called
-        mock_client.track_gh_operation.assert_called_once()
-        call_args = mock_client.track_gh_operation.call_args
-        assert call_args[0][0] == 'gh_pr_list'
+
+        # gh_cli() tracks every call generically as 'gh_cli' (with the full
+        # command as its description) -- _get_existing_pr() no longer does
+        # its own separate, more specific tracking call on top of that.
+        track_gh_operation_spy.assert_called_once()
+        call_args = track_gh_operation_spy.call_args
+        assert call_args[0][0] == 'gh_cli'
         assert 'feature/issue-123' in call_args[0][1]
-    
+
     @patch('subprocess.run')
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_get_existing_pr_no_results_no_tracking(self, mock_get_client, mock_run, manager, project_dir):
-        """Test that no results doesn't trigger tracking."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
+    def test_get_existing_pr_no_results_still_tracks_the_successful_call(self, mock_run, manager, project_dir, track_gh_operation_spy):
+        """An empty `gh pr list` result is still a successful gh invocation --
+        gh_cli() tracks every successful call generically regardless of
+        whether the parsed result was semantically meaningful, superseding
+        the old call-site-level "only track when something was found"
+        selectivity (a bare API call still spent quota either way)."""
         # Empty result
         mock_run.return_value = Mock(
             returncode=0,
-            stdout='[]'
+            stdout='[]',
+            stderr='',
         )
-        
+
         import asyncio
         result = asyncio.run(manager._get_existing_pr(
             project_dir=project_dir,
@@ -271,24 +288,20 @@ class TestGitWorkflowManagerGetExistingPR:
             org='owner',
             repo='repo'
         ))
-        
+
         assert result is None
-        # Tracking should NOT be called when no PR found
-        mock_client.track_gh_operation.assert_not_called()
-    
+        track_gh_operation_spy.assert_called_once()
+        assert track_gh_operation_spy.call_args[0][0] == 'gh_cli'
+
     @patch('subprocess.run')
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_get_existing_pr_command_failure_no_tracking(self, mock_get_client, mock_run, manager, project_dir):
+    def test_get_existing_pr_command_failure_no_tracking(self, mock_run, manager, project_dir, track_gh_operation_spy):
         """Test that command failure doesn't trigger tracking."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
         mock_run.return_value = Mock(
             returncode=1,
             stdout='',
             stderr='Permission denied'
         )
-        
+
         import asyncio
         result = asyncio.run(manager._get_existing_pr(
             project_dir=project_dir,
@@ -296,25 +309,22 @@ class TestGitWorkflowManagerGetExistingPR:
             org='owner',
             repo='repo'
         ))
-        
+
         assert result is None
         # Tracking should NOT be called on command failure
-        mock_client.track_gh_operation.assert_not_called()
-    
+        track_gh_operation_spy.assert_not_called()
+
     @patch('subprocess.run')
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_get_existing_pr_parses_state_lowercase(self, mock_get_client, mock_run, manager, project_dir):
+    def test_get_existing_pr_parses_state_lowercase(self, mock_run, manager, project_dir, track_gh_operation_spy):
         """Test that PR state is converted to lowercase."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
         # GitHub returns uppercase state
         pr_data = [{'number': 42, 'url': 'https://github.com/owner/repo/pull/42', 'state': 'DRAFT'}]
         mock_run.return_value = Mock(
             returncode=0,
-            stdout=json.dumps(pr_data)
+            stdout=json.dumps(pr_data),
+            stderr='',
         )
-        
+
         import asyncio
         result = asyncio.run(manager._get_existing_pr(
             project_dir=project_dir,
@@ -322,7 +332,7 @@ class TestGitWorkflowManagerGetExistingPR:
             org='owner',
             repo='repo'
         ))
-        
+
         # Should be converted to lowercase
         assert result['state'] == 'draft'
 

@@ -278,8 +278,11 @@ class TestUnresolvedOwnerKeepsEachMethodsContract:
         gh = GitHubIntegration(repo_owner='an-org', repo_name='a-repo')
         completed = MagicMock(returncode=0, stdout='not json at all', stderr='')
 
-        with patch('services.github_integration.subprocess.run',
-                   return_value=completed):
+        # gh_cli() is what actually invokes subprocess.run now (GitHub
+        # circuit breaker consolidation) -- services.github_integration no
+        # longer imports subprocess itself, so this patches the same
+        # module-level function object globally instead.
+        with patch('subprocess.run', return_value=completed):
             with pytest.raises(_json.JSONDecodeError):
                 asyncio.run(
                     gh.has_agent_processed_issue(1, 'some_agent', repo='a-repo')

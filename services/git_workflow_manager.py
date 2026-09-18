@@ -225,15 +225,9 @@ class GitWorkflowManager:
             if draft:
                 cmd.append('--draft')
 
-            result = subprocess.run(
-                cmd,
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+            success, result = get_github_client().gh_cli(cmd, cwd=str(project_dir), timeout=30)
 
-            if result.returncode == 0:
+            if success:
                 # Parse PR URL from output (gh pr create returns URL)
                 pr_url = result.stdout.strip()
 
@@ -245,13 +239,10 @@ class GitWorkflowManager:
                 branch_info.pr_url = pr_url
                 branch_info.pr_state = 'draft' if draft else 'open'
 
-                # Track the API call
-                github_client = get_github_client()
-                github_client.track_gh_operation(
-                    'gh_pr_create',
-                    f"Created PR #{pr_number} for issue #{issue_number} in {org}/{repo}"
-                )
-
+                # gh_cli() already tracks this call (as 'gh_cli') -- no need
+                # for a second, more specific track_gh_operation() here now
+                # that it's routed through the shared client instead of a
+                # bare subprocess.run.
                 logger.info(f"Created PR #{pr_number} for issue #{issue_number}: {pr_url}")
 
                 return {
@@ -261,7 +252,7 @@ class GitWorkflowManager:
                     'created': True
                 }
             else:
-                error_msg = result.stderr.strip()
+                error_msg = (result.stderr or '').strip()
 
                 # Check if PR already exists (common error)
                 if 'already exists' in error_msg.lower():
@@ -318,24 +309,14 @@ class GitWorkflowManager:
         try:
             if status == 'ready' and branch_info.pr_state == 'draft':
                 # Mark PR as ready for review (remove draft status)
-                result = subprocess.run(
+                success, result = get_github_client().gh_cli(
                     ['gh', 'pr', 'ready', str(pr_number), '--repo', f"{org}/{repo}"],
-                    cwd=project_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
+                    cwd=str(project_dir), timeout=30,
                 )
 
-                if result.returncode == 0:
+                if success:
                     branch_info.pr_state = 'open'
-                    
-                    # Track the API call
-                    github_client = get_github_client()
-                    github_client.track_gh_operation(
-                        'gh_pr_ready',
-                        f"Marked PR #{pr_number} as ready for review in {org}/{repo}"
-                    )
-                    
+                    # gh_cli() already tracks this call.
                     logger.info(f"Marked PR #{pr_number} as ready for review")
                     return True
                 else:
@@ -344,58 +325,39 @@ class GitWorkflowManager:
 
             elif status == 'approved':
                 # Add approval label
-                result = subprocess.run(
+                success, result = get_github_client().gh_cli(
                     ['gh', 'pr', 'edit', str(pr_number), '--add-label', 'approved', '--repo', f"{org}/{repo}"],
-                    cwd=project_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
+                    cwd=str(project_dir), timeout=30,
                 )
 
-                if result.returncode == 0:
-                    # Track the API call
-                    github_client = get_github_client()
-                    github_client.track_gh_operation(
-                        'gh_pr_edit_add_label',
-                        f"Added 'approved' label to PR #{pr_number} in {org}/{repo}"
-                    )
-
+                if success:
+                    # gh_cli() already tracks this call.
                     logger.info(f"Added 'approved' label to PR #{pr_number}")
                     return True
                 else:
-                    error_msg = result.stderr.strip()
+                    error_msg = (result.stderr or '').strip()
 
                     # Check if label doesn't exist - if so, create it and retry
                     if "'approved' not found" in error_msg:
                         logger.info(f"Creating 'approved' label in {org}/{repo}")
-                        create_result = subprocess.run(
+                        create_success, create_result = get_github_client().gh_cli(
                             ['gh', 'label', 'create', 'approved',
                              '--color', '0e8a16',  # Green
                              '--description', 'PR approved and ready to merge',
                              '--repo', f"{org}/{repo}"],
-                            cwd=project_dir,
-                            capture_output=True,
-                            text=True,
-                            timeout=30
+                            cwd=str(project_dir), timeout=30,
                         )
 
-                        if create_result.returncode == 0:
+                        if create_success:
                             logger.info(f"Created 'approved' label, retrying add to PR #{pr_number}")
                             # Retry adding the label
-                            retry_result = subprocess.run(
+                            retry_success, retry_result = get_github_client().gh_cli(
                                 ['gh', 'pr', 'edit', str(pr_number), '--add-label', 'approved', '--repo', f"{org}/{repo}"],
-                                cwd=project_dir,
-                                capture_output=True,
-                                text=True,
-                                timeout=30
+                                cwd=str(project_dir), timeout=30,
                             )
 
-                            if retry_result.returncode == 0:
-                                github_client = get_github_client()
-                                github_client.track_gh_operation(
-                                    'gh_pr_edit_add_label',
-                                    f"Created and added 'approved' label to PR #{pr_number} in {org}/{repo}"
-                                )
+                            if retry_success:
+                                # gh_cli() already tracks this call.
                                 logger.info(f"Successfully added 'approved' label to PR #{pr_number}")
                                 return True
                             else:
@@ -432,25 +394,15 @@ class GitWorkflowManager:
     ) -> Optional[Dict[str, Any]]:
         """Get existing PR for a branch"""
         try:
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'pr', 'list', '--head', branch_name, '--repo', f"{org}/{repo}", '--json', 'number,url,state'],
-                cwd=project_dir,
-                capture_output=True,
-                text=True,
-                timeout=30
+                cwd=str(project_dir), timeout=30,
             )
 
-            if result.returncode == 0 and result.stdout.strip():
-                import json
-                prs = json.loads(result.stdout)
+            if success and isinstance(result.data, list):
+                prs = result.data
                 if prs:
-                    # Track the API call
-                    github_client = get_github_client()
-                    github_client.track_gh_operation(
-                        'gh_pr_list',
-                        f"Retrieved existing PR for branch {branch_name} in {org}/{repo}"
-                    )
-                    
+                    # gh_cli() already tracks this call.
                     return {
                         'number': prs[0]['number'],
                         'url': prs[0]['url'],

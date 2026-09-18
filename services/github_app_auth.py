@@ -14,6 +14,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from pathlib import Path
 
+from services.circuit_breaker import CircuitBreakerOpen
+from services.github_app_breaker import (
+    check_github_app_breaker,
+    record_github_app_failure,
+    record_github_app_success,
+)
+
 logger = logging.getLogger(__name__)
 
 class GitHubAppAuth:
@@ -112,6 +119,8 @@ class GitHubAppAuth:
                 return self.installation_token
 
         try:
+            check_github_app_breaker()
+
             # Generate JWT for authentication
             jwt_token = self.generate_jwt()
 
@@ -123,8 +132,9 @@ class GitHubAppAuth:
                 'Accept': 'application/vnd.github.v3+json'
             }
 
-            response = requests.post(url, headers=headers)
+            response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
+            record_github_app_success()
 
             data = response.json()
 
@@ -152,12 +162,16 @@ class GitHubAppAuth:
 
             return self.installation_token
 
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping installation token request: {e}")
+            return None
         except requests.exceptions.RequestException as e:
+            record_github_app_failure()
             logger.error(f"Failed to get installation token: {e}")
             if hasattr(e.response, 'text'):
                 logger.error(f"Response: {e.response.text}")
             return None
-        except Exception as e:  
+        except Exception as e:
             logger.error(f"Error generating installation token: {e}")
             return None
 
@@ -167,6 +181,8 @@ class GitHubAppAuth:
             return None
 
         try:
+            check_github_app_breaker()
+
             jwt_token = self.generate_jwt()
 
             headers = {
@@ -174,11 +190,19 @@ class GitHubAppAuth:
                 'Accept': 'application/vnd.github.v3+json'
             }
 
-            response = requests.get('https://api.github.com/app', headers=headers)
+            response = requests.get('https://api.github.com/app', headers=headers, timeout=30)
             response.raise_for_status()
+            record_github_app_success()
 
             return response.json()
 
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping app info request: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            record_github_app_failure()
+            logger.error(f"Failed to get app info: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to get app info: {e}")
             return None
@@ -190,17 +214,27 @@ class GitHubAppAuth:
             return None
 
         try:
+            check_github_app_breaker()
+
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Accept': 'application/vnd.github.v3+json'
             }
 
             url = f"https://api.github.com/app/installations/{self.installation_id}"
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
+            record_github_app_success()
 
             return response.json()
 
+        except CircuitBreakerOpen as e:
+            logger.warning(f"Skipping installation info request: {e}")
+            return None
+        except requests.exceptions.RequestException as e:
+            record_github_app_failure()
+            logger.error(f"Failed to get installation info: {e}")
+            return None
         except Exception as e:
             logger.error(f"Failed to get installation info: {e}")
             return None
