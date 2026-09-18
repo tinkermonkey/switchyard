@@ -669,6 +669,13 @@ class DockerAgentRunner:
         docker_socket_gate = None
         docker_socket_holder_id = None
 
+        # HEAD before the agent touches anything (#266). Every agent container
+        # launch funnels through here, so this is the one place that sees both
+        # sides of an agent's effect on git history. Cheap and never raises --
+        # None for a workspace that is not a git checkout.
+        from services.git_workflow_manager import git_workflow_manager
+        pre_agent_head = git_workflow_manager.read_head(str(project_dir))
+
         try:
             # Offloaded to a thread (code review finding, issue #129): before
             # #129, _build_docker_command()'s worktree-mount preparation
@@ -709,6 +716,30 @@ class DockerAgentRunner:
                 image_name=image_name,
                 mcp_config_path=mcp_config_path
             )
+
+            # The agent has exited. If it dropped commits that were already on
+            # origin, refuse here rather than letting the damage surface later
+            # as a bare non-fast-forward rejection from a push -- which is how
+            # run fbd185c9-ec5b-475c-83de-769531240c8d was found, minutes and a
+            # whole review cycle after the fact, with the cause inferred rather
+            # than observed.
+            dropped = git_workflow_manager.find_dropped_pushed_commits(
+                str(project_dir), pre_agent_head
+            )
+            if dropped:
+                from services.git_workflow_manager import AgentRewroteHistoryError
+                listed = '\n'.join(f"  {sha[:8]}  {subject}" for sha, subject in dropped)
+                raise AgentRewroteHistoryError(
+                    f"Agent {agent!r} rewrote history in {project_dir} that had "
+                    f"already been pushed: {len(dropped)} commit(s) reachable from "
+                    f"origin are no longer on the branch.\n{listed}\n"
+                    f"HEAD was {pre_agent_head[:8] if pre_agent_head else '?'} before "
+                    f"the agent ran. The commits still exist in the repository and "
+                    f"can be recovered (`git -C <worktree> reset --hard "
+                    f"{pre_agent_head[:8] if pre_agent_head else '<sha>'}`, or "
+                    f"cherry-pick them individually); nothing has been pushed or "
+                    f"deleted. Not retried: no retry can restore them."
+                )
 
             return result_text
 

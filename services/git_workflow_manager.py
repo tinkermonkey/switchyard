@@ -22,11 +22,25 @@ from services.github_api_client import get_github_client
 logger = logging.getLogger(__name__)
 
 
+from utils.non_retryable import NonRetryableAgentError
+
+
 class PushFailedError(Exception):
     """Raised when a git push to origin fails and cannot be automatically recovered.
 
     Callers should treat this as a non-retryable blocking failure: end the pipeline
     run with retain_lock=True so the issue stays locked until a human intervenes.
+    """
+
+
+class AgentRewroteHistoryError(NonRetryableAgentError):
+    """An agent dropped commits from its worktree that were already on origin.
+
+    Subclasses NonRetryableAgentError because no retry can help: the commits are
+    gone from the local branch, and only a human can decide whether to recover
+    them or discard the rewrite. Non-retryability has to be the TYPE rather than
+    a claim in a docstring -- see claude_integration.py and #251 for the same
+    mistake made and fixed twice before.
     """
 
 
@@ -1311,6 +1325,102 @@ class GitWorkflowManager:
                 f"Could not measure how {project_dir} relates to "
                 f"origin/{branch_name} after a rejected push: {e}"
             )
+            return None
+
+    def find_dropped_pushed_commits(self, project_dir: str, pre_head: str):
+        """Commits that were on origin and are no longer reachable from HEAD (#266).
+
+        An agent has a writable worktree with the base clone's `.git` mounted, so
+        it can reset, rebase, amend or cherry-pick over commits the orchestrator
+        has ALREADY pushed. Nothing checked for this; it was discovered only
+        indirectly, when a later push was rejected, and the cause then had to be
+        guessed at. Run fbd185c9-ec5b-475c-83de-769531240c8d is the worked
+        example: the agent reset past two pushed commits and cherry-picked one
+        back, 19:32:19Z and 19:32:21Z, inside its own 19:31:59-19:32:37 run.
+
+        Deliberately NOT a plain `merge-base --is-ancestor pre post` test, which
+        is what this issue was filed proposing. That fires on any rewrite,
+        including an agent rebasing its own UNPUSHED work onto a newer origin --
+        which is legitimate and desirable, and would have made this a false-
+        positive machine. What makes a rewrite damaging is that the commits it
+        dropped were already published, so that is what this measures: of the
+        commits reachable from pre_head but not from HEAD, which are still
+        reachable from origin/<branch>.
+
+        No fetch. `git push` updates the local remote-tracking ref, so after the
+        orchestrator's own push origin/<branch> is already accurate here, and
+        skipping the network keeps this off the hot path of every agent run. A
+        stale tracking ref can only cause UNDER-detection -- a dropped commit
+        looking local when it was pushed -- never a false refusal, which is the
+        right direction for a check that blocks a pipeline.
+
+        Returns a list of (sha, subject) for the dropped-and-published commits,
+        empty when there are none. Never raises: it runs on every agent
+        execution, and a git hiccup here must not become a new way for an
+        otherwise healthy run to fail.
+        """
+        if not pre_head:
+            return []
+
+        def _git(*args):
+            return subprocess.run(
+                ['git', '-C', str(project_dir), *args],
+                capture_output=True, text=True, timeout=15,
+            )
+
+        try:
+            post = _git('rev-parse', 'HEAD')
+            if post.returncode != 0:
+                return []
+            post_head = post.stdout.strip()
+            if not post_head or post_head == pre_head:
+                return []
+
+            # Still a descendant? Then nothing was dropped, whatever else moved.
+            if _git('merge-base', '--is-ancestor', pre_head, post_head).returncode == 0:
+                return []
+
+            branch = _git('rev-parse', '--abbrev-ref', 'HEAD')
+            branch_name = branch.stdout.strip() if branch.returncode == 0 else ''
+            if not branch_name or branch_name == 'HEAD':
+                return []
+            remote_ref = f'origin/{branch_name}'
+            if _git('rev-parse', '--verify', '--quiet', remote_ref).returncode != 0:
+                # Never pushed, so nothing dropped can have been published.
+                return []
+
+            dropped = _git('rev-list', f'{post_head}..{pre_head}')
+            if dropped.returncode != 0:
+                return []
+
+            published = []
+            for sha in dropped.stdout.split():
+                if _git('merge-base', '--is-ancestor', sha, remote_ref).returncode == 0:
+                    subject = _git('log', '-1', '--format=%s', sha)
+                    published.append(
+                        (sha, subject.stdout.strip() if subject.returncode == 0 else '')
+                    )
+            return published
+        except Exception as e:
+            logger.warning(
+                f"Could not check {project_dir} for rewritten published history: {e}"
+            )
+            return []
+
+    def read_head(self, project_dir: str):
+        """Current HEAD sha, or None if this is not a readable repository.
+
+        None rather than an exception: the caller snapshots HEAD before every
+        agent run, including for agents whose workspace is not a git checkout at
+        all, and a missing repo there is ordinary rather than exceptional.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=15,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
             return None
 
     async def push_branch(self, project_dir: str, branch_name: str) -> None:
