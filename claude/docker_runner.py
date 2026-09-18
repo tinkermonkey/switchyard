@@ -669,6 +669,13 @@ class DockerAgentRunner:
         docker_socket_gate = None
         docker_socket_holder_id = None
 
+        # HEAD before the agent touches anything (#266). Every agent container
+        # launch funnels through here, so this is the one place that sees both
+        # sides of an agent's effect on git history. Cheap and never raises --
+        # None for a workspace that is not a git checkout.
+        from services.git_workflow_manager import git_workflow_manager
+        pre_agent_head = git_workflow_manager.read_head(str(project_dir))
+
         try:
             # Offloaded to a thread (code review finding, issue #129): before
             # #129, _build_docker_command()'s worktree-mount preparation
@@ -709,6 +716,30 @@ class DockerAgentRunner:
                 image_name=image_name,
                 mcp_config_path=mcp_config_path
             )
+
+            # The agent has exited. If it dropped commits that were already on
+            # origin, refuse here rather than letting the damage surface later
+            # as a bare non-fast-forward rejection from a push -- which is how
+            # run fbd185c9-ec5b-475c-83de-769531240c8d was found, minutes and a
+            # whole review cycle after the fact, with the cause inferred rather
+            # than observed.
+            dropped = git_workflow_manager.find_dropped_pushed_commits(
+                str(project_dir), pre_agent_head
+            )
+            if dropped:
+                from services.git_workflow_manager import AgentRewroteHistoryError
+                listed = '\n'.join(f"  {sha[:8]}  {subject}" for sha, subject in dropped)
+                raise AgentRewroteHistoryError(
+                    f"Agent {agent!r} rewrote history in {project_dir} that had "
+                    f"already been pushed: {len(dropped)} commit(s) reachable from "
+                    f"origin are no longer on the branch.\n{listed}\n"
+                    f"HEAD was {pre_agent_head[:8] if pre_agent_head else '?'} before "
+                    f"the agent ran. The commits still exist in the repository and "
+                    f"can be recovered (`git -C <worktree> reset --hard "
+                    f"{pre_agent_head[:8] if pre_agent_head else '<sha>'}`, or "
+                    f"cherry-pick them individually); nothing has been pushed or "
+                    f"deleted. Not retried: no retry can restore them."
+                )
 
             return result_text
 
@@ -1629,8 +1660,18 @@ class DockerAgentRunner:
         if pr_review_phase:
             cmd.extend(['--label', f'org.switchyard.pr_review_phase={pr_review_phase}'])
 
+        # NOTE: 'review_cycle' is overloaded across the codebase. pr_review_stage.py's
+        # multi-phase PR review puts a plain cycle-number scalar here (what this label
+        # is for -- see agent_container_recovery.py's pr_review_cycle_label consumer).
+        # services/review_cycle.py's generic maker-checker cycle puts a whole state
+        # dict here instead (iteration, maker_agent, previous_maker_output, ...), which
+        # can carry the full prior maker output -- multiple hundred KB of text. Passing
+        # that through str()/f-string into a `docker run --label` argument blew past the
+        # kernel's per-argument exec limit (MAX_ARG_STRLEN, 128KB) and made every
+        # detached container launch fail with "Argument list too long: 'docker'" before
+        # docker even ran. Only emit the label for the scalar form.
         review_cycle = task_context.get('review_cycle')
-        if review_cycle is not None:
+        if isinstance(review_cycle, (str, int)):
             cmd.extend(['--label', f'org.switchyard.pr_review_cycle={review_cycle}'])
 
         # Add -i (interactive) flag if we need stdin for large prompts
@@ -2011,6 +2052,38 @@ class DockerAgentRunner:
                 f"(`docker tag <id> {image_name}`) -- and check that the "
                 f"genuine image has not been left dangling."
             )
+
+    @staticmethod
+    def find_dangling_base_images() -> list:
+        """Image ids that carry our label but have no tag (#257).
+
+        The recovery handle for #251's second failure shape. When another
+        compose project takes `switchyard-orchestrator:latest`, our real image
+        is not deleted -- it is left with `tags: []`, alive only because the
+        running container pins it by id, and one `docker image prune` from
+        being collected permanently. Recovering it needs its id, which is
+        exactly what an operator does not have at the moment they need it.
+
+        Best-effort and never raises: this only ever decorates a diagnostic
+        that has already been decided, so a docker hiccup here must not turn a
+        clear message into a stack trace.
+        """
+        from services.dev_container_state import SWITCHYARD_AGENT_ENV_LABEL
+
+        try:
+            result = subprocess.run(
+                ['docker', 'images', '--filter', 'dangling=true',
+                 '--filter', f'label={SWITCHYARD_AGENT_ENV_LABEL}=true',
+                 '--format', '{{.ID}}'],
+                capture_output=True, text=True, timeout=10
+            )
+        except Exception as e:
+            logger.debug(f"Could not list dangling switchyard images: {e}")
+            return []
+
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     def _detect_rate_limit_reset_time(self, project_dir: Path) -> Optional[datetime]:
         """

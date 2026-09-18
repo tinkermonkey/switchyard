@@ -541,15 +541,6 @@ def _launch_repair_cycle_container(
             '-e', f'HOST_HOME={host_home_path}',  # Pass host home for SSH/git mounts
             '-e', 'PYTHONUNBUFFERED=1',  # Ensure logs are flushed
             '-e', f'PIPELINE_RUN_ID={pipeline_run_id}',  # Pass pipeline_run_id for event tracking
-            
-            # Image and command
-            repair_cycle_image,
-            'python', '-m', 'pipeline.repair_cycle_runner',
-            '--project', project_name,
-            '--issue', str(issue_number),
-            '--pipeline-run-id', pipeline_run_id,
-            '--stage', stage_name,
-            '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
         ]
 
         # Forward CLAUDE_CODE_USE_BEDROCK and AWS_REGION only when set: passing an
@@ -560,6 +551,17 @@ def _launch_repair_cycle_container(
             docker_cmd += ['-e', f'CLAUDE_CODE_USE_BEDROCK={env.claude_code_use_bedrock}']
         if env.aws_region:
             docker_cmd += ['-e', f'AWS_REGION={env.aws_region}']
+
+        docker_cmd += [
+            # Image and command
+            repair_cycle_image,
+            'python', '-m', 'pipeline.repair_cycle_runner',
+            '--project', project_name,
+            '--issue', str(issue_number),
+            '--pipeline-run-id', pipeline_run_id,
+            '--stage', stage_name,
+            '--context', f'/workspace/switchyard/orchestrator_data/repair_cycles/{project_name}/{issue_number}/context.json'
+        ]
 
         # Launch container
         logger.debug(f"Docker command: {' '.join(docker_cmd)}")
@@ -3019,16 +3021,28 @@ class ProjectMonitor:
             return "INFO"  # Default to INFO on error
 
     def _check_agent_processed_issue_sync(self, issue_number: int, agent: str, repository: str, org: str, workspace_type: str = 'issues', discussion_id: Optional[str] = None) -> bool:
-        """Synchronous wrapper for checking if agent has processed issue"""
+        """Synchronous wrapper for checking if agent has processed issue.
+
+        The bare asyncio.run() this used to call raised on the event loop, and
+        the except below turns any failure into False -- "no prior agent work".
+        Its one caller is trigger_agent_for_status(), which main.py's startup
+        lock-recovery reaches ON the loop, so the answer there was always
+        False regardless of the truth, and the guard against re-dispatching an
+        agent that had already run was simply absent on that path.
+        """
         try:
-            import asyncio
             from services.github_integration import GitHubIntegration
+            from utils.async_bridge import run_coroutine_blocking
             github = GitHubIntegration(repo_owner=org, repo_name=repository)
-            
+
             if workspace_type == 'discussions' and discussion_id:
-                return asyncio.run(github.has_agent_processed_discussion(discussion_id, agent))
+                return run_coroutine_blocking(
+                    lambda: github.has_agent_processed_discussion(discussion_id, agent)
+                )
             else:
-                return asyncio.run(github.has_agent_processed_issue(issue_number, agent, repository))
+                return run_coroutine_blocking(
+                    lambda: github.has_agent_processed_issue(issue_number, agent, repository)
+                )
         except Exception as e:
             logger.warning(f"Could not check for prior agent work: {e}")
             return False
@@ -4912,9 +4926,18 @@ class ProjectMonitor:
                 f"verify the lock state for {project_name}/\"{board_name}\"."
             )
 
+        # Same hazard as the PR-ready check, and worse in effect: this is
+        # reached from trigger_agent_for_status() too, so on the startup
+        # recovery path BOTH attempts below failed with the same RuntimeError
+        # and the comment never posted -- silently discarding the dispatch
+        # diagnosis #254 put into `reason` precisely so an operator would see
+        # it on the issue rather than have to find it in the logs.
+        from utils.async_bridge import run_coroutine_blocking
         for attempt in range(2):
             try:
-                asyncio.run(github.post_comment(issue_number, comment))
+                run_coroutine_blocking(
+                    lambda: github.post_comment(issue_number, comment)
+                )
                 return
             except Exception as comment_err:
                 if attempt == 0:
@@ -5103,7 +5126,14 @@ class ProjectMonitor:
             github = GitHubIntegration(
                 repo_owner=project_config.github['org'], repo_name=repository
             )
-            asyncio.run(github.post_comment(issue_number, comment))
+            # Reachable on the loop via trigger_agent_for_status() ->
+            # _check_sustained_lock_contention(), where a bare asyncio.run()
+            # meant this escalation never reached the issue -- the one signal
+            # telling an operator a board has been stuck behind one holder.
+            from utils.async_bridge import run_coroutine_blocking
+            run_coroutine_blocking(
+                lambda: github.post_comment(issue_number, comment)
+            )
         except Exception as comment_err:
             logger.error(
                 f"Failed to post sustained-lock-contention comment for issue "
@@ -5353,10 +5383,20 @@ class ProjectMonitor:
 
             # CRITICAL: Check if PR should be marked ready after issue exits pipeline
             # This handles the case where all sub-issues complete after the last finalization
-            import asyncio
+            # run_coroutine_blocking, not asyncio.run: this method is sync and
+            # reachable from BOTH loop contexts. The monitor reaches it on a
+            # daemon thread with no loop, where asyncio.run worked -- but
+            # main.py's startup lock-recovery calls trigger_agent_for_status()
+            # straight from `async def main()`, and there this raised
+            # "asyncio.run() cannot be called from a running event loop",
+            # caught below and logged, so the PR-ready check silently did not
+            # run (observed for #1017 on 2026-09-17).
+            from utils.async_bridge import run_coroutine_blocking
             try:
-                asyncio.run(
-                    self._check_pr_ready_on_issue_exit(project_name, issue_number, exit_column)
+                run_coroutine_blocking(
+                    lambda: self._check_pr_ready_on_issue_exit(
+                        project_name, issue_number, exit_column
+                    )
                 )
             except Exception as e:
                 logger.error(
@@ -9944,16 +9984,18 @@ The automated test-fix-validate cycle is now starting in a containerized environ
 _Repair cycle initiated by Switchyard_
 """
 
-                # Post the comment - handle both running-loop and no-loop contexts.
-                import asyncio
-                import concurrent.futures
-                post_coro = github.post_agent_output(start_context, comment_text)
-                try:
-                    asyncio.get_running_loop()
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        pool.submit(asyncio.run, post_coro).result()
-                except RuntimeError:
-                    asyncio.run(post_coro)
+                # Handled both contexts already, but with both of the traps
+                # run_coroutine_blocking() exists to close: `post_coro` was
+                # built ONCE and used in both branches, and one try/except
+                # wrapped the probe together with the call. So a RuntimeError
+                # from post_agent_output() itself fell into the fallback,
+                # which re-awaited an already-consumed coroutine and reported
+                # "cannot reuse already awaited coroutine" -- the real cause
+                # replaced by an unrelated complaint.
+                from utils.async_bridge import run_coroutine_blocking
+                run_coroutine_blocking(
+                    lambda: github.post_agent_output(start_context, comment_text)
+                )
             except Exception as e:
                 logger.warning(f"Failed to post initial comment: {e}")
 

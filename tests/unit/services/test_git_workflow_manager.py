@@ -145,6 +145,43 @@ class TestGitWorkflowManagerPRCreation:
         assert 'PR #42' in call_args[0][1]
         assert 'issue #123' in call_args[0][1]
 
+    @pytest.mark.asyncio
+    @patch('services.git_workflow_manager.subprocess.run')
+    @patch('services.git_workflow_manager.get_github_client')
+    @patch('services.project_workspace.workspace_manager.get_default_branch')
+    async def test_create_pr_uses_project_default_branch(
+        self,
+        mock_get_default_branch,
+        mock_get_client,
+        mock_run,
+        manager,
+        tmp_path,
+    ):
+        """PR creation should use the configured project default branch."""
+        mock_get_default_branch.return_value = 'master'
+        mock_get_client.return_value = Mock(spec=GitHubAPIClient)
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout='https://github.com/owner/repo/pull/42\n',
+            stderr='',
+        )
+        manager.track_branch('test-project', 123, 'feature/issue-123')
+
+        result = await manager.create_or_update_pr(
+            project='test-project',
+            issue_number=123,
+            project_dir=tmp_path,
+            org='owner',
+            repo='repo',
+            issue_title='Add fix',
+            issue_body='',
+            draft=True,
+        )
+
+        assert result['success'] is True
+        cmd = mock_run.call_args.args[0]
+        assert cmd[cmd.index('--base') + 1] == 'master'
+
 
 class TestGitWorkflowManagerPRStatusUpdate:
     """
@@ -469,3 +506,62 @@ class TestPullRebase:
         manager.push_branch.assert_not_called()
         reset_calls = [c for c in mock_run.call_args_list if c.args[0][:3] == ['git', 'reset', '--hard']]
         assert reset_calls == []
+
+
+class TestSyncEpicWorktreeBeforeCommit:
+    @pytest.fixture
+    def manager(self):
+        return GitWorkflowManager()
+
+    @staticmethod
+    def _run_factory(*, remote_exists=True, ahead=0, behind=0, dirty=False):
+        def _run(cmd, **kwargs):
+            if cmd[:5] == ['git', '-C', '/workspace/test-project', 'ls-remote', '--heads']:
+                return Mock(returncode=0, stdout=('sha\n' if remote_exists else ''), stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'fetch']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'rev-list'] and cmd[-1] == 'origin/feature/test..HEAD':
+                return Mock(returncode=0, stdout=f'{ahead}\n', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'rev-list'] and cmd[-1] == 'HEAD..origin/feature/test':
+                return Mock(returncode=0, stdout=f'{behind}\n', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'status']:
+                return Mock(returncode=0, stdout=(' M app.py\n' if dirty else ''), stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'reset']:
+                return Mock(returncode=0, stdout='', stderr='')
+            if cmd[:4] == ['git', '-C', '/workspace/test-project', 'clean']:
+                return Mock(returncode=0, stdout='', stderr='')
+            raise AssertionError(f"Unexpected subprocess.run call: {cmd}")
+        return _run
+
+    @pytest.mark.asyncio
+    async def test_clean_branch_behind_origin_is_reset_before_commit(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(behind=3)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is True
+        assert result.reset_to_remote is True
+
+    @pytest.mark.asyncio
+    async def test_dirty_branch_behind_origin_is_refused(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(behind=2, dirty=True)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is False
+        assert "behind origin/feature/test" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_diverged_branch_is_refused(self, manager):
+        with patch('services.git_workflow_manager.subprocess.run',
+                   side_effect=self._run_factory(ahead=1, behind=2)):
+            result = await manager.sync_epic_worktree_before_commit(
+                '/workspace/test-project', 'feature/test'
+            )
+
+        assert result.ok is False
+        assert "has diverged" in result.detail

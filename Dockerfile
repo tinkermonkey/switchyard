@@ -76,8 +76,16 @@ RUN git config --system user.name "Orchestrator Bot" && \
 # Ensure Python path includes the app directory
 ENV PYTHONPATH=/app
 
-# Add Claude's native install location to PATH (installer puts it in /root/.local/bin)
-ENV PATH="/root/.local/bin:${PATH}"
+# Note: Claude's native installer puts the binary in /root/.local/bin, but it's
+# already symlinked to the world-executable /usr/local/bin/claude above (which
+# is on PATH by default), so /root/.local/bin itself does not need to be on
+# PATH. Do not add it: /root is 0700 root:root, so once USER switches to the
+# non-root `orchestrator` user below, that PATH entry becomes unsearchable --
+# and since it would sit ahead of /usr/local/bin and /usr/bin, CPython's
+# subprocess exec search (which aborts on the first non-ENOENT error instead
+# of continuing to later PATH entries) makes EVERY subprocess.run(['docker',
+# ...]) call fail with EACCES, even though a perfectly usable docker binary
+# exists later on PATH.
 
 # Create docker group with host's docker GID and add orchestrator user to it
 # This enables docker socket access for dev_environment_setup agent

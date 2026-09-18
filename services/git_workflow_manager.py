@@ -22,11 +22,25 @@ from services.github_api_client import get_github_client
 logger = logging.getLogger(__name__)
 
 
+from utils.non_retryable import NonRetryableAgentError
+
+
 class PushFailedError(Exception):
     """Raised when a git push to origin fails and cannot be automatically recovered.
 
     Callers should treat this as a non-retryable blocking failure: end the pipeline
     run with retain_lock=True so the issue stays locked until a human intervenes.
+    """
+
+
+class AgentRewroteHistoryError(NonRetryableAgentError):
+    """An agent dropped commits from its worktree that were already on origin.
+
+    Subclasses NonRetryableAgentError because no retry can help: the commits are
+    gone from the local branch, and only a human can decide whether to recover
+    them or discard the rewrite. Non-retryability has to be the TYPE rather than
+    a claim in a docstring -- see claude_integration.py and #251 for the same
+    mistake made and fixed twice before.
     """
 
 
@@ -40,6 +54,14 @@ class BranchInfo:
     pr_number: Optional[int] = None
     pr_url: Optional[str] = None
     pr_state: Optional[str] = None  # 'draft', 'open', 'merged', 'closed'
+
+
+@dataclass
+class EpicWorktreeSyncResult:
+    """Outcome of checking whether an epic worktree is safe to commit on."""
+    ok: bool
+    detail: str = ""
+    reset_to_remote: bool = False
 
 
 def validate_no_unwanted_docs(project_dir: str, staged_files: List[str]) -> Dict[str, Any]:
@@ -211,12 +233,14 @@ class GitWorkflowManager:
             # Build PR title and body
             pr_title = issue_title if not issue_title.startswith('#') else issue_title[issue_title.find(' ')+1:]
             pr_body = self._build_pr_body(issue_number, issue_body, org, repo)
+            from services.project_workspace import workspace_manager
+            base_branch = workspace_manager.get_default_branch(project)
 
             # Create PR using gh CLI
             cmd = [
                 'gh', 'pr', 'create',
                 '--repo', f"{org}/{repo}",
-                '--base', 'main',
+                '--base', base_branch,
                 '--head', branch_name,
                 '--title', pr_title,
                 '--body', pr_body
@@ -836,6 +860,136 @@ class GitWorkflowManager:
         except subprocess.TimeoutExpired:
             raise Exception("Workspace sync timed out")
 
+    async def sync_epic_worktree_before_commit(
+        self, project_dir: str, branch_name: str
+    ) -> EpicWorktreeSyncResult:
+        """Fetch origin/<branch> and refuse or repair stale epic worktrees before commit."""
+        remote_ref = f'origin/{branch_name}'
+        try:
+            ls_remote = subprocess.run(
+                ['git', '-C', str(project_dir), 'ls-remote', '--heads', 'origin', branch_name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if ls_remote.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not query origin for branch {branch_name!r}: "
+                    f"{ls_remote.stderr.strip()}",
+                )
+            if not ls_remote.stdout.strip():
+                logger.info(
+                    f"Epic worktree {project_dir} has no remote branch {remote_ref} yet; "
+                    "skipping pre-commit alignment."
+                )
+                return EpicWorktreeSyncResult(True)
+
+            fetch_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if fetch_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Failed to fetch {remote_ref} before commit: "
+                    f"{fetch_result.stderr.strip()}",
+                )
+
+            ahead_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count', f'{remote_ref}..HEAD'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if ahead_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not compare local commits ahead of {remote_ref}: "
+                    f"{ahead_result.stderr.strip()}",
+                )
+
+            behind_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count', f'HEAD..{remote_ref}'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if behind_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not compare commits behind {remote_ref}: "
+                    f"{behind_result.stderr.strip()}",
+                )
+
+            ahead_count = int(ahead_result.stdout.strip() or '0')
+            behind_count = int(behind_result.stdout.strip() or '0')
+            if behind_count == 0 and ahead_count == 0:
+                return EpicWorktreeSyncResult(True)
+            if behind_count == 0:
+                logger.info(
+                    f"Epic worktree {project_dir} is {ahead_count} commit(s) ahead of "
+                    f"{remote_ref} and not behind it; proceeding to commit and push."
+                )
+                return EpicWorktreeSyncResult(True)
+
+            status_result = subprocess.run(
+                ['git', '-C', str(project_dir), 'status', '--porcelain'],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if status_result.returncode != 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Could not determine whether {project_dir} is dirty before aligning "
+                    f"to {remote_ref}: {status_result.stderr.strip()}",
+                )
+            dirty = bool(status_result.stdout.strip())
+
+            if ahead_count == 0 and not dirty:
+                reset_result = subprocess.run(
+                    ['git', '-C', str(project_dir), 'reset', '--hard', remote_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if reset_result.returncode != 0:
+                    return EpicWorktreeSyncResult(
+                        False,
+                        f"Failed to reset {project_dir} to {remote_ref}: "
+                        f"{reset_result.stderr.strip()}",
+                    )
+
+                logger.info(
+                    f"Reset clean epic worktree {project_dir} to {remote_ref} before commit."
+                )
+                return EpicWorktreeSyncResult(True, reset_to_remote=True)
+
+            if ahead_count > 0:
+                return EpicWorktreeSyncResult(
+                    False,
+                    f"Epic worktree {project_dir} has diverged from {remote_ref} "
+                    f"(ahead {ahead_count}, behind {behind_count}); refusing to commit "
+                    "until a human reconciles it.",
+                )
+
+            return EpicWorktreeSyncResult(
+                False,
+                f"Epic worktree {project_dir} is {behind_count} commit(s) behind "
+                f"{remote_ref} and has uncommitted changes; refusing to commit on top "
+                "of a stale base.",
+            )
+        except Exception as e:
+            return EpicWorktreeSyncResult(
+                False,
+                f"Unexpected error while syncing epic worktree {project_dir} against "
+                f"{remote_ref}: {e}",
+            )
+
     async def get_current_branch(self, project_dir: str) -> str:
         """Get the current branch name"""
         try:
@@ -1008,6 +1162,219 @@ class GitWorkflowManager:
             logger.error(f"Failed to commit: {e}")
             return False
 
+    def _describe_rejected_push(
+        self, project_dir: str, branch_name: str, stderr: str
+    ) -> str:
+        """Explain a non-fast-forward rejection from measurement, not inference.
+
+        This message used to assert, for every rejection, that "the agent likely
+        amended or rewrote history" and that a force-push or reset was required.
+        That inference happened to be right for the run this was written from,
+        but a non-fast-forward has at least two causes needing OPPOSITE actions:
+        a branch that is merely behind wants a fetch and a retry, while a
+        diverged one must be reconciled by hand -- and force-pushing it destroys
+        commits that are on origin.
+
+        git's own hint, quoted verbatim in the stderr below, makes this worse: it
+        says "the tip of your current branch is behind its remote counterpart"
+        for ANY non-fast-forward, divergence included. In the run that motivated
+        this, origin had not advanced at all.
+
+        Best-effort and never raises. It runs inside an error path that is about
+        to raise PushFailedError, so a failure to measure must not replace the
+        push failure with a measurement failure: when git cannot answer, this
+        falls back to reporting the rejection with no cause claim at all, which
+        is strictly better than a wrong one.
+        """
+        counts = self._ahead_behind(project_dir, branch_name)
+        head = f"Push rejected (non-fast-forward) for branch '{branch_name}'. "
+        tail = f"\nstderr: {stderr}"
+
+        if counts is None:
+            return (
+                head
+                + "Could not determine whether the branch is behind origin or has "
+                + "diverged from it, so no cause is claimed here -- read git's "
+                + "output below, and compare with `git -C <worktree> rev-list "
+                + f"--count origin/{branch_name}..HEAD` and the reverse."
+                + tail
+            )
+
+        ahead, behind = counts
+
+        if ahead > 0 and behind > 0:
+            return (
+                head
+                + f"Local history has DIVERGED from origin/{branch_name}: "
+                + f"{ahead} local commit(s) are not on origin and {behind} origin "
+                + "commit(s) are not local. Something rewrote history that had "
+                + "already been pushed (reset, rebase, amend or cherry-pick). Do "
+                + "NOT force-push -- that would destroy the origin-only commits. "
+                + "Reconcile by hand."
+                + tail
+            )
+
+        if behind > 0:
+            return (
+                head
+                + f"origin/{branch_name} has advanced by {behind} commit(s) that "
+                + "are not local, and local has none origin lacks. This is an "
+                + "ordinary stale branch, not a rewrite: fetch and integrate, "
+                + "then retry. No force-push is warranted."
+                + tail
+            )
+
+        # ahead >= 0, behind == 0: a fast-forward, which should not have been
+        # rejected. Report it plainly rather than inventing a reason -- a cause
+        # claim here would be guessing at something genuinely unexplained
+        # (a hook, a protected branch, a ref filter).
+        return (
+            head
+            + f"Local is {ahead} commit(s) ahead of origin/{branch_name} and not "
+            + "behind it, so this push should have fast-forwarded. The rejection "
+            + "did not come from branch divergence -- suspect a push rule, "
+            + "protected branch, or server-side hook."
+            + tail
+        )
+
+    def _ahead_behind(self, project_dir: str, branch_name: str):
+        """(ahead, behind) against origin/<branch>, or None if git cannot say.
+
+        Fetches first: after a rejected push the local remote-tracking ref can
+        be stale, which is exactly the state that would make the counts lie.
+
+        sync_epic_worktree_before_commit() runs the same two rev-list counts
+        inline and is deliberately NOT refactored onto this helper. Its callers
+        need to tell "could not compare ahead" apart from "could not compare
+        behind" and from "could not fetch", each with its own refusal text,
+        whereas this one only needs to know whether it can speak at all. Merging
+        them would also reshape the subprocess call sequence its tests assert
+        positionally, for no behavioural gain.
+        """
+        try:
+            subprocess.run(
+                ['git', '-C', str(project_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            remote_ref = f'origin/{branch_name}'
+            ahead = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count',
+                 f'{remote_ref}..HEAD'],
+                capture_output=True, text=True, timeout=10,
+            )
+            behind = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count',
+                 f'HEAD..{remote_ref}'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if ahead.returncode != 0 or behind.returncode != 0:
+                return None
+            return int(ahead.stdout.strip() or '0'), int(behind.stdout.strip() or '0')
+        except Exception as e:
+            logger.warning(
+                f"Could not measure how {project_dir} relates to "
+                f"origin/{branch_name} after a rejected push: {e}"
+            )
+            return None
+
+    def find_dropped_pushed_commits(self, project_dir: str, pre_head: str):
+        """Commits that were on origin and are no longer reachable from HEAD (#266).
+
+        An agent has a writable worktree with the base clone's `.git` mounted, so
+        it can reset, rebase, amend or cherry-pick over commits the orchestrator
+        has ALREADY pushed. Nothing checked for this; it was discovered only
+        indirectly, when a later push was rejected, and the cause then had to be
+        guessed at. Run fbd185c9-ec5b-475c-83de-769531240c8d is the worked
+        example: the agent reset past two pushed commits and cherry-picked one
+        back, 19:32:19Z and 19:32:21Z, inside its own 19:31:59-19:32:37 run.
+
+        Deliberately NOT a plain `merge-base --is-ancestor pre post` test, which
+        is what this issue was filed proposing. That fires on any rewrite,
+        including an agent rebasing its own UNPUSHED work onto a newer origin --
+        which is legitimate and desirable, and would have made this a false-
+        positive machine. What makes a rewrite damaging is that the commits it
+        dropped were already published, so that is what this measures: of the
+        commits reachable from pre_head but not from HEAD, which are still
+        reachable from origin/<branch>.
+
+        No fetch. `git push` updates the local remote-tracking ref, so after the
+        orchestrator's own push origin/<branch> is already accurate here, and
+        skipping the network keeps this off the hot path of every agent run. A
+        stale tracking ref can only cause UNDER-detection -- a dropped commit
+        looking local when it was pushed -- never a false refusal, which is the
+        right direction for a check that blocks a pipeline.
+
+        Returns a list of (sha, subject) for the dropped-and-published commits,
+        empty when there are none. Never raises: it runs on every agent
+        execution, and a git hiccup here must not become a new way for an
+        otherwise healthy run to fail.
+        """
+        if not pre_head:
+            return []
+
+        def _git(*args):
+            return subprocess.run(
+                ['git', '-C', str(project_dir), *args],
+                capture_output=True, text=True, timeout=15,
+            )
+
+        try:
+            post = _git('rev-parse', 'HEAD')
+            if post.returncode != 0:
+                return []
+            post_head = post.stdout.strip()
+            if not post_head or post_head == pre_head:
+                return []
+
+            # Still a descendant? Then nothing was dropped, whatever else moved.
+            if _git('merge-base', '--is-ancestor', pre_head, post_head).returncode == 0:
+                return []
+
+            branch = _git('rev-parse', '--abbrev-ref', 'HEAD')
+            branch_name = branch.stdout.strip() if branch.returncode == 0 else ''
+            if not branch_name or branch_name == 'HEAD':
+                return []
+            remote_ref = f'origin/{branch_name}'
+            if _git('rev-parse', '--verify', '--quiet', remote_ref).returncode != 0:
+                # Never pushed, so nothing dropped can have been published.
+                return []
+
+            dropped = _git('rev-list', f'{post_head}..{pre_head}')
+            if dropped.returncode != 0:
+                return []
+
+            published = []
+            for sha in dropped.stdout.split():
+                if _git('merge-base', '--is-ancestor', sha, remote_ref).returncode == 0:
+                    subject = _git('log', '-1', '--format=%s', sha)
+                    published.append(
+                        (sha, subject.stdout.strip() if subject.returncode == 0 else '')
+                    )
+            return published
+        except Exception as e:
+            logger.warning(
+                f"Could not check {project_dir} for rewritten published history: {e}"
+            )
+            return []
+
+    def read_head(self, project_dir: str):
+        """Current HEAD sha, or None if this is not a readable repository.
+
+        None rather than an exception: the caller snapshots HEAD before every
+        agent run, including for agents whose workspace is not a git checkout at
+        all, and a missing repo there is ordinary rather than exceptional.
+        """
+        try:
+            result = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-parse', 'HEAD'],
+                capture_output=True, text=True, timeout=15,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
     async def push_branch(self, project_dir: str, branch_name: str) -> None:
         """Push branch to remote.
 
@@ -1037,10 +1404,7 @@ class GitWorkflowManager:
 
             if any(m in stderr for m in _NON_FF_MARKERS):
                 raise PushFailedError(
-                    f"Push rejected (non-fast-forward) for branch '{branch_name}'. "
-                    f"Local commits diverge from origin — the agent likely amended or "
-                    f"rewrote history. Cannot auto-recover; manual force-push or branch "
-                    f"reset required.\nstderr: {stderr}"
+                    self._describe_rejected_push(project_dir, branch_name, stderr)
                 )
 
             if attempt < max_attempts:
