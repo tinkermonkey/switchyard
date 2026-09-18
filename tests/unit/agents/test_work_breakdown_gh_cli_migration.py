@@ -235,3 +235,42 @@ class TestCreateSubIssues:
         # No parent_issue_number and no parent_issue_id -- addSubIssue is
         # never attempted, so only 3 calls total (no create/view-poll either).
         assert mock_run.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_search_result_logs_warning_before_defaulting_to_no_match(self, agent, caplog):
+        """An ambiguous (non-JSON, non-list) success on `gh issue list` must
+        not be silently read as 'found zero issues' -- that conclusion is
+        what would let a real duplicate through as 'no existing issue
+        found' with no trace. This does not change the current fail-open
+        behavior (still proceeds to create), but it must no longer be
+        SILENT. Regression test for a gap found in code review of PR #270."""
+        state, project_config, sdlc_board = self._make_state_and_config()
+        agent.state_manager.load_project_state.return_value = state
+        agent.config_manager.get_project_config.return_value = project_config
+
+        sub_issues = [{
+            'title': 'Phase 1: Setup',
+            'body': 'Do the setup',
+            'phase': 'Phase 1: Setup',
+            'dependencies': 'None',
+        }]
+        task_context = {'issue_number': None, 'pipeline_run_id': 'run-1'}
+
+        responses = [
+            _mock_result(stdout='not json at all'),  # existing-issue search: ambiguous
+            _mock_result(stdout='https://github.com/acme/widgets/issues/123\n'),  # gh issue create
+            _mock_result(stdout='{"id": "CHILD_NODE_ID", "number": 123, "url": "https://github.com/acme/widgets/issues/123"}'),  # view poll
+            _mock_result(stdout=''),  # project item-add
+            _mock_result(stdout='{"data": {"repository": {"issue": {"projectItems": {"nodes": '
+                                 '[{"id": "SDLC_ITEM_ID", "project": {"number": 22, "id": "SDLC_PROJECT_ID", "title": "SDLC Execution"}}]}}}}}'),  # project items query
+            _mock_result(stdout='{}'),  # status mutation
+        ]
+
+        with patch('subprocess.run', side_effect=responses), \
+             patch('monitoring.decision_events.get_decision_event_emitter'), \
+             caplog.at_level('WARNING'):
+            created = await agent._create_sub_issues(sub_issues, task_context, 'acme-project')
+
+        assert len(created) == 1
+        assert 'non-list result' in caplog.text
+        assert 'Phase 1: Setup' in caplog.text

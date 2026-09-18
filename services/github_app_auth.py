@@ -134,8 +134,12 @@ class GitHubAppAuth:
 
             response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
-            record_github_app_success()
 
+            # Parsed and validated BEFORE recording success: a malformed
+            # body (bad JSON, missing 'token') must land in the except
+            # Exception block below as a single failure, not a success
+            # immediately followed by a second, contradictory failure
+            # record for the same call.
             data = response.json()
 
             # Cache the token
@@ -158,6 +162,7 @@ class GitHubAppAuth:
                 # reading as expired.
                 self.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=55)
 
+            record_github_app_success()
             logger.info(f"Generated new installation token, expires at {self.token_expires_at}")
 
             return self.installation_token
@@ -165,13 +170,32 @@ class GitHubAppAuth:
         except CircuitBreakerOpen as e:
             logger.warning(f"Skipping installation token request: {e}")
             return None
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.HTTPError as e:
+            # Unlike get_app_info()/get_installation_info() below (where a
+            # 4xx is a specific, expected answer about one GitHub
+            # resource), this endpoint has no such resource -- every 4xx
+            # here (401 bad JWT, 403 suspended/no permission, 404
+            # misconfigured installation ID, 422 validation) is a
+            # persistent, unrecoverable verdict on the App credential
+            # itself (see services/github_app.py's matching comment on its
+            # own get_installation_token()). Must count, or a revoked key
+            # never trips the breaker.
             record_github_app_failure()
             logger.error(f"Failed to get installation token: {e}")
             if hasattr(e.response, 'text'):
                 logger.error(f"Response: {e.response.text}")
             return None
+        except requests.exceptions.RequestException as e:
+            record_github_app_failure()
+            logger.error(f"Failed to get installation token: {e}")
+            return None
         except Exception as e:
+            # A malformed private key (jwt.encode() raising) or an
+            # unexpected response shape (KeyError on data['token'],
+            # ValueError parsing expires_at) is exactly the sustained
+            # App-auth failure this breaker exists to catch -- it must
+            # count, or a broken/revoked key never trips the breaker.
+            record_github_app_failure()
             logger.error(f"Error generating installation token: {e}")
             return None
 
@@ -192,18 +216,29 @@ class GitHubAppAuth:
 
             response = requests.get('https://api.github.com/app', headers=headers, timeout=30)
             response.raise_for_status()
+            # Parsed BEFORE recording success -- see get_installation_token()'s
+            # matching comment for why success and failure must not both be
+            # recorded for the same call.
+            result = response.json()
             record_github_app_success()
 
-            return response.json()
+            return result
 
         except CircuitBreakerOpen as e:
             logger.warning(f"Skipping app info request: {e}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(e.response, 'status_code', None)
+            if status_code is None or status_code >= 500:
+                record_github_app_failure()
+            logger.error(f"Failed to get app info: {e}")
             return None
         except requests.exceptions.RequestException as e:
             record_github_app_failure()
             logger.error(f"Failed to get app info: {e}")
             return None
         except Exception as e:
+            record_github_app_failure()
             logger.error(f"Failed to get app info: {e}")
             return None
 
@@ -224,18 +259,29 @@ class GitHubAppAuth:
             url = f"https://api.github.com/app/installations/{self.installation_id}"
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
+            # Parsed BEFORE recording success -- see get_installation_token()'s
+            # matching comment for why success and failure must not both be
+            # recorded for the same call.
+            result = response.json()
             record_github_app_success()
 
-            return response.json()
+            return result
 
         except CircuitBreakerOpen as e:
             logger.warning(f"Skipping installation info request: {e}")
+            return None
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(e.response, 'status_code', None)
+            if status_code is None or status_code >= 500:
+                record_github_app_failure()
+            logger.error(f"Failed to get installation info: {e}")
             return None
         except requests.exceptions.RequestException as e:
             record_github_app_failure()
             logger.error(f"Failed to get installation info: {e}")
             return None
         except Exception as e:
+            record_github_app_failure()
             logger.error(f"Failed to get installation info: {e}")
             return None
 

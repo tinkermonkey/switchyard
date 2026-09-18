@@ -14,7 +14,7 @@ import json
 from unittest.mock import Mock, AsyncMock, patch, MagicMock, call
 from pathlib import Path
 
-from services.github_api_client import GitHubAPIClient, get_github_client
+from services.github_api_client import GitHubAPIClient, GitHubBreaker, get_github_client
 from services.git_workflow_manager import GitWorkflowManager, BranchInfo, PushFailedError
 
 
@@ -187,50 +187,271 @@ class TestGitWorkflowManagerPRCreation:
         cmd = mock_run.call_args.args[0]
         assert cmd[cmd.index('--base') + 1] == 'master'
 
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    @patch('services.project_workspace.workspace_manager.get_default_branch')
+    async def test_already_exists_race_recovers_existing_pr(
+        self,
+        mock_get_default_branch,
+        mock_run,
+        manager,
+        tmp_path,
+    ):
+        """The bespoke "already exists" stderr-match race-recovery path
+        (two concurrent runs both trying to create a PR for the same
+        branch) -- previously entirely untested against the real method.
+        Regression test for a gap found in code review of PR #270."""
+        mock_get_default_branch.return_value = 'main'
+        mock_run.side_effect = [
+            Mock(returncode=1, stdout='', stderr='a pull request for branch "feature/issue-123" into branch "main" already exists'),
+            Mock(returncode=0, stdout=json.dumps(
+                [{'number': 42, 'url': 'https://github.com/owner/repo/pull/42', 'state': 'OPEN'}]
+            ), stderr=''),
+        ]
+        manager.track_branch('test-project', 123, 'feature/issue-123')
+
+        result = await manager.create_or_update_pr(
+            project='test-project',
+            issue_number=123,
+            project_dir=tmp_path,
+            org='owner',
+            repo='repo',
+            issue_title='Add fix',
+            issue_body='',
+            draft=True,
+        )
+
+        assert result == {
+            'success': True,
+            'pr_number': 42,
+            'pr_url': 'https://github.com/owner/repo/pull/42',
+            'created': False,
+        }
+        assert mock_run.call_count == 2
+        list_cmd = mock_run.call_args_list[1].args[0]
+        assert list_cmd[:3] == ['gh', 'pr', 'list']
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    @patch('services.project_workspace.workspace_manager.get_default_branch')
+    async def test_plain_creation_failure_returns_error(
+        self,
+        mock_get_default_branch,
+        mock_run,
+        manager,
+        tmp_path,
+    ):
+        mock_get_default_branch.return_value = 'main'
+        mock_run.return_value = Mock(returncode=1, stdout='', stderr='HTTP 403: Forbidden')
+        manager.track_branch('test-project', 123, 'feature/issue-123')
+
+        result = await manager.create_or_update_pr(
+            project='test-project',
+            issue_number=123,
+            project_dir=tmp_path,
+            org='owner',
+            repo='repo',
+            issue_title='Add fix',
+            issue_body='',
+            draft=True,
+        )
+
+        assert result['success'] is False
+        assert 'Forbidden' in result['error']
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_open_breaker_fails_creation_without_calling_subprocess(
+        self,
+        mock_run,
+        manager,
+        tmp_path,
+    ):
+        client = get_github_client()
+        client.breaker.state = GitHubBreaker.OPEN
+        client.breaker.reset_time = None
+        try:
+            manager.track_branch('test-project', 123, 'feature/issue-123')
+
+            result = await manager.create_or_update_pr(
+                project='test-project',
+                issue_number=123,
+                project_dir=tmp_path,
+                org='owner',
+                repo='repo',
+                issue_title='Add fix',
+                issue_body='',
+                draft=True,
+            )
+        finally:
+            client.breaker.state = GitHubBreaker.CLOSED
+            client.breaker._generic_failure_count = 0
+            client.breaker.trip_reason = None
+
+        assert result['success'] is False
+        mock_run.assert_not_called()
+
 
 class TestGitWorkflowManagerPRStatusUpdate:
     """
-    Test PR status updates with tracking.
-    
-    These tests verify that the tracking calls would be made with correct parameters.
+    Test PR status updates against the REAL update_pr_status()
+    implementation.
+
+    The 'ready' and 'approved' branches previously only simulated
+    track_gh_operation() calls against a bare Mock(spec=GitHubAPIClient)
+    and never invoked update_pr_status() itself -- so the bespoke
+    "'approved' not found -> gh label create -> retry" stderr-matching
+    chain had zero real coverage. Regression tests for a gap found in code
+    review of PR #270 (the GitHub circuit breaker consolidation).
     """
-    
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_pr_ready_tracking_parameters(self, mock_get_client):
-        """Test that marking PR ready would track with correct parameters."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
-        # Simulate what happens when PR is marked ready
-        mock_client.track_gh_operation(
-            'gh_pr_ready',
-            f"Marked PR #42 as ready for review in owner/repo"
+
+    @pytest.fixture
+    def manager(self):
+        return GitWorkflowManager()
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_marks_pr_ready_via_gh_cli(self, mock_run, manager, tmp_path):
+        mock_run.return_value = Mock(returncode=0, stdout='', stderr='')
+        branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+        branch_info.pr_number = 42
+        branch_info.pr_state = 'draft'
+
+        result = await manager.update_pr_status(
+            project='test-project', issue_number=123, project_dir=tmp_path,
+            status='ready', org='owner', repo='repo',
         )
-        
-        mock_client.track_gh_operation.assert_called_once()
-        call_args = mock_client.track_gh_operation.call_args
-        assert call_args[0][0] == 'gh_pr_ready'
-        assert 'PR #42' in call_args[0][1]
-        assert 'ready for review' in call_args[0][1]
-    
-    @patch('services.git_workflow_manager.get_github_client')
-    def test_pr_approved_tracking_parameters(self, mock_get_client):
-        """Test that adding approved label would track with correct parameters."""
-        mock_client = Mock(spec=GitHubAPIClient)
-        mock_get_client.return_value = mock_client
-        
-        # Simulate what happens when approved label is added
-        mock_client.track_gh_operation(
-            'gh_pr_edit_add_label',
-            f"Added 'approved' label to PR #42 in owner/repo"
+
+        assert result is True
+        assert branch_info.pr_state == 'open'
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ['gh', 'pr', 'ready', '42', '--repo', 'owner/repo']
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_mark_ready_failure_returns_false(self, mock_run, manager, tmp_path):
+        mock_run.return_value = Mock(returncode=1, stdout='', stderr='HTTP 404: Not Found')
+        branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+        branch_info.pr_number = 42
+        branch_info.pr_state = 'draft'
+
+        result = await manager.update_pr_status(
+            project='test-project', issue_number=123, project_dir=tmp_path,
+            status='ready', org='owner', repo='repo',
         )
-        
-        mock_client.track_gh_operation.assert_called_once()
-        call_args = mock_client.track_gh_operation.call_args
-        assert call_args[0][0] == 'gh_pr_edit_add_label'
-        assert 'approved' in call_args[0][1]
-        assert 'PR #42' in call_args[0][1]
-    
+
+        assert result is False
+        assert branch_info.pr_state == 'draft'
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_open_breaker_fails_mark_ready_without_calling_subprocess(self, mock_run, manager, tmp_path):
+        client = get_github_client()
+        client.breaker.state = GitHubBreaker.OPEN
+        client.breaker.reset_time = None
+        try:
+            branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+            branch_info.pr_number = 42
+            branch_info.pr_state = 'draft'
+
+            result = await manager.update_pr_status(
+                project='test-project', issue_number=123, project_dir=tmp_path,
+                status='ready', org='owner', repo='repo',
+            )
+        finally:
+            client.breaker.state = GitHubBreaker.CLOSED
+            client.breaker._generic_failure_count = 0
+            client.breaker.trip_reason = None
+
+        assert result is False
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_adds_approved_label_via_gh_cli(self, mock_run, manager, tmp_path):
+        mock_run.return_value = Mock(returncode=0, stdout='', stderr='')
+        branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+        branch_info.pr_number = 42
+        branch_info.pr_state = 'open'
+
+        result = await manager.update_pr_status(
+            project='test-project', issue_number=123, project_dir=tmp_path,
+            status='approved', org='owner', repo='repo',
+        )
+
+        assert result is True
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ['gh', 'pr', 'edit', '42', '--add-label', 'approved', '--repo', 'owner/repo']
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_missing_approved_label_is_created_then_retried(self, mock_run, manager, tmp_path):
+        """The bespoke "'approved' not found" stderr-match -> gh label
+        create -> retry chain, previously entirely untested against the
+        real method."""
+        mock_run.side_effect = [
+            Mock(returncode=1, stdout='', stderr="label 'approved' not found"),  # first add attempt
+            Mock(returncode=0, stdout='', stderr=''),                           # label create
+            Mock(returncode=0, stdout='', stderr=''),                           # retry add
+        ]
+        branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+        branch_info.pr_number = 42
+        branch_info.pr_state = 'open'
+
+        result = await manager.update_pr_status(
+            project='test-project', issue_number=123, project_dir=tmp_path,
+            status='approved', org='owner', repo='repo',
+        )
+
+        assert result is True
+        assert mock_run.call_count == 3
+        create_cmd = mock_run.call_args_list[1].args[0]
+        assert create_cmd[:3] == ['gh', 'label', 'create']
+        retry_cmd = mock_run.call_args_list[2].args[0]
+        assert retry_cmd == ['gh', 'pr', 'edit', '42', '--add-label', 'approved', '--repo', 'owner/repo']
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_label_creation_failure_after_missing_label_returns_false(self, mock_run, manager, tmp_path):
+        mock_run.side_effect = [
+            Mock(returncode=1, stdout='', stderr="label 'approved' not found"),
+            Mock(returncode=1, stdout='', stderr='HTTP 403: Forbidden'),
+        ]
+        branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+        branch_info.pr_number = 42
+        branch_info.pr_state = 'open'
+
+        result = await manager.update_pr_status(
+            project='test-project', issue_number=123, project_dir=tmp_path,
+            status='approved', org='owner', repo='repo',
+        )
+
+        assert result is False
+        assert mock_run.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch('subprocess.run')
+    async def test_open_breaker_fails_approved_label_without_calling_subprocess(self, mock_run, manager, tmp_path):
+        client = get_github_client()
+        client.breaker.state = GitHubBreaker.OPEN
+        client.breaker.reset_time = None
+        try:
+            branch_info = manager.track_branch('test-project', 123, 'feature/issue-123')
+            branch_info.pr_number = 42
+            branch_info.pr_state = 'open'
+
+            result = await manager.update_pr_status(
+                project='test-project', issue_number=123, project_dir=tmp_path,
+                status='approved', org='owner', repo='repo',
+            )
+        finally:
+            client.breaker.state = GitHubBreaker.CLOSED
+            client.breaker._generic_failure_count = 0
+            client.breaker.trip_reason = None
+
+        assert result is False
+        mock_run.assert_not_called()
+
     @patch('services.git_workflow_manager.get_github_client')
     def test_pr_list_tracking_parameters(self, mock_get_client):
         """Test that listing existing PRs would track with correct parameters."""

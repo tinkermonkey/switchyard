@@ -497,27 +497,53 @@ class GitHubBreaker:
             logger.warning(f"Could not connect to Redis for GitHub breaker: {e}")
 
     def trip(self, reset_time: Optional[datetime] = None):
-        """Open the breaker due to an explicit rate-limit response."""
-        if self.state == self.CLOSED:
-            self.state = self.OPEN
-            self.opened_at = datetime.now()
-            self.reset_time = reset_time or (datetime.now() + timedelta(hours=1))
-            self.trip_reason = 'rate_limit'
-            self._generic_failure_count = 0
-            self._save_to_redis()
-            logger.error(
-                f"🔴 GITHUB API CIRCUIT BREAKER OPENED - Rate limit exceeded. "
-                f"Will reset at {self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+        """Open the breaker due to an explicit rate-limit response.
+
+        Fires from CLOSED (the first trip) or HALF_OPEN (the recovery probe
+        itself just got rate-limited again) -- never from OPEN, since
+        is_open() already rejects every call before it could reach GitHub
+        to trip a second time.
+        """
+        if self.state == self.OPEN:
+            return
+        self.state = self.OPEN
+        self.opened_at = datetime.now()
+        self.reset_time = reset_time or (datetime.now() + timedelta(hours=1))
+        self.trip_reason = 'rate_limit'
+        self._generic_failure_count = 0
+        self._save_to_redis()
+        logger.error(
+            f"🔴 GITHUB API CIRCUIT BREAKER OPENED - Rate limit exceeded. "
+            f"Will reset at {self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
     def record_generic_failure(self):
         """Count a non-rate-limit failure toward a short-recovery outage trip.
 
-        Only accumulates while CLOSED -- once OPEN/HALF_OPEN, is_open()/
-        check_and_close() already govern gating, and re-tripping mid-outage
-        would just keep resetting the recovery window.
+        From CLOSED: accumulates toward GENERIC_FAILURE_THRESHOLD before
+        tripping. From HALF_OPEN: the recovery probe itself just failed --
+        reopen immediately rather than waiting to re-accumulate a fresh
+        threshold, mirroring services/circuit_breaker.py's CircuitBreaker
+        (any failure during a half-open probe reopens it). Without this
+        HALF_OPEN branch, the breaker gave exactly one recovery window of
+        protection per process lifetime and then never tripped again no
+        matter how many further failures followed -- the same silent
+        indefinite-hammering failure mode this breaker exists to prevent.
         """
-        if self.state != self.CLOSED:
+        if self.state == self.OPEN:
+            return
+        if self.state == self.HALF_OPEN:
+            self.state = self.OPEN
+            self.opened_at = datetime.now()
+            self.reset_time = datetime.now() + timedelta(seconds=self.GENERIC_FAILURE_RECOVERY_SECONDS)
+            self.trip_reason = 'generic_failure'
+            self._generic_failure_count = 0
+            self._save_to_redis()
+            logger.error(
+                f"🔴 GITHUB API CIRCUIT BREAKER RE-OPENED - recovery probe "
+                f"failed. Will retry at "
+                f"{self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             return
         self._generic_failure_count += 1
         if self._generic_failure_count >= self.GENERIC_FAILURE_THRESHOLD:
@@ -535,11 +561,20 @@ class GitHubBreaker:
             )
 
     def record_generic_success(self):
-        """Reset the consecutive-generic-failure streak. A rate-limit trip
-        tracks failures via a completely separate signal (GitHub's own
-        response), so this never touches that state.
+        """Reset the consecutive-generic-failure streak, and close the
+        breaker if this success was the HALF_OPEN recovery probe succeeding.
+
+        A single successful probe is enough to close (this class has always
+        been a single-probe design -- see check_and_close()'s "Testing if
+        rate limit reset" -- unlike CircuitBreaker's multi-success
+        success_threshold). Without this, nothing ever transitioned
+        HALF_OPEN back to CLOSED short of a manual admin reset, so
+        is_open() stayed permanently False (unprotected) while state
+        remained stuck reporting 'half_open' forever.
         """
         self._generic_failure_count = 0
+        if self.state == self.HALF_OPEN:
+            self.close()
 
     def check_and_close(self) -> bool:
         """Check if rate limit reset and close breaker if so."""
@@ -560,6 +595,7 @@ class GitHubBreaker:
     def close(self):
         """Close the breaker (rate limit or outage recovered)."""
         if self.state != self.CLOSED:
+            reason = self.trip_reason or 'rate_limit'
             self.state = self.CLOSED
             self.opened_at = None
             self.reset_time = None
@@ -570,7 +606,7 @@ class GitHubBreaker:
                     self.redis_client.delete(self.redis_key)
                 except Exception as e:
                     logger.error(f"Error deleting breaker state from Redis: {e}")
-            logger.info("🟢 GITHUB API BREAKER CLOSED - Rate limit recovered")
+            logger.info(f"🟢 GITHUB API BREAKER CLOSED - recovered (was: {reason})")
     
     def is_open(self) -> bool:
         """Check if breaker is open."""

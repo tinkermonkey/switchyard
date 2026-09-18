@@ -130,27 +130,48 @@ class TestVerifyBoardExists:
         assert exists is False
 
     @pytest.mark.asyncio
-    async def test_gh_failure_returns_false(self, manager):
+    async def test_gh_failure_assumes_board_still_exists(self, manager):
+        """A `gh_cli()`-level failure (breaker-open, timeout, rate limit, an
+        unclassified CLI/HTTP error) is never how GitHub reports "this board
+        doesn't exist" for this GraphQL query -- that only ever arrives as a
+        SUCCESSFUL response with projectV2: null (see test_board_not_found
+        above). Any failure here is therefore inconclusive, not a negative
+        answer, so it must not trigger the caller's search-by-name ->
+        possible-duplicate-creation path. Regression test for a gap found in
+        code review of PR #270 (the first fix only special-cased
+        circuit_open/timeout, still misreading a plain HTTP 404/generic
+        failure as 'board not found')."""
         result = _mock_result(returncode=1, stderr="HTTP 404: Not Found")
         with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
              patch('subprocess.run', return_value=result):
             exists = await manager._verify_board_exists(7, 'acme')
-        assert exists is False
+        assert exists is True
 
     @pytest.mark.asyncio
-    async def test_malformed_json_on_exit_zero_returns_false_not_crash(self, manager):
+    async def test_malformed_json_on_exit_zero_assumes_board_still_exists(self, manager):
+        """A successful call with an unparseable body is equally
+        inconclusive -- not the structured null response that means the
+        board is genuinely gone."""
         result = _mock_result(returncode=0, stdout='not json at all')
         with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
              patch('subprocess.run', return_value=result):
             exists = await manager._verify_board_exists(7, 'acme')
-        assert exists is False
+        assert exists is True
 
     @pytest.mark.asyncio
-    async def test_open_breaker_returns_false_without_calling_subprocess(self, manager):
+    async def test_open_breaker_assumes_board_still_exists_without_calling_subprocess(self, manager):
+        """A breaker-open failure means we could not ask GitHub at all --
+        NOT the same as GitHub answering 'no such board'. The caller treats
+        False as license to search-by-name and, on a miss, create a
+        duplicate board -- the highest-risk outcome during startup
+        reconciliation. Must assume the board still exists rather than risk
+        that from an unrelated, transient breaker trip. Regression test for
+        a bug found in code review of PR #270 (previously returned False
+        here, indistinguishable from a genuinely deleted board)."""
         get_github_client().breaker.state = GitHubBreaker.OPEN
         get_github_client().breaker.reset_time = None
         with patch('services.github_owner_utils.get_owner_type', return_value='organization'), \
              patch('subprocess.run') as mock_run:
             exists = await manager._verify_board_exists(7, 'acme')
-        assert exists is False
+        assert exists is True
         mock_run.assert_not_called()

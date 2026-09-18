@@ -55,11 +55,20 @@ def _mock_result(stdout="", returncode=0, stderr=""):
 class TestGetValidColumnsForBoardFallback:
     """_get_valid_columns_for_board()'s GitHub API fallback (reverse lookup
     via state files finds nothing first, since list_visible_projects()
-    returns [] in this fixture)."""
+    returns [] in this fixture).
+
+    `gh project field-list --format json` returns an OBJECT
+    ({"fields": [...], "totalCount": N}), not a bare list -- confirmed
+    against this same command's other two consumers in this codebase
+    (config/state_manager.py's refresh_board_field_ids(),
+    github_project_manager.py's _configure_board_columns()). The
+    isinstance(result.data, list) guard this function originally shipped
+    with could never pass against real `gh` output, making this whole
+    fallback path dead code (caught in follow-up code review of PR #270)."""
 
     def test_fallback_success_parses_status_options(self, monitor):
-        result = _mock_result(stdout='[{"name": "Status", "options": '
-                                      '[{"name": "Backlog"}, {"name": "In Progress"}]}]')
+        result = _mock_result(stdout='{"fields": [{"name": "Status", "options": '
+                                      '[{"name": "Backlog"}, {"name": "In Progress"}]}]}')
         with patch('subprocess.run', return_value=result):
             columns = monitor._get_valid_columns_for_board('acme', 7)
         assert columns == {'Backlog', 'In Progress'}
@@ -72,6 +81,15 @@ class TestGetValidColumnsForBoardFallback:
 
     def test_malformed_json_on_exit_zero_returns_empty_set_not_crash(self, monitor):
         result = _mock_result(returncode=0, stdout='not json at all')
+        with patch('subprocess.run', return_value=result):
+            columns = monitor._get_valid_columns_for_board('acme', 7)
+        assert columns == set()
+
+    def test_bare_list_shape_is_rejected_not_silently_accepted(self, monitor):
+        """A bare list is not what `gh project field-list` actually returns
+        -- must be treated as a malformed response (empty set), not parsed
+        as if it were the real {"fields": [...]} shape."""
+        result = _mock_result(stdout='[{"name": "Status", "options": [{"name": "Backlog"}]}]')
         with patch('subprocess.run', return_value=result):
             columns = monitor._get_valid_columns_for_board('acme', 7)
         assert columns == set()

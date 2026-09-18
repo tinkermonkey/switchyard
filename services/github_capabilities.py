@@ -43,7 +43,38 @@ class GitHubCapabilities:
         from services.github_api_client import get_github_client
 
         # Check PAT authentication
-        pat_authenticated, _pat_result = get_github_client().gh_cli(['gh', 'auth', 'status'])
+        pat_status_success, pat_status_result = get_github_client().gh_cli(['gh', 'auth', 'status'])
+        pat_auth_check_skipped = False
+        if not pat_status_success and pat_status_result.error_kind in ('circuit_open', 'timeout'):
+            # GitHubBreaker is a single, process-wide breaker shared by every
+            # gh_cli()/graphql()/rest() call in the orchestrator -- an
+            # unrelated trip elsewhere (a rate limit on a completely
+            # different operation) makes this probe fail even though the
+            # credential itself is fine. Since this is our own call and this
+            # class' own PAT_AUTH capability, `self._capabilities` at this
+            # point still holds whatever the PREVIOUS successful check found;
+            # falling back to it avoids flipping an already-verified
+            # credential to a false "not authenticated" (and the CRITICAL
+            # "no usable credential" warning below) purely from outage noise.
+            #
+            # Deliberately NOT extended to error_kind == 'generic' (the
+            # classification for the first GENERIC_FAILURE_THRESHOLD-1
+            # failures of an outage, before the breaker actually opens, and
+            # for an unclassified `gh` failure) or 'rate_limited': `gh auth
+            # status` reports a genuinely revoked/logged-out credential via
+            # a plain non-zero exit with no distinguishing HTTP-status text
+            # gh_cli() can key off, which lands in that same 'generic'
+            # bucket. Treating 'generic' as "couldn't determine" here would
+            # silently mask a real credential revocation as "still fine" --
+            # a worse outcome than the narrow outage-onset gap this leaves.
+            pat_authenticated = self._capabilities.get(GitHubCapability.PAT_AUTH, False)
+            pat_auth_check_skipped = True
+            logger.warning(
+                f"Could not check PAT auth status ({pat_status_result.error_kind}); "
+                f"retaining last known state: {pat_authenticated}"
+            )
+        else:
+            pat_authenticated = pat_status_success
 
         # Check GitHub App
         github_app_enabled = github_app.enabled
@@ -85,6 +116,12 @@ class GitHubCapabilities:
 
         # Build warnings
         self._warnings = []
+        if pat_auth_check_skipped:
+            self._warnings.append(
+                f"PAT auth status could not be checked this cycle "
+                f"({pat_status_result.error_kind}) -- reporting the last "
+                f"known state ({pat_authenticated}) rather than a live check."
+            )
         if not any_auth:
             self._warnings.append(
                 "CRITICAL: no usable GitHub credential (neither a PAT nor a "
@@ -221,8 +258,23 @@ class GitHubCapabilities:
         #     and blocking reconciliation on a check that does not apply to the
         #     token type would be a regression for those deployments.
         if not success:
+            if result.error_kind in ('circuit_open', 'timeout'):
+                return False, (
+                    f"could not verify PAT scopes -- GitHub API is currently "
+                    f"unavailable ({result.error_kind}), not a credential "
+                    f"problem. Treating as unable to write Projects v2 until "
+                    f"this clears: the check could not be performed, which "
+                    f"is not the same as passing it."
+                )
             stderr = (result.stderr or '').strip().splitlines()
-            detail = stderr[-1] if stderr else f"exit code {result.returncode}"
+            # returncode is None on the 'generic' except-path in gh_cli()
+            # (no subprocess result to report an exit code from) -- fall
+            # back to error_kind rather than surfacing a literal "exit code
+            # None" to whoever reads this diagnostic.
+            detail = stderr[-1] if stderr else (
+                f"exit code {result.returncode}" if result.returncode is not None
+                else (result.error_kind or 'unknown error')
+            )
             return False, (
                 f"could not verify PAT scopes -- `gh api user` failed ({detail}). "
                 f"Treating as unable to write Projects v2: the check could not be "

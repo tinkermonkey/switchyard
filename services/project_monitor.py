@@ -1459,9 +1459,14 @@ class ProjectMonitor:
                 ['gh', 'project', 'field-list', str(project_number),
                  '--owner', project_owner, '--format', 'json']
             )
-            if not success or not isinstance(result.data, list):
+            # `gh project field-list --format json` returns an object
+            # ({"fields": [...], "totalCount": N}), not a bare list -- matches
+            # the same command's other two consumers in this codebase
+            # (config/state_manager.py's refresh_board_field_ids(),
+            # services/github_project_manager.py's _configure_board_columns()).
+            if not success or not isinstance(result.data, dict):
                 raise RuntimeError(f"gh project field-list failed: {result}")
-            fields = result.data
+            fields = result.data.get('fields', [])
 
             # Find Status field
             status_field = next((f for f in fields if f['name'] == 'Status'), None)

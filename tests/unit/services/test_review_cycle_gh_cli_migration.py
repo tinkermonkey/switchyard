@@ -2,9 +2,13 @@
 Tests for ReviewCycleExecutor's migration onto GitHubAPIClient.gh_cli()
 (GitHub circuit breaker consolidation).
 
-Before: 3 raw `subprocess.run(['gh', ...])` calls
-(_get_latest_agent_comment, _escalate_blocked, _escalate_max_iterations),
-none breaker-protected. After: all routed through gh_cli().
+Before: 4 raw `subprocess.run(['gh', ...])` calls
+(_get_latest_agent_comment, _escalate_blocked, _escalate_max_iterations,
+_escalate_resume_failure), none breaker-protected. After: all routed through
+gh_cli(). _escalate_resume_failure was missed in the initial migration pass
+(caught in a follow-up code review of PR #270) despite its two siblings
+(_escalate_blocked, _escalate_max_iterations) issuing the byte-identical
+label-add command.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -149,3 +153,50 @@ class TestEscalateMaxIterationsLabelling:
 
         cmd = mock_run.call_args.args[0]
         assert cmd == ['gh', 'issue', 'edit', '42', '--repo', 'widgets', '--add-label', 'needs-human-review']
+
+
+class TestEscalateResumeFailureLabelling:
+    """_escalate_resume_failure() (#137, unresumable review cycles at
+    startup) was missed in the initial migration pass despite its siblings
+    above issuing the byte-identical label-add command -- caught in
+    follow-up code review of PR #270."""
+
+    @pytest.mark.asyncio
+    async def test_adds_label_via_gh_cli(self, executor):
+        cycle_state = _cycle_state()
+
+        with patch.object(executor.decision_events, 'emit_review_cycle_decision'), \
+             patch.object(executor, '_get_github_integration', return_value=AsyncMock()), \
+             patch.object(executor, '_save_cycle_state'), \
+             patch('services.pipeline_run.get_pipeline_run_manager'), \
+             patch('subprocess.run', return_value=_mock_result()) as mock_run:
+            await executor._escalate_resume_failure(cycle_state, RuntimeError("worktree unreadable"))
+
+        cmd = mock_run.call_args.args[0]
+        assert cmd == ['gh', 'issue', 'edit', '42', '--repo', 'widgets', '--add-label', 'needs-human-review']
+
+    @pytest.mark.asyncio
+    async def test_label_failure_does_not_crash_escalation(self, executor):
+        cycle_state = _cycle_state()
+
+        with patch.object(executor.decision_events, 'emit_review_cycle_decision'), \
+             patch.object(executor, '_get_github_integration', return_value=AsyncMock()), \
+             patch.object(executor, '_save_cycle_state'), \
+             patch('services.pipeline_run.get_pipeline_run_manager'), \
+             patch('subprocess.run', return_value=_mock_result(returncode=1, stderr="HTTP 403: Forbidden")):
+            await executor._escalate_resume_failure(cycle_state, RuntimeError("worktree unreadable"))  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_open_breaker_does_not_crash_escalation(self, executor):
+        cycle_state = _cycle_state()
+        get_github_client().breaker.state = GitHubBreaker.OPEN
+        get_github_client().breaker.reset_time = None
+
+        with patch.object(executor.decision_events, 'emit_review_cycle_decision'), \
+             patch.object(executor, '_get_github_integration', return_value=AsyncMock()), \
+             patch.object(executor, '_save_cycle_state'), \
+             patch('services.pipeline_run.get_pipeline_run_manager'), \
+             patch('subprocess.run') as mock_run:
+            await executor._escalate_resume_failure(cycle_state, RuntimeError("worktree unreadable"))
+
+        mock_run.assert_not_called()

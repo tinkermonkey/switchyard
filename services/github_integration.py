@@ -409,9 +409,8 @@ class GitHubIntegration:
 
     async def has_agent_processed_issue(self, issue_number: int, agent_name: str, repo: Optional[str] = None) -> bool:
         """Check if an agent has already processed this issue by looking for its signature in comments"""
-        # Resolved outside the block below, and caught narrowly: the enclosing
-        # handler catches only CalledProcessError, so _repo_path()'s refusal
-        # would otherwise escape an `-> bool` method that no caller expects to
+        # Resolved outside the block below, and caught narrowly: _repo_path()'s
+        # refusal must not escape an `-> bool` method that no caller expects to
         # raise. A broad `except ValueError` around the whole body would not do
         # -- json.JSONDecodeError IS a ValueError, and swallowing a malformed
         # `gh` response as "not processed" is the kind of quiet wrong answer
@@ -724,11 +723,6 @@ class GitHubIntegration:
                     # the first failing label rather than attempting the rest.
                     raise RuntimeError(f"gh issue edit --add-label '{label}' failed: {result}")
 
-        except ValueError as e:
-            # See has_agent_processed_issue: the enclosing handler catches only
-            # CalledProcessError, so _repo_path()'s refusal would otherwise
-            # escape a method whose callers do not expect it to raise.
-            logger.error(f"Failed to add labels: {e}")
         except Exception as e:
             logger.error(f"Failed to add labels: {e}")
 
@@ -742,10 +736,9 @@ class GitHubIntegration:
     ) -> Dict[str, Any]:
         """Create a new issue from agent work"""
         # Resolved and caught outside the block below for the same reason as in
-        # has_agent_processed_issue: the enclosing handler catches only
-        # CalledProcessError, and a blanket `except ValueError` around the whole
-        # body would also swallow the `int(issue_number)` below -- i.e. report
-        # "not created" for an issue GitHub did create.
+        # has_agent_processed_issue: a blanket `except ValueError` around the
+        # whole body would also swallow the `int(issue_number)` below -- i.e.
+        # report "not created" for an issue GitHub did create.
         try:
             repo_arg = self._repo_path(repo) if repo else ""
         except ValueError as e:

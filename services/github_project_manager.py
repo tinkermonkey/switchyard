@@ -967,8 +967,33 @@ class GitHubProjectManager:
                 project_data = data.get('data', {}).get(owner_key, {}).get('projectV2')
                 return project_data is not None
             else:
-                logger.debug(f"Board #{project_number} not found: {result.stderr}")
-                return False
+                # Any failure to execute this query -- breaker-open,
+                # timeout, rate limit, an unclassified CLI/HTTP error -- OR
+                # a successful call whose stdout wasn't valid JSON, means we
+                # could not get GitHub's actual answer. A real "board was
+                # deleted" only ever arrives as a SUCCESSFUL response with
+                # projectV2: null (handled above); there is no legitimate
+                # "expected failure" shape for this query the way a 4xx is
+                # expected for e.g. `gh issue view` on a genuinely-missing
+                # issue. So every branch here is inconclusive, not a
+                # negative answer -- including the first few failures of an
+                # outage that haven't yet tripped the breaker (error_kind
+                # 'generic') and an explicit rate limit ('rate_limited'),
+                # not just 'circuit_open'/'timeout'. The caller treats False
+                # as license to search-by-name and, on a further miss,
+                # create a brand-new board -- the highest-risk outcome
+                # during startup reconciliation -- so assume the board still
+                # exists rather than risk a duplicate from a transient
+                # condition; a genuinely deleted board is caught on the next
+                # reconciliation pass.
+                logger.warning(
+                    f"Could not verify board #{project_number} exists "
+                    f"({result.error_kind if not success else 'unparseable response'}) "
+                    f"-- assuming it still does rather than risking a "
+                    f"duplicate board creation. Will re-verify next "
+                    f"reconciliation cycle."
+                )
+                return True
                 
         except Exception as e:
             logger.error(f"Error verifying board existence: {e}")

@@ -149,8 +149,15 @@ class GitHubApp:
             # line and runs no error path.
             response = requests.post(url, headers=headers, timeout=30)
             response.raise_for_status()
-            record_github_app_success()
 
+            # Parsed and validated BEFORE recording success: a malformed
+            # body (bad JSON, missing 'token'/'expires_at') must land in the
+            # except Exception block below as a single failure, not a
+            # success immediately followed by a second, contradictory
+            # failure record for the same call (that pairing wipes
+            # CircuitBreaker's failure_count via its CLOSED-state success
+            # handling, so a sustained run of malformed responses would
+            # never trip the breaker).
             data = response.json()
             self._installation_token = data['token']
             # Captured on every mint so it can never drift from the token in
@@ -159,17 +166,43 @@ class GitHubApp:
             self._installation_permissions = data.get('permissions') or {}
             self._token_expires_at = datetime.fromisoformat(data['expires_at'].replace('Z', '+00:00'))
 
+            record_github_app_success()
             logger.info(f"Generated new GitHub App installation token (expires: {self._token_expires_at})")
             return self._installation_token
 
         except CircuitBreakerOpen as e:
             logger.warning(f"Skipping installation token request: {e}")
             return None
+        except requests.exceptions.HTTPError as e:
+            # Unlike graphql_request()/rest_request() below (where a 4xx is
+            # a specific, expected answer about one GitHub resource), this
+            # endpoint has no such resource -- every 4xx here (401 bad JWT,
+            # 403 suspended/no permission, 404 misconfigured installation
+            # ID, 422 validation) is a persistent, unrecoverable verdict on
+            # the App credential itself, which is exactly the "revoked/
+            # expired private key, misconfigured installation" scenario
+            # services/github_app_breaker.py's own docstring names as the
+            # motivating case. The mint fails, nothing gets cached, so
+            # every subsequent App-routed call re-attempts it -- not
+            # counting this would leave the breaker unable to ever trip for
+            # it, reproducing the indefinite-hammering bug for this one
+            # credential-verdict endpoint.
+            record_github_app_failure()
+            logger.error(f"Failed to get installation token: {e}")
+            return None
         except requests.exceptions.RequestException as e:
             record_github_app_failure()
             logger.error(f"Failed to get installation token: {e}")
             return None
         except Exception as e:
+            # Anything else (a malformed private key raising from jwt.encode(),
+            # an unexpected response shape raising KeyError/ValueError on
+            # data['token']/data['expires_at']) is exactly the class of
+            # sustained App-auth failure this breaker exists to catch -- it
+            # must count, or a broken/revoked key never trips the breaker and
+            # fails silently forever (confirmed gap: this branch previously
+            # never recorded a failure at all).
+            record_github_app_failure()
             logger.error(f"Failed to get installation token: {e}")
             return None
 
@@ -514,7 +547,13 @@ class GitHubApp:
 
         except requests.exceptions.HTTPError as e:
             self._report_call(failed=True, headers=app_headers)
-            record_github_app_failure()
+            # A 4xx is a specific, expected answer (bad auth aside, which
+            # GitHub reports via a 200 + errors body already handled above,
+            # or via 401 already retried above) -- only >=500 counts as
+            # outage evidence, mirroring GitHubAPIClient.http_request().
+            status_code = getattr(e.response, 'status_code', None)
+            if status_code is None or status_code >= 500:
+                record_github_app_failure()
             logger.error(f"GraphQL request failed: {e}")
             return None
         except Exception as e:
@@ -582,9 +621,16 @@ class GitHubApp:
                     logger.error(f"Cannot retry REST request for {method} {path}, no token available after refresh")
 
             response.raise_for_status()
+            # Parsed BEFORE recording success: a malformed body raising here
+            # must land in the except block below as a failure, not record
+            # both a success and a failure for the same call (the two would
+            # otherwise race in HALF_OPEN, where a success can close the
+            # breaker and the immediately-following failure would then be
+            # misread as a fresh CLOSED-state failure instead of reopening).
+            result = response.json() if response.text else {}
             self._report_call()
             record_github_app_success()
-            return response.json() if response.text else {}
+            return result
 
         except requests.exceptions.HTTPError as e:
             # Counted for the same reason the GraphQL path is (#168): this
@@ -599,7 +645,12 @@ class GitHubApp:
                 and 'rate limit' in (rest_response.text or '').lower()
             )
             self._report_call(rate_limited=rate_limited, failed=not rate_limited)
-            record_github_app_failure()
+            # A 4xx (rate-limit case aside) is a specific, expected answer,
+            # not outage evidence -- mirrors GitHubAPIClient.http_request()'s
+            # >=500-only rule.
+            status_code = getattr(rest_response, 'status_code', None)
+            if rate_limited or status_code is None or status_code >= 500:
+                record_github_app_failure()
             logger.error(f"REST request failed: {e}")
             return None
         except Exception as e:

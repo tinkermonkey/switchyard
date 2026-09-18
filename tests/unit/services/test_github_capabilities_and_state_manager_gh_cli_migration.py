@@ -56,6 +56,11 @@ class TestCheckCapabilitiesGhAuthStatus:
         assert any('no usable GitHub credential' in w for w in status['warnings'])
 
     def test_open_breaker_reports_unauthenticated_without_calling_subprocess(self):
+        """With no prior successful check to fall back to, an open breaker
+        on the very first check can only report unauthenticated -- there is
+        nothing else to report. See
+        test_open_breaker_preserves_previously_verified_auth below for the
+        case this migration's fix actually targets."""
         caps = self._make_capabilities()
         app = MagicMock(enabled=False)
         get_github_client().breaker.state = GitHubBreaker.OPEN
@@ -66,6 +71,34 @@ class TestCheckCapabilitiesGhAuthStatus:
             status = caps.check_capabilities()
         assert status['capabilities']['pat_authentication'] is False
         mock_run.assert_not_called()
+
+    def test_open_breaker_preserves_previously_verified_auth(self):
+        """GitHubBreaker is a single, process-wide breaker -- an unrelated
+        trip elsewhere must not flip a credential this class already
+        verified as authenticated into a false 'no usable credential'
+        CRITICAL warning that skips board reconciliation. Regression test
+        for a bug found in code review of PR #270."""
+        from services.github_capabilities import GitHubCapability
+        caps = self._make_capabilities()
+        app = MagicMock(enabled=False)
+
+        with patch('services.github_app.github_app', app), \
+             patch('subprocess.run', return_value=_mock_result()), \
+             patch.object(caps, '_probe_projects_v2_write', return_value=(True, 'ok')):
+            first = caps.check_capabilities()
+        assert first['capabilities']['pat_authentication'] is True
+
+        get_github_client().breaker.state = GitHubBreaker.OPEN
+        get_github_client().breaker.reset_time = None
+        with patch('services.github_app.github_app', app), \
+             patch('subprocess.run') as mock_run, \
+             patch.object(caps, '_probe_projects_v2_write', return_value=(True, 'ok')):
+            second = caps.check_capabilities()
+
+        assert second['capabilities']['pat_authentication'] is True
+        assert not any('no usable GitHub credential' in w for w in second['warnings'])
+        mock_run.assert_not_called()
+        assert caps._capabilities[GitHubCapability.PAT_AUTH] is True
 
 
 class TestRefreshBoardFieldIds:

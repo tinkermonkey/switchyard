@@ -304,6 +304,30 @@ class TestProjectsV2Guard:
         assert 'could not verify' in detail.lower()
         assert 'Bad credentials' in detail
 
+    def test_open_breaker_fails_closed_with_a_distinct_message(self):
+        """An open breaker (or a timeout) is not a credential problem -- it
+        means this probe was never actually attempted. Must still fail
+        closed (this is a WRITE-access guard), but the message must say so
+        distinctly rather than reading like a real auth/scope failure, since
+        an operator debugging 'Board reconciliation will be SKIPPED' needs to
+        know the difference. Regression test for a gap found in code review
+        of PR #270."""
+        from services.github_api_client import GitHubBreaker, get_github_client
+        client = get_github_client()
+        client.breaker.state = GitHubBreaker.OPEN
+        client.breaker.reset_time = None
+        try:
+            with patch('subprocess.run') as mock_run:
+                ok, detail = self._probe(CREDENTIAL_PAT, False, True)
+            mock_run.assert_not_called()
+        finally:
+            client.breaker.state = GitHubBreaker.CLOSED
+            client.breaker._generic_failure_count = 0
+            client.breaker.trip_reason = None
+        assert ok is False
+        assert 'circuit_open' in detail
+        assert 'not a credential problem' in detail
+
     def test_probe_runs_as_the_routed_credential(self):
         """The probe answers for the ACTIVE credential, so it must run as it --
         answering for a different token than reconciliation will use is the

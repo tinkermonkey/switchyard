@@ -767,6 +767,20 @@ class WorkBreakdownAgent(AnalysisAgent):
                     success, search_result = get_github_client().gh_cli(search_cmd)
                     if not success:
                         raise RuntimeError(f"gh issue list search failed: {search_result}")
+                    if not isinstance(search_result.data, list):
+                        # An ambiguous (non-JSON) success on `gh issue list`
+                        # still falls back to "found zero issues" below (this
+                        # loop already fails OPEN on any duplicate-check
+                        # error -- see the enclosing except Exception, which
+                        # swallows a hard search failure the same way). What
+                        # changes here is visibility: this can no longer
+                        # happen SILENTLY, which is what let a real duplicate
+                        # through with no trace at all.
+                        logger.warning(
+                            f"gh issue list search for '{sub_issue['title']}' "
+                            f"returned a non-list result, cannot check for an "
+                            f"existing duplicate: {search_result.data!r}"
+                        )
                     search_data = search_result.data if isinstance(search_result.data, list) else []
 
                     # Find exact match

@@ -15,6 +15,7 @@ trip does not disturb the existing rate-limit trip path.
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -406,6 +407,108 @@ class TestGitHubBreakerGenericFailureTrip:
         assert breaker.state == GitHubBreaker.CLOSED
         assert breaker.trip_reason is None
         assert breaker._generic_failure_count == 0
+
+
+class TestGitHubBreakerHalfOpenRecovery:
+    """Before this fix, nothing ever transitioned HALF_OPEN back to CLOSED
+    (short of a manual admin reset) and both trip()/record_generic_failure()
+    were guarded to fire only from CLOSED -- so a breaker that had tripped
+    and recovered even once became permanently unprotected: is_open() reads
+    False for HALF_OPEN, and every subsequent real failure was silently a
+    no-op. These tests drive a full trip -> recover -> re-trip cycle for
+    both trip paths, which is exactly the sequence that exposed the bug."""
+
+    def test_success_while_half_open_closes_the_breaker(self):
+        breaker = GitHubBreaker.__new__(GitHubBreaker)
+        breaker.state = GitHubBreaker.HALF_OPEN
+        breaker.redis_client = None
+        breaker._generic_failure_count = 0
+        breaker.trip_reason = "generic_failure"
+        breaker.opened_at = datetime.now()
+        breaker.reset_time = datetime.now()
+
+        breaker.record_generic_success()
+
+        assert breaker.state == GitHubBreaker.CLOSED
+        assert breaker.trip_reason is None
+        assert breaker.is_open() is False
+
+    def test_generic_failure_while_half_open_reopens_immediately(self):
+        """A single failed probe must reopen right away, not require
+        re-accumulating GENERIC_FAILURE_THRESHOLD failures from zero."""
+        breaker = GitHubBreaker.__new__(GitHubBreaker)
+        breaker.state = GitHubBreaker.HALF_OPEN
+        breaker.redis_client = None
+        breaker._generic_failure_count = 0
+        breaker.trip_reason = "generic_failure"
+        breaker.opened_at = None
+        breaker.reset_time = None
+
+        breaker.record_generic_failure()
+
+        assert breaker.is_open() is True
+        assert breaker.trip_reason == "generic_failure"
+        window = (breaker.reset_time - breaker.opened_at).total_seconds()
+        assert window == pytest.approx(GitHubBreaker.GENERIC_FAILURE_RECOVERY_SECONDS, abs=1)
+
+    def test_rate_limit_trip_while_half_open_reopens(self):
+        breaker = GitHubBreaker.__new__(GitHubBreaker)
+        breaker.state = GitHubBreaker.HALF_OPEN
+        breaker.redis_client = None
+        breaker._generic_failure_count = 0
+        breaker.trip_reason = "generic_failure"
+        breaker.opened_at = None
+        breaker.reset_time = None
+
+        breaker.trip()
+
+        assert breaker.is_open() is True
+        assert breaker.trip_reason == "rate_limit"
+
+    def test_trip_and_record_generic_failure_are_noops_while_open(self):
+        """Neither trip path should touch state while already OPEN -- the
+        upstream is_open() gate already prevents any call from reaching
+        GitHub to report a new failure/success in the first place."""
+        breaker = GitHubBreaker.__new__(GitHubBreaker)
+        breaker.state = GitHubBreaker.OPEN
+        breaker.redis_client = None
+        breaker._generic_failure_count = 0
+        breaker.trip_reason = "rate_limit"
+        breaker.opened_at = datetime(2020, 1, 1)
+        breaker.reset_time = datetime(2020, 1, 1)
+
+        breaker.trip()
+        breaker.record_generic_failure()
+
+        assert breaker.opened_at == datetime(2020, 1, 1)
+        assert breaker.reset_time == datetime(2020, 1, 1)
+        assert breaker.trip_reason == "rate_limit"
+
+    def test_full_cycle_trip_recover_fail_again_retrips(self):
+        """The end-to-end regression case: trip on generic failures, let the
+        recovery window pass and transition to HALF_OPEN via
+        check_and_close(), have the probe itself fail, and confirm the
+        breaker is open again rather than permanently unprotected."""
+        breaker = GitHubBreaker.__new__(GitHubBreaker)
+        breaker.state = GitHubBreaker.CLOSED
+        breaker.redis_client = None
+        breaker._generic_failure_count = 0
+        breaker.trip_reason = None
+        breaker.opened_at = None
+        breaker.reset_time = None
+
+        for _ in range(GitHubBreaker.GENERIC_FAILURE_THRESHOLD):
+            breaker.record_generic_failure()
+        assert breaker.is_open() is True
+
+        breaker.reset_time = datetime.now() - timedelta(seconds=1)
+        breaker.check_and_close()
+        assert breaker.state == GitHubBreaker.HALF_OPEN
+        assert breaker.is_open() is False
+
+        breaker.record_generic_failure()
+        assert breaker.is_open() is True
+        assert breaker.trip_reason == "generic_failure"
 
 
 class TestGhCliWiresBreakerOnRealPath:
