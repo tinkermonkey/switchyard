@@ -675,6 +675,20 @@ class DockerAgentRunner:
         # None for a workspace that is not a git checkout.
         from services.git_workflow_manager import git_workflow_manager
         pre_agent_head = git_workflow_manager.read_head(str(project_dir))
+        if pre_agent_head:
+            logger.info(
+                f"Pre-agent HEAD in {project_dir}: {pre_agent_head[:8]} "
+                f"(agent={agent}, task={task_id})"
+            )
+        else:
+            # Says which of the two it is. The first production miss (#271) was
+            # undiagnosable precisely because this case and a clean run looked
+            # the same from outside.
+            logger.warning(
+                f"No pre-agent HEAD captured for {project_dir} (agent={agent}, "
+                f"task={task_id}) -- a history rewrite by this agent will NOT be "
+                f"detected. Expected only when the workspace is not a git checkout."
+            )
 
         try:
             # Offloaded to a thread (code review finding, issue #129): before

@@ -262,3 +262,125 @@ class TestTheRefusalIsWiredAndNonRetryable:
              patch('services.git_workflow_manager.git_workflow_manager'
                    '.find_dropped_pushed_commits', return_value=[]):
             assert await runner.run_agent_in_container('prompt', ctx, tmp_path) == 'agent output'
+
+
+class TestTheCheckSaysWhichAnswerItGave:
+    """#271: the detector returned [] in production on the exact shape it was
+    built for, and left nothing in the logs to say which of its six early exits
+    it took -- so the cause still is not known.
+
+    `[]` means two completely different things: "I checked and nothing published
+    was dropped", and "I could not check". These pin them apart. Asserting on log
+    records rather than return values, because the return value is precisely what
+    cannot distinguish them.
+    """
+
+    def _m(self):
+        return GitWorkflowManager.__new__(GitWorkflowManager)
+
+    def test_a_missing_pre_head_warns_that_nothing_was_checked(self, caplog):
+        """The branch that made the production miss invisible."""
+        import logging
+        with caplog.at_level(logging.WARNING):
+            assert self._m().find_dropped_pushed_commits('/wt', None) == []
+
+        assert 'no pre-agent head' in caplog.text.lower()
+        assert 'would not see it' in caplog.text, (
+            "must say detection is DISABLED, not that the tree is clean"
+        )
+
+    def test_a_clean_run_does_not_warn(self, repo, caplog):
+        """Control: the common case must stay quiet, or the warning above is
+        noise and gets ignored."""
+        import logging
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        (repo / 'n.txt').write_text('x\n')
+        _git(repo, 'add', '-A')
+        _git(repo, 'commit', '-qm', 'ordinary work')
+
+        with caplog.at_level(logging.WARNING):
+            assert self._m().find_dropped_pushed_commits(str(repo), pre) == []
+
+        assert caplog.text.strip() == '', f"unexpected warning: {caplog.text}"
+
+    def test_a_rewrite_of_local_only_work_is_reported_as_such(self, repo, caplog):
+        """Rewriting unpushed work is legitimate, but it is NOT the same as no
+        rewrite at all -- and the logs should show the difference, since a
+        rewrite is the thing that precedes the damaging case."""
+        import logging
+        (repo / 'g.txt').write_text('local\n')
+        _git(repo, 'add', '-A')
+        _git(repo, 'commit', '-qm', 'local only')
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        _git(repo, 'commit', '-q', '--amend', '-m', 'local only, amended')
+
+        with caplog.at_level(logging.INFO):
+            assert self._m().find_dropped_pushed_commits(str(repo), pre) == []
+
+        assert 'history was rewritten' in caplog.text
+        assert 'local-only' in caplog.text or 'never been pushed' in caplog.text
+
+    def test_a_detached_head_says_it_cannot_judge(self, repo, caplog):
+        """No origin/<branch> to compare against, so the answer is unknown --
+        which must not read as an all-clear."""
+        import logging
+        (repo / 'd.txt').write_text('x\n')
+        _git(repo, 'add', '-A')
+        _git(repo, 'commit', '-qm', 'work')
+        pre = _git(repo, 'rev-parse', 'HEAD')
+        _git(repo, 'checkout', '-q', '--detach', 'HEAD~1')
+
+        with caplog.at_level(logging.WARNING):
+            assert self._m().find_dropped_pushed_commits(str(repo), pre) == []
+
+        assert 'detached HEAD' in caplog.text
+        assert 'cannot tell' in caplog.text
+
+    def test_a_git_failure_says_it_could_not_check(self, repo, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING):
+            with patch('services.git_workflow_manager.subprocess.run',
+                       side_effect=OSError("git vanished")):
+                assert self._m().find_dropped_pushed_commits(str(repo), 'a' * 40) == []
+
+        assert 'could not check' in caplog.text.lower()
+
+    def test_read_head_says_why_it_found_nothing(self, tmp_path, caplog):
+        import logging
+        with caplog.at_level(logging.DEBUG):
+            assert self._m().read_head(str(tmp_path)) is None
+        assert 'no head to snapshot' in caplog.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_container_warns_when_no_snapshot_was_taken(self, tmp_path, caplog):
+        """The call-site half of the same blind spot. Without this warning the
+        only trace of a disabled check is its absence, which is what made #271
+        undiagnosable: detection was off for that run and nothing said so."""
+        import logging
+        from claude.docker_runner import DockerAgentRunner
+
+        runner = DockerAgentRunner.__new__(DockerAgentRunner)
+        ctx = {'agent': 'senior_software_engineer', 'task_id': 't9', 'project': 'p'}
+
+        with caplog.at_level(logging.WARNING), \
+             patch('claude.docker_runner.get_breaker', return_value=None), \
+             patch.object(DockerAgentRunner, '_sanitize_container_name', return_value='c'), \
+             patch.object(DockerAgentRunner, '_build_docker_command',
+                          return_value=(['docker'], 'img')), \
+             patch.object(DockerAgentRunner, '_requires_docker_socket_access',
+                          return_value=False), \
+             patch.object(DockerAgentRunner, '_execute_in_container',
+                          new_callable=AsyncMock, return_value='out'), \
+             patch.object(DockerAgentRunner, '_register_active_container'), \
+             patch.object(DockerAgentRunner, '_cleanup_reference_worktrees'), \
+             patch.object(DockerAgentRunner, '_cleanup_container'), \
+             patch.object(DockerAgentRunner, '_unregister_active_container'), \
+             patch('services.git_workflow_manager.git_workflow_manager.read_head',
+                   return_value=None), \
+             patch('services.git_workflow_manager.git_workflow_manager'
+                   '.find_dropped_pushed_commits', return_value=[]):
+            assert await runner.run_agent_in_container('prompt', ctx, tmp_path) == 'out'
+
+        assert 'No pre-agent HEAD captured' in caplog.text
+        assert 'will NOT be' in caplog.text, "must say detection is disabled"
+        assert 'senior_software_engineer' in caplog.text, "name the agent it applies to"

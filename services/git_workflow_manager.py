@@ -1360,6 +1360,15 @@ class GitWorkflowManager:
         otherwise healthy run to fail.
         """
         if not pre_head:
+            # Not "nothing was rewritten" -- "I was never told where to look".
+            # This is the branch that made the first production miss (#271)
+            # undiagnosable: it and a genuine all-clear were byte-identical in
+            # the logs.
+            logger.warning(
+                f"Cannot check {project_dir} for rewritten published history: no "
+                f"pre-agent HEAD was captured. An agent could have dropped "
+                f"published commits here and this check would not see it."
+            )
             return []
 
         def _git(*args):
@@ -1371,26 +1380,69 @@ class GitWorkflowManager:
         try:
             post = _git('rev-parse', 'HEAD')
             if post.returncode != 0:
+                logger.warning(
+                    f"Cannot check {project_dir} for rewritten published history: "
+                    f"git could not read HEAD ({post.stderr.strip()[:120]})"
+                )
                 return []
             post_head = post.stdout.strip()
-            if not post_head or post_head == pre_head:
+            if not post_head:
+                logger.warning(
+                    f"Cannot check {project_dir} for rewritten published history: "
+                    f"git returned an empty HEAD"
+                )
+                return []
+            if post_head == pre_head:
+                logger.debug(
+                    f"{project_dir} HEAD unchanged at {post_head[:8]}; no history "
+                    f"to check"
+                )
                 return []
 
             # Still a descendant? Then nothing was dropped, whatever else moved.
             if _git('merge-base', '--is-ancestor', pre_head, post_head).returncode == 0:
+                logger.debug(
+                    f"{project_dir} moved {pre_head[:8]} -> {post_head[:8]} and the "
+                    f"old HEAD is still an ancestor; nothing dropped"
+                )
                 return []
+
+            # Past here, history WAS rewritten. Whether that matters depends on
+            # whether the dropped commits were published -- but say plainly that
+            # a rewrite happened, so a later all-clear is never mistaken for
+            # "the agent did nothing unusual".
+            logger.info(
+                f"{project_dir} history was rewritten: {pre_head[:8]} is no longer "
+                f"an ancestor of {post_head[:8]}. Checking whether any dropped "
+                f"commit was already on origin."
+            )
 
             branch = _git('rev-parse', '--abbrev-ref', 'HEAD')
             branch_name = branch.stdout.strip() if branch.returncode == 0 else ''
             if not branch_name or branch_name == 'HEAD':
+                logger.warning(
+                    f"{project_dir} rewrote history but is on a detached HEAD, so "
+                    f"there is no origin/<branch> to judge against -- cannot tell "
+                    f"whether the dropped commits were published"
+                )
                 return []
             remote_ref = f'origin/{branch_name}'
             if _git('rev-parse', '--verify', '--quiet', remote_ref).returncode != 0:
-                # Never pushed, so nothing dropped can have been published.
+                # Never pushed, so nothing dropped can have been published. A
+                # real all-clear, unlike the warnings above.
+                logger.info(
+                    f"{project_dir} rewrote history on {branch_name!r}, but that "
+                    f"branch has never been pushed, so nothing published was lost"
+                )
                 return []
 
             dropped = _git('rev-list', f'{post_head}..{pre_head}')
             if dropped.returncode != 0:
+                logger.warning(
+                    f"Cannot check {project_dir} for rewritten published history: "
+                    f"git could not list the dropped commits "
+                    f"({dropped.stderr.strip()[:120]})"
+                )
                 return []
 
             published = []
@@ -1400,6 +1452,12 @@ class GitWorkflowManager:
                     published.append(
                         (sha, subject.stdout.strip() if subject.returncode == 0 else '')
                     )
+
+            if not published:
+                logger.info(
+                    f"{project_dir} rewrote history on {branch_name!r}, but every "
+                    f"dropped commit was local-only -- nothing published was lost"
+                )
             return published
         except Exception as e:
             logger.warning(
@@ -1419,8 +1477,15 @@ class GitWorkflowManager:
                 ['git', '-C', str(project_dir), 'rev-parse', 'HEAD'],
                 capture_output=True, text=True, timeout=15,
             )
-            return result.stdout.strip() if result.returncode == 0 else None
-        except Exception:
+            if result.returncode != 0:
+                logger.debug(
+                    f"No HEAD to snapshot in {project_dir}: "
+                    f"{result.stderr.strip()[:120] or 'not a git repository'}"
+                )
+                return None
+            return result.stdout.strip()
+        except Exception as e:
+            logger.warning(f"Could not snapshot HEAD in {project_dir}: {e}")
             return None
 
     async def push_branch(self, project_dir: str, branch_name: str) -> None:
