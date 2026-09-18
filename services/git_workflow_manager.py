@@ -1196,6 +1196,123 @@ class GitWorkflowManager:
             logger.error(f"Failed to commit: {e}")
             return False
 
+    def _describe_rejected_push(
+        self, project_dir: str, branch_name: str, stderr: str
+    ) -> str:
+        """Explain a non-fast-forward rejection from measurement, not inference.
+
+        This message used to assert, for every rejection, that "the agent likely
+        amended or rewrote history" and that a force-push or reset was required.
+        That inference happened to be right for the run this was written from,
+        but a non-fast-forward has at least two causes needing OPPOSITE actions:
+        a branch that is merely behind wants a fetch and a retry, while a
+        diverged one must be reconciled by hand -- and force-pushing it destroys
+        commits that are on origin.
+
+        git's own hint, quoted verbatim in the stderr below, makes this worse: it
+        says "the tip of your current branch is behind its remote counterpart"
+        for ANY non-fast-forward, divergence included. In the run that motivated
+        this, origin had not advanced at all.
+
+        Best-effort and never raises. It runs inside an error path that is about
+        to raise PushFailedError, so a failure to measure must not replace the
+        push failure with a measurement failure: when git cannot answer, this
+        falls back to reporting the rejection with no cause claim at all, which
+        is strictly better than a wrong one.
+        """
+        counts = self._ahead_behind(project_dir, branch_name)
+        head = f"Push rejected (non-fast-forward) for branch '{branch_name}'. "
+        tail = f"\nstderr: {stderr}"
+
+        if counts is None:
+            return (
+                head
+                + "Could not determine whether the branch is behind origin or has "
+                + "diverged from it, so no cause is claimed here -- read git's "
+                + "output below, and compare with `git -C <worktree> rev-list "
+                + f"--count origin/{branch_name}..HEAD` and the reverse."
+                + tail
+            )
+
+        ahead, behind = counts
+
+        if ahead > 0 and behind > 0:
+            return (
+                head
+                + f"Local history has DIVERGED from origin/{branch_name}: "
+                + f"{ahead} local commit(s) are not on origin and {behind} origin "
+                + "commit(s) are not local. Something rewrote history that had "
+                + "already been pushed (reset, rebase, amend or cherry-pick). Do "
+                + "NOT force-push -- that would destroy the origin-only commits. "
+                + "Reconcile by hand."
+                + tail
+            )
+
+        if behind > 0:
+            return (
+                head
+                + f"origin/{branch_name} has advanced by {behind} commit(s) that "
+                + "are not local, and local has none origin lacks. This is an "
+                + "ordinary stale branch, not a rewrite: fetch and integrate, "
+                + "then retry. No force-push is warranted."
+                + tail
+            )
+
+        # ahead >= 0, behind == 0: a fast-forward, which should not have been
+        # rejected. Report it plainly rather than inventing a reason -- a cause
+        # claim here would be guessing at something genuinely unexplained
+        # (a hook, a protected branch, a ref filter).
+        return (
+            head
+            + f"Local is {ahead} commit(s) ahead of origin/{branch_name} and not "
+            + "behind it, so this push should have fast-forwarded. The rejection "
+            + "did not come from branch divergence -- suspect a push rule, "
+            + "protected branch, or server-side hook."
+            + tail
+        )
+
+    def _ahead_behind(self, project_dir: str, branch_name: str):
+        """(ahead, behind) against origin/<branch>, or None if git cannot say.
+
+        Fetches first: after a rejected push the local remote-tracking ref can
+        be stale, which is exactly the state that would make the counts lie.
+
+        sync_epic_worktree_before_commit() runs the same two rev-list counts
+        inline and is deliberately NOT refactored onto this helper. Its callers
+        need to tell "could not compare ahead" apart from "could not compare
+        behind" and from "could not fetch", each with its own refusal text,
+        whereas this one only needs to know whether it can speak at all. Merging
+        them would also reshape the subprocess call sequence its tests assert
+        positionally, for no behavioural gain.
+        """
+        try:
+            subprocess.run(
+                ['git', '-C', str(project_dir), 'fetch', 'origin',
+                 f'{branch_name}:refs/remotes/origin/{branch_name}', '--quiet'],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            remote_ref = f'origin/{branch_name}'
+            ahead = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count',
+                 f'{remote_ref}..HEAD'],
+                capture_output=True, text=True, timeout=10,
+            )
+            behind = subprocess.run(
+                ['git', '-C', str(project_dir), 'rev-list', '--count',
+                 f'HEAD..{remote_ref}'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if ahead.returncode != 0 or behind.returncode != 0:
+                return None
+            return int(ahead.stdout.strip() or '0'), int(behind.stdout.strip() or '0')
+        except Exception as e:
+            logger.warning(
+                f"Could not measure how {project_dir} relates to "
+                f"origin/{branch_name} after a rejected push: {e}"
+            )
+            return None
+
     async def push_branch(self, project_dir: str, branch_name: str) -> None:
         """Push branch to remote.
 
@@ -1225,10 +1342,7 @@ class GitWorkflowManager:
 
             if any(m in stderr for m in _NON_FF_MARKERS):
                 raise PushFailedError(
-                    f"Push rejected (non-fast-forward) for branch '{branch_name}'. "
-                    f"Local commits diverge from origin — the agent likely amended or "
-                    f"rewrote history. Cannot auto-recover; manual force-push or branch "
-                    f"reset required.\nstderr: {stderr}"
+                    self._describe_rejected_push(project_dir, branch_name, stderr)
                 )
 
             if attempt < max_attempts:

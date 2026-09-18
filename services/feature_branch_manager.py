@@ -1390,6 +1390,83 @@ class FeatureBranchManager:
         from services.git_workflow_manager import git_workflow_manager
         await git_workflow_manager.push_branch(project_dir, branch_name)
 
+    async def _refuse_if_out_of_sync_with_origin(
+        self, project: str, project_dir: str, branch_name: str
+    ) -> Optional[str]:
+        """Detail string if this epic worktree must not be committed to, else None.
+
+        #261 added sync_epic_worktree_before_commit() and wired it into
+        auto_commit._commit_and_push() and agent_executor._failsafe_commit_check().
+        It was never wired into finalize_feature_branch_work(), which is the path
+        the review cycle actually finalizes on -- so the primary commit->push
+        route had no origin check at all (#264).
+
+        That is not theoretical. Run fbd185c9-ec5b-475c-83de-769531240c8d failed
+        on 2026-09-17 with a non-fast-forward rejection AFTER #261 was already
+        deployed, because the agent reset past two pushed commits and
+        cherry-picked one back (19:32:19Z and 19:32:21Z, inside its own container
+        run). The rewrite was already on disk when finalization started, so a
+        check here would have caught it -- ahead 1, behind 1 -- and refused with
+        a clear reason instead of crashing the review-cycle thread and retaining
+        the board lock for a human.
+
+        Base clones are exempt, matching the two existing call sites: the guard
+        is about epic worktrees, whose branch is shared across an epic's
+        sub-issues and therefore can move underneath them.
+        """
+        try:
+            from services.project_workspace import workspace_manager
+            if workspace_manager.is_base_clone_dir(project, project_dir):
+                return None
+        except Exception as e:
+            # Deciding "is this a base clone" must not itself block finalization.
+            # Treated as base clone (skip) rather than as an epic worktree
+            # (refuse): this method gates a push that would otherwise have gone
+            # ahead unchecked before #264, so an unanswerable question here
+            # leaves behaviour exactly as it already was rather than inventing a
+            # new way to fail.
+            logger.warning(
+                f"Could not determine whether {project_dir} is {project}'s base "
+                f"clone ({e}); skipping the origin-sync check for this push"
+            )
+            return None
+
+        # No `origin` remote at all is a conclusive LOCAL fact, not an
+        # out-of-sync condition: there is nothing to be out of sync with, and
+        # the push that follows will fail on its own with a clear message.
+        # sync_epic_worktree_before_commit() reports this as a refusal, because
+        # its own callers only ever run where an origin exists -- so the
+        # distinction is drawn here rather than by changing that contract.
+        # Deliberately narrow: only a missing remote skips. A remote that
+        # exists but cannot be reached still refuses, because then the question
+        # genuinely went unanswered and the branch may well have moved.
+        import subprocess
+        try:
+            remote = subprocess.run(
+                ['git', '-C', str(project_dir), 'remote', 'get-url', 'origin'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if remote.returncode != 0 or not remote.stdout.strip():
+                logger.info(
+                    f"{project_dir} has no 'origin' remote; skipping the "
+                    f"origin-sync check for {branch_name!r}"
+                )
+                return None
+        except Exception as e:
+            logger.warning(
+                f"Could not read the origin remote for {project_dir} ({e}); "
+                f"skipping the origin-sync check for {branch_name!r}"
+            )
+            return None
+
+        from services.git_workflow_manager import git_workflow_manager
+        sync_result = await git_workflow_manager.sync_epic_worktree_before_commit(
+            str(project_dir), branch_name
+        )
+        if sync_result.ok:
+            return None
+        return sync_result.detail
+
 
     async def escalate_stale_branch(
         self,
@@ -1729,6 +1806,17 @@ git push --force-with-lease
                     from services.git_workflow_manager import git_workflow_manager
                     branch_name = await git_workflow_manager.get_current_branch(project_dir)
 
+                    sync_detail = await self._refuse_if_out_of_sync_with_origin(
+                        project, project_dir, branch_name
+                    )
+                    if sync_detail:
+                        logger.error(
+                            f"Refusing to push standalone branch {branch_name!r} for "
+                            f"issue #{issue_number}: {sync_detail}"
+                        )
+                        return {"success": False, "error": sync_detail,
+                                "origin_out_of_sync": True}
+
                     await self.git_push(project_dir, branch_name)
 
                     logger.info(f"Pushed standalone changes for issue #{issue_number} to {branch_name}")
@@ -1794,7 +1882,22 @@ git push --force-with-lease
                 logger.error(error_msg)
                 return {"success": False, "error": error_msg}
 
-            # Step 4: Push to remote — raises PushFailedError on failure
+            # Step 4: Push to remote — raises PushFailedError on failure.
+            # Checked against origin first (#264): before this, a worktree whose
+            # history had been rewritten reached git push and came back as a
+            # bare non-fast-forward rejection, which crashed the review-cycle
+            # thread rather than reporting a reconcilable state.
+            sync_detail = await self._refuse_if_out_of_sync_with_origin(
+                project, project_dir, feature_branch.branch_name
+            )
+            if sync_detail:
+                logger.error(
+                    f"Refusing to push {feature_branch.branch_name!r} for issue "
+                    f"#{issue_number}: {sync_detail}"
+                )
+                return {"success": False, "error": sync_detail,
+                        "origin_out_of_sync": True}
+
             await self.git_push(project_dir, feature_branch.branch_name)
 
             logger.info(f"Pushed changes for issue #{issue_number} to {feature_branch.branch_name}")
