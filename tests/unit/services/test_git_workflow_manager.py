@@ -146,20 +146,25 @@ class TestGitWorkflowManagerPRCreation:
         assert 'issue #123' in call_args[0][1]
 
     @pytest.mark.asyncio
-    @patch('services.git_workflow_manager.subprocess.run')
-    @patch('services.git_workflow_manager.get_github_client')
+    @patch('subprocess.run')
     @patch('services.project_workspace.workspace_manager.get_default_branch')
     async def test_create_pr_uses_project_default_branch(
         self,
         mock_get_default_branch,
-        mock_get_client,
         mock_run,
         manager,
         tmp_path,
     ):
-        """PR creation should use the configured project default branch."""
+        """PR creation should use the configured project default branch.
+
+        create_or_update_pr() now routes through the real
+        GitHubAPIClient.gh_cli(), which calls the global subprocess.run --
+        not services.git_workflow_manager.subprocess.run, and not a mocked
+        get_github_client() (gh_cli() needs its real breaker/env logic to
+        run, not a Mock(spec=...) that would make its `success, result =
+        client.gh_cli(...)` unpack fail).
+        """
         mock_get_default_branch.return_value = 'master'
-        mock_get_client.return_value = Mock(spec=GitHubAPIClient)
         mock_run.return_value = Mock(
             returncode=0,
             stdout='https://github.com/owner/repo/pull/42\n',
