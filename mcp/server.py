@@ -21,7 +21,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -793,12 +792,13 @@ async def toggle_project_v2_workflow(
     """
     # Resolve owner if not supplied.
     if not owner:
-        res = subprocess.run(
-            ["gh", "api", "/user", "--jq", ".login"],
-            capture_output=True, text=True, timeout=15,
+        from services.github_api_client import get_github_client
+
+        success, res = get_github_client().gh_cli(
+            ["gh", "api", "/user", "--jq", ".login"], timeout=15,
         )
-        if res.returncode != 0:
-            raise RuntimeError(f"Could not resolve authenticated user: {res.stderr.strip()}")
+        if not success:
+            raise RuntimeError(f"Could not resolve authenticated user: {(res.stderr or '').strip()}")
         owner = res.stdout.strip()
 
     # GraphQL fragments reused for both org and user queries.

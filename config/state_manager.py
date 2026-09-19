@@ -392,8 +392,7 @@ class GitHubStateManager:
         This is used to update boards that were created with placeholder IDs
         """
         try:
-            import subprocess
-            import json
+            from services.github_api_client import get_github_client
 
             state = self.load_project_state(project_name)
             if not state:
@@ -408,8 +407,10 @@ class GitHubStateManager:
             # Query GitHub for the project field list
             cmd = ['gh', 'project', 'field-list', str(board.project_number),
                    '--owner', state.org, '--format', 'json']
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            fields_data = json.loads(result.stdout)
+            success, result = get_github_client().gh_cli(cmd)
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh project field-list failed: {result}")
+            fields_data = result.data
 
             # Find the Status field
             status_field = None

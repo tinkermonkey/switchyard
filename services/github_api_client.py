@@ -17,8 +17,9 @@ import re
 import os
 import traceback
 import inspect
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Iterable
 from collections import deque
 from threading import Lock, Thread
 
@@ -194,6 +195,67 @@ RATE_LIMITED_ERROR = "rate_limited"
 FAILURE_BREAKER_OPEN = 'breaker_open'
 FAILURE_RATE_LIMITED = 'rate_limited'
 FAILURE_OTHER = 'other'
+
+# gh_cli()'s error_kind -> the legacy {"error": ...} string it used to return
+# directly, so GhCliResult.get('error')/['error'] reads the same value a
+# caller written against the old ad hoc dict would have seen.
+_GH_CLI_ERROR_KIND_TO_LEGACY = {
+    'rate_limited': RATE_LIMITED_ERROR,
+    'circuit_open': BREAKER_OPEN_ERROR,
+    'not_found': 'resource_deleted',
+    'forbidden': 'client_error',
+    'timeout': 'timeout',
+    'generic': 'cli_error',
+}
+
+
+@dataclass
+class GhCliResult:
+    """Uniform result of GitHubAPIClient.gh_cli(), replacing the ad hoc dict
+    shape the old implementation returned (sometimes {"output": stdout},
+    sometimes parsed JSON directly, sometimes an error dict with different
+    keys depending on the failure branch).
+
+    Every raw `subprocess.run(['gh', ...])` call site being migrated onto
+    gh_cli() needs stderr preserved verbatim -- several branch on its text
+    ("already exists", "already linked", "is not a draft", "'approved' not
+    found") -- plus the parsed/raw stdout, the exit code, and a classified
+    error_kind, none of which the old shape carried consistently.
+
+    Supports dict-style .get()/[]/`in` on the legacy {"error", "stderr",
+    "exit_code"} keys so the few callers written against the old return
+    shape (services/github_project_manager.py's project create/link/
+    field-list) keep working unchanged.
+    """
+    success: bool
+    data: Any = None
+    stdout: str = ""
+    stderr: str = ""
+    returncode: Optional[int] = None
+    error_kind: Optional[str] = None  # rate_limited|not_found|forbidden|circuit_open|timeout|generic|None
+
+    def _legacy_dict(self) -> Dict[str, Any]:
+        if not self.success:
+            d: Dict[str, Any] = {
+                'error': _GH_CLI_ERROR_KIND_TO_LEGACY.get(self.error_kind, self.error_kind or 'cli_error'),
+            }
+            if self.stderr:
+                d['stderr'] = self.stderr
+            if self.returncode is not None:
+                d['exit_code'] = self.returncode
+            return d
+        if isinstance(self.data, dict):
+            return self.data
+        return {'output': self.data} if self.data is not None else {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._legacy_dict().get(key, default)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._legacy_dict()[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._legacy_dict()
 
 
 def describe_graphql_failure(result: Any) -> str:
@@ -387,25 +449,45 @@ class GitHubRateLimitStatus:
 
 class GitHubBreaker:
     """
-    Circuit breaker for GitHub API rate limits.
-    
+    Circuit breaker for GitHub API rate limits AND sustained generic failures.
+
     States:
     - CLOSED: Normal operation
-    - OPEN: Rate limit hit, reject requests
-    - HALF_OPEN: Testing if rate limit reset
+    - OPEN: Rate limit hit (or a sustained outage detected), reject requests
+    - HALF_OPEN: Testing if rate limit / outage has recovered
+
+    Two independent trip paths, deliberately different recovery windows:
+    - trip(): an explicit rate-limit response. GitHub told us exactly when
+      quota resets, so the (long, ~1h default) reset_time is trustworthy.
+    - record_generic_failure(): nothing said "rate limit" -- a timeout,
+      connection error, or unclassified `gh`/HTTP failure. Without this, a
+      plain GitHub outage never opened this breaker at all (confirmed gap:
+      every migrated raw `gh` call site would otherwise keep hammering a
+      dead API indefinitely), but it's an inference, not a fact GitHub
+      reported, so it needs a threshold (avoid one flaky blip tripping the
+      whole breaker) and a short recovery window (a false trip self-heals in
+      GENERIC_FAILURE_RECOVERY_SECONDS instead of blocking for an hour).
     """
-    
+
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
-    
+
+    # Consecutive non-rate-limit failures (timeouts, connection errors,
+    # unclassified 5xx/cli errors) required to trip the breaker on suspicion
+    # of an outage, and how long that trip lasts before probing again.
+    GENERIC_FAILURE_THRESHOLD = 5
+    GENERIC_FAILURE_RECOVERY_SECONDS = 90
+
     def __init__(self):
         self.state = self.CLOSED
         self.opened_at: Optional[datetime] = None
         self.reset_time: Optional[datetime] = None
+        self.trip_reason: Optional[str] = None  # 'rate_limit' | 'generic_failure'
+        self._generic_failure_count = 0
         self.redis_client = None
         self.redis_key = "orchestrator:github_api_breaker:state"
-        
+
         try:
             import redis
             self.redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
@@ -413,19 +495,87 @@ class GitHubBreaker:
             logger.info("GitHub API breaker connected to Redis")
         except Exception as e:
             logger.warning(f"Could not connect to Redis for GitHub breaker: {e}")
-    
+
     def trip(self, reset_time: Optional[datetime] = None):
-        """Open the breaker due to rate limit."""
-        if self.state == self.CLOSED:
+        """Open the breaker due to an explicit rate-limit response.
+
+        Fires from CLOSED (the first trip) or HALF_OPEN (the recovery probe
+        itself just got rate-limited again) -- never from OPEN, since
+        is_open() already rejects every call before it could reach GitHub
+        to trip a second time.
+        """
+        if self.state == self.OPEN:
+            return
+        self.state = self.OPEN
+        self.opened_at = datetime.now()
+        self.reset_time = reset_time or (datetime.now() + timedelta(hours=1))
+        self.trip_reason = 'rate_limit'
+        self._generic_failure_count = 0
+        self._save_to_redis()
+        logger.error(
+            f"🔴 GITHUB API CIRCUIT BREAKER OPENED - Rate limit exceeded. "
+            f"Will reset at {self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    def record_generic_failure(self):
+        """Count a non-rate-limit failure toward a short-recovery outage trip.
+
+        From CLOSED: accumulates toward GENERIC_FAILURE_THRESHOLD before
+        tripping. From HALF_OPEN: the recovery probe itself just failed --
+        reopen immediately rather than waiting to re-accumulate a fresh
+        threshold, mirroring services/circuit_breaker.py's CircuitBreaker
+        (any failure during a half-open probe reopens it). Without this
+        HALF_OPEN branch, the breaker gave exactly one recovery window of
+        protection per process lifetime and then never tripped again no
+        matter how many further failures followed -- the same silent
+        indefinite-hammering failure mode this breaker exists to prevent.
+        """
+        if self.state == self.OPEN:
+            return
+        if self.state == self.HALF_OPEN:
             self.state = self.OPEN
             self.opened_at = datetime.now()
-            self.reset_time = reset_time or (datetime.now() + timedelta(hours=1))
+            self.reset_time = datetime.now() + timedelta(seconds=self.GENERIC_FAILURE_RECOVERY_SECONDS)
+            self.trip_reason = 'generic_failure'
+            self._generic_failure_count = 0
             self._save_to_redis()
             logger.error(
-                f"🔴 GITHUB API CIRCUIT BREAKER OPENED - Rate limit exceeded. "
-                f"Will reset at {self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"🔴 GITHUB API CIRCUIT BREAKER RE-OPENED - recovery probe "
+                f"failed. Will retry at "
+                f"{self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
-    
+            return
+        self._generic_failure_count += 1
+        if self._generic_failure_count >= self.GENERIC_FAILURE_THRESHOLD:
+            self.state = self.OPEN
+            self.opened_at = datetime.now()
+            self.reset_time = datetime.now() + timedelta(seconds=self.GENERIC_FAILURE_RECOVERY_SECONDS)
+            self.trip_reason = 'generic_failure'
+            self._generic_failure_count = 0
+            self._save_to_redis()
+            logger.error(
+                f"🔴 GITHUB API CIRCUIT BREAKER OPENED - "
+                f"{self.GENERIC_FAILURE_THRESHOLD} consecutive non-rate-limit "
+                f"failures (suspected outage). Will retry at "
+                f"{self.reset_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+    def record_generic_success(self):
+        """Reset the consecutive-generic-failure streak, and close the
+        breaker if this success was the HALF_OPEN recovery probe succeeding.
+
+        A single successful probe is enough to close (this class has always
+        been a single-probe design -- see check_and_close()'s "Testing if
+        rate limit reset" -- unlike CircuitBreaker's multi-success
+        success_threshold). Without this, nothing ever transitioned
+        HALF_OPEN back to CLOSED short of a manual admin reset, so
+        is_open() stayed permanently False (unprotected) while state
+        remained stuck reporting 'half_open' forever.
+        """
+        self._generic_failure_count = 0
+        if self.state == self.HALF_OPEN:
+            self.close()
+
     def check_and_close(self) -> bool:
         """Check if rate limit reset and close breaker if so."""
         if self.state == self.CLOSED:
@@ -434,23 +584,29 @@ class GitHubBreaker:
         if self.reset_time and datetime.now() >= self.reset_time:
             self.state = self.HALF_OPEN
             self._save_to_redis()
-            logger.warning("🟡 GITHUB API BREAKER HALF-OPEN - Testing rate limit recovery...")
+            logger.warning(
+                f"🟡 GITHUB API BREAKER HALF-OPEN - Testing recovery "
+                f"(was: {self.trip_reason})..."
+            )
             return False
-        
+
         return False
-    
+
     def close(self):
-        """Close the breaker (rate limit recovered)."""
+        """Close the breaker (rate limit or outage recovered)."""
         if self.state != self.CLOSED:
+            reason = self.trip_reason or 'rate_limit'
             self.state = self.CLOSED
             self.opened_at = None
             self.reset_time = None
+            self.trip_reason = None
+            self._generic_failure_count = 0
             if self.redis_client:
                 try:
                     self.redis_client.delete(self.redis_key)
                 except Exception as e:
                     logger.error(f"Error deleting breaker state from Redis: {e}")
-            logger.info("🟢 GITHUB API BREAKER CLOSED - Rate limit recovered")
+            logger.info(f"🟢 GITHUB API BREAKER CLOSED - recovered (was: {reason})")
     
     def is_open(self) -> bool:
         """Check if breaker is open."""
@@ -469,6 +625,7 @@ class GitHubBreaker:
                 'state': self.state,
                 'opened_at': self.opened_at.isoformat() if self.opened_at else None,
                 'reset_time': self.reset_time.isoformat() if self.reset_time else None,
+                'trip_reason': self.trip_reason,
             }
             self.redis_client.set(self.redis_key, json.dumps(state_dict), ex=86400)
         except Exception as e:
@@ -720,6 +877,7 @@ class GitHubAPIClient:
                     time.sleep(wait_time)
                     return self.graphql(query, variables, retries + 1)
 
+                self.breaker.record_generic_failure()
                 return False, {"error": "failed_after_retries", "stderr": result.stderr}
 
             # Parse response
@@ -753,6 +911,7 @@ class GitHubAPIClient:
 
                 # Reset backoff on success
                 self.backoff_multiplier = 1.0
+                self.breaker.record_generic_success()
 
                 # Track the operation
                 self.track_gh_operation('graphql', 'GraphQL query executed successfully')
@@ -761,16 +920,19 @@ class GitHubAPIClient:
 
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse GraphQL response: {e}")
+                self.breaker.record_generic_failure()
                 return False, {"error": "parse_error", "raw_output": body}
-        
+
         except subprocess.TimeoutExpired:
             logger.error("GraphQL query timed out")
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": "timeout"}
-        
+
         except Exception as e:
             logger.error(f"GraphQL query failed: {e}", exc_info=True)
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": str(e)}
     
     def rest(self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None, retries: int = 0) -> Tuple[bool, Any]:
@@ -883,33 +1045,39 @@ class GitHubAPIClient:
                     time.sleep(wait_time)
                     return self.rest(method, endpoint, data, retries + 1)
 
+                self.breaker.record_generic_failure()
                 return False, {"error": "failed_after_retries", "stderr": result.stderr}
-            
+
             # Success - parse response
             try:
                 response = json.loads(body)
                 self.backoff_multiplier = 1.0
-                
+                self.breaker.record_generic_success()
+
                 # Track the operation
                 self.track_gh_operation('rest_api', f'REST {method} {endpoint} executed successfully')
-                
+
                 return True, response
             except json.JSONDecodeError:
                 # Some endpoints return empty responses
                 if body.strip() == '':
+                    self.breaker.record_generic_success()
                     # Track empty response success
                     self.track_gh_operation('rest_api', f'REST {method} {endpoint} executed successfully (empty response)')
                     return True, {}
                 logger.error(f"Failed to parse REST response: {body}")
+                self.breaker.record_generic_failure()
                 return False, {"error": "parse_error"}
-        
+
         except subprocess.TimeoutExpired:
             logger.error("REST request timed out")
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": "timeout"}
         except Exception as e:
             logger.error(f"REST request failed: {e}", exc_info=True)
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": str(e)}
     
     def http_request(self, method: str, url: str, data: Optional[Dict[str, Any]] = None, 
@@ -1034,37 +1202,47 @@ class GitHubAPIClient:
             if response.status_code >= 400:
                 self.failed_requests += 1
                 logger.error(f"HTTP request failed: {response.status_code} - {response.text[:200]}")
-                
+
                 # Retry transient errors (5xx)
                 if response.status_code >= 500 and retries < 3:
                     wait_time = (2 ** retries) * 2
                     logger.info(f"Retrying after {wait_time}s (attempt {retries + 1}/3)")
                     time.sleep(wait_time)
                     return self.http_request(method, url, data, headers, retries + 1)
-                
+
+                # 5xx after retries exhausted looks like an outage, not a
+                # classified negative answer about one resource -- count it.
+                # A 4xx (other than the 403-rate-limit case above) IS a
+                # specific, expected answer (not found / unprocessable /
+                # etc.), so it does not count toward outage detection.
+                if response.status_code >= 500:
+                    self.breaker.record_generic_failure()
                 return False, {"error": f"http_error_{response.status_code}", "status_code": response.status_code}
-            
+
             # Success
             try:
                 result_data = response.json()
             except ValueError:
                 # Empty response
                 result_data = {}
-            
+
             self.backoff_multiplier = 1.0
-            
+            self.breaker.record_generic_success()
+
             # Track the operation
             self.track_gh_operation('http_api', f'HTTP {method} {url} executed successfully')
-            
+
             return True, result_data
-        
+
         except requests.exceptions.Timeout:
             logger.error("HTTP request timed out")
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": "timeout"}
         except Exception as e:
             logger.error(f"HTTP request failed: {e}", exc_info=True)
             self.failed_requests += 1
+            self.breaker.record_generic_failure()
             return False, {"error": str(e)}
     
     def _apply_backoff(self):
@@ -1672,33 +1850,79 @@ class GitHubAPIClient:
                     f"ℹ️  GitHub {bucket_label} API usage at 80%: {remaining} points remaining"
                 )
     
-    def gh_cli(self, cmd: List[str], retries: int = 0) -> Tuple[bool, Any]:
+    def gh_cli(
+        self,
+        cmd: List[str],
+        *,
+        timeout: float = 30,
+        acceptable_exit_codes: Iterable[int] = (0,),
+        env: Optional[Dict[str, str]] = None,
+        cwd: Optional[str] = None,
+        retries: int = 0,
+    ) -> Tuple[bool, GhCliResult]:
         """
         Execute a GitHub CLI command with circuit breaker awareness.
-        
+
         Use this for arbitrary 'gh' commands that need rate limiting and
-        circuit breaker protection (e.g., 'gh project create', 'gh pr create', etc.)
-        
+        circuit breaker protection (e.g., 'gh project create', 'gh pr create',
+        'gh issue edit', 'gh pr checks', etc.) -- this is the single choke
+        point every raw `subprocess.run(['gh', ...])` call site in the
+        codebase is meant to route through instead of shelling out directly.
+
         Args:
-            cmd: List of command parts, e.g., ['gh', 'project', 'create', ...]
-            retries: Current retry count (internal use)
-            
+            cmd: Full command argv including 'gh' itself, e.g.
+                ['gh', 'project', 'create', ...]. Custom headers (e.g.
+                ['-H', 'GraphQL-Features: sub_issues']) need no special
+                handling -- this list is forwarded to subprocess verbatim.
+            timeout: Seconds before the subprocess is killed. Default 30s;
+                pass a smaller value for quick reads or a larger one for
+                slow commands (e.g. `gh pr checks` commonly needs 60s).
+            acceptable_exit_codes: Exit codes treated as success. Default
+                `(0,)`. Some `gh` subcommands use non-zero exit codes as part
+                of their normal contract -- `gh pr checks` returns 1 for
+                "checks still pending" and 8 for "some checks failing", both
+                of which are valid answers a caller still wants to parse,
+                not execution failures.
+            env: Explicit environment to run the subprocess with. Defaults
+                to this client's routed-credential environment
+                (`_auth_env()`) when omitted -- the same routing every other
+                method on this class already applies, so callers that used
+                to invoke `subprocess.run` with no `env=` at all (using
+                whatever's ambient) now get consistent credential routing
+                for free instead of silently depending on process env.
+            cwd: Working directory for the subprocess. Rarely needed --
+                every migrated call site passes `--repo owner/repo`
+                explicitly, so `gh` does not need to run from inside a
+                checkout to know which repository to target -- but a few
+                call sites (services/git_workflow_manager.py) already ran
+                with `cwd=project_dir` and there was no reason to force them
+                to drop it during migration.
+            retries: Current retry count (internal use for the exponential
+                backoff below; do not set explicitly).
+
         Returns:
-            Tuple of (success, result) where result is parsed JSON if applicable, else raw output
+            Tuple of (success, GhCliResult). GhCliResult carries stdout,
+            stderr (always preserved -- several callers branch on its text:
+            "already exists", "already linked", "is not a draft", "'approved'
+            not found"), the exit code, and a classified error_kind. It also
+            supports legacy dict-style .get()/[] access for callers written
+            against the old ad hoc return shape.
         """
         # Check if breaker has recovered and can attempt again
         self.breaker.check_and_close()
-        
+
         # Check if breaker is open
         if self.breaker.is_open():
             time_until_reset = self.breaker.reset_time - datetime.now() if self.breaker.reset_time else None
             wait_msg = f" (will retry in {time_until_reset.total_seconds():.0f}s)" if time_until_reset else ""
             logger.error(f"🔴 GitHub API breaker is OPEN - rejecting CLI command{wait_msg}")
-            return False, {"error": BREAKER_OPEN_ERROR}
-        
+            return False, GhCliResult(success=False, error_kind='circuit_open')
+
         # Apply backoff
         self._apply_backoff()
-        
+
+        acceptable = set(acceptable_exit_codes)
+
         # This is the path every Projects v2 board operation takes (see
         # services/github_project_manager.py), so it is the single most
         # important call site for credential routing (WI-2).
@@ -1717,75 +1941,106 @@ class GitHubAPIClient:
 
         try:
             logger.debug(f"Executing GitHub CLI: {' '.join(cmd)}")
-            # `_` not `credential`: nothing downstream in this method reads it
-            # (see the KNOWN GAP above). Keeping the name bound would imply an
-            # accounting consequence that does not happen here.
-            call_env, _ = self._auth_env(credential)  # WI-6: mint late
+            if env is not None:
+                call_env = env
+            else:
+                # `_` not `credential`: nothing downstream in this method reads it
+                # (see the KNOWN GAP above). Keeping the name bound would imply an
+                # accounting consequence that does not happen here.
+                call_env, _ = self._auth_env(credential)  # WI-6: mint late
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=30, check=True,
-                env=call_env,
+                cmd, capture_output=True, text=True, timeout=timeout,
+                env=call_env, cwd=cwd,
             )
-            
+
             self.total_requests += 1
+
+            if result.returncode not in acceptable:
+                self.failed_requests += 1
+                self._record_request('gh_cli', False)
+
+                # Check for rate limit error
+                if 'rate limit' in result.stderr.lower() or 'rate limit' in result.stdout.lower():
+                    self.rate_limited_requests += 1
+                    logger.error("🔴 GitHub API rate limit hit (CLI command)")
+                    self.breaker.trip()
+                    return False, GhCliResult(
+                        success=False, stdout=result.stdout, stderr=result.stderr,
+                        returncode=result.returncode, error_kind='rate_limited',
+                    )
+
+                # Check for HTTP 410 (Gone/Deleted) - permanent error, don't retry.
+                # A specific, expected negative response about one resource --
+                # not evidence of an outage, so it never counts toward
+                # record_generic_failure().
+                if 'HTTP 410' in result.stderr or 'was deleted' in result.stderr:
+                    logger.error(f"GitHub CLI command failed with HTTP 410 (resource deleted): {' '.join(cmd)}")
+                    logger.error(f"Error details: {result.stderr}")
+                    return False, GhCliResult(
+                        success=False, stdout=result.stdout, stderr=result.stderr,
+                        returncode=result.returncode, error_kind='not_found',
+                    )
+
+                # Check for other 4xx errors that shouldn't be retried -- also
+                # expected/classified responses, not outage evidence.
+                if any(code in result.stderr for code in ['HTTP 404', 'HTTP 403', 'HTTP 401', 'HTTP 422']):
+                    logger.error(f"GitHub CLI command failed with client error: {' '.join(cmd)}")
+                    logger.error(f"Error details: {result.stderr}")
+                    return False, GhCliResult(
+                        success=False, stdout=result.stdout, stderr=result.stderr,
+                        returncode=result.returncode, error_kind='forbidden',
+                    )
+
+                logger.error(f"GitHub CLI command failed: {' '.join(cmd)}")
+                logger.error(f"Exit code: {result.returncode}")
+                logger.error(f"STDERR: {result.stderr[:200]}")
+
+                # Retry transient errors on 5xx or timeout-like errors
+                if 'temporarily' in result.stderr.lower() or 'timeout' in result.stderr.lower():
+                    if retries < 3:
+                        wait_time = (2 ** retries) * 2
+                        logger.info(f"Retrying transient error after {wait_time}s (attempt {retries + 1}/3)")
+                        time.sleep(wait_time)
+                        return self.gh_cli(
+                            cmd, timeout=timeout, acceptable_exit_codes=acceptable_exit_codes,
+                            env=env, cwd=cwd, retries=retries + 1,
+                        )
+
+                # Unclassified failure -- no confirmation of what went wrong,
+                # which is exactly the shape a plain outage takes.
+                self.breaker.record_generic_failure()
+                return False, GhCliResult(
+                    success=False, stdout=result.stdout, stderr=result.stderr,
+                    returncode=result.returncode, error_kind='generic',
+                )
+
             self._record_request('gh_cli', True)
-            
+            self.breaker.record_generic_success()
+
             # Try to parse as JSON if --format json was used
             try:
                 data = json.loads(result.stdout)
-                self.backoff_multiplier = 1.0
-                self.track_gh_operation('gh_cli', ' '.join(cmd))
-                return True, data
             except (json.JSONDecodeError, ValueError):
                 # Not JSON output, return raw
-                self.backoff_multiplier = 1.0
-                self.track_gh_operation('gh_cli', ' '.join(cmd))
-                return True, {"output": result.stdout}
-        
-        except subprocess.CalledProcessError as e:
-            self.failed_requests += 1
+                data = result.stdout
+            self.backoff_multiplier = 1.0
+            self.track_gh_operation('gh_cli', ' '.join(cmd))
+            return True, GhCliResult(
+                success=True, data=data, stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode,
+            )
 
-            # Check for rate limit error
-            if 'rate limit' in e.stderr.lower() or 'rate limit' in e.stdout.lower():
-                self.rate_limited_requests += 1
-                logger.error("🔴 GitHub API rate limit hit (CLI command)")
-                self.breaker.trip()
-                return False, {"error": RATE_LIMITED_ERROR, "stderr": e.stderr}
-
-            # Check for HTTP 410 (Gone/Deleted) - permanent error, don't retry
-            if 'HTTP 410' in e.stderr or 'was deleted' in e.stderr:
-                logger.error(f"GitHub CLI command failed with HTTP 410 (resource deleted): {' '.join(cmd)}")
-                logger.error(f"Error details: {e.stderr}")
-                return False, {"error": "resource_deleted", "http_code": 410, "stderr": e.stderr}
-
-            # Check for other 4xx errors that shouldn't be retried
-            if any(code in e.stderr for code in ['HTTP 404', 'HTTP 403', 'HTTP 401', 'HTTP 422']):
-                logger.error(f"GitHub CLI command failed with client error: {' '.join(cmd)}")
-                logger.error(f"Error details: {e.stderr}")
-                return False, {"error": "client_error", "stderr": e.stderr}
-
-            logger.error(f"GitHub CLI command failed: {' '.join(cmd)}")
-            logger.error(f"Exit code: {e.returncode}")
-            logger.error(f"STDERR: {e.stderr[:200]}")
-
-            # Retry transient errors on 5xx or timeout-like errors
-            if 'temporarily' in e.stderr.lower() or 'timeout' in e.stderr.lower():
-                if retries < 3:
-                    wait_time = (2 ** retries) * 2
-                    logger.info(f"Retrying transient error after {wait_time}s (attempt {retries + 1}/3)")
-                    time.sleep(wait_time)
-                    return self.gh_cli(cmd, retries + 1)
-
-            return False, {"error": f"cli_error", "exit_code": e.returncode, "stderr": e.stderr}
-        
         except subprocess.TimeoutExpired:
             logger.error(f"GitHub CLI command timed out: {' '.join(cmd)}")
             self.failed_requests += 1
-            return False, {"error": "timeout"}
-        
+            self.breaker.record_generic_failure()
+            return False, GhCliResult(success=False, error_kind='timeout')
+
         except Exception as e:
             logger.error(f"GitHub CLI command failed: {e}", exc_info=True)
             self.failed_requests += 1
-            return False, {"error": str(e)}
+            self.breaker.record_generic_failure()
+            return False, GhCliResult(success=False, error_kind='generic', stderr=str(e))
     
     def track_gh_operation(self, operation_type: str, description: str) -> None:
         """

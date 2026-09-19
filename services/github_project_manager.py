@@ -469,8 +469,8 @@ class GitHubProjectManager:
                 
                 # Automatically diagnose the issue
                 logger.error("AUTOMATIC DIAGNOSTICS:")
-                await self._diagnose_github_issue(project_config.github['org'])
-                
+                await self._diagnose_github_board_failure(project_config.github['org'])
+
                 logger.error("Orchestrator cannot manage GitHub projects without successful board creation")
                 return None
             
@@ -531,7 +531,7 @@ class GitHubProjectManager:
             # Automatically diagnose the issue
             logger.error("AUTOMATIC DIAGNOSTICS:")
             try:
-                await self._diagnose_github_issue(project_config.github['org'])
+                await self._diagnose_github_board_failure(project_config.github['org'])
             except:
                 pass
             
@@ -727,25 +727,19 @@ class GitHubProjectManager:
             # Create labels in repository
             created_labels = []
             for label_config in labels_to_create:
-                try:
-                    cmd = [
-                        'gh', 'label', 'create',
-                        label_config['name'],
-                        '--description', label_config['description'],
-                        '--color', label_config['color'],
-                        '--force'  # Update if exists
-                    ]
+                cmd = [
+                    'gh', 'label', 'create',
+                    label_config['name'],
+                    '--description', label_config['description'],
+                    '--color', label_config['color'],
+                    '--force'  # Update if exists
+                ]
 
-                    subprocess.run(
-                        cmd, capture_output=True, text=True, check=True,
-                        env=routed_gh_env(),
-                    )
+                success, _result = get_github_client().gh_cli(cmd, env=routed_gh_env())
+                if success:
                     created_labels.append(label_config['name'])
                     logger.info(f"Created label: {label_config['name']}")
-
-                except subprocess.CalledProcessError:
-                    # Label might already exist, that's fine
-                    pass
+                # else: label might already exist, that's fine
 
             # Update state with created labels
             if created_labels:
@@ -775,19 +769,16 @@ class GitHubProjectManager:
                 '--owner', org,
                 '--repo', repo
             ]
-            result = subprocess.run(
-                link_cmd, capture_output=True, text=True, check=False,
-                env=routed_gh_env(),
-            )
-            
-            if result.returncode == 0:
+            success, result = get_github_client().gh_cli(link_cmd, env=routed_gh_env())
+
+            if success:
                 logger.info(f"Linked project '{board_name}' (#{project_number}) to repository {org}/{repo}")
                 return True
-            elif "already linked" in result.stderr.lower() or "already associated" in result.stderr.lower():
+            elif "already linked" in (result.stderr or '').lower() or "already associated" in (result.stderr or '').lower():
                 logger.debug(f"Project '{board_name}' (#{project_number}) already linked to repository {org}/{repo}")
                 return True
             else:
-                logger.warning(f"Failed to link project '{board_name}' to repository: {result.stderr.strip()}")
+                logger.warning(f"Failed to link project '{board_name}' to repository: {(result.stderr or '').strip()}")
                 logger.warning(f"Project remains at organization level instead of repository level")
                 return False
                 
@@ -803,7 +794,7 @@ class GitHubProjectManager:
         """Remove all GitHub state for a project"""
         self.state_manager.cleanup_project_state(project_name)
 
-    async def _diagnose_github_issue(self, org: str):
+    async def _diagnose_github_board_failure(self, org: str):
         """Automatically diagnose GitHub connectivity and permissions issues"""
         # Uses raw subprocess calls (not the tracked GitHubAPIClient's
         # rest()/gh_cli()) since these probes intentionally run even when
@@ -962,25 +953,47 @@ class GitHubProjectManager:
                     }}
                 }}'''
             
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'api', 'graphql', '-f', f'query={query}'],
-                capture_output=True,
-                text=True,
-                check=False,
                 # Routed credential (WI-2): a board this credential cannot SEE
                 # is indistinguishable from a board that does not exist, and
                 # this method's answer decides whether one gets created.
                 env=routed_gh_env(),
             )
-            
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
+
+            if success and isinstance(result.data, dict):
+                data = result.data
                 owner_key = 'user' if owner_type == 'user' else 'organization'
                 project_data = data.get('data', {}).get(owner_key, {}).get('projectV2')
                 return project_data is not None
             else:
-                logger.debug(f"Board #{project_number} not found: {result.stderr}")
-                return False
+                # Any failure to execute this query -- breaker-open,
+                # timeout, rate limit, an unclassified CLI/HTTP error -- OR
+                # a successful call whose stdout wasn't valid JSON, means we
+                # could not get GitHub's actual answer. A real "board was
+                # deleted" only ever arrives as a SUCCESSFUL response with
+                # projectV2: null (handled above); there is no legitimate
+                # "expected failure" shape for this query the way a 4xx is
+                # expected for e.g. `gh issue view` on a genuinely-missing
+                # issue. So every branch here is inconclusive, not a
+                # negative answer -- including the first few failures of an
+                # outage that haven't yet tripped the breaker (error_kind
+                # 'generic') and an explicit rate limit ('rate_limited'),
+                # not just 'circuit_open'/'timeout'. The caller treats False
+                # as license to search-by-name and, on a further miss,
+                # create a brand-new board -- the highest-risk outcome
+                # during startup reconciliation -- so assume the board still
+                # exists rather than risk a duplicate from a transient
+                # condition; a genuinely deleted board is caught on the next
+                # reconciliation pass.
+                logger.warning(
+                    f"Could not verify board #{project_number} exists "
+                    f"({result.error_kind if not success else 'unparseable response'}) "
+                    f"-- assuming it still does rather than risking a "
+                    f"duplicate board creation. Will re-verify next "
+                    f"reconciliation cycle."
+                )
+                return True
                 
         except Exception as e:
             logger.error(f"Error verifying board existence: {e}")

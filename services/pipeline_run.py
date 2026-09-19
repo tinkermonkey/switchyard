@@ -2593,14 +2593,15 @@ class PipelineRunManager:
                                     # Ensures work is tracked under a pipeline run from the start
                                     try:
                                         # Fetch issue details for pipeline run (need title and URL)
-                                        import subprocess
-                                        result = subprocess.run(
+                                        from services.github_api_client import get_github_client
+                                        success, result = get_github_client().gh_cli(
                                             ['gh', 'issue', 'view', str(next_issue['issue_number']),
                                              '--repo', f"{project_config.github['org']}/{project_config.github['repo']}",
-                                             '--json', 'title,body,url'],
-                                            capture_output=True, text=True, check=True
+                                             '--json', 'title,body,url']
                                         )
-                                        next_issue_data = json.loads(result.stdout)
+                                        if not success or not isinstance(result.data, dict):
+                                            raise RuntimeError(f"gh issue view failed: {result}")
+                                        next_issue_data = result.data
                                     except Exception as e:
                                         logger.warning(
                                             f"Could not fetch issue details for #{next_issue['issue_number']}: {e}"

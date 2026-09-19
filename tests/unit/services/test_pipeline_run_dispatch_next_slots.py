@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from services.pipeline_queue_manager import ResetResult
 from services.pipeline_run import PipelineRunManager
+from services.github_api_client import GitHubBreaker, get_github_client
 
 # The activated_at stamp mark_issue_active() returns and the rollback hands
 # back to reset_issue_to_waiting() as its compare-and-swap token.
@@ -99,6 +100,8 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         self.manager.ensure_pipeline_run_for_task = Mock(return_value='run-200')
 
         mock_gh_result = Mock()
+        mock_gh_result.returncode = 0
+        mock_gh_result.stderr = ''
         mock_gh_result.stdout = json.dumps({'title': 'Next issue', 'body': '', 'url': 'https://x'})
 
         mock_task_queue_instance = MagicMock()
@@ -135,6 +138,97 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         dispatched_task = mock_task_queue_instance.enqueue.call_args[0][0]
         self.assertEqual(dispatched_task.context['issue_number'], 200)
         self.assertEqual(dispatched_task.context['trigger'], 'lock_release_queue_processing')
+
+    def _dispatch_with_gh_issue_view_outcome(self, subprocess_run_patch):
+        """Shared harness for the two tests below: identical dispatch setup
+        to test_dispatches_single_next_queued_issue_at_capacity_one, but the
+        `gh issue view` fetch (now routed through gh_cli() -- GitHub circuit
+        breaker consolidation) either fails or is never reached. Returns
+        (ended, mock_task_queue_instance, mock_run) so each test can assert
+        on its own concern."""
+        self._make_active_run("proj", "board", 100)
+
+        our_lock = Mock()
+        our_lock.lock_status = 'locked'
+        our_lock.locked_by_issue = 100
+
+        mock_lock_manager = MagicMock()
+        mock_lock_manager.get_lock.return_value = our_lock
+        mock_lock_manager.release_lock.return_value = True
+        mock_lock_manager.try_acquire_lock.return_value = (True, "lock_acquired")
+
+        mock_queue = MagicMock()
+        mock_queue.mark_issue_active.return_value = ACTIVATED_AT
+        mock_queue.get_next_n_waiting_issues.return_value = [
+            {'issue_number': 200, 'position_in_column': 0}
+        ]
+
+        project_config = self._project_config("board")
+        workflow_template = self._workflow_template()
+
+        mock_config_manager_instance = Mock()
+        mock_config_manager_instance.get_project_config.return_value = project_config
+        mock_config_manager_instance.get_workflow_template.return_value = workflow_template
+
+        self.manager._resolve_issue_column_from_github = Mock(return_value=('Development', True))
+        self.manager.ensure_pipeline_run_for_task = Mock(return_value='run-200')
+
+        mock_task_queue_instance = MagicMock()
+
+        with patch('services.pipeline_lock_manager.get_pipeline_lock_manager', return_value=mock_lock_manager), \
+             patch('services.pipeline_queue_manager.get_pipeline_queue_manager', return_value=mock_queue), \
+             patch('services.cancellation.get_cancellation_signal'), \
+             patch('monitoring.observability.get_observability_manager'), \
+             patch('config.manager.ConfigManager', return_value=mock_config_manager_instance), \
+             subprocess_run_patch as mock_run, \
+             patch('task_queue.task_manager.TaskQueue', return_value=mock_task_queue_instance):
+
+            ended = self.manager.end_pipeline_run(
+                project="proj", issue_number=100,
+                reason="done", retain_lock=False, outcome="success",
+            )
+
+        return ended, mock_task_queue_instance, mock_run
+
+    def test_malformed_issue_details_json_does_not_block_dispatch(self):
+        """gh exiting 0 with non-JSON stdout must degrade to
+        ensure_pipeline_run_for_task(issue_data=None), not crash the
+        dispatch -- see the isinstance(result.data, dict) guard added
+        alongside the gh_cli() migration for the same bc70ac46-shaped risk
+        pipeline_progression._get_issue_details already guards against."""
+        mock_gh_result = Mock(returncode=0, stdout='not json at all', stderr='')
+        ended, mock_task_queue_instance, mock_run = self._dispatch_with_gh_issue_view_outcome(
+            patch('subprocess.run', return_value=mock_gh_result)
+        )
+        self.assertTrue(ended)
+        mock_task_queue_instance.enqueue.assert_called_once()
+        self.manager.ensure_pipeline_run_for_task.assert_called_once_with(
+            project="proj", board="board", issue_number=200, issue_data=None
+        )
+
+    def test_open_circuit_breaker_does_not_block_dispatch(self):
+        """The whole point of the GitHub circuit breaker consolidation: an
+        open breaker must degrade this best-effort issue-details fetch the
+        same way a failed `gh` call always did, not crash dispatch, and must
+        never touch subprocess.run at all."""
+        client = get_github_client()
+        client.breaker.state = GitHubBreaker.OPEN
+        client.breaker.reset_time = None
+        try:
+            ended, mock_task_queue_instance, mock_run = self._dispatch_with_gh_issue_view_outcome(
+                patch('subprocess.run')
+            )
+        finally:
+            client.breaker.state = GitHubBreaker.CLOSED
+            client.breaker._generic_failure_count = 0
+            client.breaker.trip_reason = None
+
+        self.assertTrue(ended)
+        mock_task_queue_instance.enqueue.assert_called_once()
+        mock_run.assert_not_called()
+        self.manager.ensure_pipeline_run_for_task.assert_called_once_with(
+            project="proj", board="board", issue_number=200, issue_data=None
+        )
 
     def test_no_dispatch_when_queue_empty(self):
         """Control case: empty queue (get_next_n_waiting_issues(1) -> [])
@@ -210,6 +304,8 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         self.manager.ensure_pipeline_run_for_task = Mock(return_value=None)
 
         mock_gh_result = Mock()
+        mock_gh_result.returncode = 0
+        mock_gh_result.stderr = ''
         mock_gh_result.stdout = json.dumps({'title': 'Next issue', 'body': '', 'url': 'https://x'})
 
         mock_task_queue_instance = MagicMock()
@@ -426,6 +522,8 @@ class TestEndPipelineRunDispatchNextSlots(unittest.TestCase):
         self.manager.ensure_pipeline_run_for_task = Mock(return_value='run-200')
 
         mock_gh_result = Mock()
+        mock_gh_result.returncode = 0
+        mock_gh_result.stderr = ''
         mock_gh_result.stdout = json.dumps({'title': 'Next issue', 'body': '', 'url': 'https://x'})
 
         mock_task_queue_instance = MagicMock()

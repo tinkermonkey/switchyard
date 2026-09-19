@@ -2,7 +2,6 @@
 GitHub Integration Service for Agent Collaboration
 """
 
-import subprocess
 import json
 import os
 import logging
@@ -410,9 +409,8 @@ class GitHubIntegration:
 
     async def has_agent_processed_issue(self, issue_number: int, agent_name: str, repo: Optional[str] = None) -> bool:
         """Check if an agent has already processed this issue by looking for its signature in comments"""
-        # Resolved outside the block below, and caught narrowly: the enclosing
-        # handler catches only CalledProcessError, so _repo_path()'s refusal
-        # would otherwise escape an `-> bool` method that no caller expects to
+        # Resolved outside the block below, and caught narrowly: _repo_path()'s
+        # refusal must not escape an `-> bool` method that no caller expects to
         # raise. A broad `except ValueError` around the whole body would not do
         # -- json.JSONDecodeError IS a ValueError, and swallowing a malformed
         # `gh` response as "not processed" is the kind of quiet wrong answer
@@ -423,27 +421,37 @@ class GitHubIntegration:
             logger.error(f"Failed to check issue comments: {e}")
             return False
 
-        try:
-            cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'comments']
+        cmd = ['gh', 'issue', 'view', str(issue_number), '--json', 'comments']
 
-            if repo:
-                cmd.extend(['--repo', repo_arg])
+        if repo:
+            cmd.extend(['--repo', repo_arg])
 
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
-            data = json.loads(result.stdout)
-
-            # Look for the agent processing signature in comments
-            signature = f"_Processed by the {agent_name} agent_"
-
-            for comment in data.get('comments', []):
-                if signature in comment.get('body', ''):
-                    return True
-
-            return False
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to check issue comments: {e.stderr}")
+        success, result = get_github_client().gh_cli(cmd, env=self._get_gh_env())
+        if not success:
+            logger.error(f"Failed to check issue comments: {result}")
             return False  # Default to not processed if we can't check
+
+        # gh_cli() falls back to raw stdout rather than raising when `gh`
+        # exits 0 with non-JSON output. Re-raise here, deliberately OUTSIDE
+        # any try/except in this method: json.JSONDecodeError IS a
+        # ValueError, and swallowing it as "not processed" is exactly the
+        # quiet wrong answer the narrow exception scoping above exists to
+        # avoid (a caller reading `False` cannot tell "confirmed not
+        # processed" from "gh's response could not be read").
+        if not isinstance(result.data, dict):
+            raise json.JSONDecodeError(
+                "gh issue view returned non-JSON output", result.stdout, 0
+            )
+        data = result.data
+
+        # Look for the agent processing signature in comments
+        signature = f"_Processed by the {agent_name} agent_"
+
+        for comment in data.get('comments', []):
+            if signature in comment.get('body', ''):
+                return True
+
+        return False
 
     async def has_agent_processed_discussion(self, discussion_id: str, agent_name: str) -> bool:
         """
@@ -671,17 +679,10 @@ class GitHubIntegration:
                 '--limit', '1'
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=self._get_gh_env()
-            )
+            success, result = get_github_client().gh_cli(cmd, timeout=30, env=self._get_gh_env())
 
-            if result.returncode == 0 and result.stdout.strip():
-                import json
-                prs = json.loads(result.stdout)
+            if success and isinstance(result.data, list):
+                prs = result.data
                 if prs:
                     pr = prs[0]
                     logger.info(f"Found existing PR #{pr['number']} for branch {branch}")
@@ -716,15 +717,14 @@ class GitHubIntegration:
                 if repo:
                     cmd.extend(['--repo', repo_arg])
 
-                subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
+                success, result = get_github_client().gh_cli(cmd, env=self._get_gh_env())
+                if not success:
+                    # Matches the pre-migration check=True behavior: stop at
+                    # the first failing label rather than attempting the rest.
+                    raise RuntimeError(f"gh issue edit --add-label '{label}' failed: {result}")
 
-        except ValueError as e:
-            # See has_agent_processed_issue: the enclosing handler catches only
-            # CalledProcessError, so _repo_path()'s refusal would otherwise
-            # escape a method whose callers do not expect it to raise.
+        except Exception as e:
             logger.error(f"Failed to add labels: {e}")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to add labels: {e.stderr}")
 
     async def create_issue_from_agent(
         self,
@@ -736,45 +736,46 @@ class GitHubIntegration:
     ) -> Dict[str, Any]:
         """Create a new issue from agent work"""
         # Resolved and caught outside the block below for the same reason as in
-        # has_agent_processed_issue: the enclosing handler catches only
-        # CalledProcessError, and a blanket `except ValueError` around the whole
-        # body would also swallow the `int(issue_number)` below -- i.e. report
-        # "not created" for an issue GitHub did create.
+        # has_agent_processed_issue: a blanket `except ValueError` around the
+        # whole body would also swallow the `int(issue_number)` below -- i.e.
+        # report "not created" for an issue GitHub did create.
         try:
             repo_arg = self._repo_path(repo) if repo else ""
         except ValueError as e:
             logger.error(f"Failed to create issue: {e}")
             return {'success': False, 'error': str(e)}
 
-        try:
-            cmd = ['gh', 'issue', 'create', '--title', title, '--body', body]
+        cmd = ['gh', 'issue', 'create', '--title', title, '--body', body]
 
-            if repo:
-                cmd.extend(['--repo', repo_arg])
+        if repo:
+            cmd.extend(['--repo', repo_arg])
 
-            if labels:
-                for label in labels:
-                    cmd.extend(['--label', label])
+        if labels:
+            for label in labels:
+                cmd.extend(['--label', label])
 
-            if assignees:
-                for assignee in assignees:
-                    cmd.extend(['--assignee', assignee])
+        if assignees:
+            for assignee in assignees:
+                cmd.extend(['--assignee', assignee])
 
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self._get_gh_env())
+        success, result = get_github_client().gh_cli(cmd, env=self._get_gh_env())
+        if not success:
+            logger.error(f"Failed to create issue: {result.stderr}")
+            return {'success': False, 'error': result.stderr or (result.error_kind or 'unknown error')}
 
-            # Extract issue number from output
-            issue_url = result.stdout.strip()
-            issue_number = issue_url.split('/')[-1]
+        # Extract issue number from output. Deliberately NOT wrapped in a
+        # try/except here (see the comment at the top of this method): a
+        # ValueError from int() below means gh DID create the issue and only
+        # parsing its own output failed -- reporting that as "not created"
+        # would be a worse lie than letting it raise.
+        issue_url = result.stdout.strip()
+        issue_number = issue_url.split('/')[-1]
 
-            return {
-                'success': True,
-                'issue_number': int(issue_number),
-                'url': issue_url
-            }
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create issue: {e.stderr}")
-            return {'success': False, 'error': str(e)}
+        return {
+            'success': True,
+            'issue_number': int(issue_number),
+            'url': issue_url
+        }
 
     async def post_agent_output(self, context: Dict[str, Any], comment: str,
                                reply_to_id: Optional[str] = None) -> Dict[str, Any]:
@@ -965,15 +966,9 @@ class GitHubIntegration:
             if draft:
                 cmd.append('--draft')
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=self._get_gh_env()
-            )
+            success, result = get_github_client().gh_cli(cmd, timeout=30, env=self._get_gh_env())
 
-            if result.returncode == 0:
+            if success:
                 pr_url = result.stdout.strip()
                 last_segment = pr_url.rstrip('/').split('/')[-1]
                 if not last_segment.isdigit():
@@ -994,7 +989,7 @@ class GitHubIntegration:
             else:
                 # Even after checking, creation might fail (race condition)
                 # Try to parse the error to see if it's "already exists"
-                error_msg = result.stderr
+                error_msg = result.stderr or (result.error_kind or 'unknown error')
 
                 if "already exists" in error_msg.lower():
                     logger.warning(
@@ -1031,15 +1026,9 @@ class GitHubIntegration:
                 '--body', body
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=self._get_gh_env()
-            )
+            success, result = get_github_client().gh_cli(cmd, timeout=30, env=self._get_gh_env())
 
-            if result.returncode == 0:
+            if success:
                 logger.info(f"Updated PR #{pr_number} body")
                 return True
             else:
@@ -1078,52 +1067,46 @@ class GitHubIntegration:
             try:
                 cmd = ['gh', 'pr', 'ready', str(pr_number), '--repo', repo_arg]
 
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    env=self._get_gh_env()
-                )
+                success, result = get_github_client().gh_cli(cmd, timeout=30, env=self._get_gh_env())
 
-                if result.returncode == 0:
+                if success:
                     logger.info(
                         f"Marked PR #{pr_number} as ready for review "
                         f"(attempt {attempt}/{max_retries})"
                     )
                     return True
+
+                if result.error_kind == 'timeout':
+                    logger.warning(f"PR ready command timed out (attempt {attempt}/{max_retries})")
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    logger.error(f"Failed to mark PR #{pr_number} ready: timeout after {max_retries} attempts")
+                    return False
+
+                error_msg = (result.stderr or '').strip()
+
+                # Check if already ready (not an error)
+                if "is not a draft" in error_msg.lower():
+                    logger.info(f"PR #{pr_number} is already ready for review")
+                    return True
+
+                # Log error and retry if not last attempt
+                logger.warning(
+                    f"Failed to mark PR #{pr_number} ready (attempt {attempt}/{max_retries}): "
+                    f"{error_msg}"
+                )
+
+                if attempt < max_retries:
+                    # Exponential backoff: 2s, 4s, 8s
+                    backoff = 2 ** attempt
+                    logger.info(f"Retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
                 else:
-                    error_msg = result.stderr.strip()
-
-                    # Check if already ready (not an error)
-                    if "is not a draft" in error_msg.lower():
-                        logger.info(f"PR #{pr_number} is already ready for review")
-                        return True
-
-                    # Log error and retry if not last attempt
-                    logger.warning(
-                        f"Failed to mark PR #{pr_number} ready (attempt {attempt}/{max_retries}): "
+                    logger.error(
+                        f"Failed to mark PR #{pr_number} ready after {max_retries} attempts: "
                         f"{error_msg}"
                     )
-
-                    if attempt < max_retries:
-                        # Exponential backoff: 2s, 4s, 8s
-                        backoff = 2 ** attempt
-                        logger.info(f"Retrying in {backoff}s...")
-                        await asyncio.sleep(backoff)
-                    else:
-                        logger.error(
-                            f"Failed to mark PR #{pr_number} ready after {max_retries} attempts: "
-                            f"{error_msg}"
-                        )
-                        return False
-
-            except subprocess.TimeoutExpired:
-                logger.warning(f"PR ready command timed out (attempt {attempt}/{max_retries})")
-                if attempt < max_retries:
-                    await asyncio.sleep(2 ** attempt)
-                else:
-                    logger.error(f"Failed to mark PR #{pr_number} ready: timeout after {max_retries} attempts")
                     return False
 
             except Exception as e:
@@ -1146,15 +1129,9 @@ class GitHubIntegration:
                 '-X', 'DELETE'
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=self._get_gh_env()
-            )
+            success, result = get_github_client().gh_cli(cmd, timeout=30, env=self._get_gh_env())
 
-            if result.returncode == 0:
+            if success:
                 logger.info(f"Deleted remote branch {branch_name}")
                 return True
             else:

@@ -3642,8 +3642,7 @@ class ReviewCycleExecutor:
         org: str = None
     ) -> str:
         """Get the most recent comment from a specific agent (workspace-aware)"""
-        import subprocess
-        import json
+        from services.github_api_client import get_github_client
 
         try:
             agent_signature = f"_Processed by the {agent_name} agent_"
@@ -3714,14 +3713,14 @@ class ReviewCycleExecutor:
                 # Fetch from issue (original behavior)
                 # Build repo string in org/repo format for gh CLI
                 repo_arg = f"{org}/{repository}" if org else repository
-                result = subprocess.run(
-                    ['gh', 'issue', 'view', str(issue_number), '--repo', repo_arg, '--json', 'comments'],
-                    capture_output=True,
-                    text=True,
-                    check=True
+                success, result = get_github_client().gh_cli(
+                    ['gh', 'issue', 'view', str(issue_number), '--repo', repo_arg, '--json', 'comments']
                 )
+                if not success or not isinstance(result.data, dict):
+                    logger.error(f"Failed to fetch comments for issue #{issue_number}: {result}")
+                    return ""
 
-                data = json.loads(result.stdout)
+                data = result.data
                 comments = data.get('comments', [])
 
                 # Find the most recent comment from this agent
@@ -3826,7 +3825,7 @@ _Automated review cycle by Switchyard_
         replace the original error with its own -- the caller logs that first,
         and this only ever adds.
         """
-        import subprocess
+        from services.github_api_client import get_github_client
 
         self.decision_events.emit_review_cycle_decision(
             issue_number=cycle_state.issue_number,
@@ -3846,12 +3845,13 @@ _Automated review cycle by Switchyard_
         )
 
         if cycle_state.workspace_type == 'issues':
-            subprocess.run(
+            label_success, label_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'edit', str(cycle_state.issue_number),
                  '--repo', cycle_state.repository,
-                 '--add-label', 'needs-human-review'],
-                capture_output=True
+                 '--add-label', 'needs-human-review']
             )
+            if not label_success:
+                logger.warning(f"Failed to add needs-human-review label: {label_result}")
 
         escalation_comment = f"""## \u26a0\ufe0f Review Cycle Could Not Be Resumed - Human Review Required
 
@@ -3921,8 +3921,8 @@ _Escalated by Switchyard - Monitoring for your response..._
     async def _escalate_blocked(self, cycle_state: ReviewCycleState, review_result):
         """Escalate when blocking issues are found (workspace-aware)"""
         from services.github_integration import GitHubIntegration
-        import subprocess
-        
+        from services.github_api_client import get_github_client
+
         # EMIT DECISION EVENT: Review cycle escalated
         blocking_issues = [
             f.message for f in review_result.findings if f.severity == 'blocking'
@@ -3946,12 +3946,13 @@ _Escalated by Switchyard - Monitoring for your response..._
 
         # Add label (only for issues)
         if cycle_state.workspace_type == 'issues':
-            subprocess.run(
+            label_success, label_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'edit', str(cycle_state.issue_number),
                  '--repo', cycle_state.repository,
-                 '--add-label', 'needs-human-review'],
-                capture_output=True
+                 '--add-label', 'needs-human-review']
             )
+            if not label_success:
+                logger.warning(f"Failed to add needs-human-review label: {label_result}")
 
         # Post escalation comment
         blocking_issues = [
@@ -4009,8 +4010,8 @@ _Escalated by Switchyard - Monitoring for your response..._
 
     async def _escalate_max_iterations(self, cycle_state: ReviewCycleState, review_result):
         """Escalate when max iterations reached without approval (workspace-aware)"""
-        import subprocess
-        
+        from services.github_api_client import get_github_client
+
         # EMIT DECISION EVENT: Review cycle escalated
         self.decision_events.emit_review_cycle_decision(
             issue_number=cycle_state.issue_number,
@@ -4031,12 +4032,13 @@ _Escalated by Switchyard - Monitoring for your response..._
 
         # Add label (only for issues)
         if cycle_state.workspace_type == 'issues':
-            subprocess.run(
+            label_success, label_result = get_github_client().gh_cli(
                 ['gh', 'issue', 'edit', str(cycle_state.issue_number),
                  '--repo', cycle_state.repository,
-                 '--add-label', 'needs-human-review'],
-                capture_output=True
+                 '--add-label', 'needs-human-review']
             )
+            if not label_success:
+                logger.warning(f"Failed to add needs-human-review label: {label_result}")
 
         # Post escalation comment
         escalation_comment = f"""## ⚠️ Max Review Iterations Reached

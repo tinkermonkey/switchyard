@@ -10,10 +10,9 @@ invocations without running in Docker itself.
 
 import asyncio
 import logging
-import subprocess
-import json
 import re
 from typing import Dict, Any, List, Optional, Tuple
+from services.github_api_client import get_github_client
 from pipeline.base import PipelineStage
 from prompts.loader import default_loader
 from services.agent_executor import get_agent_executor
@@ -884,15 +883,15 @@ class PRReviewStage(PipelineStage):
         branch_prefix = f'feature/issue-{parent_issue_number}-'
 
         try:
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'pr', 'list', '-R', repo,
                  '--state', 'open',
                  '--json', 'number,url,headRefName',
                  '--limit', '100'],
-                capture_output=True, text=True, timeout=30
+                timeout=30,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                prs = json.loads(result.stdout)
+            if success and isinstance(result.data, list):
+                prs = result.data
                 for pr in prs:
                     if pr.get('headRefName', '').startswith(branch_prefix):
                         logger.info(f"Found PR #{pr['number']} for parent #{parent_issue_number} (branch: {pr['headRefName']})")
@@ -917,15 +916,15 @@ class PRReviewStage(PipelineStage):
         branch_prefix = f'feature/issue-{parent_issue_number}-'
 
         try:
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'pr', 'list', '-R', repo,
                  '--state', 'merged',
                  '--json', 'number,url,headRefName',
                  '--limit', '100'],
-                capture_output=True, text=True, timeout=30
+                timeout=30,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                prs = json.loads(result.stdout)
+            if success and isinstance(result.data, list):
+                prs = result.data
                 for pr in prs:
                     if pr.get('headRefName', '').startswith(branch_prefix):
                         logger.info(
@@ -998,12 +997,13 @@ class PRReviewStage(PipelineStage):
     def _get_parent_issue_body(self, repo: str, issue_number: int) -> str:
         """Get the body of the parent issue."""
         try:
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'issue', 'view', str(issue_number), '-R', repo, '--json', 'body'],
-                capture_output=True, text=True, check=True, timeout=30
+                timeout=30,
             )
-            data = json.loads(result.stdout)
-            return data.get('body', '')
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh issue view failed: {result}")
+            return result.data.get('body', '')
         except Exception as e:
             logger.error(f"Failed to get parent issue body: {e}", exc_info=True)
             return ''
@@ -1017,16 +1017,19 @@ class PRReviewStage(PipelineStage):
         pr_number = match.group(1)
 
         try:
-            result = subprocess.run(
+            # gh pr checks' own exit-code convention: 0 = all pass, 1 =
+            # pending, 8 = some failing -- all three are valid answers this
+            # method still wants to parse, not execution failures.
+            success, result = get_github_client().gh_cli(
                 ['gh', 'pr', 'checks', pr_number, '-R', repo,
                  '--json', 'name,state,bucket,description,link'],
-                capture_output=True, text=True, timeout=60
+                timeout=60, acceptable_exit_codes={0, 1, 8},
             )
 
-            if result.returncode not in (0, 1, 8):
+            if not success:
                 raise RuntimeError(
                     f"Unexpected exit code {result.returncode} from gh pr checks: "
-                    f"{result.stderr.strip()}"
+                    f"{(result.stderr or '').strip()}"
                 )
 
             stdout = result.stdout.strip()
@@ -1034,7 +1037,9 @@ class PRReviewStage(PipelineStage):
                 logger.info("No CI checks configured for this PR")
                 return ([], [])
 
-            checks = json.loads(stdout)
+            if not isinstance(result.data, list):
+                raise RuntimeError(f"gh pr checks returned non-JSON output: {stdout[:200]!r}")
+            checks = result.data
 
             failures = [c for c in checks if c.get('bucket') == 'fail']
             pending = [c for c in checks if c.get('bucket') == 'pending']
@@ -1100,13 +1105,13 @@ class PRReviewStage(PipelineStage):
             lines.append(f"\n**Cycle {cycle_num}** ({timestamp[:10]}): {len(issue_numbers)} issue(s) created and closed")
             for num in issue_numbers:
                 try:
-                    result = subprocess.run(
+                    success, result = get_github_client().gh_cli(
                         ['gh', 'issue', 'view', str(num), '-R', repo,
                          '--json', 'title,state'],
-                        capture_output=True, text=True, timeout=15
+                        timeout=15,
                     )
-                    if result.returncode == 0 and result.stdout.strip():
-                        data = json.loads(result.stdout)
+                    if success and isinstance(result.data, dict):
+                        data = result.data
                         title = data.get('title', f'Issue #{num}')
                         state = data.get('state', 'unknown').lower()
                         lines.append(f"  - #{num} ({state}): {title}")
@@ -1298,11 +1303,13 @@ class PRReviewStage(PipelineStage):
         # Get parent issue node ID
         parent_issue_id = None
         try:
-            result = subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'issue', 'view', str(parent_issue_number), '-R', repo, '--json', 'id'],
-                capture_output=True, text=True, check=True, timeout=30
+                timeout=30,
             )
-            parent_issue_id = json.loads(result.stdout)['id']
+            if not success or not isinstance(result.data, dict):
+                raise RuntimeError(f"gh issue view failed: {result}")
+            parent_issue_id = result.data['id']
         except Exception as e:
             logger.error(f"Failed to get parent issue ID: {e}", exc_info=True)
 
@@ -1311,13 +1318,15 @@ class PRReviewStage(PipelineStage):
         for spec in issue_specs:
             try:
                 # Create the issue
-                result = subprocess.run(
+                create_success, create_result = get_github_client().gh_cli(
                     ['gh', 'issue', 'create', '-R', repo,
                      '--title', spec['title'],
                      '--body', spec['body']],
-                    capture_output=True, text=True, check=True, timeout=30
+                    timeout=30,
                 )
-                issue_url = result.stdout.strip()
+                if not create_success:
+                    raise RuntimeError(f"gh issue create failed: {create_result}")
+                issue_url = create_result.stdout.strip()
                 url_match = re.search(r'/issues/(\d+)$', issue_url)
                 if not url_match:
                     logger.error(f"Could not extract issue number from URL: {issue_url}")
@@ -1328,14 +1337,15 @@ class PRReviewStage(PipelineStage):
                 # Get node ID - retry with backoff since GitHub's API can lag
                 # immediately after a rapid series of issue creations.
                 issue_data = None
+                view_result = None
                 for _attempt in range(3):
-                    view_result = subprocess.run(
+                    view_success, view_result = get_github_client().gh_cli(
                         ['gh', 'issue', 'view', issue_number, '-R', repo,
                          '--json', 'id,number,url'],
-                        capture_output=True, text=True, timeout=30
+                        timeout=30,
                     )
-                    if view_result.returncode == 0 and view_result.stdout.strip():
-                        issue_data = json.loads(view_result.stdout)
+                    if view_success and isinstance(view_result.data, dict):
+                        issue_data = view_result.data
                         break
                     delay = 2 ** _attempt
                     if _attempt < 2:
@@ -1347,17 +1357,19 @@ class PRReviewStage(PipelineStage):
                 if issue_data is None:
                     raise RuntimeError(
                         f"gh issue view {issue_number} failed after 3 attempts: "
-                        f"{view_result.stderr.strip()}"
+                        f"{view_result.stderr.strip() if view_result else 'no result'}"
                     )
                 issue_id = issue_data['id']
 
                 # Add to SDLC board
-                subprocess.run(
+                item_add_success, item_add_result = get_github_client().gh_cli(
                     ['gh', 'project', 'item-add', str(sdlc_board.project_number),
                      '--owner', github_config['org'],
                      '--url', issue_url],
-                    capture_output=True, text=True, check=True, timeout=30
+                    timeout=30,
                 )
+                if not item_add_success:
+                    raise RuntimeError(f"gh project item-add failed: {item_add_result}")
 
                 # Set status to Backlog
                 if not self._set_issue_status_on_board(
@@ -1490,11 +1502,13 @@ class PRReviewStage(PipelineStage):
                 )
                 new_body = issue_data['body'] + sibling_header + sibling_lines
                 try:
-                    subprocess.run(
+                    edit_success, edit_result = get_github_client().gh_cli(
                         ['gh', 'issue', 'edit', issue_data['number'], '-R', repo,
                          '--body', new_body],
-                        capture_output=True, text=True, check=True, timeout=30
+                        timeout=30,
                     )
+                    if not edit_success:
+                        raise RuntimeError(f"gh issue edit failed: {edit_result}")
                     logger.info(f"Updated #{issue_data['number']} with sibling issue context")
                 except Exception as e:
                     logger.error(
@@ -1612,12 +1626,14 @@ class PRReviewStage(PipelineStage):
               }}
             }}
             """
-            subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'api', 'graphql',
                  '-H', 'GraphQL-Features: sub_issues',
                  '-f', f'query={mutation}'],
-                capture_output=True, text=True, check=True, timeout=30
+                timeout=30,
             )
+            if not success:
+                raise RuntimeError(f"addSubIssue failed: {result}")
             logger.info(f"Linked #{child_number} as sub-issue of #{parent_number}")
             return None
         except Exception as e:
@@ -1983,12 +1999,12 @@ class PRReviewStage(PipelineStage):
         states: Dict[int, str] = {}
         for num in issue_numbers:
             try:
-                result = subprocess.run(
+                success, result = get_github_client().gh_cli(
                     ['gh', 'issue', 'view', str(num), '-R', repo, '--json', 'state'],
-                    capture_output=True, text=True, timeout=15
+                    timeout=15,
                 )
-                if result.returncode == 0:
-                    states[num] = json.loads(result.stdout).get('state', 'UNKNOWN').lower()
+                if success and isinstance(result.data, dict):
+                    states[num] = result.data.get('state', 'UNKNOWN').lower()
                 else:
                     states[num] = 'unknown'
             except Exception as e:
@@ -2054,10 +2070,12 @@ class PRReviewStage(PipelineStage):
         `_post_failure_comment_or_escalate`.
         """
         try:
-            subprocess.run(
+            success, result = get_github_client().gh_cli(
                 ['gh', 'issue', 'comment', str(issue_number), '-R', repo, '--body', comment],
-                capture_output=True, text=True, check=True, timeout=30
+                timeout=30,
             )
+            if not success:
+                raise RuntimeError(f"gh issue comment failed: {result}")
 
             try:
                 from monitoring.decision_events import get_decision_event_emitter
