@@ -499,45 +499,18 @@ class GitHubIntegration:
                 logger.error(f"Failed to get discussion {discussion_id} for processing check")
                 return False
 
+            from services.github_discussions import analyze_agent_discussion_state
+
             comments = result['node']['comments']['nodes']
-            signature = f"_Processed by the {agent_name} agent_"
+            state = analyze_agent_discussion_state(comments, agent_name)
 
-            # Collect all messages with timestamps
-            all_messages = []
-            for comment in comments:
-                all_messages.append({
-                    'body': comment.get('body', ''),
-                    'author': comment.get('author', {}).get('login', ''),
-                    'createdAt': comment.get('createdAt', ''),
-                    'type': 'comment'
-                })
-                for reply in comment.get('replies', {}).get('nodes', []):
-                    all_messages.append({
-                        'body': reply.get('body', ''),
-                        'author': reply.get('author', {}).get('login', ''),
-                        'createdAt': reply.get('createdAt', ''),
-                        'type': 'reply'
-                    })
-            
-            # Sort by createdAt
-            all_messages.sort(key=lambda x: x['createdAt'])
-            
-            last_agent_idx = -1
-            last_user_idx = -1
-            
-            for i, msg in enumerate(all_messages):
-                if signature in msg['body']:
-                    last_agent_idx = i
-                elif msg['author'] != 'orchestrator-bot' and '[bot]' not in msg['author']:
-                    last_user_idx = i
-
-            if last_agent_idx == -1:
+            if not state['agent_posted']:
                 return False # Agent never processed it
-            
-            if last_user_idx > last_agent_idx:
-                logger.info(f"New user comment found after agent signature (User idx: {last_user_idx}, Agent idx: {last_agent_idx})")
+
+            if state['superseded']:
+                logger.info(f"New user comment found after agent signature (User idx: {state['last_human_idx']}, Agent idx: {state['last_agent_idx']})")
                 return False # New user comment exists
-                
+
             logger.debug(f"Found agent signature for {agent_name} and no new user comments")
             return True
 

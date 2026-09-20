@@ -14,6 +14,62 @@ from services.github_api_client import get_github_client
 logger = logging.getLogger(__name__)
 
 
+def analyze_agent_discussion_state(comments: List[Dict], agent_name: str) -> Dict[str, Any]:
+    """
+    Decide whether an agent's latest discussion output is still the last word.
+
+    Flattens top-level comments and their nested replies, orders them by
+    createdAt, and finds the most recent message carrying the agent's
+    signature (``_Processed by the {agent_name} agent_``) and the most recent
+    human message (any non-signature message whose author is neither
+    ``orchestrator-bot`` nor a ``[bot]`` login).
+
+    Shared by GitHubIntegration.has_agent_processed_discussion and the MCP
+    get_discussion_feedback tool so both answer identically.
+
+    Returns a dict with:
+        agent_posted, superseded, still_last_word (agent_posted and not superseded),
+        last_agent_at, last_human_at, last_agent_idx, last_human_idx
+    """
+    signature = f"_Processed by the {agent_name} agent_"
+
+    all_messages = []
+    for comment in comments:
+        all_messages.append({
+            'body': comment.get('body') or '',
+            'author': (comment.get('author') or {}).get('login', ''),
+            'createdAt': comment.get('createdAt', ''),
+        })
+        for reply in (comment.get('replies') or {}).get('nodes') or []:
+            all_messages.append({
+                'body': reply.get('body') or '',
+                'author': (reply.get('author') or {}).get('login', ''),
+                'createdAt': reply.get('createdAt', ''),
+            })
+
+    all_messages.sort(key=lambda x: x['createdAt'])
+
+    last_agent_idx = -1
+    last_user_idx = -1
+    for i, msg in enumerate(all_messages):
+        if signature in msg['body']:
+            last_agent_idx = i
+        elif msg['author'] != 'orchestrator-bot' and '[bot]' not in msg['author']:
+            last_user_idx = i
+
+    agent_posted = last_agent_idx != -1
+    superseded = agent_posted and last_user_idx > last_agent_idx
+    return {
+        'agent_posted': agent_posted,
+        'superseded': superseded,
+        'still_last_word': agent_posted and not superseded,
+        'last_agent_at': all_messages[last_agent_idx]['createdAt'] if agent_posted else None,
+        'last_human_at': all_messages[last_user_idx]['createdAt'] if last_user_idx != -1 else None,
+        'last_agent_idx': last_agent_idx,
+        'last_human_idx': last_user_idx,
+    }
+
+
 class GitHubDiscussions:
     """GitHub Discussions API client"""
 
@@ -40,6 +96,14 @@ class GitHubDiscussions:
 
     def get_discussion_comments(self, owner: str, repo: str, discussion_id: str) -> List[Dict]:
         """
+        Get comments for a discussion by node ID (empty list on failure;
+        use fetch_discussion_comments to tell failure from an empty thread)
+        """
+        comments = self.fetch_discussion_comments(owner, repo, discussion_id)
+        return comments if comments is not None else []
+
+    def fetch_discussion_comments(self, owner: str, repo: str, discussion_id: str) -> Optional[List[Dict]]:
+        """
         Get comments for a discussion by node ID
         
         Args:
@@ -47,7 +111,7 @@ class GitHubDiscussions:
             repo: Repository name
             discussion_id: Discussion node ID (e.g. D_kwD...)
             
-        Returns: List of comment objects
+        Returns: List of comment objects, or None if the fetch failed
         """
         query = """
         query($discussionId: ID!) {
@@ -84,7 +148,7 @@ class GitHubDiscussions:
             return result['node']['comments']['nodes']
             
         logger.error(f"Failed to get comments for discussion {discussion_id}")
-        return []
+        return None
 
     def get_repository_id(self, owner: str, repo: str) -> Optional[str]:
         """Get repository ID (node ID) for GraphQL operations"""

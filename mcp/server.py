@@ -967,6 +967,107 @@ async def github_graphql(query: str, variables: dict | None = None) -> dict:
     return _gh_graphql(query, variables)
 
 
+def _discussions_client():
+    """Instantiate the GitHubDiscussions service (breaker-routed via get_github_client())."""
+    from services.github_discussions import GitHubDiscussions
+
+    return GitHubDiscussions()
+
+
+@mcp.tool()
+async def reply_to_discussion(
+    discussion_id: str, body: str, reply_to_id: str | None = None
+) -> dict:
+    """
+    Post a comment on a GitHub Discussion, optionally as a threaded reply.
+
+    Thin wrapper over GitHubDiscussions.add_discussion_comment. Never raises:
+    returns {"posted": True, "comment_id": "..."} on success or
+    {"posted": False, "reason": "..."} on any failure.
+
+    Args:
+        discussion_id: Discussion node ID (e.g. D_kwD...).
+        body:          Comment body (markdown).
+        reply_to_id:   Optional comment node ID to reply to (nested thread).
+    """
+    if not discussion_id or not discussion_id.strip():
+        return {"posted": False, "reason": "discussion_id is required"}
+    if not body or not body.strip():
+        return {"posted": False, "reason": "body is required"}
+    try:
+        comment_id = await asyncio.to_thread(
+            _discussions_client().add_discussion_comment,
+            discussion_id,
+            body,
+            reply_to_id or None,
+        )
+    except Exception as exc:
+        log.warning("reply_to_discussion failed for %s: %s", discussion_id, exc)
+        return {"posted": False, "reason": f"{type(exc).__name__}: {exc}"}
+    if not comment_id:
+        return {
+            "posted": False,
+            "reason": "GitHub did not return a comment (see orchestrator logs)",
+        }
+    return {"posted": True, "comment_id": comment_id}
+
+
+@mcp.tool()
+async def get_discussion_feedback(
+    discussion_id: str, agent_name: str | None = None
+) -> dict:
+    """
+    Return a discussion's full comment tree and, optionally, whether an
+    agent's latest output is still the last word.
+
+    Comments are returned as-is from GitHubDiscussions.get_discussion_comments
+    (id, body, author, createdAt, replies). When agent_name is given, the
+    result also carries an "agent" block computed with the same logic as
+    has_agent_processed_discussion: the agent's latest message is the one
+    containing "_Processed by the {agent_name} agent_"; it is "superseded" when
+    a later message (top-level or nested reply) is from a human, i.e. an
+    author that is neither orchestrator-bot nor a "[bot]" login.
+
+    Never raises: failures return {"success": False, "error": "..."}.
+
+    Args:
+        discussion_id: Discussion node ID (e.g. D_kwD...).
+        agent_name:    Optional agent whose signature to look for.
+    """
+    if not discussion_id or not discussion_id.strip():
+        return {"success": False, "error": "discussion_id is required"}
+    try:
+        comments = await asyncio.to_thread(
+            _discussions_client().fetch_discussion_comments, "", "", discussion_id
+        )
+        if comments is None:
+            return {
+                "success": False,
+                "error": "GitHub did not return the discussion's comments (see orchestrator logs)",
+            }
+        result: dict = {
+            "success": True,
+            "discussion_id": discussion_id,
+            "comments": comments,
+        }
+        if agent_name:
+            from services.github_discussions import analyze_agent_discussion_state
+
+            state = analyze_agent_discussion_state(comments, agent_name)
+            result["agent"] = {
+                "name": agent_name,
+                "has_posted": state["agent_posted"],
+                "superseded": state["superseded"],
+                "still_last_word": state["still_last_word"],
+                "last_agent_at": state["last_agent_at"],
+                "last_human_at": state["last_human_at"],
+            }
+        return result
+    except Exception as exc:
+        log.warning("get_discussion_feedback failed for %s: %s", discussion_id, exc)
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 # ── MCP tools: pipeline run diagnostics ───────────────────────────────────────
 
 @mcp.tool()
