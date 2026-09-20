@@ -495,7 +495,7 @@ class GitHubIntegration:
 
             result = github_app.graphql_request(query, {'discussionId': discussion_id})
 
-            if not result or 'node' not in result:
+            if not (result or {}).get('node'):
                 logger.error(f"Failed to get discussion {discussion_id} for processing check")
                 return False
 
