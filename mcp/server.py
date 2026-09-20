@@ -45,7 +45,7 @@ from services.pipeline_run import format_pipeline_run_issue_key
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 log = logging.getLogger(__name__)
 
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.3.0"
 
 # ── Paths & external service URLs ─────────────────────────────────────────────
 
@@ -965,6 +965,169 @@ async def github_graphql(query: str, variables: dict | None = None) -> dict:
         variables: Optional dict of query variables.
     """
     return _gh_graphql(query, variables)
+
+
+def _discussions_client():
+    """Instantiate the GitHubDiscussions service (breaker-routed via get_github_client())."""
+    from services.github_discussions import GitHubDiscussions
+
+    return GitHubDiscussions()
+
+
+class _PartFailed(Exception):
+    """A discussion comment part was rejected by GitHub (no exception raised)."""
+
+
+@mcp.tool()
+async def reply_to_discussion(
+    discussion_id: str,
+    body: str,
+    reply_to_id: str | None = None,
+    pipeline_run_id: str | None = None,
+    repo: str | None = None,
+) -> dict:
+    """
+    Post a comment on a GitHub Discussion, optionally as a threaded reply.
+
+    Thin wrapper over GitHubDiscussions.add_discussion_comment. Returns a failure
+    dict instead of raising on GitHub/service errors:
+    {"posted": True, "comment_id": "..."} on success, otherwise
+    {"posted": False, "reason": "..."}. A body over GitHub's size limit is split
+    across several comments (only the first is the threaded reply); the result
+    then also carries "parts". "posted" is True only when every part is live. If
+    a later part fails, the result is posted False with "partial": True,
+    "comment_id" (the first part) and "parts_posted": do not retry the whole
+    body. A failure after GitHub accepted a comment can also report posted False,
+    so check the thread before retrying.
+
+    Args:
+        discussion_id:   Discussion node ID (e.g. D_kwD...).
+        body:            Comment body (markdown).
+        reply_to_id:     Optional TOP-LEVEL comment node ID to reply to. GitHub
+                         only threads under top-level comments, so pass the
+                         parent's id, not the id of a nested reply; a wrong id
+                         fails with a generic reason.
+        pipeline_run_id: Optional pipeline run to attribute the comment to in
+                         the decision-event timeline.
+        repo:            Optional "owner/repo" for the same attribution.
+    """
+    if not isinstance(discussion_id, str) or not discussion_id.strip():
+        return {"posted": False, "reason": "discussion_id is required"}
+    if not isinstance(body, str) or not body.strip():
+        return {"posted": False, "reason": "body is required"}
+    if reply_to_id is not None and (not isinstance(reply_to_id, str) or not reply_to_id.strip()):
+        return {"posted": False, "reason": "reply_to_id must be a comment node ID or omitted"}
+    first_id = None
+    parts_posted = 0
+    chunks: list[str] = []
+    try:
+        from services.github_integration import GitHubIntegration
+
+        chunks = GitHubIntegration._split_oversized_comment(body)
+        client = _discussions_client()
+        for i, chunk in enumerate(chunks):
+            comment_id = await asyncio.to_thread(
+                client.add_discussion_comment,
+                discussion_id,
+                chunk,
+                reply_to_id if i == 0 else None,
+                pipeline_run_id,
+                repo or "unknown",
+            )
+            if not comment_id:
+                raise _PartFailed("GitHub did not return a comment (see orchestrator logs)")
+            first_id = first_id or comment_id
+            parts_posted += 1
+    except Exception as exc:
+        if not isinstance(exc, _PartFailed):
+            log.warning("reply_to_discussion failed for %s: %s", discussion_id, exc, exc_info=True)
+        reason = str(exc) if isinstance(exc, _PartFailed) else f"{type(exc).__name__}: {exc}"
+        result = {"posted": False, "reason": reason}
+        if parts_posted:
+            # Some parts are already live; retrying the whole body would duplicate them.
+            result.update(
+                partial=True,
+                comment_id=first_id,
+                parts=len(chunks),
+                parts_posted=parts_posted,
+                reason=f"only {parts_posted}/{len(chunks)} parts were posted: {reason}",
+            )
+        return result
+    result = {"posted": True, "comment_id": first_id}
+    if len(chunks) > 1:
+        result["parts"] = len(chunks)
+    return result
+
+
+@mcp.tool()
+async def get_discussion_feedback(
+    discussion_id: str, agent_name: str | None = None
+) -> dict:
+    """
+    Return a discussion's comment tree and, optionally, whether an agent's
+    latest output is still the last word.
+
+    "comments" is the newest window of the thread, oldest-first: up to 100
+    top-level comments, each with up to 50 replies, from
+    GitHubDiscussions.fetch_discussion_comment_tree. Each comment has id, body,
+    createdAt, author {login} (author is null for deleted accounts) and
+    replies {nodes: [...]}. "truncated" is True when older comments or replies
+    were left out; "total_comments" is the top-level count.
+
+    When agent_name is given, the result also carries an "agent" block computed
+    by analyze_agent_discussion_state, the helper that
+    GitHubIntegration.has_agent_processed_discussion uses. The agent's latest
+    message is the one containing "_Processed by the {agent_name} agent_"; it is
+    "superseded" when a later message (top-level or nested reply) is from a
+    human, i.e. an author with a login that is neither orchestrator-bot nor a
+    "[bot]" login. Null authors are treated as bots. Unlike that method, which
+    returns False on error, failures here return {"success": False, ...}.
+
+    Failures return {"success": False, "error": "..."} instead of raising.
+
+    Args:
+        discussion_id: Discussion node ID (e.g. D_kwD...).
+        agent_name:    Optional agent whose signature to look for.
+    """
+    if not isinstance(discussion_id, str) or not discussion_id.strip():
+        return {"success": False, "error": "discussion_id is required"}
+    try:
+        tree = await asyncio.to_thread(
+            _discussions_client().fetch_discussion_comment_tree, discussion_id
+        )
+    except Exception as exc:
+        log.warning("get_discussion_feedback fetch failed for %s: %s", discussion_id, exc, exc_info=True)
+        return {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+    if tree is None:
+        return {
+            "success": False,
+            "error": "GitHub did not return the discussion's comments (request failed, "
+            "or the ID is not a Discussion; see orchestrator logs)",
+        }
+    result: dict = {
+        "success": True,
+        "discussion_id": discussion_id,
+        "comments": tree["comments"],
+        "truncated": tree["truncated"],
+        "total_comments": tree["total_comments"],
+    }
+    if agent_name:
+        try:
+            from services.github_discussions import analyze_agent_discussion_state
+
+            state = analyze_agent_discussion_state(tree["comments"], agent_name)
+        except Exception as exc:
+            log.warning("get_discussion_feedback analysis failed for %s: %s", discussion_id, exc, exc_info=True)
+            return {"success": False, "error": f"analysis failed: {type(exc).__name__}: {exc}"}
+        result["agent"] = {
+            "name": agent_name,
+            "has_posted": state["agent_posted"],
+            "superseded": state["superseded"],
+            "still_last_word": state["still_last_word"],
+            "last_agent_at": state["last_agent_at"],
+            "last_human_at": state["last_human_at"],
+        }
+    return result
 
 
 # ── MCP tools: pipeline run diagnostics ───────────────────────────────────────

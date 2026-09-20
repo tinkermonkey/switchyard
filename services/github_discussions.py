@@ -14,6 +14,69 @@ from services.github_api_client import get_github_client
 logger = logging.getLogger(__name__)
 
 
+def analyze_agent_discussion_state(comments: List[Dict], agent_name: str) -> Dict[str, Any]:
+    """
+    Decide whether an agent's latest discussion output is still the last word.
+
+    Flattens top-level comments and their nested replies, orders them by
+    createdAt (ISO-8601 strings; a missing timestamp sorts first), and finds the
+    most recent message carrying the agent's signature
+    (``_Processed by the {agent_name} agent_``) and the most recent human message.
+
+    A message is human only if it lacks the signature and its author has a login
+    that is neither ``orchestrator-bot`` nor contains ``[bot]``. A missing author
+    (GitHub returns ``author: null`` for deleted accounts and some app actors) is
+    treated as a bot, not a human. A message that quotes the signature counts as
+    the agent's, whoever wrote it.
+
+    Shared by GitHubIntegration.has_agent_processed_discussion and the MCP
+    get_discussion_feedback tool so both answer identically.
+
+    Returns a dict with:
+        agent_posted, superseded, still_last_word (agent_posted and not superseded),
+        last_agent_at, last_human_at, and last_agent_idx / last_human_idx (positions
+        in the internal time-sorted list; diagnostic only)
+    """
+    signature = f"_Processed by the {agent_name} agent_"
+
+    all_messages = []
+    for comment in comments:
+        all_messages.append({
+            'body': comment.get('body') or '',
+            'author': (comment.get('author') or {}).get('login') or '',
+            'createdAt': comment.get('createdAt') or '',
+        })
+        for reply in (comment.get('replies') or {}).get('nodes') or []:
+            all_messages.append({
+                'body': reply.get('body') or '',
+                'author': (reply.get('author') or {}).get('login') or '',
+                'createdAt': reply.get('createdAt') or '',
+            })
+
+    all_messages.sort(key=lambda x: x['createdAt'])
+
+    last_agent_idx = -1
+    last_human_idx = -1
+    for i, msg in enumerate(all_messages):
+        author = msg['author']
+        if signature in msg['body']:
+            last_agent_idx = i
+        elif author and author != 'orchestrator-bot' and '[bot]' not in author:
+            last_human_idx = i
+
+    agent_posted = last_agent_idx != -1
+    superseded = agent_posted and last_human_idx > last_agent_idx
+    return {
+        'agent_posted': agent_posted,
+        'superseded': superseded,
+        'still_last_word': agent_posted and not superseded,
+        'last_agent_at': all_messages[last_agent_idx]['createdAt'] if agent_posted else None,
+        'last_human_at': all_messages[last_human_idx]['createdAt'] if last_human_idx != -1 else None,
+        'last_agent_idx': last_agent_idx,
+        'last_human_idx': last_human_idx,
+    }
+
+
 class GitHubDiscussions:
     """GitHub Discussions API client"""
 
@@ -40,20 +103,45 @@ class GitHubDiscussions:
 
     def get_discussion_comments(self, owner: str, repo: str, discussion_id: str) -> List[Dict]:
         """
-        Get comments for a discussion by node ID
-        
-        Args:
-            owner: Repository owner
-            repo: Repository name
-            discussion_id: Discussion node ID (e.g. D_kwD...)
-            
-        Returns: List of comment objects
+        Get comments for a discussion by node ID (empty list on failure;
+        use fetch_discussion_comments to tell failure from an empty thread).
+        Returns the newest window; see fetch_discussion_comment_tree.
+        """
+        comments = self.fetch_discussion_comments(owner, repo, discussion_id)
+        return comments if comments is not None else []
+
+    def fetch_discussion_comments(self, owner: str, repo: str, discussion_id: str) -> Optional[List[Dict]]:
+        """
+        Get comments for a discussion by node ID (owner/repo are unused; the
+        node ID is globally unique).
+
+        Returns: List of comment objects (the newest 100 top-level comments,
+        oldest-first, each with its newest 50 replies), or None if the fetch
+        failed or the node is not a Discussion. Use
+        fetch_discussion_comment_tree to also learn whether the window truncated.
+        """
+        tree = self.fetch_discussion_comment_tree(discussion_id)
+        return tree['comments'] if tree is not None else None
+
+    def fetch_discussion_comment_tree(self, discussion_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the newest window of a discussion's comment tree.
+
+        Uses ``last:`` because GitHub orders connections oldest-first and callers
+        ask about the tail of the thread; anything dropped is older than the
+        window's own first node.
+
+        Returns: {'comments': [...], 'truncated': bool, 'total_comments': int},
+        or None if the fetch failed or the node is not a Discussion.
+        ``truncated`` is True when any top-level comment or any comment's replies
+        exceeded the window.
         """
         query = """
         query($discussionId: ID!) {
           node(id: $discussionId) {
             ... on Discussion {
-              comments(first: 100) {
+              comments(last: 100) {
+                totalCount
                 nodes {
                   id
                   body
@@ -61,7 +149,8 @@ class GitHubDiscussions:
                   author {
                     login
                   }
-                  replies(first: 50) {
+                  replies(last: 50) {
+                    totalCount
                     nodes {
                       id
                       body
@@ -77,14 +166,25 @@ class GitHubDiscussions:
           }
         }
         """
-        
+
         result = self._execute_graphql(query, {'discussionId': discussion_id})
-        
-        if result and 'node' in result and 'comments' in result['node']:
-            return result['node']['comments']['nodes']
-            
-        logger.error(f"Failed to get comments for discussion {discussion_id}")
-        return []
+
+        node = (result or {}).get('node') or {}
+        connection = node.get('comments')
+        if connection is None or connection.get('nodes') is None:
+            logger.error(
+                f"Failed to get comments for discussion {discussion_id} "
+                f"(request failed, or node is not a Discussion)"
+            )
+            return None
+
+        comments = connection['nodes']
+        total = connection.get('totalCount', len(comments))
+        truncated = total > len(comments) or any(
+            (c.get('replies') or {}).get('totalCount', 0) > len((c.get('replies') or {}).get('nodes') or [])
+            for c in comments
+        )
+        return {'comments': comments, 'truncated': truncated, 'total_comments': total}
 
     def get_repository_id(self, owner: str, repo: str) -> Optional[str]:
         """Get repository ID (node ID) for GraphQL operations"""
