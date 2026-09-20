@@ -974,6 +974,10 @@ def _discussions_client():
     return GitHubDiscussions()
 
 
+class _PartFailed(Exception):
+    """A discussion comment part was rejected by GitHub (no exception raised)."""
+
+
 @mcp.tool()
 async def reply_to_discussion(
     discussion_id: str,
@@ -990,9 +994,11 @@ async def reply_to_discussion(
     {"posted": True, "comment_id": "..."} on success, otherwise
     {"posted": False, "reason": "..."}. A body over GitHub's size limit is split
     across several comments (only the first is the threaded reply); the result
-    then also carries "parts" and, if a later part failed, "parts_posted" with
-    "partial": True. A failure after GitHub accepted the comment can still
-    report posted False, so check the thread before retrying.
+    then also carries "parts". "posted" is True only when every part is live. If
+    a later part fails, the result is posted False with "partial": True,
+    "comment_id" (the first part) and "parts_posted": do not retry the whole
+    body. A failure after GitHub accepted a comment can also report posted False,
+    so check the thread before retrying.
 
     Args:
         discussion_id:   Discussion node ID (e.g. D_kwD...).
@@ -1011,12 +1017,14 @@ async def reply_to_discussion(
         return {"posted": False, "reason": "body is required"}
     if reply_to_id is not None and (not isinstance(reply_to_id, str) or not reply_to_id.strip()):
         return {"posted": False, "reason": "reply_to_id must be a comment node ID or omitted"}
+    first_id = None
+    parts_posted = 0
+    chunks: list[str] = []
     try:
         from services.github_integration import GitHubIntegration
 
         chunks = GitHubIntegration._split_oversized_comment(body)
         client = _discussions_client()
-        first_id = None
         for i, chunk in enumerate(chunks):
             comment_id = await asyncio.to_thread(
                 client.add_discussion_comment,
@@ -1027,24 +1035,24 @@ async def reply_to_discussion(
                 repo or "unknown",
             )
             if not comment_id:
-                if first_id is None:
-                    return {
-                        "posted": False,
-                        "reason": "GitHub did not return a comment (see orchestrator logs)",
-                    }
-                return {
-                    "posted": True,
-                    "partial": True,
-                    "comment_id": first_id,
-                    "parts": len(chunks),
-                    "parts_posted": i,
-                    "reason": f"only {i}/{len(chunks)} parts were posted",
-                }
-            if first_id is None:
-                first_id = comment_id
+                raise _PartFailed("GitHub did not return a comment (see orchestrator logs)")
+            first_id = first_id or comment_id
+            parts_posted += 1
     except Exception as exc:
-        log.warning("reply_to_discussion failed for %s: %s", discussion_id, exc, exc_info=True)
-        return {"posted": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(exc, _PartFailed):
+            log.warning("reply_to_discussion failed for %s: %s", discussion_id, exc, exc_info=True)
+        reason = str(exc) if isinstance(exc, _PartFailed) else f"{type(exc).__name__}: {exc}"
+        result = {"posted": False, "reason": reason}
+        if parts_posted:
+            # Some parts are already live; retrying the whole body would duplicate them.
+            result.update(
+                partial=True,
+                comment_id=first_id,
+                parts=len(chunks),
+                parts_posted=parts_posted,
+                reason=f"only {parts_posted}/{len(chunks)} parts were posted: {reason}",
+            )
+        return result
     result = {"posted": True, "comment_id": first_id}
     if len(chunks) > 1:
         result["parts"] = len(chunks)

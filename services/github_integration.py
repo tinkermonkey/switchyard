@@ -468,7 +468,7 @@ class GitHubIntegration:
               node(id: $discussionId) {
                 ... on Discussion {
                   number
-                  comments(first: 100) {
+                  comments(last: 100) {
                     nodes {
                       id
                       body
@@ -476,7 +476,7 @@ class GitHubIntegration:
                         login
                       }
                       createdAt
-                      replies(first: 50) {
+                      replies(last: 50) {
                         nodes {
                           id
                           body

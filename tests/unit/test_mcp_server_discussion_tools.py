@@ -118,12 +118,22 @@ class TestReplyToDiscussion:
         assert all(len(c.args[1]) <= 65000 for c in calls)
 
     @pytest.mark.asyncio
-    async def test_partial_post_is_reported(self):
+    async def test_partial_post_is_not_reported_as_posted(self):
         svc = MagicMock()
         svc.add_discussion_comment.side_effect = ["DC_a", None]
         with patch.object(mcp_server, "_discussions_client", return_value=svc):
             r = await mcp_server.reply_to_discussion("D_1", "line\n" * 30000)
-        assert r["posted"] is True and r["partial"] is True and r["parts_posted"] == 1
+        assert r["posted"] is False and r["partial"] is True
+        assert r["comment_id"] == "DC_a" and r["parts_posted"] == 1
+
+    @pytest.mark.asyncio
+    async def test_exception_after_first_part_reports_partial(self):
+        svc = MagicMock()
+        svc.add_discussion_comment.side_effect = ["DC_a", RuntimeError("rate limited")]
+        with patch.object(mcp_server, "_discussions_client", return_value=svc):
+            r = await mcp_server.reply_to_discussion("D_1", "line\n" * 30000)
+        assert r["posted"] is False and r["partial"] is True
+        assert r["comment_id"] == "DC_a" and "rate limited" in r["reason"]
 
 
 class TestGetDiscussionFeedback:
