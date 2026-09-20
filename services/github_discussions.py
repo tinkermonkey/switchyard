@@ -144,8 +144,9 @@ class GitHubDiscussions:
         
         result = self._execute_graphql(query, {'discussionId': discussion_id})
         
-        if result and 'node' in result and 'comments' in result['node']:
-            return result['node']['comments']['nodes']
+        node = (result or {}).get('node') or {}
+        if 'comments' in node:
+            return node['comments']['nodes']
             
         logger.error(f"Failed to get comments for discussion {discussion_id}")
         return None

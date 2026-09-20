@@ -988,7 +988,9 @@ async def reply_to_discussion(
     Args:
         discussion_id: Discussion node ID (e.g. D_kwD...).
         body:          Comment body (markdown).
-        reply_to_id:   Optional comment node ID to reply to (nested thread).
+        reply_to_id:   Optional TOP-LEVEL comment node ID to reply to. GitHub
+                       only threads under top-level comments, so pass the parent's
+                       id, not the id of a nested reply.
     """
     if not discussion_id or not discussion_id.strip():
         return {"posted": False, "reason": "discussion_id is required"}

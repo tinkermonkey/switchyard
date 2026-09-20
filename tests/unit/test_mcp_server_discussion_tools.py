@@ -173,3 +173,11 @@ class TestGetDiscussionFeedback:
     async def test_empty_id(self):
         r = await mcp_server.get_discussion_feedback("")
         assert r["success"] is False
+
+
+def test_fetch_comments_null_node_returns_none():
+    from services.github_discussions import GitHubDiscussions
+    svc = GitHubDiscussions.__new__(GitHubDiscussions)
+    svc._execute_graphql = lambda *a, **k: {"node": None}
+    assert svc.fetch_discussion_comments("", "", "D_bad") is None
+    assert svc.get_discussion_comments("", "", "D_bad") == []
