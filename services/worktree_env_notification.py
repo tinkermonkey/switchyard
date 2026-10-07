@@ -217,7 +217,9 @@ def _build_comment(
     env_fix_description: str,
 ) -> str:
     """Build the GitHub comment body for one worktree."""
-    has_conflicts = any(d.diverged or d.only_in_worktree for d in divergences)
+    has_conflicts = any(
+        d.diverged or d.only_in_worktree or d.only_in_main for d in divergences
+    )
     all_identical = all(d.identical for d in divergences)
 
     lines: List[str] = []
@@ -380,9 +382,12 @@ async def _notify_active_worktrees_of_env_fix(
 
     # 1. Locate the base clone (no epic_id → shared base clone path).
     base_clone = _workspace_manager.get_project_dir(project_name)
-    if not base_clone.exists():
+    # Verify the base clone is a live git repository before proceeding.
+    rc_base, _, _ = _run_git(['rev-parse', '--git-dir'], cwd=base_clone)
+    if rc_base != 0:
         logger.debug(
-            "Base clone for %s not found at %s; skipping worktree notifications",
+            "Base clone for %s at %s is not a valid git working tree; "
+            "skipping worktree notifications",
             project_name, base_clone,
         )
         return
@@ -456,9 +461,13 @@ async def _notify_active_worktrees_of_env_fix(
             continue
 
         worktree_path = Path(worktree_path_str)
-        if not worktree_path.exists():
+        # Use git to verify the path is a live git working tree rather than
+        # just checking Path.exists() -- a directory can exist without being
+        # a valid worktree (e.g. a stale directory after pruning).
+        rc, _, _ = _run_git(['rev-parse', '--git-dir'], cwd=worktree_path)
+        if rc != 0:
             logger.debug(
-                "Worktree path %s for epic %s no longer exists; skipping",
+                "Worktree path %s for epic %s is not a valid git working tree; skipping",
                 worktree_path, epic_id,
             )
             continue

@@ -94,16 +94,14 @@ async def test_no_worktrees_no_comment(mock_workspace_manager, mock_github, mock
     with (
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('abc123', ['pyproject.toml'])),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
     ):
         mock_workspace_manager.get_project_dir.return_value = Path('/workspace/p')
-        # Simulate existing base clone
-        with patch('pathlib.Path.exists', return_value=True):
-            
 
-            from services.worktree_env_notification import notify_active_worktrees_of_env_fix
-            await notify_active_worktrees_of_env_fix('test-project', 'fix output')
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'fix output')
 
     mock_github.post_issue_comment.assert_not_called()
 
@@ -121,7 +119,7 @@ async def test_unowned_worktree_no_comment(mock_workspace_manager, mock_github, 
         patch(f'{MODULE}._get_env_fix_commit', return_value=('abc123', ['pyproject.toml'])),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -150,7 +148,7 @@ async def test_active_worktree_gets_comment(mock_workspace_manager, mock_github,
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -196,7 +194,7 @@ async def test_clean_divergence_comment(mock_workspace_manager, mock_github, moc
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -243,7 +241,7 @@ async def test_conflicting_divergence_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -278,7 +276,7 @@ async def test_duplicate_epic_ids_one_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -304,7 +302,7 @@ async def test_github_comment_failure_does_not_raise(mock_workspace_manager, moc
         patch(f'{MODULE}._read_file_at_head', return_value='content'),
         patch(f'{MODULE}._make_github_integration', return_value=failing_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -325,7 +323,7 @@ async def test_no_env_fix_commit_found_no_comment(mock_workspace_manager, mock_g
         patch(f'{MODULE}._get_env_fix_commit', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
@@ -351,7 +349,7 @@ async def test_multiple_active_worktrees_each_get_one_comment(
         patch(f'{MODULE}._read_file_at_head', return_value='FROM python:3.11\n'),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
-        patch('pathlib.Path.exists', return_value=True),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
         
 
