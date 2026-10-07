@@ -10,11 +10,10 @@ Covers:
 """
 from __future__ import annotations
 
-import asyncio
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from typing import Any, Dict, Optional
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -34,26 +33,6 @@ def _worktree(epic_id: str, path: str, active: Optional[bool]) -> Dict[str, Any]
         'path': path,
         'active_run_protected': active,
     }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers to inject git output without touching the real filesystem
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _make_run_git(responses: Dict[tuple, tuple]):
-    """Return a _run_git replacement driven by an (args_prefix → response) dict.
-
-    ``args_prefix`` is matched against the first N elements of the args list.
-    The first match wins.  Unknown args return (0, '', '').
-    """
-    def _run_git_stub(args: List[str], cwd: Path, **kwargs):
-        # 'show HEAD:path/to/file' → key is ('show', 'HEAD:<something>')
-        key = tuple(args)
-        for pattern, response in responses.items():
-            if key[:len(pattern)] == pattern:
-                return response
-        return (0, '', '')
-    return _run_git_stub
 
 
 # ─────────────────────────────────────────────────────────────────────────────
