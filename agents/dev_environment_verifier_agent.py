@@ -235,6 +235,17 @@ class DevEnvironmentVerifierAgent(PipelineStage):
                         image_name=expected_tag,
                     )
                     verifier_verdict = "APPROVED"
+                    # Notify active epic worktrees about the env fix so their
+                    # owners know whether a rebase/merge is needed or whether
+                    # a conflicting local constraint requires manual attention.
+                    # Errors here must NOT affect the already-persisted VERIFIED
+                    # result -- notify_active_worktrees_of_env_fix absorbs them.
+                    from services.worktree_env_notification import (
+                        notify_active_worktrees_of_env_fix,
+                    )
+                    await notify_active_worktrees_of_env_fix(
+                        project_name, previous_stage
+                    )
             elif status == "BLOCKED":
                 error_match = re.search(
                     r"#### Issues Found\s*(.+?)(?=###|\Z)", review_text, re.DOTALL | re.IGNORECASE
