@@ -217,9 +217,11 @@ def _build_comment(
     env_fix_description: str,
 ) -> str:
     """Build the GitHub comment body for one worktree."""
-    has_conflicts = any(
-        d.diverged or d.only_in_worktree or d.only_in_main for d in divergences
-    )
+    # A genuine conflict requires a local change the worktree made that
+    # diverges from or removes a file touched by the fix on main.
+    # only_in_main (main added a file the worktree doesn't have yet) is NOT a
+    # conflict -- a rebase/merge will simply add it cleanly.
+    has_conflicts = any(d.diverged or d.only_in_worktree for d in divergences)
     all_identical = all(d.identical for d in divergences)
 
     lines: List[str] = []
@@ -261,7 +263,7 @@ def _build_comment(
 
     if not has_conflicts:
         # All changed files in the worktree either match main or are missing
-        # (i.e. main added them).  Clean pull case.
+        # (i.e. main added them).  Clean merge case.
         lines.append(
             "### 🔄 Clean Merge Available\n\n"
             "This worktree's environment files do not show a conflicting local "
