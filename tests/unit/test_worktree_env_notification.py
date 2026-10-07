@@ -121,7 +121,7 @@ async def test_unowned_worktree_no_comment(mock_workspace_manager, mock_github, 
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fix output')
@@ -150,7 +150,7 @@ async def test_active_worktree_gets_comment(mock_workspace_manager, mock_github,
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'Problem Analysis: fixed strands floor')
@@ -196,7 +196,7 @@ async def test_clean_divergence_comment(mock_workspace_manager, mock_github, moc
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'bump strands floor')
@@ -243,7 +243,7 @@ async def test_conflicting_divergence_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('qsi-ai', 'fix strands floor to >=1.56.0')
@@ -278,7 +278,7 @@ async def test_duplicate_epic_ids_one_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fix')
@@ -304,7 +304,7 @@ async def test_github_comment_failure_does_not_raise(mock_workspace_manager, moc
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         # Must not raise.
@@ -325,7 +325,7 @@ async def test_no_env_fix_commit_found_no_comment(mock_workspace_manager, mock_g
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fix')
@@ -351,7 +351,7 @@ async def test_multiple_active_worktrees_each_get_one_comment(
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-        
+
 
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fixed base image')

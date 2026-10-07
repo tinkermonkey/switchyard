@@ -440,6 +440,14 @@ async def _notify_active_worktrees_of_env_fix(
         )
         return
 
+    if repo_owner is None or repo_name is None:
+        logger.warning(
+            "Project config for %s is missing 'org' or 'repo' under github; "
+            "skipping worktree notifications",
+            project_name,
+        )
+        return
+
     github = _make_github_integration(repo_owner, repo_name)
 
     # 5. Post exactly one comment per epic (deduplicate by epic_id).
