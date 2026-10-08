@@ -713,48 +713,13 @@ def test_apply_env_fix_cleanup_scoped_to_env_files(tmp_path):
 
 
 def test_apply_env_fix_rollback_skipped_when_head_moved(tmp_path):
-    """If HEAD moved after our commit (agent committed), the rollback is skipped."""
+    """If HEAD moved after our commit (agent committed on top), the rollback is skipped."""
     reset_calls = []
-
-    def stub(args, cwd=None, timeout=None):
-        if args[0] == 'fetch':
-            return (0, '', '')
-        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
-            return (0, 'feat/55\n', '')
-        if args[:2] == ['status', '--porcelain']:
-            return (0, '', '')
-        if args[:2] == ['rev-list', '--count'] and 'origin/feat/55..HEAD' in args:
-            return (0, '0\n', '')
-        if args[:2] == ['rev-list', '--count'] and 'HEAD..origin/feat/55' in args:
-            return (0, '0\n', '')
-        if args == ['rev-parse', 'HEAD']:
-            # First call: pre-apply SHA; second call after push failure: HEAD is now
-            # 'agent_commit' (agent committed on top of our commit).
-            return (0, 'pre_apply_sha\n', '') if not reset_calls else (0, 'agent_commit\n', '')
-        if args[:2] == ['checkout', commit_sha := 'fixsha']:
-            return (0, '', '')
-        if 'checkout' in args and 'pyproject.toml' in args:
-            return (0, '', '')
-        if args[:2] == ['ls-files', '--error-unmatch']:
-            return (0, '', '')
-        if args[:3] == ['diff', '--cached', '--name-only']:
-            return (0, 'pyproject.toml\n', '')
-        if args[0] == 'commit':
-            return (0, 'our_commit\n', '')
-        if args[0] == 'push':
-            return (1, '', 'rejected')
-        if args[:2] == ['reset', '--hard']:
-            reset_calls.append(args)
-            return (0, '', '')
-        return (0, '', '')
-
-    # Patch rev-parse to return our_commit (the commit we made) right after commit,
-    # then agent_commit (meaning agent committed on top) at rollback time.
     call_counts = {'rev_parse': 0}
     our_commit = 'our_commit_sha'
     agent_commit = 'agent_on_top_sha'
 
-    def stub2(args, cwd=None, timeout=None):
+    def stub(args, cwd=None, timeout=None):
         if args[0] == 'fetch':
             return (0, '', '')
         if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
@@ -768,12 +733,13 @@ def test_apply_env_fix_rollback_skipped_when_head_moved(tmp_path):
         if args == ['rev-parse', 'HEAD']:
             call_counts['rev_parse'] += 1
             if call_counts['rev_parse'] == 1:
+                # pre-apply HEAD
                 return (0, 'pre_sha\n', '')
             elif call_counts['rev_parse'] == 2:
-                # After our commit: HEAD is our commit
+                # right after our commit: HEAD is our commit
                 return (0, our_commit + '\n', '')
             else:
-                # After push fails: agent has committed on top
+                # at rollback time: agent has committed on top
                 return (0, agent_commit + '\n', '')
         if args[:3] == ['diff', '--cached', '--name-only']:
             return (0, 'pyproject.toml\n', '')
@@ -790,7 +756,7 @@ def test_apply_env_fix_rollback_skipped_when_head_moved(tmp_path):
             return (0, '', '')
         return (0, '', '')
 
-    with patch(f'{MODULE}._run_git', side_effect=stub2):
+    with patch(f'{MODULE}._run_git', side_effect=stub):
         from services.worktree_env_notification import _apply_env_fix_to_worktree
         result = _apply_env_fix_to_worktree(
             tmp_path,
