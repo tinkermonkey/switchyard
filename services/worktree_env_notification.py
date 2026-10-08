@@ -506,8 +506,13 @@ def _apply_env_fix_to_worktree(
        committed — do not clobber unpushed work).
     4. Reset clean behind-only worktrees to the remote ref before applying, so
        the push is a simple fast-forward.
-    5. On push failure roll back the local commit so the worktree is never
-       left in a half-applied state.
+    5. On push failure roll back the local commit **only if HEAD is still the
+       commit we made** — if the agent committed on top of us in the meantime
+       we leave HEAD untouched rather than deleting the agent's work.
+
+    All cleanup (unstage/restore/clean) is **scoped to ``changed_files``
+    only** so that an agent's in-progress edits to other files are never
+    touched, even in the failure path.
 
     Returns the new commit SHA on success, ``None`` on any failure.
     """
@@ -574,7 +579,45 @@ def _apply_env_fix_to_worktree(
             worktree_path, remote_ref,
         )
 
+    # -- record HEAD before we make any commits so we can roll back safely --
+    # We use this SHA to verify that we only undo *our* commit on push
+    # failure, not a commit made by an agent that raced us.
+    rc_pre, pre_apply_sha, _ = _run_git(['rev-parse', 'HEAD'], cwd=worktree_path)
+    if rc_pre != 0 or not pre_apply_sha.strip():
+        logger.warning(
+            "Could not read HEAD SHA for worktree %s before apply; skipping",
+            worktree_path,
+        )
+        return None
+    pre_apply_sha = pre_apply_sha.strip()
+
+    def _cleanup_env_files_only() -> None:
+        """Unstage and restore only the env files we touched.
+
+        Deliberately scoped to ``changed_files`` so that an agent's
+        in-progress edits to other files are never reverted.
+        """
+        # Unstage any staged changes for our files only.
+        _run_git(['reset', 'HEAD', '--'] + changed_files, cwd=worktree_path)
+        # Restore tracked env files to their HEAD state (pre-checkout).
+        _run_git(['checkout', '--'] + changed_files, cwd=worktree_path)
+        # Remove untracked env files that were added by the checkout (e.g. a
+        # brand-new requirements.txt that the fix commit introduced).
+        for rel_path in changed_files:
+            full_path = worktree_path / rel_path
+            if full_path.exists():
+                # Only remove if not tracked at HEAD (it's an untracked new file).
+                rc_ls, _, _ = _run_git(
+                    ['ls-files', '--error-unmatch', rel_path], cwd=worktree_path
+                )
+                if rc_ls != 0:
+                    try:
+                        full_path.unlink()
+                    except OSError:
+                        pass
+
     # -- stage the env files from the fix commit ----------------------------
+    staged_files: List[str] = []
     for rel_path in changed_files:
         rc_co, _, co_err = _run_git(
             ['checkout', commit_sha, '--', rel_path],
@@ -585,12 +628,9 @@ def _apply_env_fix_to_worktree(
                 "Could not check out %s from %s in worktree %s: %s",
                 rel_path, commit_sha[:12], worktree_path, co_err.strip(),
             )
-            # Unstage, restore tracked files, remove any untracked files added
-            # by earlier successful checkouts in this loop.
-            _run_git(['reset', 'HEAD'], cwd=worktree_path)
-            _run_git(['checkout', '--', '.'], cwd=worktree_path)
-            _run_git(['clean', '-fd', '--'], cwd=worktree_path)
+            _cleanup_env_files_only()
             return None
+        staged_files.append(rel_path)
 
     # -- verify something was actually staged --------------------------------
     rc_diff, diff_out, _ = _run_git(['diff', '--cached', '--name-only'], cwd=worktree_path)
@@ -600,7 +640,7 @@ def _apply_env_fix_to_worktree(
             "(files already up to date); nothing to commit",
             worktree_path,
         )
-        _run_git(['clean', '-fd', '--'], cwd=worktree_path)
+        _cleanup_env_files_only()
         return None
 
     # -- commit the staged changes ------------------------------------------
@@ -618,10 +658,12 @@ def _apply_env_fix_to_worktree(
         logger.warning(
             "git commit failed in worktree %s: %s", worktree_path, commit_err.strip()
         )
-        _run_git(['reset', 'HEAD'], cwd=worktree_path)
-        _run_git(['checkout', '--', '.'], cwd=worktree_path)
-        _run_git(['clean', '-fd', '--'], cwd=worktree_path)
+        _cleanup_env_files_only()
         return None
+
+    # Read the SHA of the commit we just made so we can compare it later.
+    rc_our, our_sha_out, _ = _run_git(['rev-parse', 'HEAD'], cwd=worktree_path)
+    our_commit_sha = our_sha_out.strip() if (rc_our == 0 and our_sha_out.strip()) else None
 
     # -- push to remote (network call — needs timeout) ----------------------
     rc_push, _, push_err = _run_git(
@@ -634,9 +676,29 @@ def _apply_env_fix_to_worktree(
             "git push failed for worktree %s branch %s: %s",
             worktree_path, branch, push_err.strip(),
         )
-        # Roll back the local commit so the worktree is not left in a
-        # half-applied state with an unpushed commit the owner doesn't know about.
-        _run_git(['reset', '--hard', 'HEAD~1'], cwd=worktree_path)
+        # Roll back only if HEAD is still our commit — if an agent committed
+        # on top of us in the window between our commit and the push failure,
+        # do not delete the agent's work.
+        if our_commit_sha:
+            rc_cur, cur_sha_out, _ = _run_git(['rev-parse', 'HEAD'], cwd=worktree_path)
+            current_sha = cur_sha_out.strip() if rc_cur == 0 else None
+            if current_sha and current_sha == our_commit_sha:
+                # HEAD is still our commit — safe to roll back to pre-apply state.
+                rc_rb, _, rb_err = _run_git(
+                    ['reset', '--hard', pre_apply_sha],
+                    cwd=worktree_path,
+                )
+                if rc_rb != 0:
+                    logger.warning(
+                        "Rollback to %s failed for worktree %s: %s",
+                        pre_apply_sha[:12], worktree_path, rb_err.strip(),
+                    )
+            else:
+                logger.info(
+                    "HEAD moved since our commit in worktree %s "
+                    "(agent may have committed); skipping rollback",
+                    worktree_path,
+                )
         return None
 
     # -- retrieve the new commit SHA ----------------------------------------
@@ -812,6 +874,13 @@ async def _notify_active_worktrees_of_env_fix(
             base_clone, worktree_path, changed_files, pre_fix_sha=pre_fix_sha,
         )
         has_conflicts, all_identical = _classify_divergence(divergences)
+        # Note: divergences reflects the worktree state at this moment.  The
+        # apply function re-reads the live tree (including fetching and
+        # potentially resetting to origin/<branch>), so if the worktree moves
+        # between here and the apply call the apply handles it gracefully:
+        # already-up-to-date files produce no staged changes and the function
+        # returns None → Phase 1 fallback.  The divergences object is used for
+        # the comment body regardless of which code path is taken.
 
         if all_identical or has_conflicts:
             # Already aligned or conflicting local constraint: Phase 1 comment-only.

@@ -615,38 +615,193 @@ async def test_lock_held_falls_back_to_phase1_comment(
     assert 'Clean Merge Available' in comment
 
 
+def _make_git_stub(*sequence):
+    """Return a _run_git side-effect that yields responses in order."""
+    responses = list(sequence)
+    idx = [0]
+
+    def stub(args, cwd=None, timeout=None):
+        if idx[0] < len(responses):
+            resp = responses[idx[0]]
+        else:
+            resp = (0, '', '')
+        idx[0] += 1
+        return resp
+
+    return stub
+
+
 def test_apply_env_fix_to_worktree_skips_when_ahead():
     """_apply_env_fix_to_worktree returns None without staging when the worktree is
     ahead of the remote (an agent may have committed there)."""
-    from pathlib import Path
-    from unittest.mock import call as mock_call
-
-    call_responses = {
-        # fetch origin
-        ('fetch', 'origin'): (0, '', ''),
-        # rev-parse --abbrev-ref HEAD
-        ('rev-parse', '--abbrev-ref', 'HEAD'): (0, 'feature/epic-99\n', ''),
-        # status --porcelain
-        ('status', '--porcelain'): (0, '', ''),
-        # rev-list --count origin/feature/epic-99..HEAD (ahead count = 1)
-        ('rev-list', '--count', 'origin/feature/epic-99..HEAD'): (0, '1\n', ''),
-    }
-
-    def _run_git_stub(args, cwd=None, timeout=None):
-        key = tuple(a for a in args if not a.startswith('-') or a.startswith('--'))
-        # Match by first few distinct tokens
-        for k, v in call_responses.items():
-            if all(tok in args for tok in k):
-                return v
-        # Default: success with empty output (should not be reached in this path)
-        return (0, '', '')
-
-    with patch(f'{MODULE}._run_git', side_effect=_run_git_stub):
+    # Sequence: fetch, branch-name, dirty-check, ahead-count(=1) → bail
+    stub = _make_git_stub(
+        (0, '', ''),           # fetch
+        (0, 'feat/99\n', ''), # branch name
+        (0, '', ''),           # status --porcelain (clean)
+        (0, '1\n', ''),        # rev-list ahead = 1
+    )
+    with patch(f'{MODULE}._run_git', side_effect=stub):
         from services.worktree_env_notification import _apply_env_fix_to_worktree
         result = _apply_env_fix_to_worktree(
             Path('/workspace/worktrees/p/99'),
             'abc1234',
             ['pyproject.toml'],
         )
-
     assert result is None, "should return None when worktree is ahead (agent may have committed)"
+
+
+def test_apply_env_fix_cleanup_scoped_to_env_files(tmp_path):
+    """When a per-file checkout fails, cleanup commands are scoped to the
+    env files only — they must not touch files outside changed_files."""
+    # We track exactly which git commands are called.
+    git_calls = []
+
+    def stub(args, cwd=None, timeout=None):
+        git_calls.append(list(args))
+        # fetch → ok
+        if args[0] == 'fetch':
+            return (0, '', '')
+        # branch name
+        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
+            return (0, 'feat/42\n', '')
+        # status → clean
+        if args[:2] == ['status', '--porcelain']:
+            return (0, '', '')
+        # ahead count → 0
+        if args[:2] == ['rev-list', '--count'] and 'origin/feat/42..HEAD' in args:
+            return (0, '0\n', '')
+        # behind count → 0
+        if args[:2] == ['rev-list', '--count'] and 'HEAD..origin/feat/42' in args:
+            return (0, '0\n', '')
+        # pre-apply HEAD SHA
+        if args == ['rev-parse', 'HEAD']:
+            return (0, 'pre111\n', '')
+        # ls-files for cleanup path — not expected to be called in this test
+        if args[:2] == ['ls-files', '--error-unmatch']:
+            return (1, '', 'not tracked')
+        # checkout of first file → fail
+        if 'checkout' in args and 'pyproject.toml' in args:
+            return (1, '', 'checkout failed')
+        # cleanup: reset staged env file
+        if args[:2] == ['reset', 'HEAD']:
+            return (0, '', '')
+        # cleanup: restore env file
+        if args[:2] == ['checkout', '--']:
+            return (0, '', '')
+        return (0, '', '')
+
+    with patch(f'{MODULE}._run_git', side_effect=stub):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            tmp_path,
+            'fixsha',
+            ['pyproject.toml'],
+        )
+
+    assert result is None
+
+    # Verify no cleanup command used '.' or '*' (i.e., whole-tree scope)
+    for call in git_calls:
+        if 'reset' in call or 'checkout' in call:
+            assert '.' not in call, (
+                f"cleanup command used whole-tree '.': {call}"
+            )
+            assert '--' not in call or call[-1] != '.', (
+                f"cleanup command used whole-tree '.': {call}"
+            )
+
+
+def test_apply_env_fix_rollback_skipped_when_head_moved(tmp_path):
+    """If HEAD moved after our commit (agent committed), the rollback is skipped."""
+    reset_calls = []
+
+    def stub(args, cwd=None, timeout=None):
+        if args[0] == 'fetch':
+            return (0, '', '')
+        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
+            return (0, 'feat/55\n', '')
+        if args[:2] == ['status', '--porcelain']:
+            return (0, '', '')
+        if args[:2] == ['rev-list', '--count'] and 'origin/feat/55..HEAD' in args:
+            return (0, '0\n', '')
+        if args[:2] == ['rev-list', '--count'] and 'HEAD..origin/feat/55' in args:
+            return (0, '0\n', '')
+        if args == ['rev-parse', 'HEAD']:
+            # First call: pre-apply SHA; second call after push failure: HEAD is now
+            # 'agent_commit' (agent committed on top of our commit).
+            return (0, 'pre_apply_sha\n', '') if not reset_calls else (0, 'agent_commit\n', '')
+        if args[:2] == ['checkout', commit_sha := 'fixsha']:
+            return (0, '', '')
+        if 'checkout' in args and 'pyproject.toml' in args:
+            return (0, '', '')
+        if args[:2] == ['ls-files', '--error-unmatch']:
+            return (0, '', '')
+        if args[:3] == ['diff', '--cached', '--name-only']:
+            return (0, 'pyproject.toml\n', '')
+        if args[0] == 'commit':
+            return (0, 'our_commit\n', '')
+        if args[0] == 'push':
+            return (1, '', 'rejected')
+        if args[:2] == ['reset', '--hard']:
+            reset_calls.append(args)
+            return (0, '', '')
+        return (0, '', '')
+
+    # Patch rev-parse to return our_commit (the commit we made) right after commit,
+    # then agent_commit (meaning agent committed on top) at rollback time.
+    call_counts = {'rev_parse': 0}
+    our_commit = 'our_commit_sha'
+    agent_commit = 'agent_on_top_sha'
+
+    def stub2(args, cwd=None, timeout=None):
+        if args[0] == 'fetch':
+            return (0, '', '')
+        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
+            return (0, 'feat/55\n', '')
+        if args[:2] == ['status', '--porcelain']:
+            return (0, '', '')
+        if 'origin/feat/55..HEAD' in ' '.join(args):
+            return (0, '0\n', '')
+        if 'HEAD..origin/feat/55' in ' '.join(args):
+            return (0, '0\n', '')
+        if args == ['rev-parse', 'HEAD']:
+            call_counts['rev_parse'] += 1
+            if call_counts['rev_parse'] == 1:
+                return (0, 'pre_sha\n', '')
+            elif call_counts['rev_parse'] == 2:
+                # After our commit: HEAD is our commit
+                return (0, our_commit + '\n', '')
+            else:
+                # After push fails: agent has committed on top
+                return (0, agent_commit + '\n', '')
+        if args[:3] == ['diff', '--cached', '--name-only']:
+            return (0, 'pyproject.toml\n', '')
+        if 'checkout' in args and 'pyproject.toml' in args:
+            return (0, '', '')
+        if args[:2] == ['ls-files', '--error-unmatch']:
+            return (0, '', '')
+        if args[0] == 'commit':
+            return (0, '', '')
+        if args[0] == 'push':
+            return (1, '', 'rejected')
+        if args[:2] == ['reset', '--hard']:
+            reset_calls.append(list(args))
+            return (0, '', '')
+        return (0, '', '')
+
+    with patch(f'{MODULE}._run_git', side_effect=stub2):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            tmp_path,
+            'fixsha',
+            ['pyproject.toml'],
+        )
+
+    assert result is None
+    # The rollback (reset --hard) must NOT have been called because HEAD moved
+    # to agent_commit, which differs from our_commit.
+    hard_resets = [c for c in reset_calls if '--hard' in c]
+    assert not hard_resets, (
+        f"rollback should be skipped when HEAD moved away from our commit; got: {hard_resets}"
+    )
