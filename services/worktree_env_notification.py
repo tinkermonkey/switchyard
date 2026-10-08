@@ -478,6 +478,7 @@ def _apply_env_fix_to_worktree(
                 worktree_path,
             )
             _run_git(['reset', 'HEAD'], cwd=worktree_path)
+            _run_git(['checkout', '--', '.'], cwd=worktree_path)
             return None
 
     # -- commit the staged changes -----------------------------------------
@@ -677,11 +678,9 @@ async def _notify_active_worktrees_of_env_fix(
         divergences = _check_file_divergence(base_clone, worktree_path, changed_files)
         has_conflicts, all_identical = _classify_divergence(divergences)
 
-        if all_identical:
-            # Files already identical — Phase 1 "No Action Required" comment.
-            comment = _build_comment(commit_sha, divergences, env_fix_description)
-        elif has_conflicts:
-            # Conflicting local constraint — Phase 1 comment-only, never auto-apply.
+        if all_identical or has_conflicts:
+            # Already aligned or conflicting local constraint: Phase 1 comment-only.
+            # Never auto-apply when has_conflicts is True.
             comment = _build_comment(commit_sha, divergences, env_fix_description)
         else:
             # Clean case: attempt auto-apply (Phase 2).
