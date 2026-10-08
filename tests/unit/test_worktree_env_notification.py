@@ -613,3 +613,40 @@ async def test_lock_held_falls_back_to_phase1_comment(
     _, comment = mock_github.post_issue_comment.call_args.args
     assert 'Auto-Applied' not in comment
     assert 'Clean Merge Available' in comment
+
+
+def test_apply_env_fix_to_worktree_skips_when_ahead():
+    """_apply_env_fix_to_worktree returns None without staging when the worktree is
+    ahead of the remote (an agent may have committed there)."""
+    from pathlib import Path
+    from unittest.mock import call as mock_call
+
+    call_responses = {
+        # fetch origin
+        ('fetch', 'origin'): (0, '', ''),
+        # rev-parse --abbrev-ref HEAD
+        ('rev-parse', '--abbrev-ref', 'HEAD'): (0, 'feature/epic-99\n', ''),
+        # status --porcelain
+        ('status', '--porcelain'): (0, '', ''),
+        # rev-list --count origin/feature/epic-99..HEAD (ahead count = 1)
+        ('rev-list', '--count', 'origin/feature/epic-99..HEAD'): (0, '1\n', ''),
+    }
+
+    def _run_git_stub(args, cwd=None, timeout=None):
+        key = tuple(a for a in args if not a.startswith('-') or a.startswith('--'))
+        # Match by first few distinct tokens
+        for k, v in call_responses.items():
+            if all(tok in args for tok in k):
+                return v
+        # Default: success with empty output (should not be reached in this path)
+        return (0, '', '')
+
+    with patch(f'{MODULE}._run_git', side_effect=_run_git_stub):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            Path('/workspace/worktrees/p/99'),
+            'abc1234',
+            ['pyproject.toml'],
+        )
+
+    assert result is None, "should return None when worktree is ahead (agent may have committed)"
