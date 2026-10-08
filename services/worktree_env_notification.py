@@ -4,24 +4,23 @@ After ``dev_environment_verifier`` records ``DevContainerStatus.VERIFIED``,
 this module enumerates every active epic worktree for the project and posts a
 single GitHub comment on the issue that owns each worktree.
 
-The comment tells the worktree's owner:
+Phase 1 (comment-only): describes what changed and whether the worktree needs
+a manual merge or has a conflicting local constraint.
 
-* What was fixed on the main branch and a reference to the fix commit.
-* Whether the worktree's copy of those environment files is identical to
-  main's fixed version (already aligned), behind but clean (just needs a
-  rebase/merge), or diverged with a local conflicting constraint (needs
-  manual reconciliation -- NOT a blind pull).
+Phase 2 (auto-apply for clean case): when the worktree has no conflicting
+local changes the fix is automatically cherry-picked / patch-applied onto the
+worktree's feature branch and pushed.  A distinct "already done" comment is
+posted so the owner is not confused by instructions that are no longer needed.
+For the conflicting case Phase 1's comment-only behaviour is preserved intact.
 
-Phase 1: **comment-only**.  No automated commits, cherry-picks, or merges
-are performed here, even when the worktree is clean.  Automated application
-for the clean case is tracked as Phase 2 (separate ticket).
-
-Acceptance criteria (from the issue):
+Acceptance criteria:
 
 - Exactly one comment is posted per currently-active worktree (not per-run,
   not duplicated on retries -- ``active_run_protected is True`` is the gate).
 - Worktrees with ``UNKNOWN`` or ``UNOWNED`` ownership receive no comment.
 - The comment correctly distinguishes clean from conflicting.
+- The auto-apply path never touches a worktree when ``has_conflicts`` is True.
+- A failed auto-apply falls back gracefully to Phase 1's comment.
 - No existing dev-environment setup/verification behaviour is changed.
 """
 from __future__ import annotations
@@ -211,18 +210,29 @@ def _cap(text: str, limit: int) -> str:
     return text
 
 
+def _classify_divergence(divergences: List[_FileDivergence]) -> Tuple[bool, bool]:
+    """Return ``(has_conflicts, all_identical)`` for a list of divergences.
+
+    ``has_conflicts`` is True when any file in the worktree diverges from or
+    exists only in the worktree (i.e. a local constraint that would conflict
+    with a blind apply).  ``only_in_main`` is *not* a conflict — a merge/apply
+    will simply add the file cleanly.
+
+    ``all_identical`` is True when every touched file is already identical
+    between main and the worktree.
+    """
+    has_conflicts = any(d.diverged or d.only_in_worktree for d in divergences)
+    all_identical = all(d.identical for d in divergences)
+    return has_conflicts, all_identical
+
+
 def _build_comment(
     commit_sha: str,
     divergences: List[_FileDivergence],
     env_fix_description: str,
 ) -> str:
     """Build the GitHub comment body for one worktree."""
-    # A genuine conflict requires a local change the worktree made that
-    # diverges from or removes a file touched by the fix on main.
-    # only_in_main (main added a file the worktree doesn't have yet) is NOT a
-    # conflict -- a rebase/merge will simply add it cleanly.
-    has_conflicts = any(d.diverged or d.only_in_worktree for d in divergences)
-    all_identical = all(d.identical for d in divergences)
+    has_conflicts, all_identical = _classify_divergence(divergences)
 
     lines: List[str] = []
     lines.append(
@@ -328,6 +338,188 @@ def _build_comment(
             )
 
     return '\n'.join(lines)
+
+
+def _build_auto_applied_comment(
+    commit_sha: str,
+    new_commit_sha: str,
+    changed_files: List[str],
+    env_fix_description: str,
+) -> str:
+    """Build the comment posted after a successful auto-apply.
+
+    This is intentionally different from the Phase 1 "Clean Merge Available"
+    comment: it tells the owner the fix has *already been applied* so no
+    manual action is needed.
+    """
+    lines: List[str] = []
+    lines.append("## ✅ Dev Environment Fix Auto-Applied to This Branch\n")
+    lines.append(
+        "The `dev_environment_verifier` approved an environment fix on the "
+        "main branch.  Because this worktree had **no conflicting local "
+        "constraints**, the fix was automatically cherry-picked and pushed "
+        "to this branch — **no action is required from you**.\n"
+    )
+
+    if env_fix_description:
+        description_snippet = env_fix_description.strip()
+        marker = 'Problem Analysis'
+        idx = description_snippet.find(marker)
+        if idx >= 0:
+            description_snippet = description_snippet[idx:]
+        description_snippet = _cap(description_snippet, 1_500)
+        lines.append("### What Was Fixed\n")
+        lines.append(f"```\n{description_snippet}\n```\n")
+
+    lines.append(f"**Original fix commit (on main):** `{commit_sha}`\n")
+    lines.append(f"**Auto-applied commit on this branch:** `{new_commit_sha}`\n")
+    lines.append(
+        "**Environment files updated:** "
+        + ', '.join(f'`{f}`' for f in changed_files)
+        + "\n"
+    )
+    lines.append(
+        "_If you believe this auto-apply was incorrect, revert the commit "
+        "above and reconcile manually._\n"
+    )
+    return '\n'.join(lines)
+
+
+def _apply_env_fix_to_worktree(
+    base_clone: Path,
+    worktree_path: Path,
+    commit_sha: str,
+    changed_files: List[str],
+    default_branch: str = 'main',
+) -> Optional[str]:
+    """Apply the env-fix commit to the worktree's branch and push it.
+
+    Strategy:
+    1. ``git fetch origin`` so the worktree branch is up-to-date metadata-wise.
+    2. Attempt ``git cherry-pick --no-commit <sha>`` (applies cleanly when the
+       commit only touches files also present in the worktree unchanged).
+    3. If cherry-pick produces conflicts, abort it and fall back to a targeted
+       patch-apply: ``git checkout <sha> -- <files>`` to copy exactly the
+       fixed versions of the env files into the index.
+    4. Commit with an auto-generated message referencing the upstream fix.
+    5. Push to the tracking remote branch.
+
+    Returns the new commit SHA on success, or ``None`` on any failure (the
+    caller then falls back to Phase 1's comment-only behaviour).
+
+    NOTE: This function intentionally does NOT set ``check=True`` on any git
+    command so that partial state never leaks; every failure path cleans up
+    before returning ``None``.
+    """
+    # -- fetch so we have fresh remote refs ---------------------------------
+    rc, _, err = _run_git(['fetch', 'origin'], cwd=worktree_path)
+    if rc != 0:
+        logger.warning("fetch origin failed in worktree %s: %s", worktree_path, err)
+        # Non-fatal: we can still attempt local operations.
+
+    # -- determine the current branch name ----------------------------------
+    rc, branch_out, _ = _run_git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=worktree_path)
+    if rc != 0 or not branch_out.strip() or branch_out.strip() == 'HEAD':
+        logger.warning(
+            "Cannot determine branch for worktree %s (detached HEAD?); skipping auto-apply",
+            worktree_path,
+        )
+        return None
+    branch = branch_out.strip()
+
+    # -- safety: reject dirty working tree ----------------------------------
+    rc_status, status_out, _ = _run_git(['status', '--porcelain'], cwd=worktree_path)
+    if rc_status != 0:
+        logger.warning("git status failed in worktree %s; skipping auto-apply", worktree_path)
+        return None
+    if status_out.strip():
+        logger.warning(
+            "Worktree %s has uncommitted changes; skipping auto-apply to avoid data loss",
+            worktree_path,
+        )
+        return None
+
+    # -- attempt cherry-pick (no-commit so we can inspect the result) ------
+    cherry_rc, _, cherry_err = _run_git(
+        ['cherry-pick', '--no-commit', commit_sha],
+        cwd=worktree_path,
+    )
+
+    if cherry_rc != 0:
+        # Cherry-pick produced conflicts; abort and fall back to file-level apply.
+        logger.debug(
+            "cherry-pick of %s into %s produced conflicts (%s); "
+            "falling back to targeted file apply",
+            commit_sha[:12], worktree_path, cherry_err.strip(),
+        )
+        _run_git(['cherry-pick', '--abort'], cwd=worktree_path)
+
+        # Targeted apply: check out each changed file from the fix commit.
+        for rel_path in changed_files:
+            rc_co, _, co_err = _run_git(
+                ['checkout', commit_sha, '--', rel_path],
+                cwd=worktree_path,
+            )
+            if rc_co != 0:
+                logger.warning(
+                    "Could not check out %s from %s in worktree %s: %s",
+                    rel_path, commit_sha[:12], worktree_path, co_err.strip(),
+                )
+                # Clean up any staged changes and give up.
+                _run_git(['reset', 'HEAD'], cwd=worktree_path)
+                _run_git(['checkout', '--', '.'], cwd=worktree_path)
+                return None
+
+        # Verify something was actually staged.
+        rc_diff, diff_out, _ = _run_git(['diff', '--cached', '--name-only'], cwd=worktree_path)
+        if rc_diff != 0 or not diff_out.strip():
+            logger.warning(
+                "Nothing staged after targeted file apply in worktree %s; skipping",
+                worktree_path,
+            )
+            _run_git(['reset', 'HEAD'], cwd=worktree_path)
+            return None
+
+    # -- commit the staged changes -----------------------------------------
+    commit_msg = (
+        f"chore: auto-apply env fix from {commit_sha[:12]} (worktree_env_notification)\n\n"
+        f"Automatically applied by worktree_env_notification Phase 2.\n"
+        f"Source fix commit: {commit_sha}\n"
+        f"Files: {', '.join(changed_files)}"
+    )
+    rc_commit, commit_out, commit_err = _run_git(
+        ['commit', '-m', commit_msg],
+        cwd=worktree_path,
+    )
+    if rc_commit != 0:
+        logger.warning(
+            "git commit failed in worktree %s: %s", worktree_path, commit_err.strip()
+        )
+        _run_git(['reset', 'HEAD'], cwd=worktree_path)
+        _run_git(['checkout', '--', '.'], cwd=worktree_path)
+        return None
+
+    # -- push to remote ---------------------------------------------------
+    rc_push, _, push_err = _run_git(
+        ['push', 'origin', f'{branch}:{branch}'],
+        cwd=worktree_path,
+    )
+    if rc_push != 0:
+        logger.warning(
+            "git push failed for worktree %s branch %s: %s",
+            worktree_path, branch, push_err.strip(),
+        )
+        # Roll back the local commit so the worktree is not left in a
+        # half-applied state with an unpushed commit the owner doesn't know about.
+        _run_git(['reset', '--hard', 'HEAD~1'], cwd=worktree_path)
+        return None
+
+    # -- retrieve the new commit SHA --------------------------------------
+    rc_sha, sha_out, _ = _run_git(['rev-parse', 'HEAD'], cwd=worktree_path)
+    if rc_sha != 0 or not sha_out.strip():
+        # Push succeeded but we can't read the SHA; return a placeholder.
+        return 'unknown'
+    return sha_out.strip()
 
 
 async def notify_active_worktrees_of_env_fix(
@@ -483,7 +675,39 @@ async def _notify_active_worktrees_of_env_fix(
             continue
 
         divergences = _check_file_divergence(base_clone, worktree_path, changed_files)
-        comment = _build_comment(commit_sha, divergences, env_fix_description)
+        has_conflicts, all_identical = _classify_divergence(divergences)
+
+        if all_identical:
+            # Files already identical — Phase 1 "No Action Required" comment.
+            comment = _build_comment(commit_sha, divergences, env_fix_description)
+        elif has_conflicts:
+            # Conflicting local constraint — Phase 1 comment-only, never auto-apply.
+            comment = _build_comment(commit_sha, divergences, env_fix_description)
+        else:
+            # Clean case: attempt auto-apply (Phase 2).
+            logger.info(
+                "Attempting auto-apply of env-fix %s to worktree %s (epic %s)",
+                commit_sha[:12], worktree_path, epic_id,
+            )
+            new_sha = _apply_env_fix_to_worktree(
+                base_clone, worktree_path, commit_sha, changed_files,
+            )
+            if new_sha:
+                logger.info(
+                    "Auto-applied env-fix to worktree %s; new commit %s",
+                    worktree_path, new_sha[:12] if len(new_sha) >= 12 else new_sha,
+                )
+                comment = _build_auto_applied_comment(
+                    commit_sha, new_sha, changed_files, env_fix_description,
+                )
+            else:
+                # Auto-apply failed — fall back to Phase 1's "Clean Merge Available" comment.
+                logger.warning(
+                    "Auto-apply failed for worktree %s (epic %s); "
+                    "falling back to Phase 1 comment",
+                    worktree_path, epic_id,
+                )
+                comment = _build_comment(commit_sha, divergences, env_fix_description)
 
         try:
             await github.post_issue_comment(issue_number, comment)

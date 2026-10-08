@@ -7,6 +7,11 @@ Covers:
 - Conflicting divergence (worktree has its own constraint) is flagged explicitly
 - Duplicate epic_ids receive only one comment
 - Exceptions from post_issue_comment are absorbed (verification unaffected)
+- Phase 2: clean case triggers auto-apply; "already applied" comment is posted
+- Phase 2: conflicting case skips auto-apply; Phase 1 comment is posted
+- Phase 2: auto-apply failure falls back to Phase 1 comment
+- ``_classify_divergence`` helper returns correct (has_conflicts, all_identical)
+- ``_build_auto_applied_comment`` contains expected content
 """
 from __future__ import annotations
 
@@ -338,3 +343,194 @@ async def test_multiple_active_worktrees_each_get_one_comment(
     assert mock_github.post_issue_comment.await_count == 2
     issue_numbers = {c.args[0] for c in mock_github.post_issue_comment.await_args_list}
     assert issue_numbers == {700, 701}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_classify_divergence_all_identical():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('a.txt', 'x', 'x'), _FileDivergence('b.txt', 'y', 'y')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert not has_conflicts
+    assert all_identical
+
+
+def test_classify_divergence_clean():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    # main added a new file (only_in_main) — not a conflict, not identical
+    divs = [_FileDivergence('new.txt', 'content', None)]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert not has_conflicts
+    assert not all_identical
+
+
+def test_classify_divergence_conflict_diverged():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('p.toml', 'main-ver', 'worktree-ver')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert has_conflicts
+    assert not all_identical
+
+
+def test_classify_divergence_conflict_only_in_worktree():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('extra.txt', None, 'local-content')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert has_conflicts
+    assert not all_identical
+
+
+def test_build_auto_applied_comment_content():
+    from services.worktree_env_notification import _build_auto_applied_comment
+    comment = _build_auto_applied_comment(
+        'abc1234567890', 'def9876543210', ['pyproject.toml'], 'Problem Analysis: bump floor'
+    )
+    assert 'Auto-Applied' in comment
+    assert 'abc123456' in comment
+    assert 'def987654' in comment
+    assert 'pyproject.toml' in comment
+    assert 'no action is required' in comment.lower()
+    # Must NOT contain the Phase 1 "run this yourself" language
+    assert 'git rebase' not in comment
+    assert 'git merge' not in comment
+
+
+@pytest.mark.asyncio
+async def test_clean_divergence_triggers_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Clean worktree (main added a new file the worktree doesn't have — only_in_main):
+    auto-apply is called, 'already applied' comment posted, Phase 1 language absent."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('800', '/workspace/.orchestrator/worktrees/p/800', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # Simulate: main has the file, worktree does not (only_in_main → clean case)
+        if str(repo_dir) == '/workspace/test-project':
+            return '[project]\ndeps=["pkg>=2.0"]\n'  # main has it
+        return None  # worktree does not have it yet
+
+    apply_called = []
+
+    def _apply_stub(base_clone, worktree_path, commit_sha, changed_files, default_branch='main'):
+        apply_called.append((commit_sha, changed_files))
+        return 'newsha1234567890'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    assert apply_called, "auto-apply should have been invoked"
+    mock_github.post_issue_comment.assert_awaited_once()
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Auto-Applied' in comment
+    assert 'Clean Merge Available' not in comment
+    assert 'Manual Reconciliation' not in comment
+
+
+@pytest.mark.asyncio
+async def test_conflicting_case_skips_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Conflicting worktree: auto-apply must NOT be called; Phase 1 comment posted."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('900', '/workspace/.orchestrator/worktrees/p/900', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # Both sides have content but differ → diverged → has_conflicts=True
+        if str(repo_dir) == '/workspace/test-project':
+            return 'deps=["pkg>=2.0"]'
+        # Worktree has an upper-bound cap — genuine conflict
+        return 'deps=["pkg>=1.0,<2.0"]'
+
+    apply_called = []
+
+    def _apply_stub(base_clone, worktree_path, commit_sha, changed_files, default_branch='main'):
+        apply_called.append(1)
+        return 'newsha'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    assert not apply_called, "auto-apply must NOT be called for conflicting worktrees"
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Manual Reconciliation Required' in comment
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_failure_falls_back_to_phase1_comment(
+    mock_workspace_manager, mock_github, mock_project_config
+):
+    """When auto-apply returns None for a clean case, Phase 1 'Clean Merge Available' comment is posted."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('1000', '/workspace/.orchestrator/worktrees/p/1000', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # only_in_main → clean case
+        if str(repo_dir) == '/workspace/test-project':
+            return 'deps=["pkg>=2.0"]'
+        return None
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', return_value=None),  # simulate failure
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    mock_github.post_issue_comment.assert_awaited_once()
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Clean Merge Available' in comment
+    assert 'Auto-Applied' not in comment
+
+
+@pytest.mark.asyncio
+async def test_identical_files_no_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Already-identical files produce Phase 1 'No Action Required' comment; auto-apply not called."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('1100', '/workspace/.orchestrator/worktrees/p/1100', True),
+    ]
+    apply_called = []
+
+    def _apply_stub(*args, **kwargs):
+        apply_called.append(1)
+        return 'sha'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', return_value='same content'),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'fix')
+
+    assert not apply_called, "auto-apply must NOT be called when files are already identical"
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'No Action Required' in comment
