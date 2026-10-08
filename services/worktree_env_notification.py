@@ -8,10 +8,20 @@ Phase 1 (comment-only): describes what changed and whether the worktree needs
 a manual merge or has a conflicting local constraint.
 
 Phase 2 (auto-apply for clean case): when the worktree has no conflicting
-local changes the fix is automatically cherry-picked / patch-applied onto the
-worktree's feature branch and pushed.  A distinct "already done" comment is
-posted so the owner is not confused by instructions that are no longer needed.
-For the conflicting case Phase 1's comment-only behaviour is preserved intact.
+local changes the fix is automatically applied (targeted per-file checkout)
+onto the worktree's feature branch and pushed.  A distinct "already done"
+comment is posted so the owner is not confused by instructions that are no
+longer needed.  For the conflicting case Phase 1's comment-only behaviour is
+preserved intact.
+
+Divergence classification uses a **three-way comparison** against the parent of
+the fix commit (``commit_sha~1``).  A worktree file is only counted as a local
+conflict when it differs from the pre-fix baseline — "just behind" worktrees
+(same content as pre-fix) are correctly treated as clean.
+
+Concurrency: each worktree gets a try-only ``asyncio.Lock``.  If the lock is
+already held (another auto-apply coroutine is in flight for that worktree) the
+caller falls back to Phase 1's comment-only behaviour immediately.
 
 Acceptance criteria:
 
@@ -25,6 +35,7 @@ Acceptance criteria:
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 import logging
 import subprocess
@@ -67,7 +78,13 @@ _FILE_CONTENT_CAP = 3_000
 _DIFF_CAP = 2_000
 
 
-def _run_git(args: List[str], cwd: Path, *, check: bool = False) -> Tuple[int, str, str]:
+def _run_git(
+    args: List[str],
+    cwd: Path,
+    *,
+    check: bool = False,
+    timeout: Optional[int] = None,
+) -> Tuple[int, str, str]:
     """Run a git command and return (returncode, stdout, stderr)."""
     try:
         result = subprocess.run(
@@ -75,6 +92,7 @@ def _run_git(args: List[str], cwd: Path, *, check: bool = False) -> Tuple[int, s
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
         if check and result.returncode != 0:
             raise subprocess.CalledProcessError(
@@ -82,6 +100,9 @@ def _run_git(args: List[str], cwd: Path, *, check: bool = False) -> Tuple[int, s
                 output=result.stdout, stderr=result.stderr,
             )
         return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        logger.warning("git %s timed out after %ss in %s", args[0], timeout, cwd)
+        return 1, '', f'git command timed out after {timeout}s'
     except FileNotFoundError:
         logger.warning("git binary not found; cannot perform worktree diff")
         return 1, '', 'git binary not found'
@@ -128,16 +149,21 @@ def _get_env_fix_commit(base_clone: Path) -> Optional[Tuple[str, List[str]]]:
     return None
 
 
+def _read_file_at_ref(repo_dir: Path, ref: str, relative_path: str) -> Optional[str]:
+    """Read the content of ``relative_path`` at git ref ``ref`` in ``repo_dir``.
+
+    Returns ``None`` when the file does not exist at that ref.
+    """
+    rc, content, _ = _run_git(['show', f'{ref}:{relative_path}'], cwd=repo_dir)
+    return content if rc == 0 else None
+
+
 def _read_file_at_head(repo_dir: Path, relative_path: str) -> Optional[str]:
     """Read the content of ``relative_path`` from HEAD of ``repo_dir`` via git.
 
     Returns ``None`` when the file does not exist at HEAD in that repo.
     """
-    rc, content, _ = _run_git(
-        ['show', f'HEAD:{relative_path}'],
-        cwd=repo_dir,
-    )
-    return content if rc == 0 else None
+    return _read_file_at_ref(repo_dir, 'HEAD', relative_path)
 
 
 def _unified_diff(a_label: str, a_text: str, b_label: str, b_text: str) -> str:
@@ -163,10 +189,15 @@ class _FileDivergence:
         path: str,
         main_content: Optional[str],
         worktree_content: Optional[str],
+        pre_fix_content: Optional[str] = None,
     ) -> None:
         self.path = path
         self.main_content = main_content
         self.worktree_content = worktree_content
+        # Content of the file at the parent of the fix commit (commit_sha~1).
+        # Used for three-way classification — None when unavailable (falls back
+        # to two-way comparison).
+        self.pre_fix_content = pre_fix_content
 
     @property
     def only_in_main(self) -> bool:
@@ -189,18 +220,66 @@ class _FileDivergence:
             and self.main_content != self.worktree_content
         )
 
+    @property
+    def locally_conflicts(self) -> bool:
+        """True when the worktree's state conflicts with a clean auto-apply.
+
+        Uses **three-way** comparison when ``pre_fix_content`` is available:
+
+        * Worktree deleted a file that existed before the fix → conflict.
+        * Worktree's content differs from the pre-fix baseline → conflict.
+        * Worktree's content equals the pre-fix baseline (just behind, not
+          locally modified) → *not* a conflict; the targeted checkout will
+          bring it up to date.
+
+        Falls back to the two-way ``diverged or only_in_worktree`` test when
+        ``pre_fix_content`` is unavailable (e.g. the fix is the initial commit
+        and has no parent).
+        """
+        if self.pre_fix_content is not None:
+            if self.worktree_content is None:
+                # Worktree deleted a file that existed pre-fix.
+                return True
+            return self.worktree_content != self.pre_fix_content
+        # No pre-fix baseline: conservative two-way fallback.
+        return self.diverged or self.only_in_worktree
+
+
+def _get_pre_fix_sha(base_clone: Path, commit_sha: str) -> Optional[str]:
+    """Return the SHA of ``commit_sha``'s parent (``commit_sha~1``).
+
+    Returns ``None`` when the parent cannot be resolved (initial commit, git
+    unavailable, etc.).  When ``None``, callers fall back to two-way
+    comparison.
+    """
+    rc, sha_out, _ = _run_git(['rev-parse', f'{commit_sha}~1'], cwd=base_clone)
+    if rc != 0 or not sha_out.strip():
+        return None
+    return sha_out.strip()
+
 
 def _check_file_divergence(
     base_clone: Path,
     worktree_path: Path,
     changed_files: List[str],
+    pre_fix_sha: Optional[str] = None,
 ) -> List[_FileDivergence]:
-    """For each env file touched by the fix, compare main vs worktree."""
+    """For each env file touched by the fix, compare main vs worktree.
+
+    When ``pre_fix_sha`` is provided each ``_FileDivergence`` also carries the
+    file's content at that ref (the parent of the fix commit), enabling the
+    three-way ``locally_conflicts`` classification.
+    """
     results: List[_FileDivergence] = []
     for rel_path in changed_files:
         main_content = _read_file_at_head(base_clone, rel_path)
         worktree_content = _read_file_at_head(worktree_path, rel_path)
-        results.append(_FileDivergence(rel_path, main_content, worktree_content))
+        pre_fix_content = (
+            _read_file_at_ref(base_clone, pre_fix_sha, rel_path)
+            if pre_fix_sha
+            else None
+        )
+        results.append(_FileDivergence(rel_path, main_content, worktree_content, pre_fix_content))
     return results
 
 
@@ -213,15 +292,18 @@ def _cap(text: str, limit: int) -> str:
 def _classify_divergence(divergences: List[_FileDivergence]) -> Tuple[bool, bool]:
     """Return ``(has_conflicts, all_identical)`` for a list of divergences.
 
-    ``has_conflicts`` is True when any file in the worktree diverges from or
-    exists only in the worktree (i.e. a local constraint that would conflict
-    with a blind apply).  ``only_in_main`` is *not* a conflict — a merge/apply
-    will simply add the file cleanly.
+    ``has_conflicts`` is True when any file reports ``locally_conflicts``
+    (three-way when a pre-fix baseline is available, two-way fallback
+    otherwise) or ``only_in_worktree``.
+
+    ``only_in_main`` is *not* a conflict — a targeted checkout will add it
+    cleanly unless the pre-fix baseline shows the worktree deleted it (handled
+    inside ``locally_conflicts``).
 
     ``all_identical`` is True when every touched file is already identical
     between main and the worktree.
     """
-    has_conflicts = any(d.diverged or d.only_in_worktree for d in divergences)
+    has_conflicts = any(d.locally_conflicts for d in divergences)
     all_identical = all(d.identical for d in divergences)
     return has_conflicts, all_identical
 
@@ -357,7 +439,7 @@ def _build_auto_applied_comment(
     lines.append(
         "The `dev_environment_verifier` approved an environment fix on the "
         "main branch.  Because this worktree had **no conflicting local "
-        "constraints**, the fix was automatically cherry-picked and pushed "
+        "constraints**, the fix was automatically applied and pushed "
         "to this branch — **no action is required from you**.\n"
     )
 
@@ -385,37 +467,55 @@ def _build_auto_applied_comment(
     return '\n'.join(lines)
 
 
+# Per-worktree asyncio locks: keyed by str(worktree_path).
+# The try-only pattern (``if lock.locked(): skip``) prevents two concurrent
+# auto-apply coroutines from racing on the same worktree.  The dict is
+# module-level so the same lock instance is shared across all coroutines in the
+# process lifetime.  asyncio.Lock() is safe to create before any event loop is
+# running (Python 3.10+).
+_worktree_apply_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_worktree_apply_lock(worktree_path: Path) -> asyncio.Lock:
+    """Return (creating if needed) the asyncio.Lock for ``worktree_path``."""
+    key = str(worktree_path)
+    if key not in _worktree_apply_locks:
+        _worktree_apply_locks[key] = asyncio.Lock()
+    return _worktree_apply_locks[key]
+
+
 def _apply_env_fix_to_worktree(
-    base_clone: Path,
     worktree_path: Path,
     commit_sha: str,
     changed_files: List[str],
-    default_branch: str = 'main',
 ) -> Optional[str]:
-    """Apply the env-fix commit to the worktree's branch and push it.
+    """Apply each env file from the fix commit to the worktree branch and push.
 
-    Strategy:
-    1. ``git fetch origin`` so the worktree branch is up-to-date metadata-wise.
-    2. Attempt ``git cherry-pick --no-commit <sha>`` (applies cleanly when the
-       commit only touches files also present in the worktree unchanged).
-    3. If cherry-pick produces conflicts, abort it and fall back to a targeted
-       patch-apply: ``git checkout <sha> -- <files>`` to copy exactly the
-       fixed versions of the env files into the index.
-    4. Commit with an auto-generated message referencing the upstream fix.
-    5. Push to the tracking remote branch.
+    Uses targeted per-file checkout (``git checkout <sha> -- <file>``) for
+    each env file rather than cherry-picking the whole commit.  This ensures
+    only the environment files are touched and avoids applying unrelated code
+    changes from the same commit.
 
-    Returns the new commit SHA on success, or ``None`` on any failure (the
-    caller then falls back to Phase 1's comment-only behaviour).
+    This function is **synchronous** and is intended to be run via
+    ``asyncio.to_thread()`` so the event loop is not blocked.
 
-    NOTE: This function intentionally does NOT set ``check=True`` on any git
-    command so that partial state never leaks; every failure path cleans up
-    before returning ``None``.
+    Push safeguards (mirrors ``git_workflow_manager.sync_epic_worktree_before_commit``):
+    1. Fetch origin with a timeout.
+    2. Reject dirty working trees.
+    3. Reject worktrees that are ahead of the remote branch (agent may have
+       committed — do not clobber unpushed work).
+    4. Reset clean behind-only worktrees to the remote ref before applying, so
+       the push is a simple fast-forward.
+    5. On push failure roll back the local commit so the worktree is never
+       left in a half-applied state.
+
+    Returns the new commit SHA on success, ``None`` on any failure.
     """
-    # -- fetch so we have fresh remote refs ---------------------------------
-    rc, _, err = _run_git(['fetch', 'origin'], cwd=worktree_path)
-    if rc != 0:
-        logger.warning("fetch origin failed in worktree %s: %s", worktree_path, err)
-        # Non-fatal: we can still attempt local operations.
+    # -- fetch so we have fresh remote refs (network call — needs timeout) ---
+    _run_git(['fetch', 'origin'], cwd=worktree_path, timeout=30)
+    # Fetch failure is non-fatal: proceed; if the branch state is stale the
+    # ahead/behind checks will use whatever refs we have and the push will
+    # reject the attempt safely.
 
     # -- determine the current branch name ----------------------------------
     rc, branch_out, _ = _run_git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=worktree_path)
@@ -426,6 +526,7 @@ def _apply_env_fix_to_worktree(
         )
         return None
     branch = branch_out.strip()
+    remote_ref = f'origin/{branch}'
 
     # -- safety: reject dirty working tree ----------------------------------
     rc_status, status_out, _ = _run_git(['status', '--porcelain'], cwd=worktree_path)
@@ -439,56 +540,77 @@ def _apply_env_fix_to_worktree(
         )
         return None
 
-    # -- attempt cherry-pick (no-commit so we can inspect the result) ------
-    cherry_rc, _, cherry_err = _run_git(
-        ['cherry-pick', '--no-commit', commit_sha],
+    # -- check ahead/behind relative to remote ------------------------------
+    rc_ahead, ahead_out, _ = _run_git(
+        ['rev-list', '--count', f'{remote_ref}..HEAD'],
         cwd=worktree_path,
     )
-
-    if cherry_rc != 0:
-        # Cherry-pick produced conflicts; abort and fall back to file-level apply.
-        logger.debug(
-            "cherry-pick of %s into %s produced conflicts (%s); "
-            "falling back to targeted file apply",
-            commit_sha[:12], worktree_path, cherry_err.strip(),
+    if rc_ahead == 0 and ahead_out.strip().isdigit() and int(ahead_out.strip()) > 0:
+        logger.warning(
+            "Worktree %s is %s commit(s) ahead of %s; "
+            "an agent may be working there — skipping auto-apply",
+            worktree_path, ahead_out.strip(), remote_ref,
         )
-        _run_git(['cherry-pick', '--abort'], cwd=worktree_path)
+        return None
 
-        # Targeted apply: check out each changed file from the fix commit.
-        for rel_path in changed_files:
-            rc_co, _, co_err = _run_git(
-                ['checkout', commit_sha, '--', rel_path],
-                cwd=worktree_path,
-            )
-            if rc_co != 0:
-                logger.warning(
-                    "Could not check out %s from %s in worktree %s: %s",
-                    rel_path, commit_sha[:12], worktree_path, co_err.strip(),
-                )
-                # Clean up any staged changes and give up.
-                _run_git(['reset', 'HEAD'], cwd=worktree_path)
-                _run_git(['checkout', '--', '.'], cwd=worktree_path)
-                return None
-
-        # Verify something was actually staged.
-        rc_diff, diff_out, _ = _run_git(['diff', '--cached', '--name-only'], cwd=worktree_path)
-        if rc_diff != 0 or not diff_out.strip():
+    # -- if behind (and not ahead, not dirty) reset to remote ---------------
+    rc_behind, behind_out, _ = _run_git(
+        ['rev-list', '--count', f'HEAD..{remote_ref}'],
+        cwd=worktree_path,
+    )
+    if rc_behind == 0 and behind_out.strip().isdigit() and int(behind_out.strip()) > 0:
+        rc_reset, _, reset_err = _run_git(
+            ['reset', '--hard', remote_ref],
+            cwd=worktree_path,
+        )
+        if rc_reset != 0:
             logger.warning(
-                "Nothing staged after targeted file apply in worktree %s; skipping",
-                worktree_path,
+                "Failed to reset worktree %s to %s before env-fix apply: %s",
+                worktree_path, remote_ref, reset_err.strip(),
             )
+            return None
+        logger.info(
+            "Reset clean worktree %s to %s before applying env fix",
+            worktree_path, remote_ref,
+        )
+
+    # -- stage the env files from the fix commit ----------------------------
+    for rel_path in changed_files:
+        rc_co, _, co_err = _run_git(
+            ['checkout', commit_sha, '--', rel_path],
+            cwd=worktree_path,
+        )
+        if rc_co != 0:
+            logger.warning(
+                "Could not check out %s from %s in worktree %s: %s",
+                rel_path, commit_sha[:12], worktree_path, co_err.strip(),
+            )
+            # Unstage, restore tracked files, remove any untracked files added
+            # by earlier successful checkouts in this loop.
             _run_git(['reset', 'HEAD'], cwd=worktree_path)
             _run_git(['checkout', '--', '.'], cwd=worktree_path)
+            _run_git(['clean', '-fd', '--'], cwd=worktree_path)
             return None
 
-    # -- commit the staged changes -----------------------------------------
+    # -- verify something was actually staged --------------------------------
+    rc_diff, diff_out, _ = _run_git(['diff', '--cached', '--name-only'], cwd=worktree_path)
+    if rc_diff != 0 or not diff_out.strip():
+        logger.info(
+            "No staged changes after applying env files to %s "
+            "(files already up to date); nothing to commit",
+            worktree_path,
+        )
+        _run_git(['clean', '-fd', '--'], cwd=worktree_path)
+        return None
+
+    # -- commit the staged changes ------------------------------------------
     commit_msg = (
         f"chore: auto-apply env fix from {commit_sha[:12]} (worktree_env_notification)\n\n"
         f"Automatically applied by worktree_env_notification Phase 2.\n"
         f"Source fix commit: {commit_sha}\n"
         f"Files: {', '.join(changed_files)}"
     )
-    rc_commit, commit_out, commit_err = _run_git(
+    rc_commit, _, commit_err = _run_git(
         ['commit', '-m', commit_msg],
         cwd=worktree_path,
     )
@@ -498,12 +620,14 @@ def _apply_env_fix_to_worktree(
         )
         _run_git(['reset', 'HEAD'], cwd=worktree_path)
         _run_git(['checkout', '--', '.'], cwd=worktree_path)
+        _run_git(['clean', '-fd', '--'], cwd=worktree_path)
         return None
 
-    # -- push to remote ---------------------------------------------------
+    # -- push to remote (network call — needs timeout) ----------------------
     rc_push, _, push_err = _run_git(
         ['push', 'origin', f'{branch}:{branch}'],
         cwd=worktree_path,
+        timeout=30,
     )
     if rc_push != 0:
         logger.warning(
@@ -515,11 +639,15 @@ def _apply_env_fix_to_worktree(
         _run_git(['reset', '--hard', 'HEAD~1'], cwd=worktree_path)
         return None
 
-    # -- retrieve the new commit SHA --------------------------------------
+    # -- retrieve the new commit SHA ----------------------------------------
     rc_sha, sha_out, _ = _run_git(['rev-parse', 'HEAD'], cwd=worktree_path)
     if rc_sha != 0 or not sha_out.strip():
-        # Push succeeded but we can't read the SHA; return a placeholder.
-        return 'unknown'
+        logger.warning(
+            "Push succeeded but could not read HEAD SHA for worktree %s; "
+            "falling back to comment-only",
+            worktree_path,
+        )
+        return None
     return sha_out.strip()
 
 
@@ -603,6 +731,11 @@ async def _notify_active_worktrees_of_env_fix(
         commit_sha[:12], len(changed_files), project_name, changed_files,
     )
 
+    # Compute the parent of the fix commit for three-way divergence comparison.
+    # If None (initial commit / git error), _check_file_divergence falls back
+    # to the two-way comparison from Phase 1.
+    pre_fix_sha = _get_pre_fix_sha(base_clone, commit_sha)
+
     # 3. Enumerate active worktrees -- filter to active_run_protected is True.
     worktrees = _workspace_manager.survey_epic_worktrees(project_name)
     active = [w for w in worktrees if w.get('active_run_protected') is True]
@@ -675,7 +808,9 @@ async def _notify_active_worktrees_of_env_fix(
             )
             continue
 
-        divergences = _check_file_divergence(base_clone, worktree_path, changed_files)
+        divergences = _check_file_divergence(
+            base_clone, worktree_path, changed_files, pre_fix_sha=pre_fix_sha,
+        )
         has_conflicts, all_identical = _classify_divergence(divergences)
 
         if all_identical or has_conflicts:
@@ -684,29 +819,45 @@ async def _notify_active_worktrees_of_env_fix(
             comment = _build_comment(commit_sha, divergences, env_fix_description)
         else:
             # Clean case: attempt auto-apply (Phase 2).
-            logger.info(
-                "Attempting auto-apply of env-fix %s to worktree %s (epic %s)",
-                commit_sha[:12], worktree_path, epic_id,
-            )
-            new_sha = _apply_env_fix_to_worktree(
-                base_clone, worktree_path, commit_sha, changed_files,
-            )
-            if new_sha:
+            # Try-only lock: if another coroutine is already applying the fix
+            # to this worktree, fall back to Phase 1's comment immediately
+            # rather than waiting or racing.
+            apply_lock = _get_worktree_apply_lock(worktree_path)
+            if apply_lock.locked():
                 logger.info(
-                    "Auto-applied env-fix to worktree %s; new commit %s",
-                    worktree_path, new_sha[:12] if len(new_sha) >= 12 else new_sha,
-                )
-                comment = _build_auto_applied_comment(
-                    commit_sha, new_sha, changed_files, env_fix_description,
-                )
-            else:
-                # Auto-apply failed — fall back to Phase 1's "Clean Merge Available" comment.
-                logger.warning(
-                    "Auto-apply failed for worktree %s (epic %s); "
+                    "Auto-apply already in progress for worktree %s (epic %s); "
                     "falling back to Phase 1 comment",
                     worktree_path, epic_id,
                 )
                 comment = _build_comment(commit_sha, divergences, env_fix_description)
+            else:
+                # No await between the locked() check and the acquire below, so
+                # no other coroutine can interleave and steal the lock.
+                async with apply_lock:
+                    logger.info(
+                        "Attempting auto-apply of env-fix %s to worktree %s (epic %s)",
+                        commit_sha[:12], worktree_path, epic_id,
+                    )
+                    new_sha = await asyncio.to_thread(
+                        _apply_env_fix_to_worktree,
+                        worktree_path, commit_sha, changed_files,
+                    )
+                if new_sha:
+                    logger.info(
+                        "Auto-applied env-fix to worktree %s; new commit %s",
+                        worktree_path, new_sha[:12],
+                    )
+                    comment = _build_auto_applied_comment(
+                        commit_sha, new_sha, changed_files, env_fix_description,
+                    )
+                else:
+                    # Auto-apply failed — fall back to Phase 1's comment.
+                    logger.warning(
+                        "Auto-apply failed for worktree %s (epic %s); "
+                        "falling back to Phase 1 comment",
+                        worktree_path, epic_id,
+                    )
+                    comment = _build_comment(commit_sha, divergences, env_fix_description)
 
         try:
             await github.post_issue_comment(issue_number, comment)
