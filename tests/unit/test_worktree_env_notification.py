@@ -7,6 +7,11 @@ Covers:
 - Conflicting divergence (worktree has its own constraint) is flagged explicitly
 - Duplicate epic_ids receive only one comment
 - Exceptions from post_issue_comment are absorbed (verification unaffected)
+- Phase 2: clean case triggers auto-apply; "already applied" comment is posted
+- Phase 2: conflicting case skips auto-apply; Phase 1 comment is posted
+- Phase 2: auto-apply failure falls back to Phase 1 comment
+- ``_classify_divergence`` helper returns correct (has_conflicts, all_identical)
+- ``_build_auto_applied_comment`` contains expected content
 """
 from __future__ import annotations
 
@@ -125,12 +130,11 @@ async def test_active_worktree_gets_comment(mock_workspace_manager, mock_github,
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('deadbeef', ['pyproject.toml'])),
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'Problem Analysis: fixed strands floor')
 
@@ -171,12 +175,11 @@ async def test_clean_divergence_comment(mock_workspace_manager, mock_github, moc
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('abc', ['pyproject.toml'])),
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'bump strands floor')
 
@@ -218,12 +221,11 @@ async def test_conflicting_divergence_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('fix123', ['pyproject.toml'])),
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('qsi-ai', 'fix strands floor to >=1.56.0')
 
@@ -253,12 +255,11 @@ async def test_duplicate_epic_ids_one_comment(mock_workspace_manager, mock_githu
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('abc', ['pyproject.toml'])),
         patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fix')
 
@@ -279,12 +280,11 @@ async def test_github_comment_failure_does_not_raise(mock_workspace_manager, moc
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('abc', ['pyproject.toml'])),
         patch(f'{MODULE}._read_file_at_head', return_value='content'),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=failing_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         # Must not raise.
         await notify_active_worktrees_of_env_fix('test-project', 'fix')
@@ -326,15 +326,448 @@ async def test_multiple_active_worktrees_each_get_one_comment(
         patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
         patch(f'{MODULE}._get_env_fix_commit', return_value=('sha999', ['Dockerfile.agent'])),
         patch(f'{MODULE}._read_file_at_head', return_value='FROM python:3.11\n'),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
         patch(f'{MODULE}._make_github_integration', return_value=mock_github),
         patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
         patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
     ):
-
-
         from services.worktree_env_notification import notify_active_worktrees_of_env_fix
         await notify_active_worktrees_of_env_fix('test-project', 'fixed base image')
 
     assert mock_github.post_issue_comment.await_count == 2
     issue_numbers = {c.args[0] for c in mock_github.post_issue_comment.await_args_list}
     assert issue_numbers == {700, 701}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_classify_divergence_all_identical():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('a.txt', 'x', 'x'), _FileDivergence('b.txt', 'y', 'y')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert not has_conflicts
+    assert all_identical
+
+
+def test_classify_divergence_clean():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    # main added a new file (only_in_main) — not a conflict, not identical
+    divs = [_FileDivergence('new.txt', 'content', None)]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert not has_conflicts
+    assert not all_identical
+
+
+def test_classify_divergence_conflict_diverged():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('p.toml', 'main-ver', 'worktree-ver')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert has_conflicts
+    assert not all_identical
+
+
+def test_classify_divergence_conflict_only_in_worktree():
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+    divs = [_FileDivergence('extra.txt', None, 'local-content')]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert has_conflicts
+    assert not all_identical
+
+
+def test_build_auto_applied_comment_content():
+    from services.worktree_env_notification import _build_auto_applied_comment
+    comment = _build_auto_applied_comment(
+        'abc1234567890', 'def9876543210', ['pyproject.toml'], 'Problem Analysis: bump floor'
+    )
+    assert 'Auto-Applied' in comment
+    assert 'abc123456' in comment
+    assert 'def987654' in comment
+    assert 'pyproject.toml' in comment
+    assert 'no action is required' in comment.lower()
+    # Must NOT contain the Phase 1 "run this yourself" language
+    assert 'git rebase' not in comment
+    assert 'git merge' not in comment
+
+
+@pytest.mark.asyncio
+async def test_clean_divergence_triggers_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Clean worktree (main added a new file the worktree doesn't have — only_in_main):
+    auto-apply is called, 'already applied' comment posted, Phase 1 language absent."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('800', '/workspace/.orchestrator/worktrees/p/800', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # Simulate: main has the file, worktree does not (only_in_main → clean case)
+        if str(repo_dir) == '/workspace/test-project':
+            return '[project]\ndeps=["pkg>=2.0"]\n'  # main has it
+        return None  # worktree does not have it yet
+
+    apply_called = []
+
+    def _apply_stub(worktree_path, commit_sha, changed_files):
+        apply_called.append((commit_sha, changed_files))
+        return 'newsha1234567890'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    assert apply_called, "auto-apply should have been invoked"
+    mock_github.post_issue_comment.assert_awaited_once()
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Auto-Applied' in comment
+    assert 'Clean Merge Available' not in comment
+    assert 'Manual Reconciliation' not in comment
+
+
+@pytest.mark.asyncio
+async def test_conflicting_case_skips_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Conflicting worktree: auto-apply must NOT be called; Phase 1 comment posted."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('900', '/workspace/.orchestrator/worktrees/p/900', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # Both sides have content but differ → diverged → has_conflicts=True
+        if str(repo_dir) == '/workspace/test-project':
+            return 'deps=["pkg>=2.0"]'
+        # Worktree has an upper-bound cap — genuine conflict
+        return 'deps=["pkg>=1.0,<2.0"]'
+
+    apply_called = []
+
+    def _apply_stub(worktree_path, commit_sha, changed_files):
+        apply_called.append(1)
+        return 'newsha'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    assert not apply_called, "auto-apply must NOT be called for conflicting worktrees"
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Manual Reconciliation Required' in comment
+
+
+@pytest.mark.asyncio
+async def test_auto_apply_failure_falls_back_to_phase1_comment(
+    mock_workspace_manager, mock_github, mock_project_config
+):
+    """When auto-apply returns None for a clean case, Phase 1 'Clean Merge Available' comment is posted."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('1000', '/workspace/.orchestrator/worktrees/p/1000', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # only_in_main → clean case
+        if str(repo_dir) == '/workspace/test-project':
+            return 'deps=["pkg>=2.0"]'
+        return None
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', return_value=None),  # simulate failure
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    mock_github.post_issue_comment.assert_awaited_once()
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Clean Merge Available' in comment
+    assert 'Auto-Applied' not in comment
+
+
+@pytest.mark.asyncio
+async def test_identical_files_no_auto_apply(mock_workspace_manager, mock_github, mock_project_config):
+    """Already-identical files produce Phase 1 'No Action Required' comment; auto-apply not called."""
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('1100', '/workspace/.orchestrator/worktrees/p/1100', True),
+    ]
+    apply_called = []
+
+    def _apply_stub(*args, **kwargs):
+        apply_called.append(1)
+        return 'sha'
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', return_value='same content'),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'fix')
+
+    assert not apply_called, "auto-apply must NOT be called when files are already identical"
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'No Action Required' in comment
+
+
+def test_classify_divergence_three_way_clean_behind():
+    """Worktree has the pre-fix content (just hasn't received the fix yet): NOT a conflict."""
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+
+    pre_fix = '[project]\ndeps=["pkg>=1.5"]\n'
+    main_fixed = '[project]\ndeps=["pkg>=2.0"]\n'
+    # Worktree matches the pre-fix baseline: clean behind, no local modification.
+    divs = [_FileDivergence('pyproject.toml', main_fixed, pre_fix, pre_fix)]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert not has_conflicts, "worktree just behind pre-fix should not be a conflict"
+    assert not all_identical
+
+
+def test_classify_divergence_three_way_locally_modified():
+    """Worktree content differs from pre-fix baseline: locally modified → conflict."""
+    from services.worktree_env_notification import _FileDivergence, _classify_divergence
+
+    pre_fix = '[project]\ndeps=["pkg>=1.5"]\n'
+    main_fixed = '[project]\ndeps=["pkg>=2.0"]\n'
+    worktree_modified = '[project]\ndeps=["pkg>=1.5,<2.0"]\n'  # different from pre_fix
+    divs = [_FileDivergence('pyproject.toml', main_fixed, worktree_modified, pre_fix)]
+    has_conflicts, all_identical = _classify_divergence(divs)
+    assert has_conflicts, "locally modified worktree should be a conflict"
+    assert not all_identical
+
+
+@pytest.mark.asyncio
+async def test_lock_held_falls_back_to_phase1_comment(
+    mock_workspace_manager, mock_github, mock_project_config
+):
+    """When the per-worktree apply lock is already held, fall back to Phase 1 comment
+    and do NOT call _apply_env_fix_to_worktree."""
+    import asyncio
+
+    mock_workspace_manager.survey_epic_worktrees.return_value = [
+        _worktree('1200', '/workspace/.orchestrator/worktrees/p/1200', True),
+    ]
+
+    def _read_file_stub(repo_dir: Path, rel_path: str):
+        # only_in_main → clean case, so we'd normally auto-apply
+        if str(repo_dir) == '/workspace/test-project':
+            return 'deps=["pkg>=2.0"]'
+        return None
+
+    apply_called = []
+
+    def _apply_stub(worktree_path, commit_sha, changed_files):
+        apply_called.append(1)
+        return 'newsha'
+
+    # Pre-acquire the lock for this worktree path so the notification loop
+    # sees it as held and falls back to Phase 1.
+    held_lock = asyncio.Lock()
+    await held_lock.acquire()
+
+    def _lock_stub(worktree_path):
+        return held_lock
+
+    with (
+        patch(f'{MODULE}._get_workspace_manager', return_value=mock_workspace_manager),
+        patch(f'{MODULE}._get_env_fix_commit', return_value=('fixsha', ['pyproject.toml'])),
+        patch(f'{MODULE}._read_file_at_head', side_effect=_read_file_stub),
+        patch(f'{MODULE}._get_pre_fix_sha', return_value=None),
+        patch(f'{MODULE}._get_worktree_apply_lock', side_effect=_lock_stub),
+        patch(f'{MODULE}._apply_env_fix_to_worktree', side_effect=_apply_stub),
+        patch(f'{MODULE}._make_github_integration', return_value=mock_github),
+        patch(f'{MODULE}._get_config_manager', return_value=MagicMock(get_project_config=MagicMock(return_value=mock_project_config))),
+        patch(f'{MODULE}._run_git', return_value=(0, '.git', '')),
+    ):
+        from services.worktree_env_notification import notify_active_worktrees_of_env_fix
+        await notify_active_worktrees_of_env_fix('test-project', 'bump pkg')
+
+    held_lock.release()
+
+    assert not apply_called, "_apply_env_fix_to_worktree must NOT be called when lock is held"
+    mock_github.post_issue_comment.assert_awaited_once()
+    _, comment = mock_github.post_issue_comment.call_args.args
+    assert 'Auto-Applied' not in comment
+    assert 'Clean Merge Available' in comment
+
+
+def _make_git_stub(*sequence):
+    """Return a _run_git side-effect that yields responses in order."""
+    responses = list(sequence)
+    idx = [0]
+
+    def stub(args, cwd=None, timeout=None):
+        if idx[0] < len(responses):
+            resp = responses[idx[0]]
+        else:
+            resp = (0, '', '')
+        idx[0] += 1
+        return resp
+
+    return stub
+
+
+def test_apply_env_fix_to_worktree_skips_when_ahead():
+    """_apply_env_fix_to_worktree returns None without staging when the worktree is
+    ahead of the remote (an agent may have committed there)."""
+    # Sequence: fetch, branch-name, dirty-check, ahead-count(=1) → bail
+    stub = _make_git_stub(
+        (0, '', ''),           # fetch
+        (0, 'feat/99\n', ''), # branch name
+        (0, '', ''),           # status --porcelain (clean)
+        (0, '1\n', ''),        # rev-list ahead = 1
+    )
+    with patch(f'{MODULE}._run_git', side_effect=stub):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            Path('/workspace/worktrees/p/99'),
+            'abc1234',
+            ['pyproject.toml'],
+        )
+    assert result is None, "should return None when worktree is ahead (agent may have committed)"
+
+
+def test_apply_env_fix_cleanup_scoped_to_env_files(tmp_path):
+    """When a per-file checkout fails, cleanup commands are scoped to the
+    env files only — they must not touch files outside changed_files."""
+    # We track exactly which git commands are called.
+    git_calls = []
+
+    def stub(args, cwd=None, timeout=None):
+        git_calls.append(list(args))
+        # fetch → ok
+        if args[0] == 'fetch':
+            return (0, '', '')
+        # branch name
+        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
+            return (0, 'feat/42\n', '')
+        # status → clean
+        if args[:2] == ['status', '--porcelain']:
+            return (0, '', '')
+        # ahead count → 0
+        if args[:2] == ['rev-list', '--count'] and 'origin/feat/42..HEAD' in args:
+            return (0, '0\n', '')
+        # behind count → 0
+        if args[:2] == ['rev-list', '--count'] and 'HEAD..origin/feat/42' in args:
+            return (0, '0\n', '')
+        # pre-apply HEAD SHA
+        if args == ['rev-parse', 'HEAD']:
+            return (0, 'pre111\n', '')
+        # ls-files for cleanup path — not expected to be called in this test
+        if args[:2] == ['ls-files', '--error-unmatch']:
+            return (1, '', 'not tracked')
+        # checkout of first file → fail
+        if 'checkout' in args and 'pyproject.toml' in args:
+            return (1, '', 'checkout failed')
+        # cleanup: reset staged env file
+        if args[:2] == ['reset', 'HEAD']:
+            return (0, '', '')
+        # cleanup: restore env file
+        if args[:2] == ['checkout', '--']:
+            return (0, '', '')
+        return (0, '', '')
+
+    with patch(f'{MODULE}._run_git', side_effect=stub):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            tmp_path,
+            'fixsha',
+            ['pyproject.toml'],
+        )
+
+    assert result is None
+
+    # Verify no cleanup command used '.' or '*' (i.e., whole-tree scope)
+    for call in git_calls:
+        if 'reset' in call or 'checkout' in call:
+            assert '.' not in call, (
+                f"cleanup command used whole-tree '.': {call}"
+            )
+            assert '--' not in call or call[-1] != '.', (
+                f"cleanup command used whole-tree '.': {call}"
+            )
+
+
+def test_apply_env_fix_rollback_skipped_when_head_moved(tmp_path):
+    """If HEAD moved after our commit (agent committed on top), the rollback is skipped."""
+    reset_calls = []
+    call_counts = {'rev_parse': 0}
+    our_commit = 'our_commit_sha'
+    agent_commit = 'agent_on_top_sha'
+
+    def stub(args, cwd=None, timeout=None):
+        if args[0] == 'fetch':
+            return (0, '', '')
+        if args[:3] == ['rev-parse', '--abbrev-ref', 'HEAD']:
+            return (0, 'feat/55\n', '')
+        if args[:2] == ['status', '--porcelain']:
+            return (0, '', '')
+        if 'origin/feat/55..HEAD' in ' '.join(args):
+            return (0, '0\n', '')
+        if 'HEAD..origin/feat/55' in ' '.join(args):
+            return (0, '0\n', '')
+        if args == ['rev-parse', 'HEAD']:
+            call_counts['rev_parse'] += 1
+            if call_counts['rev_parse'] == 1:
+                # pre-apply HEAD
+                return (0, 'pre_sha\n', '')
+            elif call_counts['rev_parse'] == 2:
+                # right after our commit: HEAD is our commit
+                return (0, our_commit + '\n', '')
+            else:
+                # at rollback time: agent has committed on top
+                return (0, agent_commit + '\n', '')
+        if args[:3] == ['diff', '--cached', '--name-only']:
+            return (0, 'pyproject.toml\n', '')
+        if 'checkout' in args and 'pyproject.toml' in args:
+            return (0, '', '')
+        if args[:2] == ['ls-files', '--error-unmatch']:
+            return (0, '', '')
+        if args[0] == 'commit':
+            return (0, '', '')
+        if args[0] == 'push':
+            return (1, '', 'rejected')
+        if args[:2] == ['reset', '--hard']:
+            reset_calls.append(list(args))
+            return (0, '', '')
+        return (0, '', '')
+
+    with patch(f'{MODULE}._run_git', side_effect=stub):
+        from services.worktree_env_notification import _apply_env_fix_to_worktree
+        result = _apply_env_fix_to_worktree(
+            tmp_path,
+            'fixsha',
+            ['pyproject.toml'],
+        )
+
+    assert result is None
+    # The rollback (reset --hard) must NOT have been called because HEAD moved
+    # to agent_commit, which differs from our_commit.
+    hard_resets = [c for c in reset_calls if '--hard' in c]
+    assert not hard_resets, (
+        f"rollback should be skipped when HEAD moved away from our commit; got: {hard_resets}"
+    )
